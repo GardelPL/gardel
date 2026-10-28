@@ -1,0 +1,30 @@
+# Rust build artifacts
+target/
+**/target/
+
+# Compiler build outputs and native binaries
+build/
+**/build/
+*.exe
+*.dll
+*.so
+*.dylib
+*.pdb
+*.ilk
+*.obj
+*.o
+
+# External tools and binaries
+tools/
+
+# Editor and IDE directories
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS artifacts
+.DS_Store
+Thumbs.db
+desktop.ini

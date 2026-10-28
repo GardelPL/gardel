@@ -1,0 +1,61 @@
+module BOUNDED_STACK[A]
+
+representation {NONE}
+  items: LIST[A]
+  size: NAT
+  limit: NAT
+
+create {ANY}
+
+  make(cap: NAT): BOUNDED_STACK[A]
+    require
+      positive_capacity: cap > 0
+    do
+      { items = LIST.empty, size = 0, limit = cap }
+    ensure
+      is_empty: Result.count = 0
+      capacity_set: Result.capacity = cap
+    end
+
+feature {ANY}
+
+  count: NAT
+    do
+      Current.size
+    end
+
+  capacity: NAT
+    do
+      Current.limit
+    end
+
+  push(x: A): BOUNDED_STACK[A]
+    require
+      not_full: Current.count < Current.capacity
+    do
+      { items = Current.items.prepend(x),
+        size = Current.size + 1,
+        limit = Current.limit }
+    ensure
+      count_incremented: Result.count = Current.count + 1
+      capacity_unchanged: Result.capacity = Current.capacity
+    end
+
+  pop: TUPLE[A, BOUNDED_STACK[A]]
+    require
+      not_empty: Current.count > 0
+    do
+      ( Current.items.head,
+        { items = Current.items.tail,
+          size = Current.size - 1,
+          limit = Current.limit } )
+    ensure
+      count_decremented: Result.second.count = Current.count - 1
+    end
+
+invariant
+  positive_capacity: limit > 0
+  size_matches: size = items.length
+  within_bounds: size <= limit
+
+end

@@ -1,0 +1,158 @@
+concept EQ
+
+  equals(other: Current): BOOL
+
+  law agrees_with_structural(a: Current, b: Current)
+    ensure
+      sound: a.equals(b) = (a = b)
+    end
+
+end
+
+concept ORD refines EQ
+
+  less_than(other: Current): BOOL
+
+  less_or_equal(other: Current): BOOL
+    do
+      Current.less_than(other) or Current.equals(other)
+    ensure
+      definition: Result = (Current.less_than(other) or Current = other)
+    end
+
+  law irreflexive(a: Current)
+    ensure
+      not_less_than_self: not a.less_than(a)
+    end
+
+  law transitive(a: Current, b: Current, c: Current)
+    require
+      a_lt_b: a.less_than(b)
+      b_lt_c: b.less_than(c)
+    ensure
+      a_lt_c: a.less_than(c)
+    end
+
+  law total(a: Current, b: Current)
+    ensure
+      comparable: a.less_than(b) or a = b or b.less_than(a)
+    end
+
+end
+
+module PEANO satisfies ORD
+
+representation {ANY}
+  | Zero
+  | Succ(pred: PEANO)
+
+feature {ANY}
+
+  equals(other: PEANO): BOOL
+    variant
+      Current
+    do
+      match Current
+        case Zero then
+          match other
+            case Zero then True
+            case Succ(_) then False
+          end
+        case Succ(p) then
+          match other
+            case Zero then False
+            case Succ(q) then p.equals(q)
+          end
+      end
+    ensure
+      structural: Result = (Current = other)
+    end
+
+  less_than(other: PEANO): BOOL
+    variant
+      Current
+    do
+      match Current
+        case Zero then
+          match other
+            case Zero then False
+            case Succ(_) then True
+          end
+        case Succ(p) then
+          match other
+            case Zero then False
+            case Succ(q) then p.less_than(q)
+          end
+      end
+    end
+
+specify {ORD}
+
+  law agrees_with_structural(a: PEANO, b: PEANO)
+    variant
+      a
+    do
+      match a
+        case Zero then True
+        case Succ(p) then
+          match b
+            case Zero then True
+            case Succ(q) then agrees_with_structural(p, q)
+          end
+      end
+    ensure
+      sound: a.equals(b) = (a = b)
+    end
+
+  law irreflexive(a: PEANO)
+    variant
+      a
+    do
+      match a
+        case Zero then True
+        case Succ(p) then irreflexive(p)
+      end
+    ensure
+      not_less_than_self: not a.less_than(a)
+    end
+
+  law transitive(a: PEANO, b: PEANO, c: PEANO)
+    require
+      a_lt_b: a.less_than(b)
+      b_lt_c: b.less_than(c)
+    variant
+      a
+    do
+      match a
+        case Zero then True
+        case Succ(p) then
+          match b
+            case Zero then True
+            case Succ(q) then
+              match c
+                case Zero then True
+                case Succ(r) then transitive(p, q, r)
+              end
+          end
+      end
+    ensure
+      a_lt_c: a.less_than(c)
+    end
+
+  law total(a: PEANO, b: PEANO)
+    variant
+      a
+    do
+      match a
+        case Zero then True
+        case Succ(p) then
+          match b
+            case Zero then True
+            case Succ(q) then total(p, q)
+          end
+      end
+    ensure
+      comparable: a.less_than(b) or a = b or b.less_than(a)
+    end
+
+end

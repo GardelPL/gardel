@@ -1,0 +1,60 @@
+module TREE
+
+representation {ANY}
+  | Leaf(value: NAT)
+  | Node(left: TREE, right: TREE)
+
+specify {ANY}
+
+  leaves: LIST[NAT]
+    variant
+      Current
+    do
+      match Current
+        case Leaf(v) then LIST.singleton(v)
+        case Node(l, r) then l.leaves.append(r.leaves)
+      end
+    end
+
+create {ANY}
+
+  from_range(lo: NAT, hi: NAT): TREE
+    require
+      valid_range: lo <= hi
+    variant
+      hi - lo
+    do
+      if lo = hi then
+        Leaf(lo)
+      else
+        let mid = lo + (hi - lo) / 2
+        let left_tree = from_range(lo, mid)
+        let right_tree = from_range(mid + 1, hi)
+        Node(left_tree, right_tree)
+      end
+    ensure
+      non_empty: Result.leaves.length > 0
+      in_bounds: forall x: NAT. Result.leaves.has(x) implies (lo <= x and x <= hi)
+      has_lo: Result.leaves.has(lo)
+      has_hi: Result.leaves.has(hi)
+    end
+
+feature {ANY}
+
+  max_value: NAT
+    variant
+      Current
+    do
+      match Current
+        case Leaf(v) then v
+        case Node(l, r) then
+          let ml = l.max_value
+          let mr = r.max_value
+          if ml >= mr then ml else mr end
+      end
+    ensure
+      upper_bound: forall x: NAT. Current.leaves.has(x) implies x <= Result
+      attained: Current.leaves.has(Result)
+    end
+
+end
