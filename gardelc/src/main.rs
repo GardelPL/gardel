@@ -168,7 +168,7 @@ pub enum IoStmt {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Literal {
-    Int(u64),
+    Int(u128),
     Float(f64),
     Char(u32),
     Bool(bool),
@@ -228,7 +228,7 @@ impl Pattern {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Expr {
-    Int(u64),
+    Int(u128),
     Float(f64),
     Char(u32),
     Unit,
@@ -260,7 +260,11 @@ pub struct MatchCase {
 
 impl MatchCase {
     pub fn new(pattern: Pattern, stmts: Vec<Stmt>, body: Expr) -> Self {
-        Self { pattern, stmts, body }
+        Self {
+            pattern,
+            stmts,
+            body,
+        }
     }
 
     pub fn ctor(&self) -> &str {
@@ -313,7 +317,7 @@ impl std::error::Error for LexError {}
 #[derive(Debug, Clone, PartialEq)]
 pub enum Token {
     Ident(String),
-    Int(u64),
+    Int(u128),
     Float(f64),
     Char(char),
     Str(String),
@@ -470,7 +474,11 @@ pub fn tokenize_with_lines(src: &str) -> Result<(Vec<Token>, Vec<usize>), LexErr
             while i < chars.len() && chars[i].is_ascii_digit() {
                 i += 1;
             }
-            if i < chars.len() && chars[i] == '.' && i + 1 < chars.len() && chars[i + 1].is_ascii_digit() {
+            if i < chars.len()
+                && chars[i] == '.'
+                && i + 1 < chars.len()
+                && chars[i + 1].is_ascii_digit()
+            {
                 i += 1; // skip '.'
                 while i < chars.len() && chars[i].is_ascii_digit() {
                     i += 1;
@@ -484,7 +492,7 @@ pub fn tokenize_with_lines(src: &str) -> Result<(Vec<Token>, Vec<usize>), LexErr
                 lines.push(start_line);
             } else {
                 let s: String = chars[start..i].iter().collect();
-                let val = s.parse::<u64>().map_err(|e| LexError {
+                let val = s.parse::<u128>().map_err(|e| LexError {
                     message: format!("Invalid integer literal '{s}': {e}"),
                     position: start,
                 })?;
@@ -750,7 +758,9 @@ impl Parser {
         let id = self.expect_ident()?;
         if !id.chars().next().is_some_and(|c| c.is_ascii_uppercase()) {
             return Err(ParseError {
-                message: format!("Expected UpperIdent (starting with uppercase letter), got `{id}`"),
+                message: format!(
+                    "Expected UpperIdent (starting with uppercase letter), got `{id}`"
+                ),
                 token_pos: self.pos,
             });
         }
@@ -761,7 +771,9 @@ impl Parser {
         let id = self.expect_ident()?;
         if !id.chars().next().is_some_and(|c| c.is_ascii_lowercase()) {
             return Err(ParseError {
-                message: format!("Expected LowerIdent (starting with lowercase letter), got `{id}`"),
+                message: format!(
+                    "Expected LowerIdent (starting with lowercase letter), got `{id}`"
+                ),
                 token_pos: self.pos,
             });
         }
@@ -1524,7 +1536,11 @@ impl Parser {
         if self.is_kw("implies") {
             self.next();
             let right = self.parse_implies()?;
-            Ok(Expr::BinOp("implies".into(), Box::new(left), Box::new(right)))
+            Ok(Expr::BinOp(
+                "implies".into(),
+                Box::new(left),
+                Box::new(right),
+            ))
         } else {
             Ok(left)
         }
@@ -2497,12 +2513,7 @@ fn expr_uses_io(e: &Expr) -> bool {
     }
 }
 
-fn check_branch_io_linearity(
-    e: &Expr,
-    rname: &str,
-    in_with_io: bool,
-    diags: &mut Vec<Diagnostic>,
-) {
+fn check_branch_io_linearity(e: &Expr, rname: &str, in_with_io: bool, diags: &mut Vec<Diagnostic>) {
     match e {
         Expr::WithIo(stmts, final_e) => {
             for s in stmts {
@@ -2610,7 +2621,12 @@ fn check_branch_io_linearity(
 fn count_var_occurrences(e: &Expr, target: &str) -> usize {
     match e {
         Expr::Var(v) => usize::from(v == target),
-        Expr::Int(_) | Expr::Float(_) | Expr::Char(_) | Expr::Unit | Expr::Bool(_) | Expr::Str(_) => 0,
+        Expr::Int(_)
+        | Expr::Float(_)
+        | Expr::Char(_)
+        | Expr::Unit
+        | Expr::Bool(_)
+        | Expr::Str(_) => 0,
         Expr::UnaryNot(inner) | Expr::UnaryNeg(inner) => count_var_occurrences(inner, target),
         Expr::BinOp(_, l, r) => count_var_occurrences(l, target) + count_var_occurrences(r, target),
         Expr::Call(_, args) => args.iter().map(|a| count_var_occurrences(a, target)).sum(),
@@ -2810,7 +2826,12 @@ pub fn collect_symbols(e: &Expr) -> HashSet<String> {
 pub fn collect_symbols_scoped(e: &Expr, locals: &HashSet<String>) -> HashSet<String> {
     let mut set = HashSet::new();
     match e {
-        Expr::Int(_) | Expr::Float(_) | Expr::Char(_) | Expr::Bool(_) | Expr::Str(_) | Expr::Unit => {}
+        Expr::Int(_)
+        | Expr::Float(_)
+        | Expr::Char(_)
+        | Expr::Bool(_)
+        | Expr::Str(_)
+        | Expr::Unit => {}
         Expr::Var(v) => {
             if !locals.contains(v) && v != "Current" && v != "Result" {
                 set.insert(v.clone());
@@ -3066,10 +3087,7 @@ pub fn format_gardel_expr(e: &Expr) -> String {
             format!("with IO {} end", ss.join("; "))
         }
         Expr::Lambda(params, ret_ty, stmts, body) => {
-            let ps: Vec<String> = params
-                .iter()
-                .map(|(p, t)| format!("{p}: {t}"))
-                .collect();
+            let ps: Vec<String> = params.iter().map(|(p, t)| format!("{p}: {t}")).collect();
             let mut ss = Vec::new();
             for s in stmts {
                 match s {
@@ -3148,6 +3166,7 @@ create {ANY}
       Empty
     ensure
       empty_len: Result.length = 0
+      empty_model: Result.model = LIST.empty
     end
 
   singleton(x: A): SEQ[A]
@@ -3155,6 +3174,7 @@ create {ANY}
       Leaf(x)
     ensure
       unit_len: Result.length = 1
+      unit_model: Result.model = LIST.empty.prepend(x)
     end
 
 feature {ANY}
@@ -3170,6 +3190,13 @@ feature {ANY}
       end
     end
 
+  is_empty: BOOL
+    do
+      Current.length = 0
+    ensure
+      def: Result = (Current.length = 0)
+    end
+
   concat(other: SEQ[A]): SEQ[A]
     require
       fits: Current.length <= 18446744073709551615 - other.length
@@ -3177,6 +3204,7 @@ feature {ANY}
       Concat(Current, other, Current.length + other.length)
     ensure
       len_sum: Result.length = Current.length + other.length
+      model_concat: Result.model = Current.model.append(other.model)
     end
 
 end
@@ -3189,9 +3217,21 @@ representation {NONE}
 
 specify {ANY}
 
+  value_of(ls: LIST[U64]): MATH_INT
+    variant
+      ls.length
+    do
+      if ls.length = 0 then
+        0
+      else
+        ls.head + 18446744073709551616 * value_of(ls.tail)
+      end
+    end
+
   model: MATH_INT
     do
-      Current.size
+      reveal value_of
+      value_of(Current.limbs)
     end
 
 create {ANY}
@@ -3200,6 +3240,7 @@ create {ANY}
     do
       { limbs = LIST.empty, size = 0 }
     ensure
+      value_is_zero: Result.model = 0
       zero_limbs: Result.limb_count = 0
     end
 
@@ -3211,6 +3252,7 @@ create {ANY}
         { limbs = LIST.empty.prepend(x), size = 1 }
       end
     ensure
+      val: Result.model = x
       count_bounded: Result.limb_count <= 1
     end
 
@@ -3229,6 +3271,7 @@ feature {ANY}
         size = Current.size + 1 }
     ensure
       limb_added: Result.limb_count = Current.limb_count + 1
+      model_updated: Result.model = limb + 18446744073709551616 * Current.model
     end
 
 invariant
@@ -3240,15 +3283,31 @@ end
 module STRING
 
 representation {NONE}
-  items: LIST[U64]
+  bytes: LIST[U64]
   size: NAT
   limit: NAT
 
 specify {ANY}
 
-  chars: LIST[U64]
+  all_bytes_valid(bs: LIST[U64]): BOOL
+    variant
+      bs.length
     do
-      Current.items
+      if bs.length = 0 then
+        True
+      else
+        bs.head < 256 and all_bytes_valid(bs.tail)
+      end
+    end
+
+  byte_model: LIST[U64]
+    do
+      Current.bytes
+    end
+
+  chars: LIST[CHAR]
+    do
+      Current.bytes
     end
 
 create {ANY}
@@ -3257,9 +3316,10 @@ create {ANY}
     require
       positive_cap: cap > 0
     do
-      { items = LIST.empty, size = 0, limit = cap }
+      { bytes = LIST.empty, size = 0, limit = cap }
     ensure
       empty_bytes: Result.byte_length = 0
+      empty_str: Result.is_empty
     end
 
 feature {ANY}
@@ -3281,22 +3341,37 @@ feature {ANY}
       def: Result = (Current.byte_length = 0)
     end
 
+  push_byte(b: U64): STRING
+    require
+      is_byte: b < 256
+      has_room: Current.byte_length < Current.capacity
+    do
+      { bytes = Current.bytes.prepend(b),
+        size = Current.size + 1,
+        limit = Current.limit }
+    ensure
+      grew: Result.byte_length = Current.byte_length + 1
+      non_empty: not Result.is_empty
+    end
+
   push_utf8_word(w: U64): STRING
     require
       valid_word: w < 256
       has_room: Current.byte_length < Current.capacity
     do
-      { items = Current.items.prepend(w),
+      { bytes = Current.bytes.prepend(w),
         size = Current.size + 1,
         limit = Current.limit }
     ensure
       grew: Result.byte_length = Current.byte_length + 1
+      non_empty: not Result.is_empty
     end
 
 invariant
   positive_capacity: limit > 0
-  size_matches: size = items.length
+  size_matches: size = bytes.length
   within_bounds: size <= limit
+  valid_bytes: all_bytes_valid(bytes)
 
 end
 "#
@@ -3568,8 +3643,12 @@ fn convert_expr_lambdas(
                 Expr::RecordLit(rec_fields)
             }
         }
-        Expr::UnaryNot(inner) => Expr::UnaryNot(Box::new(convert_expr_lambdas(inner, counter, combinators))),
-        Expr::UnaryNeg(inner) => Expr::UnaryNeg(Box::new(convert_expr_lambdas(inner, counter, combinators))),
+        Expr::UnaryNot(inner) => {
+            Expr::UnaryNot(Box::new(convert_expr_lambdas(inner, counter, combinators)))
+        }
+        Expr::UnaryNeg(inner) => {
+            Expr::UnaryNeg(Box::new(convert_expr_lambdas(inner, counter, combinators)))
+        }
         Expr::BinOp(op, l, r) => Expr::BinOp(
             op.clone(),
             Box::new(convert_expr_lambdas(l, counter, combinators)),
@@ -3577,58 +3656,109 @@ fn convert_expr_lambdas(
         ),
         Expr::Call(f, args) => Expr::Call(
             f.clone(),
-            args.iter().map(|a| convert_expr_lambdas(a, counter, combinators)).collect(),
+            args.iter()
+                .map(|a| convert_expr_lambdas(a, counter, combinators))
+                .collect(),
         ),
         Expr::MethodCall(recv, mname, args) => Expr::MethodCall(
             Box::new(convert_expr_lambdas(recv, counter, combinators)),
             mname.clone(),
-            args.iter().map(|a| convert_expr_lambdas(a, counter, combinators)).collect(),
+            args.iter()
+                .map(|a| convert_expr_lambdas(a, counter, combinators))
+                .collect(),
         ),
         Expr::If(c, ts, te, es, ee) => Expr::If(
             Box::new(convert_expr_lambdas(c, counter, combinators)),
-            ts.iter().map(|s| match s {
-                Stmt::Let(v, e) => Stmt::Let(v.clone(), convert_expr_lambdas(e, counter, combinators)),
-                Stmt::Check(t, e) => Stmt::Check(t.clone(), convert_expr_lambdas(e, counter, combinators)),
-                Stmt::Assume(t, e) => Stmt::Assume(t.clone(), convert_expr_lambdas(e, counter, combinators)),
-                Stmt::Reveal(r) => Stmt::Reveal(r.clone()),
-            }).collect(),
+            ts.iter()
+                .map(|s| match s {
+                    Stmt::Let(v, e) => {
+                        Stmt::Let(v.clone(), convert_expr_lambdas(e, counter, combinators))
+                    }
+                    Stmt::Check(t, e) => {
+                        Stmt::Check(t.clone(), convert_expr_lambdas(e, counter, combinators))
+                    }
+                    Stmt::Assume(t, e) => {
+                        Stmt::Assume(t.clone(), convert_expr_lambdas(e, counter, combinators))
+                    }
+                    Stmt::Reveal(r) => Stmt::Reveal(r.clone()),
+                })
+                .collect(),
             Box::new(convert_expr_lambdas(te, counter, combinators)),
-            es.iter().map(|s| match s {
-                Stmt::Let(v, e) => Stmt::Let(v.clone(), convert_expr_lambdas(e, counter, combinators)),
-                Stmt::Check(t, e) => Stmt::Check(t.clone(), convert_expr_lambdas(e, counter, combinators)),
-                Stmt::Assume(t, e) => Stmt::Assume(t.clone(), convert_expr_lambdas(e, counter, combinators)),
-                Stmt::Reveal(r) => Stmt::Reveal(r.clone()),
-            }).collect(),
+            es.iter()
+                .map(|s| match s {
+                    Stmt::Let(v, e) => {
+                        Stmt::Let(v.clone(), convert_expr_lambdas(e, counter, combinators))
+                    }
+                    Stmt::Check(t, e) => {
+                        Stmt::Check(t.clone(), convert_expr_lambdas(e, counter, combinators))
+                    }
+                    Stmt::Assume(t, e) => {
+                        Stmt::Assume(t.clone(), convert_expr_lambdas(e, counter, combinators))
+                    }
+                    Stmt::Reveal(r) => Stmt::Reveal(r.clone()),
+                })
+                .collect(),
             Box::new(convert_expr_lambdas(ee, counter, combinators)),
         ),
         Expr::Match(scrut, cases) => Expr::Match(
             Box::new(convert_expr_lambdas(scrut, counter, combinators)),
-            cases.iter().map(|c| {
-                let stmts: Vec<Stmt> = c.stmts.iter().map(|s| match s {
-                    Stmt::Let(v, e) => Stmt::Let(v.clone(), convert_expr_lambdas(e, counter, combinators)),
-                    Stmt::Check(t, e) => Stmt::Check(t.clone(), convert_expr_lambdas(e, counter, combinators)),
-                    Stmt::Assume(t, e) => Stmt::Assume(t.clone(), convert_expr_lambdas(e, counter, combinators)),
-                    Stmt::Reveal(r) => Stmt::Reveal(r.clone()),
-                }).collect();
-                let body = convert_expr_lambdas(&c.body, counter, combinators);
-                MatchCase::new(c.pattern.clone(), stmts, body)
-            }).collect(),
+            cases
+                .iter()
+                .map(|c| {
+                    let stmts: Vec<Stmt> = c
+                        .stmts
+                        .iter()
+                        .map(|s| match s {
+                            Stmt::Let(v, e) => {
+                                Stmt::Let(v.clone(), convert_expr_lambdas(e, counter, combinators))
+                            }
+                            Stmt::Check(t, e) => Stmt::Check(
+                                t.clone(),
+                                convert_expr_lambdas(e, counter, combinators),
+                            ),
+                            Stmt::Assume(t, e) => Stmt::Assume(
+                                t.clone(),
+                                convert_expr_lambdas(e, counter, combinators),
+                            ),
+                            Stmt::Reveal(r) => Stmt::Reveal(r.clone()),
+                        })
+                        .collect();
+                    let body = convert_expr_lambdas(&c.body, counter, combinators);
+                    MatchCase::new(c.pattern.clone(), stmts, body)
+                })
+                .collect(),
         ),
         Expr::RecordLit(fields) => Expr::RecordLit(
-            fields.iter().map(|(k, v)| (k.clone(), convert_expr_lambdas(v, counter, combinators))).collect(),
+            fields
+                .iter()
+                .map(|(k, v)| (k.clone(), convert_expr_lambdas(v, counter, combinators)))
+                .collect(),
         ),
         Expr::RecordUpdate(base, fields) => Expr::RecordUpdate(
             Box::new(convert_expr_lambdas(base, counter, combinators)),
-            fields.iter().map(|(k, v)| (k.clone(), convert_expr_lambdas(v, counter, combinators))).collect(),
+            fields
+                .iter()
+                .map(|(k, v)| (k.clone(), convert_expr_lambdas(v, counter, combinators)))
+                .collect(),
         ),
         Expr::TupleLit(elems) => Expr::TupleLit(
-            elems.iter().map(|el| convert_expr_lambdas(el, counter, combinators)).collect(),
+            elems
+                .iter()
+                .map(|el| convert_expr_lambdas(el, counter, combinators))
+                .collect(),
         ),
         Expr::WithIo(stmts, final_e) => Expr::WithIo(
-            stmts.iter().map(|s| match s {
-                IoStmt::Bind(v, e) => IoStmt::Bind(v.clone(), convert_expr_lambdas(e, counter, combinators)),
-                IoStmt::Action(e) => IoStmt::Action(convert_expr_lambdas(e, counter, combinators)),
-            }).collect(),
+            stmts
+                .iter()
+                .map(|s| match s {
+                    IoStmt::Bind(v, e) => {
+                        IoStmt::Bind(v.clone(), convert_expr_lambdas(e, counter, combinators))
+                    }
+                    IoStmt::Action(e) => {
+                        IoStmt::Action(convert_expr_lambdas(e, counter, combinators))
+                    }
+                })
+                .collect(),
             Box::new(convert_expr_lambdas(final_e, counter, combinators)),
         ),
         other => other.clone(),
@@ -3795,7 +3925,9 @@ pub fn emit_boogie(m: &ModuleDecl, fuel_limit: usize) -> String {
     out.push_str("axiom I64_MIN == -9223372036854775808;\n");
     out.push_str("const I64_MAX: int;\n");
     out.push_str("axiom I64_MAX == 9223372036854775807;\n");
-    out.push_str("function {:inline} in_i64(x: int) returns (bool) { I64_MIN <= x && x <= I64_MAX }\n\n");
+    out.push_str(
+        "function {:inline} in_i64(x: int) returns (bool) { I64_MIN <= x && x <= I64_MAX }\n\n",
+    );
 
     out.push_str("type Unit;\n");
     out.push_str("const unique Unit_val: Unit;\n");
@@ -3824,15 +3956,25 @@ pub fn emit_boogie(m: &ModuleDecl, fuel_limit: usize) -> String {
 
     for (tp, bound) in &m.type_bounds {
         if bound == "EQ" || bound == "ORD" {
-            out.push_str(&format!("function {tp}_eq(x: {tp}, y: {tp}) returns (bool);\n"));
-            out.push_str(&format!("axiom (forall x: {tp} :: {{ {tp}_eq(x, x) }} {tp}_eq(x, x));\n"));
+            out.push_str(&format!(
+                "function {tp}_eq(x: {tp}, y: {tp}) returns (bool);\n"
+            ));
+            out.push_str(&format!(
+                "axiom (forall x: {tp} :: {{ {tp}_eq(x, x) }} {tp}_eq(x, x));\n"
+            ));
             out.push_str(&format!("axiom (forall x: {tp}, y: {tp} :: {{ {tp}_eq(x, y) }} {tp}_eq(x, y) ==> {tp}_eq(y, x));\n"));
             out.push_str(&format!("axiom (forall x: {tp}, y: {tp}, z: {tp} :: {{ {tp}_eq(x, y), {tp}_eq(y, z) }} {tp}_eq(x, y) && {tp}_eq(y, z) ==> {tp}_eq(x, z));\n"));
         }
         if bound == "ORD" {
-            out.push_str(&format!("function {tp}_less(x: {tp}, y: {tp}) returns (bool);\n"));
-            out.push_str(&format!("function {tp}_less_eq(x: {tp}, y: {tp}) returns (bool);\n"));
-            out.push_str(&format!("axiom (forall x: {tp} :: {{ {tp}_less(x, x) }} !{tp}_less(x, x));\n"));
+            out.push_str(&format!(
+                "function {tp}_less(x: {tp}, y: {tp}) returns (bool);\n"
+            ));
+            out.push_str(&format!(
+                "function {tp}_less_eq(x: {tp}, y: {tp}) returns (bool);\n"
+            ));
+            out.push_str(&format!(
+                "axiom (forall x: {tp} :: {{ {tp}_less(x, x) }} !{tp}_less(x, x));\n"
+            ));
             out.push_str(&format!("axiom (forall x: {tp}, y: {tp}, z: {tp} :: {{ {tp}_less(x, y), {tp}_less(y, z) }} {tp}_less(x, y) && {tp}_less(y, z) ==> {tp}_less(x, z));\n"));
             out.push_str(&format!("axiom (forall x: {tp}, y: {tp} :: {{ {tp}_less_eq(x, y) }} {tp}_less_eq(x, y) <==> ({tp}_less(x, y) || {tp}_eq(x, y)));\n"));
             out.push_str(&format!("axiom (forall x: {tp}, y: {tp} :: {{ {tp}_less(x, y), {tp}_less(y, x) }} {tp}_less(x, y) || {tp}_eq(x, y) || {tp}_less(y, x));\n"));
@@ -3866,7 +4008,10 @@ pub fn emit_boogie(m: &ModuleDecl, fuel_limit: usize) -> String {
     let strings = collect_module_strings(m);
     for (idx, s) in strings.iter().enumerate() {
         out.push_str(&format!("const unique str_lit_{idx}: GardelString;\n"));
-        out.push_str(&format!("axiom Str_length(str_lit_{idx}) == {};\n", s.len()));
+        out.push_str(&format!(
+            "axiom Str_length(str_lit_{idx}) == {};\n",
+            s.len()
+        ));
     }
     out.push_str("function IO_read_line() returns (GardelString);\n");
     out.push_str("function IO_print(s: GardelString) returns (IO int);\n");
@@ -4026,10 +4171,16 @@ pub fn emit_boogie(m: &ModuleDecl, fuel_limit: usize) -> String {
                         .iter()
                         .map(|(fnm, fty)| format!("_b_{fnm}: {}", map_boogie_type(fty, m)))
                         .collect();
-                    let c1_args: Vec<String> =
-                        v.fields.iter().map(|(fnm, _)| format!("_a_{fnm}")).collect();
-                    let c2_args: Vec<String> =
-                        v.fields.iter().map(|(fnm, _)| format!("_b_{fnm}")).collect();
+                    let c1_args: Vec<String> = v
+                        .fields
+                        .iter()
+                        .map(|(fnm, _)| format!("_a_{fnm}"))
+                        .collect();
+                    let c2_args: Vec<String> = v
+                        .fields
+                        .iter()
+                        .map(|(fnm, _)| format!("_b_{fnm}"))
+                        .collect();
                     let eqs: Vec<String> = v
                         .fields
                         .iter()
@@ -4170,8 +4321,10 @@ pub fn emit_boogie(m: &ModuleDecl, fuel_limit: usize) -> String {
         .collect();
 
     for (r, has_current) in &all_routines {
+        let uses_curr = *has_current && routine_uses_current(r, &implicit_fields);
         let mut sig_params = vec!["fuel: Fuel".to_string()];
         let mut q_params = vec!["f: Fuel".to_string()];
+        let mut call_args_step_two = vec!["SuccFuel(SuccFuel(f))".to_string()];
         let mut call_args_succ = vec!["SuccFuel(f)".to_string()];
         let mut call_args_f = vec!["f".to_string()];
         let mut pre_guards = Vec::new();
@@ -4179,14 +4332,18 @@ pub fn emit_boogie(m: &ModuleDecl, fuel_limit: usize) -> String {
         if *has_current {
             sig_params.push(format!("Current: {mod_bpl_ty}"));
             q_params.push(format!("Current: {mod_bpl_ty}"));
+            call_args_step_two.push("Current".to_string());
             call_args_succ.push("Current".to_string());
             call_args_f.push("Current".to_string());
-            pre_guards.push(format!("{}_Invariant(Current)", m.name));
+            if uses_curr {
+                pre_guards.push(format!("{}_Invariant(Current)", m.name));
+            }
         }
         for (pn, pt) in &r.params {
             let bty = map_boogie_type(pt, m);
             sig_params.push(format!("{pn}: {bty}"));
             q_params.push(format!("{pn}: {bty}"));
+            call_args_step_two.push(pn.clone());
             call_args_succ.push(pn.clone());
             call_args_f.push(pn.clone());
             if pt == "NAT" || pt == "U64" {
@@ -4211,6 +4368,7 @@ pub fn emit_boogie(m: &ModuleDecl, fuel_limit: usize) -> String {
             sig_params.join(", ")
         ));
 
+        let fn_step_two_app = format!("fn_{}({})", r.name, call_args_step_two.join(", "));
         let fn_succ_app = format!("fn_{}({})", r.name, call_args_succ.join(", "));
         let fn_f_app = format!("fn_{}({})", r.name, call_args_f.join(", "));
         let body_expr = emit_boogie_block_expr(&r.stmts, &r.body, m, &empty_fields, "f", &strings);
@@ -4218,6 +4376,11 @@ pub fn emit_boogie(m: &ModuleDecl, fuel_limit: usize) -> String {
             String::new()
         } else {
             format!("{} ==> ", pre_guards.join(" && "))
+        };
+        let fn_step_two_trigger = if m.type_params.is_empty() {
+            format!("{{ {fn_step_two_app} }}")
+        } else {
+            format!("{{ ({fn_step_two_app} : {ret_bty}) }}")
         };
         let fn_succ_trigger = if m.type_params.is_empty() {
             format!("{{ {fn_succ_app} }}")
@@ -4233,6 +4396,35 @@ pub fn emit_boogie(m: &ModuleDecl, fuel_limit: usize) -> String {
             "axiom (forall{tp_quant} {} :: {fn_succ_trigger} {guard_str}{fn_succ_app} == {body_expr});\n",
             q_params.join(", ")
         ));
+        out.push_str(&format!(
+            "axiom (forall{tp_quant} {} :: {fn_step_two_trigger} {guard_str}{fn_step_two_app} == {fn_succ_app});\n",
+            q_params.join(", ")
+        ));
+        if *has_current && !uses_curr {
+            let mut ri_q_params = vec![
+                "f: Fuel".to_string(),
+                format!("_c1: {mod_bpl_ty}"),
+                format!("_c2: {mod_bpl_ty}"),
+            ];
+            let mut args_c1 = vec!["f".to_string(), "_c1".to_string()];
+            let mut args_c2 = vec!["f".to_string(), "_c2".to_string()];
+            for (pn, pt) in &r.params {
+                ri_q_params.push(format!("{pn}: {}", map_boogie_type(pt, m)));
+                args_c1.push(pn.clone());
+                args_c2.push(pn.clone());
+            }
+            let app_c1 = format!("fn_{}({})", r.name, args_c1.join(", "));
+            let app_c2 = format!("fn_{}({})", r.name, args_c2.join(", "));
+            let ri_trig = if m.type_params.is_empty() {
+                format!("{{ {app_c1}, {app_c2} }}")
+            } else {
+                format!("{{ ({app_c1} : {ret_bty}), ({app_c2} : {ret_bty}) }}")
+            };
+            out.push_str(&format!(
+                "axiom (forall{tp_quant} {} :: {ri_trig} {app_c1} == {app_c2});\n",
+                ri_q_params.join(", ")
+            ));
+        }
 
         // Opaque Postcondition Frame Axiom (holds at any fuel `f`, including `ZeroFuel`)
         let mut post_clauses = Vec::new();
@@ -4368,9 +4560,7 @@ pub fn emit_boogie(m: &ModuleDecl, fuel_limit: usize) -> String {
         if !m.invariants.is_empty() {
             let has_recursive_fields = variants.iter().any(|v| {
                 v.fields.iter().any(|(_, fty)| {
-                    fty == &m.name
-                        || fty == "Current"
-                        || fty.starts_with(&format!("{}[", m.name))
+                    fty == &m.name || fty == "Current" || fty.starts_with(&format!("{}[", m.name))
                 })
             });
             if has_recursive_fields {
@@ -4413,6 +4603,83 @@ pub fn emit_boogie(m: &ModuleDecl, fuel_limit: usize) -> String {
     }
 
     out
+}
+
+fn routine_uses_current(r: &RoutineDecl, field_names: &HashSet<String>) -> bool {
+    let self_name = r.name.as_str();
+    r.requires
+        .iter()
+        .any(|(_, e)| expr_uses_current(e, field_names, self_name))
+        || r.ensures
+            .iter()
+            .any(|(_, e)| expr_uses_current(e, field_names, self_name))
+        || r.variant
+            .iter()
+            .any(|e| expr_uses_current(e, field_names, self_name))
+        || stmts_use_current(&r.stmts, field_names, self_name)
+        || expr_uses_current(&r.body, field_names, self_name)
+}
+
+fn stmts_use_current(stmts: &[Stmt], field_names: &HashSet<String>, self_routine: &str) -> bool {
+    stmts.iter().any(|st| match st {
+        Stmt::Let(_, e) | Stmt::Check(_, e) | Stmt::Assume(_, e) => {
+            expr_uses_current(e, field_names, self_routine)
+        }
+        Stmt::Reveal(_) => false,
+    })
+}
+
+fn expr_uses_current(e: &Expr, field_names: &HashSet<String>, self_routine: &str) -> bool {
+    match e {
+        Expr::Int(_)
+        | Expr::Float(_)
+        | Expr::Char(_)
+        | Expr::Unit
+        | Expr::Bool(_)
+        | Expr::Str(_) => false,
+        Expr::Var(v) => v == "Current" || field_names.contains(v),
+        Expr::UnaryNot(inner) | Expr::UnaryNeg(inner) => {
+            expr_uses_current(inner, field_names, self_routine)
+        }
+        Expr::BinOp(_, l, r) => {
+            expr_uses_current(l, field_names, self_routine)
+                || expr_uses_current(r, field_names, self_routine)
+        }
+        Expr::Call(fname, args) => {
+            fname != self_routine
+                || args
+                    .iter()
+                    .any(|a| expr_uses_current(a, field_names, self_routine))
+        }
+        Expr::MethodCall(recv, _, args) => {
+            expr_uses_current(recv, field_names, self_routine)
+                || args
+                    .iter()
+                    .any(|a| expr_uses_current(a, field_names, self_routine))
+        }
+        Expr::If(c, ts, te, es, ee) => {
+            expr_uses_current(c, field_names, self_routine)
+                || stmts_use_current(ts, field_names, self_routine)
+                || expr_uses_current(te, field_names, self_routine)
+                || stmts_use_current(es, field_names, self_routine)
+                || expr_uses_current(ee, field_names, self_routine)
+        }
+        Expr::Match(scrut, cases) => {
+            expr_uses_current(scrut, field_names, self_routine)
+                || cases.iter().any(|c| {
+                    stmts_use_current(&c.stmts, field_names, self_routine)
+                        || expr_uses_current(&c.body, field_names, self_routine)
+                })
+        }
+        Expr::RecordLit(_) | Expr::RecordUpdate(_, _) => true,
+        Expr::TupleLit(es) => es
+            .iter()
+            .any(|el| expr_uses_current(el, field_names, self_routine)),
+        Expr::Forall(_, _, b) | Expr::Exists(_, _, b) => {
+            expr_uses_current(b, field_names, self_routine)
+        }
+        Expr::WithIo(_, _) | Expr::Lambda(_, _, _, _) => true,
+    }
 }
 
 fn map_boogie_type(ty: &str, m: &ModuleDecl) -> String {
@@ -4508,7 +4775,14 @@ fn emit_boogie_verify_routine(
     for (tag, req_e) in &r.requires {
         s.push_str(&format!(
             "  requires {}; // require:{tag}\n",
-            emit_boogie_expr_with_strings(req_e, m, &empty_fields, &revealed, "DefaultFuel", strings)
+            emit_boogie_expr_with_strings(
+                req_e,
+                m,
+                &empty_fields,
+                &revealed,
+                "DefaultFuel",
+                strings
+            )
         ));
     }
     s.push_str("{\n");
@@ -4547,7 +4821,14 @@ fn emit_boogie_verify_routine(
         s.push_str(&format!(
             "  assert {{:msg \"{}::ensure::{tag}\"}} {};\n",
             r.name,
-            emit_boogie_expr_with_strings(ens_e, m, &empty_fields, &revealed, "DefaultFuel", strings)
+            emit_boogie_expr_with_strings(
+                ens_e,
+                m,
+                &empty_fields,
+                &revealed,
+                "DefaultFuel",
+                strings
+            )
         ));
     }
 
@@ -4584,7 +4865,14 @@ fn emit_boogie_verify_law(law: &LawDecl, m: &ModuleDecl, strings: &[String]) -> 
     for (tag, req_e) in &law.requires {
         s.push_str(&format!(
             "  requires {}; // require:{tag}\n",
-            emit_boogie_expr_with_strings(req_e, m, &empty_fields, &revealed, "DefaultFuel", strings)
+            emit_boogie_expr_with_strings(
+                req_e,
+                m,
+                &empty_fields,
+                &revealed,
+                "DefaultFuel",
+                strings
+            )
         ));
     }
     s.push_str("{\n");
@@ -4594,13 +4882,27 @@ fn emit_boogie_verify_law(law: &LawDecl, m: &ModuleDecl, strings: &[String]) -> 
                 s.push_str(&format!(
                     "  assert {{:msg \"{}::check::{tag}\"}} {};\n",
                     law.name,
-                    emit_boogie_expr_with_strings(e, m, &empty_fields, &revealed, "DefaultFuel", strings)
+                    emit_boogie_expr_with_strings(
+                        e,
+                        m,
+                        &empty_fields,
+                        &revealed,
+                        "DefaultFuel",
+                        strings
+                    )
                 ));
             }
             Stmt::Assume(tag, e) => {
                 s.push_str(&format!(
                     "  assume {}; // assume:{tag}\n",
-                    emit_boogie_expr_with_strings(e, m, &empty_fields, &revealed, "DefaultFuel", strings)
+                    emit_boogie_expr_with_strings(
+                        e,
+                        m,
+                        &empty_fields,
+                        &revealed,
+                        "DefaultFuel",
+                        strings
+                    )
                 ));
             }
             Stmt::Reveal(target) => {
@@ -4616,7 +4918,14 @@ fn emit_boogie_verify_law(law: &LawDecl, m: &ModuleDecl, strings: &[String]) -> 
         s.push_str(&format!(
             "  assert {{:msg \"{}::ensure::{tag}\"}} {};\n",
             law.name,
-            emit_boogie_expr_with_strings(ens_e, m, &empty_fields, &revealed, "DefaultFuel", strings)
+            emit_boogie_expr_with_strings(
+                ens_e,
+                m,
+                &empty_fields,
+                &revealed,
+                "DefaultFuel",
+                strings
+            )
         ));
     }
     s.push_str("}\n\n");
@@ -4818,24 +5127,8 @@ fn emit_boogie_proc_stmts_and_ret(
                     "DefaultFuel",
                     strings
                 ),
-                emit_boogie_proc_stmts_and_ret(
-                    ts,
-                    te,
-                    r,
-                    m,
-                    &mut rev_then,
-                    indent + 2,
-                    strings
-                ),
-                emit_boogie_proc_stmts_and_ret(
-                    es,
-                    ee,
-                    r,
-                    m,
-                    &mut rev_else,
-                    indent + 2,
-                    strings
-                ),
+                emit_boogie_proc_stmts_and_ret(ts, te, r, m, &mut rev_then, indent + 2, strings),
+                emit_boogie_proc_stmts_and_ret(es, ee, r, m, &mut rev_else, indent + 2, strings),
             ));
         }
         Expr::Match(scrut, cases) => {
@@ -4863,11 +5156,14 @@ fn emit_boogie_proc_stmts_and_ret(
                 s.push_str(&format!("{pad}{kw} (is_{}({scrut_bpl})) {{\n", c.ctor()));
                 if let ReprKind::Sum(variants) = &m.repr {
                     if let Some(vdecl) = variants.iter().find(|v| v.name == c.ctor()) {
-                        for (opt_b, (fname, fty)) in c.top_bindings().iter().zip(vdecl.fields.iter()) {
+                        for (opt_b, (fname, fty)) in
+                            c.top_bindings().iter().zip(vdecl.fields.iter())
+                        {
                             if let Some(bname) = opt_b {
                                 s.push_str(&format!(
                                     "{pad}  {bname} := {}_{}({scrut_bpl});\n",
-                                    c.ctor(), fname
+                                    c.ctor(),
+                                    fname
                                 ));
                                 if !m.invariants.is_empty()
                                     && (fty == &m.name
@@ -5000,19 +5296,19 @@ fn emit_boogie_expr_obligations(
                 strings,
             );
             match op.as_str() {
-                "+" => {
+                "+" if r.ret_type != "MATH_INT" => {
                     s.push_str(&format!(
                         "{pad}assert {{:msg \"{}::overflow::overflow_add\"}} in_u64({l_bpl} + {r_bpl});\n",
                         r.name
                     ));
                 }
-                "-" => {
+                "-" if r.ret_type != "MATH_INT" => {
                     s.push_str(&format!(
                         "{pad}assert {{:msg \"{}::overflow::overflow_sub\"}} 0 <= ({l_bpl} - {r_bpl});\n",
                         r.name
                     ));
                 }
-                "*" => {
+                "*" if r.ret_type != "MATH_INT" => {
                     s.push_str(&format!(
                         "{pad}assert {{:msg \"{}::overflow::overflow_mul\"}} in_u64({l_bpl} * {r_bpl});\n",
                         r.name
@@ -5128,13 +5424,21 @@ fn emit_boogie_variant_obligations(
     let mut next_vals = Vec::new();
 
     for v_e in &r.variant {
-        let curr_v = emit_boogie_expr_with_strings(v_e, m, &empty_fields, revealed, "DefaultFuel", strings);
+        let curr_v =
+            emit_boogie_expr_with_strings(v_e, m, &empty_fields, revealed, "DefaultFuel", strings);
         s.push_str(&format!(
             "{pad}assert {{:msg \"{}::variant::variant_non_negative\"}} 0 <= {curr_v};\n",
             r.name
         ));
         let next_var_e = subst_expr_vars(v_e, substs);
-        let next_v = emit_boogie_expr_with_strings(&next_var_e, m, &empty_fields, revealed, "DefaultFuel", strings);
+        let next_v = emit_boogie_expr_with_strings(
+            &next_var_e,
+            m,
+            &empty_fields,
+            revealed,
+            "DefaultFuel",
+            strings,
+        );
         curr_vals.push(curr_v);
         next_vals.push(next_v);
     }
@@ -5194,7 +5498,12 @@ pub fn subst_expr_vars(e: &Expr, substs: &[(String, Expr)]) -> Expr {
         return e.clone();
     }
     match e {
-        Expr::Int(_) | Expr::Float(_) | Expr::Char(_) | Expr::Unit | Expr::Bool(_) | Expr::Str(_) => e.clone(),
+        Expr::Int(_)
+        | Expr::Float(_)
+        | Expr::Char(_)
+        | Expr::Unit
+        | Expr::Bool(_)
+        | Expr::Str(_) => e.clone(),
         Expr::Var(v) => {
             if let Some((_, repl)) = substs.iter().find(|(target, _)| target == v) {
                 repl.clone()
@@ -5260,12 +5569,15 @@ pub fn subst_expr_vars(e: &Expr, substs: &[(String, Expr)]) -> Expr {
                 .map(|(k, v)| (k.clone(), subst_expr_vars(v, substs)))
                 .collect(),
         ),
-        Expr::TupleLit(elems) => Expr::TupleLit(
-            elems.iter().map(|el| subst_expr_vars(el, substs)).collect(),
-        ),
+        Expr::TupleLit(elems) => {
+            Expr::TupleLit(elems.iter().map(|el| subst_expr_vars(el, substs)).collect())
+        }
         Expr::Forall(v, ty, body) => {
-            let active_substs: Vec<(String, Expr)> =
-                substs.iter().filter(|(target, _)| target != v).cloned().collect();
+            let active_substs: Vec<(String, Expr)> = substs
+                .iter()
+                .filter(|(target, _)| target != v)
+                .cloned()
+                .collect();
             Expr::Forall(
                 v.clone(),
                 ty.clone(),
@@ -5273,8 +5585,11 @@ pub fn subst_expr_vars(e: &Expr, substs: &[(String, Expr)]) -> Expr {
             )
         }
         Expr::Exists(v, ty, body) => {
-            let active_substs: Vec<(String, Expr)> =
-                substs.iter().filter(|(target, _)| target != v).cloned().collect();
+            let active_substs: Vec<(String, Expr)> = substs
+                .iter()
+                .filter(|(target, _)| target != v)
+                .cloned()
+                .collect();
             Expr::Exists(
                 v.clone(),
                 ty.clone(),
@@ -5312,11 +5627,7 @@ pub fn subst_expr_vars(e: &Expr, substs: &[(String, Expr)]) -> Expr {
     }
 }
 
-fn subst_block(
-    stmts: &[Stmt],
-    body: &Expr,
-    substs: &[(String, Expr)],
-) -> (Vec<Stmt>, Expr) {
+fn subst_block(stmts: &[Stmt], body: &Expr, substs: &[(String, Expr)]) -> (Vec<Stmt>, Expr) {
     let mut new_stmts = Vec::new();
     let mut cur_substs = substs.to_vec();
     for s in stmts {
@@ -5393,21 +5704,49 @@ fn emit_boogie_expr_with_strings(
         Expr::UnaryNot(inner) => {
             format!(
                 "(!{})",
-                emit_boogie_expr_with_strings(inner, m, implicit_fields, revealed, fuel_var, strings)
+                emit_boogie_expr_with_strings(
+                    inner,
+                    m,
+                    implicit_fields,
+                    revealed,
+                    fuel_var,
+                    strings
+                )
             )
         }
         Expr::UnaryNeg(inner) => {
             format!(
                 "(-{})",
-                emit_boogie_expr_with_strings(inner, m, implicit_fields, revealed, fuel_var, strings)
+                emit_boogie_expr_with_strings(
+                    inner,
+                    m,
+                    implicit_fields,
+                    revealed,
+                    fuel_var,
+                    strings
+                )
             )
         }
         Expr::BinOp(op, l, r) => {
             if op == "+" && (matches!(&**l, Expr::Str(_)) || matches!(&**r, Expr::Str(_))) {
                 return format!(
                     "Str_concat({}, {})",
-                    emit_boogie_expr_with_strings(l, m, implicit_fields, revealed, fuel_var, strings),
-                    emit_boogie_expr_with_strings(r, m, implicit_fields, revealed, fuel_var, strings)
+                    emit_boogie_expr_with_strings(
+                        l,
+                        m,
+                        implicit_fields,
+                        revealed,
+                        fuel_var,
+                        strings
+                    ),
+                    emit_boogie_expr_with_strings(
+                        r,
+                        m,
+                        implicit_fields,
+                        revealed,
+                        fuel_var,
+                        strings
+                    )
                 );
             }
             let b_fn = match op.as_str() {
@@ -5424,8 +5763,22 @@ fn emit_boogie_expr_with_strings(
             if let Some(fn_name) = b_fn {
                 return format!(
                     "{fn_name}({}, {})",
-                    emit_boogie_expr_with_strings(l, m, implicit_fields, revealed, fuel_var, strings),
-                    emit_boogie_expr_with_strings(r, m, implicit_fields, revealed, fuel_var, strings)
+                    emit_boogie_expr_with_strings(
+                        l,
+                        m,
+                        implicit_fields,
+                        revealed,
+                        fuel_var,
+                        strings
+                    ),
+                    emit_boogie_expr_with_strings(
+                        r,
+                        m,
+                        implicit_fields,
+                        revealed,
+                        fuel_var,
+                        strings
+                    )
                 );
             }
             let b_op = match op.as_str() {
@@ -5448,7 +5801,16 @@ fn emit_boogie_expr_with_strings(
                 matches!(&m.repr, ReprKind::Sum(vs) if vs.iter().any(|v| v.name == *fname));
             let a_str: Vec<String> = args
                 .iter()
-                .map(|a| emit_boogie_expr_with_strings(a, m, implicit_fields, revealed, fuel_var, strings))
+                .map(|a| {
+                    emit_boogie_expr_with_strings(
+                        a,
+                        m,
+                        implicit_fields,
+                        revealed,
+                        fuel_var,
+                        strings,
+                    )
+                })
                 .collect();
             if is_ctor {
                 format!("{fname}({})", a_str.join(", "))
@@ -5524,22 +5886,50 @@ fn emit_boogie_expr_with_strings(
                     return format!("fn_{mname}({})", full_args.join(", "));
                 }
             }
-            let r_str = emit_boogie_expr_with_strings(recv, m, implicit_fields, revealed, fuel_var, strings);
+            let r_str = emit_boogie_expr_with_strings(
+                recv,
+                m,
+                implicit_fields,
+                revealed,
+                fuel_var,
+                strings,
+            );
             match mname.as_str() {
                 "append" => format!(
                     "Seq_append({r_str}, {})",
-                    emit_boogie_expr_with_strings(&args[0], m, implicit_fields, revealed, fuel_var, strings)
+                    emit_boogie_expr_with_strings(
+                        &args[0],
+                        m,
+                        implicit_fields,
+                        revealed,
+                        fuel_var,
+                        strings
+                    )
                 ),
                 "prepend" => format!(
                     "Seq_prepend({}, {r_str})",
-                    emit_boogie_expr_with_strings(&args[0], m, implicit_fields, revealed, fuel_var, strings)
+                    emit_boogie_expr_with_strings(
+                        &args[0],
+                        m,
+                        implicit_fields,
+                        revealed,
+                        fuel_var,
+                        strings
+                    )
                 ),
                 "head" => format!("Seq_head({r_str})"),
                 "tail" => format!("Seq_tail({r_str})"),
                 "length" if m.name != "SEQ" => format!("Seq_length({r_str})"),
                 "has" => format!(
                     "Seq_has({r_str}, {})",
-                    emit_boogie_expr_with_strings(&args[0], m, implicit_fields, revealed, fuel_var, strings)
+                    emit_boogie_expr_with_strings(
+                        &args[0],
+                        m,
+                        implicit_fields,
+                        revealed,
+                        fuel_var,
+                        strings
+                    )
                 ),
                 "first" => format!("Tuple2_first({r_str})"),
                 "second" => format!("Tuple2_second({r_str})"),
@@ -5578,8 +5968,14 @@ fn emit_boogie_expr_with_strings(
             )
         }
         Expr::Match(scrut, cases) => {
-            let s_str =
-                emit_boogie_expr_with_strings(scrut, m, implicit_fields, revealed, fuel_var, strings);
+            let s_str = emit_boogie_expr_with_strings(
+                scrut,
+                m,
+                implicit_fields,
+                revealed,
+                fuel_var,
+                strings,
+            );
             if cases.is_empty() {
                 return s_str;
             }
@@ -5636,8 +6032,14 @@ fn emit_boogie_expr_with_strings(
             }
         }
         Expr::RecordUpdate(base, updates) => {
-            let b_str =
-                emit_boogie_expr_with_strings(base, m, implicit_fields, revealed, fuel_var, strings);
+            let b_str = emit_boogie_expr_with_strings(
+                base,
+                m,
+                implicit_fields,
+                revealed,
+                fuel_var,
+                strings,
+            );
             if let ReprKind::Product(fields) = &m.repr {
                 let args: Vec<String> = fields
                     .iter()
@@ -5665,7 +6067,14 @@ fn emit_boogie_expr_with_strings(
             let es: Vec<String> = elems
                 .iter()
                 .map(|el| {
-                    emit_boogie_expr_with_strings(el, m, implicit_fields, revealed, fuel_var, strings)
+                    emit_boogie_expr_with_strings(
+                        el,
+                        m,
+                        implicit_fields,
+                        revealed,
+                        fuel_var,
+                        strings,
+                    )
                 })
                 .collect();
             if es.len() == 2 {
@@ -5678,14 +6087,28 @@ fn emit_boogie_expr_with_strings(
             format!(
                 "(forall {v}: {} :: {})",
                 map_boogie_type(ty, m),
-                emit_boogie_expr_with_strings(body, m, implicit_fields, revealed, fuel_var, strings)
+                emit_boogie_expr_with_strings(
+                    body,
+                    m,
+                    implicit_fields,
+                    revealed,
+                    fuel_var,
+                    strings
+                )
             )
         }
         Expr::Exists(v, ty, body) => {
             format!(
                 "(exists {v}: {} :: {})",
                 map_boogie_type(ty, m),
-                emit_boogie_expr_with_strings(body, m, implicit_fields, revealed, fuel_var, strings)
+                emit_boogie_expr_with_strings(
+                    body,
+                    m,
+                    implicit_fields,
+                    revealed,
+                    fuel_var,
+                    strings
+                )
             )
         }
         Expr::WithIo(_, final_e) => {
@@ -5872,7 +6295,9 @@ pub fn translate_z3_model_to_gardel(raw_model: &str, m: &ModuleDecl) -> BTreeMap
             };
             if !out.contains_key(clean_var)
                 || (!gardel_val.starts_with("T@")
-                    && out.get(clean_var).is_some_and(|v: &String| v.starts_with("T@")))
+                    && out
+                        .get(clean_var)
+                        .is_some_and(|v: &String| v.starts_with("T@")))
             {
                 out.insert(clean_var.to_string(), gardel_val);
             }
@@ -5939,7 +6364,11 @@ fn run_boogie_verification(
 ) -> Result<Vec<Diagnostic>, String> {
     let bpl_code = emit_boogie(m, fuel_limit);
     let mut temp_path = env::temp_dir();
-    temp_path.push(format!("gardel_verify_{}_{}.bpl", m.name, std::process::id()));
+    temp_path.push(format!(
+        "gardel_verify_{}_{}.bpl",
+        m.name,
+        std::process::id()
+    ));
     fs::write(&temp_path, &bpl_code)
         .map_err(|e| format!("Failed to write temporary Boogie file: {e}"))?;
 
@@ -5949,7 +6378,9 @@ fn run_boogie_verification(
     cmd.arg("/errorTrace:0");
     cmd.arg(&temp_path);
 
-    let output = cmd.output().map_err(|e| format!("Failed to spawn Boogie process: {e}"))?;
+    let output = cmd
+        .output()
+        .map_err(|e| format!("Failed to spawn Boogie process: {e}"))?;
     let _ = fs::remove_file(&temp_path);
 
     let stdout = String::from_utf8_lossy(&output.stdout).to_string();
@@ -6077,14 +6508,8 @@ pub fn parse_boogie_output(
                     _ => "Phase 3 Boogie (Verification Condition Failed)",
                 };
                 diags.push(
-                    Diagnostic::basic(
-                        "error",
-                        static_rule,
-                        routine,
-                        tag,
-                        line.to_string(),
-                    )
-                    .with_ai_context(sp, pcs, BTreeMap::new(), lemmas),
+                    Diagnostic::basic("error", static_rule, routine, tag, line.to_string())
+                        .with_ai_context(sp, pcs, BTreeMap::new(), lemmas),
                 );
             }
         }
@@ -6107,11 +6532,23 @@ fn parse_msg_tag(msg: &str) -> (String, String, String) {
     };
     let parts: Vec<&str> = clean.split("::").collect();
     if parts.len() == 3 {
-        (parts[0].to_string(), parts[1].to_string(), parts[2].to_string())
+        (
+            parts[0].to_string(),
+            parts[1].to_string(),
+            parts[2].to_string(),
+        )
     } else if parts.len() == 2 {
-        (parts[0].to_string(), "contract_violation".to_string(), parts[1].to_string())
+        (
+            parts[0].to_string(),
+            "contract_violation".to_string(),
+            parts[1].to_string(),
+        )
     } else {
-        ("Unknown".to_string(), "verification_failure".to_string(), clean.to_string())
+        (
+            "Unknown".to_string(),
+            "verification_failure".to_string(),
+            clean.to_string(),
+        )
     }
 }
 
@@ -6971,7 +7408,13 @@ fn find_violated_invariant(
 
 fn expr_calls_routine(e: &Expr, rname: &str) -> bool {
     match e {
-        Expr::Int(_) | Expr::Float(_) | Expr::Char(_) | Expr::Unit | Expr::Bool(_) | Expr::Str(_) | Expr::Var(_) => false,
+        Expr::Int(_)
+        | Expr::Float(_)
+        | Expr::Char(_)
+        | Expr::Unit
+        | Expr::Bool(_)
+        | Expr::Str(_)
+        | Expr::Var(_) => false,
         Expr::UnaryNot(inner) | Expr::UnaryNeg(inner) => expr_calls_routine(inner, rname),
         Expr::BinOp(_, l, r) => expr_calls_routine(l, rname) || expr_calls_routine(r, rname),
         Expr::Call(f, args) => f == rname || args.iter().any(|a| expr_calls_routine(a, rname)),
@@ -7270,8 +7713,8 @@ fn eval_expr_symbolic(
                 (">", GardelVal::Int(a), GardelVal::Int(b)) => Ok(GardelVal::Bool(a > b)),
                 (">=", GardelVal::Int(a), GardelVal::Int(b)) => Ok(GardelVal::Bool(a >= b)),
                 ("+", GardelVal::Int(a), GardelVal::Int(b)) => {
-                    let sum = a + b;
-                    if sum > u64::MAX as i128 {
+                    let sum = a.saturating_add(b);
+                    if a <= u64::MAX as i128 && b <= u64::MAX as i128 && sum > u64::MAX as i128 {
                         Err(EvalFault::Overflow("overflow_add", e.clone()))
                     } else {
                         Ok(GardelVal::Int(sum))
@@ -7286,8 +7729,8 @@ fn eval_expr_symbolic(
                     }
                 }
                 ("*", GardelVal::Int(a), GardelVal::Int(b)) => {
-                    let prod = a * b;
-                    if prod > u64::MAX as i128 {
+                    let prod = a.saturating_mul(b);
+                    if a <= u64::MAX as i128 && b <= u64::MAX as i128 && prod > u64::MAX as i128 {
                         Err(EvalFault::Overflow("overflow_mul", e.clone()))
                     } else {
                         Ok(GardelVal::Int(prod))
@@ -7320,7 +7763,14 @@ fn eval_expr_symbolic(
                     return Ok(GardelVal::Variant(fname.clone(), eval_args));
                 }
             }
-            invoke_routine_symbolic(fname, None, &eval_args, m, revealed, fuel)
+            invoke_routine_symbolic(
+                fname,
+                env.get("Current").cloned(),
+                &eval_args,
+                m,
+                revealed,
+                fuel,
+            )
         }
         Expr::MethodCall(recv, mname, args) => {
             if let Expr::Var(v) = &**recv {
@@ -8251,7 +8701,7 @@ pub fn emit_bend_v2(m: &ModuleDecl) -> String {
 fn emit_bend_block(stmts: &[Stmt], body: &Expr, mod_name: &str, indent: usize) -> String {
     let pad = " ".repeat(indent);
     let mut s = String::new();
-    
+
     // Analyze independent recursive let groups for Bend v2 parallel bindings (§10.2)
     let groups = analyze_parallel_lets(stmts);
     for group in groups {
@@ -8449,7 +8899,9 @@ pub fn is_tail_recursive_routine(r: &RoutineDecl) -> bool {
         match e {
             Expr::Call(f, _) => f == target,
             Expr::MethodCall(_, m, _) => m == target,
-            Expr::If(_, _, te, _, ee) => expr_is_tail_call(te, target) || expr_is_tail_call(ee, target),
+            Expr::If(_, _, te, _, ee) => {
+                expr_is_tail_call(te, target) || expr_is_tail_call(ee, target)
+            }
             Expr::Match(_, cases) => cases.iter().any(|c| expr_is_tail_call(&c.body, target)),
             _ => false,
         }
@@ -8949,10 +9401,16 @@ pub fn map_c_type(ty: &str) -> String {
         "UNIT" | "()" => "GARDEL_UNIT".to_string(),
         "STRING" => "GardelString".to_string(),
         other => {
-            if let Some(inner) = other.strip_prefix("OPTION[").and_then(|s| s.strip_suffix(']')) {
+            if let Some(inner) = other
+                .strip_prefix("OPTION[")
+                .and_then(|s| s.strip_suffix(']'))
+            {
                 return format!("{}_ptr", map_c_type(inner));
             }
-            if let Some(inner) = other.strip_prefix("LIST[").and_then(|s| s.strip_suffix(']')) {
+            if let Some(inner) = other
+                .strip_prefix("LIST[")
+                .and_then(|s| s.strip_suffix(']'))
+            {
                 return format!("struct LIST_{}*", map_c_type(inner));
             }
             if let Some(inner) = other.strip_prefix("SEQ[").and_then(|s| s.strip_suffix(']')) {
@@ -9020,7 +9478,8 @@ static inline const char* gardel_io_read_line(char* buf, size_t cap) {
     }
     return "";
 }
-"#.to_string()
+"#
+    .to_string()
 }
 
 pub fn emit_c11_general_module(m: &ModuleDecl) -> String {
@@ -9155,8 +9614,15 @@ fn emit_c11_routine(r: &RoutineDecl, has_current: bool, mod_name: &str) -> Strin
     for (pname, pty) in &r.params {
         param_strs.push(format!("{} {pname}", map_c_type(pty)));
     }
-    let rname = if r.name == "main" { "main_routine" } else { &r.name };
-    s.push_str(&format!("{ret_type} {rname}({}) {{\n", param_strs.join(", ")));
+    let rname = if r.name == "main" {
+        "main_routine"
+    } else {
+        &r.name
+    };
+    s.push_str(&format!(
+        "{ret_type} {rname}({}) {{\n",
+        param_strs.join(", ")
+    ));
 
     // Check tail recursion
     let is_tail = is_tail_recursive_routine(r);
@@ -9164,7 +9630,9 @@ fn emit_c11_routine(r: &RoutineDecl, has_current: bool, mod_name: &str) -> Strin
         s.push_str("tail_loop:\n");
     }
 
-    s.push_str(&emit_c11_block(&r.stmts, &r.body, mod_name, is_tail, rname, 4));
+    s.push_str(&emit_c11_block(
+        &r.stmts, &r.body, mod_name, is_tail, rname, 4,
+    ));
     s.push_str("}\n\n");
     s
 }
@@ -9222,10 +9690,7 @@ fn emit_c11_block(
             ));
         }
         _ => {
-            s.push_str(&format!(
-                "{pad}return {};\n",
-                emit_c11_expr(body, mod_name)
-            ));
+            s.push_str(&format!("{pad}return {};\n", emit_c11_expr(body, mod_name)));
         }
     }
     s
@@ -9302,9 +9767,7 @@ fn emit_c11_expr(e: &Expr, mod_name: &str) -> String {
                     if idx + 1 == cases.len() {
                         cond_expr.push_str(&val);
                     } else {
-                        cond_expr.push_str(&format!(
-                            "({s_str}->tag == {tag_name} ? ({val}) : "
-                        ));
+                        cond_expr.push_str(&format!("({s_str}->tag == {tag_name} ? ({val}) : "));
                     }
                 }
                 for _ in 0..cases.len() - 1 {
@@ -9315,7 +9778,10 @@ fn emit_c11_expr(e: &Expr, mod_name: &str) -> String {
             s
         }
         Expr::RecordLit(fields) => {
-            let vals: Vec<String> = fields.iter().map(|(_, fe)| emit_c11_expr(fe, mod_name)).collect();
+            let vals: Vec<String> = fields
+                .iter()
+                .map(|(_, fe)| emit_c11_expr(fe, mod_name))
+                .collect();
             format!("make_{mod_name}({})", vals.join(", "))
         }
         Expr::RecordUpdate(base, _fields) => {
@@ -9326,15 +9792,9 @@ fn emit_c11_expr(e: &Expr, mod_name: &str) -> String {
             let es: Vec<String> = elems.iter().map(|el| emit_c11_expr(el, mod_name)).collect();
             format!("({})", es.join(", "))
         }
-        Expr::WithIo(_io_stmts, final_e) => {
-            emit_c11_expr(final_e, mod_name)
-        }
-        Expr::Lambda(_, _, _, _) => {
-            "/* lifted closure */ 0".to_string()
-        }
-        Expr::Forall(_, _, _) | Expr::Exists(_, _, _) => {
-            "0".to_string()
-        }
+        Expr::WithIo(_io_stmts, final_e) => emit_c11_expr(final_e, mod_name),
+        Expr::Lambda(_, _, _, _) => "/* lifted closure */ 0".to_string(),
+        Expr::Forall(_, _, _) | Expr::Exists(_, _, _) => "0".to_string(),
     }
 }
 
@@ -10026,7 +10486,8 @@ feature {ANY}
 end
 "#;
         let m_unrev = parse_single_module(src_unrevealed);
-        let diags_zero = verify_module_phase3(&m_unrev, src_unrevealed, "box.gdl", 0, false, false, false);
+        let diags_zero =
+            verify_module_phase3(&m_unrev, src_unrevealed, "box.gdl", 0, false, false, false);
         assert_eq!(diags_zero.len(), 1);
         assert_eq!(diags_zero[0].tag, "matches_ghost");
         assert!(
@@ -10055,7 +10516,8 @@ feature {ANY}
 end
 "#;
         let m_rev = parse_single_module(src_revealed);
-        let diags_rev = verify_module_phase3(&m_rev, src_revealed, "box.gdl", 0, false, false, false);
+        let diags_rev =
+            verify_module_phase3(&m_rev, src_revealed, "box.gdl", 0, false, false, false);
         assert!(diags_rev.is_empty());
     }
 
@@ -10649,10 +11111,30 @@ end
     #[test]
     fn test_plan4_stdlib_bignat_math_int_and_string_utf8_models() {
         let stdlib = parse_phase4_stdlib().expect("Phase 4 stdlib parses");
+        let seq_mod = stdlib.modules.iter().find(|m| m.name == "SEQ").unwrap();
+        assert!(
+            seq_mod
+                .feature_routines
+                .iter()
+                .any(|(_, r)| r.name == "concat"
+                    && r.ensures.iter().any(|(tag, _)| tag == "model_concat"))
+        );
         let bignat = stdlib.modules.iter().find(|m| m.name == "BIGNAT").unwrap();
         assert_eq!(bignat.invariants.len(), 2);
+        assert!(
+            bignat
+                .specify_routines
+                .iter()
+                .any(|(_, r)| r.name == "value_of" && r.ret_type == "MATH_INT")
+        );
         let str_mod = stdlib.modules.iter().find(|m| m.name == "STRING").unwrap();
-        assert_eq!(str_mod.invariants.len(), 3);
+        assert_eq!(str_mod.invariants.len(), 4);
+        assert!(
+            str_mod
+                .specify_routines
+                .iter()
+                .any(|(_, r)| r.name == "chars" && r.ret_type == "LIST[CHAR]")
+        );
     }
 
     #[test]
@@ -10664,4 +11146,3 @@ end
         }
     }
 }
-

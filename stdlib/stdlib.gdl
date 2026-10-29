@@ -54,6 +54,7 @@ create {ANY}
       Empty
     ensure
       empty_len: Result.length = 0
+      empty_model: Result.model = LIST.empty
     end
 
   singleton(x: A): SEQ[A]
@@ -61,6 +62,7 @@ create {ANY}
       Leaf(x)
     ensure
       unit_len: Result.length = 1
+      unit_model: Result.model = LIST.empty.prepend(x)
     end
 
 feature {ANY}
@@ -76,6 +78,13 @@ feature {ANY}
       end
     end
 
+  is_empty: BOOL
+    do
+      Current.length = 0
+    ensure
+      def: Result = (Current.length = 0)
+    end
+
   concat(other: SEQ[A]): SEQ[A]
     require
       fits: Current.length <= 18446744073709551615 - other.length
@@ -83,6 +92,7 @@ feature {ANY}
       Concat(Current, other, Current.length + other.length)
     ensure
       len_sum: Result.length = Current.length + other.length
+      model_concat: Result.model = Current.model.append(other.model)
     end
 
 end
@@ -95,9 +105,21 @@ representation {NONE}
 
 specify {ANY}
 
+  value_of(ls: LIST[U64]): MATH_INT
+    variant
+      ls.length
+    do
+      if ls.length = 0 then
+        0
+      else
+        ls.head + 18446744073709551616 * value_of(ls.tail)
+      end
+    end
+
   model: MATH_INT
     do
-      Current.size
+      reveal value_of
+      value_of(Current.limbs)
     end
 
 create {ANY}
@@ -106,6 +128,7 @@ create {ANY}
     do
       { limbs = LIST.empty, size = 0 }
     ensure
+      value_is_zero: Result.model = 0
       zero_limbs: Result.limb_count = 0
     end
 
@@ -117,6 +140,7 @@ create {ANY}
         { limbs = LIST.empty.prepend(x), size = 1 }
       end
     ensure
+      val: Result.model = x
       count_bounded: Result.limb_count <= 1
     end
 
@@ -135,6 +159,7 @@ feature {ANY}
         size = Current.size + 1 }
     ensure
       limb_added: Result.limb_count = Current.limb_count + 1
+      model_updated: Result.model = limb + 18446744073709551616 * Current.model
     end
 
 invariant
@@ -146,15 +171,31 @@ end
 module STRING
 
 representation {NONE}
-  items: LIST[U64]
+  bytes: LIST[U64]
   size: NAT
   limit: NAT
 
 specify {ANY}
 
-  chars: LIST[U64]
+  all_bytes_valid(bs: LIST[U64]): BOOL
+    variant
+      bs.length
     do
-      Current.items
+      if bs.length = 0 then
+        True
+      else
+        bs.head < 256 and all_bytes_valid(bs.tail)
+      end
+    end
+
+  byte_model: LIST[U64]
+    do
+      Current.bytes
+    end
+
+  chars: LIST[CHAR]
+    do
+      Current.bytes
     end
 
 create {ANY}
@@ -163,9 +204,10 @@ create {ANY}
     require
       positive_cap: cap > 0
     do
-      { items = LIST.empty, size = 0, limit = cap }
+      { bytes = LIST.empty, size = 0, limit = cap }
     ensure
       empty_bytes: Result.byte_length = 0
+      empty_str: Result.is_empty
     end
 
 feature {ANY}
@@ -187,22 +229,36 @@ feature {ANY}
       def: Result = (Current.byte_length = 0)
     end
 
+  push_byte(b: U64): STRING
+    require
+      is_byte: b < 256
+      has_room: Current.byte_length < Current.capacity
+    do
+      { bytes = Current.bytes.prepend(b),
+        size = Current.size + 1,
+        limit = Current.limit }
+    ensure
+      grew: Result.byte_length = Current.byte_length + 1
+      non_empty: not Result.is_empty
+    end
+
   push_utf8_word(w: U64): STRING
     require
       valid_word: w < 256
       has_room: Current.byte_length < Current.capacity
     do
-      { items = Current.items.prepend(w),
+      { bytes = Current.bytes.prepend(w),
         size = Current.size + 1,
         limit = Current.limit }
     ensure
       grew: Result.byte_length = Current.byte_length + 1
+      non_empty: not Result.is_empty
     end
 
 invariant
   positive_capacity: limit > 0
-  size_matches: size = items.length
+  size_matches: size = bytes.length
   within_bounds: size <= limit
+  valid_bytes: all_bytes_valid(bytes)
 
 end
-

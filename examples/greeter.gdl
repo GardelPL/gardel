@@ -32,7 +32,7 @@ module SEQ[A]
 representation {ANY}
   | Empty
   | Leaf(value: A)
-  | Concat(left: SEQ[A], right: SEQ[A])
+  | Concat(left: SEQ[A], right: SEQ[A], len: NAT)
 
 specify {ANY}
 
@@ -41,9 +41,9 @@ specify {ANY}
       Current
     do
       match Current
-        case Empty        then LIST.empty
-        case Leaf(v)      then LIST.empty.prepend(v)
-        case Concat(l, r) then l.model.append(r.model)
+        case Empty           then LIST.empty
+        case Leaf(v)         then LIST.empty.prepend(v)
+        case Concat(l, r, _) then l.model.append(r.model)
       end
     end
 
@@ -54,6 +54,7 @@ create {ANY}
       Empty
     ensure
       empty_len: Result.length = 0
+      empty_model: Result.model = LIST.empty
     end
 
   singleton(x: A): SEQ[A]
@@ -61,6 +62,7 @@ create {ANY}
       Leaf(x)
     ensure
       unit_len: Result.length = 1
+      unit_model: Result.model = LIST.empty.prepend(x)
     end
 
 feature {ANY}
@@ -69,24 +71,28 @@ feature {ANY}
     variant
       Current
     do
-      reveal model
       match Current
-        case Empty        then 0
-        case Leaf(_)      then 1
-        case Concat(l, r) then
-          let ll = l.length
-          let rl = r.length
-          if ll <= 9223372036854775807 and rl <= 9223372036854775807 then
-            ll + rl
-          else
-            ll
-          end
+        case Empty            then 0
+        case Leaf(_)          then 1
+        case Concat(_, _, ln) then ln
       end
     end
 
-  concat(other: SEQ[A]): SEQ[A]
+  is_empty: BOOL
     do
-      Concat(Current, other)
+      Current.length = 0
+    ensure
+      def: Result = (Current.length = 0)
+    end
+
+  concat(other: SEQ[A]): SEQ[A]
+    require
+      fits: Current.length <= 18446744073709551615 - other.length
+    do
+      Concat(Current, other, Current.length + other.length)
+    ensure
+      len_sum: Result.length = Current.length + other.length
+      model_concat: Result.model = Current.model.append(other.model)
     end
 
 end
@@ -99,9 +105,21 @@ representation {NONE}
 
 specify {ANY}
 
-  model: NAT
+  value_of(ls: LIST[U64]): MATH_INT
+    variant
+      ls.length
     do
-      Current.size
+      if ls.length = 0 then
+        0
+      else
+        ls.head + 18446744073709551616 * value_of(ls.tail)
+      end
+    end
+
+  model: MATH_INT
+    do
+      reveal value_of
+      value_of(Current.limbs)
     end
 
 create {ANY}
@@ -110,16 +128,20 @@ create {ANY}
     do
       { limbs = LIST.empty, size = 0 }
     ensure
+      value_is_zero: Result.model = 0
       zero_limbs: Result.limb_count = 0
     end
 
   from_u64(x: U64): BIGNAT
-    require
-      non_zero: x > 0
     do
-      { limbs = LIST.empty.prepend(x), size = 1 }
+      if x = 0 then
+        { limbs = LIST.empty, size = 0 }
+      else
+        { limbs = LIST.empty.prepend(x), size = 1 }
+      end
     ensure
-      single_limb: Result.limb_count = 1
+      val: Result.model = x
+      count_bounded: Result.limb_count <= 1
     end
 
 feature {ANY}
@@ -137,6 +159,7 @@ feature {ANY}
         size = Current.size + 1 }
     ensure
       limb_added: Result.limb_count = Current.limb_count + 1
+      model_updated: Result.model = limb + 18446744073709551616 * Current.model
     end
 
 invariant
@@ -148,15 +171,31 @@ end
 module STRING
 
 representation {NONE}
-  items: LIST[U64]
+  bytes: LIST[U64]
   size: NAT
   limit: NAT
 
 specify {ANY}
 
-  chars: LIST[U64]
+  all_bytes_valid(bs: LIST[U64]): BOOL
+    variant
+      bs.length
     do
-      Current.items
+      if bs.length = 0 then
+        True
+      else
+        bs.head < 256 and all_bytes_valid(bs.tail)
+      end
+    end
+
+  byte_model: LIST[U64]
+    do
+      Current.bytes
+    end
+
+  chars: LIST[CHAR]
+    do
+      Current.bytes
     end
 
 create {ANY}
@@ -165,9 +204,10 @@ create {ANY}
     require
       positive_cap: cap > 0
     do
-      { items = LIST.empty, size = 0, limit = cap }
+      { bytes = LIST.empty, size = 0, limit = cap }
     ensure
       empty_bytes: Result.byte_length = 0
+      empty_str: Result.is_empty
     end
 
 feature {ANY}
@@ -182,21 +222,44 @@ feature {ANY}
       Current.limit
     end
 
-  push_utf8_word(w: U64): STRING
+  is_empty: BOOL
+    do
+      Current.size = 0
+    ensure
+      def: Result = (Current.byte_length = 0)
+    end
+
+  push_byte(b: U64): STRING
     require
+      is_byte: b < 256
       has_room: Current.byte_length < Current.capacity
     do
-      { items = Current.items.prepend(w),
+      { bytes = Current.bytes.prepend(b),
         size = Current.size + 1,
         limit = Current.limit }
     ensure
       grew: Result.byte_length = Current.byte_length + 1
+      non_empty: not Result.is_empty
+    end
+
+  push_utf8_word(w: U64): STRING
+    require
+      valid_word: w < 256
+      has_room: Current.byte_length < Current.capacity
+    do
+      { bytes = Current.bytes.prepend(w),
+        size = Current.size + 1,
+        limit = Current.limit }
+    ensure
+      grew: Result.byte_length = Current.byte_length + 1
+      non_empty: not Result.is_empty
     end
 
 invariant
   positive_capacity: limit > 0
-  size_matches: size = items.length
+  size_matches: size = bytes.length
   within_bounds: size <= limit
+  valid_bytes: all_bytes_valid(bytes)
 
 end
 
@@ -214,4 +277,3 @@ feature {ANY}
     end
 
 end
-
