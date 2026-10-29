@@ -1,4 +1,4 @@
-group { SEQ, BIGNAT, STRING, OPTION, GREETER }
+group { SEQ, BIGNAT, STRING, OPTION }
 
 module OPTION[A]
 
@@ -32,7 +32,7 @@ module SEQ[A]
 representation {ANY}
   | Empty
   | Leaf(value: A)
-  | Concat(left: SEQ[A], right: SEQ[A])
+  | Concat(left: SEQ[A], right: SEQ[A], len: NAT)
 
 specify {ANY}
 
@@ -41,9 +41,9 @@ specify {ANY}
       Current
     do
       match Current
-        case Empty        then LIST.empty
-        case Leaf(v)      then LIST.empty.prepend(v)
-        case Concat(l, r) then l.model.append(r.model)
+        case Empty           then LIST.empty
+        case Leaf(v)         then LIST.empty.prepend(v)
+        case Concat(l, r, _) then l.model.append(r.model)
       end
     end
 
@@ -69,24 +69,20 @@ feature {ANY}
     variant
       Current
     do
-      reveal model
       match Current
-        case Empty        then 0
-        case Leaf(_)      then 1
-        case Concat(l, r) then
-          let ll = l.length
-          let rl = r.length
-          if ll <= 9223372036854775807 and rl <= 9223372036854775807 then
-            ll + rl
-          else
-            ll
-          end
+        case Empty            then 0
+        case Leaf(_)          then 1
+        case Concat(_, _, ln) then ln
       end
     end
 
   concat(other: SEQ[A]): SEQ[A]
+    require
+      fits: Current.length <= 18446744073709551615 - other.length
     do
-      Concat(Current, other)
+      Concat(Current, other, Current.length + other.length)
+    ensure
+      len_sum: Result.length = Current.length + other.length
     end
 
 end
@@ -99,7 +95,7 @@ representation {NONE}
 
 specify {ANY}
 
-  model: NAT
+  model: MATH_INT
     do
       Current.size
     end
@@ -114,12 +110,14 @@ create {ANY}
     end
 
   from_u64(x: U64): BIGNAT
-    require
-      non_zero: x > 0
     do
-      { limbs = LIST.empty.prepend(x), size = 1 }
+      if x = 0 then
+        { limbs = LIST.empty, size = 0 }
+      else
+        { limbs = LIST.empty.prepend(x), size = 1 }
+      end
     ensure
-      single_limb: Result.limb_count = 1
+      count_bounded: Result.limb_count <= 1
     end
 
 feature {ANY}
@@ -182,8 +180,16 @@ feature {ANY}
       Current.limit
     end
 
+  is_empty: BOOL
+    do
+      Current.size = 0
+    ensure
+      def: Result = (Current.byte_length = 0)
+    end
+
   push_utf8_word(w: U64): STRING
     require
+      valid_word: w < 256
       has_room: Current.byte_length < Current.capacity
     do
       { items = Current.items.prepend(w),
@@ -200,17 +206,3 @@ invariant
 
 end
 
-program GREETER
-
-feature {ANY}
-
-  main(args: LIST[STRING]): IO[EXIT_CODE]
-    do
-      with IO
-        name <- IO.read_line
-        IO.print("Hello, " + name)
-        IO.exit(0)
-      end
-    end
-
-end

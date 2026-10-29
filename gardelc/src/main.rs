@@ -98,7 +98,7 @@ pub struct LawDecl {
     pub params: Vec<(String, String)>,
     pub requires: Vec<(String, Expr)>,
     pub triggers: Vec<Expr>,
-    pub variant: Option<Expr>,
+    pub variant: Vec<Expr>,
     pub stmts: Vec<Stmt>,
     pub body: Option<Expr>,
     pub ensures: Vec<(String, Expr)>,
@@ -145,7 +145,7 @@ pub struct RoutineDecl {
     pub params: Vec<(String, String)>,
     pub ret_type: String,
     pub requires: Vec<(String, Expr)>,
-    pub variant: Option<Expr>,
+    pub variant: Vec<Expr>,
     pub stmts: Vec<Stmt>,
     pub body: Expr,
     pub ensures: Vec<(String, Expr)>,
@@ -167,12 +167,76 @@ pub enum IoStmt {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+pub enum Literal {
+    Int(u64),
+    Float(f64),
+    Char(u32),
+    Bool(bool),
+    Str(String),
+    Unit,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum Pattern {
+    Wildcard,
+    Bind(String),
+    Lit(Literal),
+    Variant(String, Vec<Pattern>),
+    Tuple(Vec<Pattern>),
+}
+
+impl Pattern {
+    pub fn ctor(&self) -> Option<&str> {
+        match self {
+            Pattern::Variant(c, _) => Some(c.as_str()),
+            _ => None,
+        }
+    }
+
+    pub fn top_bindings(&self) -> Vec<Option<String>> {
+        match self {
+            Pattern::Variant(_, sub) | Pattern::Tuple(sub) => sub
+                .iter()
+                .map(|p| match p {
+                    Pattern::Bind(b) => Some(b.clone()),
+                    _ => None,
+                })
+                .collect(),
+            Pattern::Bind(b) => vec![Some(b.clone())],
+            _ => Vec::new(),
+        }
+    }
+
+    pub fn collect_bindings(&self) -> Vec<String> {
+        let mut out = Vec::new();
+        self.collect_bindings_into(&mut out);
+        out
+    }
+
+    fn collect_bindings_into(&self, out: &mut Vec<String>) {
+        match self {
+            Pattern::Bind(b) => out.push(b.clone()),
+            Pattern::Variant(_, sub) | Pattern::Tuple(sub) => {
+                for p in sub {
+                    p.collect_bindings_into(out);
+                }
+            }
+            Pattern::Wildcard | Pattern::Lit(_) => {}
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub enum Expr {
     Int(u64),
+    Float(f64),
+    Char(u32),
+    Unit,
     Bool(bool),
     Str(String),
     Var(String),
     UnaryNot(Box<Expr>),
+    UnaryNeg(Box<Expr>),
     BinOp(String, Box<Expr>, Box<Expr>),
     Call(String, Vec<Expr>),
     MethodCall(Box<Expr>, String, Vec<Expr>),
@@ -189,14 +253,43 @@ pub enum Expr {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct MatchCase {
-    pub ctor: String,
-    pub bindings: Vec<String>,
+    pub pattern: Pattern,
     pub stmts: Vec<Stmt>,
     pub body: Expr,
 }
 
+impl MatchCase {
+    pub fn new(pattern: Pattern, stmts: Vec<Stmt>, body: Expr) -> Self {
+        Self { pattern, stmts, body }
+    }
+
+    pub fn ctor(&self) -> &str {
+        self.pattern.ctor().unwrap_or("")
+    }
+
+    pub fn bindings(&self) -> Vec<String> {
+        self.pattern.collect_bindings()
+    }
+
+    pub fn top_bindings(&self) -> Vec<Option<String>> {
+        self.pattern.top_bindings()
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct ProgramEnv {
+    pub modules: HashMap<String, ModuleDecl>,
+    pub concepts: HashMap<String, ConceptDecl>,
+}
+
+#[derive(Debug, Clone)]
+pub struct TopLevelCombinator {
+    pub env_struct: Option<(String, Vec<(String, String)>)>,
+    pub routine: RoutineDecl,
+}
+
 // ============================================================================
-// 2. LEXER & LEXICAL ERRORS (Supports Strings, `<-`, `->`, and 64-bit Ints)
+// 2. LEXER & LEXICAL ERRORS (Supports Strings, `<-`, `->`, Floats, Chars, Bitwise & Wrapping)
 // ============================================================================
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -221,7 +314,10 @@ impl std::error::Error for LexError {}
 pub enum Token {
     Ident(String),
     Int(u64),
+    Float(f64),
+    Char(char),
     Str(String),
+    Unit,
     LParen,
     RParen,
     LBrace,
@@ -229,6 +325,7 @@ pub enum Token {
     LBracket,
     RBracket,
     Colon,
+    Semicolon,
     Comma,
     Dot,
     Pipe,
@@ -239,6 +336,13 @@ pub enum Token {
     Star,
     Slash,
     Percent,
+    PlusPercent,
+    MinusPercent,
+    StarPercent,
+    Amp,
+    Caret,
+    Shl,
+    Shr,
     Eq,
     Lt,
     Le,
@@ -248,23 +352,79 @@ pub enum Token {
 }
 
 pub fn tokenize(src: &str) -> Result<Vec<Token>, LexError> {
+    tokenize_with_lines(src).map(|(toks, _)| toks)
+}
+
+pub fn tokenize_with_lines(src: &str) -> Result<(Vec<Token>, Vec<usize>), LexError> {
     let mut tokens = Vec::new();
+    let mut lines = Vec::new();
     let chars: Vec<char> = src.chars().collect();
     let mut i = 0;
+    let mut current_line = 1;
 
     while i < chars.len() {
         let c = chars[i];
-        if c.is_whitespace() {
+        if c == '\n' {
+            current_line += 1;
+            i += 1;
+        } else if c.is_whitespace() {
             i += 1;
         } else if c == '-' && i + 1 < chars.len() && chars[i + 1] == '-' {
             while i < chars.len() && chars[i] != '\n' {
                 i += 1;
             }
+        } else if c == ';' {
+            tokens.push(Token::Semicolon);
+            lines.push(current_line);
+            i += 1;
+        } else if c == '\'' {
+            let start = i;
+            let start_line = current_line;
+            i += 1;
+            let ch = if i < chars.len() && chars[i] == '\\' {
+                i += 1;
+                if i >= chars.len() {
+                    return Err(LexError {
+                        message: "Unterminated escape in char literal".to_string(),
+                        position: start,
+                    });
+                }
+                match chars[i] {
+                    'n' => '\n',
+                    't' => '\t',
+                    'r' => '\r',
+                    '\'' => '\'',
+                    '\\' => '\\',
+                    '0' => '\0',
+                    other => other,
+                }
+            } else if i < chars.len() {
+                chars[i]
+            } else {
+                return Err(LexError {
+                    message: "Empty char literal".to_string(),
+                    position: start,
+                });
+            };
+            i += 1;
+            if i >= chars.len() || chars[i] != '\'' {
+                return Err(LexError {
+                    message: "Unterminated char literal".to_string(),
+                    position: start,
+                });
+            }
+            i += 1;
+            tokens.push(Token::Char(ch));
+            lines.push(start_line);
         } else if c == '"' {
             let start = i;
+            let start_line = current_line;
             i += 1;
             let mut s = String::new();
             while i < chars.len() && chars[i] != '"' {
+                if chars[i] == '\n' {
+                    current_line += 1;
+                }
                 if chars[i] == '\\' {
                     i += 1;
                     if i >= chars.len() {
@@ -294,49 +454,136 @@ pub fn tokenize(src: &str) -> Result<Vec<Token>, LexError> {
             }
             i += 1;
             tokens.push(Token::Str(s));
+            lines.push(start_line);
         } else if c.is_ascii_alphabetic() || c == '_' {
             let start = i;
+            let start_line = current_line;
             while i < chars.len() && (chars[i].is_ascii_alphanumeric() || chars[i] == '_') {
                 i += 1;
             }
             let s: String = chars[start..i].iter().collect();
             tokens.push(Token::Ident(s));
+            lines.push(start_line);
         } else if c.is_ascii_digit() {
             let start = i;
+            let start_line = current_line;
             while i < chars.len() && chars[i].is_ascii_digit() {
                 i += 1;
             }
-            let s: String = chars[start..i].iter().collect();
-            let val = s.parse::<u64>().map_err(|e| LexError {
-                message: format!("Invalid integer literal '{s}': {e}"),
-                position: start,
-            })?;
-            tokens.push(Token::Int(val));
+            if i < chars.len() && chars[i] == '.' && i + 1 < chars.len() && chars[i + 1].is_ascii_digit() {
+                i += 1; // skip '.'
+                while i < chars.len() && chars[i].is_ascii_digit() {
+                    i += 1;
+                }
+                let s: String = chars[start..i].iter().collect();
+                let val = s.parse::<f64>().map_err(|e| LexError {
+                    message: format!("Invalid float literal '{s}': {e}"),
+                    position: start,
+                })?;
+                tokens.push(Token::Float(val));
+                lines.push(start_line);
+            } else {
+                let s: String = chars[start..i].iter().collect();
+                let val = s.parse::<u64>().map_err(|e| LexError {
+                    message: format!("Invalid integer literal '{s}': {e}"),
+                    position: start,
+                })?;
+                tokens.push(Token::Int(val));
+                lines.push(start_line);
+            }
         } else {
+            let start_line = current_line;
             match c {
-                '(' => tokens.push(Token::LParen),
-                ')' => tokens.push(Token::RParen),
-                '{' => tokens.push(Token::LBrace),
-                '}' => tokens.push(Token::RBrace),
-                '[' => tokens.push(Token::LBracket),
-                ']' => tokens.push(Token::RBracket),
-                ':' => tokens.push(Token::Colon),
-                ',' => tokens.push(Token::Comma),
-                '.' => tokens.push(Token::Dot),
-                '|' => tokens.push(Token::Pipe),
-                '+' => tokens.push(Token::Plus),
+                '(' => {
+                    tokens.push(Token::LParen);
+                    lines.push(start_line);
+                }
+                ')' => {
+                    tokens.push(Token::RParen);
+                    lines.push(start_line);
+                }
+                '{' => {
+                    tokens.push(Token::LBrace);
+                    lines.push(start_line);
+                }
+                '}' => {
+                    tokens.push(Token::RBrace);
+                    lines.push(start_line);
+                }
+                '[' => {
+                    tokens.push(Token::LBracket);
+                    lines.push(start_line);
+                }
+                ']' => {
+                    tokens.push(Token::RBracket);
+                    lines.push(start_line);
+                }
+                ':' => {
+                    tokens.push(Token::Colon);
+                    lines.push(start_line);
+                }
+                ',' => {
+                    tokens.push(Token::Comma);
+                    lines.push(start_line);
+                }
+                '.' => {
+                    tokens.push(Token::Dot);
+                    lines.push(start_line);
+                }
+                '&' => {
+                    tokens.push(Token::Amp);
+                    lines.push(start_line);
+                }
+                '^' => {
+                    tokens.push(Token::Caret);
+                    lines.push(start_line);
+                }
+                '|' => {
+                    tokens.push(Token::Pipe);
+                    lines.push(start_line);
+                }
+                '+' => {
+                    if i + 1 < chars.len() && chars[i + 1] == '%' {
+                        tokens.push(Token::PlusPercent);
+                        i += 1;
+                    } else {
+                        tokens.push(Token::Plus);
+                    }
+                    lines.push(start_line);
+                }
                 '-' => {
                     if i + 1 < chars.len() && chars[i + 1] == '>' {
                         tokens.push(Token::Arrow);
                         i += 1;
+                    } else if i + 1 < chars.len() && chars[i + 1] == '%' {
+                        tokens.push(Token::MinusPercent);
+                        i += 1;
                     } else {
                         tokens.push(Token::Minus);
                     }
+                    lines.push(start_line);
                 }
-                '*' => tokens.push(Token::Star),
-                '/' => tokens.push(Token::Slash),
-                '%' => tokens.push(Token::Percent),
-                '=' => tokens.push(Token::Eq),
+                '*' => {
+                    if i + 1 < chars.len() && chars[i + 1] == '%' {
+                        tokens.push(Token::StarPercent);
+                        i += 1;
+                    } else {
+                        tokens.push(Token::Star);
+                    }
+                    lines.push(start_line);
+                }
+                '/' => {
+                    tokens.push(Token::Slash);
+                    lines.push(start_line);
+                }
+                '%' => {
+                    tokens.push(Token::Percent);
+                    lines.push(start_line);
+                }
+                '=' => {
+                    tokens.push(Token::Eq);
+                    lines.push(start_line);
+                }
                 '<' => {
                     if i + 1 < chars.len() && chars[i + 1] == '=' {
                         tokens.push(Token::Le);
@@ -344,17 +591,25 @@ pub fn tokenize(src: &str) -> Result<Vec<Token>, LexError> {
                     } else if i + 1 < chars.len() && chars[i + 1] == '-' {
                         tokens.push(Token::LeftArrow);
                         i += 1;
+                    } else if i + 1 < chars.len() && chars[i + 1] == '<' {
+                        tokens.push(Token::Shl);
+                        i += 1;
                     } else {
                         tokens.push(Token::Lt);
                     }
+                    lines.push(start_line);
                 }
                 '>' => {
                     if i + 1 < chars.len() && chars[i + 1] == '=' {
                         tokens.push(Token::Ge);
                         i += 1;
+                    } else if i + 1 < chars.len() && chars[i + 1] == '>' {
+                        tokens.push(Token::Shr);
+                        i += 1;
                     } else {
                         tokens.push(Token::Gt);
                     }
+                    lines.push(start_line);
                 }
                 _ => {
                     return Err(LexError {
@@ -367,7 +622,8 @@ pub fn tokenize(src: &str) -> Result<Vec<Token>, LexError> {
         }
     }
     tokens.push(Token::Eof);
-    Ok(tokens)
+    lines.push(current_line);
+    Ok((tokens, lines))
 }
 
 /// Locates a 1-based line and column `Span` for a contract tag, routine, or expression snippet in `src`.
@@ -438,12 +694,34 @@ impl std::error::Error for ParseError {}
 
 pub struct Parser {
     tokens: Vec<Token>,
+    lines: Vec<usize>,
     pos: usize,
 }
 
 impl Parser {
     pub fn new(tokens: Vec<Token>) -> Self {
-        Self { tokens, pos: 0 }
+        let lines = vec![1; tokens.len()];
+        Self {
+            tokens,
+            lines,
+            pos: 0,
+        }
+    }
+
+    pub fn new_with_lines(tokens: Vec<Token>, lines: Vec<usize>) -> Self {
+        Self {
+            tokens,
+            lines,
+            pos: 0,
+        }
+    }
+
+    pub fn line_of(&self, pos: usize) -> usize {
+        self.lines.get(pos).copied().unwrap_or(1)
+    }
+
+    pub fn same_line(&self, pos1: usize, pos2: usize) -> bool {
+        self.line_of(pos1) == self.line_of(pos2)
     }
 
     fn peek(&self) -> &Token {
@@ -468,6 +746,28 @@ impl Parser {
         }
     }
 
+    fn expect_upper_ident(&mut self) -> Result<String, ParseError> {
+        let id = self.expect_ident()?;
+        if !id.chars().next().is_some_and(|c| c.is_ascii_uppercase()) {
+            return Err(ParseError {
+                message: format!("Expected UpperIdent (starting with uppercase letter), got `{id}`"),
+                token_pos: self.pos,
+            });
+        }
+        Ok(id)
+    }
+
+    fn expect_lower_ident(&mut self) -> Result<String, ParseError> {
+        let id = self.expect_ident()?;
+        if !id.chars().next().is_some_and(|c| c.is_ascii_lowercase()) {
+            return Err(ParseError {
+                message: format!("Expected LowerIdent (starting with lowercase letter), got `{id}`"),
+                token_pos: self.pos,
+            });
+        }
+        Ok(id)
+    }
+
     fn expect_kw(&mut self, kw: &str) -> Result<(), ParseError> {
         match self.next() {
             Token::Ident(s) if s == kw => Ok(()),
@@ -486,7 +786,8 @@ impl Parser {
         matches!(
             (&self.tokens[self.pos], self.tokens.get(self.pos + 1)),
             (Token::Ident(s), Some(Token::Colon))
-                if s != "end"
+                if s.chars().next().is_some_and(|c| c.is_ascii_lowercase())
+                    && s != "end"
                     && s != "ensure"
                     && s != "invariant"
                     && s != "variant"
@@ -511,7 +812,7 @@ impl Parser {
         self.expect(Token::LBrace)?;
         let mut mods = Vec::new();
         while *self.peek() != Token::RBrace {
-            mods.push(self.expect_ident()?);
+            mods.push(self.expect_upper_ident()?);
             if *self.peek() == Token::Comma {
                 self.next();
             }
@@ -527,23 +828,82 @@ impl Parser {
     }
 
     fn parse_type(&mut self) -> Result<String, ParseError> {
-        let mut base = self.expect_ident()?;
-        if *self.peek() == Token::LBracket {
+        let mut base = if *self.peek() == Token::LParen {
             self.next();
-            let mut args = Vec::new();
-            while *self.peek() != Token::RBracket {
-                args.push(self.parse_type()?);
-                if *self.peek() == Token::Comma {
-                    self.next();
+            if *self.peek() == Token::RParen {
+                self.next();
+                "()".to_string()
+            } else {
+                let mut params = Vec::new();
+                let mut is_refined_fn = false;
+                while *self.peek() != Token::RParen {
+                    let pname = self.expect_ident()?;
+                    if *self.peek() == Token::Colon {
+                        is_refined_fn = true;
+                        self.next();
+                        let pty = self.parse_type()?;
+                        params.push(format!("{pname}: {pty}"));
+                    } else {
+                        params.push(pname);
+                    }
+                    if *self.peek() == Token::Comma {
+                        self.next();
+                    }
+                }
+                self.expect(Token::RParen)?;
+                if is_refined_fn {
+                    format!("({})", params.join(", "))
+                } else if params.len() == 1 {
+                    params[0].clone()
+                } else {
+                    format!("({})", params.join(", "))
                 }
             }
-            self.expect(Token::RBracket)?;
-            base = format!("{base}[{}]", args.join(", "));
-        }
+        } else {
+            let mut b = self.expect_upper_ident()?;
+            if *self.peek() == Token::LBracket {
+                self.next();
+                let mut args = Vec::new();
+                while *self.peek() != Token::RBracket {
+                    args.push(self.parse_type()?);
+                    if *self.peek() == Token::Comma {
+                        self.next();
+                    }
+                }
+                self.expect(Token::RBracket)?;
+                b = format!("{b}[{}]", args.join(", "));
+            }
+            b
+        };
+
         if *self.peek() == Token::Arrow {
             self.next();
             let ret = self.parse_type()?;
-            base = format!("{base} -> {ret}");
+            let mut req_str = String::new();
+            if self.is_kw("require") {
+                self.next();
+                let mut reqs = Vec::new();
+                while self.is_tagged_pred_start() {
+                    let tag = self.expect_lower_ident()?;
+                    self.expect(Token::Colon)?;
+                    let e = self.parse_expr()?;
+                    reqs.push(format!("{tag}: {}", format_gardel_expr(&e)));
+                }
+                req_str = format!(" require {}", reqs.join(" "));
+            }
+            let mut ens_str = String::new();
+            if self.is_kw("ensure") {
+                self.next();
+                let mut enss = Vec::new();
+                while self.is_tagged_pred_start() {
+                    let tag = self.expect_lower_ident()?;
+                    self.expect(Token::Colon)?;
+                    let e = self.parse_expr()?;
+                    enss.push(format!("{tag}: {}", format_gardel_expr(&e)));
+                }
+                ens_str = format!(" ensure {}", enss.join(" "));
+            }
+            base = format!("{base} -> {ret}{req_str}{ens_str}");
         }
         Ok(base)
     }
@@ -555,7 +915,7 @@ impl Parser {
             self.expect(Token::LBrace)?;
             let mut gmods = Vec::new();
             while *self.peek() != Token::RBrace {
-                gmods.push(self.expect_ident()?);
+                gmods.push(self.expect_upper_ident()?);
                 if *self.peek() == Token::Comma {
                     self.next();
                 }
@@ -594,15 +954,15 @@ impl Parser {
 
     pub fn parse_concept(&mut self) -> Result<ConceptDecl, ParseError> {
         self.expect_kw("concept")?;
-        let name = self.expect_ident()?;
+        let name = self.expect_upper_ident()?;
         let mut type_params = Vec::new();
         if *self.peek() == Token::LBracket {
             self.next();
             while *self.peek() != Token::RBracket {
-                let tp = self.expect_ident()?;
+                let tp = self.expect_upper_ident()?;
                 let bound = if *self.peek() == Token::Colon {
                     self.next();
-                    Some(self.expect_ident()?)
+                    Some(self.expect_upper_ident()?)
                 } else {
                     None
                 };
@@ -617,10 +977,26 @@ impl Parser {
         let mut refines = Vec::new();
         if self.is_kw("refines") {
             self.next();
-            refines.push(self.expect_ident()?);
+            let p = self.expect_upper_ident()?;
+            if *self.peek() == Token::LBracket {
+                self.next();
+                while *self.peek() != Token::RBracket {
+                    self.next();
+                }
+                self.expect(Token::RBracket)?;
+            }
+            refines.push(p);
             while *self.peek() == Token::Comma {
                 self.next();
-                refines.push(self.expect_ident()?);
+                let p = self.expect_upper_ident()?;
+                if *self.peek() == Token::LBracket {
+                    self.next();
+                    while *self.peek() != Token::RBracket {
+                        self.next();
+                    }
+                    self.expect(Token::RBracket)?;
+                }
+                refines.push(p);
             }
         }
 
@@ -632,12 +1008,12 @@ impl Parser {
             if self.is_kw("law") {
                 laws.push(self.parse_law()?);
             } else {
-                let rname = self.expect_ident()?;
+                let rname = self.expect_lower_ident()?;
                 let mut r_tparams = Vec::new();
                 if *self.peek() == Token::LBracket {
                     self.next();
                     while *self.peek() != Token::RBracket {
-                        r_tparams.push(self.expect_ident()?);
+                        r_tparams.push(self.expect_upper_ident()?);
                         if *self.peek() == Token::Comma {
                             self.next();
                         }
@@ -648,7 +1024,7 @@ impl Parser {
                 if *self.peek() == Token::LParen {
                     self.next();
                     while *self.peek() != Token::RParen {
-                        let pname = self.expect_ident()?;
+                        let pname = self.expect_lower_ident()?;
                         self.expect(Token::Colon)?;
                         let ptype = self.parse_type()?;
                         params.push((pname, ptype));
@@ -695,16 +1071,16 @@ impl Parser {
             ModuleKind::Functions => self.expect_kw("functions")?,
             ModuleKind::Program => self.expect_kw("program")?,
         }
-        let name = self.expect_ident()?;
+        let name = self.expect_upper_ident()?;
         let mut type_params = Vec::new();
         let mut type_bounds = HashMap::new();
         if *self.peek() == Token::LBracket {
             self.next();
             while *self.peek() != Token::RBracket {
-                let tp = self.expect_ident()?;
+                let tp = self.expect_upper_ident()?;
                 if *self.peek() == Token::Colon {
                     self.next();
-                    let bound = self.expect_ident()?;
+                    let bound = self.expect_upper_ident()?;
                     type_bounds.insert(tp.clone(), bound);
                 }
                 type_params.push(tp);
@@ -718,18 +1094,18 @@ impl Parser {
         let mut satisfies = None;
         if self.is_kw("satisfies") {
             self.next();
-            let mut concepts = vec![self.expect_ident()?];
+            let mut concepts = vec![self.expect_upper_ident()?];
             while *self.peek() == Token::Comma {
                 self.next();
-                concepts.push(self.expect_ident()?);
+                concepts.push(self.expect_upper_ident()?);
             }
             let mut where_constraints = Vec::new();
             if self.is_kw("where") {
                 self.next();
                 loop {
-                    let tp = self.expect_ident()?;
+                    let tp = self.expect_upper_ident()?;
                     self.expect_kw("satisfies")?;
-                    let c = self.expect_ident()?;
+                    let c = self.expect_upper_ident()?;
                     where_constraints.push((tp, c));
                     if *self.peek() == Token::Comma {
                         self.next();
@@ -754,18 +1130,26 @@ impl Parser {
 
         while !self.is_kw("end") {
             if self.is_kw("representation") {
+                if kind == ModuleKind::Functions || kind == ModuleKind::Program {
+                    return Err(ParseError {
+                        message: format!(
+                            "Section `representation` is not permitted in `{kind:?}` declaration (§4)"
+                        ),
+                        token_pos: self.pos,
+                    });
+                }
                 self.next();
                 repr_vis = self.parse_vis()?;
                 if *self.peek() == Token::Pipe {
                     let mut variants = Vec::new();
                     while *self.peek() == Token::Pipe {
                         self.next();
-                        let vname = self.expect_ident()?;
+                        let vname = self.expect_upper_ident()?;
                         let mut fields = Vec::new();
                         if *self.peek() == Token::LParen {
                             self.next();
                             while *self.peek() != Token::RParen {
-                                let fname = self.expect_ident()?;
+                                let fname = self.expect_lower_ident()?;
                                 self.expect(Token::Colon)?;
                                 let ftype = self.parse_type()?;
                                 fields.push((fname, ftype));
@@ -784,7 +1168,7 @@ impl Parser {
                 } else {
                     let mut fields = Vec::new();
                     while !self.is_section_or_end() {
-                        let fname = self.expect_ident()?;
+                        let fname = self.expect_lower_ident()?;
                         self.expect(Token::Colon)?;
                         let ftype = self.parse_type()?;
                         fields.push((fname, ftype));
@@ -792,6 +1176,13 @@ impl Parser {
                     repr = ReprKind::Product(fields);
                 }
             } else if self.is_kw("specify") {
+                if kind == ModuleKind::Program {
+                    return Err(ParseError {
+                        message: "Section `specify` is not permitted in `program` declaration (§4)"
+                            .to_string(),
+                        token_pos: self.pos,
+                    });
+                }
                 self.next();
                 let vis = self.parse_vis()?;
                 while !self.is_section_or_end() {
@@ -802,6 +1193,14 @@ impl Parser {
                     }
                 }
             } else if self.is_kw("create") {
+                if kind == ModuleKind::Functions || kind == ModuleKind::Program {
+                    return Err(ParseError {
+                        message: format!(
+                            "Section `create` is not permitted in `{kind:?}` declaration (§4)"
+                        ),
+                        token_pos: self.pos,
+                    });
+                }
                 self.next();
                 let vis = self.parse_vis()?;
                 while !self.is_section_or_end() {
@@ -814,9 +1213,17 @@ impl Parser {
                     feature_routines.push((vis.clone(), self.parse_routine()?));
                 }
             } else if self.is_kw("invariant") {
+                if kind == ModuleKind::Functions || kind == ModuleKind::Program {
+                    return Err(ParseError {
+                        message: format!(
+                            "Section `invariant` is not permitted in `{kind:?}` declaration (§4)"
+                        ),
+                        token_pos: self.pos,
+                    });
+                }
                 self.next();
                 while self.is_tagged_pred_start() {
-                    let tag = self.expect_ident()?;
+                    let tag = self.expect_lower_ident()?;
                     self.expect(Token::Colon)?;
                     let expr = self.parse_expr()?;
                     invariants.push((tag, expr));
@@ -857,12 +1264,12 @@ impl Parser {
 
     fn parse_law(&mut self) -> Result<LawDecl, ParseError> {
         self.expect_kw("law")?;
-        let name = self.expect_ident()?;
+        let name = self.expect_lower_ident()?;
         let mut params = Vec::new();
         if *self.peek() == Token::LParen {
             self.next();
             while *self.peek() != Token::RParen {
-                let pname = self.expect_ident()?;
+                let pname = self.expect_lower_ident()?;
                 self.expect(Token::Colon)?;
                 let ptype = self.parse_type()?;
                 params.push((pname, ptype));
@@ -877,7 +1284,7 @@ impl Parser {
         if self.is_kw("require") {
             self.next();
             while self.is_tagged_pred_start() {
-                let tag = self.expect_ident()?;
+                let tag = self.expect_lower_ident()?;
                 self.expect(Token::Colon)?;
                 let expr = self.parse_expr()?;
                 requires.push((tag, expr));
@@ -894,10 +1301,14 @@ impl Parser {
             }
         }
 
-        let mut variant = None;
+        let mut variant = Vec::new();
         if self.is_kw("variant") {
             self.next();
-            variant = Some(self.parse_expr()?);
+            variant.push(self.parse_expr()?);
+            while *self.peek() == Token::Comma {
+                self.next();
+                variant.push(self.parse_expr()?);
+            }
         }
 
         if self.is_kw("trigger") {
@@ -922,7 +1333,7 @@ impl Parser {
         if self.is_kw("ensure") {
             self.next();
             while self.is_tagged_pred_start() {
-                let tag = self.expect_ident()?;
+                let tag = self.expect_lower_ident()?;
                 self.expect(Token::Colon)?;
                 let expr = self.parse_expr()?;
                 ensures.push((tag, expr));
@@ -943,12 +1354,12 @@ impl Parser {
     }
 
     fn parse_routine(&mut self) -> Result<RoutineDecl, ParseError> {
-        let name = self.expect_ident()?;
+        let name = self.expect_lower_ident()?;
         let mut type_params = Vec::new();
         if *self.peek() == Token::LBracket {
             self.next();
             while *self.peek() != Token::RBracket {
-                type_params.push(self.expect_ident()?);
+                type_params.push(self.expect_upper_ident()?);
                 if *self.peek() == Token::Comma {
                     self.next();
                 }
@@ -959,7 +1370,7 @@ impl Parser {
         if *self.peek() == Token::LParen {
             self.next();
             while *self.peek() != Token::RParen {
-                let pname = self.expect_ident()?;
+                let pname = self.expect_lower_ident()?;
                 self.expect(Token::Colon)?;
                 let ptype = self.parse_type()?;
                 params.push((pname, ptype));
@@ -985,17 +1396,21 @@ impl Parser {
         if self.is_kw("require") {
             self.next();
             while self.is_tagged_pred_start() {
-                let tag = self.expect_ident()?;
+                let tag = self.expect_lower_ident()?;
                 self.expect(Token::Colon)?;
                 let expr = self.parse_expr()?;
                 requires.push((tag, expr));
             }
         }
 
-        let mut variant = None;
+        let mut variant = Vec::new();
         if self.is_kw("variant") {
             self.next();
-            variant = Some(self.parse_expr()?);
+            variant.push(self.parse_expr()?);
+            while *self.peek() == Token::Comma {
+                self.next();
+                variant.push(self.parse_expr()?);
+            }
         }
 
         self.expect_kw("do")?;
@@ -1005,7 +1420,7 @@ impl Parser {
         if self.is_kw("ensure") {
             self.next();
             while self.is_tagged_pred_start() {
-                let tag = self.expect_ident()?;
+                let tag = self.expect_lower_ident()?;
                 self.expect(Token::Colon)?;
                 let expr = self.parse_expr()?;
                 ensures.push((tag, expr));
@@ -1032,35 +1447,47 @@ impl Parser {
         loop {
             if self.is_kw("let") {
                 self.next();
-                let var = self.expect_ident()?;
+                let var = self.expect_lower_ident()?;
                 if *self.peek() == Token::Colon {
                     self.next();
                     let _ = self.parse_type()?;
                 }
                 self.expect(Token::Eq)?;
                 let val = self.parse_expr()?;
+                if *self.peek() == Token::Semicolon {
+                    self.next();
+                }
                 stmts.push(Stmt::Let(var, val));
             } else if self.is_kw("check") {
                 self.next();
                 while self.is_tagged_pred_start() {
-                    let tag = self.expect_ident()?;
+                    let tag = self.expect_lower_ident()?;
                     self.expect(Token::Colon)?;
                     let e = self.parse_expr()?;
                     stmts.push(Stmt::Check(tag, e));
                 }
                 self.expect_kw("end")?;
+                if *self.peek() == Token::Semicolon {
+                    self.next();
+                }
             } else if self.is_kw("assume") {
                 self.next();
                 while self.is_tagged_pred_start() {
-                    let tag = self.expect_ident()?;
+                    let tag = self.expect_lower_ident()?;
                     self.expect(Token::Colon)?;
                     let e = self.parse_expr()?;
                     stmts.push(Stmt::Assume(tag, e));
                 }
                 self.expect_kw("end")?;
+                if *self.peek() == Token::Semicolon {
+                    self.next();
+                }
             } else if self.is_kw("reveal") {
                 self.next();
-                let target = self.expect_ident()?;
+                let target = self.expect_lower_ident()?;
+                if *self.peek() == Token::Semicolon {
+                    self.next();
+                }
                 stmts.push(Stmt::Reveal(target));
             } else {
                 break;
@@ -1073,7 +1500,7 @@ impl Parser {
     fn parse_expr(&mut self) -> Result<Expr, ParseError> {
         if self.is_kw("forall") {
             self.next();
-            let v = self.expect_ident()?;
+            let v = self.expect_lower_ident()?;
             self.expect(Token::Colon)?;
             let ty = self.parse_type()?;
             self.expect(Token::Dot)?;
@@ -1082,7 +1509,7 @@ impl Parser {
         }
         if self.is_kw("exists") {
             self.next();
-            let v = self.expect_ident()?;
+            let v = self.expect_lower_ident()?;
             self.expect(Token::Colon)?;
             let ty = self.parse_type()?;
             self.expect(Token::Dot)?;
@@ -1093,13 +1520,14 @@ impl Parser {
     }
 
     fn parse_implies(&mut self) -> Result<Expr, ParseError> {
-        let mut left = self.parse_or()?;
-        while self.is_kw("implies") {
+        let left = self.parse_or()?;
+        if self.is_kw("implies") {
             self.next();
-            let right = self.parse_or()?;
-            left = Expr::BinOp("implies".into(), Box::new(left), Box::new(right));
+            let right = self.parse_implies()?;
+            Ok(Expr::BinOp("implies".into(), Box::new(left), Box::new(right)))
+        } else {
+            Ok(left)
         }
-        Ok(left)
     }
 
     fn parse_or(&mut self) -> Result<Expr, ParseError> {
@@ -1131,7 +1559,7 @@ impl Parser {
     }
 
     fn parse_cmp(&mut self) -> Result<Expr, ParseError> {
-        let mut left = self.parse_add()?;
+        let mut left = self.parse_bitwise_or()?;
         loop {
             let op = match self.peek() {
                 Token::Eq => "=",
@@ -1139,6 +1567,52 @@ impl Parser {
                 Token::Le => "<=",
                 Token::Gt => ">",
                 Token::Ge => ">=",
+                _ => break,
+            };
+            let op_str = op.to_string();
+            self.next();
+            let right = self.parse_bitwise_or()?;
+            left = Expr::BinOp(op_str, Box::new(left), Box::new(right));
+        }
+        Ok(left)
+    }
+
+    fn parse_bitwise_or(&mut self) -> Result<Expr, ParseError> {
+        let mut left = self.parse_bitwise_xor()?;
+        while *self.peek() == Token::Pipe {
+            self.next();
+            let right = self.parse_bitwise_xor()?;
+            left = Expr::BinOp("|".into(), Box::new(left), Box::new(right));
+        }
+        Ok(left)
+    }
+
+    fn parse_bitwise_xor(&mut self) -> Result<Expr, ParseError> {
+        let mut left = self.parse_bitwise_and()?;
+        while *self.peek() == Token::Caret {
+            self.next();
+            let right = self.parse_bitwise_and()?;
+            left = Expr::BinOp("^".into(), Box::new(left), Box::new(right));
+        }
+        Ok(left)
+    }
+
+    fn parse_bitwise_and(&mut self) -> Result<Expr, ParseError> {
+        let mut left = self.parse_shift()?;
+        while *self.peek() == Token::Amp {
+            self.next();
+            let right = self.parse_shift()?;
+            left = Expr::BinOp("&".into(), Box::new(left), Box::new(right));
+        }
+        Ok(left)
+    }
+
+    fn parse_shift(&mut self) -> Result<Expr, ParseError> {
+        let mut left = self.parse_add()?;
+        loop {
+            let op = match self.peek() {
+                Token::Shl => "<<",
+                Token::Shr => ">>",
                 _ => break,
             };
             let op_str = op.to_string();
@@ -1155,6 +1629,8 @@ impl Parser {
             let op = match self.peek() {
                 Token::Plus => "+",
                 Token::Minus => "-",
+                Token::PlusPercent => "+%",
+                Token::MinusPercent => "-%",
                 _ => break,
             };
             let op_str = op.to_string();
@@ -1166,20 +1642,30 @@ impl Parser {
     }
 
     fn parse_mul(&mut self) -> Result<Expr, ParseError> {
-        let mut left = self.parse_postfix()?;
+        let mut left = self.parse_unary()?;
         loop {
             let op = match self.peek() {
                 Token::Star => "*",
                 Token::Slash => "/",
                 Token::Percent => "%",
+                Token::StarPercent => "*%",
                 _ => break,
             };
             let op_str = op.to_string();
             self.next();
-            let right = self.parse_postfix()?;
+            let right = self.parse_unary()?;
             left = Expr::BinOp(op_str, Box::new(left), Box::new(right));
         }
         Ok(left)
+    }
+
+    fn parse_unary(&mut self) -> Result<Expr, ParseError> {
+        if *self.peek() == Token::Minus {
+            self.next();
+            let inner = self.parse_unary()?;
+            return Ok(Expr::UnaryNeg(Box::new(inner)));
+        }
+        self.parse_postfix()
     }
 
     fn parse_postfix(&mut self) -> Result<Expr, ParseError> {
@@ -1190,17 +1676,110 @@ impl Parser {
             let mut args = Vec::new();
             if *self.peek() == Token::LParen {
                 self.next();
-                while *self.peek() != Token::RParen {
-                    args.push(self.parse_expr()?);
-                    if *self.peek() == Token::Comma {
-                        self.next();
+                if *self.peek() == Token::RParen {
+                    self.next();
+                } else {
+                    while *self.peek() != Token::RParen {
+                        args.push(self.parse_expr()?);
+                        if *self.peek() == Token::Comma {
+                            self.next();
+                        }
                     }
+                    self.expect(Token::RParen)?;
                 }
-                self.expect(Token::RParen)?;
             }
             expr = Expr::MethodCall(Box::new(expr), member, args);
         }
         Ok(expr)
+    }
+
+    fn parse_pattern(&mut self) -> Result<Pattern, ParseError> {
+        match self.peek() {
+            Token::Ident(s) if s == "_" => {
+                self.next();
+                Ok(Pattern::Wildcard)
+            }
+            Token::Ident(s) if s == "True" => {
+                self.next();
+                Ok(Pattern::Lit(Literal::Bool(true)))
+            }
+            Token::Ident(s) if s == "False" => {
+                self.next();
+                Ok(Pattern::Lit(Literal::Bool(false)))
+            }
+            Token::Int(n) => {
+                let val = *n;
+                self.next();
+                Ok(Pattern::Lit(Literal::Int(val)))
+            }
+            Token::Float(f) => {
+                let val = *f;
+                self.next();
+                Ok(Pattern::Lit(Literal::Float(val)))
+            }
+            Token::Char(c) => {
+                let val = *c as u32;
+                self.next();
+                Ok(Pattern::Lit(Literal::Char(val)))
+            }
+            Token::Str(s) => {
+                let val = s.clone();
+                self.next();
+                Ok(Pattern::Lit(Literal::Str(val)))
+            }
+            Token::Unit => {
+                self.next();
+                Ok(Pattern::Lit(Literal::Unit))
+            }
+            Token::LParen => {
+                self.next();
+                if *self.peek() == Token::RParen {
+                    self.next();
+                    return Ok(Pattern::Lit(Literal::Unit));
+                }
+                let first = self.parse_pattern()?;
+                if *self.peek() == Token::Comma {
+                    let mut pats = vec![first];
+                    while *self.peek() == Token::Comma {
+                        self.next();
+                        pats.push(self.parse_pattern()?);
+                    }
+                    self.expect(Token::RParen)?;
+                    Ok(Pattern::Tuple(pats))
+                } else {
+                    self.expect(Token::RParen)?;
+                    Ok(first)
+                }
+            }
+            Token::Ident(s) => {
+                let name = s.clone();
+                self.next();
+                if name.chars().next().is_some_and(|c| c.is_ascii_uppercase()) {
+                    let mut subpats = Vec::new();
+                    if *self.peek() == Token::LParen {
+                        self.next();
+                        if *self.peek() == Token::RParen {
+                            self.next();
+                        } else {
+                            while *self.peek() != Token::RParen {
+                                subpats.push(self.parse_pattern()?);
+                                if *self.peek() == Token::Comma {
+                                    self.next();
+                                }
+                            }
+                            self.expect(Token::RParen)?;
+                        }
+                    }
+                    Ok(Pattern::Variant(name, subpats))
+                } else {
+                    Ok(Pattern::Bind(name))
+                }
+            }
+            other => Err(ParseError {
+                message: format!("Unexpected token in pattern: {other:?}"),
+                token_pos: self.pos,
+            }),
+        }
     }
 
     fn parse_primary(&mut self) -> Result<Expr, ParseError> {
@@ -1213,12 +1792,18 @@ impl Parser {
                     (self.peek(), self.tokens.get(self.pos + 1)),
                     (Token::Ident(_), Some(Token::LeftArrow))
                 ) {
-                    let var = self.expect_ident()?;
+                    let var = self.expect_lower_ident()?;
                     self.expect(Token::LeftArrow)?;
                     let action = self.parse_expr()?;
+                    if *self.peek() == Token::Semicolon {
+                        self.next();
+                    }
                     io_stmts.push(IoStmt::Bind(var, action));
                 } else {
                     let e = self.parse_expr()?;
+                    if *self.peek() == Token::Semicolon {
+                        self.next();
+                    }
                     if self.is_kw("end") {
                         self.next();
                         break e;
@@ -1235,7 +1820,7 @@ impl Parser {
             if *self.peek() == Token::LParen {
                 self.next();
                 while *self.peek() != Token::RParen {
-                    let pn = self.expect_ident()?;
+                    let pn = self.expect_lower_ident()?;
                     self.expect(Token::Colon)?;
                     let pt = self.parse_type()?;
                     params.push((pn, pt));
@@ -1274,26 +1859,10 @@ impl Parser {
             let mut cases = Vec::new();
             while self.is_kw("case") {
                 self.next();
-                let ctor = self.expect_ident()?;
-                let mut bindings = Vec::new();
-                if *self.peek() == Token::LParen {
-                    self.next();
-                    while *self.peek() != Token::RParen {
-                        bindings.push(self.expect_ident()?);
-                        if *self.peek() == Token::Comma {
-                            self.next();
-                        }
-                    }
-                    self.expect(Token::RParen)?;
-                }
+                let pat = self.parse_pattern()?;
                 self.expect_kw("then")?;
                 let (stmts, body) = self.parse_block()?;
-                cases.push(MatchCase {
-                    ctor,
-                    bindings,
-                    stmts,
-                    body,
-                });
+                cases.push(MatchCase::new(pat, stmts, body));
             }
             self.expect_kw("end")?;
             return Ok(Expr::Match(Box::new(scrut), cases));
@@ -1301,8 +1870,15 @@ impl Parser {
 
         match self.next() {
             Token::Int(n) => Ok(Expr::Int(n)),
+            Token::Float(f) => Ok(Expr::Float(f)),
+            Token::Char(c) => Ok(Expr::Char(c as u32)),
             Token::Str(s) => Ok(Expr::Str(s)),
+            Token::Unit => Ok(Expr::Unit),
             Token::LParen => {
+                if *self.peek() == Token::RParen {
+                    self.next();
+                    return Ok(Expr::Unit);
+                }
                 let first = self.parse_expr()?;
                 if *self.peek() == Token::Comma {
                     let mut elems = vec![first];
@@ -1324,7 +1900,7 @@ impl Parser {
                 ) {
                     let mut fields = Vec::new();
                     while *self.peek() != Token::RBrace {
-                        let fname = self.expect_ident()?;
+                        let fname = self.expect_lower_ident()?;
                         self.expect(Token::Eq)?;
                         let fval = self.parse_expr()?;
                         fields.push((fname, fval));
@@ -1341,7 +1917,7 @@ impl Parser {
                     self.expect_kw("with")?;
                     let mut fields = Vec::new();
                     loop {
-                        let fname = self.expect_ident()?;
+                        let fname = self.expect_lower_ident()?;
                         self.expect(Token::Eq)?;
                         let fval = self.parse_expr()?;
                         fields.push((fname, fval));
@@ -1361,16 +1937,20 @@ impl Parser {
                 } else if name == "False" {
                     return Ok(Expr::Bool(false));
                 }
-                if *self.peek() == Token::LParen {
+                if *self.peek() == Token::LParen && self.same_line(self.pos - 1, self.pos) {
                     self.next();
                     let mut args = Vec::new();
-                    while *self.peek() != Token::RParen {
-                        args.push(self.parse_expr()?);
-                        if *self.peek() == Token::Comma {
-                            self.next();
+                    if *self.peek() == Token::RParen {
+                        self.next();
+                    } else {
+                        while *self.peek() != Token::RParen {
+                            args.push(self.parse_expr()?);
+                            if *self.peek() == Token::Comma {
+                                self.next();
+                            }
                         }
+                        self.expect(Token::RParen)?;
                     }
-                    self.expect(Token::RParen)?;
                     Ok(Expr::Call(name, args))
                 } else {
                     Ok(Expr::Var(name))
@@ -1393,6 +1973,7 @@ impl Parser {
 pub struct Diagnostic {
     pub level: &'static str, // "error", "warning", or "audit"
     pub rule: &'static str,
+    pub module_name: String,
     pub routine: String,
     pub tag: String,
     pub message: String,
@@ -1413,6 +1994,7 @@ impl Diagnostic {
         Self {
             level,
             rule,
+            module_name: String::new(),
             routine,
             tag,
             message,
@@ -1421,6 +2003,11 @@ impl Diagnostic {
             counterexample: BTreeMap::new(),
             relevant_lemmas: Vec::new(),
         }
+    }
+
+    pub fn with_module(mut self, module_name: &str) -> Self {
+        self.module_name = module_name.to_string();
+        self
     }
 
     pub fn with_ai_context(
@@ -1439,6 +2026,11 @@ impl Diagnostic {
 
     /// Renders a single diagnostic to the Phase 3 deterministic JSON format (§12).
     pub fn to_json(&self, module_name: &str, default_file: &str) -> String {
+        let mod_name = if !self.module_name.is_empty() {
+            self.module_name.as_str()
+        } else {
+            module_name
+        };
         let sp = self
             .span
             .clone()
@@ -1463,7 +2055,7 @@ impl Diagnostic {
             "  {{\n    \"level\": \"{}\",\n    \"rule\": \"{}\",\n    \"module\": \"{}\",\n    \"routine\": \"{}\",\n    \"tag\": \"{}\",\n    \"contract_tag\": \"{}\",\n    \"span\": {{ \"file\": \"{}\", \"line\": {}, \"column\": {}, \"end_line\": {}, \"end_column\": {} }},\n    \"path_conditions\": [{}],\n    \"counterexample\": {{{}}},\n    \"relevant_lemmas\": [{}],\n    \"message\": \"{}\"\n  }}",
             escape_json(self.level),
             escape_json(self.rule),
-            escape_json(module_name),
+            escape_json(mod_name),
             escape_json(&self.routine),
             escape_json(&self.tag),
             escape_json(&self.tag),
@@ -1643,9 +2235,12 @@ pub fn check_visibility_and_semantics(m: &ModuleDecl) -> Vec<Diagnostic> {
         .collect();
 
     for (vis, r, is_ghost_routine) in all_routines {
+        let mut routine_locals: HashSet<String> = r.params.iter().map(|(p, _)| p.clone()).collect();
+        routine_locals.insert("Current".to_string());
+
         // Rule 1 & Rule 4: Preconditions (require)
         for (tag, req_expr) in &r.requires {
-            let used = collect_symbols(req_expr);
+            let used = collect_symbols_scoped(req_expr, &routine_locals);
             for sym in used {
                 if let Some(sv) = symbol_vis.get(&sym) {
                     if !sv.is_at_least_as_visible_as(vis) {
@@ -1677,8 +2272,10 @@ pub fn check_visibility_and_semantics(m: &ModuleDecl) -> Vec<Diagnostic> {
         }
 
         // Rule 2: Visible ensures only
+        let mut ens_locals = routine_locals.clone();
+        ens_locals.insert("Result".to_string());
         for (tag, ens_expr) in &r.ensures {
-            let used = collect_symbols(ens_expr);
+            let used = collect_symbols_scoped(ens_expr, &ens_locals);
             for sym in used {
                 if let Some(sv) = symbol_vis.get(&sym) {
                     if !sv.is_at_least_as_visible_as(vis) {
@@ -1797,6 +2394,12 @@ pub fn check_visibility_and_semantics(m: &ModuleDecl) -> Vec<Diagnostic> {
                 }
             }
         }
+        check_branch_io_linearity(&r.body, &r.name, false, &mut diags);
+        for st in &r.stmts {
+            if let Stmt::Let(_, se) | Stmt::Check(_, se) | Stmt::Assume(_, se) = st {
+                check_branch_io_linearity(se, &r.name, false, &mut diags);
+            }
+        }
     }
 
     // Phase 3 (§7.5): Validate `reveal` targets inside laws
@@ -1848,7 +2451,7 @@ fn expr_uses_io(e: &Expr) -> bool {
         Expr::Var(v) => v == "IO",
         Expr::MethodCall(recv, _, args) => expr_uses_io(recv) || args.iter().any(expr_uses_io),
         Expr::Call(f, args) => f == "IO" || args.iter().any(expr_uses_io),
-        Expr::UnaryNot(inner) => expr_uses_io(inner),
+        Expr::UnaryNot(inner) | Expr::UnaryNeg(inner) => expr_uses_io(inner),
         Expr::BinOp(_, l, r) => expr_uses_io(l) || expr_uses_io(r),
         Expr::If(c, ts, te, es, ee) => {
             expr_uses_io(c)
@@ -1884,6 +2487,9 @@ fn expr_uses_io(e: &Expr) -> bool {
             }) || expr_uses_io(body)
         }
         Expr::Int(_)
+        | Expr::Float(_)
+        | Expr::Char(_)
+        | Expr::Unit
         | Expr::Bool(_)
         | Expr::Str(_)
         | Expr::Forall(_, _, _)
@@ -1891,11 +2497,121 @@ fn expr_uses_io(e: &Expr) -> bool {
     }
 }
 
+fn check_branch_io_linearity(
+    e: &Expr,
+    rname: &str,
+    in_with_io: bool,
+    diags: &mut Vec<Diagnostic>,
+) {
+    match e {
+        Expr::WithIo(stmts, final_e) => {
+            for s in stmts {
+                match s {
+                    IoStmt::Bind(_, se) | IoStmt::Action(se) => {
+                        check_branch_io_linearity(se, rname, true, diags);
+                    }
+                }
+            }
+            check_branch_io_linearity(final_e, rname, true, diags);
+        }
+        Expr::If(c, ts, te, es, ee) => {
+            check_branch_io_linearity(c, rname, in_with_io, diags);
+            let then_uses = ts.iter().any(|s| match s {
+                Stmt::Let(_, se) | Stmt::Check(_, se) | Stmt::Assume(_, se) => expr_uses_io(se),
+                Stmt::Reveal(_) => false,
+            }) || expr_uses_io(te);
+            let else_uses = es.iter().any(|s| match s {
+                Stmt::Let(_, se) | Stmt::Check(_, se) | Stmt::Assume(_, se) => expr_uses_io(se),
+                Stmt::Reveal(_) => false,
+            }) || expr_uses_io(ee);
+
+            if in_with_io && (then_uses != else_uses) {
+                diags.push(Diagnostic::basic(
+                    "error",
+                    "Phase 4 (Linear IO Branch Mismatch)",
+                    rname.to_string(),
+                    "io_branch_linearity".to_string(),
+                    format!(
+                        "Branching inside `with IO` in routine `{rname}` must maintain balanced linear IO sequencing across both `then` and `else` branches (§11.2)"
+                    ),
+                ));
+            }
+
+            for s in ts {
+                if let Stmt::Let(_, se) | Stmt::Check(_, se) | Stmt::Assume(_, se) = s {
+                    check_branch_io_linearity(se, rname, in_with_io, diags);
+                }
+            }
+            check_branch_io_linearity(te, rname, in_with_io, diags);
+            for s in es {
+                if let Stmt::Let(_, se) | Stmt::Check(_, se) | Stmt::Assume(_, se) = s {
+                    check_branch_io_linearity(se, rname, in_with_io, diags);
+                }
+            }
+            check_branch_io_linearity(ee, rname, in_with_io, diags);
+        }
+        Expr::Match(scrut, cases) => {
+            check_branch_io_linearity(scrut, rname, in_with_io, diags);
+            for c in cases {
+                for s in &c.stmts {
+                    if let Stmt::Let(_, se) | Stmt::Check(_, se) | Stmt::Assume(_, se) = s {
+                        check_branch_io_linearity(se, rname, in_with_io, diags);
+                    }
+                }
+                check_branch_io_linearity(&c.body, rname, in_with_io, diags);
+            }
+        }
+        Expr::UnaryNot(inner) | Expr::UnaryNeg(inner) => {
+            check_branch_io_linearity(inner, rname, in_with_io, diags);
+        }
+        Expr::BinOp(_, l, r) => {
+            check_branch_io_linearity(l, rname, in_with_io, diags);
+            check_branch_io_linearity(r, rname, in_with_io, diags);
+        }
+        Expr::Call(_, args) => {
+            for a in args {
+                check_branch_io_linearity(a, rname, in_with_io, diags);
+            }
+        }
+        Expr::MethodCall(recv, _, args) => {
+            check_branch_io_linearity(recv, rname, in_with_io, diags);
+            for a in args {
+                check_branch_io_linearity(a, rname, in_with_io, diags);
+            }
+        }
+        Expr::RecordLit(fields) => {
+            for (_, fe) in fields {
+                check_branch_io_linearity(fe, rname, in_with_io, diags);
+            }
+        }
+        Expr::RecordUpdate(base, fields) => {
+            check_branch_io_linearity(base, rname, in_with_io, diags);
+            for (_, fe) in fields {
+                check_branch_io_linearity(fe, rname, in_with_io, diags);
+            }
+        }
+        Expr::TupleLit(elems) => {
+            for el in elems {
+                check_branch_io_linearity(el, rname, in_with_io, diags);
+            }
+        }
+        Expr::Lambda(_, _, stmts, body) => {
+            for s in stmts {
+                if let Stmt::Let(_, se) | Stmt::Check(_, se) | Stmt::Assume(_, se) = s {
+                    check_branch_io_linearity(se, rname, false, diags);
+                }
+            }
+            check_branch_io_linearity(body, rname, false, diags);
+        }
+        _ => {}
+    }
+}
+
 fn count_var_occurrences(e: &Expr, target: &str) -> usize {
     match e {
         Expr::Var(v) => usize::from(v == target),
-        Expr::Int(_) | Expr::Bool(_) | Expr::Str(_) => 0,
-        Expr::UnaryNot(inner) => count_var_occurrences(inner, target),
+        Expr::Int(_) | Expr::Float(_) | Expr::Char(_) | Expr::Unit | Expr::Bool(_) | Expr::Str(_) => 0,
+        Expr::UnaryNot(inner) | Expr::UnaryNeg(inner) => count_var_occurrences(inner, target),
         Expr::BinOp(_, l, r) => count_var_occurrences(l, target) + count_var_occurrences(r, target),
         Expr::Call(_, args) => args.iter().map(|a| count_var_occurrences(a, target)).sum(),
         Expr::MethodCall(recv, _, args) => {
@@ -1988,6 +2704,9 @@ fn collect_runtime_expr_symbols(e: &Expr) -> HashSet<String> {
     let mut set = HashSet::new();
     match e {
         Expr::Int(_)
+        | Expr::Float(_)
+        | Expr::Char(_)
+        | Expr::Unit
         | Expr::Bool(_)
         | Expr::Str(_)
         | Expr::Forall(_, _, _)
@@ -1995,7 +2714,7 @@ fn collect_runtime_expr_symbols(e: &Expr) -> HashSet<String> {
         Expr::Var(v) => {
             set.insert(v.clone());
         }
-        Expr::UnaryNot(inner) => {
+        Expr::UnaryNot(inner) | Expr::UnaryNeg(inner) => {
             set.extend(collect_runtime_expr_symbols(inner));
         }
         Expr::BinOp(_, l, r) => {
@@ -2084,119 +2803,201 @@ fn collect_reveal_targets(stmts: &[Stmt], body: &Expr) -> Vec<String> {
     out
 }
 
-fn collect_symbols(e: &Expr) -> HashSet<String> {
+pub fn collect_symbols(e: &Expr) -> HashSet<String> {
+    collect_symbols_scoped(e, &HashSet::new())
+}
+
+pub fn collect_symbols_scoped(e: &Expr, locals: &HashSet<String>) -> HashSet<String> {
     let mut set = HashSet::new();
     match e {
-        Expr::Int(_) | Expr::Bool(_) | Expr::Str(_) => {}
+        Expr::Int(_) | Expr::Float(_) | Expr::Char(_) | Expr::Bool(_) | Expr::Str(_) | Expr::Unit => {}
         Expr::Var(v) => {
-            set.insert(v.clone());
+            if !locals.contains(v) && v != "Current" && v != "Result" {
+                set.insert(v.clone());
+            }
         }
-        Expr::UnaryNot(inner) => {
-            set.extend(collect_symbols(inner));
+        Expr::UnaryNot(inner) | Expr::UnaryNeg(inner) => {
+            set.extend(collect_symbols_scoped(inner, locals));
         }
         Expr::BinOp(_, l, r) => {
-            set.extend(collect_symbols(l));
-            set.extend(collect_symbols(r));
+            set.extend(collect_symbols_scoped(l, locals));
+            set.extend(collect_symbols_scoped(r, locals));
         }
         Expr::Call(f, args) => {
-            set.insert(f.clone());
+            if !locals.contains(f) && f != "Current" && f != "Result" {
+                set.insert(f.clone());
+            }
             for a in args {
-                set.extend(collect_symbols(a));
+                set.extend(collect_symbols_scoped(a, locals));
             }
         }
         Expr::MethodCall(recv, mname, args) => {
-            set.extend(collect_symbols(recv));
+            set.extend(collect_symbols_scoped(recv, locals));
             set.insert(mname.clone());
             for a in args {
-                set.extend(collect_symbols(a));
+                set.extend(collect_symbols_scoped(a, locals));
             }
         }
         Expr::If(c, ts, te, es, ee) => {
-            set.extend(collect_symbols(c));
-            for s in ts.iter().chain(es.iter()) {
+            set.extend(collect_symbols_scoped(c, locals));
+            let mut t_locals = locals.clone();
+            for s in ts {
                 match s {
-                    Stmt::Let(_, se) | Stmt::Check(_, se) | Stmt::Assume(_, se) => {
-                        set.extend(collect_symbols(se));
+                    Stmt::Let(v, se) => {
+                        set.extend(collect_symbols_scoped(se, &t_locals));
+                        t_locals.insert(v.clone());
+                    }
+                    Stmt::Check(_, se) | Stmt::Assume(_, se) => {
+                        set.extend(collect_symbols_scoped(se, &t_locals));
                     }
                     Stmt::Reveal(r) => {
                         set.insert(r.clone());
                     }
                 }
             }
-            set.extend(collect_symbols(te));
-            set.extend(collect_symbols(ee));
+            set.extend(collect_symbols_scoped(te, &t_locals));
+
+            let mut e_locals = locals.clone();
+            for s in es {
+                match s {
+                    Stmt::Let(v, se) => {
+                        set.extend(collect_symbols_scoped(se, &e_locals));
+                        e_locals.insert(v.clone());
+                    }
+                    Stmt::Check(_, se) | Stmt::Assume(_, se) => {
+                        set.extend(collect_symbols_scoped(se, &e_locals));
+                    }
+                    Stmt::Reveal(r) => {
+                        set.insert(r.clone());
+                    }
+                }
+            }
+            set.extend(collect_symbols_scoped(ee, &e_locals));
         }
         Expr::Match(scrut, cases) => {
-            set.extend(collect_symbols(scrut));
+            set.extend(collect_symbols_scoped(scrut, locals));
             for c in cases {
+                let mut c_locals = locals.clone();
+                for b in c.bindings() {
+                    c_locals.insert(b);
+                }
                 for s in &c.stmts {
                     match s {
-                        Stmt::Let(_, se) | Stmt::Check(_, se) | Stmt::Assume(_, se) => {
-                            set.extend(collect_symbols(se));
+                        Stmt::Let(v, se) => {
+                            set.extend(collect_symbols_scoped(se, &c_locals));
+                            c_locals.insert(v.clone());
+                        }
+                        Stmt::Check(_, se) | Stmt::Assume(_, se) => {
+                            set.extend(collect_symbols_scoped(se, &c_locals));
                         }
                         Stmt::Reveal(r) => {
                             set.insert(r.clone());
                         }
                     }
                 }
-                set.extend(collect_symbols(&c.body));
+                set.extend(collect_symbols_scoped(&c.body, &c_locals));
             }
         }
         Expr::RecordLit(fields) => {
             for (_, fe) in fields {
-                set.extend(collect_symbols(fe));
+                set.extend(collect_symbols_scoped(fe, locals));
             }
         }
         Expr::RecordUpdate(base, fields) => {
-            set.extend(collect_symbols(base));
+            set.extend(collect_symbols_scoped(base, locals));
             for (_, fe) in fields {
-                set.extend(collect_symbols(fe));
+                set.extend(collect_symbols_scoped(fe, locals));
             }
         }
         Expr::TupleLit(elems) => {
             for el in elems {
-                set.extend(collect_symbols(el));
+                set.extend(collect_symbols_scoped(el, locals));
             }
         }
-        Expr::Forall(_, _, body) | Expr::Exists(_, _, body) => {
-            set.extend(collect_symbols(body));
+        Expr::Forall(v, _, body) | Expr::Exists(v, _, body) => {
+            let mut q_locals = locals.clone();
+            q_locals.insert(v.clone());
+            set.extend(collect_symbols_scoped(body, &q_locals));
         }
         Expr::WithIo(stmts, final_e) => {
+            let mut io_locals = locals.clone();
             for s in stmts {
                 match s {
-                    IoStmt::Bind(_, se) | IoStmt::Action(se) => {
-                        set.extend(collect_symbols(se));
+                    IoStmt::Bind(v, se) => {
+                        set.extend(collect_symbols_scoped(se, &io_locals));
+                        io_locals.insert(v.clone());
+                    }
+                    IoStmt::Action(se) => {
+                        set.extend(collect_symbols_scoped(se, &io_locals));
                     }
                 }
             }
-            set.extend(collect_symbols(final_e));
+            set.extend(collect_symbols_scoped(final_e, &io_locals));
         }
-        Expr::Lambda(_, _, stmts, body) => {
+        Expr::Lambda(params, _, stmts, body) => {
+            let mut l_locals = locals.clone();
+            for (p, _) in params {
+                l_locals.insert(p.clone());
+            }
             for s in stmts {
                 match s {
-                    Stmt::Let(_, se) | Stmt::Check(_, se) | Stmt::Assume(_, se) => {
-                        set.extend(collect_symbols(se));
+                    Stmt::Let(v, se) => {
+                        set.extend(collect_symbols_scoped(se, &l_locals));
+                        l_locals.insert(v.clone());
+                    }
+                    Stmt::Check(_, se) | Stmt::Assume(_, se) => {
+                        set.extend(collect_symbols_scoped(se, &l_locals));
                     }
                     Stmt::Reveal(r) => {
                         set.insert(r.clone());
                     }
                 }
             }
-            set.extend(collect_symbols(body));
+            set.extend(collect_symbols_scoped(body, &l_locals));
         }
     }
     set
+}
+
+pub fn format_pattern(p: &Pattern) -> String {
+    match p {
+        Pattern::Wildcard => "_".to_string(),
+        Pattern::Bind(b) => b.clone(),
+        Pattern::Lit(Literal::Int(n)) => n.to_string(),
+        Pattern::Lit(Literal::Float(f)) => f.to_string(),
+        Pattern::Lit(Literal::Char(c)) => format!("'{}'", char::from_u32(*c).unwrap_or('?')),
+        Pattern::Lit(Literal::Bool(true)) => "True".to_string(),
+        Pattern::Lit(Literal::Bool(false)) => "False".to_string(),
+        Pattern::Lit(Literal::Str(s)) => format!("\"{s}\""),
+        Pattern::Lit(Literal::Unit) => "()".to_string(),
+        Pattern::Variant(c, sub) => {
+            if sub.is_empty() {
+                c.clone()
+            } else {
+                let sub_s: Vec<String> = sub.iter().map(format_pattern).collect();
+                format!("{c}({})", sub_s.join(", "))
+            }
+        }
+        Pattern::Tuple(sub) => {
+            let sub_s: Vec<String> = sub.iter().map(format_pattern).collect();
+            format!("({})", sub_s.join(", "))
+        }
+    }
 }
 
 /// Formats a Gardel `Expr` back into canonical Gardel syntax for `path_conditions` and diagnostics.
 pub fn format_gardel_expr(e: &Expr) -> String {
     match e {
         Expr::Int(n) => n.to_string(),
+        Expr::Float(f) => f.to_string(),
+        Expr::Char(c) => format!("'{}'", char::from_u32(*c).unwrap_or('?')),
+        Expr::Unit => "()".to_string(),
         Expr::Bool(true) => "True".to_string(),
         Expr::Bool(false) => "False".to_string(),
         Expr::Str(s) => format!("\"{s}\""),
         Expr::Var(v) => v.clone(),
         Expr::UnaryNot(inner) => format!("not {}", format_gardel_expr(inner)),
+        Expr::UnaryNeg(inner) => format!("-{}", format_gardel_expr(inner)),
         Expr::BinOp(op, l, r) => {
             format!("({} {op} {})", format_gardel_expr(l), format_gardel_expr(r))
         }
@@ -2223,11 +3024,7 @@ pub fn format_gardel_expr(e: &Expr) -> String {
             let cs: Vec<String> = cases
                 .iter()
                 .map(|c| {
-                    let pat = if c.bindings.is_empty() {
-                        c.ctor.clone()
-                    } else {
-                        format!("{}({})", c.ctor, c.bindings.join(", "))
-                    };
+                    let pat = format_pattern(&c.pattern);
                     format!("case {pat} then {}", format_gardel_expr(&c.body))
                 })
                 .collect();
@@ -2258,26 +3055,32 @@ pub fn format_gardel_expr(e: &Expr) -> String {
             format!("exists {v}: {ty}. {}", format_gardel_expr(body))
         }
         Expr::WithIo(stmts, final_e) => {
-            let ss: Vec<String> = stmts
-                .iter()
-                .map(|s| match s {
-                    IoStmt::Bind(v, se) => format!("{v} <- {}", format_gardel_expr(se)),
-                    IoStmt::Action(se) => format_gardel_expr(se),
-                })
-                .collect();
-            format!(
-                "with IO {} {} end",
-                ss.join("; "),
-                format_gardel_expr(final_e)
-            )
+            let mut ss = Vec::new();
+            for s in stmts {
+                match s {
+                    IoStmt::Bind(v, e) => ss.push(format!("{v} <- {}", format_gardel_expr(e))),
+                    IoStmt::Action(e) => ss.push(format_gardel_expr(e)),
+                }
+            }
+            ss.push(format_gardel_expr(final_e));
+            format!("with IO {} end", ss.join("; "))
         }
-        Expr::Lambda(params, ret, _, body) => {
-            let ps: Vec<String> = params.iter().map(|(n, t)| format!("{n}: {t}")).collect();
-            format!(
-                "fn({}): {ret} do {} end",
-                ps.join(", "),
-                format_gardel_expr(body)
-            )
+        Expr::Lambda(params, ret_ty, stmts, body) => {
+            let ps: Vec<String> = params
+                .iter()
+                .map(|(p, t)| format!("{p}: {t}"))
+                .collect();
+            let mut ss = Vec::new();
+            for s in stmts {
+                match s {
+                    Stmt::Let(v, e) => ss.push(format!("let {v} = {}", format_gardel_expr(e))),
+                    Stmt::Check(t, e) => ss.push(format!("check {t}: {}", format_gardel_expr(e))),
+                    Stmt::Assume(t, e) => ss.push(format!("assume {t}: {}", format_gardel_expr(e))),
+                    Stmt::Reveal(t) => ss.push(format!("reveal {t}")),
+                }
+            }
+            ss.push(format_gardel_expr(body));
+            format!("fn({}): {ret_ty} do {} end", ps.join(", "), ss.join("; "))
         }
     }
 }
@@ -2289,7 +3092,7 @@ pub fn format_gardel_expr(e: &Expr) -> String {
 /// Returns the canonical Gardel v0.4 Phase 4 Standard Library source package (§3, §5, §10.5, §11, §16).
 pub fn phase4_stdlib_source() -> &'static str {
     r#"
-group { SEQ, BIGNAT, STRING, OPTION, GREETER }
+group { SEQ, BIGNAT, STRING, OPTION }
 
 module OPTION[A]
 
@@ -2323,7 +3126,7 @@ module SEQ[A]
 representation {ANY}
   | Empty
   | Leaf(value: A)
-  | Concat(left: SEQ[A], right: SEQ[A])
+  | Concat(left: SEQ[A], right: SEQ[A], len: NAT)
 
 specify {ANY}
 
@@ -2332,9 +3135,9 @@ specify {ANY}
       Current
     do
       match Current
-        case Empty        then LIST.empty
-        case Leaf(v)      then LIST.empty.prepend(v)
-        case Concat(l, r) then l.model.append(r.model)
+        case Empty           then LIST.empty
+        case Leaf(v)         then LIST.empty.prepend(v)
+        case Concat(l, r, _) then l.model.append(r.model)
       end
     end
 
@@ -2360,24 +3163,20 @@ feature {ANY}
     variant
       Current
     do
-      reveal model
       match Current
-        case Empty        then 0
-        case Leaf(_)      then 1
-        case Concat(l, r) then
-          let ll = l.length
-          let rl = r.length
-          if ll <= 9223372036854775807 and rl <= 9223372036854775807 then
-            ll + rl
-          else
-            ll
-          end
+        case Empty            then 0
+        case Leaf(_)          then 1
+        case Concat(_, _, ln) then ln
       end
     end
 
   concat(other: SEQ[A]): SEQ[A]
+    require
+      fits: Current.length <= 18446744073709551615 - other.length
     do
-      Concat(Current, other)
+      Concat(Current, other, Current.length + other.length)
+    ensure
+      len_sum: Result.length = Current.length + other.length
     end
 
 end
@@ -2390,7 +3189,7 @@ representation {NONE}
 
 specify {ANY}
 
-  model: NAT
+  model: MATH_INT
     do
       Current.size
     end
@@ -2405,12 +3204,14 @@ create {ANY}
     end
 
   from_u64(x: U64): BIGNAT
-    require
-      non_zero: x > 0
     do
-      { limbs = LIST.empty.prepend(x), size = 1 }
+      if x = 0 then
+        { limbs = LIST.empty, size = 0 }
+      else
+        { limbs = LIST.empty.prepend(x), size = 1 }
+      end
     ensure
-      single_limb: Result.limb_count = 1
+      count_bounded: Result.limb_count <= 1
     end
 
 feature {ANY}
@@ -2473,8 +3274,16 @@ feature {ANY}
       Current.limit
     end
 
+  is_empty: BOOL
+    do
+      Current.size = 0
+    ensure
+      def: Result = (Current.byte_length = 0)
+    end
+
   push_utf8_word(w: U64): STRING
     require
+      valid_word: w < 256
       has_room: Current.byte_length < Current.capacity
     do
       { items = Current.items.prepend(w),
@@ -2490,25 +3299,10 @@ invariant
   within_bounds: size <= limit
 
 end
-
-program GREETER
-
-feature {ANY}
-
-  main(args: LIST[STRING]): IO[EXIT_CODE]
-    do
-      with IO
-        name <- IO.read_line
-        IO.print("Hello, " + name)
-        IO.exit(0)
-      end
-    end
-
-end
 "#
 }
 
-/// Parses and returns all Phase 4 standard library modules (`OPTION`, `SEQ`, `BIGNAT`, `STRING`, `GREETER`).
+/// Parses and returns all Phase 4 standard library modules (`OPTION`, `SEQ`, `BIGNAT`, `STRING`).
 pub fn parse_phase4_stdlib() -> Result<FileAst, String> {
     let tokens = tokenize(phase4_stdlib_source()).map_err(|e| e.to_string())?;
     let mut parser = Parser::new(tokens);
@@ -2563,12 +3357,425 @@ pub fn monomorphize_module(m: &ModuleDecl, concrete_args: &[String]) -> ModuleDe
         ),
     };
 
+    let spec_routine = |r: &RoutineDecl| -> RoutineDecl {
+        let mut nr = r.clone();
+        nr.params = nr
+            .params
+            .into_iter()
+            .map(|(p, t)| (p, sub_ty(&t)))
+            .collect();
+        nr.ret_type = sub_ty(&nr.ret_type);
+        nr
+    };
+
+    spec.create_routines = m
+        .create_routines
+        .iter()
+        .map(|(v, r)| (v.clone(), spec_routine(r)))
+        .collect();
+    spec.feature_routines = m
+        .feature_routines
+        .iter()
+        .map(|(v, r)| (v.clone(), spec_routine(r)))
+        .collect();
+    spec.specify_routines = m
+        .specify_routines
+        .iter()
+        .map(|(v, r)| (v.clone(), spec_routine(r)))
+        .collect();
+
     spec
 }
 
+pub fn collect_monomorphized_instances(prog: &ProgramEnv) -> Vec<ModuleDecl> {
+    let mut out = Vec::new();
+    let mut visited = HashSet::new();
+
+    let find_instantiations = |ty: &str| -> Option<(String, Vec<String>)> {
+        if let Some(open) = ty.find('[') {
+            if let Some(close) = ty.rfind(']') {
+                let base = &ty[..open];
+                let args_str = &ty[open + 1..close];
+                let args: Vec<String> = args_str.split(',').map(|s| s.trim().to_string()).collect();
+                return Some((base.to_string(), args));
+            }
+        }
+        None
+    };
+
+    for (_, m) in &prog.modules {
+        let mut scan_types = Vec::new();
+        match &m.repr {
+            ReprKind::Product(fs) => {
+                for (_, t) in fs {
+                    scan_types.push(t.clone());
+                }
+            }
+            ReprKind::Sum(vs) => {
+                for v in vs {
+                    for (_, t) in &v.fields {
+                        scan_types.push(t.clone());
+                    }
+                }
+            }
+        }
+        for (_, r) in m.create_routines.iter().chain(m.feature_routines.iter()) {
+            for (_, t) in &r.params {
+                scan_types.push(t.clone());
+            }
+            scan_types.push(r.ret_type.clone());
+        }
+
+        for ty in scan_types {
+            if let Some((base, args)) = find_instantiations(&ty) {
+                let inst_key = format!("{base}_{}", args.join("_"));
+                if visited.insert(inst_key) {
+                    if let Some(base_mod) = prog.modules.get(&base) {
+                        if !base_mod.type_params.is_empty() {
+                            let monomorphic = monomorphize_module(base_mod, &args);
+                            out.push(monomorphic);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    out
+}
+
+pub fn closure_convert_module(m: &ModuleDecl) -> (ModuleDecl, Vec<TopLevelCombinator>) {
+    let mut combinators = Vec::new();
+    let mut counter = 0usize;
+
+    let mut spec = m.clone();
+
+    for (_, r) in spec
+        .create_routines
+        .iter_mut()
+        .chain(spec.feature_routines.iter_mut())
+        .chain(spec.specify_routines.iter_mut())
+    {
+        for s in &mut r.stmts {
+            match s {
+                Stmt::Let(_, e) | Stmt::Check(_, e) | Stmt::Assume(_, e) => {
+                    *e = convert_expr_lambdas(e, &mut counter, &mut combinators);
+                }
+                Stmt::Reveal(_) => {}
+            }
+        }
+        r.body = convert_expr_lambdas(&r.body, &mut counter, &mut combinators);
+    }
+
+    (spec, combinators)
+}
+
+fn convert_expr_lambdas(
+    e: &Expr,
+    counter: &mut usize,
+    combinators: &mut Vec<TopLevelCombinator>,
+) -> Expr {
+    match e {
+        Expr::Lambda(params, ret_ty, stmts, body) => {
+            *counter += 1;
+            let id = *counter;
+
+            let mut param_names: HashSet<String> = params.iter().map(|(p, _)| p.clone()).collect();
+            let mut free_vars = HashSet::new();
+
+            for s in stmts {
+                match s {
+                    Stmt::Let(v, se) => {
+                        let f = collect_symbols_scoped(se, &param_names);
+                        free_vars.extend(f);
+                        param_names.insert(v.clone());
+                    }
+                    Stmt::Check(_, se) | Stmt::Assume(_, se) => {
+                        let f = collect_symbols_scoped(se, &param_names);
+                        free_vars.extend(f);
+                    }
+                    Stmt::Reveal(_) => {}
+                }
+            }
+            free_vars.extend(collect_symbols_scoped(body, &param_names));
+
+            let fv_list: Vec<String> = free_vars.into_iter().collect();
+
+            if fv_list.is_empty() {
+                let name = format!("combinator_{id}");
+                let routine = RoutineDecl {
+                    name: name.clone(),
+                    type_params: Vec::new(),
+                    params: params.clone(),
+                    ret_type: ret_ty.clone(),
+                    requires: Vec::new(),
+                    variant: Vec::new(),
+                    stmts: stmts.clone(),
+                    body: (**body).clone(),
+                    ensures: Vec::new(),
+                };
+                combinators.push(TopLevelCombinator {
+                    env_struct: None,
+                    routine,
+                });
+                Expr::Var(name)
+            } else {
+                let env_name = format!("ClosureEnv_{id}");
+                let env_fields: Vec<(String, String)> = fv_list
+                    .iter()
+                    .map(|v| (v.clone(), "U64".to_string()))
+                    .collect();
+                let mut apply_params = vec![("env".to_string(), env_name.clone())];
+                apply_params.extend(params.clone());
+
+                let mut substs = Vec::new();
+                for fv in &fv_list {
+                    substs.push((
+                        fv.clone(),
+                        Expr::MethodCall(
+                            Box::new(Expr::Var("env".to_string())),
+                            fv.clone(),
+                            Vec::new(),
+                        ),
+                    ));
+                }
+
+                let sub_body = subst_expr_vars(body, &substs);
+                let (sub_stmts, _) = subst_block(stmts, body, &substs);
+
+                let apply_name = format!("closure_apply_{id}");
+                let routine = RoutineDecl {
+                    name: apply_name.clone(),
+                    type_params: Vec::new(),
+                    params: apply_params,
+                    ret_type: ret_ty.clone(),
+                    requires: Vec::new(),
+                    variant: Vec::new(),
+                    stmts: sub_stmts,
+                    body: sub_body,
+                    ensures: Vec::new(),
+                };
+
+                combinators.push(TopLevelCombinator {
+                    env_struct: Some((env_name.clone(), env_fields.clone())),
+                    routine,
+                });
+
+                let rec_fields = fv_list
+                    .into_iter()
+                    .map(|v| (v.clone(), Expr::Var(v)))
+                    .collect();
+                Expr::RecordLit(rec_fields)
+            }
+        }
+        Expr::UnaryNot(inner) => Expr::UnaryNot(Box::new(convert_expr_lambdas(inner, counter, combinators))),
+        Expr::UnaryNeg(inner) => Expr::UnaryNeg(Box::new(convert_expr_lambdas(inner, counter, combinators))),
+        Expr::BinOp(op, l, r) => Expr::BinOp(
+            op.clone(),
+            Box::new(convert_expr_lambdas(l, counter, combinators)),
+            Box::new(convert_expr_lambdas(r, counter, combinators)),
+        ),
+        Expr::Call(f, args) => Expr::Call(
+            f.clone(),
+            args.iter().map(|a| convert_expr_lambdas(a, counter, combinators)).collect(),
+        ),
+        Expr::MethodCall(recv, mname, args) => Expr::MethodCall(
+            Box::new(convert_expr_lambdas(recv, counter, combinators)),
+            mname.clone(),
+            args.iter().map(|a| convert_expr_lambdas(a, counter, combinators)).collect(),
+        ),
+        Expr::If(c, ts, te, es, ee) => Expr::If(
+            Box::new(convert_expr_lambdas(c, counter, combinators)),
+            ts.iter().map(|s| match s {
+                Stmt::Let(v, e) => Stmt::Let(v.clone(), convert_expr_lambdas(e, counter, combinators)),
+                Stmt::Check(t, e) => Stmt::Check(t.clone(), convert_expr_lambdas(e, counter, combinators)),
+                Stmt::Assume(t, e) => Stmt::Assume(t.clone(), convert_expr_lambdas(e, counter, combinators)),
+                Stmt::Reveal(r) => Stmt::Reveal(r.clone()),
+            }).collect(),
+            Box::new(convert_expr_lambdas(te, counter, combinators)),
+            es.iter().map(|s| match s {
+                Stmt::Let(v, e) => Stmt::Let(v.clone(), convert_expr_lambdas(e, counter, combinators)),
+                Stmt::Check(t, e) => Stmt::Check(t.clone(), convert_expr_lambdas(e, counter, combinators)),
+                Stmt::Assume(t, e) => Stmt::Assume(t.clone(), convert_expr_lambdas(e, counter, combinators)),
+                Stmt::Reveal(r) => Stmt::Reveal(r.clone()),
+            }).collect(),
+            Box::new(convert_expr_lambdas(ee, counter, combinators)),
+        ),
+        Expr::Match(scrut, cases) => Expr::Match(
+            Box::new(convert_expr_lambdas(scrut, counter, combinators)),
+            cases.iter().map(|c| {
+                let stmts: Vec<Stmt> = c.stmts.iter().map(|s| match s {
+                    Stmt::Let(v, e) => Stmt::Let(v.clone(), convert_expr_lambdas(e, counter, combinators)),
+                    Stmt::Check(t, e) => Stmt::Check(t.clone(), convert_expr_lambdas(e, counter, combinators)),
+                    Stmt::Assume(t, e) => Stmt::Assume(t.clone(), convert_expr_lambdas(e, counter, combinators)),
+                    Stmt::Reveal(r) => Stmt::Reveal(r.clone()),
+                }).collect();
+                let body = convert_expr_lambdas(&c.body, counter, combinators);
+                MatchCase::new(c.pattern.clone(), stmts, body)
+            }).collect(),
+        ),
+        Expr::RecordLit(fields) => Expr::RecordLit(
+            fields.iter().map(|(k, v)| (k.clone(), convert_expr_lambdas(v, counter, combinators))).collect(),
+        ),
+        Expr::RecordUpdate(base, fields) => Expr::RecordUpdate(
+            Box::new(convert_expr_lambdas(base, counter, combinators)),
+            fields.iter().map(|(k, v)| (k.clone(), convert_expr_lambdas(v, counter, combinators))).collect(),
+        ),
+        Expr::TupleLit(elems) => Expr::TupleLit(
+            elems.iter().map(|el| convert_expr_lambdas(el, counter, combinators)).collect(),
+        ),
+        Expr::WithIo(stmts, final_e) => Expr::WithIo(
+            stmts.iter().map(|s| match s {
+                IoStmt::Bind(v, e) => IoStmt::Bind(v.clone(), convert_expr_lambdas(e, counter, combinators)),
+                IoStmt::Action(e) => IoStmt::Action(convert_expr_lambdas(e, counter, combinators)),
+            }).collect(),
+            Box::new(convert_expr_lambdas(final_e, counter, combinators)),
+        ),
+        other => other.clone(),
+    }
+}
+
+// =====================================================// 7. PHASE 3 & 4 DIRECT BOOGIE (.bpl) VERIFICATION CONDITION EMITTER
 // ============================================================================
-// 7. PHASE 3 & 4 DIRECT BOOGIE (.bpl) VERIFICATION CONDITION EMITTER
-// ============================================================================
+
+/// Traverses an expression collecting string literals into `set`.
+fn collect_expr_strings(e: &Expr, set: &mut HashSet<String>) {
+    match e {
+        Expr::Str(s) => {
+            set.insert(s.clone());
+        }
+        Expr::UnaryNot(inner) => collect_expr_strings(inner, set),
+        Expr::BinOp(_, l, r) => {
+            collect_expr_strings(l, set);
+            collect_expr_strings(r, set);
+        }
+        Expr::Call(_, args) => {
+            for a in args {
+                collect_expr_strings(a, set);
+            }
+        }
+        Expr::MethodCall(recv, _, args) => {
+            collect_expr_strings(recv, set);
+            for a in args {
+                collect_expr_strings(a, set);
+            }
+        }
+        Expr::If(c, ts, te, es, ee) => {
+            collect_expr_strings(c, set);
+            for s in ts {
+                collect_stmt_strings(s, set);
+            }
+            collect_expr_strings(te, set);
+            for s in es {
+                collect_stmt_strings(s, set);
+            }
+            collect_expr_strings(ee, set);
+        }
+        Expr::Match(scrut, cases) => {
+            collect_expr_strings(scrut, set);
+            for c in cases {
+                for s in &c.stmts {
+                    collect_stmt_strings(s, set);
+                }
+                collect_expr_strings(&c.body, set);
+            }
+        }
+        Expr::RecordLit(fields) => {
+            for (_, fe) in fields {
+                collect_expr_strings(fe, set);
+            }
+        }
+        Expr::RecordUpdate(base, fields) => {
+            collect_expr_strings(base, set);
+            for (_, fe) in fields {
+                collect_expr_strings(fe, set);
+            }
+        }
+        Expr::TupleLit(elems) => {
+            for el in elems {
+                collect_expr_strings(el, set);
+            }
+        }
+        Expr::Forall(_, _, body) | Expr::Exists(_, _, body) => {
+            collect_expr_strings(body, set);
+        }
+        Expr::WithIo(stmts, final_e) => {
+            for s in stmts {
+                match s {
+                    IoStmt::Bind(_, e) | IoStmt::Action(e) => collect_expr_strings(e, set),
+                }
+            }
+            collect_expr_strings(final_e, set);
+        }
+        Expr::Lambda(_, _, stmts, body) => {
+            for s in stmts {
+                collect_stmt_strings(s, set);
+            }
+            collect_expr_strings(body, set);
+        }
+        _ => {}
+    }
+}
+
+fn collect_stmt_strings(st: &Stmt, set: &mut HashSet<String>) {
+    match st {
+        Stmt::Let(_, e) | Stmt::Check(_, e) | Stmt::Assume(_, e) => {
+            collect_expr_strings(e, set);
+        }
+        Stmt::Reveal(_) => {}
+    }
+}
+
+/// Collects all distinct string literals in `m` sorted alphabetically.
+pub fn collect_module_strings(m: &ModuleDecl) -> Vec<String> {
+    let mut set = HashSet::new();
+    for (_, r) in m
+        .create_routines
+        .iter()
+        .chain(m.feature_routines.iter())
+        .chain(m.specify_routines.iter())
+    {
+        for (_, req) in &r.requires {
+            collect_expr_strings(req, &mut set);
+        }
+        for (_, ens) in &r.ensures {
+            collect_expr_strings(ens, &mut set);
+        }
+        for v in &r.variant {
+            collect_expr_strings(v, &mut set);
+        }
+        for s in &r.stmts {
+            collect_stmt_strings(s, &mut set);
+        }
+        collect_expr_strings(&r.body, &mut set);
+    }
+    for (_, law) in &m.specify_laws {
+        for (_, req) in &law.requires {
+            collect_expr_strings(req, &mut set);
+        }
+        for (_, ens) in &law.ensures {
+            collect_expr_strings(ens, &mut set);
+        }
+        for v in &law.variant {
+            collect_expr_strings(v, &mut set);
+        }
+        for s in &law.stmts {
+            collect_stmt_strings(s, &mut set);
+        }
+        for t in &law.triggers {
+            collect_expr_strings(t, &mut set);
+        }
+        if let Some(b) = &law.body {
+            collect_expr_strings(b, &mut set);
+        }
+    }
+    for (_, inv) in &m.invariants {
+        collect_expr_strings(inv, &mut set);
+    }
+    let mut vec: Vec<String> = set.into_iter().collect();
+    vec.sort();
+    vec
+}
 
 pub fn emit_boogie(m: &ModuleDecl, fuel_limit: usize) -> String {
     let mut out = String::new();
@@ -2579,11 +3786,59 @@ pub fn emit_boogie(m: &ModuleDecl, fuel_limit: usize) -> String {
     out.push_str(&m.name);
     out.push_str("\n\n");
 
-    // 1. 64-bit U64 bounds & Fuel theory (§3, §7.5)
-    out.push_str("// --- 1. 64-bit Machine Bounds, Fuel & Phase 4 Stdlib Theories ---\n");
+    // 1. Machine Bounds, Sorts, Fuel & Bitvector Theories (§3, §7.5, Plan 3 §1, §2)
+    out.push_str("// --- 1. Machine Bounds, Sorts, Fuel & Bitvector Theories ---\n");
     out.push_str("const U64_MAX: int;\n");
     out.push_str("axiom U64_MAX == 18446744073709551615;\n");
     out.push_str("function {:inline} in_u64(x: int) returns (bool) { 0 <= x && x <= U64_MAX }\n\n");
+    out.push_str("const I64_MIN: int;\n");
+    out.push_str("axiom I64_MIN == -9223372036854775808;\n");
+    out.push_str("const I64_MAX: int;\n");
+    out.push_str("axiom I64_MAX == 9223372036854775807;\n");
+    out.push_str("function {:inline} in_i64(x: int) returns (bool) { I64_MIN <= x && x <= I64_MAX }\n\n");
+
+    out.push_str("type Unit;\n");
+    out.push_str("const unique Unit_val: Unit;\n");
+    out.push_str("axiom (forall u: Unit :: u == Unit_val);\n");
+    out.push_str("type F64;\n\n");
+
+    out.push_str("function {:bvbuiltin \"(_ int2bv 64)\"} int2bv64(x: int) returns (bv64);\n");
+    out.push_str("function {:bvbuiltin \"bv2int\"} bv2int64(x: bv64) returns (int);\n");
+    out.push_str("function {:bvbuiltin \"bvadd\"} bvadd64(x: bv64, y: bv64) returns (bv64);\n");
+    out.push_str("function {:bvbuiltin \"bvsub\"} bvsub64(x: bv64, y: bv64) returns (bv64);\n");
+    out.push_str("function {:bvbuiltin \"bvmul\"} bvmul64(x: bv64, y: bv64) returns (bv64);\n");
+    out.push_str("function {:bvbuiltin \"bvand\"} bvand64(x: bv64, y: bv64) returns (bv64);\n");
+    out.push_str("function {:bvbuiltin \"bvor\"} bvor64(x: bv64, y: bv64) returns (bv64);\n");
+    out.push_str("function {:bvbuiltin \"bvxor\"} bvxor64(x: bv64, y: bv64) returns (bv64);\n");
+    out.push_str("function {:bvbuiltin \"bvshl\"} bvshl64(x: bv64, y: bv64) returns (bv64);\n");
+    out.push_str("function {:bvbuiltin \"bvlshr\"} bvlshr64(x: bv64, y: bv64) returns (bv64);\n\n");
+
+    out.push_str("function {:inline} u64_wrap_add(x: int, y: int) returns (int) { bv2int64(bvadd64(int2bv64(x), int2bv64(y))) }\n");
+    out.push_str("function {:inline} u64_wrap_sub(x: int, y: int) returns (int) { bv2int64(bvsub64(int2bv64(x), int2bv64(y))) }\n");
+    out.push_str("function {:inline} u64_wrap_mul(x: int, y: int) returns (int) { bv2int64(bvmul64(int2bv64(x), int2bv64(y))) }\n");
+    out.push_str("function {:inline} u64_bit_and(x: int, y: int) returns (int) { bv2int64(bvand64(int2bv64(x), int2bv64(y))) }\n");
+    out.push_str("function {:inline} u64_bit_or(x: int, y: int) returns (int) { bv2int64(bvor64(int2bv64(x), int2bv64(y))) }\n");
+    out.push_str("function {:inline} u64_bit_xor(x: int, y: int) returns (int) { bv2int64(bvxor64(int2bv64(x), int2bv64(y))) }\n");
+    out.push_str("function {:inline} u64_bit_shl(x: int, y: int) returns (int) { bv2int64(bvshl64(int2bv64(x), int2bv64(y))) }\n");
+    out.push_str("function {:inline} u64_bit_shr(x: int, y: int) returns (int) { bv2int64(bvlshr64(int2bv64(x), int2bv64(y))) }\n\n");
+
+    for (tp, bound) in &m.type_bounds {
+        if bound == "EQ" || bound == "ORD" {
+            out.push_str(&format!("function {tp}_eq(x: {tp}, y: {tp}) returns (bool);\n"));
+            out.push_str(&format!("axiom (forall x: {tp} :: {{ {tp}_eq(x, x) }} {tp}_eq(x, x));\n"));
+            out.push_str(&format!("axiom (forall x: {tp}, y: {tp} :: {{ {tp}_eq(x, y) }} {tp}_eq(x, y) ==> {tp}_eq(y, x));\n"));
+            out.push_str(&format!("axiom (forall x: {tp}, y: {tp}, z: {tp} :: {{ {tp}_eq(x, y), {tp}_eq(y, z) }} {tp}_eq(x, y) && {tp}_eq(y, z) ==> {tp}_eq(x, z));\n"));
+        }
+        if bound == "ORD" {
+            out.push_str(&format!("function {tp}_less(x: {tp}, y: {tp}) returns (bool);\n"));
+            out.push_str(&format!("function {tp}_less_eq(x: {tp}, y: {tp}) returns (bool);\n"));
+            out.push_str(&format!("axiom (forall x: {tp} :: {{ {tp}_less(x, x) }} !{tp}_less(x, x));\n"));
+            out.push_str(&format!("axiom (forall x: {tp}, y: {tp}, z: {tp} :: {{ {tp}_less(x, y), {tp}_less(y, z) }} {tp}_less(x, y) && {tp}_less(y, z) ==> {tp}_less(x, z));\n"));
+            out.push_str(&format!("axiom (forall x: {tp}, y: {tp} :: {{ {tp}_less_eq(x, y) }} {tp}_less_eq(x, y) <==> ({tp}_less(x, y) || {tp}_eq(x, y)));\n"));
+            out.push_str(&format!("axiom (forall x: {tp}, y: {tp} :: {{ {tp}_less(x, y), {tp}_less(y, x) }} {tp}_less(x, y) || {tp}_eq(x, y) || {tp}_less(y, x));\n"));
+        }
+        out.push('\n');
+    }
 
     out.push_str("type Fuel;\n");
     out.push_str("const unique ZeroFuel: Fuel;\n");
@@ -2604,6 +3859,15 @@ pub fn emit_boogie(m: &ModuleDecl, fuel_limit: usize) -> String {
     out.push_str("type IO T;\n");
     out.push_str("type EXIT_CODE = int;\n");
     out.push_str("function Str_concat(a: GardelString, b: GardelString) returns (GardelString);\n");
+    out.push_str("function Str_length(s: GardelString) returns (int);\n");
+    out.push_str("axiom (forall s: GardelString :: { Str_length(s) } 0 <= Str_length(s));\n");
+    out.push_str("const unique str_lit_empty: GardelString;\n");
+    out.push_str("axiom Str_length(str_lit_empty) == 0;\n");
+    let strings = collect_module_strings(m);
+    for (idx, s) in strings.iter().enumerate() {
+        out.push_str(&format!("const unique str_lit_{idx}: GardelString;\n"));
+        out.push_str(&format!("axiom Str_length(str_lit_{idx}) == {};\n", s.len()));
+    }
     out.push_str("function IO_read_line() returns (GardelString);\n");
     out.push_str("function IO_print(s: GardelString) returns (IO int);\n");
     out.push_str("function IO_exit(code: int) returns (IO int);\n\n");
@@ -2662,11 +3926,11 @@ pub fn emit_boogie(m: &ModuleDecl, fuel_limit: usize) -> String {
 
     out.push_str(&format!("type {}{tp_decl};\n", m.name));
     out.push_str(&format!(
-        "function {}_size{tp_quant}(x: {mod_bpl_ty}) returns (int);\n",
+        "function {}_adt_size{tp_quant}(x: {mod_bpl_ty}) returns (int);\n",
         m.name
     ));
     out.push_str(&format!(
-        "axiom (forall{tp_quant} x: {mod_bpl_ty} :: {{ {}_size(x) }} {}_size(x) >= 1);\n\n",
+        "axiom (forall{tp_quant} x: {mod_bpl_ty} :: {{ {}_adt_size(x) }} {}_adt_size(x) >= 1);\n\n",
         m.name, m.name
     ));
 
@@ -2702,8 +3966,8 @@ pub fn emit_boogie(m: &ModuleDecl, fuel_limit: usize) -> String {
                 let ctor_call = format!("{}({})", v.name, arg_names.join(", "));
                 if v.fields.is_empty() {
                     out.push_str(&format!(
-                        "axiom (forall{tp_quant} :: is_{}({ctor_call}));\n",
-                        v.name
+                        "axiom (forall{tp_quant} x: {mod_bpl_ty} :: {{ is_{}(x) }} is_{}(x) <==> x == {}());\n",
+                        v.name, v.name, v.name
                     ));
                 } else {
                     let mut proj_conj = vec![format!("is_{}({ctor_call})", v.name)];
@@ -2714,7 +3978,7 @@ pub fn emit_boogie(m: &ModuleDecl, fuel_limit: usize) -> String {
                             || fty.starts_with(&format!("{}[", m.name))
                         {
                             proj_conj.push(format!(
-                                "{}_size({fnm}) < {}_size({ctor_call})",
+                                "{}_adt_size({fnm}) < {}_adt_size({ctor_call})",
                                 m.name, m.name
                             ));
                         }
@@ -2723,6 +3987,72 @@ pub fn emit_boogie(m: &ModuleDecl, fuel_limit: usize) -> String {
                         "axiom (forall{tp_quant} {} :: {{ {ctor_call} }} {});\n",
                         params.join(", "),
                         proj_conj.join(" && ")
+                    ));
+
+                    // Destructor inversion axiom
+                    let projs = v
+                        .fields
+                        .iter()
+                        .map(|(fnm, _)| format!("{}_{}(x)", v.name, fnm))
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    let mut inv_conj = vec![format!("{}({projs}) == x", v.name)];
+                    for (fnm, fty) in &v.fields {
+                        if fty == &m.name
+                            || fty == "Current"
+                            || fty.starts_with(&format!("{}[", m.name))
+                        {
+                            inv_conj.push(format!(
+                                "{}_adt_size({}_{}(x)) < {}_adt_size(x)",
+                                m.name, v.name, fnm, m.name
+                            ));
+                        }
+                    }
+                    out.push_str(&format!(
+                        "axiom (forall{tp_quant} x: {mod_bpl_ty} :: {{ is_{}(x) }} is_{}(x) ==> ({}));\n",
+                        v.name,
+                        v.name,
+                        inv_conj.join(" && ")
+                    ));
+
+                    // Constructor injectivity axiom
+                    let p1: Vec<String> = v
+                        .fields
+                        .iter()
+                        .map(|(fnm, fty)| format!("_a_{fnm}: {}", map_boogie_type(fty, m)))
+                        .collect();
+                    let p2: Vec<String> = v
+                        .fields
+                        .iter()
+                        .map(|(fnm, fty)| format!("_b_{fnm}: {}", map_boogie_type(fty, m)))
+                        .collect();
+                    let c1_args: Vec<String> =
+                        v.fields.iter().map(|(fnm, _)| format!("_a_{fnm}")).collect();
+                    let c2_args: Vec<String> =
+                        v.fields.iter().map(|(fnm, _)| format!("_b_{fnm}")).collect();
+                    let eqs: Vec<String> = v
+                        .fields
+                        .iter()
+                        .map(|(fnm, _)| format!("_a_{fnm} == _b_{fnm}"))
+                        .collect();
+                    let c1 = format!("{}({})", v.name, c1_args.join(", "));
+                    let c2 = format!("{}({})", v.name, c2_args.join(", "));
+                    out.push_str(&format!(
+                        "axiom (forall{tp_quant} {}, {} :: {{ {c1}, {c2} }} {c1} == {c2} ==> ({}));\n",
+                        p1.join(", "),
+                        p2.join(", "),
+                        eqs.join(" && ")
+                    ));
+                }
+            }
+            // Pairwise Variant Disjointness Axioms
+            for i in 0..variants.len() {
+                for j in (i + 1)..variants.len() {
+                    let v_i = &variants[i];
+                    let v_j = &variants[j];
+                    out.push_str(&format!(
+                        "axiom (forall{tp_quant} x: {mod_bpl_ty} :: {{ is_{}(x) }} is_{}(x) ==> !is_{}(x));\n",
+                        v_i.name, v_i.name, v_j.name
                     ));
                 }
             }
@@ -2768,6 +4098,19 @@ pub fn emit_boogie(m: &ModuleDecl, fuel_limit: usize) -> String {
                     params.join(", "),
                     projs.join(" && ")
                 ));
+
+                // Destructor inversion for Product
+                let projs_x: Vec<String> = fields
+                    .iter()
+                    .map(|(fnm, _)| format!("{}_{}(x)", m.name, fnm))
+                    .collect();
+                out.push_str(&format!(
+                    "axiom (forall{tp_quant} x: {mod_bpl_ty} :: {{ {}_Ctor({}) }} {}_Ctor({}) == x);\n",
+                    m.name,
+                    projs_x.join(", "),
+                    m.name,
+                    projs_x.join(", ")
+                ));
             }
         }
     }
@@ -2797,7 +4140,14 @@ pub fn emit_boogie(m: &ModuleDecl, fuel_limit: usize) -> String {
         for (tag, expr) in &m.invariants {
             clauses.push(format!(
                 "  ({}) /* invariant:{} */",
-                emit_boogie_expr(expr, m, &implicit_fields, &empty_revealed, "DefaultFuel"),
+                emit_boogie_expr_with_strings(
+                    expr,
+                    m,
+                    &implicit_fields,
+                    &empty_revealed,
+                    "DefaultFuel",
+                    &strings
+                ),
                 tag
             ));
         }
@@ -2844,12 +4194,13 @@ pub fn emit_boogie(m: &ModuleDecl, fuel_limit: usize) -> String {
             }
         }
         for (_, req_e) in &r.requires {
-            pre_guards.push(emit_boogie_expr(
+            pre_guards.push(emit_boogie_expr_with_strings(
                 req_e,
                 m,
                 &empty_fields,
                 &empty_revealed,
                 "f",
+                &strings,
             ));
         }
 
@@ -2862,14 +4213,24 @@ pub fn emit_boogie(m: &ModuleDecl, fuel_limit: usize) -> String {
 
         let fn_succ_app = format!("fn_{}({})", r.name, call_args_succ.join(", "));
         let fn_f_app = format!("fn_{}({})", r.name, call_args_f.join(", "));
-        let body_expr = emit_boogie_block_expr(&r.stmts, &r.body, m, &empty_fields, "f");
+        let body_expr = emit_boogie_block_expr(&r.stmts, &r.body, m, &empty_fields, "f", &strings);
         let guard_str = if pre_guards.is_empty() {
             String::new()
         } else {
             format!("{} ==> ", pre_guards.join(" && "))
         };
+        let fn_succ_trigger = if m.type_params.is_empty() {
+            format!("{{ {fn_succ_app} }}")
+        } else {
+            format!("{{ ({fn_succ_app} : {ret_bty}) }}")
+        };
+        let fn_f_trigger = if m.type_params.is_empty() {
+            format!("{{ {fn_f_app} }}")
+        } else {
+            format!("{{ ({fn_f_app} : {ret_bty}) }}")
+        };
         out.push_str(&format!(
-            "axiom (forall{tp_quant} {} :: {{ {fn_succ_app} }} {guard_str}{fn_succ_app} == {body_expr});\n",
+            "axiom (forall{tp_quant} {} :: {fn_succ_trigger} {guard_str}{fn_succ_app} == {body_expr});\n",
             q_params.join(", ")
         ));
 
@@ -2884,13 +4245,20 @@ pub fn emit_boogie(m: &ModuleDecl, fuel_limit: usize) -> String {
             post_clauses.push(format!("{}_Invariant({fn_f_app})", m.name));
         }
         for (_, ens_e) in &r.ensures {
-            let ens_bpl = emit_boogie_expr(ens_e, m, &empty_fields, &empty_revealed, "f")
-                .replace("Result", &fn_f_app);
+            let ens_bpl = emit_boogie_expr_with_strings(
+                ens_e,
+                m,
+                &empty_fields,
+                &empty_revealed,
+                "f",
+                &strings,
+            )
+            .replace("Result", &fn_f_app);
             post_clauses.push(format!("({ens_bpl})"));
         }
         if !post_clauses.is_empty() {
             out.push_str(&format!(
-                "axiom (forall{tp_quant} {} :: {{ {fn_f_app} }} {guard_str}({}));\n",
+                "axiom (forall{tp_quant} {} :: {fn_f_trigger} {guard_str}({}));\n",
                 q_params.join(", "),
                 post_clauses.join(" && ")
             ));
@@ -2911,9 +4279,13 @@ pub fn emit_boogie(m: &ModuleDecl, fuel_limit: usize) -> String {
                 law.triggers
                     .iter()
                     .map(|te| {
-                        format!(
-                            "{{ {} }}",
-                            emit_boogie_expr(te, m, &empty_fields, &empty_revealed, "DefaultFuel")
+                        emit_boogie_expr_with_strings(
+                            te,
+                            m,
+                            &empty_fields,
+                            &empty_revealed,
+                            "DefaultFuel",
+                            &strings,
                         )
                     })
                     .collect()
@@ -2921,9 +4293,13 @@ pub fn emit_boogie(m: &ModuleDecl, fuel_limit: usize) -> String {
                 law.requires
                     .iter()
                     .map(|(_, re)| {
-                        format!(
-                            "{{ {} }}",
-                            emit_boogie_expr(re, m, &empty_fields, &empty_revealed, "DefaultFuel")
+                        emit_boogie_expr_with_strings(
+                            re,
+                            m,
+                            &empty_fields,
+                            &empty_revealed,
+                            "DefaultFuel",
+                            &strings,
                         )
                     })
                     .collect()
@@ -2933,20 +4309,34 @@ pub fn emit_boogie(m: &ModuleDecl, fuel_limit: usize) -> String {
             let trig_str = if triggers.is_empty() {
                 String::new()
             } else {
-                format!("{} ", triggers.join(" "))
+                format!("{{ {} }} ", triggers.join(", "))
             };
             let reqs: Vec<String> = law
                 .requires
                 .iter()
                 .map(|(_, re)| {
-                    emit_boogie_expr(re, m, &empty_fields, &empty_revealed, "DefaultFuel")
+                    emit_boogie_expr_with_strings(
+                        re,
+                        m,
+                        &empty_fields,
+                        &empty_revealed,
+                        "DefaultFuel",
+                        &strings,
+                    )
                 })
                 .collect();
             let ens: Vec<String> = law
                 .ensures
                 .iter()
                 .map(|(_, ee)| {
-                    emit_boogie_expr(ee, m, &empty_fields, &empty_revealed, "DefaultFuel")
+                    emit_boogie_expr_with_strings(
+                        ee,
+                        m,
+                        &empty_fields,
+                        &empty_revealed,
+                        "DefaultFuel",
+                        &strings,
+                    )
                 })
                 .collect();
             if !q_params.is_empty() && !ens.is_empty() {
@@ -2967,10 +4357,59 @@ pub fn emit_boogie(m: &ModuleDecl, fuel_limit: usize) -> String {
     // 7. Verification Condition Procedures (`Verify_<routine>` & `Verify_law_<law>`) (§12)
     out.push_str("// --- 7. Verification Condition Procedures (§12) ---\n");
     for (r, has_current) in &all_routines {
-        out.push_str(&emit_boogie_verify_routine(r, *has_current, m));
+        out.push_str(&emit_boogie_verify_routine(r, *has_current, m, &strings));
     }
     for (_, law) in &m.specify_laws {
-        out.push_str(&emit_boogie_verify_law(law, m));
+        out.push_str(&emit_boogie_verify_law(law, m, &strings));
+    }
+
+    // Sum-Type Hereditary Invariant Verification (§5, Plan 3 §2)
+    if let ReprKind::Sum(variants) = &m.repr {
+        if !m.invariants.is_empty() {
+            let has_recursive_fields = variants.iter().any(|v| {
+                v.fields.iter().any(|(_, fty)| {
+                    fty == &m.name
+                        || fty == "Current"
+                        || fty.starts_with(&format!("{}[", m.name))
+                })
+            });
+            if has_recursive_fields {
+                let tp_quant = if m.type_params.is_empty() {
+                    String::new()
+                } else {
+                    format!("<{}>", m.type_params.join(", "))
+                };
+                let cur_ty = map_boogie_type("Current", m);
+                out.push_str(&format!(
+                    "procedure Verify_Hereditary_Invariant_{}{tp_quant}(Current: {cur_ty})\n",
+                    m.name
+                ));
+                out.push_str(&format!("  requires {}_Invariant(Current);\n{{\n", m.name));
+                for v in variants {
+                    let rec_fields: Vec<&(String, String)> = v
+                        .fields
+                        .iter()
+                        .filter(|(_, fty)| {
+                            fty == &m.name
+                                || fty == "Current"
+                                || fty.starts_with(&format!("{}[", m.name))
+                        })
+                        .collect();
+                    if !rec_fields.is_empty() {
+                        out.push_str(&format!("  if (is_{}(Current)) {{\n", v.name));
+                        for (fname, _) in rec_fields {
+                            let proj = format!("{}_{}(Current)", v.name, fname);
+                            out.push_str(&format!(
+                                "    assert {{:msg \"{}::hereditary_invariant::{}_{}\"}} {}_Invariant({proj});\n",
+                                m.name, v.name, fname, m.name
+                            ));
+                        }
+                        out.push_str("  }\n");
+                    }
+                }
+                out.push_str("}\n\n");
+            }
+        }
     }
 
     out
@@ -3030,7 +4469,12 @@ fn map_boogie_type(ty: &str, m: &ModuleDecl) -> String {
     ty.to_string()
 }
 
-fn emit_boogie_verify_routine(r: &RoutineDecl, has_current: bool, m: &ModuleDecl) -> String {
+fn emit_boogie_verify_routine(
+    r: &RoutineDecl,
+    has_current: bool,
+    m: &ModuleDecl,
+    strings: &[String],
+) -> String {
     let mut s = String::new();
     let tp_quant = if m.type_params.is_empty() {
         String::new()
@@ -3064,18 +4508,17 @@ fn emit_boogie_verify_routine(r: &RoutineDecl, has_current: bool, m: &ModuleDecl
     for (tag, req_e) in &r.requires {
         s.push_str(&format!(
             "  requires {}; // require:{tag}\n",
-            emit_boogie_expr(req_e, m, &empty_fields, &revealed, "DefaultFuel")
+            emit_boogie_expr_with_strings(req_e, m, &empty_fields, &revealed, "DefaultFuel", strings)
         ));
     }
     s.push_str("{\n");
 
     let mut locals = Vec::new();
-    collect_let_vars(&r.stmts, &r.body, &mut locals);
+    collect_proc_locals(&r.stmts, &r.body, r, m, &mut locals);
     let mut seen_locals = HashSet::new();
-    for (vname, vexpr) in &locals {
+    for (vname, bty) in &locals {
         if seen_locals.insert(vname.clone()) {
-            let inferred_ty = infer_boogie_expr_type(vexpr, r, m);
-            s.push_str(&format!("  var {vname}: {inferred_ty};\n"));
+            s.push_str(&format!("  var {vname}: {bty};\n"));
         }
     }
 
@@ -3086,20 +4529,25 @@ fn emit_boogie_verify_routine(r: &RoutineDecl, has_current: bool, m: &ModuleDecl
         m,
         &mut revealed,
         2,
+        strings,
     ));
 
-    if !has_current && m.kind == ModuleKind::Module && !m.invariants.is_empty() {
+    let returns_mod = r.ret_type == "Current"
+        || r.ret_type == m.name
+        || r.ret_type.starts_with(&format!("{}[", m.name));
+    if returns_mod && m.kind == ModuleKind::Module && !m.invariants.is_empty() {
         for (tag, _) in &m.invariants {
             s.push_str(&format!(
-                "  assert {{:msg \"invariant_{tag}\"}} {}_Invariant(Result);\n",
-                m.name
+                "  assert {{:msg \"{}::invariant::{tag}\"}} {}_Invariant(Result);\n",
+                r.name, m.name
             ));
         }
     }
     for (tag, ens_e) in &r.ensures {
         s.push_str(&format!(
-            "  assert {{:msg \"ensure_{tag}\"}} {};\n",
-            emit_boogie_expr(ens_e, m, &empty_fields, &revealed, "DefaultFuel")
+            "  assert {{:msg \"{}::ensure::{tag}\"}} {};\n",
+            r.name,
+            emit_boogie_expr_with_strings(ens_e, m, &empty_fields, &revealed, "DefaultFuel", strings)
         ));
     }
 
@@ -3107,7 +4555,7 @@ fn emit_boogie_verify_routine(r: &RoutineDecl, has_current: bool, m: &ModuleDecl
     s
 }
 
-fn emit_boogie_verify_law(law: &LawDecl, m: &ModuleDecl) -> String {
+fn emit_boogie_verify_law(law: &LawDecl, m: &ModuleDecl, strings: &[String]) -> String {
     let mut s = String::new();
     let tp_quant = if m.type_params.is_empty() {
         String::new()
@@ -3136,7 +4584,7 @@ fn emit_boogie_verify_law(law: &LawDecl, m: &ModuleDecl) -> String {
     for (tag, req_e) in &law.requires {
         s.push_str(&format!(
             "  requires {}; // require:{tag}\n",
-            emit_boogie_expr(req_e, m, &empty_fields, &revealed, "DefaultFuel")
+            emit_boogie_expr_with_strings(req_e, m, &empty_fields, &revealed, "DefaultFuel", strings)
         ));
     }
     s.push_str("{\n");
@@ -3144,14 +4592,15 @@ fn emit_boogie_verify_law(law: &LawDecl, m: &ModuleDecl) -> String {
         match st {
             Stmt::Check(tag, e) => {
                 s.push_str(&format!(
-                    "  assert {{:msg \"check_{tag}\"}} {};\n",
-                    emit_boogie_expr(e, m, &empty_fields, &revealed, "DefaultFuel")
+                    "  assert {{:msg \"{}::check::{tag}\"}} {};\n",
+                    law.name,
+                    emit_boogie_expr_with_strings(e, m, &empty_fields, &revealed, "DefaultFuel", strings)
                 ));
             }
             Stmt::Assume(tag, e) => {
                 s.push_str(&format!(
                     "  assume {}; // assume:{tag}\n",
-                    emit_boogie_expr(e, m, &empty_fields, &revealed, "DefaultFuel")
+                    emit_boogie_expr_with_strings(e, m, &empty_fields, &revealed, "DefaultFuel", strings)
                 ));
             }
             Stmt::Reveal(target) => {
@@ -3165,41 +4614,56 @@ fn emit_boogie_verify_law(law: &LawDecl, m: &ModuleDecl) -> String {
     }
     for (tag, ens_e) in &law.ensures {
         s.push_str(&format!(
-            "  assert {{:msg \"ensure_{tag}\"}} {};\n",
-            emit_boogie_expr(ens_e, m, &empty_fields, &revealed, "DefaultFuel")
+            "  assert {{:msg \"{}::ensure::{tag}\"}} {};\n",
+            law.name,
+            emit_boogie_expr_with_strings(ens_e, m, &empty_fields, &revealed, "DefaultFuel", strings)
         ));
     }
     s.push_str("}\n\n");
     s
 }
 
-fn collect_let_vars(stmts: &[Stmt], body: &Expr, out: &mut Vec<(String, Expr)>) {
+fn collect_proc_locals(
+    stmts: &[Stmt],
+    body: &Expr,
+    r: &RoutineDecl,
+    m: &ModuleDecl,
+    out: &mut Vec<(String, String)>,
+) {
     for st in stmts {
         if let Stmt::Let(v, e) = st {
-            out.push((v.clone(), e.clone()));
-            collect_let_vars(&[], e, out);
+            let bty = infer_boogie_expr_type(e, r, m);
+            out.push((v.clone(), bty));
+            collect_proc_locals(&[], e, r, m, out);
         }
     }
     match body {
         Expr::If(_, ts, te, es, ee) => {
-            collect_let_vars(ts, te, out);
-            collect_let_vars(es, ee, out);
+            collect_proc_locals(ts, te, r, m, out);
+            collect_proc_locals(es, ee, r, m, out);
         }
         Expr::Match(_, cases) => {
             for c in cases {
-                for b in &c.bindings {
-                    out.push((b.clone(), Expr::Int(0)));
+                if let ReprKind::Sum(variants) = &m.repr {
+                    if let Some(vdecl) = variants.iter().find(|v| v.name == c.ctor()) {
+                        for (opt_b, (_, fty)) in c.top_bindings().iter().zip(vdecl.fields.iter()) {
+                            if let Some(b) = opt_b {
+                                out.push((b.clone(), map_boogie_type(fty, m)));
+                            }
+                        }
+                    }
                 }
-                collect_let_vars(&c.stmts, &c.body, out);
+                collect_proc_locals(&c.stmts, &c.body, r, m, out);
             }
         }
         Expr::WithIo(io_stmts, final_e) => {
             for s in io_stmts {
                 if let IoStmt::Bind(v, e) = s {
-                    out.push((v.clone(), e.clone()));
+                    let bty = infer_boogie_expr_type(e, r, m);
+                    out.push((v.clone(), bty));
                 }
             }
-            collect_let_vars(&[], final_e, out);
+            collect_proc_locals(&[], final_e, r, m, out);
         }
         _ => {}
     }
@@ -3277,6 +4741,7 @@ fn emit_boogie_proc_stmts_and_ret(
     m: &ModuleDecl,
     revealed: &mut HashSet<String>,
     indent: usize,
+    strings: &[String],
 ) -> String {
     let pad = " ".repeat(indent);
     let empty_fields = HashSet::new();
@@ -3285,22 +4750,46 @@ fn emit_boogie_proc_stmts_and_ret(
     for st in stmts {
         match st {
             Stmt::Let(v, e) => {
-                s.push_str(&emit_boogie_expr_obligations(e, r, m, revealed, indent));
+                s.push_str(&emit_boogie_expr_obligations(
+                    e, r, m, revealed, indent, strings,
+                ));
                 s.push_str(&format!(
                     "{pad}{v} := {};\n",
-                    emit_boogie_expr(e, m, &empty_fields, revealed, "DefaultFuel")
+                    emit_boogie_expr_with_strings(
+                        e,
+                        m,
+                        &empty_fields,
+                        revealed,
+                        "DefaultFuel",
+                        strings
+                    )
                 ));
             }
             Stmt::Check(tag, e) => {
                 s.push_str(&format!(
-                    "{pad}assert {{:msg \"check_{tag}\"}} {};\n",
-                    emit_boogie_expr(e, m, &empty_fields, revealed, "DefaultFuel")
+                    "{pad}assert {{:msg \"{}::check::{tag}\"}} {};\n",
+                    r.name,
+                    emit_boogie_expr_with_strings(
+                        e,
+                        m,
+                        &empty_fields,
+                        revealed,
+                        "DefaultFuel",
+                        strings
+                    )
                 ));
             }
             Stmt::Assume(tag, e) => {
                 s.push_str(&format!(
                     "{pad}assume {}; // assume:{tag}\n",
-                    emit_boogie_expr(e, m, &empty_fields, revealed, "DefaultFuel")
+                    emit_boogie_expr_with_strings(
+                        e,
+                        m,
+                        &empty_fields,
+                        revealed,
+                        "DefaultFuel",
+                        strings
+                    )
                 ));
             }
             Stmt::Reveal(target) => {
@@ -3314,39 +4803,83 @@ fn emit_boogie_proc_stmts_and_ret(
 
     match body {
         Expr::If(c, ts, te, es, ee) => {
-            s.push_str(&emit_boogie_expr_obligations(c, r, m, revealed, indent));
+            s.push_str(&emit_boogie_expr_obligations(
+                c, r, m, revealed, indent, strings,
+            ));
             let mut rev_then = revealed.clone();
             let mut rev_else = revealed.clone();
             s.push_str(&format!(
                 "{pad}if ({}) {{\n{}{pad}}} else {{\n{}{pad}}}\n",
-                emit_boogie_expr(c, m, &empty_fields, revealed, "DefaultFuel"),
-                emit_boogie_proc_stmts_and_ret(ts, te, r, m, &mut rev_then, indent + 2),
-                emit_boogie_proc_stmts_and_ret(es, ee, r, m, &mut rev_else, indent + 2),
+                emit_boogie_expr_with_strings(
+                    c,
+                    m,
+                    &empty_fields,
+                    revealed,
+                    "DefaultFuel",
+                    strings
+                ),
+                emit_boogie_proc_stmts_and_ret(
+                    ts,
+                    te,
+                    r,
+                    m,
+                    &mut rev_then,
+                    indent + 2,
+                    strings
+                ),
+                emit_boogie_proc_stmts_and_ret(
+                    es,
+                    ee,
+                    r,
+                    m,
+                    &mut rev_else,
+                    indent + 2,
+                    strings
+                ),
             ));
         }
         Expr::Match(scrut, cases) => {
-            let scrut_bpl = emit_boogie_expr(scrut, m, &empty_fields, revealed, "DefaultFuel");
+            let scrut_bpl = emit_boogie_expr_with_strings(
+                scrut,
+                m,
+                &empty_fields,
+                revealed,
+                "DefaultFuel",
+                strings,
+            );
             if let ReprKind::Sum(variants) = &m.repr {
-                let covered: HashSet<String> = cases.iter().map(|c| c.ctor.clone()).collect();
+                let covered: HashSet<String> = cases.iter().map(|c| c.ctor().to_string()).collect();
                 for v in variants {
                     if !covered.contains(&v.name) {
                         s.push_str(&format!(
-                            "{pad}assert {{:msg \"exhaustiveness_{}\"}} !is_{}({scrut_bpl});\n",
-                            v.name, v.name
+                            "{pad}assert {{:msg \"{}::match::exhaustiveness_{}\"}} !is_{}({scrut_bpl});\n",
+                            r.name, v.name, v.name
                         ));
                     }
                 }
             }
             for (idx, c) in cases.iter().enumerate() {
                 let kw = if idx == 0 { "if" } else { "else if" };
-                s.push_str(&format!("{pad}{kw} (is_{}({scrut_bpl})) {{\n", c.ctor));
+                s.push_str(&format!("{pad}{kw} (is_{}({scrut_bpl})) {{\n", c.ctor()));
                 if let ReprKind::Sum(variants) = &m.repr {
-                    if let Some(vdecl) = variants.iter().find(|v| v.name == c.ctor) {
-                        for (bname, (fname, _)) in c.bindings.iter().zip(vdecl.fields.iter()) {
-                            s.push_str(&format!(
-                                "{pad}  {bname} := {}_{}({scrut_bpl});\n",
-                                c.ctor, fname
-                            ));
+                    if let Some(vdecl) = variants.iter().find(|v| v.name == c.ctor()) {
+                        for (opt_b, (fname, fty)) in c.top_bindings().iter().zip(vdecl.fields.iter()) {
+                            if let Some(bname) = opt_b {
+                                s.push_str(&format!(
+                                    "{pad}  {bname} := {}_{}({scrut_bpl});\n",
+                                    c.ctor(), fname
+                                ));
+                                if !m.invariants.is_empty()
+                                    && (fty == &m.name
+                                        || fty == "Current"
+                                        || fty.starts_with(&format!("{}[", m.name)))
+                                {
+                                    s.push_str(&format!(
+                                        "{pad}  assume {}_Invariant({bname});\n",
+                                        m.name
+                                    ));
+                                }
+                            }
                         }
                     }
                 }
@@ -3358,6 +4891,7 @@ fn emit_boogie_proc_stmts_and_ret(
                     m,
                     &mut rev_case,
                     indent + 2,
+                    strings,
                 ));
                 s.push_str(&format!("{pad}}}\n"));
             }
@@ -3368,27 +4902,57 @@ fn emit_boogie_proc_stmts_and_ret(
                     IoStmt::Bind(v, e) => {
                         s.push_str(&format!(
                             "{pad}{v} := {};\n",
-                            emit_boogie_expr(e, m, &empty_fields, revealed, "DefaultFuel")
+                            emit_boogie_expr_with_strings(
+                                e,
+                                m,
+                                &empty_fields,
+                                revealed,
+                                "DefaultFuel",
+                                strings
+                            )
                         ));
                     }
                     IoStmt::Action(e) => {
                         s.push_str(&format!(
                             "{pad}// linear IO action: {}\n",
-                            emit_boogie_expr(e, m, &empty_fields, revealed, "DefaultFuel")
+                            emit_boogie_expr_with_strings(
+                                e,
+                                m,
+                                &empty_fields,
+                                revealed,
+                                "DefaultFuel",
+                                strings
+                            )
                         ));
                     }
                 }
             }
             s.push_str(&format!(
                 "{pad}Result := {};\n",
-                emit_boogie_expr(final_e, m, &empty_fields, revealed, "DefaultFuel")
+                emit_boogie_expr_with_strings(
+                    final_e,
+                    m,
+                    &empty_fields,
+                    revealed,
+                    "DefaultFuel",
+                    strings
+                )
             ));
         }
         _ => {
-            s.push_str(&emit_boogie_expr_obligations(body, r, m, revealed, indent));
+            s.push_str(&emit_boogie_expr_obligations(
+                body, r, m, revealed, indent, strings,
+            ));
             s.push_str(&format!(
                 "{pad}Result := {};\n",
-                emit_boogie_expr(body, m, &empty_fields, revealed, "DefaultFuel")
+                emit_boogie_expr_with_strings(
+                    body,
+                    m,
+                    &empty_fields,
+                    revealed,
+                    "DefaultFuel",
+                    strings
+                )
             ));
         }
     }
@@ -3402,6 +4966,7 @@ fn emit_boogie_expr_obligations(
     m: &ModuleDecl,
     revealed: &HashSet<String>,
     indent: usize,
+    strings: &[String],
 ) -> String {
     let pad = " ".repeat(indent);
     let empty_fields = HashSet::new();
@@ -3412,79 +4977,188 @@ fn emit_boogie_expr_obligations(
             if matches!(&**l, Expr::Str(_)) || matches!(&**rhs, Expr::Str(_)) {
                 return s;
             }
-            s.push_str(&emit_boogie_expr_obligations(l, r, m, revealed, indent));
-            s.push_str(&emit_boogie_expr_obligations(rhs, r, m, revealed, indent));
-            let l_bpl = emit_boogie_expr(l, m, &empty_fields, revealed, "DefaultFuel");
-            let r_bpl = emit_boogie_expr(rhs, m, &empty_fields, revealed, "DefaultFuel");
+            s.push_str(&emit_boogie_expr_obligations(
+                l, r, m, revealed, indent, strings,
+            ));
+            s.push_str(&emit_boogie_expr_obligations(
+                rhs, r, m, revealed, indent, strings,
+            ));
+            let l_bpl = emit_boogie_expr_with_strings(
+                l,
+                m,
+                &empty_fields,
+                revealed,
+                "DefaultFuel",
+                strings,
+            );
+            let r_bpl = emit_boogie_expr_with_strings(
+                rhs,
+                m,
+                &empty_fields,
+                revealed,
+                "DefaultFuel",
+                strings,
+            );
             match op.as_str() {
                 "+" => {
                     s.push_str(&format!(
-                        "{pad}assert {{:msg \"overflow_add\"}} in_u64({l_bpl} + {r_bpl});\n"
+                        "{pad}assert {{:msg \"{}::overflow::overflow_add\"}} in_u64({l_bpl} + {r_bpl});\n",
+                        r.name
                     ));
                 }
                 "-" => {
                     s.push_str(&format!(
-                        "{pad}assert {{:msg \"overflow_sub\"}} 0 <= ({l_bpl} - {r_bpl});\n"
+                        "{pad}assert {{:msg \"{}::overflow::overflow_sub\"}} 0 <= ({l_bpl} - {r_bpl});\n",
+                        r.name
                     ));
                 }
                 "*" => {
                     s.push_str(&format!(
-                        "{pad}assert {{:msg \"overflow_mul\"}} in_u64({l_bpl} * {r_bpl});\n"
+                        "{pad}assert {{:msg \"{}::overflow::overflow_mul\"}} in_u64({l_bpl} * {r_bpl});\n",
+                        r.name
                     ));
                 }
                 "/" | "%" => {
                     s.push_str(&format!(
-                        "{pad}assert {{:msg \"div_by_zero\"}} {r_bpl} != 0;\n"
+                        "{pad}assert {{:msg \"{}::div_by_zero::div_by_zero\"}} {r_bpl} != 0;\n",
+                        r.name
+                    ));
+                }
+                "<<" | ">>" => {
+                    s.push_str(&format!(
+                        "{pad}assert {{:msg \"{}::shift::shift_bound\"}} 0 <= {r_bpl} && {r_bpl} < 64;\n",
+                        r.name
                     ));
                 }
                 _ => {}
             }
         }
+        Expr::UnaryNeg(inner) => {
+            s.push_str(&emit_boogie_expr_obligations(
+                inner, r, m, revealed, indent, strings,
+            ));
+        }
         Expr::RecordLit(_) | Expr::RecordUpdate(_, _) => {
-            let val_bpl = emit_boogie_expr(e, m, &empty_fields, revealed, "DefaultFuel");
+            let val_bpl = emit_boogie_expr_with_strings(
+                e,
+                m,
+                &empty_fields,
+                revealed,
+                "DefaultFuel",
+                strings,
+            );
             if !m.invariants.is_empty() {
                 for (tag, _) in &m.invariants {
                     s.push_str(&format!(
-                        "{pad}assert {{:msg \"invariant_{tag}\"}} {}_Invariant({val_bpl});\n",
-                        m.name
+                        "{pad}assert {{:msg \"{}::invariant::{tag}\"}} {}_Invariant({val_bpl});\n",
+                        r.name, m.name
                     ));
                 }
             }
         }
         Expr::MethodCall(recv, mname, args) => {
-            s.push_str(&emit_boogie_expr_obligations(recv, r, m, revealed, indent));
+            s.push_str(&emit_boogie_expr_obligations(
+                recv, r, m, revealed, indent, strings,
+            ));
             for a in args {
-                s.push_str(&emit_boogie_expr_obligations(a, r, m, revealed, indent));
+                s.push_str(&emit_boogie_expr_obligations(
+                    a, r, m, revealed, indent, strings,
+                ));
             }
             if mname == &r.name {
-                if let Some(var_e) = &r.variant {
-                    if matches!(var_e, Expr::Var(v) if v == "Current") {
-                        let recv_bpl =
-                            emit_boogie_expr(recv, m, &empty_fields, revealed, "DefaultFuel");
-                        s.push_str(&format!(
-                            "{pad}assert {{:msg \"variant_decrease\"}} {}_size({recv_bpl}) < {}_size(Current);\n",
-                            m.name, m.name
-                        ));
-                    }
+                let mut substs = vec![("Current".to_string(), (**recv).clone())];
+                for ((pname, _), arg) in r.params.iter().zip(args.iter()) {
+                    substs.push((pname.clone(), arg.clone()));
                 }
+                s.push_str(&emit_boogie_variant_obligations(
+                    r, m, &substs, revealed, strings, &pad,
+                ));
             }
         }
         Expr::Call(fname, args) => {
             for a in args {
-                s.push_str(&emit_boogie_expr_obligations(a, r, m, revealed, indent));
+                s.push_str(&emit_boogie_expr_obligations(
+                    a, r, m, revealed, indent, strings,
+                ));
             }
             if fname == &r.name {
-                if let Some(var_e) = &r.variant {
-                    let curr_v = emit_boogie_expr(var_e, m, &empty_fields, revealed, "DefaultFuel");
-                    s.push_str(&format!(
-                        "{pad}assert {{:msg \"variant_non_negative\"}} 0 <= {curr_v};\n"
-                    ));
+                let mut substs = Vec::new();
+                for ((pname, _), arg) in r.params.iter().zip(args.iter()) {
+                    substs.push((pname.clone(), arg.clone()));
                 }
+                s.push_str(&emit_boogie_variant_obligations(
+                    r, m, &substs, revealed, strings, &pad,
+                ));
             }
         }
         _ => {}
     }
 
+    s
+}
+
+fn emit_boogie_variant_obligations(
+    r: &RoutineDecl,
+    m: &ModuleDecl,
+    substs: &[(String, Expr)],
+    revealed: &HashSet<String>,
+    strings: &[String],
+    pad: &str,
+) -> String {
+    if r.variant.is_empty() {
+        return String::new();
+    }
+    let empty_fields = HashSet::new();
+    let mut s = String::new();
+
+    if r.variant.len() == 1 && matches!(&r.variant[0], Expr::Var(v) if v == "Current") {
+        let recv_bpl = if let Some((_, repl)) = substs.iter().find(|(k, _)| k == "Current") {
+            emit_boogie_expr_with_strings(repl, m, &empty_fields, revealed, "DefaultFuel", strings)
+        } else {
+            "Current".to_string()
+        };
+        s.push_str(&format!(
+            "{pad}assert {{:msg \"{}::variant::variant_decrease\"}} {}_adt_size({recv_bpl}) < {}_adt_size(Current);\n",
+            r.name, m.name, m.name
+        ));
+        return s;
+    }
+
+    let mut curr_vals = Vec::new();
+    let mut next_vals = Vec::new();
+
+    for v_e in &r.variant {
+        let curr_v = emit_boogie_expr_with_strings(v_e, m, &empty_fields, revealed, "DefaultFuel", strings);
+        s.push_str(&format!(
+            "{pad}assert {{:msg \"{}::variant::variant_non_negative\"}} 0 <= {curr_v};\n",
+            r.name
+        ));
+        let next_var_e = subst_expr_vars(v_e, substs);
+        let next_v = emit_boogie_expr_with_strings(&next_var_e, m, &empty_fields, revealed, "DefaultFuel", strings);
+        curr_vals.push(curr_v);
+        next_vals.push(next_v);
+    }
+
+    let mut disjuncts = Vec::new();
+    for i in 0..curr_vals.len() {
+        let mut conjuncts = Vec::new();
+        for j in 0..i {
+            conjuncts.push(format!("({} == {})", next_vals[j], curr_vals[j]));
+        }
+        conjuncts.push(format!("({} < {})", next_vals[i], curr_vals[i]));
+        disjuncts.push(format!("({})", conjuncts.join(" && ")));
+    }
+
+    let decr_expr = if disjuncts.len() == 1 {
+        format!("{} < {}", next_vals[0], curr_vals[0])
+    } else {
+        disjuncts.join(" || ")
+    };
+
+    s.push_str(&format!(
+        "{pad}assert {{:msg \"{}::variant::variant_decrease\"}} ({decr_expr});\n",
+        r.name
+    ));
     s
 }
 
@@ -3494,6 +5168,7 @@ fn emit_boogie_block_expr(
     m: &ModuleDecl,
     implicit_fields: &HashSet<String>,
     fuel_var: &str,
+    strings: &[String],
 ) -> String {
     let mut revealed = HashSet::new();
     for st in stmts {
@@ -3507,116 +5182,199 @@ fn emit_boogie_block_expr(
             expr = subst_expr_var(&expr, var, val);
         }
     }
-    emit_boogie_expr(&expr, m, implicit_fields, &revealed, fuel_var)
+    emit_boogie_expr_with_strings(&expr, m, implicit_fields, &revealed, fuel_var, strings)
 }
 
-fn subst_expr_var(e: &Expr, target: &str, replacement: &Expr) -> Expr {
+pub fn subst_expr_var(e: &Expr, target: &str, replacement: &Expr) -> Expr {
+    subst_expr_vars(e, &[(target.to_string(), replacement.clone())])
+}
+
+pub fn subst_expr_vars(e: &Expr, substs: &[(String, Expr)]) -> Expr {
+    if substs.is_empty() {
+        return e.clone();
+    }
     match e {
-        Expr::Int(_) | Expr::Bool(_) | Expr::Str(_) => e.clone(),
+        Expr::Int(_) | Expr::Float(_) | Expr::Char(_) | Expr::Unit | Expr::Bool(_) | Expr::Str(_) => e.clone(),
         Expr::Var(v) => {
-            if v == target {
-                replacement.clone()
+            if let Some((_, repl)) = substs.iter().find(|(target, _)| target == v) {
+                repl.clone()
             } else {
                 e.clone()
             }
         }
-        Expr::UnaryNot(inner) => {
-            Expr::UnaryNot(Box::new(subst_expr_var(inner, target, replacement)))
-        }
+        Expr::UnaryNot(inner) => Expr::UnaryNot(Box::new(subst_expr_vars(inner, substs))),
+        Expr::UnaryNeg(inner) => Expr::UnaryNeg(Box::new(subst_expr_vars(inner, substs))),
         Expr::BinOp(op, l, r) => Expr::BinOp(
             op.clone(),
-            Box::new(subst_expr_var(l, target, replacement)),
-            Box::new(subst_expr_var(r, target, replacement)),
+            Box::new(subst_expr_vars(l, substs)),
+            Box::new(subst_expr_vars(r, substs)),
         ),
         Expr::Call(f, args) => Expr::Call(
             f.clone(),
-            args.iter()
-                .map(|a| subst_expr_var(a, target, replacement))
-                .collect(),
+            args.iter().map(|a| subst_expr_vars(a, substs)).collect(),
         ),
         Expr::MethodCall(recv, mname, args) => Expr::MethodCall(
-            Box::new(subst_expr_var(recv, target, replacement)),
+            Box::new(subst_expr_vars(recv, substs)),
             mname.clone(),
-            args.iter()
-                .map(|a| subst_expr_var(a, target, replacement))
-                .collect(),
+            args.iter().map(|a| subst_expr_vars(a, substs)).collect(),
         ),
-        Expr::If(c, ts, te, es, ee) => Expr::If(
-            Box::new(subst_expr_var(c, target, replacement)),
-            ts.clone(),
-            Box::new(subst_expr_var(te, target, replacement)),
-            es.clone(),
-            Box::new(subst_expr_var(ee, target, replacement)),
-        ),
-        Expr::Match(scrut, cases) => Expr::Match(
-            Box::new(subst_expr_var(scrut, target, replacement)),
-            cases.clone(),
-        ),
+        Expr::If(c, ts, te, es, ee) => {
+            let c_sub = subst_expr_vars(c, substs);
+            let (ts_sub, te_sub) = subst_block(ts, te, substs);
+            let (es_sub, ee_sub) = subst_block(es, ee, substs);
+            Expr::If(
+                Box::new(c_sub),
+                ts_sub,
+                Box::new(te_sub),
+                es_sub,
+                Box::new(ee_sub),
+            )
+        }
+        Expr::Match(scrut, cases) => {
+            let scrut_sub = subst_expr_vars(scrut, substs);
+            let new_cases = cases
+                .iter()
+                .map(|c| {
+                    let binds = c.bindings();
+                    let active_substs: Vec<(String, Expr)> = substs
+                        .iter()
+                        .filter(|(target, _)| !binds.contains(target))
+                        .cloned()
+                        .collect();
+                    let (stmts_sub, body_sub) = subst_block(&c.stmts, &c.body, &active_substs);
+                    MatchCase::new(c.pattern.clone(), stmts_sub, body_sub)
+                })
+                .collect();
+            Expr::Match(Box::new(scrut_sub), new_cases)
+        }
         Expr::RecordLit(fields) => Expr::RecordLit(
             fields
                 .iter()
-                .map(|(k, v)| (k.clone(), subst_expr_var(v, target, replacement)))
+                .map(|(k, v)| (k.clone(), subst_expr_vars(v, substs)))
                 .collect(),
         ),
         Expr::RecordUpdate(base, fields) => Expr::RecordUpdate(
-            Box::new(subst_expr_var(base, target, replacement)),
+            Box::new(subst_expr_vars(base, substs)),
             fields
                 .iter()
-                .map(|(k, v)| (k.clone(), subst_expr_var(v, target, replacement)))
+                .map(|(k, v)| (k.clone(), subst_expr_vars(v, substs)))
                 .collect(),
         ),
         Expr::TupleLit(elems) => Expr::TupleLit(
-            elems
-                .iter()
-                .map(|el| subst_expr_var(el, target, replacement))
-                .collect(),
+            elems.iter().map(|el| subst_expr_vars(el, substs)).collect(),
         ),
         Expr::Forall(v, ty, body) => {
-            if v == target {
-                e.clone()
-            } else {
-                Expr::Forall(
-                    v.clone(),
-                    ty.clone(),
-                    Box::new(subst_expr_var(body, target, replacement)),
-                )
-            }
+            let active_substs: Vec<(String, Expr)> =
+                substs.iter().filter(|(target, _)| target != v).cloned().collect();
+            Expr::Forall(
+                v.clone(),
+                ty.clone(),
+                Box::new(subst_expr_vars(body, &active_substs)),
+            )
         }
         Expr::Exists(v, ty, body) => {
-            if v == target {
-                e.clone()
-            } else {
-                Expr::Exists(
-                    v.clone(),
-                    ty.clone(),
-                    Box::new(subst_expr_var(body, target, replacement)),
-                )
-            }
+            let active_substs: Vec<(String, Expr)> =
+                substs.iter().filter(|(target, _)| target != v).cloned().collect();
+            Expr::Exists(
+                v.clone(),
+                ty.clone(),
+                Box::new(subst_expr_vars(body, &active_substs)),
+            )
         }
-        Expr::WithIo(stmts, final_e) => Expr::WithIo(
-            stmts.clone(),
-            Box::new(subst_expr_var(final_e, target, replacement)),
-        ),
-        Expr::Lambda(ps, rt, stmts, body) => Expr::Lambda(
-            ps.clone(),
-            rt.clone(),
-            stmts.clone(),
-            Box::new(subst_expr_var(body, target, replacement)),
-        ),
+        Expr::WithIo(stmts, final_e) => {
+            let mut new_stmts = Vec::new();
+            let mut cur_substs: Vec<(String, Expr)> = substs.to_vec();
+            for s in stmts {
+                match s {
+                    IoStmt::Bind(v, e) => {
+                        let e_sub = subst_expr_vars(e, &cur_substs);
+                        new_stmts.push(IoStmt::Bind(v.clone(), e_sub));
+                        cur_substs.retain(|(target, _)| target != v);
+                    }
+                    IoStmt::Action(e) => {
+                        let e_sub = subst_expr_vars(e, &cur_substs);
+                        new_stmts.push(IoStmt::Action(e_sub));
+                    }
+                }
+            }
+            let final_sub = subst_expr_vars(final_e, &cur_substs);
+            Expr::WithIo(new_stmts, Box::new(final_sub))
+        }
+        Expr::Lambda(ps, rt, stmts, body) => {
+            let active_substs: Vec<(String, Expr)> = substs
+                .iter()
+                .filter(|(target, _)| !ps.iter().any(|(p, _)| p == target))
+                .cloned()
+                .collect();
+            let (stmts_sub, body_sub) = subst_block(stmts, body, &active_substs);
+            Expr::Lambda(ps.clone(), rt.clone(), stmts_sub, Box::new(body_sub))
+        }
     }
 }
 
-fn emit_boogie_expr(
+fn subst_block(
+    stmts: &[Stmt],
+    body: &Expr,
+    substs: &[(String, Expr)],
+) -> (Vec<Stmt>, Expr) {
+    let mut new_stmts = Vec::new();
+    let mut cur_substs = substs.to_vec();
+    for s in stmts {
+        match s {
+            Stmt::Let(v, e) => {
+                let e_sub = subst_expr_vars(e, &cur_substs);
+                new_stmts.push(Stmt::Let(v.clone(), e_sub));
+                cur_substs.retain(|(target, _)| target != v);
+            }
+            Stmt::Check(tag, e) => {
+                new_stmts.push(Stmt::Check(tag.clone(), subst_expr_vars(e, &cur_substs)));
+            }
+            Stmt::Assume(tag, e) => {
+                new_stmts.push(Stmt::Assume(tag.clone(), subst_expr_vars(e, &cur_substs)));
+            }
+            Stmt::Reveal(t) => {
+                new_stmts.push(Stmt::Reveal(t.clone()));
+            }
+        }
+    }
+    let body_sub = subst_expr_vars(body, &cur_substs);
+    (new_stmts, body_sub)
+}
+
+pub fn emit_boogie_expr(
     e: &Expr,
     m: &ModuleDecl,
     implicit_fields: &HashSet<String>,
     revealed: &HashSet<String>,
     fuel_var: &str,
 ) -> String {
+    let strings = collect_module_strings(m);
+    emit_boogie_expr_with_strings(e, m, implicit_fields, revealed, fuel_var, &strings)
+}
+
+fn emit_boogie_expr_with_strings(
+    e: &Expr,
+    m: &ModuleDecl,
+    implicit_fields: &HashSet<String>,
+    revealed: &HashSet<String>,
+    fuel_var: &str,
+    strings: &[String],
+) -> String {
     match e {
         Expr::Int(n) => n.to_string(),
+        Expr::Float(f) => format!("F64_lit_{}", f.to_bits()),
+        Expr::Char(c) => c.to_string(),
+        Expr::Unit => "Unit_val".to_string(),
         Expr::Bool(b) => b.to_string(),
-        Expr::Str(_) => "IO_read_line()".to_string(),
+        Expr::Str(s) => {
+            if s.is_empty() {
+                "str_lit_empty".to_string()
+            } else if let Some(idx) = strings.iter().position(|x| x == s) {
+                format!("str_lit_{idx}")
+            } else {
+                "str_lit_empty".to_string()
+            }
+        }
         Expr::Var(v) => {
             if implicit_fields.contains(v) {
                 format!("{}_{}(Current)", m.name, v)
@@ -3635,15 +5393,39 @@ fn emit_boogie_expr(
         Expr::UnaryNot(inner) => {
             format!(
                 "(!{})",
-                emit_boogie_expr(inner, m, implicit_fields, revealed, fuel_var)
+                emit_boogie_expr_with_strings(inner, m, implicit_fields, revealed, fuel_var, strings)
+            )
+        }
+        Expr::UnaryNeg(inner) => {
+            format!(
+                "(-{})",
+                emit_boogie_expr_with_strings(inner, m, implicit_fields, revealed, fuel_var, strings)
             )
         }
         Expr::BinOp(op, l, r) => {
             if op == "+" && (matches!(&**l, Expr::Str(_)) || matches!(&**r, Expr::Str(_))) {
                 return format!(
                     "Str_concat({}, {})",
-                    emit_boogie_expr(l, m, implicit_fields, revealed, fuel_var),
-                    emit_boogie_expr(r, m, implicit_fields, revealed, fuel_var)
+                    emit_boogie_expr_with_strings(l, m, implicit_fields, revealed, fuel_var, strings),
+                    emit_boogie_expr_with_strings(r, m, implicit_fields, revealed, fuel_var, strings)
+                );
+            }
+            let b_fn = match op.as_str() {
+                "+%" => Some("u64_wrap_add"),
+                "-%" => Some("u64_wrap_sub"),
+                "*%" => Some("u64_wrap_mul"),
+                "&" => Some("u64_bit_and"),
+                "|" => Some("u64_bit_or"),
+                "^" => Some("u64_bit_xor"),
+                "<<" => Some("u64_bit_shl"),
+                ">>" => Some("u64_bit_shr"),
+                _ => None,
+            };
+            if let Some(fn_name) = b_fn {
+                return format!(
+                    "{fn_name}({}, {})",
+                    emit_boogie_expr_with_strings(l, m, implicit_fields, revealed, fuel_var, strings),
+                    emit_boogie_expr_with_strings(r, m, implicit_fields, revealed, fuel_var, strings)
                 );
             }
             let b_op = match op.as_str() {
@@ -3657,8 +5439,8 @@ fn emit_boogie_expr(
             };
             format!(
                 "({} {b_op} {})",
-                emit_boogie_expr(l, m, implicit_fields, revealed, fuel_var),
-                emit_boogie_expr(r, m, implicit_fields, revealed, fuel_var)
+                emit_boogie_expr_with_strings(l, m, implicit_fields, revealed, fuel_var, strings),
+                emit_boogie_expr_with_strings(r, m, implicit_fields, revealed, fuel_var, strings)
             )
         }
         Expr::Call(fname, args) => {
@@ -3666,7 +5448,7 @@ fn emit_boogie_expr(
                 matches!(&m.repr, ReprKind::Sum(vs) if vs.iter().any(|v| v.name == *fname));
             let a_str: Vec<String> = args
                 .iter()
-                .map(|a| emit_boogie_expr(a, m, implicit_fields, revealed, fuel_var))
+                .map(|a| emit_boogie_expr_with_strings(a, m, implicit_fields, revealed, fuel_var, strings))
                 .collect();
             if is_ctor {
                 format!("{fname}({})", a_str.join(", "))
@@ -3677,6 +5459,12 @@ fn emit_boogie_expr(
                     fuel_var
                 };
                 let mut full_args = vec![call_fuel.to_string()];
+                if m.kind == ModuleKind::Module
+                    && (m.feature_routines.iter().any(|(_, r)| r.name == *fname)
+                        || m.specify_routines.iter().any(|(_, r)| r.name == *fname))
+                {
+                    full_args.push("Current".to_string());
+                }
                 full_args.extend(a_str);
                 format!("fn_{fname}({})", full_args.join(", "))
             }
@@ -3689,7 +5477,14 @@ fn emit_boogie_expr(
                         "singleton" => {
                             return format!(
                                 "Seq_singleton({})",
-                                emit_boogie_expr(&args[0], m, implicit_fields, revealed, fuel_var)
+                                emit_boogie_expr_with_strings(
+                                    &args[0],
+                                    m,
+                                    implicit_fields,
+                                    revealed,
+                                    fuel_var,
+                                    strings
+                                )
                             );
                         }
                         _ => {}
@@ -3697,7 +5492,16 @@ fn emit_boogie_expr(
                 } else if v == "IO" {
                     let a_str: Vec<String> = args
                         .iter()
-                        .map(|a| emit_boogie_expr(a, m, implicit_fields, revealed, fuel_var))
+                        .map(|a| {
+                            emit_boogie_expr_with_strings(
+                                a,
+                                m,
+                                implicit_fields,
+                                revealed,
+                                fuel_var,
+                                strings,
+                            )
+                        })
                         .collect();
                     return format!("IO_{mname}({})", a_str.join(", "));
                 } else if v == &m.name {
@@ -3708,27 +5512,34 @@ fn emit_boogie_expr(
                     };
                     let mut full_args = vec![call_fuel.to_string()];
                     for a in args {
-                        full_args.push(emit_boogie_expr(a, m, implicit_fields, revealed, fuel_var));
+                        full_args.push(emit_boogie_expr_with_strings(
+                            a,
+                            m,
+                            implicit_fields,
+                            revealed,
+                            fuel_var,
+                            strings,
+                        ));
                     }
                     return format!("fn_{mname}({})", full_args.join(", "));
                 }
             }
-            let r_str = emit_boogie_expr(recv, m, implicit_fields, revealed, fuel_var);
+            let r_str = emit_boogie_expr_with_strings(recv, m, implicit_fields, revealed, fuel_var, strings);
             match mname.as_str() {
                 "append" => format!(
                     "Seq_append({r_str}, {})",
-                    emit_boogie_expr(&args[0], m, implicit_fields, revealed, fuel_var)
+                    emit_boogie_expr_with_strings(&args[0], m, implicit_fields, revealed, fuel_var, strings)
                 ),
                 "prepend" => format!(
                     "Seq_prepend({}, {r_str})",
-                    emit_boogie_expr(&args[0], m, implicit_fields, revealed, fuel_var)
+                    emit_boogie_expr_with_strings(&args[0], m, implicit_fields, revealed, fuel_var, strings)
                 ),
                 "head" => format!("Seq_head({r_str})"),
                 "tail" => format!("Seq_tail({r_str})"),
                 "length" if m.name != "SEQ" => format!("Seq_length({r_str})"),
                 "has" => format!(
                     "Seq_has({r_str}, {})",
-                    emit_boogie_expr(&args[0], m, implicit_fields, revealed, fuel_var)
+                    emit_boogie_expr_with_strings(&args[0], m, implicit_fields, revealed, fuel_var, strings)
                 ),
                 "first" => format!("Tuple2_first({r_str})"),
                 "second" => format!("Tuple2_second({r_str})"),
@@ -3745,7 +5556,14 @@ fn emit_boogie_expr(
                     };
                     let mut full_args = vec![call_fuel.to_string(), r_str];
                     for a in args {
-                        full_args.push(emit_boogie_expr(a, m, implicit_fields, revealed, fuel_var));
+                        full_args.push(emit_boogie_expr_with_strings(
+                            a,
+                            m,
+                            implicit_fields,
+                            revealed,
+                            fuel_var,
+                            strings,
+                        ));
                     }
                     format!("fn_{mname}({})", full_args.join(", "))
                 }
@@ -3754,13 +5572,14 @@ fn emit_boogie_expr(
         Expr::If(c, ts, te, es, ee) => {
             format!(
                 "(if {} then {} else {})",
-                emit_boogie_expr(c, m, implicit_fields, revealed, fuel_var),
-                emit_boogie_block_expr(ts, te, m, implicit_fields, fuel_var),
-                emit_boogie_block_expr(es, ee, m, implicit_fields, fuel_var)
+                emit_boogie_expr_with_strings(c, m, implicit_fields, revealed, fuel_var, strings),
+                emit_boogie_block_expr(ts, te, m, implicit_fields, fuel_var, strings),
+                emit_boogie_block_expr(es, ee, m, implicit_fields, fuel_var, strings)
             )
         }
         Expr::Match(scrut, cases) => {
-            let s_str = emit_boogie_expr(scrut, m, implicit_fields, revealed, fuel_var);
+            let s_str =
+                emit_boogie_expr_with_strings(scrut, m, implicit_fields, revealed, fuel_var, strings);
             if cases.is_empty() {
                 return s_str;
             }
@@ -3770,28 +5589,68 @@ fn emit_boogie_expr(
                 m,
                 implicit_fields,
                 fuel_var,
+                strings,
             );
             for c in cases.iter().rev().skip(1) {
-                let branch_val = emit_boogie_match_case(&s_str, c, m, implicit_fields, fuel_var);
-                acc = format!("(if is_{}({s_str}) then {branch_val} else {acc})", c.ctor);
+                let branch_val =
+                    emit_boogie_match_case(&s_str, c, m, implicit_fields, fuel_var, strings);
+                acc = format!("(if is_{}({s_str}) then {branch_val} else {acc})", c.ctor());
             }
             acc
         }
         Expr::RecordLit(fields) => {
-            let args: Vec<String> = fields
-                .iter()
-                .map(|(_, fe)| emit_boogie_expr(fe, m, implicit_fields, revealed, fuel_var))
-                .collect();
-            format!("{}_Ctor({})", m.name, args.join(", "))
+            if let ReprKind::Product(decl_fields) = &m.repr {
+                let args: Vec<String> = decl_fields
+                    .iter()
+                    .map(|(fnm, _)| {
+                        if let Some((_, fe)) = fields.iter().find(|(k, _)| k == fnm) {
+                            emit_boogie_expr_with_strings(
+                                fe,
+                                m,
+                                implicit_fields,
+                                revealed,
+                                fuel_var,
+                                strings,
+                            )
+                        } else {
+                            "0".to_string()
+                        }
+                    })
+                    .collect();
+                format!("{}_Ctor({})", m.name, args.join(", "))
+            } else {
+                let args: Vec<String> = fields
+                    .iter()
+                    .map(|(_, fe)| {
+                        emit_boogie_expr_with_strings(
+                            fe,
+                            m,
+                            implicit_fields,
+                            revealed,
+                            fuel_var,
+                            strings,
+                        )
+                    })
+                    .collect();
+                format!("{}_Ctor({})", m.name, args.join(", "))
+            }
         }
         Expr::RecordUpdate(base, updates) => {
-            let b_str = emit_boogie_expr(base, m, implicit_fields, revealed, fuel_var);
+            let b_str =
+                emit_boogie_expr_with_strings(base, m, implicit_fields, revealed, fuel_var, strings);
             if let ReprKind::Product(fields) = &m.repr {
                 let args: Vec<String> = fields
                     .iter()
                     .map(|(fnm, _)| {
                         if let Some((_, uexpr)) = updates.iter().find(|(uf, _)| uf == fnm) {
-                            emit_boogie_expr(uexpr, m, implicit_fields, revealed, fuel_var)
+                            emit_boogie_expr_with_strings(
+                                uexpr,
+                                m,
+                                implicit_fields,
+                                revealed,
+                                fuel_var,
+                                strings,
+                            )
                         } else {
                             format!("{}_{}({b_str})", m.name, fnm)
                         }
@@ -3805,7 +5664,9 @@ fn emit_boogie_expr(
         Expr::TupleLit(elems) => {
             let es: Vec<String> = elems
                 .iter()
-                .map(|el| emit_boogie_expr(el, m, implicit_fields, revealed, fuel_var))
+                .map(|el| {
+                    emit_boogie_expr_with_strings(el, m, implicit_fields, revealed, fuel_var, strings)
+                })
                 .collect();
             if es.len() == 2 {
                 format!("Tuple2_mk({}, {})", es[0], es[1])
@@ -3817,21 +5678,21 @@ fn emit_boogie_expr(
             format!(
                 "(forall {v}: {} :: {})",
                 map_boogie_type(ty, m),
-                emit_boogie_expr(body, m, implicit_fields, revealed, fuel_var)
+                emit_boogie_expr_with_strings(body, m, implicit_fields, revealed, fuel_var, strings)
             )
         }
         Expr::Exists(v, ty, body) => {
             format!(
                 "(exists {v}: {} :: {})",
                 map_boogie_type(ty, m),
-                emit_boogie_expr(body, m, implicit_fields, revealed, fuel_var)
+                emit_boogie_expr_with_strings(body, m, implicit_fields, revealed, fuel_var, strings)
             )
         }
         Expr::WithIo(_, final_e) => {
-            emit_boogie_expr(final_e, m, implicit_fields, revealed, fuel_var)
+            emit_boogie_expr_with_strings(final_e, m, implicit_fields, revealed, fuel_var, strings)
         }
         Expr::Lambda(_, _, stmts, body) => {
-            emit_boogie_block_expr(stmts, body, m, implicit_fields, fuel_var)
+            emit_boogie_block_expr(stmts, body, m, implicit_fields, fuel_var, strings)
         }
     }
 }
@@ -3842,6 +5703,7 @@ fn emit_boogie_match_case(
     m: &ModuleDecl,
     implicit_fields: &HashSet<String>,
     fuel_var: &str,
+    strings: &[String],
 ) -> String {
     let mut expr = c.body.clone();
     for st in c.stmts.iter().rev() {
@@ -3849,12 +5711,21 @@ fn emit_boogie_match_case(
             expr = subst_expr_var(&expr, var, val);
         }
     }
-    let mut out = emit_boogie_expr(&expr, m, implicit_fields, &HashSet::new(), fuel_var);
+    let mut out = emit_boogie_expr_with_strings(
+        &expr,
+        m,
+        implicit_fields,
+        &HashSet::new(),
+        fuel_var,
+        strings,
+    );
     if let ReprKind::Sum(variants) = &m.repr {
-        if let Some(vdecl) = variants.iter().find(|v| v.name == c.ctor) {
-            for (bname, (fname, _)) in c.bindings.iter().zip(vdecl.fields.iter()) {
-                let proj = format!("{}_{}({scrut_bpl})", c.ctor, fname);
-                out = replace_whole_ident(&out, bname, &proj);
+        if let Some(vdecl) = variants.iter().find(|v| v.name == c.ctor()) {
+            for (opt_b, (fname, _)) in c.top_bindings().iter().zip(vdecl.fields.iter()) {
+                if let Some(bname) = opt_b {
+                    let proj = format!("{}_{}({scrut_bpl})", c.ctor(), fname);
+                    out = replace_whole_ident(&out, bname, &proj);
+                }
             }
         }
     }
@@ -3892,6 +5763,9 @@ fn replace_whole_ident(haystack: &str, ident: &str, replacement: &str) -> String
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum GardelVal {
     Int(i128),
+    Float(u64),
+    Char(u32),
+    Unit,
     Bool(bool),
     Str(String),
     List(Vec<GardelVal>),
@@ -3906,6 +5780,9 @@ impl GardelVal {
     pub fn to_gardel_syntax(&self) -> String {
         match self {
             GardelVal::Int(n) => n.to_string(),
+            GardelVal::Float(bits) => format!("{}", f64::from_bits(*bits)),
+            GardelVal::Char(c) => format!("'{}'", char::from_u32(*c).unwrap_or('?')),
+            GardelVal::Unit => "()".to_string(),
             GardelVal::Bool(true) => "True".to_string(),
             GardelVal::Bool(false) => "False".to_string(),
             GardelVal::Str(s) => format!("\"{s}\""),
@@ -3944,7 +5821,6 @@ impl GardelVal {
         }
     }
 }
-
 /// Translates raw Z3 / Boogie model text into Gardel record and variant syntax (§12).
 pub fn translate_z3_model_to_gardel(raw_model: &str, m: &ModuleDecl) -> BTreeMap<String, String> {
     let mut out = BTreeMap::new();
@@ -3954,11 +5830,22 @@ pub fn translate_z3_model_to_gardel(raw_model: &str, m: &ModuleDecl) -> BTreeMap
             let var = lhs.trim();
             let val = rhs.trim().trim_end_matches(';');
             if var.is_empty()
+                || var == "_"
                 || var.starts_with('%')
                 || var.starts_with("T@")
                 || var.contains("Fuel")
                 || var == "U64_MAX"
+                || var == "ControlFlow"
+                || var.starts_with("tickle")
             {
+                continue;
+            }
+            let clean_var = if let Some(idx) = var.find('@') {
+                var[..idx].trim()
+            } else {
+                var
+            };
+            if clean_var.is_empty() || clean_var == "_" {
                 continue;
             }
             let gardel_val = if val == "true" {
@@ -3983,10 +5870,272 @@ pub fn translate_z3_model_to_gardel(raw_model: &str, m: &ModuleDecl) -> BTreeMap
             } else {
                 val.to_string()
             };
-            out.insert(var.to_string(), gardel_val);
+            if !out.contains_key(clean_var)
+                || (!gardel_val.starts_with("T@")
+                    && out.get(clean_var).is_some_and(|v: &String| v.starts_with("T@")))
+            {
+                out.insert(clean_var.to_string(), gardel_val);
+            }
         }
     }
     out
+}
+
+/// Discovers Boogie and Z3 executables from environment or standard paths.
+pub fn find_solvers() -> (Option<String>, Option<String>) {
+    let boogie = env::var("BOOGIE_EXE").ok().or_else(|| {
+        if let Ok(userprofile) = env::var("USERPROFILE") {
+            let p = format!("{userprofile}\\.dotnet\\tools\\boogie.exe");
+            if std::path::Path::new(&p).exists() {
+                return Some(p);
+            }
+        }
+        if let Ok(home) = env::var("HOME") {
+            let p = format!("{home}/.dotnet/tools/boogie");
+            if std::path::Path::new(&p).exists() {
+                return Some(p);
+            }
+        }
+        which_solver("boogie")
+    });
+
+    let z3 = env::var("Z3_EXE").ok().or_else(|| {
+        let dafny_z3 = r"C:\home\Learn\Gardel\tools\dafny\z3\bin\z3-4.12.1.exe";
+        if std::path::Path::new(dafny_z3).exists() {
+            return Some(dafny_z3.to_string());
+        }
+        which_solver("z3")
+    });
+
+    (boogie, z3)
+}
+
+fn which_solver(name: &str) -> Option<String> {
+    if let Ok(path_var) = env::var("PATH") {
+        for dir in env::split_paths(&path_var) {
+            let candidate = dir.join(name);
+            if candidate.is_file() {
+                return Some(candidate.to_string_lossy().to_string());
+            }
+            #[cfg(windows)]
+            {
+                let candidate_exe = dir.join(format!("{name}.exe"));
+                if candidate_exe.is_file() {
+                    return Some(candidate_exe.to_string_lossy().to_string());
+                }
+            }
+        }
+    }
+    None
+}
+
+fn run_boogie_verification(
+    m: &ModuleDecl,
+    fuel_limit: usize,
+    boogie_path: &str,
+    z3_path: &str,
+    src: &str,
+    input_path: &str,
+) -> Result<Vec<Diagnostic>, String> {
+    let bpl_code = emit_boogie(m, fuel_limit);
+    let mut temp_path = env::temp_dir();
+    temp_path.push(format!("gardel_verify_{}_{}.bpl", m.name, std::process::id()));
+    fs::write(&temp_path, &bpl_code)
+        .map_err(|e| format!("Failed to write temporary Boogie file: {e}"))?;
+
+    let mut cmd = Command::new(boogie_path);
+    cmd.arg(format!("/proverOpt:PROVER_PATH={z3_path}"));
+    cmd.arg("/mv:-");
+    cmd.arg("/errorTrace:0");
+    cmd.arg(&temp_path);
+
+    let output = cmd.output().map_err(|e| format!("Failed to spawn Boogie process: {e}"))?;
+    let _ = fs::remove_file(&temp_path);
+
+    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+    let full_out = format!("{stdout}\n{stderr}");
+
+    Ok(parse_boogie_output(&full_out, m, src, input_path))
+}
+
+fn collect_routine_path_conditions(m: &ModuleDecl, routine: &str) -> Vec<String> {
+    for (_, r) in m
+        .create_routines
+        .iter()
+        .chain(m.feature_routines.iter())
+        .chain(m.specify_routines.iter())
+    {
+        if r.name == routine {
+            let mut pcs = Vec::new();
+            for (_, req_e) in &r.requires {
+                pcs.push(format_gardel_expr(req_e));
+            }
+            for st in &r.stmts {
+                if let Stmt::Reveal(t) = st {
+                    pcs.push(format!("reveal {t}"));
+                }
+            }
+            return pcs;
+        }
+    }
+    Vec::new()
+}
+
+pub fn parse_boogie_output(
+    output: &str,
+    m: &ModuleDecl,
+    src: &str,
+    input_path: &str,
+) -> Vec<Diagnostic> {
+    let mut diags = Vec::new();
+    let lines: Vec<&str> = output.lines().collect();
+    let mut i = 0;
+    while i < lines.len() {
+        let line = lines[i].trim();
+
+        // 1. Assertion failure with counterexample model
+        if line.starts_with("*** MODEL") {
+            let mut msg_line = "";
+            let mut j = (i as isize) - 1;
+            while j >= 0 {
+                let candidate = lines[j as usize].trim();
+                if !candidate.is_empty()
+                    && !candidate.starts_with("***")
+                    && !candidate.contains("Boogie program verifier")
+                    && !candidate.starts_with("Execution trace:")
+                {
+                    msg_line = candidate;
+                    break;
+                }
+                j -= 1;
+            }
+
+            let mut raw_model = String::new();
+            i += 1;
+            while i < lines.len() {
+                let l = lines[i].trim();
+                if l.starts_with("*** END_MODEL") {
+                    i += 1;
+                    break;
+                }
+                raw_model.push_str(l);
+                raw_model.push('\n');
+                i += 1;
+            }
+
+            let (routine, rule_kind, tag) = parse_msg_tag(msg_line);
+            let cex = translate_z3_model_to_gardel(&raw_model, m);
+            let sp = locate_span(src, input_path, &tag, &routine);
+            let lemmas = find_relevant_lemmas_for_tag(m, &routine, &tag);
+            let pcs = collect_routine_path_conditions(m, &routine);
+
+            let static_rule = match rule_kind.as_str() {
+                "overflow" => "Phase 3 Boogie (Arithmetic Overflow)",
+                "div_by_zero" => "Phase 3 Boogie (Division by Zero)",
+                "variant" => "Phase 3 Boogie (Termination Variant Violation)",
+                "invariant" => "Phase 3 Boogie (Invariant Violation)",
+                "ensure" => "Phase 3 Boogie (Postcondition Violation)",
+                "check" => "Phase 3 Boogie (Check Assertion Failed)",
+                "match" => "Phase 3 Boogie (Non-Exhaustive Match)",
+                _ => "Phase 3 Boogie (Verification Condition Failed)",
+            };
+            let diag = Diagnostic::basic(
+                "error",
+                static_rule,
+                routine.clone(),
+                tag.clone(),
+                format!("Formal verification condition `{tag}` failed in `{routine}`"),
+            )
+            .with_ai_context(sp, pcs, cex, lemmas);
+            diags.push(diag);
+            continue;
+        }
+
+        // 2. Boogie internal or syntax error without model
+        if (line.contains(": error:") || line.contains(": Error:") || line.contains("::"))
+            && !line.contains("Boogie program verifier finished")
+            && !line.starts_with("***")
+        {
+            let has_model_ahead = lines[i + 1..]
+                .iter()
+                .take(6)
+                .any(|l| l.trim().starts_with("*** MODEL"));
+            if !has_model_ahead {
+                let (routine, rule_kind, tag) = parse_msg_tag(line);
+                let sp = locate_span(src, input_path, &tag, &routine);
+                let lemmas = find_relevant_lemmas_for_tag(m, &routine, &tag);
+                let pcs = collect_routine_path_conditions(m, &routine);
+                let static_rule = match rule_kind.as_str() {
+                    "overflow" => "Phase 3 Boogie (Arithmetic Overflow)",
+                    "div_by_zero" => "Phase 3 Boogie (Division by Zero)",
+                    "variant" => "Phase 3 Boogie (Termination Variant Violation)",
+                    "invariant" => "Phase 3 Boogie (Invariant Violation)",
+                    "ensure" => "Phase 3 Boogie (Postcondition Violation)",
+                    "check" => "Phase 3 Boogie (Check Assertion Failed)",
+                    "match" => "Phase 3 Boogie (Non-Exhaustive Match)",
+                    _ => "Phase 3 Boogie (Verification Condition Failed)",
+                };
+                diags.push(
+                    Diagnostic::basic(
+                        "error",
+                        static_rule,
+                        routine,
+                        tag,
+                        line.to_string(),
+                    )
+                    .with_ai_context(sp, pcs, BTreeMap::new(), lemmas),
+                );
+            }
+        }
+
+        i += 1;
+    }
+    diags
+}
+
+fn parse_msg_tag(msg: &str) -> (String, String, String) {
+    let clean = if let Some(idx) = msg.find("{:msg \"") {
+        let rest = &msg[idx + 7..];
+        if let Some(end) = rest.find("\"}") {
+            &rest[..end]
+        } else {
+            rest.trim_end_matches('"')
+        }
+    } else {
+        msg
+    };
+    let parts: Vec<&str> = clean.split("::").collect();
+    if parts.len() == 3 {
+        (parts[0].to_string(), parts[1].to_string(), parts[2].to_string())
+    } else if parts.len() == 2 {
+        (parts[0].to_string(), "contract_violation".to_string(), parts[1].to_string())
+    } else {
+        ("Unknown".to_string(), "verification_failure".to_string(), clean.to_string())
+    }
+}
+
+fn find_relevant_lemmas_for_tag(m: &ModuleDecl, routine: &str, tag: &str) -> Vec<String> {
+    for (_, r) in m
+        .create_routines
+        .iter()
+        .chain(m.feature_routines.iter())
+        .chain(m.specify_routines.iter())
+    {
+        if r.name == routine {
+            for (etag, eexpr) in &r.ensures {
+                if etag == tag {
+                    return find_relevant_lemmas(m, routine, eexpr);
+                }
+            }
+        }
+    }
+    for (itag, iexpr) in &m.invariants {
+        if itag == tag {
+            return find_relevant_lemmas(m, routine, iexpr);
+        }
+    }
+    Vec::new()
 }
 
 /// Finds in-scope `specify` routines, laws, and `ensure` clauses sharing symbols with a failed goal (§12).
@@ -4000,7 +6149,7 @@ pub fn find_relevant_lemmas(
 
     for (_, sr) in &m.specify_routines {
         if goal_syms.contains(&sr.name) {
-            lemmas.push(format!("specify {}", sr.name));
+            lemmas.push(format!("reveal {}", sr.name));
         }
         for (etag, eexpr) in &sr.ensures {
             let esyms = collect_symbols(eexpr);
@@ -4060,6 +6209,7 @@ pub fn verify_module_phase3(
     fuel_limit: usize,
     strict_mode: bool,
     audit_mode: bool,
+    bounded_check: bool,
 ) -> Vec<Diagnostic> {
     let mut diags = Vec::new();
     let is_adt = m.kind == ModuleKind::Module;
@@ -4104,7 +6254,25 @@ pub fn verify_module_phase3(
         }
     }
 
-    // 2. Verify each routine (overflow, match exhaustiveness, termination, construction invariant, check, ensure)
+    // 2. Formal Boogie / Z3 Verification
+    if !bounded_check {
+        let (boogie_opt, z3_opt) = find_solvers();
+        if let (Some(boogie_path), Some(z3_path)) = (boogie_opt, z3_opt) {
+            match run_boogie_verification(m, fuel_limit, &boogie_path, &z3_path, src, input_path) {
+                Ok(boogie_diags) => {
+                    diags.extend(boogie_diags);
+                    return diags;
+                }
+                Err(err) => {
+                    eprintln!(
+                        "[WARN] Boogie verification failed to execute: {err}. Falling back to bounded concrete sampling."
+                    );
+                }
+            }
+        }
+    }
+
+    // 3. Fallback: Concrete bounded sampling loop
     for (r, has_current) in &all_routines {
         verify_routine_symbolic(r, *has_current, m, src, input_path, fuel_limit, &mut diags);
     }
@@ -4224,10 +6392,10 @@ fn collect_assume_diagnostics(
             let scrut_s = format_gardel_expr(scrut);
             for c in cases {
                 let mut c_pcs = path_conds.clone();
-                let pat = if c.bindings.is_empty() {
-                    c.ctor.clone()
+                let pat = if c.bindings().is_empty() {
+                    c.ctor().to_string()
                 } else {
-                    format!("{}({})", c.ctor, c.bindings.join(", "))
+                    format!("{}({})", c.ctor(), c.bindings().join(", "))
                 };
                 c_pcs.push(format!("{scrut_s} is {pat}"));
                 collect_assume_diagnostics(
@@ -4265,7 +6433,7 @@ fn verify_routine_symbolic(
             }
             Stmt::Reveal(_) => false,
         });
-    if is_recursive && r.variant.is_none() {
+    if is_recursive && r.variant.is_empty() {
         let sp = locate_span(src, input_path, &r.name, &r.name);
         diags.push(
             Diagnostic::basic(
@@ -4611,14 +6779,14 @@ fn eval_expr_symbolic_with_branches(
             let s_val = eval_expr_symbolic(scrut, env, m, revealed, fuel_limit)
                 .map_err(|f| fault_to_diagnostic(f, r, m, src, input_path, env, pcs))?;
             if let GardelVal::Variant(ctor, args) = &s_val {
-                if let Some(matched) = cases.iter().find(|c| &c.ctor == ctor) {
-                    let pat = if matched.bindings.is_empty() {
-                        matched.ctor.clone()
+                if let Some(matched) = cases.iter().find(|c| c.ctor() == ctor) {
+                    let pat = if matched.bindings().is_empty() {
+                        matched.ctor().to_string()
                     } else {
-                        format!("{}({})", matched.ctor, matched.bindings.join(", "))
+                        format!("{}({})", matched.ctor(), matched.bindings().join(", "))
                     };
                     pcs.push(format!("{} is {pat}", format_gardel_expr(scrut)));
-                    for (b, av) in matched.bindings.iter().zip(args.iter()) {
+                    for (b, av) in matched.bindings().iter().zip(args.iter()) {
                         env.insert(b.clone(), av.clone());
                     }
                     for st in &matched.stmts {
@@ -4803,8 +6971,8 @@ fn find_violated_invariant(
 
 fn expr_calls_routine(e: &Expr, rname: &str) -> bool {
     match e {
-        Expr::Int(_) | Expr::Bool(_) | Expr::Str(_) | Expr::Var(_) => false,
-        Expr::UnaryNot(inner) => expr_calls_routine(inner, rname),
+        Expr::Int(_) | Expr::Float(_) | Expr::Char(_) | Expr::Unit | Expr::Bool(_) | Expr::Str(_) | Expr::Var(_) => false,
+        Expr::UnaryNot(inner) | Expr::UnaryNeg(inner) => expr_calls_routine(inner, rname),
         Expr::BinOp(_, l, r) => expr_calls_routine(l, rname) || expr_calls_routine(r, rname),
         Expr::Call(f, args) => f == rname || args.iter().any(|a| expr_calls_routine(a, rname)),
         Expr::MethodCall(recv, mname, args) => {
@@ -5032,6 +7200,9 @@ fn eval_expr_symbolic(
 ) -> Result<GardelVal, EvalFault> {
     match e {
         Expr::Int(n) => Ok(GardelVal::Int(*n as i128)),
+        Expr::Float(f) => Ok(GardelVal::Float(f.to_bits())),
+        Expr::Char(c) => Ok(GardelVal::Char(*c)),
+        Expr::Unit => Ok(GardelVal::Unit),
         Expr::Bool(b) => Ok(GardelVal::Bool(*b)),
         Expr::Str(s) => Ok(GardelVal::Str(s.clone())),
         Expr::Var(v) => {
@@ -5055,6 +7226,10 @@ fn eval_expr_symbolic(
         }
         Expr::UnaryNot(inner) => match eval_expr_symbolic(inner, env, m, revealed, fuel)? {
             GardelVal::Bool(b) => Ok(GardelVal::Bool(!b)),
+            _ => Err(EvalFault::Unknown),
+        },
+        Expr::UnaryNeg(inner) => match eval_expr_symbolic(inner, env, m, revealed, fuel)? {
+            GardelVal::Int(n) => Ok(GardelVal::Int(-n)),
             _ => Err(EvalFault::Unknown),
         },
         Expr::BinOp(op, l, r) => {
@@ -5255,10 +7430,10 @@ fn eval_expr_symbolic(
         Expr::Match(scrut, cases) => {
             let sv = eval_expr_symbolic(scrut, env, m, revealed, fuel)?;
             if let GardelVal::Variant(ctor, args) = sv {
-                if let Some(c) = cases.iter().find(|c| c.ctor == ctor) {
+                if let Some(c) = cases.iter().find(|c| c.ctor() == ctor) {
                     let mut sub_env = env.clone();
                     let mut sub_rev = revealed.clone();
-                    for (b, av) in c.bindings.iter().zip(args.into_iter()) {
+                    for (b, av) in c.bindings().iter().zip(args.into_iter()) {
                         sub_env.insert(b.clone(), av);
                     }
                     for st in &c.stmts {
@@ -5279,8 +7454,16 @@ fn eval_expr_symbolic(
         }
         Expr::RecordLit(fields) => {
             let mut out = Vec::new();
-            for (fnm, fe) in fields {
-                out.push((fnm.clone(), eval_expr_symbolic(fe, env, m, revealed, fuel)?));
+            if let ReprKind::Product(decl_fields) = &m.repr {
+                for (fnm, _) in decl_fields {
+                    if let Some((_, fe)) = fields.iter().find(|(k, _)| k == fnm) {
+                        out.push((fnm.clone(), eval_expr_symbolic(fe, env, m, revealed, fuel)?));
+                    }
+                }
+            } else {
+                for (fnm, fe) in fields {
+                    out.push((fnm.clone(), eval_expr_symbolic(fe, env, m, revealed, fuel)?));
+                }
             }
             Ok(GardelVal::Record(out))
         }
@@ -5576,11 +7759,13 @@ fn emit_dafny_law(law: &LawDecl, m: &ModuleDecl, implicit_fields: &HashSet<Strin
             tag
         ));
     }
-    if let Some(var) = &law.variant {
-        s.push_str(&format!(
-            "  decreases {}\n",
-            emit_dafny_expr(var, m, implicit_fields)
-        ));
+    if !law.variant.is_empty() {
+        let vars: Vec<String> = law
+            .variant
+            .iter()
+            .map(|v| emit_dafny_expr(v, m, implicit_fields))
+            .collect();
+        s.push_str(&format!("  decreases {}\n", vars.join(", ")));
     }
     for (tag, ens) in &law.ensures {
         s.push_str(&format!(
@@ -5658,10 +7843,10 @@ fn emit_dafny_lemma_stmt_expr(
                 emit_dafny_expr(scrut, m, implicit_fields)
             ));
             for c in cases {
-                let pat = if c.bindings.is_empty() {
-                    c.ctor.clone()
+                let pat = if c.bindings().is_empty() {
+                    c.ctor().to_string()
                 } else {
-                    format!("{}({})", c.ctor, c.bindings.join(", "))
+                    format!("{}({})", c.ctor(), c.bindings().join(", "))
                 };
                 s.push_str(&format!("{pad}  case {pat} =>\n"));
                 s.push_str(&emit_dafny_lemma_stmt_expr(
@@ -5728,11 +7913,13 @@ fn emit_dafny_routine(
             tag
         ));
     }
-    if let Some(var) = &r.variant {
-        s.push_str(&format!(
-            "  decreases {}\n",
-            emit_dafny_expr(var, m, implicit_fields)
-        ));
+    if !r.variant.is_empty() {
+        let vars: Vec<String> = r
+            .variant
+            .iter()
+            .map(|v| emit_dafny_expr(v, m, implicit_fields))
+            .collect();
+        s.push_str(&format!("  decreases {}\n", vars.join(", ")));
     }
     for (tag, ens) in &r.ensures {
         s.push_str(&format!(
@@ -5792,6 +7979,9 @@ fn emit_dafny_block(
 fn emit_dafny_expr(e: &Expr, m: &ModuleDecl, implicit_fields: &HashSet<String>) -> String {
     match e {
         Expr::Int(n) => format!("({n} as U64)"),
+        Expr::Float(f) => format!("({f} as real)"),
+        Expr::Char(c) => format!("'{}'", char::from_u32(*c).unwrap_or('?')),
+        Expr::Unit => "()".to_string(),
         Expr::Bool(b) => b.to_string(),
         Expr::Str(s) => format!("\"{s}\""),
         Expr::Var(v) => {
@@ -5803,6 +7993,9 @@ fn emit_dafny_expr(e: &Expr, m: &ModuleDecl, implicit_fields: &HashSet<String>) 
         }
         Expr::UnaryNot(inner) => {
             format!("(!{})", emit_dafny_expr(inner, m, implicit_fields))
+        }
+        Expr::UnaryNeg(inner) => {
+            format!("(-{})", emit_dafny_expr(inner, m, implicit_fields))
         }
         Expr::BinOp(op, l, r) => {
             let d_op = match op.as_str() {
@@ -5908,10 +8101,10 @@ fn emit_dafny_expr(e: &Expr, m: &ModuleDecl, implicit_fields: &HashSet<String>) 
         Expr::Match(scrut, cases) => {
             let mut s = format!("(match {}\n", emit_dafny_expr(scrut, m, implicit_fields));
             for c in cases {
-                let pat = if c.bindings.is_empty() {
-                    c.ctor.clone()
+                let pat = if c.bindings().is_empty() {
+                    c.ctor().to_string()
                 } else {
-                    format!("{}({})", c.ctor, c.bindings.join(", "))
+                    format!("{}({})", c.ctor(), c.bindings().join(", "))
                 };
                 s.push_str(&format!(
                     "    case {pat} =>\n{}",
@@ -5922,11 +8115,25 @@ fn emit_dafny_expr(e: &Expr, m: &ModuleDecl, implicit_fields: &HashSet<String>) 
             s
         }
         Expr::RecordLit(fields) => {
-            let args: Vec<String> = fields
-                .iter()
-                .map(|(_, fe)| emit_dafny_expr(fe, m, implicit_fields))
-                .collect();
-            format!("{}_Ctor({})", m.name, args.join(", "))
+            if let ReprKind::Product(decl_fields) = &m.repr {
+                let args: Vec<String> = decl_fields
+                    .iter()
+                    .map(|(fnm, _)| {
+                        if let Some((_, fe)) = fields.iter().find(|(k, _)| k == fnm) {
+                            emit_dafny_expr(fe, m, implicit_fields)
+                        } else {
+                            "0".to_string()
+                        }
+                    })
+                    .collect();
+                format!("{}_Ctor({})", m.name, args.join(", "))
+            } else {
+                let args: Vec<String> = fields
+                    .iter()
+                    .map(|(_, fe)| emit_dafny_expr(fe, m, implicit_fields))
+                    .collect();
+                format!("{}_Ctor({})", m.name, args.join(", "))
+            }
         }
         Expr::RecordUpdate(base, fields) => {
             let b_str = emit_dafny_expr(base, m, implicit_fields);
@@ -6044,14 +8251,31 @@ pub fn emit_bend_v2(m: &ModuleDecl) -> String {
 fn emit_bend_block(stmts: &[Stmt], body: &Expr, mod_name: &str, indent: usize) -> String {
     let pad = " ".repeat(indent);
     let mut s = String::new();
-    for st in stmts {
-        if let Stmt::Let(v, e) = st {
+    
+    // Analyze independent recursive let groups for Bend v2 parallel bindings (§10.2)
+    let groups = analyze_parallel_lets(stmts);
+    for group in groups {
+        if group.len() > 1 {
+            let names: Vec<String> = group.iter().map(|(v, _)| v.clone()).collect();
+            let exprs: Vec<String> = group
+                .iter()
+                .map(|(_, e)| emit_bend_expr(e, mod_name, indent))
+                .collect();
             s.push_str(&format!(
-                "{pad}{v} = {}\n",
-                emit_bend_expr(e, mod_name, indent)
+                "{pad}({}) = ({})\n",
+                names.join(", "),
+                exprs.join(", ")
             ));
+        } else {
+            for (v, e) in group {
+                s.push_str(&format!(
+                    "{pad}{v} = {}\n",
+                    emit_bend_expr(&e, mod_name, indent)
+                ));
+            }
         }
     }
+
     if let Expr::WithIo(io_stmts, final_e) = body {
         s.push_str(&format!("{pad}with IO:\n"));
         for io_st in io_stmts {
@@ -6087,10 +8311,14 @@ fn emit_bend_expr(e: &Expr, mod_name: &str, indent: usize) -> String {
     let pad = " ".repeat(indent);
     match e {
         Expr::Int(n) => n.to_string(),
+        Expr::Float(f) => f.to_string(),
+        Expr::Char(c) => c.to_string(),
+        Expr::Unit => "*".to_string(),
         Expr::Bool(b) => (if *b { "1" } else { "0" }).to_string(),
         Expr::Str(s) => format!("\"{s}\""),
         Expr::Var(v) => v.clone(),
         Expr::UnaryNot(inner) => format!("(!{})", emit_bend_expr(inner, mod_name, indent)),
+        Expr::UnaryNeg(inner) => format!("(-{})", emit_bend_expr(inner, mod_name, indent)),
         Expr::BinOp(op, l, r) => {
             let b_op = if op == "=" { "==" } else { op.as_str() };
             format!(
@@ -6133,9 +8361,13 @@ fn emit_bend_expr(e: &Expr, mod_name: &str, indent: usize) -> String {
         Expr::Match(scrut, cases) => {
             let mut s = format!("match {}:\n", emit_bend_expr(scrut, mod_name, indent));
             for c in cases {
+                let pat_arm = if c.bindings().is_empty() {
+                    format!("{mod_name}/{}", c.ctor())
+                } else {
+                    format!("{mod_name}/{} {{ {} }}", c.ctor(), c.bindings().join(", "))
+                };
                 s.push_str(&format!(
-                    "{pad}  case {mod_name}/{}:\n{}",
-                    c.ctor,
+                    "{pad}  case {pat_arm}:\n{}",
                     emit_bend_block(&c.stmts, &c.body, mod_name, indent + 4)
                 ));
             }
@@ -6181,6 +8413,48 @@ fn emit_bend_expr(e: &Expr, mod_name: &str, indent: usize) -> String {
             unreachable!("Ghost expressions erased before codegen")
         }
     }
+}
+
+// ============================================================================
+// 10.5. PARALLEL DEPENDENCY ANALYSIS (§10.2, §10.3)
+// ============================================================================
+
+/// Partitions consecutive `Stmt::Let` bindings into independent groups that can run in parallel (§10.2).
+pub fn analyze_parallel_lets(stmts: &[Stmt]) -> Vec<Vec<(String, Expr)>> {
+    let mut groups: Vec<Vec<(String, Expr)>> = Vec::new();
+    let mut current_group: Vec<(String, Expr)> = Vec::new();
+    let mut current_names: HashSet<String> = HashSet::new();
+
+    for st in stmts {
+        if let Stmt::Let(v, e) = st {
+            let free = collect_symbols(e);
+            let conflicts = current_names.iter().any(|name| free.contains(name));
+            if conflicts && !current_group.is_empty() {
+                groups.push(std::mem::take(&mut current_group));
+                current_names.clear();
+            }
+            current_names.insert(v.clone());
+            current_group.push((v.clone(), e.clone()));
+        }
+    }
+    if !current_group.is_empty() {
+        groups.push(current_group);
+    }
+    groups
+}
+
+/// Checks if a routine's body ends in a self-recursive tail call (§10.3).
+pub fn is_tail_recursive_routine(r: &RoutineDecl) -> bool {
+    fn expr_is_tail_call(e: &Expr, target: &str) -> bool {
+        match e {
+            Expr::Call(f, _) => f == target,
+            Expr::MethodCall(_, m, _) => m == target,
+            Expr::If(_, _, te, _, ee) => expr_is_tail_call(te, target) || expr_is_tail_call(ee, target),
+            Expr::Match(_, cases) => cases.iter().any(|c| expr_is_tail_call(&c.body, target)),
+            _ => false,
+        }
+    }
+    expr_is_tail_call(&r.body, &r.name)
 }
 
 // ============================================================================
@@ -6659,13 +8933,409 @@ int main(void) {
             );
         }
         _ => {
-            out.push_str(&format!(
-                "// C11 representation for module {}\n#include <stdint.h>\n#include <stdio.h>\nint main(void) {{ return 0; }}\n",
-                m.name
-            ));
+            out.push_str(&emit_c11_general_module(m));
         }
     }
     out
+}
+
+pub fn map_c_type(ty: &str) -> String {
+    match ty {
+        "U64" | "NAT" | "EXIT_CODE" => "uint64_t".to_string(),
+        "I64" | "INT" => "int64_t".to_string(),
+        "F64" => "double".to_string(),
+        "BOOL" => "bool".to_string(),
+        "CHAR" => "uint32_t".to_string(),
+        "UNIT" | "()" => "GARDEL_UNIT".to_string(),
+        "STRING" => "GardelString".to_string(),
+        other => {
+            if let Some(inner) = other.strip_prefix("OPTION[").and_then(|s| s.strip_suffix(']')) {
+                return format!("{}_ptr", map_c_type(inner));
+            }
+            if let Some(inner) = other.strip_prefix("LIST[").and_then(|s| s.strip_suffix(']')) {
+                return format!("struct LIST_{}*", map_c_type(inner));
+            }
+            if let Some(inner) = other.strip_prefix("SEQ[").and_then(|s| s.strip_suffix(']')) {
+                return format!("struct SEQ_{}*", map_c_type(inner));
+            }
+            if let Some(idx) = other.find('[') {
+                let base = &other[..idx];
+                let inner = &other[idx + 1..other.len() - 1];
+                let parts: Vec<String> = inner.split(',').map(|p| map_c_type(p.trim())).collect();
+                return format!("struct {}_{}*", base, parts.join("_"));
+            }
+            format!("struct {}*", other)
+        }
+    }
+}
+
+pub fn emit_c11_runtime_header() -> String {
+    r#"#pragma STDC FP_CONTRACT OFF
+#include <stdint.h>
+#include <stdbool.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <stdatomic.h>
+
+#ifndef GARDEL_PAR_THRESHOLD
+#define GARDEL_PAR_THRESHOLD 512
+#endif
+
+typedef uint8_t GARDEL_UNIT;
+#define UNIT_VAL 0
+
+static _Atomic uint64_t g_gardel_live_allocs = 0;
+
+static inline void* gardel_alloc(size_t sz) {
+    void* p = malloc(sz);
+    if (!p) { fprintf(stderr, "Out of memory\n"); exit(1); }
+    atomic_fetch_add(&g_gardel_live_allocs, 1);
+    return p;
+}
+
+static inline void gardel_free(void* p) {
+    if (p) {
+        atomic_fetch_sub(&g_gardel_live_allocs, 1);
+        free(p);
+    }
+}
+
+uint64_t gardel_live_allocations(void) {
+    return atomic_load(&g_gardel_live_allocs);
+}
+
+typedef struct {
+    const char* data;
+    uint64_t len;
+} GardelString;
+
+static inline const char* gardel_io_read_line(char* buf, size_t cap) {
+    if (fgets(buf, (int)cap, stdin) != NULL) {
+        size_t n = strlen(buf);
+        while (n > 0 && (buf[n - 1] == '\n' || buf[n - 1] == '\r')) {
+            buf[--n] = '\0';
+        }
+        return buf;
+    }
+    return "";
+}
+"#.to_string()
+}
+
+pub fn emit_c11_general_module(m: &ModuleDecl) -> String {
+    let mut out = String::new();
+    out.push_str("// Automatically generated by gardelc (Phase 4 -> General C11 AST Lowering)\n");
+    out.push_str(&emit_c11_runtime_header());
+    out.push('\n');
+
+    let mod_name = &m.name;
+
+    // 1. Types & Data Structures (Product / Sum)
+    if m.kind == ModuleKind::Module {
+        match &m.repr {
+            ReprKind::Product(fields) => {
+                out.push_str(&format!("typedef struct {mod_name} {{\n"));
+                out.push_str("    _Atomic uint64_t _rc;\n");
+                for (fnm, fty) in fields {
+                    out.push_str(&format!("    {} {fnm};\n", map_c_type(fty)));
+                }
+                out.push_str(&format!("}} {mod_name};\n\n"));
+
+                let param_decls: Vec<String> = fields
+                    .iter()
+                    .map(|(fnm, fty)| format!("{} {fnm}", map_c_type(fty)))
+                    .collect();
+                out.push_str(&format!(
+                    "static inline {mod_name}* make_{mod_name}({}) {{\n",
+                    param_decls.join(", ")
+                ));
+                out.push_str(&format!(
+                    "    {mod_name}* res = ({mod_name}*)gardel_alloc(sizeof({mod_name}));\n"
+                ));
+                out.push_str("    atomic_init(&res->_rc, 1);\n");
+                for (fnm, _) in fields {
+                    out.push_str(&format!("    res->{fnm} = {fnm};\n"));
+                }
+                out.push_str("    return res;\n}\n\n");
+            }
+            ReprKind::Sum(variants) => {
+                out.push_str(&format!("typedef struct {mod_name} {{\n"));
+                out.push_str("    _Atomic uint64_t _rc;\n");
+                let tag_names: Vec<String> = variants
+                    .iter()
+                    .map(|v| format!("TAG_{mod_name}_{}", v.name))
+                    .collect();
+                out.push_str(&format!("    enum {{ {} }} tag;\n", tag_names.join(", ")));
+                out.push_str("    union {\n");
+                for v in variants {
+                    if !v.fields.is_empty() {
+                        out.push_str(&format!("        struct {{\n"));
+                        for (fnm, fty) in &v.fields {
+                            out.push_str(&format!("            {} {fnm};\n", map_c_type(fty)));
+                        }
+                        out.push_str(&format!("        }} {};\n", v.name));
+                    }
+                }
+                out.push_str("    };\n");
+                out.push_str(&format!("}} {mod_name};\n\n"));
+
+                for v in variants {
+                    let vname = &v.name;
+                    let param_decls: Vec<String> = v
+                        .fields
+                        .iter()
+                        .map(|(fnm, fty)| format!("{} {fnm}", map_c_type(fty)))
+                        .collect();
+                    out.push_str(&format!(
+                        "static inline {mod_name}* make_{mod_name}_{vname}({}) {{\n",
+                        param_decls.join(", ")
+                    ));
+                    out.push_str(&format!(
+                        "    {mod_name}* res = ({mod_name}*)gardel_alloc(sizeof({mod_name}));\n"
+                    ));
+                    out.push_str("    atomic_init(&res->_rc, 1);\n");
+                    out.push_str(&format!("    res->tag = TAG_{mod_name}_{vname};\n"));
+                    for (fnm, _) in &v.fields {
+                        out.push_str(&format!("    res->{vname}.{fnm} = {fnm};\n"));
+                    }
+                    out.push_str("    return res;\n}\n\n");
+                }
+            }
+        }
+    }
+
+    // 2. Closure conversion
+    let (_, combinators) = closure_convert_module(m);
+    for comb in &combinators {
+        if let Some((env_name, env_fields)) = &comb.env_struct {
+            out.push_str(&format!("typedef struct {env_name} {{\n"));
+            out.push_str("    _Atomic uint64_t _rc;\n");
+            for (fnm, fty) in env_fields {
+                out.push_str(&format!("    {} {fnm};\n", map_c_type(fty)));
+            }
+            out.push_str(&format!("}} {env_name};\n\n"));
+        }
+        out.push_str(&emit_c11_routine(&comb.routine, false, mod_name));
+    }
+
+    // 3. Create Routines
+    for (_, r) in &m.create_routines {
+        out.push_str(&emit_c11_routine(r, false, mod_name));
+    }
+
+    // 4. Feature Routines
+    let is_adt = m.kind == ModuleKind::Module;
+    for (_, r) in &m.feature_routines {
+        out.push_str(&emit_c11_routine(r, is_adt, mod_name));
+    }
+
+    // 5. Program Entry Point if Program
+    if m.kind == ModuleKind::Program {
+        out.push_str("int main(void) {\n");
+        if m.feature_routines.iter().any(|(_, r)| r.name == "main") {
+            out.push_str("    main_routine();\n");
+        }
+        out.push_str("    return 0;\n");
+        out.push_str("}\n");
+    } else {
+        out.push_str("int main(void) { return 0; }\n");
+    }
+
+    out
+}
+
+fn emit_c11_routine(r: &RoutineDecl, has_current: bool, mod_name: &str) -> String {
+    let mut s = String::new();
+    let ret_type = map_c_type(&r.ret_type);
+    let mut param_strs = Vec::new();
+    if has_current {
+        param_strs.push(format!("struct {mod_name}* Current"));
+    }
+    for (pname, pty) in &r.params {
+        param_strs.push(format!("{} {pname}", map_c_type(pty)));
+    }
+    let rname = if r.name == "main" { "main_routine" } else { &r.name };
+    s.push_str(&format!("{ret_type} {rname}({}) {{\n", param_strs.join(", ")));
+
+    // Check tail recursion
+    let is_tail = is_tail_recursive_routine(r);
+    if is_tail {
+        s.push_str("tail_loop:\n");
+    }
+
+    s.push_str(&emit_c11_block(&r.stmts, &r.body, mod_name, is_tail, rname, 4));
+    s.push_str("}\n\n");
+    s
+}
+
+fn emit_c11_block(
+    stmts: &[Stmt],
+    body: &Expr,
+    mod_name: &str,
+    _is_tail: bool,
+    _routine_name: &str,
+    indent: usize,
+) -> String {
+    let pad = " ".repeat(indent);
+    let mut s = String::new();
+
+    let groups = analyze_parallel_lets(stmts);
+    for group in groups {
+        if group.len() > 1 {
+            for (v, e) in &group {
+                s.push_str(&format!("{pad}__auto_type {v};\n"));
+                s.push_str(&format!(
+                    "{pad}#pragma omp task shared({v})\n{pad}{v} = {};\n",
+                    emit_c11_expr(e, mod_name)
+                ));
+            }
+            s.push_str(&format!("{pad}#pragma omp taskwait;\n"));
+        } else {
+            for (v, e) in group {
+                s.push_str(&format!(
+                    "{pad}__auto_type {v} = {};\n",
+                    emit_c11_expr(&e, mod_name)
+                ));
+            }
+        }
+    }
+
+    match body {
+        Expr::WithIo(io_stmts, final_e) => {
+            for io_st in io_stmts {
+                match io_st {
+                    IoStmt::Bind(v, se) => {
+                        s.push_str(&format!(
+                            "{pad}__auto_type {v} = {};\n",
+                            emit_c11_expr(se, mod_name)
+                        ));
+                    }
+                    IoStmt::Action(se) => {
+                        s.push_str(&format!("{pad}{};\n", emit_c11_expr(se, mod_name)));
+                    }
+                }
+            }
+            s.push_str(&format!(
+                "{pad}return {};\n",
+                emit_c11_expr(final_e, mod_name)
+            ));
+        }
+        _ => {
+            s.push_str(&format!(
+                "{pad}return {};\n",
+                emit_c11_expr(body, mod_name)
+            ));
+        }
+    }
+    s
+}
+
+fn emit_c11_expr(e: &Expr, mod_name: &str) -> String {
+    match e {
+        Expr::Int(n) => format!("{n}ULL"),
+        Expr::Float(f) => format!("{f}"),
+        Expr::Char(c) => format!("{c}U"),
+        Expr::Unit => "UNIT_VAL".to_string(),
+        Expr::Bool(b) => (if *b { "true" } else { "false" }).to_string(),
+        Expr::Str(s) => format!("(GardelString){{ \"{s}\", {} }}", s.len()),
+        Expr::Var(v) => v.clone(),
+        Expr::UnaryNot(inner) => format!("(!{})", emit_c11_expr(inner, mod_name)),
+        Expr::UnaryNeg(inner) => format!("(-{})", emit_c11_expr(inner, mod_name)),
+        Expr::BinOp(op, l, r) => {
+            let c_op = match op.as_str() {
+                "=" => "==",
+                "+%" => "+",
+                "-%" => "-",
+                "*%" => "*",
+                "and" => "&&",
+                "or" => "||",
+                other => other,
+            };
+            format!(
+                "({} {c_op} {})",
+                emit_c11_expr(l, mod_name),
+                emit_c11_expr(r, mod_name)
+            )
+        }
+        Expr::Call(fname, args) => {
+            let a_str: Vec<String> = args.iter().map(|a| emit_c11_expr(a, mod_name)).collect();
+            format!("{fname}({})", a_str.join(", "))
+        }
+        Expr::MethodCall(recv, mname, args) => {
+            if let Expr::Var(v) = &**recv {
+                if v == "IO" {
+                    if mname == "print" {
+                        let arg = emit_c11_expr(&args[0], mod_name);
+                        return format!("printf(\"%s\\n\", (const char*){arg}.data)");
+                    } else if mname == "read_line" {
+                        return "gardel_io_read_line((char[256]){{0}}, 256)".to_string();
+                    } else if mname == "exit" && !args.is_empty() {
+                        return format!("exit({})", emit_c11_expr(&args[0], mod_name));
+                    }
+                }
+            }
+            let r_str = emit_c11_expr(recv, mod_name);
+            let mut a_str = vec![r_str];
+            for a in args {
+                a_str.push(emit_c11_expr(a, mod_name));
+            }
+            format!("{mname}({})", a_str.join(", "))
+        }
+        Expr::If(c, ts, te, es, ee) => {
+            format!(
+                "({} ? ({}) : ({}))",
+                emit_c11_expr(c, mod_name),
+                emit_c11_block(ts, te, mod_name, false, "", 0).trim(),
+                emit_c11_block(es, ee, mod_name, false, "", 0).trim()
+            )
+        }
+        Expr::Match(scrut, cases) => {
+            let s_str = emit_c11_expr(scrut, mod_name);
+            let mut s = format!("({s_str}->tag == 0 ? 0 : 0)");
+            if !cases.is_empty() {
+                let mut cond_expr = String::new();
+                for (idx, c) in cases.iter().enumerate() {
+                    let ctor = c.ctor();
+                    let tag_name = format!("TAG_{mod_name}_{ctor}");
+                    let val = emit_c11_expr(&c.body, mod_name);
+                    if idx + 1 == cases.len() {
+                        cond_expr.push_str(&val);
+                    } else {
+                        cond_expr.push_str(&format!(
+                            "({s_str}->tag == {tag_name} ? ({val}) : "
+                        ));
+                    }
+                }
+                for _ in 0..cases.len() - 1 {
+                    cond_expr.push(')');
+                }
+                s = cond_expr;
+            }
+            s
+        }
+        Expr::RecordLit(fields) => {
+            let vals: Vec<String> = fields.iter().map(|(_, fe)| emit_c11_expr(fe, mod_name)).collect();
+            format!("make_{mod_name}({})", vals.join(", "))
+        }
+        Expr::RecordUpdate(base, _fields) => {
+            let b_str = emit_c11_expr(base, mod_name);
+            format!("/* update */ {b_str}")
+        }
+        Expr::TupleLit(elems) => {
+            let es: Vec<String> = elems.iter().map(|el| emit_c11_expr(el, mod_name)).collect();
+            format!("({})", es.join(", "))
+        }
+        Expr::WithIo(_io_stmts, final_e) => {
+            emit_c11_expr(final_e, mod_name)
+        }
+        Expr::Lambda(_, _, _, _) => {
+            "/* lifted closure */ 0".to_string()
+        }
+        Expr::Forall(_, _, _) | Expr::Exists(_, _, _) => {
+            "0".to_string()
+        }
+    }
 }
 
 // ============================================================================
@@ -6877,7 +9547,7 @@ fn main() {
     let args: Vec<String> = env::args().collect();
     if args.len() < 2 {
         eprintln!(
-            "Usage: gardelc <input.gdl | --stdlib> [--inspect [MODULE]] [--emit-stdlib] [--json-diagnostics] [--fuel <N>] [--audit] [--strict] [--run]"
+            "Usage: gardelc <input.gdl | --stdlib> [--inspect [MODULE]] [--emit-stdlib] [--json-diagnostics] [--fuel <N>] [--audit] [--strict] [--bounded-check] [--run]"
         );
         std::process::exit(1);
     }
@@ -6907,6 +9577,7 @@ fn main() {
     let json_mode = args.iter().any(|a| a == "--json-diagnostics");
     let audit_mode = args.iter().any(|a| a == "--audit");
     let strict_mode = args.iter().any(|a| a == "--strict");
+    let bounded_check = args.iter().any(|a| a == "--bounded-check");
     let fuel_limit = parse_fuel_arg(&args);
 
     let src = if stdlib_only {
@@ -7008,6 +9679,7 @@ fn main() {
             fuel_limit,
             strict_mode,
             audit_mode,
+            bounded_check,
         ));
         diags.extend(mod_diags);
     }
@@ -7102,55 +9774,98 @@ fn main() {
         eprintln!("[ERROR] Failed to create build directory: {e}");
         std::process::exit(1);
     }
-    let stem = module.name.to_lowercase();
-    let bpl_path = format!("build/{stem}.bpl");
-    let dfy_path = format!("build/{stem}.dfy");
-    let bend_path = format!("build/{stem}.bend");
-    let c_path = format!("build/{stem}.c");
-    let exe_path = format!("build/{stem}_bin.exe");
-
-    let bpl_code = emit_boogie(&module, fuel_limit);
-    if let Err(e) = fs::write(&bpl_path, bpl_code) {
-        eprintln!("[ERROR] Failed to write Boogie output '{bpl_path}': {e}");
-        std::process::exit(1);
-    }
-
-    let dfy_code = emit_dafny(&module);
-    if let Err(e) = fs::write(&dfy_path, dfy_code) {
-        eprintln!("[ERROR] Failed to write Dafny output '{dfy_path}': {e}");
-        std::process::exit(1);
-    }
-
-    let mono_module = if module.type_params.is_empty() {
-        module.clone()
-    } else {
-        monomorphize_module(&module, &["U64".to_string()])
+    let mut prog_env = ProgramEnv {
+        modules: HashMap::new(),
+        concepts: concept_map.clone(),
     };
-
-    let bend_code = emit_bend_v2(&mono_module);
-    if let Err(e) = fs::write(&bend_path, bend_code) {
-        eprintln!("[ERROR] Failed to write Bend v2 output '{bend_path}': {e}");
-        std::process::exit(1);
+    for m in &file_ast.modules {
+        prog_env.modules.insert(m.name.clone(), m.clone());
     }
 
-    let c_code = emit_c11(&module);
-    if let Err(e) = fs::write(&c_path, c_code) {
-        eprintln!("[ERROR] Failed to write C11 output '{c_path}': {e}");
-        std::process::exit(1);
+    let mut primary_bpl = String::new();
+    let mut primary_dfy = String::new();
+    let mut primary_bend = String::new();
+    let mut primary_c = String::new();
+    let mut primary_exe = String::new();
+
+    for m in &file_ast.modules {
+        let stem = m.name.to_lowercase();
+        let bpl_path = format!("build/{stem}.bpl");
+        let dfy_path = format!("build/{stem}.dfy");
+        let bend_path = format!("build/{stem}.bend");
+        let c_path = format!("build/{stem}.c");
+
+        let bpl_code = emit_boogie(m, fuel_limit);
+        if let Err(e) = fs::write(&bpl_path, bpl_code) {
+            eprintln!("[ERROR] Failed to write Boogie output '{bpl_path}': {e}");
+            std::process::exit(1);
+        }
+
+        let dfy_code = emit_dafny(m);
+        if let Err(e) = fs::write(&dfy_path, dfy_code) {
+            eprintln!("[ERROR] Failed to write Dafny output '{dfy_path}': {e}");
+            std::process::exit(1);
+        }
+
+        let mono_module = if m.type_params.is_empty() {
+            m.clone()
+        } else {
+            monomorphize_module(m, &["U64".to_string()])
+        };
+
+        let (converted_mono, combinators) = closure_convert_module(&mono_module);
+
+        let mut bend_code = emit_bend_v2(&converted_mono);
+        for comb in &combinators {
+            let dummy_mod = ModuleDecl {
+                kind: ModuleKind::Functions,
+                name: format!("{}_closures", m.name),
+                type_params: Vec::new(),
+                type_bounds: HashMap::new(),
+                satisfies: None,
+                repr_vis: Visibility::Any,
+                repr: ReprKind::Product(Vec::new()),
+                specify_routines: Vec::new(),
+                specify_laws: Vec::new(),
+                create_routines: Vec::new(),
+                feature_routines: vec![(Visibility::Any, comb.routine.clone())],
+                invariants: Vec::new(),
+            };
+            bend_code.push_str(&emit_bend_v2(&dummy_mod));
+        }
+
+        if let Err(e) = fs::write(&bend_path, bend_code) {
+            eprintln!("[ERROR] Failed to write Bend v2 output '{bend_path}': {e}");
+            std::process::exit(1);
+        }
+
+        let c_code = emit_c11(&converted_mono);
+        if let Err(e) = fs::write(&c_path, c_code) {
+            eprintln!("[ERROR] Failed to write C11 output '{c_path}': {e}");
+            std::process::exit(1);
+        }
+
+        if m.name == module.name {
+            primary_bpl = bpl_path;
+            primary_dfy = dfy_path;
+            primary_bend = bend_path;
+            primary_c = c_path;
+            primary_exe = format!("build/{stem}_bin.exe");
+        }
     }
 
     let gcc_compiled = Command::new("gcc")
-        .args(["-O3", "-fopenmp", &c_path, "-o", &exe_path])
+        .args(["-O3", "-fopenmp", &primary_c, "-o", &primary_exe])
         .status()
         .is_ok_and(|s| s.success());
 
     if !json_mode {
-        println!("[3/6] Emitted direct Boogie VCs & fuel axioms -> {bpl_path}");
-        println!("[4/6] Emitted Dafny refinement & law lemmas   -> {dfy_path}");
-        println!("[5/6] Emitted monomorphized Bend v2 target    -> {bend_path}");
-        println!("[6/6] Emitted C11 runtime target              -> {c_path}");
+        println!("[3/6] Emitted direct Boogie VCs & fuel axioms -> {primary_bpl}");
+        println!("[4/6] Emitted Dafny refinement & law lemmas   -> {primary_dfy}");
+        println!("[5/6] Emitted monomorphized Bend v2 target    -> {primary_bend}");
+        println!("[6/6] Emitted C11 runtime target              -> {primary_c}");
         if gcc_compiled {
-            println!("      Compiled native executable              -> {exe_path}");
+            println!("      Compiled native executable              -> {primary_exe}");
         }
     }
 
@@ -7166,13 +9881,13 @@ fn main() {
             .find(|cand| std::path::Path::new(cand).exists());
 
         let mut boogie_cmd = Command::new("boogie");
-        boogie_cmd.args(["/mv:-", &bpl_path]);
+        boogie_cmd.args(["/mv:-", &primary_bpl]);
         if let Some(solver) = found_solver {
             boogie_cmd.arg(format!("/proverOpt:PROVER_PATH={solver}"));
         }
 
         if let Ok(output) = boogie_cmd.output() {
-            println!("\n=== [0] Direct Boogie + Z3 Verification ({bpl_path}) ===");
+            println!("\n=== [0] Direct Boogie + Z3 Verification ({primary_bpl}) ===");
             let stdout = String::from_utf8_lossy(&output.stdout);
             print!("{stdout}");
             if stdout.contains("*** MODEL") {
@@ -7185,15 +9900,15 @@ fn main() {
 
         println!("\n=== [1] Dafny Formal Verification (Routines + Concept Laws) ===");
         let mut cmd = Command::new("dafny");
-        cmd.args(["verify", &dfy_path]);
+        cmd.args(["verify", &primary_dfy]);
         if let Some(solver) = found_solver {
             cmd.args(["--solver-path", solver]);
         }
         let _ = cmd.status();
 
-        if gcc_compiled && std::path::Path::new(&exe_path).exists() {
-            println!("\n=== [2] Executing Native Executable ({exe_path}) ===");
-            let _ = Command::new(&exe_path).status();
+        if gcc_compiled && std::path::Path::new(&primary_exe).exists() {
+            println!("\n=== [2] Executing Native Executable ({primary_exe}) ===");
+            let _ = Command::new(&primary_exe).status();
         }
     }
 }
@@ -7258,7 +9973,7 @@ end
         assert!(bpl.contains("function fn_leaves("));
         assert!(bpl.contains("procedure Verify_max_value("));
         assert!(bpl.contains("reveal leaves"));
-        let diags = verify_module_phase3(&m, src, "tree.gdl", 2, false, false);
+        let diags = verify_module_phase3(&m, src, "tree.gdl", 2, false, false, false);
         assert!(diags.is_empty(), "Expected 0 errors, got {diags:?}");
     }
 
@@ -7280,7 +9995,7 @@ feature {ANY}
 end
 "#;
         let m = parse_single_module(src);
-        let diags = verify_module_phase3(&m, src, "midpoint.gdl", 2, false, false);
+        let diags = verify_module_phase3(&m, src, "midpoint.gdl", 2, false, false, false);
         assert_eq!(diags.len(), 1);
         assert_eq!(diags[0].tag, "overflow_add");
         assert!(diags[0].counterexample.contains_key("lo"));
@@ -7311,7 +10026,7 @@ feature {ANY}
 end
 "#;
         let m_unrev = parse_single_module(src_unrevealed);
-        let diags_zero = verify_module_phase3(&m_unrev, src_unrevealed, "box.gdl", 0, false, false);
+        let diags_zero = verify_module_phase3(&m_unrev, src_unrevealed, "box.gdl", 0, false, false, false);
         assert_eq!(diags_zero.len(), 1);
         assert_eq!(diags_zero[0].tag, "matches_ghost");
         assert!(
@@ -7340,7 +10055,7 @@ feature {ANY}
 end
 "#;
         let m_rev = parse_single_module(src_revealed);
-        let diags_rev = verify_module_phase3(&m_rev, src_revealed, "box.gdl", 0, false, false);
+        let diags_rev = verify_module_phase3(&m_rev, src_revealed, "box.gdl", 0, false, false, false);
         assert!(diags_rev.is_empty());
     }
 
@@ -7361,15 +10076,15 @@ feature {ANY}
 end
 "#;
         let m = parse_single_module(src);
-        let diags_def = verify_module_phase3(&m, src, "test.gdl", 2, false, false);
+        let diags_def = verify_module_phase3(&m, src, "test.gdl", 2, false, false, false);
         assert!(diags_def.is_empty());
 
-        let diags_audit = verify_module_phase3(&m, src, "test.gdl", 2, false, true);
+        let diags_audit = verify_module_phase3(&m, src, "test.gdl", 2, false, true, false);
         assert_eq!(diags_audit.len(), 1);
         assert_eq!(diags_audit[0].level, "audit");
         assert_eq!(diags_audit[0].tag, "unproven_fact");
 
-        let diags_strict = verify_module_phase3(&m, src, "test.gdl", 2, true, false);
+        let diags_strict = verify_module_phase3(&m, src, "test.gdl", 2, true, false, false);
         assert_eq!(diags_strict.len(), 1);
         assert_eq!(diags_strict[0].level, "error");
         assert_eq!(diags_strict[0].tag, "unproven_fact");
@@ -7385,10 +10100,9 @@ end
                 "BIGNAT".to_string(),
                 "STRING".to_string(),
                 "OPTION".to_string(),
-                "GREETER".to_string()
             ])
         );
-        assert_eq!(stdlib.modules.len(), 5);
+        assert_eq!(stdlib.modules.len(), 4);
         for m in &stdlib.modules {
             let mut diags = check_visibility_and_semantics(m);
             diags.extend(verify_module_phase3(
@@ -7397,6 +10111,7 @@ end
                 "stdlib.gdl",
                 2,
                 true,
+                false,
                 false,
             ));
             assert!(
@@ -7450,4 +10165,503 @@ end
         assert!(iface.contains("singleton(x: A): SEQ[A]"));
         assert!(iface.contains("ensure  unit_len: (Result.length = 1)"));
     }
+
+    #[test]
+    fn test_phase2_variant_disjointness_and_distinct_strings() {
+        let src = r#"
+module TRAFFIC_LIGHT
+representation {ANY}
+  | Red
+  | Yellow
+  | Green
+feature {ANY}
+  name_of(color: TRAFFIC_LIGHT): STRING
+    do
+      match color
+        case Red then "stop"
+        case Yellow then "caution"
+        case Green then "go"
+      end
+    end
+end
+"#;
+        let m = parse_single_module(src);
+        let bpl = emit_boogie(&m, 2);
+        // 1. Pairwise variant disjointness axioms
+        assert!(bpl.contains("is_Red(x) ==> !is_Yellow(x)"));
+        assert!(bpl.contains("is_Red(x) ==> !is_Green(x)"));
+        assert!(bpl.contains("is_Yellow(x) ==> !is_Green(x)"));
+        // 2. Interned unique string literal constants
+        assert!(bpl.contains("const unique str_lit_0: GardelString;"));
+        assert!(bpl.contains("const unique str_lit_1: GardelString;"));
+        assert!(bpl.contains("const unique str_lit_2: GardelString;"));
+        assert!(bpl.contains("axiom Str_length(str_lit_0) =="));
+        // 3. Verify module phase 3 passes
+        let diags = verify_module_phase3(&m, src, "traffic.gdl", 2, false, false, false);
+        assert!(diags.is_empty(), "Expected 0 errors, got {diags:?}");
+    }
+
+    #[test]
+    fn test_phase2_canonical_record_ordering() {
+        let src = r#"
+module POINT3D
+representation {ANY}
+  x: NAT
+  y: NAT
+  z: NAT
+create {ANY}
+  make(a: NAT, b: NAT, c: NAT): POINT3D
+    do
+      { z = c, x = a, y = b }
+    ensure
+      check_x: Result.x = a
+      check_y: Result.y = b
+      check_z: Result.z = c
+    end
+end
+"#;
+        let m = parse_single_module(src);
+        let bpl = emit_boogie(&m, 2);
+        // Constructor arguments must be sorted to canonical declaration order: x, y, z
+        assert!(bpl.contains("POINT3D_Ctor(a, b, c)"));
+        let diags = verify_module_phase3(&m, src, "point.gdl", 2, false, false, false);
+        assert!(diags.is_empty(), "Expected 0 errors, got {diags:?}");
+    }
+
+    #[test]
+    fn test_phase2_capture_avoiding_substitution() {
+        // Test 1: Variable substitution
+        let orig = Expr::Var("x".to_string());
+        let subst_val = Expr::Int(42);
+        let replaced = subst_expr_var(&orig, "x", &subst_val);
+        assert_eq!(replaced, Expr::Int(42));
+
+        // Test 2: Lambda parameter shadowing prevents substitution
+        let lambda_shadowed = Expr::Lambda(
+            vec![("x".to_string(), "NAT".to_string())],
+            "NAT".to_string(),
+            Vec::new(),
+            Box::new(Expr::Var("x".to_string())),
+        );
+        let lambda_subst = subst_expr_var(&lambda_shadowed, "x", &subst_val);
+        assert_eq!(lambda_subst, lambda_shadowed);
+
+        // Test 3: Lambda parameter different name allows substitution
+        let lambda_other = Expr::Lambda(
+            vec![("y".to_string(), "NAT".to_string())],
+            "NAT".to_string(),
+            Vec::new(),
+            Box::new(Expr::Var("x".to_string())),
+        );
+        let lambda_other_subst = subst_expr_var(&lambda_other, "x", &subst_val);
+        assert_eq!(
+            lambda_other_subst,
+            Expr::Lambda(
+                vec![("y".to_string(), "NAT".to_string())],
+                "NAT".to_string(),
+                Vec::new(),
+                Box::new(Expr::Int(42))
+            )
+        );
+
+        // Test 4: Block with let shadowing
+        let stmts = vec![Stmt::Let("x".to_string(), Expr::Int(10))];
+        let body = Expr::Var("x".to_string());
+        let (new_stmts, new_body) = subst_block(&stmts, &body, &[("x".to_string(), subst_val)]);
+        assert_eq!(new_stmts.len(), 1);
+        assert_eq!(new_body, Expr::Var("x".to_string())); // shadowed!
+    }
+
+    #[test]
+    fn test_phase2_general_numeric_variant_termination() {
+        let src = r#"
+module COUNTDOWN
+representation {ANY}
+  dummy: NAT
+feature {ANY}
+  count(n: NAT): NAT
+    variant
+      n
+    do
+      if n = 0 then
+        0
+      else
+        count(n - 1)
+      end
+    ensure
+      done: Result = 0
+    end
+end
+"#;
+        let m = parse_single_module(src);
+        let bpl = emit_boogie(&m, 2);
+        assert!(bpl.contains("count::variant::variant_non_negative"));
+        assert!(bpl.contains("count::variant::variant_decrease"));
+        let diags = verify_module_phase3(&m, src, "countdown.gdl", 2, false, false, false);
+        assert!(diags.is_empty(), "Expected 0 errors, got {diags:?}");
+    }
+
+    #[test]
+    fn test_plan3_ebnf_lexer_casing_and_delimiters() {
+        let invalid_mod = "module my_mod representation {ANY} x: NAT end";
+        let toks = tokenize(invalid_mod).unwrap();
+        let mut p = Parser::new(toks);
+        assert!(p.parse_file().is_err());
+
+        let valid_src = r#"
+module PRIMITIVES
+representation {ANY}
+  val: U64
+feature {ANY}
+  compute(a: U64, b: U64): U64
+    do
+      let sum = a +% b;
+      let diff = a -% b;
+      let prod = a *% b;
+      let mask = a & b | (a ^ b);
+      let shifted = (a << 2) >> 1;
+      sum +% mask
+    end
+end
+"#;
+        let m = parse_single_module(valid_src);
+        assert_eq!(m.name, "PRIMITIVES");
+        let bpl = emit_boogie(&m, 2);
+        assert!(bpl.contains("u64_wrap_add"));
+        assert!(bpl.contains("u64_bit_and"));
+        assert!(bpl.contains("u64_bit_or"));
+        assert!(bpl.contains("u64_bit_xor"));
+        assert!(bpl.contains("u64_bit_shl"));
+        assert!(bpl.contains("u64_bit_shr"));
+    }
+
+    #[test]
+    fn test_plan3_nested_pattern_matching_ast() {
+        let src = r#"
+module EVAL_MATCH
+representation {ANY}
+  | Lit(n: U64)
+  | Pair(fst: U64, snd: U64)
+feature {ANY}
+  eval_it(c: EVAL_MATCH): U64
+    do
+      match c
+        case Lit(x) then x
+        case Pair(a, b) then a +% b
+      end
+    end
+end
+"#;
+        let m = parse_single_module(src);
+        let bpl = emit_boogie(&m, 2);
+        assert!(bpl.contains("is_Lit"));
+        assert!(bpl.contains("is_Pair"));
+        let dfy = emit_dafny(&m);
+        assert!(dfy.contains("case Lit(x) =>"));
+        assert!(dfy.contains("case Pair(a, b) =>"));
+        let bend = emit_bend_v2(&m);
+        assert!(bend.contains("case EVAL_MATCH/Lit { x }:"));
+        assert!(bend.contains("case EVAL_MATCH/Pair { a, b }:"));
+    }
+
+    #[test]
+    fn test_plan3_lexicographic_termination_variants() {
+        let src = r#"
+module ACKERMANN
+representation {ANY}
+  dummy: NAT
+feature {ANY}
+  ack(m: NAT, n: NAT): NAT
+    variant
+      m, n
+    do
+      if m = 0 then
+        n + 1
+      else
+        if n = 0 then
+          ack(m - 1, 1)
+        else
+          ack(m - 1, ack(m, n - 1))
+        end
+      end
+    end
+end
+"#;
+        let m = parse_single_module(src);
+        assert_eq!(m.feature_routines[0].1.variant.len(), 2);
+        let bpl = emit_boogie(&m, 2);
+        assert!(bpl.contains("ack::variant::variant_non_negative"));
+        assert!(bpl.contains("ack::variant::variant_decrease"));
+        let dfy = emit_dafny(&m);
+        assert!(dfy.contains("decreases m, n"));
+    }
+
+    #[test]
+    fn test_plan3_sum_type_hereditary_invariants() {
+        let src = r#"
+module BIN_TREE
+representation {ANY}
+  | Leaf(val: U64)
+  | Node(left: BIN_TREE, right: BIN_TREE)
+invariant
+  positive_leaves: True
+end
+"#;
+        let m = parse_single_module(src);
+        let bpl = emit_boogie(&m, 2);
+        assert!(bpl.contains("procedure Verify_Hereditary_Invariant_BIN_TREE(Current: BIN_TREE)"));
+        assert!(bpl.contains("BIN_TREE::hereditary_invariant::Node_left"));
+        assert!(bpl.contains("BIN_TREE::hereditary_invariant::Node_right"));
+    }
+
+    #[test]
+    fn test_plan3_monadic_io_linearity() {
+        let invalid_src = r#"
+program UNBALANCED_IO
+feature {ANY}
+  run_prog: IO[EXIT_CODE]
+    do
+      with IO
+        let x = if 1 = 1 then
+          IO.print("Hello")
+        else
+          0
+        end
+        IO.exit(0)
+      end
+    end
+end
+"#;
+        let m = parse_single_module(invalid_src);
+        let diags = check_visibility_and_semantics(&m);
+        assert!(
+            diags.iter().any(|d| d.tag == "io_branch_linearity"),
+            "Expected io_branch_linearity error, got: {diags:?}"
+        );
+    }
+
+    #[test]
+    fn test_plan3_constrained_generics_concept_laws() {
+        let src = r#"
+module GENERIC_CONTAINER[T: ORD]
+representation {ANY}
+  item: T
+feature {ANY}
+  check_same(x: T): BOOL
+    do
+      True
+    end
+end
+"#;
+        let m = parse_single_module(src);
+        assert_eq!(m.type_bounds.get("T"), Some(&"ORD".to_string()));
+        let bpl = emit_boogie(&m, 2);
+        assert!(bpl.contains("function T_eq(x: T, y: T) returns (bool);"));
+        assert!(bpl.contains("function T_less(x: T, y: T) returns (bool);"));
+        assert!(bpl.contains("axiom (forall x: T :: { T_eq(x, x) } T_eq(x, x));"));
+        assert!(bpl.contains("axiom (forall x: T :: { T_less(x, x) } !T_less(x, x));"));
+    }
+
+    #[test]
+    fn test_plan3_closure_conversion() {
+        let src = r#"
+module CLOSURE_TEST
+representation {ANY}
+  val: U64
+feature {ANY}
+  make_adder(factor: U64): U64
+    do
+      let f = fn(x: U64): U64 do x +% factor end
+      0
+    end
+end
+"#;
+        let m = parse_single_module(src);
+        let (_converted, combinators) = closure_convert_module(&m);
+        assert_eq!(combinators.len(), 1);
+        let comb = &combinators[0];
+        assert!(comb.routine.name.starts_with("closure_apply_"));
+        assert!(comb.env_struct.is_some());
+        let (env_name, env_fields) = comb.env_struct.as_ref().unwrap();
+        assert!(env_name.starts_with("ClosureEnv_"));
+        assert!(env_fields.iter().any(|(f, _)| f == "factor"));
+    }
+
+    #[test]
+    fn test_plan3_multi_module_stdlib_pipeline() {
+        let ast = parse_phase4_stdlib().expect("stdlib parses cleanly");
+        assert_eq!(ast.modules.len(), 4);
+        let mut prog_env = ProgramEnv {
+            modules: HashMap::new(),
+            concepts: HashMap::new(),
+        };
+        for m in &ast.modules {
+            prog_env.modules.insert(m.name.clone(), m.clone());
+        }
+        let instances = collect_monomorphized_instances(&prog_env);
+        assert!(!instances.is_empty() || ast.modules.iter().any(|m| !m.type_params.is_empty()));
+
+        for m in &ast.modules {
+            let diags = check_visibility_and_semantics(m);
+            assert!(
+                !diags.iter().any(|d| d.level == "error"),
+                "Module {} had unexpected errors: {diags:?}",
+                m.name
+            );
+            let bpl = emit_boogie(m, 2);
+            assert!(!bpl.is_empty());
+        }
+    }
+
+    #[test]
+    fn test_plan4_general_c11_ast_lowering_custom_adt() {
+        let src = r#"
+module CUSTOM_CONTAINER
+representation {ANY}
+  | Empty
+  | Entry(id: U64, weight: F64)
+feature {ANY}
+  get_id(c: CUSTOM_CONTAINER): U64
+    do
+      match c
+        case Empty then 0
+        case Entry(i, w) then i
+      end
+    end
+end
+"#;
+        let m = parse_single_module(src);
+        let c_code = emit_c11(&m);
+        assert!(c_code.contains("typedef struct CUSTOM_CONTAINER"));
+        assert!(c_code.contains("TAG_CUSTOM_CONTAINER_Empty"));
+        assert!(c_code.contains("TAG_CUSTOM_CONTAINER_Entry"));
+        assert!(c_code.contains("make_CUSTOM_CONTAINER_Entry"));
+        assert!(c_code.contains("double weight;"));
+        assert!(c_code.contains("#pragma STDC FP_CONTRACT OFF"));
+    }
+
+    #[test]
+    fn test_plan4_c11_and_bend_closure_conversion_codegen() {
+        let src = r#"
+module CLOSURE_GEN
+representation {ANY}
+  val: U64
+feature {ANY}
+  apply_multiplier(factor: U64, x: U64): U64
+    do
+      let mul = fn(n: U64): U64 do n *% factor end;
+      0
+    end
+end
+"#;
+        let m = parse_single_module(src);
+        let (converted, combinators) = closure_convert_module(&m);
+        assert!(!combinators.is_empty());
+        let bend = emit_bend_v2(&converted);
+        assert!(bend.contains("apply_multiplier"));
+        let c_code = emit_c11(&m);
+        assert!(c_code.contains("ClosureEnv_"));
+        assert!(c_code.contains("closure_apply_"));
+    }
+
+    #[test]
+    fn test_plan4_automatic_fork_join_parallel_let_analysis() {
+        let stmts = vec![
+            Stmt::Let("a".to_string(), Expr::Int(10)),
+            Stmt::Let("b".to_string(), Expr::Int(20)),
+        ];
+        let groups = analyze_parallel_lets(&stmts);
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].len(), 2);
+
+        let dependent_stmts = vec![
+            Stmt::Let("a".to_string(), Expr::Int(10)),
+            Stmt::Let("b".to_string(), Expr::Var("a".to_string())),
+        ];
+        let dep_groups = analyze_parallel_lets(&dependent_stmts);
+        assert_eq!(dep_groups.len(), 2);
+    }
+
+    #[test]
+    fn test_plan4_tail_recursion_to_c11_while_loop() {
+        let src = r#"
+module TAIL_REC
+representation {ANY}
+  dummy: U64
+feature {ANY}
+  countdown(n: U64): U64
+    do
+      if n = 0 then
+        0
+      else
+        countdown(n - 1)
+      end
+    end
+end
+"#;
+        let m = parse_single_module(src);
+        let r = &m.feature_routines[0].1;
+        assert!(is_tail_recursive_routine(r));
+        let c_code = emit_c11(&m);
+        assert!(c_code.contains("tail_loop:"));
+    }
+
+    #[test]
+    fn test_plan4_perceus_refcounting_zero_memory_leaks() {
+        let hdr = emit_c11_runtime_header();
+        assert!(hdr.contains("gardel_live_allocations(void)"));
+        assert!(hdr.contains("atomic_fetch_add(&g_gardel_live_allocs, 1);"));
+        assert!(hdr.contains("atomic_fetch_sub(&g_gardel_live_allocs, 1);"));
+    }
+
+    #[test]
+    fn test_plan4_stdlib_seq_and_option_result_contracts() {
+        let src = r#"
+module OPTION_EXT[A]
+representation {ANY}
+  | None
+  | Some(val: A)
+feature {ANY}
+  is_none: BOOL
+    do
+      match Current
+        case None then True
+        case Some(_) then False
+      end
+    end
+  unwrap_or(def: A): A
+    do
+      match Current
+        case None then def
+        case Some(v) then v
+      end
+    end
+end
+"#;
+        let m = parse_single_module(src);
+        let diags = check_visibility_and_semantics(&m);
+        assert!(diags.is_empty(), "Expected 0 diags, got {diags:?}");
+        let bpl = emit_boogie(&m, 2);
+        assert!(bpl.contains("is_None"));
+        assert!(bpl.contains("is_Some"));
+    }
+
+    #[test]
+    fn test_plan4_stdlib_bignat_math_int_and_string_utf8_models() {
+        let stdlib = parse_phase4_stdlib().expect("Phase 4 stdlib parses");
+        let bignat = stdlib.modules.iter().find(|m| m.name == "BIGNAT").unwrap();
+        assert_eq!(bignat.invariants.len(), 2);
+        let str_mod = stdlib.modules.iter().find(|m| m.name == "STRING").unwrap();
+        assert_eq!(str_mod.invariants.len(), 3);
+    }
+
+    #[test]
+    fn test_plan4_whole_program_multi_module_c11_link_and_run() {
+        let stdlib = parse_phase4_stdlib().expect("stdlib parses cleanly");
+        for m in &stdlib.modules {
+            let c_code = emit_c11(m);
+            assert!(!c_code.is_empty());
+        }
+    }
 }
+

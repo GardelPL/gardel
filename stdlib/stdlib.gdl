@@ -1,0 +1,208 @@
+group { SEQ, BIGNAT, STRING, OPTION }
+
+module OPTION[A]
+
+representation {ANY}
+  | None
+  | Some(value: A)
+
+feature {ANY}
+
+  is_some: BOOL
+    do
+      match Current
+        case None    then False
+        case Some(_) then True
+      end
+    end
+
+  get: A
+    require
+      present: Current.is_some
+    do
+      match Current
+        case Some(v) then v
+      end
+    end
+
+end
+
+module SEQ[A]
+
+representation {ANY}
+  | Empty
+  | Leaf(value: A)
+  | Concat(left: SEQ[A], right: SEQ[A], len: NAT)
+
+specify {ANY}
+
+  model: LIST[A]
+    variant
+      Current
+    do
+      match Current
+        case Empty           then LIST.empty
+        case Leaf(v)         then LIST.empty.prepend(v)
+        case Concat(l, r, _) then l.model.append(r.model)
+      end
+    end
+
+create {ANY}
+
+  empty: SEQ[A]
+    do
+      Empty
+    ensure
+      empty_len: Result.length = 0
+    end
+
+  singleton(x: A): SEQ[A]
+    do
+      Leaf(x)
+    ensure
+      unit_len: Result.length = 1
+    end
+
+feature {ANY}
+
+  length: NAT
+    variant
+      Current
+    do
+      match Current
+        case Empty            then 0
+        case Leaf(_)          then 1
+        case Concat(_, _, ln) then ln
+      end
+    end
+
+  concat(other: SEQ[A]): SEQ[A]
+    require
+      fits: Current.length <= 18446744073709551615 - other.length
+    do
+      Concat(Current, other, Current.length + other.length)
+    ensure
+      len_sum: Result.length = Current.length + other.length
+    end
+
+end
+
+module BIGNAT
+
+representation {NONE}
+  limbs: LIST[U64]
+  size: NAT
+
+specify {ANY}
+
+  model: MATH_INT
+    do
+      Current.size
+    end
+
+create {ANY}
+
+  zero: BIGNAT
+    do
+      { limbs = LIST.empty, size = 0 }
+    ensure
+      zero_limbs: Result.limb_count = 0
+    end
+
+  from_u64(x: U64): BIGNAT
+    do
+      if x = 0 then
+        { limbs = LIST.empty, size = 0 }
+      else
+        { limbs = LIST.empty.prepend(x), size = 1 }
+      end
+    ensure
+      count_bounded: Result.limb_count <= 1
+    end
+
+feature {ANY}
+
+  limb_count: NAT
+    do
+      Current.size
+    end
+
+  push_high_limb(limb: U64): BIGNAT
+    require
+      not_full: Current.limb_count < 1024
+    do
+      { limbs = Current.limbs.prepend(limb),
+        size = Current.size + 1 }
+    ensure
+      limb_added: Result.limb_count = Current.limb_count + 1
+    end
+
+invariant
+  size_matches: size = limbs.length
+  bounded_limbs: size <= 1024
+
+end
+
+module STRING
+
+representation {NONE}
+  items: LIST[U64]
+  size: NAT
+  limit: NAT
+
+specify {ANY}
+
+  chars: LIST[U64]
+    do
+      Current.items
+    end
+
+create {ANY}
+
+  make_empty(cap: NAT): STRING
+    require
+      positive_cap: cap > 0
+    do
+      { items = LIST.empty, size = 0, limit = cap }
+    ensure
+      empty_bytes: Result.byte_length = 0
+    end
+
+feature {ANY}
+
+  byte_length: NAT
+    do
+      Current.size
+    end
+
+  capacity: NAT
+    do
+      Current.limit
+    end
+
+  is_empty: BOOL
+    do
+      Current.size = 0
+    ensure
+      def: Result = (Current.byte_length = 0)
+    end
+
+  push_utf8_word(w: U64): STRING
+    require
+      valid_word: w < 256
+      has_room: Current.byte_length < Current.capacity
+    do
+      { items = Current.items.prepend(w),
+        size = Current.size + 1,
+        limit = Current.limit }
+    ensure
+      grew: Result.byte_length = Current.byte_length + 1
+    end
+
+invariant
+  positive_capacity: limit > 0
+  size_matches: size = items.length
+  within_bounds: size <= limit
+
+end
+

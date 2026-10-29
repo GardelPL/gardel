@@ -6,6 +6,9 @@
 
 ## Overview
 
+> 📖 **Comprehensive Language Guide**: Read [`guide/GUIDE.md`](guide/GUIDE.md) for an in-depth reference and tutorial designed for human engineers and AI coding agents.
+> 🌟 **Interactive Guided Tour**: Open [`tutorial/index.html`](tutorial/index.html) in your browser for a visual, interactive walkthrough of contracts, SMT verification, fuel theories, and multi-target compilation.
+
 **Gardel** is designed for high-integrity systems, human readability, and seamless AI-assisted software construction. It eliminates traditional runtime failure modes—such as null pointer dereferences, data races, out-of-bounds access, integer overflow, and infinite recursion—by moving correctness guarantees entirely into compile-time mathematical proofs.
 
 ### Key Pillars
@@ -173,7 +176,7 @@ From the `gardelc` folder:
 ```bash
 cd gardelc
 
-# Compile and verify the embedded standard library (SEQ, BIGNAT, STRING, OPTION, GREETER)
+# Compile and verify the embedded standard library (SEQ, BIGNAT, STRING, OPTION)
 cargo run -- --stdlib
 
 # Inspect the public contract interface of all modules (short view)
@@ -185,8 +188,8 @@ cargo run -- --stdlib --inspect SEQ
 # Inspect contracts on an example file
 cargo run -- ../examples/bounded_stack.gdl --inspect
 
-# Compile and run natively
-cargo run -- --stdlib --run
+# Compile and run an example program
+cargo run -- ../examples/greeter.gdl
 
 # Emit the embedded standard library to standalone .gdl files
 cargo run -- --emit-stdlib

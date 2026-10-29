@@ -23,7 +23,7 @@ Gardel is a pure, total, deterministic, statically verified language designed fo
 Gardel trades mutation, inheritance, and ad-hoc loops for mathematical proofs, strict determinism, and implicit parallelism:
 
 1. **One module, one ADT.** A `module` defines one data type, its operations, and its invariant. `functions` and `program` modules hold free functions and entry points.
-2. **Pure, total, deterministic.** Every routine terminates and nothing mutates. Evaluation order never changes a result (Church-Rosser confluence). Command-query separation becomes queries versus transformers that return a new value. `old` and `modifies` are unnecessary.
+2. **Pure, total, deterministic.** Every routine terminates and nothing mutates. Evaluation order never changes a result for exact discrete types (`U64`, `I64`, `MATH_INT`, `BOOL`, `CHAR`, and algebraic data types, satisfying strict Church-Rosser bit-for-bit confluence). `F64` operations follow strict IEEE-754 expression-tree semantics without compiler re-association. Command-query separation becomes queries versus transformers that return a new value. `old` and `modifies` are unnecessary.
 3. **Contracts are proofs, not checks.** `require`, `ensure`, `invariant`, `variant`, and `check` are discharged by the verifier and erased. Nothing is evaluated at runtime.
 4. **Invariants are types.** A module's invariant is part of what its type means, so it holds for every value wherever that value travels.
 5. **Selective export is a verification firewall.** Visibility lists control both name access and which facts the solver sees.
@@ -39,9 +39,10 @@ Runtime numbers are standard 64-bit machine values, and every checked arithmetic
 
 | Type | Runtime representation | Meaning in contracts |
 | --- | --- | --- |
+| `UNIT` (alias `()`) | Bend v2 `0` / C `void` (0-byte singleton) | unit value `()`; empty tuple / zero-argument return |
 | `U64` (alias `NAT`) | Bend v2 `U64` / C `uint64_t` | integer in $[0, 2^{64} - 1]$; `NAT.max` $= 18\,446\,744\,073\,709\,551\,615$ |
 | `I64` (alias `INT`) | Bend v2 `I64` / C `int64_t` | integer in $[-2^{63}, 2^{63} - 1]$ |
-| `F64` | Bend v2 `F64` / C `double` | IEEE-754 binary64 values with bound axioms; strict deterministic evaluation |
+| `F64` | Bend v2 `F64` / C `double` | IEEE-754 binary64 values with bound axioms; strict expression-tree evaluation |
 | `BOOL`, `CHAR` | `uint8_t`, `uint32_t` | booleans; Unicode scalar values |
 | `MATH_INT` | none (ghost) | unbounded integer; legal only in `specify` and contracts |
 
@@ -50,7 +51,8 @@ Rules:
 - **Contracts use mathematics.** Runtime numbers lift implicitly to `MATH_INT` inside contracts, so `Result = a + b` in an `ensure` means the true mathematical sum.
 - **Checked operators.** `+`, `-`, `*` on runtime numbers generate a proof obligation that the mathematical result is in $[0, 2^{64} - 1]$ for `U64` (or $[-2^{63}, 2^{63} - 1]$ for `I64`). `/` and `%` require a non-zero divisor (and for `I64`, `a != INT.min or b != -1`).
 - **Wrapping and bitwise operators.** `+%`, `-%`, `*%` are total and defined modulo $2^{64}$. Bitwise operators `&`, `|`, `^`, `<<`, `>>` operate on `U64` (with shift amounts required to be $< 64$). They are verified with Z3's `(_ BitVec 64)` theory and never mix with checked operators without an explicit conversion.
-- **Deterministic floating point.** `F64` operations follow strict IEEE-754 evaluation order matching the expression tree. Compiler re-association (such as `-ffast-math` contractions) is forbidden so parallel reductions remain bit-for-bit deterministic across CPU and GPU backends.
+- **Deterministic floating point.** `F64` operations follow strict IEEE-754 evaluation order matching the syntactic expression tree. Compiler re-association (such as `-ffast-math` contractions or fused multiply-add `fma` synthesis across distinct operations) is strictly forbidden (`-ffp-contract=off`), and quiet/signaling NaN representations are canonicalized, ensuring that execution along a given expression tree is deterministic across CPU and GPU backends. However, because floating-point addition and multiplication are mathematically non-associative ($(a+b)+c \neq a+(b+c)$), parallel reductions do not claim bit-for-bit equivalence across dynamically re-partitioned trees; exact Church-Rosser confluence is guaranteed for discrete types (`NAT`, `INT`, `MATH_INT`, `BOOL`, `CHAR`, and ADTs).
+- **Unit type.** `UNIT` is a primitive type with exactly one value, written `()`. It represents computations evaluated purely for sequenced effects (such as `IO.print(...) : IO[UNIT]`), and erases at runtime.
 - **Conversions are explicit.** `NAT.of(m)` from a `MATH_INT` requires a proof that `0 <= m and m <= NAT.max`.
 - **Large numbers.** A library type `BIGNAT` stores limbs in a `SEQ[U64]` and has `MATH_INT` as its ghost model.
 
@@ -143,8 +145,9 @@ end
 
 A module's `invariant` is part of its type: every value of type `M` anywhere in a program satisfies it. Formally, `M` denotes the refinement type $\{ x : M_{\text{raw}} \mid I(x) \}$, where $I$ is the conjunction of the invariant clauses.
 
-- **Checked at every construction site.** A record literal, functional update, or variant constructor that produces an `M` is a construction site. The verifier must prove $I(v)$ there, using the path conditions, local `let` definitions, the `require` clauses, and $I(\mathit{Current})$. It does not matter whether the value is returned directly or nested in a `TUPLE`, `OPTION`, or `LIST`.
+- **Checked at every construction site.** A record literal, functional update, or variant constructor that produces an `M` is a construction site. The verifier must prove $I(v)$ there, using the path conditions, local `let` definitions, the `require` clauses, and $I(\mathit{Current})$. It does not matter whether the value is returned directly or nested in a `TUPLE`, `OPTION`, or `LIST`. Local `check` blocks or lemmas may immediately precede construction sites to establish inductive properties required by $I(v)$.
 - **Assumed everywhere else.** Any value of type `M` can be used knowing $I(x)$ with no re-proof, because values never change.
+- **Destructuring and recursive sum types.** When destructuring an inductive sum type (e.g., `match t` with `case Node(l, r)`), the branch context assumes subterms satisfy the module invariant ($I(l)$ and $I(r)$) if and only if $I$ is proven hereditary (i.e., inductive over subterms: $\forall l, r.\; I(\text{Node}(l, r)) \implies I(l) \land I(r)$). For non-hereditary predicates (such as global tree balance or key uniqueness), invariants on recursive ADTs must either provide an inductive heredity proof or be formulated as ghost model properties verified at public module boundaries.
 - **Privileged modules.** A friend module listed in `representation {FRIEND}` that builds an `M` directly pays the same obligation at its own construction site (guaranteed visible by Visibility Rule 5 in §4).
 - **Generic containers need no special rules.** `LIST[M]` holds only values that already satisfy $I$.
 
@@ -303,12 +306,36 @@ end
 
 A `concept` lists required operations and the laws they must obey, and a module conforms with `satisfies` and proves the laws in a `specify` block. Gardel has no implementation inheritance and no subtyping.
 
-`=` in contracts is built-in structural equality, and the concept `EQ` requires that the runtime `equals` agree with it. `ORD` refines `EQ` and requires totality, ensuring a unique, deterministic total order.
+`=` in contracts denotes built-in structural Leibniz equality in SMT. The concept `EQ` defines behavioral equivalence via standard equivalence relation laws (reflexive, symmetric, transitive). This decouples behavioral equivalence from structural term identity, allowing collection and quotient types with non-canonical representations (such as `SEQ[A]`, `SET[A]`, and `RAT`) to conform soundly without introducing SMT contradictions. For types where structural representation is canonical and bijective with mathematical identity (such as `U64`, `BOOL`, or `OPTION[U64]`), the sub-concept `CANONICAL_EQ` refines `EQ` and requires agreement with structural equality. `ORD` refines `EQ` and requires a total order consistent with `a.equals(b)`.
 
 ```eiffel
 concept EQ
 
   equals(other: Current): BOOL
+
+  law reflexive(a: Current)
+    ensure
+      refl: a.equals(a)
+    end
+
+  law symmetric(a: Current, b: Current)
+    require
+      ab: a.equals(b)
+    ensure
+      ba: b.equals(a)
+    end
+
+  law transitive(a: Current, b: Current, c: Current)
+    require
+      ab: a.equals(b)
+      bc: b.equals(c)
+    ensure
+      ac: a.equals(c)
+    end
+
+end
+
+concept CANONICAL_EQ refines EQ
 
   law agrees_with_structural(a: Current, b: Current)
     ensure
@@ -325,7 +352,7 @@ concept ORD refines EQ
     do
       Current.less_than(other) or Current.equals(other)
     ensure
-      definition: Result = (Current.less_than(other) or Current = other)
+      definition: Result = (Current.less_than(other) or Current.equals(other))
     end
 
   law irreflexive(a: Current)
@@ -343,7 +370,7 @@ concept ORD refines EQ
 
   law total(a: Current, b: Current)
     ensure
-      comparable: a.less_than(b) or a = b or b.less_than(a)
+      comparable: a.less_than(b) or a.equals(b) or b.less_than(a)
     end
 
 end
@@ -363,7 +390,7 @@ Rules:
 
 Gardel removes the special-purpose `fold` and `unfold` syntax of v0.2. Instead, parallelism arises directly from standard divide-and-conquer recursion, `let` bindings, and the `SEQ[A]` collection type, compiled to **Bend v2 / BendRT**.
 
-1. **Deterministic confluence.** Because every routine is pure and total (§2), evaluating two sub-expressions in parallel or sequentially always produces the exact same value. Race conditions and schedule-dependent outputs cannot exist.
+1. **Deterministic confluence.** Because every routine is pure and total (§2), evaluating two sub-expressions in parallel or sequentially always produces the exact same value for all exact discrete types (`U64`, `I64`, `MATH_INT`, `BOOL`, `CHAR`, and ADTs). Race conditions and schedule-dependent outputs cannot exist. Floating-point (`F64`) expressions strictly preserve their specified expression-tree structure without compiler re-association.
 2. **Automatic fork-join on independent bindings.** When a block contains two or more independent `let` bindings (or constructor arguments) that make recursive calls—such as `let ml = l.max_value` followed by `let mr = r.max_value` where `mr` does not depend on `ml`—`gardelc` emits a parallel fork (`ml mr = max_value(l) max_value(r)` in Bend v2 / BendRT task rings).
 3. **Tail recursion to loops.** Self-recursive tail calls are lowered directly to native C loops / BendRT tail jumps with zero stack frame allocation.
 4. **Tree generation without `unfold`.** Building a balanced parallel structure from a scalar seed uses a standard recursive routine with a decreasing numeric `variant` (such as `variant hi - lo`), giving the generator full access to `require` and `ensure` contracts (§14).
@@ -376,9 +403,13 @@ Gardel removes the special-purpose `fold` and `unfold` syntax of v0.2. Instead, 
 Gardel keeps a pure core and moves all input and output to the program boundary through a linear action type `IO[A]`.
 
 1. **Where IO lives.** Only a `program` module and routines typed `IO[A]` may perform effects. Core modules stay pure and verified.
-2. **Linear actions.** An `IO[A]` value is used exactly once and is sequenced in a `with IO` block, which the compiler lowers to Bend v2 / C host IO primitives.
-3. **External data is untrusted.** Bytes, strings, and numbers enter as raw values. They become invariant-carrying ADTs only through `create` or boundary routines that return `OPTION` or `RESULT` (§7).
-4. **Limited specifications.** Contracts on an `IO` routine cover its pure arguments and result. The verifier does not model the outside world.
+2. **Linear actions and affine consumption.** An `IO[A]` value represents an unexecuted linear action token that must be consumed exactly once along every execution path in a `with IO` sequence. An `IO[...]` value cannot be duplicated, dropped silently in a branch, or captured by a multi-use closure (`fn`). Every branch of a conditional (`if` or `match`) within an IO routine must uniformly consume or return an `IO` action.
+3. **Typing rules for `with IO`.** Sequences within a `with IO` block obey explicit monadic sequencing rules:
+   - Binding statement `x <- e`: requires $e : \text{IO}[A]$, and binds $x : A$ in all subsequent statements of the block.
+   - Bare statement $e$: requires $e : \text{IO}[\text{UNIT}]$, executing the effect and discarding the unit result.
+   - Final expression: the trailing expression $e_{\text{final}}$ of `with IO ... end` must have type $\text{IO}[R]$, making the entire `with IO` block evaluate to $\text{IO}[R]$.
+4. **External data is untrusted.** Bytes, strings, and numbers enter as raw values. They become invariant-carrying ADTs only through `create` or boundary routines that return `OPTION` or `RESULT` (§7).
+5. **Limited specifications.** Contracts on an `IO` routine cover its pure arguments and result. The verifier does not model the outside world.
 
 ```eiffel
 program GREETER
@@ -407,14 +438,14 @@ Let $I$ be the invariant of a module, $P$ the `require` clauses, and $Q$ the `en
 
 $$\forall \bar{a}.\; P(\bar{a}) \Rightarrow Q(\bar{a}, \mathit{Result}) \land I(\mathit{Result}) \qquad \text{(create)}$$
 
-$$\forall c, \bar{a}.\; I(c) \land P(c, \bar{a}) \Rightarrow Q(c, \bar{a}, \mathit{Result}) \qquad \text{(routine on Current)}$$
+$$\forall c, \bar{a}.\; I(c) \land P(c, \bar{a}) \Rightarrow Q(c, \bar{a}, \mathit{Result}) \land ( \mathit{Result} : M \implies I(\mathit{Result}) ) \qquad \text{(routine on Current)}$$
 
-Because $I$ is part of the type, a routine's $I(\mathit{Result})$ follows directly from the construction-site obligations below.
+Both `create` and `feature` routines returning an instance of `Current` (or any refined type $M$) carry the explicit postcondition obligation $I(\mathit{Result})$. This ensures that whenever a routine produces or transforms a value of type $M$—including via conditional branches, function compositions, or generic wrappers—the invariant is verified at the routine interface boundary in addition to checking construction sites.
 
 | Obligation | Generated at | Must be proven |
 | --- | --- | --- |
 | Creation | each `create` routine | $P$ implies $Q$ and $I(\mathit{Result})$ |
-| Routine | each `feature` and `specify` routine | $I(\mathit{Current})$ and $P$ imply $Q$ |
+| Routine | each `feature` and `specify` routine | $I(\mathit{Current})$ and $P$ imply $Q$, plus $I(\mathit{Result})$ if returning `Current` or a refined type $M$ |
 | Construction site | every record literal, update, or variant constructor that builds an `M` | active context implies $I(v)$ |
 | Overflow & Shift | each checked `+`, `-`, `*`, `/`, `%`, `<<`, `>>` | mathematical result in `U64`/`I64` range; divisor $\neq 0$; shift $< 64$ |
 | Termination | each recursive routine and law proof | `variant` strictly decreases in a well-founded order |
@@ -540,43 +571,43 @@ Block syntax is locked to `end`-delimited blocks to maximize structural accuracy
 ```ebnf
 File          ::= GroupDecl? ( ModuleDecl | FunctionsDecl | ProgramDecl | ConceptDecl )+
 
-GroupDecl     ::= "group" "{" Ident ( "," Ident )* "}"
+GroupDecl     ::= "group" "{" UpperIdent ( "," UpperIdent )* "}"
 
-ModuleDecl    ::= "module" Ident TypeParams? Satisfies?
+ModuleDecl    ::= "module" UpperIdent TypeParams? Satisfies?
                     ( RepresentationSection | CreateSection
                     | FeatureSection | SpecifySection )*
                     InvariantBlock?
                   "end"
-FunctionsDecl ::= "functions" Ident ( FeatureSection | SpecifySection )* "end"
-ProgramDecl   ::= "program" Ident FeatureSection* "end"
-ConceptDecl   ::= "concept" Ident TypeParams? Refines?
+FunctionsDecl ::= "functions" UpperIdent ( FeatureSection | SpecifySection )* "end"
+ProgramDecl   ::= "program" UpperIdent FeatureSection* "end"
+ConceptDecl   ::= "concept" UpperIdent TypeParams? Refines?
                     ( Signature | RoutineDecl | LawDecl )*
                   "end"
 
 TypeParams    ::= "[" TypeParam ( "," TypeParam )* "]"
-TypeParam     ::= Ident ( ":" Ident )?
-Satisfies     ::= "satisfies" Ident ( "," Ident )*
-                    ( "where" Ident "satisfies" Ident )?
-Refines       ::= "refines" Ident ( "," Ident )*
+TypeParam     ::= UpperIdent ( ":" UpperIdent )?
+Satisfies     ::= "satisfies" UpperIdent ( "," UpperIdent )*
+                    ( "where" UpperIdent "satisfies" UpperIdent )?
+Refines       ::= "refines" UpperIdent ( "," UpperIdent )*
 
-VisList       ::= "{" Ident ( "," Ident )* "}"
+VisList       ::= "{" UpperIdent ( "," UpperIdent )* "}"
 RepresentationSection ::= "representation" VisList ( FieldDecl+ | VariantDecl+ )
-FieldDecl     ::= Ident ":" Type
-VariantDecl   ::= "|" Ident ( "(" FieldDecl ( "," FieldDecl )* ")" )?
+FieldDecl     ::= LowerIdent ":" Type
+VariantDecl   ::= "|" UpperIdent ( "(" FieldDecl ( "," FieldDecl )* ")" )?
 CreateSection ::= "create" VisList RoutineDecl+
 FeatureSection::= "feature" VisList RoutineDecl+
 SpecifySection::= "specify" VisList ( RoutineDecl | LawDecl )+
 
-RoutineDecl   ::= Ident TypeParams? Params? ":" Type
+RoutineDecl   ::= LowerIdent TypeParams? Params? ":" Type
                     RequireBlock? VariantBlock?
                     "do" Block
                     EnsureBlock?
                   "end"
-Signature     ::= Ident Params? ":" Type
+Signature     ::= LowerIdent Params? ":" Type
 Params        ::= "(" Param ( "," Param )* ")"
-Param         ::= Ident ":" Type
+Param         ::= LowerIdent ":" Type
 
-LawDecl       ::= "law" Ident Params
+LawDecl       ::= "law" LowerIdent Params
                     RequireBlock? TriggerBlock? VariantBlock?
                     ( "do" Block )?
                     EnsureBlock?
@@ -587,37 +618,41 @@ EnsureBlock   ::= "ensure" TaggedPred+
 InvariantBlock::= "invariant" TaggedPred+
 VariantBlock  ::= "variant" Expr ( "," Expr )*
 TriggerBlock  ::= "trigger" Expr ( "," Expr )*
-TaggedPred    ::= Ident ":" Expr
+TaggedPred    ::= LowerIdent ":" Expr
 
-Block         ::= Stmt* Expr
-Stmt          ::= "let" Ident ( ":" Type )? "=" Expr
+Block         ::= ( Stmt ( "\n" | ";" )+ )* Expr
+Stmt          ::= "let" LowerIdent ( ":" Type )? "=" Expr
                 | CheckBlock
                 | AssumeBlock
-                | "reveal" Ident
+                | "reveal" LowerIdent
 
-Type          ::= Ident TypeArgs?
+Type          ::= UpperIdent TypeArgs?
                 | Type "->" Type
-                | "(" Ident ":" Type ")" "->" Type RequireBlock? EnsureBlock?
+                | "(" ( Param ( "," Param )* )? ")" "->" Type RequireBlock? EnsureBlock?
 TypeArgs      ::= "[" Type ( "," Type )* "]"
 
-Expr          ::= Literal | Ident | Expr "." Ident Args? | Ident Args
+Expr          ::= Literal | LowerIdent | UpperIdent Args? | Expr "." LowerIdent Args? | LowerIdent Args
                 | Expr BinOp Expr | UnOp Expr | "(" Expr ( "," Expr )* ")"
                 | "if" Expr "then" Block "else" Block "end"
                 | MatchExpr | LambdaExpr | WithIoExpr
                 | RecordLit | RecordUpdate | QuantExpr
 Args          ::= "(" ( Expr ( "," Expr )* )? ")"
 MatchExpr     ::= "match" Expr ( "case" Pattern "then" Block )+ "end"
-Pattern       ::= "_" | Ident | Literal
-                | Ident "(" Pattern ( "," Pattern )* ")"
+Pattern       ::= "_" | LowerIdent | Literal
+                | UpperIdent ( "(" Pattern ( "," Pattern )* ")" )?
                 | "(" Pattern ( "," Pattern )* ")"
 LambdaExpr    ::= "fn" Params ":" Type "do" Block "end"
-WithIoExpr    ::= "with" "IO" IoStmt* Expr "end"
-IoStmt        ::= Ident "<-" Expr | Expr
-RecordLit     ::= "{" Ident "=" Expr ( "," Ident "=" Expr )* "}"
-RecordUpdate  ::= "{" Expr "with" Ident "=" Expr ( "," Ident "=" Expr )* "}"
-QuantExpr     ::= ( "forall" | "exists" ) Ident ":" Type "." Expr
+WithIoExpr    ::= "with" "IO" ( IoStmt ( "\n" | ";" )+ )* Expr "end"
+IoStmt        ::= LowerIdent "<-" Expr | Expr
+RecordLit     ::= "{" LowerIdent "=" Expr ( "," LowerIdent "=" Expr )* "}"
+RecordUpdate  ::= "{" Expr "with" LowerIdent "=" Expr ( "," LowerIdent "=" Expr )* "}"
+QuantExpr     ::= ( "forall" | "exists" ) LowerIdent ":" Type "." Expr
 CheckBlock    ::= "check" TaggedPred+ "end"
 AssumeBlock   ::= "assume" TaggedPred+ "end"
+
+UpperIdent    ::= [A-Z] [A-Za-z0-9_]*      (* Types, Modules, Concepts, Variant Constructors *)
+LowerIdent    ::= [a-z] [a-z0-9_]*        (* Routines, Parameters, Variables, Fields, Contract Tags *)
+Literal       ::= Integer | Float | String | Char | Bool | "()"
 ```
 
 ---
