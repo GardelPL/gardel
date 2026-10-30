@@ -250,6 +250,17 @@ Contracts are never evaluated at runtime, so a program must be able to establish
      ensure
        accepted: Result.is_some = (cap > 0)
      end
+
+   try_make_result(cap: NAT): RESULT[STRING, BOUNDED_STACK[A]]
+     do
+       if cap > 0
+         then Ok(BOUNDED_STACK.make(cap))
+         else Error("capacity must be positive")
+       end
+     ensure
+       accepted: Result.is_ok = (cap > 0)
+       err_message: Result.is_error implies Result.get_error = "capacity must be positive"
+     end
    ```
 5. **Opaque bodies and fuel.** Outside its module a function is known only by its signature and `ensure` clauses. Inside, recursive functions unfold up to a `fuel` limit (default 2), and `reveal f` unfolds one definition fully for the remainder of the current block. State key facts as `ensure` clauses so clients can use them without unfolding.
 
@@ -669,7 +680,7 @@ The table below records the architectural decisions locked in v0.4 alongside the
 | Closure semantics | Unrestricted via compile-time closure conversion | **Locked in v0.4** (replaces affine rule) |
 | Verifier backend | Boogie and Z3 (with Phase 0 Dafny prototype) | Active |
 | Memory management in C | Perceus reference counting with in-place reuse vs. BendRT arena | To benchmark in Phase 1 |
-| Gradual verification | None; `assume` audited by `--audit` / `--strict` | Open (failure-as-value `RESULT` preferred) |
+| Gradual verification | None; `assume` audited by `--audit` / `--strict` | **Locked in v0.4** (failure-as-value `RESULT[E, A]` standardized with full combinators and verified algebraic laws) |
 | Strings | UTF-8 byte-buffer backed by `SEQ[U64]` with ghost `LIST[CHAR]` | Planned for Phase 4 |
 
 **Roadmap**

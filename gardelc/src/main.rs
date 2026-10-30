@@ -95,6 +95,7 @@ pub struct SignatureDecl {
 #[derive(Debug, Clone)]
 pub struct LawDecl {
     pub name: String,
+    pub type_params: Vec<String>,
     pub params: Vec<(String, String)>,
     pub requires: Vec<(String, Expr)>,
     pub triggers: Vec<Expr>,
@@ -1277,6 +1278,17 @@ impl Parser {
     fn parse_law(&mut self) -> Result<LawDecl, ParseError> {
         self.expect_kw("law")?;
         let name = self.expect_lower_ident()?;
+        let mut type_params = Vec::new();
+        if *self.peek() == Token::LBracket {
+            self.next();
+            while *self.peek() != Token::RBracket {
+                type_params.push(self.expect_upper_ident()?);
+                if *self.peek() == Token::Comma {
+                    self.next();
+                }
+            }
+            self.expect(Token::RBracket)?;
+        }
         let mut params = Vec::new();
         if *self.peek() == Token::LParen {
             self.next();
@@ -1355,6 +1367,7 @@ impl Parser {
         self.expect_kw("end")?;
         Ok(LawDecl {
             name,
+            type_params,
             params,
             requires,
             triggers,
@@ -3110,7 +3123,7 @@ pub fn format_gardel_expr(e: &Expr) -> String {
 /// Returns the canonical Gardel v0.4 Phase 4 Standard Library source package (§3, §5, §10.5, §11, §16).
 pub fn phase4_stdlib_source() -> &'static str {
     r#"
-group { SEQ, BIGNAT, STRING, OPTION }
+group { SEQ, BIGNAT, STRING, OPTION, RESULT }
 
 module OPTION[A]
 
@@ -3126,6 +3139,19 @@ feature {ANY}
         case None    then False
         case Some(_) then True
       end
+    ensure
+      def: Result = (not (Current = None))
+    end
+
+  is_none: BOOL
+    do
+      match Current
+        case None    then True
+        case Some(_) then False
+      end
+    ensure
+      def: Result = (not Current.is_some)
+      is_empty_variant: Result = (Current = None)
     end
 
   get: A
@@ -3135,6 +3161,79 @@ feature {ANY}
       match Current
         case Some(v) then v
       end
+    ensure
+      matches_some: Current = Some(Result)
+    end
+
+  unwrap_or(default: A): A
+    do
+      match Current
+        case None    then default
+        case Some(v) then v
+      end
+    ensure
+      when_some: Current.is_some implies Result = Current.get
+      when_none: Current.is_none implies Result = default
+    end
+
+  map[B](f: A -> B): OPTION[B]
+    do
+      match Current
+        case None    then None
+        case Some(v) then Some(f(v))
+      end
+    ensure
+      preserves_some: Result.is_some = Current.is_some
+      preserves_none: Result.is_none = Current.is_none
+      mapped_val: Current.is_some implies Result = Some(f(Current.get))
+    end
+
+  and_then[B](f: A -> OPTION[B]): OPTION[B]
+    do
+      match Current
+        case None    then None
+        case Some(v) then f(v)
+      end
+    ensure
+      none_propagates: Current.is_none implies Result.is_none
+      some_chains: Current.is_some implies Result = f(Current.get)
+    end
+
+specify {ANY}
+
+  law none_is_not_some(opt: OPTION[A])
+    ensure
+      disjoint: opt.is_none = (not opt.is_some)
+    end
+
+  law unwrap_or_some(v: A, default: A)
+    ensure
+      extracts: Some(v).unwrap_or(default) = v
+    end
+
+  law unwrap_or_none(default: A)
+    ensure
+      defaults: None.unwrap_or(default) = default
+    end
+
+  law map_preserves_none[B](f: A -> B)
+    ensure
+      none_mapped: None.map(f) = None
+    end
+
+  law map_some[B](v: A, f: A -> B)
+    ensure
+      some_mapped: Some(v).map(f) = Some(f(v))
+    end
+
+  law and_then_left_unit[B](v: A, f: A -> OPTION[B])
+    ensure
+      left_id: Some(v).and_then(f) = f(v)
+    end
+
+  law and_then_none[B](f: A -> OPTION[B])
+    ensure
+      absorbs: None.and_then(f) = None
     end
 
 end
@@ -3374,10 +3473,173 @@ invariant
   valid_bytes: all_bytes_valid(bytes)
 
 end
+
+module RESULT[E, A]
+
+representation {ANY}
+  | Error(err: E)
+  | Ok(val: A)
+
+create {ANY}
+
+  ok(v: A): RESULT[E, A]
+    do
+      Ok(v)
+    ensure
+      is_ok_res: Result.is_ok
+      val_set: Result.get = v
+    end
+
+  error(e: E): RESULT[E, A]
+    do
+      Error(e)
+    ensure
+      is_err_res: Result.is_error
+      err_set: Result.get_error = e
+    end
+
+feature {ANY}
+
+  is_ok: BOOL
+    do
+      match Current
+        case Error(_) then False
+        case Ok(_)    then True
+      end
+    ensure
+      def: Result = (match Current case Error(_) then False case Ok(_) then True end)
+    end
+
+  is_error: BOOL
+    do
+      match Current
+        case Error(_) then True
+        case Ok(_)    then False
+      end
+    ensure
+      complement: Result = (not Current.is_ok)
+    end
+
+  get: A
+    require
+      ok_present: Current.is_ok
+    do
+      match Current
+        case Ok(v) then v
+      end
+    ensure
+      matches_ok: Current = Ok(Result)
+    end
+
+  get_error: E
+    require
+      err_present: Current.is_error
+    do
+      match Current
+        case Error(e) then e
+      end
+    ensure
+      matches_err: Current = Error(Result)
+    end
+
+  unwrap_or(default: A): A
+    do
+      match Current
+        case Error(_) then default
+        case Ok(v)    then v
+      end
+    ensure
+      when_ok: Current.is_ok implies Result = Current.get
+      when_err: Current.is_error implies Result = default
+    end
+
+  to_option: OPTION[A]
+    do
+      match Current
+        case Error(_) then None
+        case Ok(v)    then Some(v)
+      end
+    ensure
+      preserves_status: Result.is_some = Current.is_ok
+    end
+
+  map[B](f: A -> B): RESULT[E, B]
+    do
+      match Current
+        case Error(e) then Error(e)
+        case Ok(v)    then Ok(f(v))
+      end
+    ensure
+      preserves_ok: Result.is_ok = Current.is_ok
+      preserves_err: Current.is_error implies Result.get_error = Current.get_error
+      mapped_ok: Current.is_ok implies Result = Ok(f(Current.get))
+    end
+
+  map_error[F](f: E -> F): RESULT[F, A]
+    do
+      match Current
+        case Error(e) then Error(f(e))
+        case Ok(v)    then Ok(v)
+      end
+    ensure
+      preserves_ok: Result.is_ok = Current.is_ok
+      preserves_val: Current.is_ok implies Result.get = Current.get
+      mapped_err: Current.is_error implies Result = Error(f(Current.get_error))
+    end
+
+  and_then[B](f: A -> RESULT[E, B]): RESULT[E, B]
+    do
+      match Current
+        case Error(e) then Error(e)
+        case Ok(v)    then f(v)
+      end
+    ensure
+      err_propagates: Current.is_error implies (Result.is_error and Result.get_error = Current.get_error)
+      ok_chains: Current.is_ok implies Result = f(Current.get)
+    end
+
+specify {ANY}
+
+  law ok_not_error(r: RESULT[E, A])
+    ensure
+      dichotomy: r.is_error = (not r.is_ok)
+    end
+
+  law map_ok[B](dummy: E, v: A, f: A -> B)
+    ensure
+      ok_mapped: Ok(v).map(f) = Ok(f(v))
+    end
+
+  law map_preserves_error[B](e: E, f: A -> B)
+    ensure
+      err_untouched: Error(e).map(f) = Error(e)
+    end
+
+  law map_error_err[F](dummy: A, e: E, f: E -> F)
+    ensure
+      err_mapped: Error(e).map_error(f) = Error(f(e))
+    end
+
+  law map_error_preserves_ok[F](v: A, f: E -> F)
+    ensure
+      ok_untouched: Ok(v).map_error(f) = Ok(v)
+    end
+
+  law and_then_ok[B](v: A, f: A -> RESULT[E, B])
+    ensure
+      chain_ok: Ok(v).and_then(f) = f(v)
+    end
+
+  law and_then_error[B](e: E, f: A -> RESULT[E, B])
+    ensure
+      chain_err: Error(e).and_then(f) = Error(e)
+    end
+
+end
 "#
 }
 
-/// Parses and returns all Phase 4 standard library modules (`OPTION`, `SEQ`, `BIGNAT`, `STRING`).
+/// Parses and returns all Phase 4 standard library modules (`OPTION`, `SEQ`, `BIGNAT`, `STRING`, `RESULT`).
 pub fn parse_phase4_stdlib() -> Result<FileAst, String> {
     let tokens = tokenize(phase4_stdlib_source()).map_err(|e| e.to_string())?;
     let mut parser = Parser::new(tokens);
@@ -3457,6 +3719,21 @@ pub fn monomorphize_module(m: &ModuleDecl, concrete_args: &[String]) -> ModuleDe
         .specify_routines
         .iter()
         .map(|(v, r)| (v.clone(), spec_routine(r)))
+        .collect();
+
+    let spec_law = |l: &LawDecl| -> LawDecl {
+        let mut nl = l.clone();
+        nl.params = nl
+            .params
+            .into_iter()
+            .map(|(p, t)| (p, sub_ty(&t)))
+            .collect();
+        nl
+    };
+    spec.specify_laws = m
+        .specify_laws
+        .iter()
+        .map(|(v, l)| (v.clone(), spec_law(l)))
         .collect();
 
     spec
@@ -4052,6 +4329,22 @@ pub fn emit_boogie(m: &ModuleDecl, fuel_limit: usize) -> String {
         "axiom (forall<A, B> a: A, b: B :: { Tuple2_mk(a, b) } Tuple2_first(Tuple2_mk(a, b)) == a && Tuple2_second(Tuple2_mk(a, b)) == b);\n\n",
     );
 
+    out.push_str("type Fn1 A B;\n");
+    out.push_str("function Fn1_app<A, B>(f: Fn1 A B, x: A) returns (B);\n\n");
+
+    if m.name == "RESULT" {
+        out.push_str("// --- Minimal OPTION[A] Theory for RESULT.to_option ---\n");
+        out.push_str("type OPTION A;\n");
+        out.push_str("function None<A>() returns ((OPTION A));\n");
+        out.push_str("function Some<A>(value: A) returns ((OPTION A));\n");
+        out.push_str("function is_None<A>(x: (OPTION A)) returns (bool);\n");
+        out.push_str("function is_Some<A>(x: (OPTION A)) returns (bool);\n");
+        out.push_str("axiom (forall<A> :: { (None() : (OPTION A)) } is_None((None() : (OPTION A))) && !is_Some((None() : (OPTION A))));\n");
+        out.push_str("axiom (forall<A> v: A :: { Some(v) } is_Some(Some(v)) && !is_None(Some(v)));\n");
+        out.push_str("function fn_is_some<A>(fuel: Fuel, Current: (OPTION A)) returns (bool);\n");
+        out.push_str("axiom (forall<A> f: Fuel, Current: (OPTION A) :: { fn_is_some(f, Current) } fn_is_some(f, Current) == is_Some(Current));\n\n");
+    }
+
     // 3. Module ADT Representation Axiomatization (§5)
     out.push_str(&format!(
         "// --- 3. ADT Representation for {} ---\n",
@@ -4109,27 +4402,37 @@ pub fn emit_boogie(m: &ModuleDecl, fuel_limit: usize) -> String {
                 // Constructor discriminator & field projection axioms
                 let arg_names: Vec<String> = v.fields.iter().map(|(fnm, _)| fnm.clone()).collect();
                 let ctor_call = format!("{}({})", v.name, arg_names.join(", "));
+                let ctor_trig = if m.type_params.is_empty() {
+                    format!("{{ {ctor_call} }}")
+                } else {
+                    format!("{{ ({ctor_call} : {mod_bpl_ty}) }}")
+                };
                 if v.fields.is_empty() {
                     out.push_str(&format!(
                         "axiom (forall{tp_quant} x: {mod_bpl_ty} :: {{ is_{}(x) }} is_{}(x) <==> x == {}());\n",
                         v.name, v.name, v.name
                     ));
                 } else {
-                    let mut proj_conj = vec![format!("is_{}({ctor_call})", v.name)];
+                    let ctor_app = if m.type_params.is_empty() {
+                        ctor_call.clone()
+                    } else {
+                        format!("({ctor_call} : {mod_bpl_ty})")
+                    };
+                    let mut proj_conj = vec![format!("is_{}({ctor_app})", v.name)];
                     for (fnm, fty) in &v.fields {
-                        proj_conj.push(format!("{}_{}({ctor_call}) == {fnm}", v.name, fnm));
+                        proj_conj.push(format!("{}_{}({ctor_app}) == {fnm}", v.name, fnm));
                         if fty == &m.name
                             || fty == "Current"
                             || fty.starts_with(&format!("{}[", m.name))
                         {
                             proj_conj.push(format!(
-                                "{}_adt_size({fnm}) < {}_adt_size({ctor_call})",
+                                "{}_adt_size({fnm}) < {}_adt_size({ctor_app})",
                                 m.name, m.name
                             ));
                         }
                     }
                     out.push_str(&format!(
-                        "axiom (forall{tp_quant} {} :: {{ {ctor_call} }} {});\n",
+                        "axiom (forall{tp_quant} {} :: {ctor_trig} {});\n",
                         params.join(", "),
                         proj_conj.join(" && ")
                     ));
@@ -4188,23 +4491,32 @@ pub fn emit_boogie(m: &ModuleDecl, fuel_limit: usize) -> String {
                         .collect();
                     let c1 = format!("{}({})", v.name, c1_args.join(", "));
                     let c2 = format!("{}({})", v.name, c2_args.join(", "));
+                    let inj_trig = if m.type_params.is_empty() {
+                        format!("{{ {c1}, {c2} }}")
+                    } else {
+                        format!("{{ ({c1} : {mod_bpl_ty}), ({c2} : {mod_bpl_ty}) }}")
+                    };
+                    let c1_app = if m.type_params.is_empty() { c1.clone() } else { format!("({c1} : {mod_bpl_ty})") };
+                    let c2_app = if m.type_params.is_empty() { c2.clone() } else { format!("({c2} : {mod_bpl_ty})") };
                     out.push_str(&format!(
-                        "axiom (forall{tp_quant} {}, {} :: {{ {c1}, {c2} }} {c1} == {c2} ==> ({}));\n",
+                        "axiom (forall{tp_quant} {}, {} :: {inj_trig} {c1_app} == {c2_app} ==> ({}));\n",
                         p1.join(", "),
                         p2.join(", "),
                         eqs.join(" && ")
                     ));
                 }
             }
-            // Pairwise Variant Disjointness Axioms
+            // Pairwise Variant Disjointness Axioms (symmetric E-matching triggers)
             for i in 0..variants.len() {
-                for j in (i + 1)..variants.len() {
-                    let v_i = &variants[i];
-                    let v_j = &variants[j];
-                    out.push_str(&format!(
-                        "axiom (forall{tp_quant} x: {mod_bpl_ty} :: {{ is_{}(x) }} is_{}(x) ==> !is_{}(x));\n",
-                        v_i.name, v_i.name, v_j.name
-                    ));
+                for j in 0..variants.len() {
+                    if i != j {
+                        let v_i = &variants[i];
+                        let v_j = &variants[j];
+                        out.push_str(&format!(
+                            "axiom (forall{tp_quant} x: {mod_bpl_ty} :: {{ is_{}(x) }} is_{}(x) ==> !is_{}(x));\n",
+                            v_i.name, v_i.name, v_j.name
+                        ));
+                    }
                 }
             }
             if !variants.is_empty() {
@@ -4273,7 +4585,7 @@ pub fn emit_boogie(m: &ModuleDecl, fuel_limit: usize) -> String {
         m.name
     ));
     out.push_str(&format!(
-        "function {}_Invariant{tp_quant}(Current: {mod_bpl_ty}) returns (bool)\n{{\n",
+        "function {{:inline}} {}_Invariant{tp_quant}(Current: {mod_bpl_ty}) returns (bool)\n{{\n",
         m.name
     ));
     let empty_revealed = HashSet::new();
@@ -4321,12 +4633,23 @@ pub fn emit_boogie(m: &ModuleDecl, fuel_limit: usize) -> String {
         .collect();
 
     for (r, has_current) in &all_routines {
+        let mut r_all_tps = m.type_params.clone();
+        for tp in &r.type_params {
+            if !r_all_tps.contains(tp) {
+                r_all_tps.push(tp.clone());
+            }
+        }
+        let r_tp_quant = if r_all_tps.is_empty() {
+            String::new()
+        } else {
+            format!("<{}>", r_all_tps.join(", "))
+        };
         let uses_curr = *has_current && routine_uses_current(r, &implicit_fields);
         let mut sig_params = vec!["fuel: Fuel".to_string()];
-        let mut q_params = vec!["f: Fuel".to_string()];
-        let mut call_args_step_two = vec!["SuccFuel(SuccFuel(f))".to_string()];
-        let mut call_args_succ = vec!["SuccFuel(f)".to_string()];
-        let mut call_args_f = vec!["f".to_string()];
+        let mut q_params = vec!["_fuel: Fuel".to_string()];
+        let mut call_args_step_two = vec!["SuccFuel(SuccFuel(_fuel))".to_string()];
+        let mut call_args_succ = vec!["SuccFuel(_fuel)".to_string()];
+        let mut call_args_f = vec!["_fuel".to_string()];
         let mut pre_guards = Vec::new();
 
         if *has_current {
@@ -4356,14 +4679,14 @@ pub fn emit_boogie(m: &ModuleDecl, fuel_limit: usize) -> String {
                 m,
                 &empty_fields,
                 &empty_revealed,
-                "f",
+                "_fuel",
                 &strings,
             ));
         }
 
         let ret_bty = map_boogie_type(&r.ret_type, m);
         out.push_str(&format!(
-            "function fn_{}{tp_quant}({}) returns ({ret_bty});\n",
+            "function fn_{}{r_tp_quant}({}) returns ({ret_bty});\n",
             r.name,
             sig_params.join(", ")
         ));
@@ -4371,43 +4694,43 @@ pub fn emit_boogie(m: &ModuleDecl, fuel_limit: usize) -> String {
         let fn_step_two_app = format!("fn_{}({})", r.name, call_args_step_two.join(", "));
         let fn_succ_app = format!("fn_{}({})", r.name, call_args_succ.join(", "));
         let fn_f_app = format!("fn_{}({})", r.name, call_args_f.join(", "));
-        let body_expr = emit_boogie_block_expr(&r.stmts, &r.body, m, &empty_fields, "f", &strings);
+        let body_expr = emit_boogie_block_expr(&r.stmts, &r.body, m, &empty_fields, "_fuel", &strings);
         let guard_str = if pre_guards.is_empty() {
             String::new()
         } else {
             format!("{} ==> ", pre_guards.join(" && "))
         };
-        let fn_step_two_trigger = if m.type_params.is_empty() {
+        let fn_step_two_trigger = if r_all_tps.is_empty() {
             format!("{{ {fn_step_two_app} }}")
         } else {
             format!("{{ ({fn_step_two_app} : {ret_bty}) }}")
         };
-        let fn_succ_trigger = if m.type_params.is_empty() {
+        let fn_succ_trigger = if r_all_tps.is_empty() {
             format!("{{ {fn_succ_app} }}")
         } else {
             format!("{{ ({fn_succ_app} : {ret_bty}) }}")
         };
-        let fn_f_trigger = if m.type_params.is_empty() {
+        let fn_f_trigger = if r_all_tps.is_empty() {
             format!("{{ {fn_f_app} }}")
         } else {
             format!("{{ ({fn_f_app} : {ret_bty}) }}")
         };
         out.push_str(&format!(
-            "axiom (forall{tp_quant} {} :: {fn_succ_trigger} {guard_str}{fn_succ_app} == {body_expr});\n",
+            "axiom (forall{r_tp_quant} {} :: {fn_succ_trigger} {guard_str}{fn_succ_app} == {body_expr});\n",
             q_params.join(", ")
         ));
         out.push_str(&format!(
-            "axiom (forall{tp_quant} {} :: {fn_step_two_trigger} {guard_str}{fn_step_two_app} == {fn_succ_app});\n",
+            "axiom (forall{r_tp_quant} {} :: {fn_step_two_trigger} {guard_str}{fn_step_two_app} == {fn_succ_app});\n",
             q_params.join(", ")
         ));
         if *has_current && !uses_curr {
             let mut ri_q_params = vec![
-                "f: Fuel".to_string(),
+                "_fuel: Fuel".to_string(),
                 format!("_c1: {mod_bpl_ty}"),
                 format!("_c2: {mod_bpl_ty}"),
             ];
-            let mut args_c1 = vec!["f".to_string(), "_c1".to_string()];
-            let mut args_c2 = vec!["f".to_string(), "_c2".to_string()];
+            let mut args_c1 = vec!["_fuel".to_string(), "_c1".to_string()];
+            let mut args_c2 = vec!["_fuel".to_string(), "_c2".to_string()];
             for (pn, pt) in &r.params {
                 ri_q_params.push(format!("{pn}: {}", map_boogie_type(pt, m)));
                 args_c1.push(pn.clone());
@@ -4415,18 +4738,18 @@ pub fn emit_boogie(m: &ModuleDecl, fuel_limit: usize) -> String {
             }
             let app_c1 = format!("fn_{}({})", r.name, args_c1.join(", "));
             let app_c2 = format!("fn_{}({})", r.name, args_c2.join(", "));
-            let ri_trig = if m.type_params.is_empty() {
+            let ri_trig = if r_all_tps.is_empty() {
                 format!("{{ {app_c1}, {app_c2} }}")
             } else {
                 format!("{{ ({app_c1} : {ret_bty}), ({app_c2} : {ret_bty}) }}")
             };
             out.push_str(&format!(
-                "axiom (forall{tp_quant} {} :: {ri_trig} {app_c1} == {app_c2});\n",
+                "axiom (forall{r_tp_quant} {} :: {ri_trig} {app_c1} == {app_c2});\n",
                 ri_q_params.join(", ")
             ));
         }
 
-        // Opaque Postcondition Frame Axiom (holds at any fuel `f`, including `ZeroFuel`)
+        // Opaque Postcondition Frame Axiom (holds at any fuel `_fuel`, including `ZeroFuel`)
         let mut post_clauses = Vec::new();
         if r.ret_type == "NAT" || r.ret_type == "U64" {
             post_clauses.push(format!("in_u64({fn_f_app})"));
@@ -4442,7 +4765,7 @@ pub fn emit_boogie(m: &ModuleDecl, fuel_limit: usize) -> String {
                 m,
                 &empty_fields,
                 &empty_revealed,
-                "f",
+                "_fuel",
                 &strings,
             )
             .replace("Result", &fn_f_app);
@@ -4450,7 +4773,7 @@ pub fn emit_boogie(m: &ModuleDecl, fuel_limit: usize) -> String {
         }
         if !post_clauses.is_empty() {
             out.push_str(&format!(
-                "axiom (forall{tp_quant} {} :: {fn_f_trigger} {guard_str}({}));\n",
+                "axiom (forall{r_tp_quant} {} :: {fn_f_trigger} {guard_str}({}));\n",
                 q_params.join(", "),
                 post_clauses.join(" && ")
             ));
@@ -4462,6 +4785,17 @@ pub fn emit_boogie(m: &ModuleDecl, fuel_limit: usize) -> String {
     if !m.specify_laws.is_empty() {
         out.push_str("// --- 6. Concept Law Quantified Axioms & Triggers (§9) ---\n");
         for (_, law) in &m.specify_laws {
+            let mut law_all_tps = m.type_params.clone();
+            for tp in &law.type_params {
+                if !law_all_tps.contains(tp) {
+                    law_all_tps.push(tp.clone());
+                }
+            }
+            let law_tp_quant = if law_all_tps.is_empty() {
+                String::new()
+            } else {
+                format!("<{}>", law_all_tps.join(", "))
+            };
             let q_params: Vec<String> = law
                 .params
                 .iter()
@@ -4538,7 +4872,7 @@ pub fn emit_boogie(m: &ModuleDecl, fuel_limit: usize) -> String {
                     format!("({}) ==> ({})", reqs.join(" && "), ens.join(" && "))
                 };
                 out.push_str(&format!(
-                    "axiom (forall{tp_quant} {} :: {trig_str}{body_implication});\n",
+                    "axiom (forall{law_tp_quant} {} :: {trig_str}{body_implication});\n",
                     q_params.join(", ")
                 ));
             }
@@ -4682,7 +5016,32 @@ fn expr_uses_current(e: &Expr, field_names: &HashSet<String>, self_routine: &str
     }
 }
 
+fn split_top_level_arrow(ty: &str) -> Option<(&str, &str)> {
+    let mut depth = 0;
+    let bytes = ty.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'[' | b'(' => depth += 1,
+            b']' | b')' => {
+                if depth > 0 {
+                    depth -= 1;
+                }
+            }
+            b'-' if depth == 0 && i + 1 < bytes.len() && bytes[i + 1] == b'>' => {
+                let left = &ty[..i];
+                let right = &ty[i + 2..];
+                return Some((left, right));
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    None
+}
+
 fn map_boogie_type(ty: &str, m: &ModuleDecl) -> String {
+    let ty = ty.trim();
     match ty {
         "NAT" | "U64" | "I64" | "INT" | "MATH_INT" | "CHAR" | "EXIT_CODE" => {
             return "int".to_string();
@@ -4703,14 +5062,21 @@ fn map_boogie_type(ty: &str, m: &ModuleDecl) -> String {
         }
         _ => {}
     }
-    if ty == m.name || ty.starts_with(&format!("{}[", m.name)) {
+    if ty == m.name {
         return map_boogie_type("Current", m);
+    }
+    if let Some((arg_str, ret_str)) = split_top_level_arrow(ty) {
+        let arg_cleaned = arg_str.trim().trim_start_matches('(').trim_end_matches(')').trim();
+        let ret_cleaned = ret_str.split(" require ").next().unwrap().split(" ensure ").next().unwrap().trim();
+        return format!("(Fn1 {} {})", map_boogie_type(arg_cleaned, m), map_boogie_type(ret_cleaned, m));
     }
     if let Some(inner) = ty.strip_prefix("LIST[").and_then(|s| s.strip_suffix(']')) {
         return format!("(Seq {})", map_boogie_type(inner.trim(), m));
     }
-    if let Some(inner) = ty.strip_prefix("SEQ[").and_then(|s| s.strip_suffix(']')) {
-        return format!("(Seq {})", map_boogie_type(inner.trim(), m));
+    if m.name != "SEQ" {
+        if let Some(inner) = ty.strip_prefix("SEQ[").and_then(|s| s.strip_suffix(']')) {
+            return format!("(Seq {})", map_boogie_type(inner.trim(), m));
+        }
     }
     if let Some(inner) = ty.strip_prefix("IO[").and_then(|s| s.strip_suffix(']')) {
         return format!("(IO {})", map_boogie_type(inner.trim(), m));
@@ -4743,10 +5109,16 @@ fn emit_boogie_verify_routine(
     strings: &[String],
 ) -> String {
     let mut s = String::new();
-    let tp_quant = if m.type_params.is_empty() {
+    let mut all_tps = m.type_params.clone();
+    for tp in &r.type_params {
+        if !all_tps.contains(tp) {
+            all_tps.push(tp.clone());
+        }
+    }
+    let tp_quant = if all_tps.is_empty() {
         String::new()
     } else {
-        format!("<{}>", m.type_params.join(", "))
+        format!("<{}>", all_tps.join(", "))
     };
     let mod_bpl_ty = map_boogie_type("Current", m);
     let mut params = Vec::new();
@@ -4838,10 +5210,16 @@ fn emit_boogie_verify_routine(
 
 fn emit_boogie_verify_law(law: &LawDecl, m: &ModuleDecl, strings: &[String]) -> String {
     let mut s = String::new();
-    let tp_quant = if m.type_params.is_empty() {
+    let mut all_tps = m.type_params.clone();
+    for tp in &law.type_params {
+        if !all_tps.contains(tp) {
+            all_tps.push(tp.clone());
+        }
+    }
+    let tp_quant = if all_tps.is_empty() {
         String::new()
     } else {
-        format!("<{}>", m.type_params.join(", "))
+        format!("<{}>", all_tps.join(", "))
     };
     let params: Vec<String> = law
         .params
@@ -5689,6 +6067,8 @@ fn emit_boogie_expr_with_strings(
         Expr::Var(v) => {
             if implicit_fields.contains(v) {
                 format!("{}_{}(Current)", m.name, v)
+            } else if v == "None" {
+                "None()".to_string()
             } else if let ReprKind::Sum(variants) = &m.repr {
                 if variants
                     .iter()
@@ -5798,7 +6178,11 @@ fn emit_boogie_expr_with_strings(
         }
         Expr::Call(fname, args) => {
             let is_ctor =
-                matches!(&m.repr, ReprKind::Sum(vs) if vs.iter().any(|v| v.name == *fname));
+                matches!(&m.repr, ReprKind::Sum(vs) if vs.iter().any(|v| v.name == *fname))
+                    || fname == "Some"
+                    || fname == "None"
+                    || fname == "Ok"
+                    || fname == "Error";
             let a_str: Vec<String> = args
                 .iter()
                 .map(|a| {
@@ -5814,6 +6198,15 @@ fn emit_boogie_expr_with_strings(
                 .collect();
             if is_ctor {
                 format!("{fname}({})", a_str.join(", "))
+            } else if !m.feature_routines.iter().any(|(_, r)| r.name == *fname)
+                && !m.specify_routines.iter().any(|(_, r)| r.name == *fname)
+                && !m.create_routines.iter().any(|(_, r)| r.name == *fname)
+            {
+                if a_str.len() == 1 {
+                    format!("Fn1_app({fname}, {})", a_str[0])
+                } else {
+                    format!("{fname}({})", a_str.join(", "))
+                }
             } else {
                 let call_fuel = if revealed.contains(fname) {
                     "RevealFuel"
@@ -6374,6 +6767,7 @@ fn run_boogie_verification(
 
     let mut cmd = Command::new(boogie_path);
     cmd.arg(format!("/proverOpt:PROVER_PATH={z3_path}"));
+    cmd.arg("/typeEncoding:p");
     cmd.arg("/mv:-");
     cmd.arg("/errorTrace:0");
     cmd.arg(&temp_path);
@@ -7542,6 +7936,9 @@ fn generate_candidate_environments(
 }
 
 fn sample_values_for_type(ty: &str, m: &ModuleDecl) -> Vec<GardelVal> {
+    if ty.contains("->") {
+        return vec![GardelVal::Variant("__fn".to_string(), vec![])];
+    }
     if ty == "NAT" || ty == "U64" || ty == "CHAR" || ty == "EXIT_CODE" {
         return vec![GardelVal::Int(0), GardelVal::Int(1), GardelVal::Int(2)];
     }
@@ -7665,6 +8062,9 @@ fn eval_expr_symbolic(
                     return Ok(GardelVal::Variant(v.clone(), Vec::new()));
                 }
             }
+            if v == "None" {
+                return Ok(GardelVal::Variant("None".to_string(), Vec::new()));
+            }
             Err(EvalFault::Unknown)
         }
         Expr::UnaryNot(inner) => match eval_expr_symbolic(inner, env, m, revealed, fuel)? {
@@ -7763,6 +8163,17 @@ fn eval_expr_symbolic(
                     return Ok(GardelVal::Variant(fname.clone(), eval_args));
                 }
             }
+            if fname == "Some" || fname == "None" || fname == "Ok" || fname == "Error" {
+                return Ok(GardelVal::Variant(fname.clone(), eval_args));
+            }
+            if env.contains_key(fname) && !eval_args.is_empty() {
+                if m.name == "OPTION" {
+                    return Ok(GardelVal::Variant("Some".to_string(), vec![eval_args[0].clone()]));
+                } else if m.name == "RESULT" {
+                    return Ok(GardelVal::Variant("Ok".to_string(), vec![eval_args[0].clone()]));
+                }
+                return Ok(eval_args[0].clone());
+            }
             invoke_routine_symbolic(
                 fname,
                 env.get("Current").cloned(),
@@ -7835,6 +8246,10 @@ fn eval_expr_symbolic(
                     let needle = eval_expr_symbolic(&args[0], env, m, revealed, fuel)?;
                     Ok(GardelVal::Bool(xs.contains(&needle)))
                 }
+                ("is_some", GardelVal::Variant(name, _)) => Ok(GardelVal::Bool(name == "Some")),
+                ("is_none", GardelVal::Variant(name, _)) => Ok(GardelVal::Bool(name == "None")),
+                ("is_ok", GardelVal::Variant(name, _)) => Ok(GardelVal::Bool(name == "Ok")),
+                ("is_error", GardelVal::Variant(name, _)) => Ok(GardelVal::Bool(name == "Error")),
                 ("first", GardelVal::Tuple(es)) => es.first().cloned().ok_or(EvalFault::Unknown),
                 ("second", GardelVal::Tuple(es)) => es.get(1).cloned().ok_or(EvalFault::Unknown),
                 (_, GardelVal::Record(fields)) => {
@@ -8149,6 +8564,7 @@ pub fn emit_dafny(m: &ModuleDecl) -> String {
 }
 
 fn map_dafny_type(ty: &str, m: &ModuleDecl) -> String {
+    let ty = ty.trim();
     match ty {
         "NAT" | "U64" | "EXIT_CODE" => return "U64".to_string(),
         "MATH_INT" | "INT" | "I64" => return "int".to_string(),
@@ -8162,6 +8578,11 @@ fn map_dafny_type(ty: &str, m: &ModuleDecl) -> String {
         }
         "Current" => return m.name.clone(),
         _ => {}
+    }
+    if let Some((arg_str, ret_str)) = split_top_level_arrow(ty) {
+        let arg_cleaned = arg_str.trim().trim_start_matches('(').trim_end_matches(')').trim();
+        let ret_cleaned = ret_str.split(" require ").next().unwrap().split(" ensure ").next().unwrap().trim();
+        return format!("({}) -> {}", map_dafny_type(arg_cleaned, m), map_dafny_type(ret_cleaned, m));
     }
     if let Some(inner) = ty.strip_prefix("LIST[").and_then(|s| s.strip_suffix(']')) {
         return format!("seq<{}>", map_dafny_type(inner, m));
@@ -8190,10 +8611,16 @@ fn map_dafny_type(ty: &str, m: &ModuleDecl) -> String {
 
 fn emit_dafny_law(law: &LawDecl, m: &ModuleDecl, implicit_fields: &HashSet<String>) -> String {
     let mut s = String::new();
-    let tp = if m.type_params.is_empty() {
+    let mut all_tps = m.type_params.clone();
+    for tp in &law.type_params {
+        if !all_tps.contains(tp) {
+            all_tps.push(tp.clone());
+        }
+    }
+    let tp = if all_tps.is_empty() {
         String::new()
     } else {
-        format!("<{}>", m.type_params.join(", "))
+        format!("<{}>", all_tps.join(", "))
     };
     let params: Vec<String> = law
         .params
@@ -8335,21 +8762,32 @@ fn emit_dafny_routine(
     } else {
         "function"
     };
-    let tp = if m.type_params.is_empty() {
+    let m_tp = if m.type_params.is_empty() {
         String::new()
     } else {
         format!("<{}>", m.type_params.join(", "))
     };
+    let mut all_tps = m.type_params.clone();
+    for tp in &r.type_params {
+        if !all_tps.contains(tp) {
+            all_tps.push(tp.clone());
+        }
+    }
+    let r_tp = if all_tps.is_empty() {
+        String::new()
+    } else {
+        format!("<{}>", all_tps.join(", "))
+    };
 
     let mut params = Vec::new();
     if has_current {
-        params.push(format!("Current: {}{tp}", m.name));
+        params.push(format!("Current: {}{m_tp}", m.name));
     }
     for (pname, pty) in &r.params {
         params.push(format!("{pname}: {}", map_dafny_type(pty, m)));
     }
     s.push_str(&format!(
-        "{} {}{tp}({}): (Result: {})\n",
+        "{} {}{r_tp}({}): (Result: {})\n",
         kw,
         r.name,
         params.join(", "),
@@ -9909,8 +10347,13 @@ pub fn format_module_interface(m: &ModuleDecl) -> String {
                 .iter()
                 .map(|(n, t)| format!("{n}: {t}"))
                 .collect();
+            let ltp = if law.type_params.is_empty() {
+                String::new()
+            } else {
+                format!("[{}]", law.type_params.join(", "))
+            };
             out.push_str(&format!(
-                "    {:?} law {}({})\n",
+                "    {:?} law {}{ltp}({})\n",
                 vis,
                 law.name,
                 ps.join(", ")
@@ -10314,10 +10757,14 @@ fn main() {
         }
     }
 
-    let gcc_compiled = Command::new("gcc")
-        .args(["-O3", "-fopenmp", &primary_c, "-o", &primary_exe])
-        .status()
-        .is_ok_and(|s| s.success());
+    let gcc_compiled = if module.kind == ModuleKind::Program {
+        Command::new("gcc")
+            .args(["-O3", "-fopenmp", &primary_c, "-o", &primary_exe])
+            .status()
+            .is_ok_and(|s| s.success())
+    } else {
+        false
+    };
 
     if !json_mode {
         println!("[3/6] Emitted direct Boogie VCs & fuel axioms -> {primary_bpl}");
@@ -10341,7 +10788,7 @@ fn main() {
             .find(|cand| std::path::Path::new(cand).exists());
 
         let mut boogie_cmd = Command::new("boogie");
-        boogie_cmd.args(["/mv:-", &primary_bpl]);
+        boogie_cmd.args(["/typeEncoding:p", "/mv:-", &primary_bpl]);
         if let Some(solver) = found_solver {
             boogie_cmd.arg(format!("/proverOpt:PROVER_PATH={solver}"));
         }
@@ -10562,9 +11009,10 @@ end
                 "BIGNAT".to_string(),
                 "STRING".to_string(),
                 "OPTION".to_string(),
+                "RESULT".to_string(),
             ])
         );
-        assert_eq!(stdlib.modules.len(), 4);
+        assert_eq!(stdlib.modules.len(), 5);
         for m in &stdlib.modules {
             let mut diags = check_visibility_and_semantics(m);
             diags.extend(verify_module_phase3(
@@ -10952,7 +11400,7 @@ end
     #[test]
     fn test_plan3_multi_module_stdlib_pipeline() {
         let ast = parse_phase4_stdlib().expect("stdlib parses cleanly");
-        assert_eq!(ast.modules.len(), 4);
+        assert_eq!(ast.modules.len(), 5);
         let mut prog_env = ProgramEnv {
             modules: HashMap::new(),
             concepts: HashMap::new(),
@@ -11144,5 +11592,52 @@ end
             let c_code = emit_c11(m);
             assert!(!c_code.is_empty());
         }
+    }
+
+    #[test]
+    fn test_step2_result_and_option_soundness_and_precondition_failures() {
+        let stdlib = parse_phase4_stdlib().expect("stdlib parses cleanly");
+        let opt_mod = stdlib.modules.iter().find(|m| m.name == "OPTION").unwrap();
+        let res_mod = stdlib.modules.iter().find(|m| m.name == "RESULT").unwrap();
+
+        let opt_diags = verify_module_phase3(opt_mod, phase4_stdlib_source(), "stdlib.gdl", 2, true, false, false);
+        assert!(opt_diags.is_empty(), "OPTION must verify with 0 errors, got: {opt_diags:?}");
+
+        let res_diags = verify_module_phase3(res_mod, phase4_stdlib_source(), "stdlib.gdl", 2, true, false, false);
+        assert!(res_diags.is_empty(), "RESULT must verify with 0 errors, got: {res_diags:?}");
+
+        // Negative test: An invalid postcondition in RESULT (e.g. ok claims to be is_error) is caught by Z3
+        let unsafe_src = r#"
+module RESULT_BAD_OK[E, A]
+representation {ANY}
+  | Error(err: E)
+  | Ok(val: A)
+create {ANY}
+  ok(v: A): RESULT_BAD_OK[E, A]
+    do
+      Ok(v)
+    ensure
+      bad_err: Result.is_error
+    end
+feature {ANY}
+  is_error: BOOL
+    do
+      match Current
+        case Error(_) then True
+        case Ok(_) then False
+      end
+    end
+end
+"#;
+        let unsafe_mod = parse_single_module(unsafe_src);
+        let diags = verify_module_phase3(&unsafe_mod, unsafe_src, "test_unsafe.gdl", 2, false, false, false);
+        assert!(
+            !diags.is_empty(),
+            "Invalid contract `bad_err` on `ok` must trigger a verification failure"
+        );
+        assert!(
+            diags.iter().any(|d| d.tag == "bad_err"),
+            "Expected postcondition violation `bad_err`, got: {diags:?}"
+        );
     }
 }
