@@ -128,13 +128,13 @@ flowchart TD
 - [x] Specify in §3 and §15 that string literals (`"..."`) desugar into verified `STRING` values whose `chars` model matches the sequence of Unicode scalar values.
 - [x] In §11 (IO), specify boundary decoding: `STRING.from_utf8(bytes: BYTES): RESULT[STRING_ERROR, STRING]`.
 
-#### Task A.5: Standardize Strict Equality Semantics & Law Catalogue (§9)
-- Codify the three levels of equality in §9:
+#### Task A.5: Standardize Strict Equality Semantics & Law Catalogue (§9) [✅ Completed]
+- [x] Codify the three levels of equality in §9:
   1. **Structural Leibniz Equality (`=`):** Permitted only for primitives and types conforming to `CANONICAL_EQ`.
   2. **Behavioral Equivalence (`a.equals(b)`):** Required for all types conforming to `EQ`, including non-canonical/quotient types (`SEQ`, `BIGNAT`).
   3. **Ghost Model Equality (`a.model = b.model`):** The standard method for stating contracts on non-canonical types against canonical mathematical models.
-- Clean up contracts in §8 and §14 to eliminate accidental Leibniz equality assertions on collection types.
-- Incorporate the Bird & Wadler algebraic law catalogue (Monoids, Functors, Monads, Folds, Orders) as normative concept laws.
+- [x] Clean up contracts in §8 and §14 to eliminate accidental Leibniz equality assertions on collection types.
+- [x] Incorporate the Bird & Wadler algebraic law catalogue (Monoids, Functors, Monads, Folds, Orders) as normative concept laws.
 
 #### Task A.6: AI Diagnostic Law Surfacing in `--json-diagnostics` (§12)
 - Specify how `gardelc --json-diagnostics` indexes in-scope concept laws and catalogue lemmas and emits them in `relevant_lemmas`.

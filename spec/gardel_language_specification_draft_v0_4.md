@@ -1610,9 +1610,24 @@ feature {ANY}
 
 specify {ANY}
 
+  law identity_law[A](x: A)
+    ensure
+      fixed: FUNCTION_OPS.identity(x) = x
+    end
+
   law compose_pointwise[A, B, C](f: B -> C, g: A -> B, x: A)
     ensure
       applied: FUNCTION_OPS.compose(f, g)(x) = f(g(x))
+    end
+
+  law compose_left_identity[A, B](f: A -> B, x: A)
+    ensure
+      left_id: FUNCTION_OPS.compose(FUNCTION_OPS.id_fn, f)(x) = f(x)
+    end
+
+  law compose_right_identity[A, B](f: A -> B, x: A)
+    ensure
+      right_id: FUNCTION_OPS.compose(f, FUNCTION_OPS.id_fn)(x) = f(x)
     end
 
   law compose_associative[A, B, C, D](f: C -> D, g: B -> C, h: A -> B, x: A)
@@ -1623,6 +1638,9 @@ specify {ANY}
 end
 ```
 
+> [!NOTE]
+> **Strict Equality and Function Extensionality:** In first-order SMT, functions `A -> B` cannot be compared directly using structural Leibniz equality (`f = g`) due to the undecidability of higher-order extensionality. Consequently, Gardel specifies higher-order combinators strictly pointwise (`forall x: A. Result(x) = f(g(x))`). Category-theoretic monoid and category laws (identity and associativity) are proven pointwise for arbitrary inputs `x: A`, guaranteeing sound first-order reasoning without higher-order quantifier traps.
+
 ---
 
 ## 9. Concepts, laws and conformance
@@ -1631,14 +1649,31 @@ A `concept` lists required operations and the algebraic laws they must obey. A m
 
 ### The Three Levels of Equality
 
-To avoid unsoundness and false negatives in SMT proofs, Gardel standardizes a three-level hierarchy for equality:
+To eliminate verification unsoundness, eliminate false negatives in automated theorem proving, and decouple physical data structures from mathematical specifications, Gardel establishes a strict, three-level equality hierarchy:
 
-1. **Structural Leibniz Equality (`=`):**
-   Denotes built-in syntactic/term identity in SMT. Permitted **only** for primitive scalar types (`U64`, `I64`, `BOOL`, `CHAR`, `MATH_INT`) and algebraic types that satisfy `CANONICAL_EQ` (where structural representation is strictly bijective with mathematical equivalence, such as `OPTION[A]` when `A satisfies CANONICAL_EQ`).
-2. **Behavioral Equivalence (`a.equals(b)`):**
-   Defined by the root concept `EQ`. Required for all generic comparisons and non-canonical/quotient types (such as `SEQ[A]`, `BIGNAT`, `SET[A]`, and `RAT`). Two sequences with different tree branching or balancing shapes are behaviorally equivalent (`a.equals(b)`) even when their physical memory layouts are not Leibniz-identical ($a \neq b$).
-3. **Ghost Model Equality (`a.model = b.model`):**
-   The standard technique for specifying behavioral equality on non-canonical types against canonical mathematical ghost models (Dual-Layer Model Refinement, §2). For example, `SEQ[A].equals` is verified by proving `Result = (a.model = b.model)`.
+| Level | Syntax / Form | Applicable Types | SMT Interpretation (Z3 / Boogie) | Semantic Property & Role |
+| :--- | :--- | :--- | :--- | :--- |
+| **1. Structural Leibniz Equality** | `a = b` | Exact discrete primitive scalars (`UNIT`, `U64`, `I64`, `BOOL`, `CHAR`, `MATH_INT`), canonical ghost models (`LIST[A]`), and types satisfying `CANONICAL_EQ` | Native SMT equality (`a == b`) | Syntactic/term identity. Obeys Indiscernibility of Identicals ($\forall P.\; a = b \implies (P(a) \iff P(b))$). Prohibited on `F64` and quotient or non-canonical ADTs. |
+| **2. Behavioral Equivalence** | `a.equals(b)` | All types conforming to `EQ` (including non-canonical types `SEQ[A]`, `BIGNAT`, `STRING`, `SET[A]`, `RAT[A]`) | Uninterpreted function or relational predicate `T_eq(a, b)` constrained by equivalence axioms | Equivalence relation modulo abstraction (reflexive, symmetric, transitive). Compares observable computational value regardless of physical memory layout. |
+| **3. Ghost Model Equality** | `a.model = b.model` (or `a.chars = b.chars`) | Non-canonical runtime ADTs paired with canonical inductive ghost models (§2 Principle 9) | SMT equality over canonical ghost domains (`LIST == LIST`, `int == int`) | Foundational verification bridge. Enables decidable structural induction in SMT without unfolding runtime tree or buffer layouts. |
+
+#### 1. Structural Leibniz Equality (`=`)
+Structural Leibniz equality denotes syntactic term identity in First-Order Logic SMT. It is governed by the classical axiom of Indiscernibility of Identicals:
+$$\forall x, y \in T.\; x = y \implies (\forall P.\; P(x) \iff P(y))$$
+
+**Scope of Validity:**
+Leibniz equality (`=`) is permitted **strictly** for:
+1. Exact discrete primitive scalar types (`UNIT`, `U64`, `I64`, `BOOL`, `CHAR`, and `MATH_INT`). Floating-point `F64` is explicitly excluded because IEEE-754 `NaN != NaN` and signed zeroes (`+0.0` vs `-0.0`) violate reflexivity and Leibniz indiscernibility (§3).
+2. Canonical inductive ghost models (`LIST[A]`).
+3. User ADTs that explicitly prove conformance to `concept CANONICAL_EQ refines EQ`.
+
+**The Non-Canonical / Quotient Unsoundness Hazard:**
+For runtime collections and quotient structures with internal structural degrees of freedom (such as binary tree balance in `SEQ[A]`, chunk boundaries, or buffer capacity in `STRING`), two distinct physical terms represent the exact same mathematical value. For example, in `SEQ[NAT]`:
+$$s_1 = \text{Concat}(\text{Leaf}(1), \text{Leaf}(2), 2) \qquad \text{and} \qquad s_2 = \text{Concat}(\text{Concat}(\text{Empty}, \text{Leaf}(1), 1), \text{Leaf}(2), 2)$$
+Both values represent the sequence $[1, 2]$. However, because their syntactic AST terms are distinct, SMT provers strictly deduce $s_1 \neq s_2$. If a programmer or specification asserts Leibniz equality $s_1 = s_2$, the SMT solver produces a contradiction or false negative, rejecting valid programs. Therefore, asserting $a = b$ on non-canonical types is strictly forbidden.
+
+#### 2. Behavioral Equivalence (`a.equals(b)`)
+Behavioral equivalence defines computational indistinguishability with respect to all public operations. It is codified by the root concept `EQ`:
 
 ```eiffel
 concept EQ
@@ -1666,7 +1701,14 @@ concept EQ
     end
 
 end
+```
 
+Any type where distinct memory representations denote equivalent values (such as `SEQ[A]`, `STRING`, `BIGNAT`, `SET[A]`, or `RAT[A]`) must conform to `EQ` by implementing `equals(other: Current): BOOL` and discharging the three equivalence relation laws in a `specify {EQ}` block.
+
+##### Canonical Equivalence (`CANONICAL_EQ`)
+When an algebraic data type possesses a strictly canonical representation—meaning every mathematical equivalence class corresponds to exactly one syntactic term—it refines `EQ` by declaring conformance to `CANONICAL_EQ`:
+
+```eiffel
 concept CANONICAL_EQ refines EQ
 
   law agrees_with_structural(a: Current, b: Current)
@@ -1675,7 +1717,17 @@ concept CANONICAL_EQ refines EQ
     end
 
 end
+```
 
+Examples of canonical types include `OPTION[A]` (when `A satisfies CANONICAL_EQ`), `RESULT[E, A]` (when `E, A satisfy CANONICAL_EQ`), and natural numbers `PEANO`.
+
+> [!IMPORTANT]
+> **Negative Soundness Theorem:** A non-canonical type CANNOT satisfy `CANONICAL_EQ`. Attempting to declare `module SEQ[A] satisfies CANONICAL_EQ` forces the proof obligation `agrees_with_structural: a.equals(b) = (a = b)`. Because two different tree layouts can have equal ghost models (`a.equals(b) = True`) while being structurally non-identical ($a = b$ is `False`), Z3 immediately rejects the postcondition, preventing unsound structural equality assumptions.
+
+##### Total Order (`ORD`)
+Total ordering refines `EQ` with a strict weak order (`less_than`) that is irreflexive, transitive, and trichotomous (`total`) with respect to behavioral equivalence, alongside a derived default `less_or_equal`:
+
+```eiffel
 concept ORD refines EQ
 
   less_than(other: Current): BOOL
@@ -1705,52 +1757,260 @@ concept ORD refines EQ
       comparable: a.less_than(b) or a.equals(b) or b.less_than(a)
     end
 
-  law antisymmetric(a: Current, b: Current)
-    require
-      ab: a.less_or_equal(b)
-      ba: b.less_or_equal(a)
+end
+```
+
+Because `less_or_equal` is defined as `Current.less_than(other) or Current.equals(other)`, antisymmetry (`a.less_or_equal(b) and b.less_or_equal(a) implies a.equals(b)`) follows automatically as a derived consequence of `irreflexive`, `transitive`, and `EQ.symmetric`.
+
+#### 3. Ghost Model Equality (`a.model = b.model`)
+Ghost model equality is the verification mechanism of Dual-Layer Model Refinement (§2 Principle 9). Non-canonical runtime data structures project their state into canonical inductive mathematical models in `specify`:
+- `SEQ[A]` projects to `specify model: LIST[A]`.
+- `BIGNAT` projects to `specify model: MATH_INT` (via Horner polynomial evaluation).
+- `STRING` projects to `specify chars: LIST[CHAR]`.
+
+Because the ghost model (`LIST[A]`, `MATH_INT`, `LIST[CHAR]`) is canonical and purely mathematical, First-Order SMT equality (`=`) is sound over the ghost domain. Runtime `equals` routines specify their functional contract by equating the boolean result to ghost model equality in `ensure`:
+```eiffel
+feature {ANY}
+
+  equals(other: SEQ[A]): BOOL
+    do
+      ...
     ensure
-      eq: a.equals(b)
+      model_equality: Result = (Current.model = other.model)
+    end
+```
+In all client contracts and algebraic proofs, specifications express equivalence and behavioral transformations directly on the ghost model:
+```eiffel
+ensure
+  model_concat: Result.model = Current.model.append(other.model)
+```
+This guarantees that caller routines discharge functional specifications through simple, linear structural induction over `LIST[A]` or `MATH_INT`, completely insulated from runtime tree balancing, chunking, or memory layouts.
+
+---
+
+### The Bird & Wadler Algebraic Law Catalogue
+
+Gardel incorporates a formal, normative catalogue of algebraic equations across five primary mathematical families (`stdlib/stdlib.gdl`). Codified as concept laws and module specifications, these equations are verified by SMT and indexed into `--json-diagnostics` for AI-guided program derivation and automated proof repair (§12):
+
+#### 1. Monoid Laws & Length Homomorphisms
+For associative binary operations with identity elements (such as `concat` on `SEQ[A]` with `SEQ.empty` and `append` on `LIST[A]` with `LIST.empty`):
+
+```eiffel
+-- Inside module SEQ[A] satisfies EQ where A satisfies EQ
+specify {ANY}
+
+  law concat_associative(a: SEQ[A], b: SEQ[A], c: SEQ[A])
+    require
+      no_overflow_1: a.length <= 18446744073709551615 - b.length
+      no_overflow_2: (a.length + b.length) <= 18446744073709551615 - c.length
+      no_overflow_3: b.length <= 18446744073709551615 - c.length
+      no_overflow_4: a.length <= 18446744073709551615 - (b.length + c.length)
+    ensure
+      assoc: a.concat(b).concat(c).equals(a.concat(b.concat(c)))
+    end
+
+  law concat_left_identity(a: SEQ[A])
+    ensure
+      left_id: SEQ.empty.concat(a).equals(a)
+    end
+
+  law concat_right_identity(a: SEQ[A])
+    ensure
+      right_id: a.concat(SEQ.empty).equals(a)
+    end
+
+  law concat_length_homomorphism(a: SEQ[A], b: SEQ[A])
+    require
+      no_overflow: a.length <= 18446744073709551615 - b.length
+    ensure
+      len_homo: a.concat(b).length = a.length + b.length
     end
 
 end
 ```
 
-### The Bird & Wadler Algebraic Law Catalogue
+#### 2. Functor Laws & Map Fusion
+For structure-preserving mappings (`map` on `SEQ`, `LIST`, `OPTION`, `RESULT`):
+- **Identity Preservation:** Mapping the identity function (`FUNCTION_OPS.id_fn`) over a container yields an equivalent container.
+- **Functor Composition / Map Fusion:** Chaining two successive `map` traversals collapses into a single traversal applying `FUNCTION_OPS.compose(f, g)`, eliminating intermediate allocations.
+- **Base Case Refinement:** For unconstrained target types `B` (which need not satisfy `EQ`), empty and singleton preservation laws are stated using Level 3 ghost model equality (`.model = ...`).
 
-Gardel incorporates a formal catalogue of algebraic equations across five primary mathematical families. These laws are proven in `specify` blocks and indexed for automated AI proof synthesis and lemma dispatch (§12):
+```eiffel
+-- Inside module SEQ[A] satisfies EQ where A satisfies EQ
+specify {ANY}
 
-1. **Monoid Laws:**
-   For associative binary operations with identity elements (such as `concat` on `SEQ[A]` and `append` on `LIST[A]` with `empty`):
-   - *Associativity:* `a.concat(b).concat(c).equals(a.concat(b.concat(c)))`
-   - *Left Identity:* `empty.concat(a).equals(a)`
-   - *Right Identity:* `a.concat(empty).equals(a)`
-2. **Functor Laws and Map Fusion:**
-   For structure-preserving transformations (`map` on `SEQ`, `LIST`, `OPTION`, `RESULT`):
-   - *Identity Preservation:* `xs.map(fn(x: A): A do x end).equals(xs)`
-   - *Functor Composition / Map Fusion:* `xs.map(g).map(f).equals(xs.map(fn(x: A): C do f(g(x)) end))`
-3. **Monad Laws:**
-   For sequential monadic computation (`and_then` on `OPTION` and `RESULT`):
-   - *Left Unit:* `Some(x).and_then(f) = f(x)` and `Ok(x).and_then(f) = f(x)`
-   - *Right Unit:* `m.and_then(fn(x: A): OPTION[A] do Some(x) end) = m` and `m.and_then(fn(x: A): RESULT[E, A] do Ok(x) end) = m`
-   - *Associativity:* `m.and_then(f).and_then(g) = m.and_then(fn(x: A): M[C] do f(x).and_then(g) end)`
-4. **Fold Laws and Homomorphisms:**
-   For divide-and-conquer reductions and aggregations:
-   - *Fold-Map Fusion:* `xs.map(g).fold_left(f, init) = xs.fold_left(fn(acc: C, x: A): C do f(acc, g(x)) end, init)`
-   - *Homomorphism over Concatenation:* When `op` is associative with identity `id`:  
-     `concat(xs, ys).fold_left(op, id) = op(xs.fold_left(op, id), ys.fold_left(op, id))`
-   - *Duality:* For commutative operations, `xs.fold_left(op, id) = xs.fold_right(op, id)`
-5. **Order Laws:**
-   For total orders (`ORD refines EQ`):
-   - Strict totality and antisymmetry consistent with `a.equals(b)`.
+  law map_preserves_empty[B](f: A -> B)
+    ensure
+      empty_mapped: SEQ.empty.map(f).model = LIST.empty
+    end
 
-Rules:
+  law map_singleton_refines[B](x: A, f: A -> B)
+    ensure
+      single_mapped: SEQ.singleton(x).map(f).model = LIST.empty.prepend(f(x))
+    end
 
-- **Proofs.** Each law is proven in a `specify {CONCEPT}` block, by structural recursion with a `variant` when the type is recursive.
-- **Conditional conformance.** `module LIST[A] satisfies EQ where A satisfies EQ` makes a generic module conform only when its parameter does.
-- **Constrained generics.** In `module SORTED_LIST[A: ORD]` the laws of `ORD` enter the proof context as quantified axioms about `A`.
+  law map_identity(s: SEQ[A])
+    ensure
+      id_preserved: s.map(FUNCTION_OPS.id_fn).equals(s)
+    end
+
+  law map_fusion[B, C](s: SEQ[A], f: B -> C, g: A -> B)
+    ensure
+      fusion: s.map(g).map(f).equals(s.map(FUNCTION_OPS.compose(f, g)))
+    end
+
+  law filter_conjunction(s: SEQ[A], p: A -> BOOL, q: A -> BOOL)
+    ensure
+      conjunction: s.filter(p).filter(q).equals(s.filter(fn(x: A): BOOL do p(x) and q(x) end))
+    end
+
+end
+```
+
+#### 3. Monad Laws (Railway-Oriented Sequencing)
+For sequential fallible and optional computation (`and_then` on `OPTION[A]` and `RESULT[E, A]`, where variant constructors `Some`, `None`, `Ok`, and `Error` are canonical):
+- **Left Unit:** Injecting a value into `Some(v)` or `Ok(v)` and binding `f` is equivalent to applying `f(v)` directly.
+- **Right Unit:** Binding the monadic constructor over a container yields the original container unchanged.
+- **Associativity:** Chaining multiple dependent operations is associative, guaranteeing that pipeline grouping does not alter the outcome.
+- **Failure Preservation:** `None` and `Error(e)` short-circuit the pipeline immediately.
+
+```eiffel
+-- Inside module OPTION[A] satisfies CANONICAL_EQ where A satisfies CANONICAL_EQ
+specify {ANY}
+
+  law and_then_left_unit[B](v: A, f: A -> OPTION[B])
+    ensure
+      left_id: Some(v).and_then(f) = f(v)
+    end
+
+  law and_then_none[B](f: A -> OPTION[B])
+    ensure
+      absorbs: None.and_then(f) = None
+    end
+
+  law and_then_right_identity(opt: OPTION[A])
+    ensure
+      right_id: opt.and_then(fn(x: A): OPTION[A] do Some(x) end) = opt
+    end
+
+  law and_then_associative[B, C](opt: OPTION[A], f: A -> OPTION[B], g: B -> OPTION[C])
+    ensure
+      assoc: opt.and_then(f).and_then(g) =
+             opt.and_then(fn(x: A): OPTION[C] do f(x).and_then(g) end)
+    end
+
+end
+
+-- Inside module RESULT[E, A] satisfies CANONICAL_EQ where E satisfies CANONICAL_EQ, A satisfies CANONICAL_EQ
+specify {ANY}
+
+  law and_then_ok[B](v: A, f: A -> RESULT[E, B])
+    ensure
+      chain_ok: Ok(v).and_then(f) = f(v)
+    end
+
+  law and_then_error[B](e: E, f: A -> RESULT[E, B])
+    ensure
+      chain_err: Error(e).and_then(f) = Error(e)
+    end
+
+  law and_then_right_identity(res: RESULT[E, A])
+    ensure
+      right_id: res.and_then(fn(x: A): RESULT[E, A] do Ok(x) end) = res
+    end
+
+  law and_then_associative[B, C](res: RESULT[E, A], f: A -> RESULT[E, B], g: B -> RESULT[E, C])
+    ensure
+      assoc: res.and_then(f).and_then(g) =
+             res.and_then(fn(x: A): RESULT[E, C] do f(x).and_then(g) end)
+    end
+
+end
+```
+
+#### 4. Fold Laws & Homomorphisms
+For aggregations and divide-and-conquer reductions across `LIST_OPS` and `SEQ[A]`:
+- **Fold-Map Fusion:** Aggregating after a mapping is equivalent to aggregating the transformed elements in a single pass.
+- **Homomorphism over Concatenation:** Reducing an appended list chains the accumulator through the left and right segments (`fold_left_append`, `fold_right_append`).
+- **Singleton Reductions:** Reducing a singleton sequence applies the step function directly to the initial accumulator and element.
+
+```eiffel
+-- Inside functions LIST_OPS
+specify {ANY}
+
+  law fold_left_append[A, B](xs: LIST[A], ys: LIST[A], f: (acc: B, x: A) -> B, init: B)
+    ensure
+      chains: LIST_OPS.fold_left(xs.append(ys), f, init) =
+              LIST_OPS.fold_left(ys, f, LIST_OPS.fold_left(xs, f, init))
+    end
+
+  law fold_right_append[A, B](xs: LIST[A], ys: LIST[A], f: (x: A, acc: B) -> B, init: B)
+    ensure
+      chains: LIST_OPS.fold_right(xs.append(ys), f, init) =
+              LIST_OPS.fold_right(xs, f, LIST_OPS.fold_right(ys, f, init))
+    end
+
+  law fold_map_fusion[A, B, C](xs: LIST[A], g: A -> B, f: (acc: C, b: B) -> C, init: C)
+    ensure
+      fused: LIST_OPS.fold_left(LIST_OPS.map(xs, g), f, init) =
+             LIST_OPS.fold_left(xs, fn(acc: C, x: A): C do f(acc, g(x)) end, init)
+    end
+
+end
+
+-- Inside module SEQ[A]
+specify {ANY}
+
+  law fold_left_singleton[B](x: A, f: (acc: B, item: A) -> B, init: B)
+    ensure
+      single_folded: SEQ.singleton(x).fold_left(f, init) = f(init, x)
+    end
+
+  law fold_right_singleton[B](x: A, f: (item: A, acc: B) -> B, init: B)
+    ensure
+      single_folded: SEQ.singleton(x).fold_right(f, init) = f(x, init)
+    end
+
+end
+```
+
+#### 5. Order & Arithmetic Laws
+For totally ordered and arbitrary-precision numeric structures (`BIGNAT satisfies ORD`):
+- **Model Consistency:** The `less_than` postcondition (`model_lt: Result = (Current.model < other.model)`) connects runtime ordering to mathematical integer ordering over `MATH_INT`.
+- **Total Order Conformance:** `specify {ORD}` discharges `irreflexive`, `transitive`, and `total` against `equals`.
+
+```eiffel
+-- Inside module BIGNAT satisfies ORD
+specify {ORD}
+
+  law irreflexive(a: BIGNAT)
+    ensure
+      not_less_than_self: not a.less_than(a)
+    end
+
+  law transitive(a: BIGNAT, b: BIGNAT, c: BIGNAT)
+    require
+      a_lt_b: a.less_than(b)
+      b_lt_c: b.less_than(c)
+    ensure
+      a_lt_c: a.less_than(c)
+    end
+
+  law total(a: BIGNAT, b: BIGNAT)
+    ensure
+      comparable: a.less_than(b) or a.equals(b) or b.less_than(a)
+    end
+
+end
+```
+
+Rules for Concept Conformance and Law Verification:
+
+- **Proofs.** Each law is proven in a `specify {CONCEPT}` block, using structural recursion with a decreasing `variant` when the carrier type is recursive.
+- **Conditional Conformance.** `module SEQ[A] satisfies EQ where A satisfies EQ` establishes that the compound container conforms if and only if its type parameter conforms.
+- **Constrained Generics.** In `module SORTED_LIST[A: ORD]` or generic routines (`sort[A: ORD](xs: SEQ[A]): SEQ[A]`), the laws of `ORD` enter the Boogie proof context as quantified axioms about `A`.
 - **Triggers.** Each law is instantiated by an SMT trigger pattern. The default is the predicates of its `require` clause, and `trigger a.less_than(b)` overrides it to prevent quantifier instantiation loops.
-- **No runtime dictionaries.** All generic code is monomorphized before Bend v2 / C codegen.
+- **No Runtime Dictionaries.** All generic code and concept dispatch are monomorphized before Bend v2 / C11 codegen, incurring zero runtime dictionary or vtable overhead.
 
 ---
 
@@ -1979,6 +2239,10 @@ What the verifier and compiler do:
 1. **`from_range` termination and overflow safety.** When `lo < hi`, `mid = lo + (hi - lo) / 2` satisfies `lo <= mid` and `mid < hi`, so `mid + 1` cannot overflow `U64` and both recursive calls strictly decrease the `variant hi - lo`.
 2. **`max_value` structural induction.** In the `Leaf(v)` case, `leaves` is `[v]`, so `v` is both an upper bound and attained. In the `Node(l, r)` case, `l` and `r` are structurally smaller than `Current` (`variant Current`), so the verifier assumes the `ensure` postconditions for `l.max_value` (`ml`) and `r.max_value` (`mr`). Whichever is larger bounds all leaves of `l.leaves.append(r.leaves)` and is a member of one of them.
 3. **Parallel execution.** In both `from_range` (`left_tree` and `right_tree`) and `max_value` (`ml` and `mr`), the two recursive `let` bindings are independent, so `gardelc` lowers them to parallel fork-join tasks in Bend v2 / BendRT.
+4. **Strict Equality Semantics & Ghost Model Specifications (§9).** `TREE` illustrates Dual-Layer Model Refinement and the Strict Equality Hierarchy:
+   - Because `specify {ANY}` queries (`leaves: LIST[NAT]`) are erased before code generation, runtime `do` bodies (`from_range`, `max_value`) manipulate only concrete `TREE` constructors and `NAT` scalars, never invoking `leaves` at runtime (§4, §7).
+   - Two trees with different branching shapes (e.g., left-leaning vs. right-leaning trees over `[1, 2, 3]`) are structurally distinct terms in SMT ($t_1 \neq t_2$), so `TREE` cannot satisfy `CANONICAL_EQ`.
+   - Instead, all `ensure` contracts state properties over the canonical ghost model `Current.leaves: LIST[NAT]`, where first-order SMT equality (`t1.leaves = t2.leaves`) and linear structural induction are sound.
 
 ---
 
