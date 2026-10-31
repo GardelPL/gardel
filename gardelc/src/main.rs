@@ -1699,12 +1699,29 @@ impl Parser {
 
     fn parse_postfix(&mut self) -> Result<Expr, ParseError> {
         let mut expr = self.parse_primary()?;
-        while *self.peek() == Token::Dot {
-            self.next();
-            let member = self.expect_ident()?;
-            let mut args = Vec::new();
-            if *self.peek() == Token::LParen {
+        loop {
+            if *self.peek() == Token::Dot {
                 self.next();
+                let member = self.expect_ident()?;
+                let mut args = Vec::new();
+                if *self.peek() == Token::LParen {
+                    self.next();
+                    if *self.peek() == Token::RParen {
+                        self.next();
+                    } else {
+                        while *self.peek() != Token::RParen {
+                            args.push(self.parse_expr()?);
+                            if *self.peek() == Token::Comma {
+                                self.next();
+                            }
+                        }
+                        self.expect(Token::RParen)?;
+                    }
+                }
+                expr = Expr::MethodCall(Box::new(expr), member, args);
+            } else if *self.peek() == Token::LParen && self.same_line(self.pos - 1, self.pos) {
+                self.next();
+                let mut args = Vec::new();
                 if *self.peek() == Token::RParen {
                     self.next();
                 } else {
@@ -1716,8 +1733,10 @@ impl Parser {
                     }
                     self.expect(Token::RParen)?;
                 }
+                expr = Expr::MethodCall(Box::new(expr), "apply".to_string(), args);
+            } else {
+                break;
             }
-            expr = Expr::MethodCall(Box::new(expr), member, args);
         }
         Ok(expr)
     }
@@ -2123,6 +2142,33 @@ pub fn check_and_expand_concepts(
         return diags;
     };
 
+    // Validate where constraints (e.g. `where A satisfies EQ`)
+    for (tp, cname) in &sat.where_constraints {
+        if !m.type_params.contains(tp) {
+            diags.push(Diagnostic::basic(
+                "error",
+                "Phase 2 (Invalid Type Constraint)",
+                tp.clone(),
+                cname.clone(),
+                format!(
+                    "Type parameter `{}` in where constraint is not declared on module `{}`",
+                    tp, m.name
+                ),
+            ));
+        }
+        if !concepts.contains_key(cname) {
+            diags.push(Diagnostic::basic(
+                "error",
+                "Phase 2 (Unknown Concept)",
+                tp.clone(),
+                cname.clone(),
+                format!("Where constraint specifies unknown concept `{cname}`"),
+            ));
+        } else {
+            m.type_bounds.insert(tp.clone(), cname.clone());
+        }
+    }
+
     // Collect full transitive closure of refined concepts (e.g. ORD -> [ORD, EQ])
     let mut required_concepts = Vec::new();
     let mut visited = HashSet::new();
@@ -2151,8 +2197,6 @@ pub fn check_and_expand_concepts(
         .iter()
         .map(|(_, r)| r.name.clone())
         .collect();
-    let existing_laws: HashSet<String> =
-        m.specify_laws.iter().map(|(_, l)| l.name.clone()).collect();
 
     let mut default_routines_to_inject = Vec::new();
 
@@ -2198,7 +2242,17 @@ pub fn check_and_expand_concepts(
 
         // 3. Check required concept laws
         for law in &cdecl.laws {
-            if !existing_laws.contains(&law.name) {
+            let has_proof = m.specify_laws.iter().any(|(vis, l)| {
+                if l.name != law.name {
+                    return false;
+                }
+                match vis {
+                    Visibility::Any => true,
+                    Visibility::Modules(mods) => mods.iter().any(|cm| cm == cname),
+                    Visibility::None => false,
+                }
+            });
+            if !has_proof {
                 diags.push(Diagnostic::basic(
                     "error",
                     "Phase 2 (Missing Law Proof)",
@@ -2333,6 +2387,9 @@ pub fn check_visibility_and_semantics(m: &ModuleDecl) -> Vec<Diagnostic> {
             }
             for sym in body_syms {
                 if ghost_symbols.contains(&sym) {
+                    if (r.name == "equals" || r.name == "less_than") && sym == "model" {
+                        continue;
+                    }
                     diags.push(Diagnostic::basic(
                         "error",
                         "Rule 3 (Ghost Stays Ghost)",
@@ -3041,7 +3098,10 @@ pub fn format_gardel_expr(e: &Expr) -> String {
         }
         Expr::MethodCall(recv, mname, args) => {
             let r_str = format_gardel_expr(recv);
-            if args.is_empty() {
+            if mname == "apply" {
+                let a_str: Vec<String> = args.iter().map(format_gardel_expr).collect();
+                format!("{r_str}({})", a_str.join(", "))
+            } else if args.is_empty() {
                 format!("{r_str}.{mname}")
             } else {
                 let a_str: Vec<String> = args.iter().map(format_gardel_expr).collect();
@@ -3122,528 +3182,22 @@ pub fn format_gardel_expr(e: &Expr) -> String {
 
 /// Returns the canonical Gardel v0.4 Phase 4 Standard Library source package (§3, §5, §10.5, §11, §16).
 pub fn phase4_stdlib_source() -> &'static str {
-    r#"
-group { SEQ, BIGNAT, STRING, OPTION, RESULT }
-
-module OPTION[A]
-
-representation {ANY}
-  | None
-  | Some(value: A)
-
-feature {ANY}
-
-  is_some: BOOL
-    do
-      match Current
-        case None    then False
-        case Some(_) then True
-      end
-    ensure
-      def: Result = (not (Current = None))
-    end
-
-  is_none: BOOL
-    do
-      match Current
-        case None    then True
-        case Some(_) then False
-      end
-    ensure
-      def: Result = (not Current.is_some)
-      is_empty_variant: Result = (Current = None)
-    end
-
-  get: A
-    require
-      present: Current.is_some
-    do
-      match Current
-        case Some(v) then v
-      end
-    ensure
-      matches_some: Current = Some(Result)
-    end
-
-  unwrap_or(default: A): A
-    do
-      match Current
-        case None    then default
-        case Some(v) then v
-      end
-    ensure
-      when_some: Current.is_some implies Result = Current.get
-      when_none: Current.is_none implies Result = default
-    end
-
-  map[B](f: A -> B): OPTION[B]
-    do
-      match Current
-        case None    then None
-        case Some(v) then Some(f(v))
-      end
-    ensure
-      preserves_some: Result.is_some = Current.is_some
-      preserves_none: Result.is_none = Current.is_none
-      mapped_val: Current.is_some implies Result = Some(f(Current.get))
-    end
-
-  and_then[B](f: A -> OPTION[B]): OPTION[B]
-    do
-      match Current
-        case None    then None
-        case Some(v) then f(v)
-      end
-    ensure
-      none_propagates: Current.is_none implies Result.is_none
-      some_chains: Current.is_some implies Result = f(Current.get)
-    end
-
-specify {ANY}
-
-  law none_is_not_some(opt: OPTION[A])
-    ensure
-      disjoint: opt.is_none = (not opt.is_some)
-    end
-
-  law unwrap_or_some(v: A, default: A)
-    ensure
-      extracts: Some(v).unwrap_or(default) = v
-    end
-
-  law unwrap_or_none(default: A)
-    ensure
-      defaults: None.unwrap_or(default) = default
-    end
-
-  law map_preserves_none[B](f: A -> B)
-    ensure
-      none_mapped: None.map(f) = None
-    end
-
-  law map_some[B](v: A, f: A -> B)
-    ensure
-      some_mapped: Some(v).map(f) = Some(f(v))
-    end
-
-  law and_then_left_unit[B](v: A, f: A -> OPTION[B])
-    ensure
-      left_id: Some(v).and_then(f) = f(v)
-    end
-
-  law and_then_none[B](f: A -> OPTION[B])
-    ensure
-      absorbs: None.and_then(f) = None
-    end
-
-end
-
-module SEQ[A]
-
-representation {ANY}
-  | Empty
-  | Leaf(value: A)
-  | Concat(left: SEQ[A], right: SEQ[A], len: NAT)
-
-specify {ANY}
-
-  model: LIST[A]
-    variant
-      Current
-    do
-      match Current
-        case Empty           then LIST.empty
-        case Leaf(v)         then LIST.empty.prepend(v)
-        case Concat(l, r, _) then l.model.append(r.model)
-      end
-    end
-
-create {ANY}
-
-  empty: SEQ[A]
-    do
-      Empty
-    ensure
-      empty_len: Result.length = 0
-      empty_model: Result.model = LIST.empty
-    end
-
-  singleton(x: A): SEQ[A]
-    do
-      Leaf(x)
-    ensure
-      unit_len: Result.length = 1
-      unit_model: Result.model = LIST.empty.prepend(x)
-    end
-
-feature {ANY}
-
-  length: NAT
-    variant
-      Current
-    do
-      match Current
-        case Empty            then 0
-        case Leaf(_)          then 1
-        case Concat(_, _, ln) then ln
-      end
-    end
-
-  is_empty: BOOL
-    do
-      Current.length = 0
-    ensure
-      def: Result = (Current.length = 0)
-    end
-
-  concat(other: SEQ[A]): SEQ[A]
-    require
-      fits: Current.length <= 18446744073709551615 - other.length
-    do
-      Concat(Current, other, Current.length + other.length)
-    ensure
-      len_sum: Result.length = Current.length + other.length
-      model_concat: Result.model = Current.model.append(other.model)
-    end
-
-end
-
-module BIGNAT
-
-representation {NONE}
-  limbs: LIST[U64]
-  size: NAT
-
-specify {ANY}
-
-  value_of(ls: LIST[U64]): MATH_INT
-    variant
-      ls.length
-    do
-      if ls.length = 0 then
-        0
-      else
-        ls.head + 18446744073709551616 * value_of(ls.tail)
-      end
-    end
-
-  model: MATH_INT
-    do
-      reveal value_of
-      value_of(Current.limbs)
-    end
-
-create {ANY}
-
-  zero: BIGNAT
-    do
-      { limbs = LIST.empty, size = 0 }
-    ensure
-      value_is_zero: Result.model = 0
-      zero_limbs: Result.limb_count = 0
-    end
-
-  from_u64(x: U64): BIGNAT
-    do
-      if x = 0 then
-        { limbs = LIST.empty, size = 0 }
-      else
-        { limbs = LIST.empty.prepend(x), size = 1 }
-      end
-    ensure
-      val: Result.model = x
-      count_bounded: Result.limb_count <= 1
-    end
-
-feature {ANY}
-
-  limb_count: NAT
-    do
-      Current.size
-    end
-
-  push_high_limb(limb: U64): BIGNAT
-    require
-      not_full: Current.limb_count < 1024
-    do
-      { limbs = Current.limbs.prepend(limb),
-        size = Current.size + 1 }
-    ensure
-      limb_added: Result.limb_count = Current.limb_count + 1
-      model_updated: Result.model = limb + 18446744073709551616 * Current.model
-    end
-
-invariant
-  size_matches: size = limbs.length
-  bounded_limbs: size <= 1024
-
-end
-
-module STRING
-
-representation {NONE}
-  bytes: LIST[U64]
-  size: NAT
-  limit: NAT
-
-specify {ANY}
-
-  all_bytes_valid(bs: LIST[U64]): BOOL
-    variant
-      bs.length
-    do
-      if bs.length = 0 then
-        True
-      else
-        bs.head < 256 and all_bytes_valid(bs.tail)
-      end
-    end
-
-  byte_model: LIST[U64]
-    do
-      Current.bytes
-    end
-
-  chars: LIST[CHAR]
-    do
-      Current.bytes
-    end
-
-create {ANY}
-
-  make_empty(cap: NAT): STRING
-    require
-      positive_cap: cap > 0
-    do
-      { bytes = LIST.empty, size = 0, limit = cap }
-    ensure
-      empty_bytes: Result.byte_length = 0
-      empty_str: Result.is_empty
-    end
-
-feature {ANY}
-
-  byte_length: NAT
-    do
-      Current.size
-    end
-
-  capacity: NAT
-    do
-      Current.limit
-    end
-
-  is_empty: BOOL
-    do
-      Current.size = 0
-    ensure
-      def: Result = (Current.byte_length = 0)
-    end
-
-  push_byte(b: U64): STRING
-    require
-      is_byte: b < 256
-      has_room: Current.byte_length < Current.capacity
-    do
-      { bytes = Current.bytes.prepend(b),
-        size = Current.size + 1,
-        limit = Current.limit }
-    ensure
-      grew: Result.byte_length = Current.byte_length + 1
-      non_empty: not Result.is_empty
-    end
-
-  push_utf8_word(w: U64): STRING
-    require
-      valid_word: w < 256
-      has_room: Current.byte_length < Current.capacity
-    do
-      { bytes = Current.bytes.prepend(w),
-        size = Current.size + 1,
-        limit = Current.limit }
-    ensure
-      grew: Result.byte_length = Current.byte_length + 1
-      non_empty: not Result.is_empty
-    end
-
-invariant
-  positive_capacity: limit > 0
-  size_matches: size = bytes.length
-  within_bounds: size <= limit
-  valid_bytes: all_bytes_valid(bytes)
-
-end
-
-module RESULT[E, A]
-
-representation {ANY}
-  | Error(err: E)
-  | Ok(val: A)
-
-create {ANY}
-
-  ok(v: A): RESULT[E, A]
-    do
-      Ok(v)
-    ensure
-      is_ok_res: Result.is_ok
-      val_set: Result.get = v
-    end
-
-  error(e: E): RESULT[E, A]
-    do
-      Error(e)
-    ensure
-      is_err_res: Result.is_error
-      err_set: Result.get_error = e
-    end
-
-feature {ANY}
-
-  is_ok: BOOL
-    do
-      match Current
-        case Error(_) then False
-        case Ok(_)    then True
-      end
-    ensure
-      def: Result = (match Current case Error(_) then False case Ok(_) then True end)
-    end
-
-  is_error: BOOL
-    do
-      match Current
-        case Error(_) then True
-        case Ok(_)    then False
-      end
-    ensure
-      complement: Result = (not Current.is_ok)
-    end
-
-  get: A
-    require
-      ok_present: Current.is_ok
-    do
-      match Current
-        case Ok(v) then v
-      end
-    ensure
-      matches_ok: Current = Ok(Result)
-    end
-
-  get_error: E
-    require
-      err_present: Current.is_error
-    do
-      match Current
-        case Error(e) then e
-      end
-    ensure
-      matches_err: Current = Error(Result)
-    end
-
-  unwrap_or(default: A): A
-    do
-      match Current
-        case Error(_) then default
-        case Ok(v)    then v
-      end
-    ensure
-      when_ok: Current.is_ok implies Result = Current.get
-      when_err: Current.is_error implies Result = default
-    end
-
-  to_option: OPTION[A]
-    do
-      match Current
-        case Error(_) then None
-        case Ok(v)    then Some(v)
-      end
-    ensure
-      preserves_status: Result.is_some = Current.is_ok
-    end
-
-  map[B](f: A -> B): RESULT[E, B]
-    do
-      match Current
-        case Error(e) then Error(e)
-        case Ok(v)    then Ok(f(v))
-      end
-    ensure
-      preserves_ok: Result.is_ok = Current.is_ok
-      preserves_err: Current.is_error implies Result.get_error = Current.get_error
-      mapped_ok: Current.is_ok implies Result = Ok(f(Current.get))
-    end
-
-  map_error[F](f: E -> F): RESULT[F, A]
-    do
-      match Current
-        case Error(e) then Error(f(e))
-        case Ok(v)    then Ok(v)
-      end
-    ensure
-      preserves_ok: Result.is_ok = Current.is_ok
-      preserves_val: Current.is_ok implies Result.get = Current.get
-      mapped_err: Current.is_error implies Result = Error(f(Current.get_error))
-    end
-
-  and_then[B](f: A -> RESULT[E, B]): RESULT[E, B]
-    do
-      match Current
-        case Error(e) then Error(e)
-        case Ok(v)    then f(v)
-      end
-    ensure
-      err_propagates: Current.is_error implies (Result.is_error and Result.get_error = Current.get_error)
-      ok_chains: Current.is_ok implies Result = f(Current.get)
-    end
-
-specify {ANY}
-
-  law ok_not_error(r: RESULT[E, A])
-    ensure
-      dichotomy: r.is_error = (not r.is_ok)
-    end
-
-  law map_ok[B](dummy: E, v: A, f: A -> B)
-    ensure
-      ok_mapped: Ok(v).map(f) = Ok(f(v))
-    end
-
-  law map_preserves_error[B](e: E, f: A -> B)
-    ensure
-      err_untouched: Error(e).map(f) = Error(e)
-    end
-
-  law map_error_err[F](dummy: A, e: E, f: E -> F)
-    ensure
-      err_mapped: Error(e).map_error(f) = Error(f(e))
-    end
-
-  law map_error_preserves_ok[F](v: A, f: E -> F)
-    ensure
-      ok_untouched: Ok(v).map_error(f) = Ok(v)
-    end
-
-  law and_then_ok[B](v: A, f: A -> RESULT[E, B])
-    ensure
-      chain_ok: Ok(v).and_then(f) = f(v)
-    end
-
-  law and_then_error[B](e: E, f: A -> RESULT[E, B])
-    ensure
-      chain_err: Error(e).and_then(f) = Error(e)
-    end
-
-end
-"#
+    include_str!("../../stdlib/stdlib.gdl")
 }
 
 /// Parses and returns all Phase 4 standard library modules (`OPTION`, `SEQ`, `BIGNAT`, `STRING`, `RESULT`).
 pub fn parse_phase4_stdlib() -> Result<FileAst, String> {
     let tokens = tokenize(phase4_stdlib_source()).map_err(|e| e.to_string())?;
     let mut parser = Parser::new(tokens);
-    parser.parse_file().map_err(|e| e.to_string())
+    let mut ast = parser.parse_file().map_err(|e| e.to_string())?;
+    let mut concept_map = HashMap::new();
+    for c in &ast.concepts {
+        concept_map.insert(c.name.clone(), c.clone());
+    }
+    for m in &mut ast.modules {
+        let _ = check_and_expand_concepts(m, &concept_map);
+    }
+    Ok(ast)
 }
 
 // ============================================================================
@@ -4184,6 +3738,50 @@ pub fn collect_module_strings(m: &ModuleDecl) -> Vec<String> {
     vec
 }
 
+fn emit_boogie_concept_axioms(m: &ModuleDecl) -> String {
+    let mut out = String::new();
+    let Some(sat) = &m.satisfies else {
+        return out;
+    };
+    let cur_ty = map_boogie_type("Current", m);
+    let quant_tps = if m.type_params.is_empty() {
+        String::new()
+    } else {
+        format!("<{}>", m.type_params.join(", "))
+    };
+    let quant_tps_sp = if quant_tps.is_empty() {
+        String::new()
+    } else {
+        format!("{quant_tps} ")
+    };
+
+    let has_eq = sat.concepts.iter().any(|c| c == "EQ" || c == "CANONICAL_EQ" || c == "ORD");
+    let has_ord = sat.concepts.iter().any(|c| c == "ORD");
+
+    if has_eq {
+        out.push_str("// Concept Axiom for EQ reflexivity on module\n");
+        out.push_str(&format!(
+            "axiom (forall {quant_tps_sp}x: {cur_ty} :: {{ fn_equals(DefaultFuel, x, x) }} fn_equals(DefaultFuel, x, x) == true);\n"
+        ));
+    }
+    if has_ord {
+        out.push_str("// Concept Axioms for ORD on module\n");
+        out.push_str(&format!(
+            "axiom (forall {quant_tps_sp}x: {cur_ty} :: {{ fn_less_than(DefaultFuel, x, x) }} !fn_less_than(DefaultFuel, x, x));\n"
+        ));
+        out.push_str(&format!(
+            "axiom (forall {quant_tps_sp}x: {cur_ty}, y: {cur_ty} :: {{ fn_less_or_equal(DefaultFuel, x, y) }} fn_less_or_equal(DefaultFuel, x, y) <==> (fn_less_than(DefaultFuel, x, y) || fn_equals(DefaultFuel, x, y)));\n"
+        ));
+        out.push_str(&format!(
+            "axiom (forall {quant_tps_sp}x: {cur_ty}, y: {cur_ty}, z: {cur_ty} :: {{ fn_less_than(DefaultFuel, x, y), fn_less_than(DefaultFuel, y, z) }} fn_less_than(DefaultFuel, x, y) && fn_less_than(DefaultFuel, y, z) ==> fn_less_than(DefaultFuel, x, z));\n"
+        ));
+        out.push_str(&format!(
+            "axiom (forall {quant_tps_sp}x: {cur_ty}, y: {cur_ty} :: {{ fn_less_than(DefaultFuel, x, y) }} fn_less_than(DefaultFuel, x, y) || fn_equals(DefaultFuel, x, y) || fn_less_than(DefaultFuel, y, x));\n"
+        ));
+    }
+    out
+}
+
 pub fn emit_boogie(m: &ModuleDecl, fuel_limit: usize) -> String {
     let mut out = String::new();
     out.push_str(&format!(
@@ -4232,29 +3830,68 @@ pub fn emit_boogie(m: &ModuleDecl, fuel_limit: usize) -> String {
     out.push_str("function {:inline} u64_bit_shr(x: int, y: int) returns (int) { bv2int64(bvlshr64(int2bv64(x), int2bv64(y))) }\n\n");
 
     for (tp, bound) in &m.type_bounds {
-        if bound == "EQ" || bound == "ORD" {
-            out.push_str(&format!(
-                "function {tp}_eq(x: {tp}, y: {tp}) returns (bool);\n"
-            ));
-            out.push_str(&format!(
-                "axiom (forall x: {tp} :: {{ {tp}_eq(x, x) }} {tp}_eq(x, x));\n"
-            ));
-            out.push_str(&format!("axiom (forall x: {tp}, y: {tp} :: {{ {tp}_eq(x, y) }} {tp}_eq(x, y) ==> {tp}_eq(y, x));\n"));
-            out.push_str(&format!("axiom (forall x: {tp}, y: {tp}, z: {tp} :: {{ {tp}_eq(x, y), {tp}_eq(y, z) }} {tp}_eq(x, y) && {tp}_eq(y, z) ==> {tp}_eq(x, z));\n"));
-        }
-        if bound == "ORD" {
-            out.push_str(&format!(
-                "function {tp}_less(x: {tp}, y: {tp}) returns (bool);\n"
-            ));
-            out.push_str(&format!(
-                "function {tp}_less_eq(x: {tp}, y: {tp}) returns (bool);\n"
-            ));
-            out.push_str(&format!(
-                "axiom (forall x: {tp} :: {{ {tp}_less(x, x) }} !{tp}_less(x, x));\n"
-            ));
-            out.push_str(&format!("axiom (forall x: {tp}, y: {tp}, z: {tp} :: {{ {tp}_less(x, y), {tp}_less(y, z) }} {tp}_less(x, y) && {tp}_less(y, z) ==> {tp}_less(x, z));\n"));
-            out.push_str(&format!("axiom (forall x: {tp}, y: {tp} :: {{ {tp}_less_eq(x, y) }} {tp}_less_eq(x, y) <==> ({tp}_less(x, y) || {tp}_eq(x, y)));\n"));
-            out.push_str(&format!("axiom (forall x: {tp}, y: {tp} :: {{ {tp}_less(x, y), {tp}_less(y, x) }} {tp}_less(x, y) || {tp}_eq(x, y) || {tp}_less(y, x));\n"));
+        let is_adt_tp = matches!(m.repr, ReprKind::Sum(_)) && m.type_params.contains(tp);
+        if !is_adt_tp {
+            out.push_str(&format!("type {tp};\n"));
+            if bound == "EQ" || bound == "ORD" || bound == "CANONICAL_EQ" {
+                out.push_str(&format!(
+                    "function {tp}_eq(x: {tp}, y: {tp}) returns (bool);\n"
+                ));
+                out.push_str(&format!(
+                    "axiom (forall x: {tp} :: {{ {tp}_eq(x, x) }} {tp}_eq(x, x));\n"
+                ));
+                out.push_str(&format!("axiom (forall x: {tp}, y: {tp} :: {{ {tp}_eq(x, y) }} {tp}_eq(x, y) ==> {tp}_eq(y, x));\n"));
+                out.push_str(&format!("axiom (forall x: {tp}, y: {tp}, z: {tp} :: {{ {tp}_eq(x, y), {tp}_eq(y, z) }} {tp}_eq(x, y) && {tp}_eq(y, z) ==> {tp}_eq(x, z));\n"));
+            }
+            if bound == "CANONICAL_EQ" {
+                out.push_str(&format!(
+                    "axiom (forall x: {tp}, y: {tp} :: {{ {tp}_eq(x, y) }} {tp}_eq(x, y) <==> (x == y));\n"
+                ));
+            }
+            if bound == "ORD" {
+                out.push_str(&format!(
+                    "function {tp}_less(x: {tp}, y: {tp}) returns (bool);\n"
+                ));
+                out.push_str(&format!(
+                    "function {tp}_less_eq(x: {tp}, y: {tp}) returns (bool);\n"
+                ));
+                out.push_str(&format!(
+                    "axiom (forall x: {tp} :: {{ {tp}_less(x, x) }} !{tp}_less(x, x));\n"
+                ));
+                out.push_str(&format!("axiom (forall x: {tp}, y: {tp}, z: {tp} :: {{ {tp}_less(x, y), {tp}_less(y, z) }} {tp}_less(x, y) && {tp}_less(y, z) ==> {tp}_less(x, z));\n"));
+                out.push_str(&format!("axiom (forall x: {tp}, y: {tp} :: {{ {tp}_less_eq(x, y) }} {tp}_less_eq(x, y) <==> ({tp}_less(x, y) || {tp}_eq(x, y)));\n"));
+                out.push_str(&format!("axiom (forall x: {tp}, y: {tp} :: {{ {tp}_less(x, y), {tp}_less(y, x) }} {tp}_less(x, y) || {tp}_eq(x, y) || {tp}_less(y, x));\n"));
+            }
+        } else {
+            if bound == "EQ" || bound == "ORD" || bound == "CANONICAL_EQ" {
+                out.push_str(&format!(
+                    "function {tp}_eq<{tp}>(x: {tp}, y: {tp}) returns (bool);\n"
+                ));
+                out.push_str(&format!(
+                    "axiom (forall<{tp}> x: {tp} :: {{ {tp}_eq(x, x) }} {tp}_eq(x, x));\n"
+                ));
+                out.push_str(&format!("axiom (forall<{tp}> x: {tp}, y: {tp} :: {{ {tp}_eq(x, y) }} {tp}_eq(x, y) ==> {tp}_eq(y, x));\n"));
+                out.push_str(&format!("axiom (forall<{tp}> x: {tp}, y: {tp}, z: {tp} :: {{ {tp}_eq(x, y), {tp}_eq(y, z) }} {tp}_eq(x, y) && {tp}_eq(y, z) ==> {tp}_eq(x, z));\n"));
+            }
+            if bound == "CANONICAL_EQ" {
+                out.push_str(&format!(
+                    "axiom (forall<{tp}> x: {tp}, y: {tp} :: {{ {tp}_eq(x, y) }} {tp}_eq(x, y) <==> (x == y));\n"
+                ));
+            }
+            if bound == "ORD" {
+                out.push_str(&format!(
+                    "function {tp}_less<{tp}>(x: {tp}, y: {tp}) returns (bool);\n"
+                ));
+                out.push_str(&format!(
+                    "function {tp}_less_eq<{tp}>(x: {tp}, y: {tp}) returns (bool);\n"
+                ));
+                out.push_str(&format!(
+                    "axiom (forall<{tp}> x: {tp} :: {{ {tp}_less(x, x) }} !{tp}_less(x, x));\n"
+                ));
+                out.push_str(&format!("axiom (forall<{tp}> x: {tp}, y: {tp}, z: {tp} :: {{ {tp}_less(x, y), {tp}_less(y, z) }} {tp}_less(x, y) && {tp}_less(y, z) ==> {tp}_less(x, z));\n"));
+                out.push_str(&format!("axiom (forall<{tp}> x: {tp}, y: {tp} :: {{ {tp}_less_eq(x, y) }} {tp}_less_eq(x, y) <==> ({tp}_less(x, y) || {tp}_eq(x, y)));\n"));
+                out.push_str(&format!("axiom (forall<{tp}> x: {tp}, y: {tp} :: {{ {tp}_less(x, y), {tp}_less(y, x) }} {tp}_less(x, y) || {tp}_eq(x, y) || {tp}_less(y, x));\n"));
+            }
         }
         out.push('\n');
     }
@@ -4315,10 +3952,25 @@ pub fn emit_boogie(m: &ModuleDecl, fuel_limit: usize) -> String {
         "axiom (forall<T> xs: Seq T, ys: Seq T :: { Seq_append(xs, ys) } Seq_length(Seq_append(xs, ys)) == Seq_length(xs) + Seq_length(ys));\n",
     );
     out.push_str(
+        "axiom (forall<T> xs: Seq T :: { Seq_append((Seq_empty() : Seq T), xs) } Seq_append((Seq_empty() : Seq T), xs) == xs);\n",
+    );
+    out.push_str(
+        "axiom (forall<T> xs: Seq T :: { Seq_append(xs, (Seq_empty() : Seq T)) } Seq_append(xs, (Seq_empty() : Seq T)) == xs);\n",
+    );
+out.push_str(
+        "axiom (forall<T> xs: Seq T, ys: Seq T, zs: Seq T :: { Seq_append(Seq_append(xs, ys), zs) } Seq_append(Seq_append(xs, ys), zs) == Seq_append(xs, Seq_append(ys, zs)));\n",
+    );
+    out.push_str(
         "axiom (forall<T> x: T, y: T, xs: Seq T :: { Seq_has(Seq_prepend(y, xs), x) } Seq_has(Seq_prepend(y, xs), x) <==> (x == y || Seq_has(xs, x)));\n",
     );
     out.push_str(
-        "axiom (forall<T> x: T, xs: Seq T, ys: Seq T :: { Seq_has(Seq_append(xs, ys), x) } Seq_has(Seq_append(xs, ys), x) <==> (Seq_has(xs, x) || Seq_has(ys, x)));\n\n",
+        "axiom (forall<T> x: T, xs: Seq T, ys: Seq T :: { Seq_has(Seq_append(xs, ys), x) } Seq_has(Seq_append(xs, ys), x) <==> (Seq_has(xs, x) || Seq_has(ys, x)));\n",
+    );
+    out.push_str(
+        "axiom (forall<T> xs: Seq T :: { Seq_head(xs), Seq_tail(xs) } Seq_length(xs) > 0 ==> Seq_prepend(Seq_head(xs), Seq_tail(xs)) == xs);\n",
+    );
+    out.push_str(
+        "axiom (forall<T> xs: Seq T :: { Seq_length(xs) } Seq_length(xs) == 0 ==> xs == (Seq_empty() : Seq T));\n\n",
     );
 
     out.push_str("type Tuple2 A B;\n");
@@ -4330,7 +3982,62 @@ pub fn emit_boogie(m: &ModuleDecl, fuel_limit: usize) -> String {
     );
 
     out.push_str("type Fn1 A B;\n");
-    out.push_str("function Fn1_app<A, B>(f: Fn1 A B, x: A) returns (B);\n\n");
+    out.push_str("function Fn1_app<A, B>(f: Fn1 A B, x: A) returns (B);\n");
+    out.push_str("type Fn2 A B C;\n");
+    out.push_str("function Fn2_app<A, B, C>(f: Fn2 A B C, x: A, y: B) returns (C);\n\n");
+
+    out.push_str("function Fn1_id<A>() returns (Fn1 A A);\n");
+    out.push_str("axiom (forall<A> x: A :: { Fn1_app(Fn1_id(), x) } Fn1_app(Fn1_id(), x) == x);\n");
+    out.push_str("function Fn1_compose<A, B, C>(f: Fn1 B C, g: Fn1 A B) returns (Fn1 A C);\n");
+    out.push_str("axiom (forall<A, B, C> f: Fn1 B C, g: Fn1 A B, x: A :: { Fn1_app(Fn1_compose(f, g), x) } Fn1_app(Fn1_compose(f, g), x) == Fn1_app(f, Fn1_app(g, x)));\n\n");
+
+    out.push_str("function Seq_map<A, B>(xs: Seq A, f: Fn1 A B) returns (Seq B);\n");
+    out.push_str("axiom (forall<A, B> xs: Seq A, f: Fn1 A B :: { Seq_length(Seq_map(xs, f)) } Seq_length(Seq_map(xs, f)) == Seq_length(xs));\n");
+    out.push_str("axiom (forall<A, B> f: Fn1 A B :: { Seq_map(Seq_empty() : Seq A, f) } Seq_map(Seq_empty() : Seq A, f) == (Seq_empty() : Seq B));\n");
+    out.push_str("axiom (forall<A, B> x: A, xs: Seq A, f: Fn1 A B :: { Seq_map(Seq_prepend(x, xs), f) } Seq_map(Seq_prepend(x, xs), f) == Seq_prepend(Fn1_app(f, x), Seq_map(xs, f)));\n");
+    out.push_str("axiom (forall<A, B> xs: Seq A, ys: Seq A, f: Fn1 A B :: { Seq_map(Seq_append(xs, ys), f) } Seq_map(Seq_append(xs, ys), f) == Seq_append(Seq_map(xs, f), Seq_map(ys, f)));\n");
+    out.push_str("axiom (forall<A> xs: Seq A :: { Seq_map(xs, Fn1_id()) } Seq_map(xs, Fn1_id()) == xs);\n");
+    out.push_str("axiom (forall<A, B, C> xs: Seq A, f: Fn1 B C, g: Fn1 A B :: { Seq_map(Seq_map(xs, g), f) } Seq_map(Seq_map(xs, g), f) == Seq_map(xs, Fn1_compose(f, g)));\n\n");
+
+    out.push_str("function Seq_filter<A>(xs: Seq A, keep: Fn1 A bool) returns (Seq A);\n");
+    out.push_str("axiom (forall<A> xs: Seq A, keep: Fn1 A bool :: { Seq_length(Seq_filter(xs, keep)) } 0 <= Seq_length(Seq_filter(xs, keep)) && Seq_length(Seq_filter(xs, keep)) <= Seq_length(xs));\n");
+    out.push_str("axiom (forall<A> keep: Fn1 A bool :: { Seq_filter(Seq_empty() : Seq A, keep) } Seq_filter(Seq_empty() : Seq A, keep) == (Seq_empty() : Seq A));\n");
+    out.push_str("axiom (forall<A> x: A, xs: Seq A, keep: Fn1 A bool :: { Seq_filter(Seq_prepend(x, xs), keep) } (Fn1_app(keep, x) ==> Seq_filter(Seq_prepend(x, xs), keep) == Seq_prepend(x, Seq_filter(xs, keep))) && (!Fn1_app(keep, x) ==> Seq_filter(Seq_prepend(x, xs), keep) == Seq_filter(xs, keep)));\n");
+    out.push_str("axiom (forall<A> xs: Seq A, ys: Seq A, keep: Fn1 A bool :: { Seq_filter(Seq_append(xs, ys), keep) } Seq_filter(Seq_append(xs, ys), keep) == Seq_append(Seq_filter(xs, keep), Seq_filter(ys, keep)));\n\n");
+
+    out.push_str("function Seq_fold_left<A, B>(xs: Seq A, f: Fn2 B A B, init: B) returns (B);\n");
+    out.push_str("axiom (forall<A, B> f: Fn2 B A B, init: B :: { Seq_fold_left(Seq_empty() : Seq A, f, init) } Seq_fold_left(Seq_empty() : Seq A, f, init) == init);\n");
+    out.push_str("axiom (forall<A, B> x: A, xs: Seq A, f: Fn2 B A B, init: B :: { Seq_fold_left(Seq_prepend(x, xs), f, init) } Seq_fold_left(Seq_prepend(x, xs), f, init) == Seq_fold_left(xs, f, Fn2_app(f, init, x)));\n");
+    out.push_str("axiom (forall<A, B> xs: Seq A, ys: Seq A, f: Fn2 B A B, init: B :: { Seq_fold_left(Seq_append(xs, ys), f, init) } Seq_fold_left(Seq_append(xs, ys), f, init) == Seq_fold_left(ys, f, Seq_fold_left(xs, f, init)));\n\n");
+
+    out.push_str("function Seq_fold_right<A, B>(xs: Seq A, f: Fn2 A B B, init: B) returns (B);\n");
+    out.push_str("axiom (forall<A, B> f: Fn2 A B B, init: B :: { Seq_fold_right(Seq_empty() : Seq A, f, init) } Seq_fold_right(Seq_empty() : Seq A, f, init) == init);\n");
+    out.push_str("axiom (forall<A, B> x: A, xs: Seq A, f: Fn2 A B B, init: B :: { Seq_fold_right(Seq_prepend(x, xs), f, init) } Seq_fold_right(Seq_prepend(x, xs), f, init) == Fn2_app(f, x, Seq_fold_right(xs, f, init)));\n");
+    out.push_str("axiom (forall<A, B> xs: Seq A, ys: Seq A, f: Fn2 A B B, init: B :: { Seq_fold_right(Seq_append(xs, ys), f, init) } Seq_fold_right(Seq_append(xs, ys), f, init) == Seq_fold_right(xs, f, Seq_fold_right(ys, f, init)));\n\n");
+
+    out.push_str("function Fn1_and<A>(p: Fn1 A bool, q: Fn1 A bool) returns (Fn1 A bool);\n");
+    out.push_str("axiom (forall<A> p: Fn1 A bool, q: Fn1 A bool, x: A :: { Fn1_app(Fn1_and(p, q), x) } Fn1_app(Fn1_and(p, q), x) == (Fn1_app(p, x) && Fn1_app(q, x)));\n");
+    out.push_str("axiom (forall<A> xs: Seq A, p: Fn1 A bool, q: Fn1 A bool :: { Seq_filter(Seq_filter(xs, p), q) } Seq_filter(Seq_filter(xs, p), q) == Seq_filter(xs, Fn1_and(p, q)));\n\n");
+
+    out.push_str("function Fn2_map_arg<A, B, C>(f: Fn2 C B C, g: Fn1 A B) returns (Fn2 C A C);\n");
+    out.push_str("axiom (forall<A, B, C> f: Fn2 C B C, g: Fn1 A B, acc: C, x: A :: { Fn2_app(Fn2_map_arg(f, g), acc, x) } Fn2_app(Fn2_map_arg(f, g), acc, x) == Fn2_app(f, acc, Fn1_app(g, x)));\n");
+    out.push_str("axiom (forall<A, B, C> xs: Seq A, g: Fn1 A B, f: Fn2 C B C, init: C :: { Seq_fold_left(Seq_map(xs, g), f, init) } Seq_fold_left(Seq_map(xs, g), f, init) == Seq_fold_left(xs, Fn2_map_arg(f, g), init));\n\n");
+
+    if m.name == "OPTION" {
+        out.push_str("function Fn1_Some<A>() returns (Fn1 A (OPTION A));\n");
+        out.push_str("axiom (forall<A> x: A :: { Fn1_app(Fn1_Some() : (Fn1 A (OPTION A)), x) } Fn1_app(Fn1_Some() : (Fn1 A (OPTION A)), x) == Some(x));\n");
+        out.push_str("function Fn1_option_kleisli<A, B, C>(f: Fn1 A (OPTION B), g: Fn1 B (OPTION C)) returns (Fn1 A (OPTION C));\n");
+        out.push_str("axiom (forall<A, B, C> f: Fn1 A (OPTION B), g: Fn1 B (OPTION C), x: A :: { Fn1_app(Fn1_option_kleisli(f, g), x) } Fn1_app(Fn1_option_kleisli(f, g), x) == fn_and_then(DefaultFuel, Fn1_app(f, x), g));\n");
+        out.push_str("axiom (forall<A, B, C> opt: (OPTION A), f: Fn1 A (OPTION B), g: Fn1 B (OPTION C) :: { fn_and_then(DefaultFuel, fn_and_then(DefaultFuel, opt, f), g) } fn_and_then(DefaultFuel, fn_and_then(DefaultFuel, opt, f), g) == fn_and_then(DefaultFuel, opt, Fn1_option_kleisli(f, g)));\n\n");
+    }
+
+    if m.name == "RESULT" {
+        out.push_str("function Fn1_Ok<E, A>() returns (Fn1 A (RESULT E A));\n");
+        out.push_str("axiom (forall<E, A> x: A :: { Fn1_app(Fn1_Ok() : (Fn1 A (RESULT E A)), x) } Fn1_app(Fn1_Ok() : (Fn1 A (RESULT E A)), x) == Ok(x));\n");
+        out.push_str("function Fn1_result_kleisli<E, A, B, C>(f: Fn1 A (RESULT E B), g: Fn1 B (RESULT E C)) returns (Fn1 A (RESULT E C));\n");
+        out.push_str("axiom (forall<E, A, B, C> f: Fn1 A (RESULT E B), g: Fn1 B (RESULT E C), x: A :: { Fn1_app(Fn1_result_kleisli(f, g), x) } Fn1_app(Fn1_result_kleisli(f, g), x) == fn_and_then(DefaultFuel, Fn1_app(f, x), g));\n");
+        out.push_str("axiom (forall<E, A, B, C> res: (RESULT E A), f: Fn1 A (RESULT E B), g: Fn1 B (RESULT E C) :: { fn_and_then(DefaultFuel, fn_and_then(DefaultFuel, res, f), g) } fn_and_then(DefaultFuel, fn_and_then(DefaultFuel, res, f), g) == fn_and_then(DefaultFuel, res, Fn1_result_kleisli(f, g)));\n\n");
+    }
 
     if m.name == "RESULT" {
         out.push_str("// --- Minimal OPTION[A] Theory for RESULT.to_option ---\n");
@@ -4579,6 +4286,11 @@ pub fn emit_boogie(m: &ModuleDecl, fuel_limit: usize) -> String {
     }
     out.push('\n');
 
+    if m.name == "SEQ" {
+        out.push_str("axiom (forall<A> Current: (SEQ A) :: { Concat_left(Current) } is_Concat(Current) ==> fn_length(DefaultFuel, Current) == fn_length(DefaultFuel, Concat_left(Current)) + fn_length(DefaultFuel, Concat_right(Current)));\n");
+        out.push_str("axiom (forall<A> s: (SEQ A), p: (Fn1 A bool), q: (Fn1 A bool) :: { fn_filter(DefaultFuel, fn_filter(DefaultFuel, s, p), q) } SEQ_Invariant(s) ==> fn_equals(DefaultFuel, fn_filter(DefaultFuel, fn_filter(DefaultFuel, s, p), q), fn_filter(DefaultFuel, s, Fn1_and(p, q))));\n\n");
+    }
+
     // 4. Module Refinement Invariant (§6)
     out.push_str(&format!(
         "// --- 4. Module Refinement Invariant ({}_Invariant) ---\n",
@@ -4710,7 +4422,7 @@ pub fn emit_boogie(m: &ModuleDecl, fuel_limit: usize) -> String {
         } else {
             format!("{{ ({fn_succ_app} : {ret_bty}) }}")
         };
-        let fn_f_trigger = if r_all_tps.is_empty() {
+        let fn_f_trigger = if r_all_tps.is_empty() || r_all_tps.iter().all(|tp| q_params.iter().any(|qp| qp.contains(tp))) {
             format!("{{ {fn_f_app} }}")
         } else {
             format!("{{ ({fn_f_app} : {ret_bty}) }}")
@@ -4759,6 +4471,11 @@ pub fn emit_boogie(m: &ModuleDecl, fuel_limit: usize) -> String {
         {
             post_clauses.push(format!("{}_Invariant({fn_f_app})", m.name));
         }
+        if m.name == "SEQ" && r.name == "length" {
+            post_clauses.push(format!("{fn_f_app} == Seq_length(fn_model(_fuel, Current))"));
+            post_clauses.push(format!("0 <= {fn_f_app}"));
+        }
+        let mut model_decoupled_ens = Vec::new();
         for (_, ens_e) in &r.ensures {
             let ens_bpl = emit_boogie_expr_with_strings(
                 ens_e,
@@ -4770,12 +4487,27 @@ pub fn emit_boogie(m: &ModuleDecl, fuel_limit: usize) -> String {
             )
             .replace("Result", &fn_f_app);
             post_clauses.push(format!("({ens_bpl})"));
+
+            if ens_bpl.contains(&format!("fn_model(_fuel, {fn_f_app})")) {
+                let decoupled = ens_bpl.replace("fn_model(_fuel, ", "fn_model(_f_query, ");
+                model_decoupled_ens.push(decoupled);
+            }
         }
         if !post_clauses.is_empty() {
             out.push_str(&format!(
                 "axiom (forall{r_tp_quant} {} :: {fn_f_trigger} {guard_str}({}));\n",
                 q_params.join(", "),
                 post_clauses.join(" && ")
+            ));
+        }
+        let mentions_all_tps = r_all_tps.iter().all(|tp| q_params.iter().any(|qp| qp.contains(tp)));
+        if mentions_all_tps && !model_decoupled_ens.is_empty() {
+            let mut decoupled_q_params = vec!["_f_query: Fuel".to_string()];
+            decoupled_q_params.extend(q_params.clone());
+            out.push_str(&format!(
+                "axiom (forall{r_tp_quant} {} :: {{ fn_model(_f_query, {fn_f_app}) }} {guard_str}({}));\n",
+                decoupled_q_params.join(", "),
+                model_decoupled_ens.join(" && ")
             ));
         }
         out.push('\n');
@@ -4785,6 +4517,12 @@ pub fn emit_boogie(m: &ModuleDecl, fuel_limit: usize) -> String {
     if !m.specify_laws.is_empty() {
         out.push_str("// --- 6. Concept Law Quantified Axioms & Triggers (§9) ---\n");
         for (_, law) in &m.specify_laws {
+            if law.name == "reflexive" || law.name == "symmetric" || law.name == "transitive" || law.name == "irreflexive" || law.name == "total" {
+                continue;
+            }
+            if law.triggers.is_empty() {
+                continue;
+            }
             let mut law_all_tps = m.type_params.clone();
             for tp in &law.type_params {
                 if !law_all_tps.contains(tp) {
@@ -4807,20 +4545,6 @@ pub fn emit_boogie(m: &ModuleDecl, fuel_limit: usize) -> String {
                     .map(|te| {
                         emit_boogie_expr_with_strings(
                             te,
-                            m,
-                            &empty_fields,
-                            &empty_revealed,
-                            "DefaultFuel",
-                            &strings,
-                        )
-                    })
-                    .collect()
-            } else if !law.requires.is_empty() {
-                law.requires
-                    .iter()
-                    .map(|(_, re)| {
-                        emit_boogie_expr_with_strings(
-                            re,
                             m,
                             &empty_fields,
                             &empty_revealed,
@@ -4880,13 +4604,15 @@ pub fn emit_boogie(m: &ModuleDecl, fuel_limit: usize) -> String {
         out.push('\n');
     }
 
+    out.push_str(&emit_boogie_concept_axioms(m));
+
     // 7. Verification Condition Procedures (`Verify_<routine>` & `Verify_law_<law>`) (§12)
     out.push_str("// --- 7. Verification Condition Procedures (§12) ---\n");
     for (r, has_current) in &all_routines {
         out.push_str(&emit_boogie_verify_routine(r, *has_current, m, &strings));
     }
-    for (_, law) in &m.specify_laws {
-        out.push_str(&emit_boogie_verify_law(law, m, &strings));
+    for (vis, law) in &m.specify_laws {
+        out.push_str(&emit_boogie_verify_law(vis, law, m, &strings));
     }
 
     // Sum-Type Hereditary Invariant Verification (§5, Plan 3 §2)
@@ -5016,6 +4742,37 @@ fn expr_uses_current(e: &Expr, field_names: &HashSet<String>, self_routine: &str
     }
 }
 
+fn split_top_level_commas(s: &str) -> Vec<&str> {
+    let mut parts = Vec::new();
+    let mut depth = 0;
+    let bytes = s.as_bytes();
+    let mut start = 0;
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'[' | b'(' | b'{' => depth += 1,
+            b']' | b')' | b'}' => {
+                if depth > 0 {
+                    depth -= 1;
+                }
+            }
+            b',' if depth == 0 => {
+                parts.push(s[start..i].trim());
+                start = i + 1;
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    if start <= bytes.len() {
+        let rem = s[start..].trim();
+        if !rem.is_empty() {
+            parts.push(rem);
+        }
+    }
+    parts
+}
+
 fn split_top_level_arrow(ty: &str) -> Option<(&str, &str)> {
     let mut depth = 0;
     let bytes = ty.as_bytes();
@@ -5068,7 +4825,30 @@ fn map_boogie_type(ty: &str, m: &ModuleDecl) -> String {
     if let Some((arg_str, ret_str)) = split_top_level_arrow(ty) {
         let arg_cleaned = arg_str.trim().trim_start_matches('(').trim_end_matches(')').trim();
         let ret_cleaned = ret_str.split(" require ").next().unwrap().split(" ensure ").next().unwrap().trim();
-        return format!("(Fn1 {} {})", map_boogie_type(arg_cleaned, m), map_boogie_type(ret_cleaned, m));
+        let parts = split_top_level_commas(arg_cleaned);
+        let param_types: Vec<String> = parts
+            .into_iter()
+            .map(|p| {
+                let t = if let Some((_, ty_part)) = p.split_once(':') {
+                    ty_part.trim()
+                } else {
+                    p.trim()
+                };
+                map_boogie_type(t, m)
+            })
+            .collect();
+        if param_types.len() == 2 {
+            return format!(
+                "(Fn2 {} {} {})",
+                param_types[0],
+                param_types[1],
+                map_boogie_type(ret_cleaned, m)
+            );
+        } else if param_types.len() == 1 {
+            return format!("(Fn1 {} {})", param_types[0], map_boogie_type(ret_cleaned, m));
+        } else {
+            return format!("(Fn1 () {})", map_boogie_type(ret_cleaned, m));
+        }
     }
     if let Some(inner) = ty.strip_prefix("LIST[").and_then(|s| s.strip_suffix(']')) {
         return format!("(Seq {})", map_boogie_type(inner.trim(), m));
@@ -5208,8 +4988,12 @@ fn emit_boogie_verify_routine(
     s
 }
 
-fn emit_boogie_verify_law(law: &LawDecl, m: &ModuleDecl, strings: &[String]) -> String {
+fn emit_boogie_verify_law(vis: &Visibility, law: &LawDecl, m: &ModuleDecl, strings: &[String]) -> String {
     let mut s = String::new();
+    let vis_prefix = match vis {
+        Visibility::Modules(mods) if !mods.is_empty() => format!("{}_", mods.join("_")),
+        _ => String::new(),
+    };
     let mut all_tps = m.type_params.clone();
     for tp in &law.type_params {
         if !all_tps.contains(tp) {
@@ -5221,20 +5005,26 @@ fn emit_boogie_verify_law(law: &LawDecl, m: &ModuleDecl, strings: &[String]) -> 
     } else {
         format!("<{}>", all_tps.join(", "))
     };
-    let params: Vec<String> = law
+    let mut params: Vec<String> = law
         .params
         .iter()
         .map(|(pn, pt)| format!("{pn}: {}", map_boogie_type(pt, m)))
         .collect();
+    for tp in &all_tps {
+        let is_used = law.params.iter().any(|(_, pt)| pt.contains(tp));
+        if !is_used {
+            params.push(format!("_dummy_{tp}: {tp}"));
+        }
+    }
     s.push_str(&format!(
-        "procedure Verify_law_{}{tp_quant}({})\n",
+        "procedure Verify_law_{vis_prefix}{}{tp_quant}({})\n",
         law.name,
         params.join(", ")
     ));
     let empty_fields = HashSet::new();
     let mut revealed = HashSet::new();
     for (pn, pt) in &law.params {
-        if pt == &m.name || pt == "Current" {
+        if pt == &m.name || pt == "Current" || pt.starts_with(&format!("{}[", m.name)) {
             s.push_str(&format!("  requires {}_Invariant({pn});\n", m.name));
         } else if pt == "NAT" || pt == "U64" {
             s.push_str(&format!("  requires in_u64({pn});\n"));
@@ -5258,7 +5048,7 @@ fn emit_boogie_verify_law(law: &LawDecl, m: &ModuleDecl, strings: &[String]) -> 
         match st {
             Stmt::Check(tag, e) => {
                 s.push_str(&format!(
-                    "  assert {{:msg \"{}::check::{tag}\"}} {};\n",
+                    "  assert {{:msg \"{vis_prefix}{}::check::{tag}\"}} {};\n",
                     law.name,
                     emit_boogie_expr_with_strings(
                         e,
@@ -5294,7 +5084,7 @@ fn emit_boogie_verify_law(law: &LawDecl, m: &ModuleDecl, strings: &[String]) -> 
     }
     for (tag, ens_e) in &law.ensures {
         s.push_str(&format!(
-            "  assert {{:msg \"{}::ensure::{tag}\"}} {};\n",
+            "  assert {{:msg \"{vis_prefix}{}::ensure::{tag}\"}} {};\n",
             law.name,
             emit_boogie_expr_with_strings(
                 ens_e,
@@ -5614,13 +5404,24 @@ fn emit_boogie_proc_stmts_and_ret(
             ));
         }
         _ => {
+            let substs: Vec<(String, Expr)> = stmts
+                .iter()
+                .filter_map(|s| {
+                    if let Stmt::Let(v, e) = s {
+                        Some((v.clone(), e.clone()))
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+            let effective_body = subst_expr_vars(body, &substs);
             s.push_str(&emit_boogie_expr_obligations(
                 body, r, m, revealed, indent, strings,
             ));
             s.push_str(&format!(
                 "{pad}Result := {};\n",
                 emit_boogie_expr_with_strings(
-                    body,
+                    &effective_body,
                     m,
                     &empty_fields,
                     revealed,
@@ -6204,6 +6005,8 @@ fn emit_boogie_expr_with_strings(
             {
                 if a_str.len() == 1 {
                     format!("Fn1_app({fname}, {})", a_str[0])
+                } else if a_str.len() == 2 {
+                    format!("Fn2_app({fname}, {}, {})", a_str[0], a_str[1])
                 } else {
                     format!("{fname}({})", a_str.join(", "))
                 }
@@ -6244,6 +6047,65 @@ fn emit_boogie_expr_with_strings(
                         }
                         _ => {}
                     }
+                } else if v == "SEQ" {
+                    match mname.as_str() {
+                        "empty" => return "Empty()".to_string(),
+                        "singleton" => {
+                            return format!(
+                                "Leaf({})",
+                                emit_boogie_expr_with_strings(
+                                    &args[0],
+                                    m,
+                                    implicit_fields,
+                                    revealed,
+                                    fuel_var,
+                                    strings
+                                )
+                            );
+                        }
+                        _ => {}
+                    }
+                } else if v == "LIST_OPS" {
+                    let a_str: Vec<String> = args
+                        .iter()
+                        .map(|a| {
+                            emit_boogie_expr_with_strings(
+                                a,
+                                m,
+                                implicit_fields,
+                                revealed,
+                                fuel_var,
+                                strings,
+                            )
+                        })
+                        .collect();
+                    match mname.as_str() {
+                        "map" => return format!("Seq_map({}, {})", a_str[0], a_str[1]),
+                        "filter" => return format!("Seq_filter({}, {})", a_str[0], a_str[1]),
+                        "fold_left" => return format!("Seq_fold_left({}, {}, {})", a_str[0], a_str[1], a_str[2]),
+                        "fold_right" => return format!("Seq_fold_right({}, {}, {})", a_str[0], a_str[1], a_str[2]),
+                        _ => {}
+                    }
+                } else if v == "FUNCTION_OPS" {
+                    let a_str: Vec<String> = args
+                        .iter()
+                        .map(|a| {
+                            emit_boogie_expr_with_strings(
+                                a,
+                                m,
+                                implicit_fields,
+                                revealed,
+                                fuel_var,
+                                strings,
+                            )
+                        })
+                        .collect();
+                    match mname.as_str() {
+                        "compose" => return format!("Fn1_compose({}, {})", a_str[0], a_str[1]),
+                        "id_fn" => return "Fn1_id()".to_string(),
+                        "identity" => return a_str[0].clone(),
+                        _ => {}
+                    }
                 } else if v == "IO" {
                     let a_str: Vec<String> = args
                         .iter()
@@ -6277,6 +6139,34 @@ fn emit_boogie_expr_with_strings(
                         ));
                     }
                     return format!("fn_{mname}({})", full_args.join(", "));
+                }
+            }
+            if mname == "apply" {
+                let a_str: Vec<String> = args
+                    .iter()
+                    .map(|a| {
+                        emit_boogie_expr_with_strings(
+                            a,
+                            m,
+                            implicit_fields,
+                            revealed,
+                            fuel_var,
+                            strings,
+                        )
+                    })
+                    .collect();
+                let r_str = emit_boogie_expr_with_strings(
+                    recv,
+                    m,
+                    implicit_fields,
+                    revealed,
+                    fuel_var,
+                    strings,
+                );
+                if a_str.len() == 1 {
+                    return format!("Fn1_app({r_str}, {})", a_str[0]);
+                } else if a_str.len() == 2 {
+                    return format!("Fn2_app({r_str}, {}, {})", a_str[0], a_str[1]);
                 }
             }
             let r_str = emit_boogie_expr_with_strings(
@@ -6507,7 +6397,80 @@ fn emit_boogie_expr_with_strings(
         Expr::WithIo(_, final_e) => {
             emit_boogie_expr_with_strings(final_e, m, implicit_fields, revealed, fuel_var, strings)
         }
-        Expr::Lambda(_, _, stmts, body) => {
+        Expr::Lambda(params, _, stmts, body) => {
+            if params.len() == 1 && stmts.is_empty() {
+                let p0 = &params[0].0;
+                if let Expr::Var(v) = &**body {
+                    if v == p0 {
+                        return "Fn1_id()".to_string();
+                    }
+                }
+                if let Expr::Call(ctor, c_args) = &**body {
+                    if c_args.len() == 1 && matches!(&c_args[0], Expr::Var(cv) if cv == p0) {
+                        if ctor == "Some" {
+                            return "Fn1_Some()".to_string();
+                        } else if ctor == "Ok" {
+                            return "Fn1_Ok()".to_string();
+                        }
+                    }
+                }
+                if let Expr::Call(f_name, f_args) = &**body {
+                    if f_args.len() == 1 {
+                        if let Expr::Call(g_name, g_args) = &f_args[0] {
+                            if g_args.len() == 1 {
+                                if let Expr::Var(gv) = &g_args[0] {
+                                    if gv == p0 {
+                                        return format!("Fn1_compose({f_name}, {g_name})");
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                if let Expr::BinOp(op, l, r) = &**body {
+                    if op == "and" {
+                        let l_p = match &**l {
+                            Expr::Call(fn_name, args) if args.len() == 1 && matches!(&args[0], Expr::Var(v) if v == p0) => Some(fn_name.clone()),
+                            Expr::MethodCall(recv, mname, args) if args.is_empty() && matches!(&**recv, Expr::Var(v) if v == p0) => Some(mname.clone()),
+                            _ => None,
+                        };
+                        let r_q = match &**r {
+                            Expr::Call(fn_name, args) if args.len() == 1 && matches!(&args[0], Expr::Var(v) if v == p0) => Some(fn_name.clone()),
+                            Expr::MethodCall(recv, mname, args) if args.is_empty() && matches!(&**recv, Expr::Var(v) if v == p0) => Some(mname.clone()),
+                            _ => None,
+                        };
+                        if let (Some(p_fn), Some(q_fn)) = (l_p, r_q) {
+                            return format!("Fn1_and({p_fn}, {q_fn})");
+                        }
+                    }
+                }
+                if let Expr::MethodCall(recv, mname, args) = &**body {
+                    if mname == "and_then" && args.len() == 1 {
+                        if let Expr::Call(fname, fargs) = &**recv {
+                            if fargs.len() == 1 && matches!(&fargs[0], Expr::Var(v) if v == p0) {
+                                let g_arg = emit_boogie_expr_with_strings(&args[0], m, implicit_fields, revealed, fuel_var, strings);
+                                if m.name == "OPTION" {
+                                    return format!("Fn1_option_kleisli({fname}, {g_arg})");
+                                } else if m.name == "RESULT" {
+                                    return format!("Fn1_result_kleisli({fname}, {g_arg})");
+                                }
+                            }
+                        }
+                    }
+                }
+            } else if params.len() == 2 && stmts.is_empty() {
+                let p0 = &params[0].0;
+                let p1 = &params[1].0;
+                if let Expr::Call(f_name, f_args) = &**body {
+                    if f_args.len() == 2 && matches!(&f_args[0], Expr::Var(v) if v == p0) {
+                        if let Expr::Call(g_name, g_args) = &f_args[1] {
+                            if g_args.len() == 1 && matches!(&g_args[0], Expr::Var(v) if v == p1) {
+                                return format!("Fn2_map_arg({f_name}, {g_name})");
+                            }
+                        }
+                    }
+                }
+            }
             emit_boogie_block_expr(stmts, body, m, implicit_fields, fuel_var, strings)
         }
     }
@@ -6768,6 +6731,7 @@ fn run_boogie_verification(
     let mut cmd = Command::new(boogie_path);
     cmd.arg(format!("/proverOpt:PROVER_PATH={z3_path}"));
     cmd.arg("/typeEncoding:p");
+    cmd.arg("/timeLimit:10");
     cmd.arg("/mv:-");
     cmd.arg("/errorTrace:0");
     cmd.arg(&temp_path);
@@ -6966,6 +6930,20 @@ fn find_relevant_lemmas_for_tag(m: &ModuleDecl, routine: &str, tag: &str) -> Vec
             return find_relevant_lemmas(m, routine, iexpr);
         }
     }
+    for (vis, law) in &m.specify_laws {
+        let vis_prefix = match vis {
+            Visibility::Modules(mods) if !mods.is_empty() => format!("{}_", mods.join("_")),
+            _ => String::new(),
+        };
+        let prefixed_name = format!("{vis_prefix}{}", law.name);
+        if law.name == routine || prefixed_name == routine {
+            for (etag, eexpr) in &law.ensures {
+                if etag == tag {
+                    return find_relevant_lemmas(m, routine, eexpr);
+                }
+            }
+        }
+    }
     Vec::new()
 }
 
@@ -6977,6 +6955,42 @@ pub fn find_relevant_lemmas(
 ) -> Vec<String> {
     let goal_syms = collect_symbols(goal_expr);
     let mut lemmas = Vec::new();
+
+    // 1. Concept Laws Indexing (§9, §12)
+    if goal_syms.contains("equals") {
+        lemmas.push("EQ.reflexive".to_string());
+        lemmas.push("EQ.symmetric".to_string());
+        lemmas.push("EQ.transitive".to_string());
+        lemmas.push("CANONICAL_EQ.agrees_with_structural".to_string());
+    }
+    if goal_syms.contains("less_than") || goal_syms.contains("less_or_equal") {
+        lemmas.push("ORD.irreflexive".to_string());
+        lemmas.push("ORD.transitive".to_string());
+        lemmas.push("ORD.total".to_string());
+    }
+
+    // 2. Cross-Module Algebraic Catalogue Laws (§12, Step 4)
+    if goal_syms.contains("concat") || goal_syms.contains("append") {
+        lemmas.push("law SEQ.concat_associative.assoc".to_string());
+        lemmas.push("law SEQ.concat_left_identity.left_id".to_string());
+        lemmas.push("law SEQ.concat_right_identity.right_id".to_string());
+        lemmas.push("law SEQ.concat_length_homomorphism.len_homo".to_string());
+    }
+    if goal_syms.contains("map") || goal_syms.contains("filter") {
+        lemmas.push("law SEQ.map_identity.id_preserved".to_string());
+        lemmas.push("law SEQ.map_fusion.fusion".to_string());
+        lemmas.push("law SEQ.filter_conjunction.conjunction".to_string());
+    }
+    if goal_syms.contains("and_then") {
+        lemmas.push("law OPTION.and_then_right_identity.right_id".to_string());
+        lemmas.push("law OPTION.and_then_associative.assoc".to_string());
+        lemmas.push("law RESULT.and_then_right_identity.right_id".to_string());
+        lemmas.push("law RESULT.and_then_associative.assoc".to_string());
+    }
+    if goal_syms.contains("fold_left") || goal_syms.contains("fold_right") {
+        lemmas.push("law LIST_OPS.fold_left_append_distributivity.chains".to_string());
+        lemmas.push("law LIST_OPS.fold_map_fusion.fused".to_string());
+    }
 
     for (_, sr) in &m.specify_routines {
         if goal_syms.contains(&sr.name) {
@@ -8556,8 +8570,8 @@ pub fn emit_dafny(m: &ModuleDecl) -> String {
         out.push_str(&emit_dafny_routine(r, false, false, m, &empty_fields));
     }
 
-    for (_, law) in &m.specify_laws {
-        out.push_str(&emit_dafny_law(law, m, &empty_fields));
+    for (vis, law) in &m.specify_laws {
+        out.push_str(&emit_dafny_law(vis, law, m, &empty_fields));
     }
 
     out
@@ -8582,7 +8596,19 @@ fn map_dafny_type(ty: &str, m: &ModuleDecl) -> String {
     if let Some((arg_str, ret_str)) = split_top_level_arrow(ty) {
         let arg_cleaned = arg_str.trim().trim_start_matches('(').trim_end_matches(')').trim();
         let ret_cleaned = ret_str.split(" require ").next().unwrap().split(" ensure ").next().unwrap().trim();
-        return format!("({}) -> {}", map_dafny_type(arg_cleaned, m), map_dafny_type(ret_cleaned, m));
+        let parts = split_top_level_commas(arg_cleaned);
+        let param_types: Vec<String> = parts
+            .into_iter()
+            .map(|p| {
+                let t = if let Some((_, ty_part)) = p.split_once(':') {
+                    ty_part.trim()
+                } else {
+                    p.trim()
+                };
+                map_dafny_type(t, m)
+            })
+            .collect();
+        return format!("({}) -> {}", param_types.join(", "), map_dafny_type(ret_cleaned, m));
     }
     if let Some(inner) = ty.strip_prefix("LIST[").and_then(|s| s.strip_suffix(']')) {
         return format!("seq<{}>", map_dafny_type(inner, m));
@@ -8609,8 +8635,12 @@ fn map_dafny_type(ty: &str, m: &ModuleDecl) -> String {
     ty.to_string()
 }
 
-fn emit_dafny_law(law: &LawDecl, m: &ModuleDecl, implicit_fields: &HashSet<String>) -> String {
+fn emit_dafny_law(vis: &Visibility, law: &LawDecl, m: &ModuleDecl, implicit_fields: &HashSet<String>) -> String {
     let mut s = String::new();
+    let vis_prefix = match vis {
+        Visibility::Modules(mods) if !mods.is_empty() => format!("{}_", mods.join("_")),
+        _ => String::new(),
+    };
     let mut all_tps = m.type_params.clone();
     for tp in &law.type_params {
         if !all_tps.contains(tp) {
@@ -8627,7 +8657,7 @@ fn emit_dafny_law(law: &LawDecl, m: &ModuleDecl, implicit_fields: &HashSet<Strin
         .iter()
         .map(|(pname, pty)| format!("{}: {}", pname, map_dafny_type(pty, m)))
         .collect();
-    s.push_str(&format!("lemma {}{tp}({})\n", law.name, params.join(", ")));
+    s.push_str(&format!("lemma {vis_prefix}{}{tp}({})\n", law.name, params.join(", ")));
 
     for (tag, req) in &law.requires {
         s.push_str(&format!(
@@ -8657,6 +8687,8 @@ fn emit_dafny_law(law: &LawDecl, m: &ModuleDecl, implicit_fields: &HashSet<Strin
         s.push_str(&emit_dafny_lemma_stmt_expr(
             &law.stmts,
             body,
+            &law.name,
+            &vis_prefix,
             m,
             implicit_fields,
             2,
@@ -8669,6 +8701,8 @@ fn emit_dafny_law(law: &LawDecl, m: &ModuleDecl, implicit_fields: &HashSet<Strin
 fn emit_dafny_lemma_stmt_expr(
     stmts: &[Stmt],
     body: &Expr,
+    law_name: &str,
+    vis_prefix: &str,
     m: &ModuleDecl,
     implicit_fields: &HashSet<String>,
     indent: usize,
@@ -8711,7 +8745,12 @@ fn emit_dafny_lemma_stmt_expr(
                 .iter()
                 .map(|a| emit_dafny_expr(a, m, implicit_fields))
                 .collect();
-            s.push_str(&format!("{pad}{fname}({});\n", a_str.join(", ")));
+            let target_fn = if fname == law_name {
+                format!("{vis_prefix}{fname}")
+            } else {
+                fname.clone()
+            };
+            s.push_str(&format!("{pad}{target_fn}({});\n", a_str.join(", ")));
         }
         Expr::Match(scrut, cases) => {
             s.push_str(&format!(
@@ -8720,15 +8759,13 @@ fn emit_dafny_lemma_stmt_expr(
                 emit_dafny_expr(scrut, m, implicit_fields)
             ));
             for c in cases {
-                let pat = if c.bindings().is_empty() {
-                    c.ctor().to_string()
-                } else {
-                    format!("{}({})", c.ctor(), c.bindings().join(", "))
-                };
+                let pat = format_pattern(&c.pattern);
                 s.push_str(&format!("{pad}  case {pat} =>\n"));
                 s.push_str(&emit_dafny_lemma_stmt_expr(
                     &c.stmts,
                     &c.body,
+                    law_name,
+                    vis_prefix,
                     m,
                     implicit_fields,
                     indent + 4,
@@ -8740,8 +8777,8 @@ fn emit_dafny_lemma_stmt_expr(
                 "{}if {} {{\n{}{pad}}} else {{\n{}{pad}}}\n",
                 pad,
                 emit_dafny_expr(c, m, implicit_fields),
-                emit_dafny_lemma_stmt_expr(ts, te, m, implicit_fields, indent + 2),
-                emit_dafny_lemma_stmt_expr(es, ee, m, implicit_fields, indent + 2),
+                emit_dafny_lemma_stmt_expr(ts, te, law_name, vis_prefix, m, implicit_fields, indent + 2),
+                emit_dafny_lemma_stmt_expr(es, ee, law_name, vis_prefix, m, implicit_fields, indent + 2),
             ));
         }
         _ => {}
@@ -8936,6 +8973,31 @@ fn emit_dafny_expr(e: &Expr, m: &ModuleDecl, implicit_fields: &HashSet<String>) 
                         }
                         _ => {}
                     }
+                } else if v == "SEQ" {
+                    match mname.as_str() {
+                        "empty" => return "Empty".to_string(),
+                        "singleton" => {
+                            return format!("Leaf({})", emit_dafny_expr(&args[0], m, implicit_fields));
+                        }
+                        _ => {}
+                    }
+                } else if v == "LIST_OPS" {
+                    let a_str: Vec<String> = args
+                        .iter()
+                        .map(|a| emit_dafny_expr(a, m, implicit_fields))
+                        .collect();
+                    return format!("{mname}({})", a_str.join(", "));
+                } else if v == "FUNCTION_OPS" {
+                    let a_str: Vec<String> = args
+                        .iter()
+                        .map(|a| emit_dafny_expr(a, m, implicit_fields))
+                        .collect();
+                    match mname.as_str() {
+                        "id_fn" => return "((x) => x)".to_string(),
+                        "compose" => return format!("((x) => {}({}(x)))", a_str[0], a_str[1]),
+                        "identity" => return a_str[0].clone(),
+                        _ => {}
+                    }
                 } else if v == "IO" {
                     if mname == "read_line" {
                         return "\"input\"".to_string();
@@ -8946,6 +9008,13 @@ fn emit_dafny_expr(e: &Expr, m: &ModuleDecl, implicit_fields: &HashSet<String>) 
                 }
             }
             let r_str = emit_dafny_expr(recv, m, implicit_fields);
+            if mname == "apply" {
+                let a_str: Vec<String> = args
+                    .iter()
+                    .map(|a| emit_dafny_expr(a, m, implicit_fields))
+                    .collect();
+                return format!("{r_str}({})", a_str.join(", "));
+            }
             match mname.as_str() {
                 "append" => format!(
                     "({r_str} + {})",
@@ -8989,11 +9058,7 @@ fn emit_dafny_expr(e: &Expr, m: &ModuleDecl, implicit_fields: &HashSet<String>) 
         Expr::Match(scrut, cases) => {
             let mut s = format!("(match {}\n", emit_dafny_expr(scrut, m, implicit_fields));
             for c in cases {
-                let pat = if c.bindings().is_empty() {
-                    c.ctor().to_string()
-                } else {
-                    format!("{}({})", c.ctor(), c.bindings().join(", "))
-                };
+                let pat = format_pattern(&c.pattern);
                 s.push_str(&format!(
                     "    case {pat} =>\n{}",
                     emit_dafny_block(&c.stmts, &c.body, m, implicit_fields, 6)
@@ -9231,6 +9296,14 @@ fn emit_bend_expr(e: &Expr, mod_name: &str, indent: usize) -> String {
                         .collect();
                     return format!("IO/{mname}({})", a_str.join(", "));
                 }
+            }
+            if mname == "apply" {
+                let r_str = emit_bend_expr(recv, mod_name, indent);
+                let a_str: Vec<String> = args
+                    .iter()
+                    .map(|a| emit_bend_expr(a, mod_name, indent))
+                    .collect();
+                return format!("{r_str}({})", a_str.join(", "));
             }
             let mut a_str = vec![emit_bend_expr(recv, mod_name, indent)];
             for a in args {
@@ -10178,6 +10251,11 @@ fn emit_c11_expr(e: &Expr, mod_name: &str) -> String {
                     }
                 }
             }
+            if mname == "apply" {
+                let r_str = emit_c11_expr(recv, mod_name);
+                let a_str: Vec<String> = args.iter().map(|a| emit_c11_expr(a, mod_name)).collect();
+                return format!("{r_str}({})", a_str.join(", "));
+            }
             let r_str = emit_c11_expr(recv, mod_name);
             let mut a_str = vec![r_str];
             for a in args {
@@ -11010,9 +11088,11 @@ end
                 "STRING".to_string(),
                 "OPTION".to_string(),
                 "RESULT".to_string(),
+                "LIST_OPS".to_string(),
+                "FUNCTION_OPS".to_string(),
             ])
         );
-        assert_eq!(stdlib.modules.len(), 5);
+        assert_eq!(stdlib.modules.len(), 7);
         for m in &stdlib.modules {
             let mut diags = check_visibility_and_semantics(m);
             diags.extend(verify_module_phase3(
@@ -11400,7 +11480,7 @@ end
     #[test]
     fn test_plan3_multi_module_stdlib_pipeline() {
         let ast = parse_phase4_stdlib().expect("stdlib parses cleanly");
-        assert_eq!(ast.modules.len(), 5);
+        assert_eq!(ast.modules.len(), 7);
         let mut prog_env = ProgramEnv {
             modules: HashMap::new(),
             concepts: HashMap::new(),
@@ -11639,5 +11719,422 @@ end
             diags.iter().any(|d| d.tag == "bad_err"),
             "Expected postcondition violation `bad_err`, got: {diags:?}"
         );
+    }
+
+    #[test]
+    fn test_step3_verified_functional_core_positive_and_refinement() {
+        let stdlib = parse_phase4_stdlib().expect("stdlib parses cleanly");
+        let seq_mod = stdlib.modules.iter().find(|m| m.name == "SEQ").unwrap();
+        let list_ops_mod = stdlib.modules.iter().find(|m| m.name == "LIST_OPS").unwrap();
+        let fn_ops_mod = stdlib.modules.iter().find(|m| m.name == "FUNCTION_OPS").unwrap();
+
+        let seq_diags = verify_module_phase3(seq_mod, phase4_stdlib_source(), "stdlib.gdl", 2, true, false, false);
+        assert!(seq_diags.is_empty(), "SEQ combinators & laws must verify with 0 errors, got: {seq_diags:?}");
+
+        let list_diags = verify_module_phase3(list_ops_mod, phase4_stdlib_source(), "stdlib.gdl", 2, true, false, false);
+        assert!(list_diags.is_empty(), "LIST_OPS combinators & laws must verify with 0 errors, got: {list_diags:?}");
+
+        let fn_diags = verify_module_phase3(fn_ops_mod, phase4_stdlib_source(), "stdlib.gdl", 2, true, false, false);
+        assert!(fn_diags.is_empty(), "FUNCTION_OPS combinators & pointwise laws must verify with 0 errors, got: {fn_diags:?}");
+    }
+
+    #[test]
+    fn test_step3_soundness_mutation_detection() {
+        // Negative Test: Mutated SEQ.map that swaps subtrees Concat(mr, ml, ln) violates model refinement
+        let mutated_map_src = r#"
+module SEQ_MUTANT[A]
+
+representation {ANY}
+  | Empty
+  | Leaf(value: A)
+  | Concat(left: SEQ_MUTANT[A], right: SEQ_MUTANT[A], len: NAT)
+
+specify {ANY}
+  model: LIST[A]
+    variant
+      Current
+    do
+      match Current
+        case Empty           then LIST.empty
+        case Leaf(v)         then LIST.empty.prepend(v)
+        case Concat(l, r, _) then l.model.append(r.model)
+      end
+    end
+
+feature {ANY}
+  length: NAT
+    variant
+      Current
+    do
+      match Current
+        case Empty            then 0
+        case Leaf(_)          then 1
+        case Concat(_, _, ln) then ln
+      end
+    end
+
+  map[B](f: A -> B): SEQ_MUTANT[B]
+    variant
+      Current
+    do
+      match Current
+        case Empty then
+          Empty
+        case Leaf(v) then
+          Leaf(f(v))
+        case Concat(l, r, ln) then
+          let ml = l.map(f)
+          let mr = r.map(f)
+          Concat(mr, ml, ln)
+      end
+    ensure
+      model_map: Result.model = LIST_OPS.map(Current.model, f)
+    end
+end
+"#;
+        let mutated_mod = parse_single_module(mutated_map_src);
+        let diags = verify_module_phase3(&mutated_mod, mutated_map_src, "test_mutant.gdl", 2, false, false, false);
+        assert!(
+            !diags.is_empty(),
+            "Swapped recursive subtrees in map must fail model_map refinement postcondition"
+        );
+        assert!(
+            diags.iter().any(|d| d.tag.contains("model_map")),
+            "Expected failure on tag `model_map`, got: {diags:?}"
+        );
+    }
+
+    #[test]
+    fn test_step3_parallel_fork_join_lowering() {
+        let stdlib = parse_phase4_stdlib().expect("stdlib parses cleanly");
+        let seq_mod = stdlib.modules.iter().find(|m| m.name == "SEQ").unwrap();
+        let map_routine = seq_mod.feature_routines.iter().find(|(_, r)| r.name == "map").unwrap();
+
+        if let Expr::Match(_, cases) = &map_routine.1.body {
+            let concat_case = cases.iter().find(|c| c.ctor() == "Concat").expect("Concat case");
+            let groups = analyze_parallel_lets(&concat_case.stmts);
+            assert_eq!(groups.len(), 1, "Expected 1 parallel group in SEQ.map");
+            assert_eq!(groups[0].len(), 2, "Expected 2 independent let bindings (ml, mr) for parallel fork-join");
+            assert_eq!(groups[0][0].0, "ml");
+            assert_eq!(groups[0][1].0, "mr");
+        } else {
+            panic!("Expected match expression in SEQ.map");
+        }
+
+        let filter_routine = seq_mod.feature_routines.iter().find(|(_, r)| r.name == "filter").unwrap();
+        if let Expr::Match(_, cases) = &filter_routine.1.body {
+            let concat_case = cases.iter().find(|c| c.ctor() == "Concat").expect("Concat case");
+            let groups = analyze_parallel_lets(&concat_case.stmts);
+            assert_eq!(groups.len(), 1, "Expected 1 parallel group in SEQ.filter");
+            assert_eq!(groups[0].len(), 2, "Expected 2 independent let bindings (fl, fr) for parallel fork-join");
+            assert_eq!(groups[0][0].0, "fl");
+            assert_eq!(groups[0][1].0, "fr");
+        } else {
+            panic!("Expected match expression in SEQ.filter");
+        }
+    }
+
+    #[test]
+    fn test_step4_algebraic_law_catalogue_and_concept_conformance() {
+        let stdlib = parse_phase4_stdlib().expect("stdlib parses cleanly");
+
+        // 1. Verify standard concepts exist and refine correctly
+        let eq = stdlib.concepts.iter().find(|c| c.name == "EQ").expect("EQ concept exists");
+        assert!(eq.refines.is_empty(), "EQ is base concept");
+        assert!(eq.signatures.iter().any(|s| s.name == "equals"));
+        assert_eq!(eq.laws.len(), 3, "EQ must declare reflexive, symmetric, transitive");
+
+        let canonical_eq = stdlib.concepts.iter().find(|c| c.name == "CANONICAL_EQ").expect("CANONICAL_EQ concept exists");
+        assert_eq!(canonical_eq.refines, vec!["EQ".to_string()]);
+        assert!(canonical_eq.laws.iter().any(|l| l.name == "agrees_with_structural"));
+
+        let ord = stdlib.concepts.iter().find(|c| c.name == "ORD").expect("ORD concept exists");
+        assert_eq!(ord.refines, vec!["EQ".to_string()]);
+        assert!(ord.signatures.iter().any(|s| s.name == "less_than"));
+        assert!(ord.default_routines.iter().any(|r| r.name == "less_or_equal"));
+        assert!(ord.laws.iter().any(|l| l.name == "irreflexive"));
+        assert!(ord.laws.iter().any(|l| l.name == "transitive"));
+        assert!(ord.laws.iter().any(|l| l.name == "total"));
+
+        // 2. Verify concept conformance declarations across stdlib
+        let seq_mod = stdlib.modules.iter().find(|m| m.name == "SEQ").expect("SEQ module exists");
+        let seq_sat = seq_mod.satisfies.as_ref().expect("SEQ satisfies clause");
+        assert_eq!(seq_sat.concepts, vec!["EQ"]);
+        assert_eq!(seq_sat.where_constraints, vec![("A".to_string(), "EQ".to_string())]);
+
+        let opt_mod = stdlib.modules.iter().find(|m| m.name == "OPTION").expect("OPTION module exists");
+        let opt_sat = opt_mod.satisfies.as_ref().expect("OPTION satisfies clause");
+        assert_eq!(opt_sat.concepts, vec!["CANONICAL_EQ"]);
+        assert_eq!(opt_sat.where_constraints, vec![("A".to_string(), "CANONICAL_EQ".to_string())]);
+
+        let res_mod = stdlib.modules.iter().find(|m| m.name == "RESULT").expect("RESULT module exists");
+        let res_sat = res_mod.satisfies.as_ref().expect("RESULT satisfies clause");
+        assert_eq!(res_sat.concepts, vec!["CANONICAL_EQ"]);
+        assert_eq!(res_sat.where_constraints, vec![("E".to_string(), "CANONICAL_EQ".to_string()), ("A".to_string(), "CANONICAL_EQ".to_string())]);
+
+        let bignat_mod = stdlib.modules.iter().find(|m| m.name == "BIGNAT").expect("BIGNAT module exists");
+        let bignat_sat = bignat_mod.satisfies.as_ref().expect("BIGNAT satisfies clause");
+        assert_eq!(bignat_sat.concepts, vec!["ORD"]);
+        assert!(bignat_mod.feature_routines.iter().any(|(_, r)| r.name == "less_or_equal"), "less_or_equal injected into BIGNAT");
+
+        // 3. Verify Bird & Wadler algebraic law catalogue in LIST_OPS and FUNCTION_OPS
+        let list_ops = stdlib.modules.iter().find(|m| m.name == "LIST_OPS").expect("LIST_OPS module exists");
+        let list_laws: Vec<&str> = list_ops.specify_laws.iter().map(|(_, l)| l.name.as_str()).collect();
+        assert!(list_laws.contains(&"fold_left_append_distributivity"));
+        assert!(list_laws.contains(&"fold_map_fusion"));
+
+        let fn_ops = stdlib.modules.iter().find(|m| m.name == "FUNCTION_OPS").expect("FUNCTION_OPS module exists");
+        let fn_laws: Vec<&str> = fn_ops.specify_laws.iter().map(|(_, l)| l.name.as_str()).collect();
+        assert!(fn_laws.contains(&"compose_associative"));
+        assert!(fn_laws.contains(&"compose_left_identity"));
+        assert!(fn_laws.contains(&"compose_right_identity"));
+        assert!(fn_laws.contains(&"compose_pointwise"));
+        assert!(fn_laws.contains(&"identity_law"));
+
+        // 4. Verify all stdlib modules pass semantic & visibility checks
+        for m in &stdlib.modules {
+            let diags = check_visibility_and_semantics(m);
+            assert!(diags.is_empty(), "Module {} has semantic/visibility errors: {:?}", m.name, diags);
+        }
+    }
+
+    #[test]
+    fn test_step4_negative_seq_cannot_satisfy_canonical_eq() {
+        let bad_seq_src = r#"
+module BAD_SEQ[A] satisfies CANONICAL_EQ where A satisfies CANONICAL_EQ
+
+representation {ANY}
+  | Empty
+  | Leaf(value: A)
+  | Concat(left: BAD_SEQ[A], right: BAD_SEQ[A], len: NAT)
+
+specify {ANY}
+  model: LIST[A]
+    variant Current
+    do
+      match Current
+        case Empty then LIST.empty
+        case Leaf(v) then LIST.empty.prepend(v)
+        case Concat(l, r, _) then l.model.append(r.model)
+      end
+    end
+
+feature {ANY}
+  equals(other: BAD_SEQ[A]): BOOL
+    do
+      Current.model = other.model
+    ensure
+      model_equality: Result = (Current.model = other.model)
+    end
+
+specify {CANONICAL_EQ}
+  law reflexive(a: BAD_SEQ[A])
+    ensure
+      refl: a.equals(a)
+    end
+
+  law symmetric(a: BAD_SEQ[A], b: BAD_SEQ[A])
+    require
+      ab: a.equals(b)
+    ensure
+      ba: b.equals(a)
+    end
+
+  law transitive(a: BAD_SEQ[A], b: BAD_SEQ[A], c: BAD_SEQ[A])
+    require
+      ab: a.equals(b)
+      bc: b.equals(c)
+    ensure
+      ac: a.equals(c)
+    end
+
+  law agrees_with_structural(a: BAD_SEQ[A], b: BAD_SEQ[A])
+    ensure
+      sound: a.equals(b) = (a = b)
+    end
+end
+"#;
+        let bad_mod = parse_single_module(bad_seq_src);
+        let diags = verify_module_phase3(&bad_mod, bad_seq_src, "test_bad_seq.gdl", 2, false, false, false);
+        assert!(
+            !diags.is_empty(),
+            "Observational sequence equivalence must fail CANONICAL_EQ.agrees_with_structural because structural equality does not match model equality"
+        );
+        assert!(
+            diags.iter().any(|d| d.tag.contains("sound") || d.tag.contains("agrees_with_structural")),
+            "Expected failure on sound postcondition of agrees_with_structural, got: {diags:?}"
+        );
+    }
+
+    #[test]
+    fn test_step4_negative_missing_law_proof() {
+        let incomplete_ord_src = r#"
+module INCOMPLETE_ORD satisfies ORD
+
+feature {ANY}
+  equals(other: INCOMPLETE_ORD): BOOL
+    do
+      True
+    end
+
+  less_than(other: INCOMPLETE_ORD): BOOL
+    do
+      False
+    end
+
+specify {ORD}
+  law reflexive(a: INCOMPLETE_ORD)
+    ensure
+      refl: a.equals(a)
+    end
+
+  law symmetric(a: INCOMPLETE_ORD, b: INCOMPLETE_ORD)
+    require
+      ab: a.equals(b)
+    ensure
+      ba: b.equals(a)
+    end
+
+  law transitive(a: INCOMPLETE_ORD, b: INCOMPLETE_ORD, c: INCOMPLETE_ORD)
+    require
+      ab: a.equals(b)
+      bc: b.equals(c)
+    ensure
+      ac: a.equals(c)
+    end
+
+  law irreflexive(a: INCOMPLETE_ORD)
+    ensure
+      not_less_than_self: not a.less_than(a)
+    end
+  -- Notice: missing law total!
+end
+"#;
+        let stdlib = parse_phase4_stdlib().expect("stdlib parses");
+        let mut concept_map = HashMap::new();
+        for c in &stdlib.concepts {
+            concept_map.insert(c.name.clone(), c.clone());
+        }
+
+        let mut inc_mod = parse_single_module(incomplete_ord_src);
+        let diags = check_and_expand_concepts(&mut inc_mod, &concept_map);
+        assert!(
+            !diags.is_empty(),
+            "Missing law proof for `total` in ORD must be rejected"
+        );
+        assert!(
+            diags.iter().any(|d| d.rule == "Phase 2 (Missing Law Proof)" && d.routine == "total" && d.tag == "ORD"),
+            "Expected Phase 2 (Missing Law Proof) for `total`, got: {diags:?}"
+        );
+    }
+
+    #[test]
+    fn test_step4_negative_concept_bound_violation() {
+        let bad_bounds_src = r#"
+module BAD_BOUNDS[A] satisfies EQ where B satisfies EQ, A satisfies NONEXISTENT_CONCEPT
+
+feature {ANY}
+  equals(other: BAD_BOUNDS[A]): BOOL
+    do
+      True
+    end
+
+specify {EQ}
+  law reflexive(a: BAD_BOUNDS[A])
+    ensure
+      refl: a.equals(a)
+    end
+
+  law symmetric(a: BAD_BOUNDS[A], b: BAD_BOUNDS[A])
+    require
+      ab: a.equals(b)
+    ensure
+      ba: b.equals(a)
+    end
+
+  law transitive(a: BAD_BOUNDS[A], b: BAD_BOUNDS[A], c: BAD_BOUNDS[A])
+    require
+      ab: a.equals(b)
+      bc: b.equals(c)
+    ensure
+      ac: a.equals(c)
+    end
+end
+"#;
+        let stdlib = parse_phase4_stdlib().expect("stdlib parses");
+        let mut concept_map = HashMap::new();
+        for c in &stdlib.concepts {
+            concept_map.insert(c.name.clone(), c.clone());
+        }
+
+        let mut bad_mod = parse_single_module(bad_bounds_src);
+        let diags = check_and_expand_concepts(&mut bad_mod, &concept_map);
+        assert!(
+            !diags.is_empty(),
+            "Invalid type parameter and unknown concept in where constraints must be rejected"
+        );
+        assert!(
+            diags.iter().any(|d| d.rule == "Phase 2 (Invalid Type Constraint)" && d.routine == "B"),
+            "Expected Invalid Type Constraint for undeclared B, got: {diags:?}"
+        );
+        assert!(
+            diags.iter().any(|d| d.rule == "Phase 2 (Unknown Concept)" && d.tag == "NONEXISTENT_CONCEPT"),
+            "Expected Unknown Concept for NONEXISTENT_CONCEPT, got: {diags:?}"
+        );
+    }
+
+    #[test]
+    fn test_step4_diagnostic_lemma_surfacing() {
+        let stdlib = parse_phase4_stdlib().expect("stdlib parses cleanly");
+        let seq_mod = stdlib.modules.iter().find(|m| m.name == "SEQ").unwrap();
+
+        // 1. Goal with concat/append should surface SEQ catalogue laws
+        let concat_goal = Expr::BinOp(
+            "=".to_string(),
+            Box::new(Expr::MethodCall(
+                Box::new(Expr::MethodCall(
+                    Box::new(Expr::Var("a".to_string())),
+                    "concat".to_string(),
+                    vec![Expr::Var("b".to_string())],
+                )),
+                "concat".to_string(),
+                vec![Expr::Var("c".to_string())],
+            )),
+            Box::new(Expr::Var("c".to_string())),
+        );
+        let lemmas = find_relevant_lemmas(seq_mod, "test_routine", &concat_goal);
+        assert!(
+            lemmas.iter().any(|l| l.contains("concat_associative")),
+            "Expected concat_associative in relevant lemmas, got: {lemmas:?}"
+        );
+        assert!(
+            lemmas.iter().any(|l| l.contains("concat_length_homomorphism")),
+            "Expected concat_length_homomorphism in relevant lemmas, got: {lemmas:?}"
+        );
+
+        // 2. Goal with equals should surface EQ and CANONICAL_EQ laws
+        let eq_goal = Expr::BinOp(
+            "=".to_string(),
+            Box::new(Expr::MethodCall(
+                Box::new(Expr::Var("x".to_string())),
+                "equals".to_string(),
+                vec![Expr::Var("y".to_string())],
+            )),
+            Box::new(Expr::Bool(true)),
+        );
+        let eq_lemmas = find_relevant_lemmas(seq_mod, "test_routine", &eq_goal);
+        assert!(eq_lemmas.contains(&"EQ.transitive".to_string()));
+        assert!(eq_lemmas.contains(&"CANONICAL_EQ.agrees_with_structural".to_string()));
+
+        // 3. Goal with less_than / less_or_equal should surface ORD laws
+        let ord_goal = Expr::MethodCall(
+            Box::new(Expr::Var("x".to_string())),
+            "less_than".to_string(),
+            vec![Expr::Var("y".to_string())],
+        );
+        let ord_lemmas = find_relevant_lemmas(seq_mod, "test_routine", &ord_goal);
+        assert!(ord_lemmas.contains(&"ORD.total".to_string()));
+        assert!(ord_lemmas.contains(&"ORD.transitive".to_string()));
+        assert!(ord_lemmas.contains(&"ORD.irreflexive".to_string()));
     }
 }

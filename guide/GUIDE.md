@@ -15,6 +15,7 @@ This guide is written for two audiences:
   - [The Core Invariant: Total Purity and Determinism](#the-core-invariant-total-purity-and-determinism)
   - [Contracts as Static Proofs, Not Runtime Assertions](#contracts-as-static-proofs-not-runtime-assertions)
 - [2. Getting Started: Hello World](#2-getting-started-hello-world)
+  - [Building from Source](#building-from-source)
   - [Your First Program](#your-first-program)
   - [Running and Checking Code](#running-and-checking-code)
 - [3. Primitives and 64-Bit Numerics](#3-primitives-and-64-bit-numerics)
@@ -124,6 +125,88 @@ In Gardel, **contracts are never executed at runtime**:
 
 ## 2. Getting Started: Hello World
 
+### Building from Source
+
+Before compiling and verifying Gardel programs, you need to build the `gardelc` compiler binary from source. The compiler is written in Rust and has zero external crate dependencies.
+
+#### 1. Prerequisites
+
+- **Rust & Cargo:** Rust toolchain (Rust 2024 edition / 1.85+ recommended). Install via [rustup.rs](https://rustup.rs/):
+  ```bash
+  # Linux / macOS:
+  curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+
+  # Windows:
+  # Download and run rustup-init.exe from https://rustup.rs/
+  ```
+- **C11 Compiler (Optional, for native CPU binaries):** GCC or Clang with OpenMP support (e.g., `gcc -fopenmp`).
+- **Bend / BendRT (Optional, for GPU / parallel interaction nets):** Install Bend v2 via `cargo install bend-lang` if you plan to execute `.bend` files on CUDA or Apple Metal.
+
+#### 2. Compiling the Compiler
+
+Clone the Gardel repository and build the release binary:
+
+```bash
+# Clone the repository
+git clone https://github.com/gardel-lang/gardel.git
+cd gardel
+
+# Build the release binary with Cargo
+cargo build --release --manifest-path gardelc/Cargo.toml
+
+# Or navigate directly into the compiler crate directory:
+cd gardelc
+cargo build --release
+```
+
+#### 3. Running the Test Suite
+
+Confirm that all compiler components (parser, visibility rules, concept laws, Boogie verification conditions, and C11/Bend emitters) pass:
+
+```bash
+cargo test
+# Output: test result: ok. 36 passed; 0 failed
+```
+
+#### 4. Installing `gardelc` to Your PATH
+
+Install the binary directly into your Cargo binary directory (which is usually in your system `PATH`):
+
+```bash
+# From within the gardelc directory:
+cargo install --path .
+
+# Or from the repository root:
+cargo install --path gardelc
+```
+
+Alternatively, copy the compiled binary to a folder in your `PATH`:
+
+```bash
+# Linux / macOS:
+sudo cp target/release/gardelc /usr/local/bin/
+
+# Windows (PowerShell):
+Copy-Item target\release\gardelc.exe "$HOME\.cargo\bin\"
+```
+
+#### 5. Verifying the Installation
+
+Test that `gardelc` is installed and verify the entire built-in Standard Prelude under strict mode:
+
+```bash
+gardelc --stdlib --strict
+```
+
+You should see:
+```text
+[1/6] Parsed 3 concepts ["EQ", "CANONICAL_EQ", "ORD"], ...
+[2/6] Checked §4 Visibility, §9 Concept Laws, §11 IO Boundary & §12 Direct Verification:
+      0 errors, 0 warnings — all visibility, concept laws, IO linearity, overflow, and contract obligations satisfied.
+```
+
+---
+
 ### Your First Program
 
 Programs that interact with the outside world (printing to standard output, reading files) are defined inside a `program` module. The entry point is `main`, which returns an `IO` action:
@@ -149,20 +232,28 @@ end
 The Gardel compiler is `gardelc`:
 
 ```bash
-# Verify all contracts and proofs statically without executing
-gardelc check hello.gdl
+# Verify all contracts, concept laws, and proofs statically (emits C11/Bend/Boogie to build/):
+gardelc hello.gdl
 
-# Compile, verify, and run using the Bend v2 interpreter / BendRT runtime
-gardelc run hello.gdl
+# Strict verification (rejects any unproven 'assume' blocks):
+gardelc hello.gdl --strict
 
-# Compile directly to portable C11
-gardelc emit-c hello.gdl -o hello.c
-gcc -O3 hello.c -o hello
+# Compile, verify, and run immediately:
+gardelc hello.gdl --run
 
-# Compile directly to Bend v2 (for CPU / CUDA / Metal execution)
-gardelc emit-bend hello.gdl -o hello.bend
-bend run-c hello.bend     # Multi-core CPU
-bend run-cu hello.bend    # NVIDIA CUDA GPU
+# Emit structured JSON diagnostics for AI repair loops:
+gardelc hello.gdl --json-diagnostics
+
+# Inspect the public Eiffel-style contract interface of a module (like Eiffel 'short'):
+gardelc --inspect hello.gdl
+
+# Run the emitted C11 binary (in build/):
+gcc -O3 -fopenmp build/hello.c -o hello
+./hello
+
+# Run the emitted Bend v2 file (in build/):
+bend run-c build/hello.bend     # Multi-core CPU
+bend run-cu build/hello.bend    # NVIDIA CUDA GPU
 ```
 
 ---
@@ -849,7 +940,7 @@ Every function generates verification conditions (VCs):
 When verification fails, run `gardelc --json-diagnostics` to receive structured, machine-actionable JSON:
 
 ```bash
-gardelc check stack.gdl --json-diagnostics
+gardelc stack.gdl --json-diagnostics
 ```
 
 ```json
@@ -1134,32 +1225,47 @@ end
 
 ## 16. Compiler CLI Cheatsheet & Grammar Reference
 
+### Building & Installing from Source
+
+```bash
+# Clone the repository
+git clone https://github.com/gardel-lang/gardel.git
+cd gardel/gardelc
+
+# Build release binary and run test suite
+cargo build --release
+cargo test
+
+# Install gardelc to PATH (via Cargo binary directory)
+cargo install --path .
+
+# Verify installation by checking the Standard Prelude
+gardelc --stdlib --strict
+```
+
 ### CLI Commands
 
 ```bash
-# Typecheck and verify all contracts statically
-gardelc check <file.gdl>
+# Verify all contracts, concept laws, and proofs statically (emits C11, Bend, Boogie to build/)
+gardelc <file.gdl>
 
-# Run typechecker with structured JSON diagnostics for AI agents
-gardelc check <file.gdl> --json-diagnostics
+# Run verification with structured JSON diagnostics for AI agents
+gardelc <file.gdl> --json-diagnostics
 
-# Audit all 'assume' blocks in the project
-gardelc --audit
+# Audit all 'assume' blocks in the file or project
+gardelc <file.gdl> --audit
 
 # Reject any 'assume' blocks (strict verification mode)
-gardelc check <file.gdl> --strict
+gardelc <file.gdl> --strict
 
 # Inspect public contract interface of a module (like Eiffel 'short')
 gardelc --inspect <file.gdl>
 
-# Execute program via the Bend v2 interpreter
-gardelc run <file.gdl>
+# Compile, verify, and run immediately via the backend
+gardelc <file.gdl> --run
 
-# Transpile to portable C11
-gardelc emit-c <file.gdl> -o output.c
-
-# Transpile to Bend v2 (for CPU / CUDA / Metal execution)
-gardelc emit-bend <file.gdl> -o output.bend
+# Emit the bundled Standard Prelude files to stdlib/ directory
+gardelc --emit-stdlib
 ```
 
 ### Formal Grammar (EBNF Summary)

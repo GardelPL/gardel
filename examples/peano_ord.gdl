@@ -2,6 +2,30 @@ concept EQ
 
   equals(other: Current): BOOL
 
+  law reflexive(a: Current)
+    ensure
+      refl: a.equals(a)
+    end
+
+  law symmetric(a: Current, b: Current)
+    require
+      ab: a.equals(b)
+    ensure
+      ba: b.equals(a)
+    end
+
+  law transitive(a: Current, b: Current, c: Current)
+    require
+      ab: a.equals(b)
+      bc: b.equals(c)
+    ensure
+      ac: a.equals(c)
+    end
+
+end
+
+concept CANONICAL_EQ refines EQ
+
   law agrees_with_structural(a: Current, b: Current)
     ensure
       sound: a.equals(b) = (a = b)
@@ -17,7 +41,7 @@ concept ORD refines EQ
     do
       Current.less_than(other) or Current.equals(other)
     ensure
-      definition: Result = (Current.less_than(other) or Current = other)
+      definition: Result = (Current.less_than(other) or Current.equals(other))
     end
 
   law irreflexive(a: Current)
@@ -35,12 +59,12 @@ concept ORD refines EQ
 
   law total(a: Current, b: Current)
     ensure
-      comparable: a.less_than(b) or a = b or b.less_than(a)
+      comparable: a.less_than(b) or a.equals(b) or b.less_than(a)
     end
 
 end
 
-module PEANO satisfies ORD
+module PEANO satisfies ORD, CANONICAL_EQ
 
 representation {ANY}
   | Zero
@@ -86,7 +110,62 @@ feature {ANY}
       end
     end
 
-specify {ORD}
+specify {EQ}
+
+  law reflexive(a: PEANO)
+    variant
+      a
+    do
+      match a
+        case Zero then True
+        case Succ(p) then reflexive(p)
+      end
+    ensure
+      refl: a.equals(a)
+    end
+
+  law symmetric(a: PEANO, b: PEANO)
+    require
+      ab: a.equals(b)
+    variant
+      a
+    do
+      match a
+        case Zero then True
+        case Succ(p) then
+          match b
+            case Zero then True
+            case Succ(q) then symmetric(p, q)
+          end
+      end
+    ensure
+      ba: b.equals(a)
+    end
+
+  law transitive(a: PEANO, b: PEANO, c: PEANO)
+    require
+      ab: a.equals(b)
+      bc: b.equals(c)
+    variant
+      a
+    do
+      match a
+        case Zero then True
+        case Succ(p) then
+          match b
+            case Zero then True
+            case Succ(q) then
+              match c
+                case Zero then True
+                case Succ(r) then transitive(p, q, r)
+              end
+          end
+      end
+    ensure
+      ac: a.equals(c)
+    end
+
+specify {CANONICAL_EQ}
 
   law agrees_with_structural(a: PEANO, b: PEANO)
     variant
@@ -103,6 +182,8 @@ specify {ORD}
     ensure
       sound: a.equals(b) = (a = b)
     end
+
+specify {ORD}
 
   law irreflexive(a: PEANO)
     variant
@@ -152,7 +233,7 @@ specify {ORD}
           end
       end
     ensure
-      comparable: a.less_than(b) or a = b or b.less_than(a)
+      comparable: a.less_than(b) or a.equals(b) or b.less_than(a)
     end
 
 end

@@ -1,12 +1,92 @@
-group { SEQ, BIGNAT, STRING, OPTION, RESULT }
+group { SEQ, BIGNAT, STRING, OPTION, RESULT, LIST_OPS, FUNCTION_OPS }
 
-module OPTION[A]
+concept EQ
+
+  equals(other: Current): BOOL
+
+  law reflexive(a: Current)
+    ensure
+      refl: a.equals(a)
+    end
+
+  law symmetric(a: Current, b: Current)
+    require
+      ab: a.equals(b)
+    ensure
+      ba: b.equals(a)
+    end
+
+  law transitive(a: Current, b: Current, c: Current)
+    require
+      ab: a.equals(b)
+      bc: b.equals(c)
+    ensure
+      ac: a.equals(c)
+    end
+
+end
+
+concept CANONICAL_EQ refines EQ
+
+  law agrees_with_structural(a: Current, b: Current)
+    ensure
+      sound: a.equals(b) = (a = b)
+    end
+
+end
+
+concept ORD refines EQ
+
+  less_than(other: Current): BOOL
+
+  less_or_equal(other: Current): BOOL
+    do
+      Current.less_than(other) or Current.equals(other)
+    ensure
+      definition: Result = (Current.less_than(other) or Current.equals(other))
+    end
+
+  law irreflexive(a: Current)
+    ensure
+      not_less_than_self: not a.less_than(a)
+    end
+
+  law transitive(a: Current, b: Current, c: Current)
+    require
+      a_lt_b: a.less_than(b)
+      b_lt_c: b.less_than(c)
+    ensure
+      a_lt_c: a.less_than(c)
+    end
+
+  law total(a: Current, b: Current)
+    ensure
+      comparable: a.less_than(b) or a.equals(b) or b.less_than(a)
+    end
+
+end
+
+module OPTION[A] satisfies CANONICAL_EQ where A satisfies CANONICAL_EQ
 
 representation {ANY}
   | None
   | Some(value: A)
 
 feature {ANY}
+
+  equals(other: OPTION[A]): BOOL
+    do
+      match Current
+        case None then other.is_none
+        case Some(v1) then
+          match other
+            case None then False
+            case Some(v2) then v1 = v2
+          end
+      end
+    ensure
+      sound: Result = (Current = other)
+    end
 
   is_some: BOOL
     do
@@ -74,6 +154,35 @@ feature {ANY}
       some_chains: Current.is_some implies Result = f(Current.get)
     end
 
+specify {CANONICAL_EQ}
+
+  law agrees_with_structural(a: OPTION[A], b: OPTION[A])
+    ensure
+      sound: a.equals(b) = (a = b)
+    end
+
+specify {EQ}
+
+  law reflexive(a: OPTION[A])
+    ensure
+      refl: a.equals(a)
+    end
+
+  law symmetric(a: OPTION[A], b: OPTION[A])
+    require
+      ab: a.equals(b)
+    ensure
+      ba: b.equals(a)
+    end
+
+  law transitive(a: OPTION[A], b: OPTION[A], c: OPTION[A])
+    require
+      ab: a.equals(b)
+      bc: b.equals(c)
+    ensure
+      ac: a.equals(c)
+    end
+
 specify {ANY}
 
   law none_is_not_some(opt: OPTION[A])
@@ -111,9 +220,20 @@ specify {ANY}
       absorbs: None.and_then(f) = None
     end
 
+  law and_then_right_identity(opt: OPTION[A])
+    ensure
+      right_id: opt.and_then(fn(x: A): OPTION[A] do Some(x) end) = opt
+    end
+
+  law and_then_associative[B, C](opt: OPTION[A], f: A -> OPTION[B], g: B -> OPTION[C])
+    ensure
+      assoc: opt.and_then(f).and_then(g) =
+             opt.and_then(fn(x: A): OPTION[C] do f(x).and_then(g) end)
+    end
+
 end
 
-module SEQ[A]
+module SEQ[A] satisfies EQ where A satisfies EQ
 
 representation {ANY}
   | Empty
@@ -153,6 +273,13 @@ create {ANY}
 
 feature {ANY}
 
+  equals(other: SEQ[A]): BOOL
+    do
+      Current.model = other.model
+    ensure
+      model_equality: Result = (Current.model = other.model)
+    end
+
   length: NAT
     variant
       Current
@@ -181,9 +308,179 @@ feature {ANY}
       model_concat: Result.model = Current.model.append(other.model)
     end
 
+  map[B](f: A -> B): SEQ[B]
+    variant
+      Current
+    do
+      match Current
+        case Empty then
+          Empty
+        case Leaf(v) then
+          Leaf(f(v))
+        case Concat(l, r, ln) then
+          let ml = l.map(f)
+          let mr = r.map(f)
+          Concat(ml, mr, ln)
+      end
+    ensure
+      same_length: Result.length = Current.length
+      model_map: Result.model = LIST_OPS.map(Current.model, f)
+    end
+
+  filter(keep: A -> BOOL): SEQ[A]
+    variant
+      Current
+    do
+      match Current
+        case Empty then
+          Empty
+        case Leaf(v) then
+          if keep(v) then
+            Leaf(v)
+          else
+            Empty
+          end
+        case Concat(l, r, _) then
+          let fl = l.filter(keep)
+          let fr = r.filter(keep)
+          Concat(fl, fr, fl.length + fr.length)
+      end
+    ensure
+      not_longer: Result.length <= Current.length
+      model_filter: Result.model = LIST_OPS.filter(Current.model, keep)
+    end
+
+  fold_left[B](f: (acc: B, x: A) -> B, init: B): B
+    variant
+      Current
+    do
+      match Current
+        case Empty then
+          init
+        case Leaf(v) then
+          f(init, v)
+        case Concat(l, r, _) then
+          r.fold_left(f, l.fold_left(f, init))
+      end
+    ensure
+      model_fold_left: Result = LIST_OPS.fold_left(Current.model, f, init)
+    end
+
+  fold_right[B](f: (x: A, acc: B) -> B, init: B): B
+    variant
+      Current
+    do
+      match Current
+        case Empty then
+          init
+        case Leaf(v) then
+          f(v, init)
+        case Concat(l, r, _) then
+          l.fold_right(f, r.fold_right(f, init))
+      end
+    ensure
+      model_fold_right: Result = LIST_OPS.fold_right(Current.model, f, init)
+    end
+
+specify {EQ}
+
+  law reflexive(a: SEQ[A])
+    ensure
+      refl: a.equals(a)
+    end
+
+  law symmetric(a: SEQ[A], b: SEQ[A])
+    require
+      ab: a.equals(b)
+    ensure
+      ba: b.equals(a)
+    end
+
+  law transitive(a: SEQ[A], b: SEQ[A], c: SEQ[A])
+    require
+      ab: a.equals(b)
+      bc: b.equals(c)
+    ensure
+      ac: a.equals(c)
+    end
+
+specify {ANY}
+
+  law empty_is_empty
+    ensure
+      empty_check: SEQ.empty.is_empty
+    end
+
+  law singleton_not_empty(x: A)
+    ensure
+      non_empty: not SEQ.singleton(x).is_empty
+    end
+
+  law map_preserves_empty[B](f: A -> B)
+    ensure
+      empty_mapped: SEQ.empty.map(f).model = LIST.empty
+    end
+
+  law map_singleton_refines[B](x: A, f: A -> B)
+    ensure
+      single_mapped: SEQ.singleton(x).map(f).model = LIST.empty.prepend(f(x))
+    end
+
+  law fold_left_singleton[B](x: A, f: (acc: B, item: A) -> B, init: B)
+    ensure
+      single_folded: SEQ.singleton(x).fold_left(f, init) = f(init, x)
+    end
+
+  law fold_right_singleton[B](x: A, f: (item: A, acc: B) -> B, init: B)
+    ensure
+      single_folded: SEQ.singleton(x).fold_right(f, init) = f(x, init)
+    end
+
+  law concat_associative(a: SEQ[A], b: SEQ[A], c: SEQ[A])
+    require
+      no_overflow_1: a.length <= 18446744073709551615 - b.length
+      no_overflow_2: (a.length + b.length) <= 18446744073709551615 - c.length
+      no_overflow_3: b.length <= 18446744073709551615 - c.length
+      no_overflow_4: a.length <= 18446744073709551615 - (b.length + c.length)
+    ensure
+      assoc: a.concat(b).concat(c).equals(a.concat(b.concat(c)))
+    end
+
+  law concat_left_identity(a: SEQ[A])
+    ensure
+      left_id: SEQ.empty.concat(a).equals(a)
+    end
+
+  law concat_right_identity(a: SEQ[A])
+    ensure
+      right_id: a.concat(SEQ.empty).equals(a)
+    end
+
+  law concat_length_homomorphism(a: SEQ[A], b: SEQ[A])
+    require
+      no_overflow: a.length <= 18446744073709551615 - b.length
+    ensure
+      len_homo: a.concat(b).length = a.length + b.length
+    end
+
+  law map_identity(s: SEQ[A])
+    ensure
+      id_preserved: s.map(FUNCTION_OPS.id_fn).equals(s)
+    end
+
+  law map_fusion[B, C](s: SEQ[A], f: B -> C, g: A -> B)
+    ensure
+      fusion: s.map(g).map(f).equals(s.map(FUNCTION_OPS.compose(f, g)))
+    end
+
+  law filter_conjunction(s: SEQ[A], p: A -> BOOL, q: A -> BOOL)
+    ensure
+      conjunction: s.filter(p).filter(q).equals(s.filter(fn(x: A): BOOL do p(x) and q(x) end))
+    end
+
 end
 
-module BIGNAT
+module BIGNAT satisfies ORD
 
 representation {NONE}
   limbs: LIST[U64]
@@ -232,6 +529,20 @@ create {ANY}
 
 feature {ANY}
 
+  equals(other: BIGNAT): BOOL
+    do
+      Current.model = other.model
+    ensure
+      model_eq: Result = (Current.model = other.model)
+    end
+
+  less_than(other: BIGNAT): BOOL
+    do
+      Current.model < other.model
+    ensure
+      model_lt: Result = (Current.model < other.model)
+    end
+
   limb_count: NAT
     do
       Current.size
@@ -246,6 +557,48 @@ feature {ANY}
     ensure
       limb_added: Result.limb_count = Current.limb_count + 1
       model_updated: Result.model = limb + 18446744073709551616 * Current.model
+    end
+
+specify {EQ}
+
+  law reflexive(a: BIGNAT)
+    ensure
+      refl: a.equals(a)
+    end
+
+  law symmetric(a: BIGNAT, b: BIGNAT)
+    require
+      ab: a.equals(b)
+    ensure
+      ba: b.equals(a)
+    end
+
+  law transitive(a: BIGNAT, b: BIGNAT, c: BIGNAT)
+    require
+      ab: a.equals(b)
+      bc: b.equals(c)
+    ensure
+      ac: a.equals(c)
+    end
+
+specify {ORD}
+
+  law irreflexive(a: BIGNAT)
+    ensure
+      not_less_than_self: not a.less_than(a)
+    end
+
+  law transitive(a: BIGNAT, b: BIGNAT, c: BIGNAT)
+    require
+      a_lt_b: a.less_than(b)
+      b_lt_c: b.less_than(c)
+    ensure
+      a_lt_c: a.less_than(c)
+    end
+
+  law total(a: BIGNAT, b: BIGNAT)
+    ensure
+      comparable: a.less_than(b) or a.equals(b) or b.less_than(a)
     end
 
 invariant
@@ -349,7 +702,7 @@ invariant
 
 end
 
-module RESULT[E, A]
+module RESULT[E, A] satisfies CANONICAL_EQ where E satisfies CANONICAL_EQ, A satisfies CANONICAL_EQ
 
 representation {ANY}
   | Error(err: E)
@@ -374,6 +727,24 @@ create {ANY}
     end
 
 feature {ANY}
+
+  equals(other: RESULT[E, A]): BOOL
+    do
+      match Current
+        case Error(e1) then
+          match other
+            case Error(e2) then e1 = e2
+            case Ok(_)     then False
+          end
+        case Ok(v1) then
+          match other
+            case Error(_)  then False
+            case Ok(v2)    then v1 = v2
+          end
+      end
+    ensure
+      sound: Result = (Current = other)
+    end
 
   is_ok: BOOL
     do
@@ -473,6 +844,35 @@ feature {ANY}
       ok_chains: Current.is_ok implies Result = f(Current.get)
     end
 
+specify {CANONICAL_EQ}
+
+  law agrees_with_structural(a: RESULT[E, A], b: RESULT[E, A])
+    ensure
+      sound: a.equals(b) = (a = b)
+    end
+
+specify {EQ}
+
+  law reflexive(a: RESULT[E, A])
+    ensure
+      refl: a.equals(a)
+    end
+
+  law symmetric(a: RESULT[E, A], b: RESULT[E, A])
+    require
+      ab: a.equals(b)
+    ensure
+      ba: b.equals(a)
+    end
+
+  law transitive(a: RESULT[E, A], b: RESULT[E, A], c: RESULT[E, A])
+    require
+      ab: a.equals(b)
+      bc: b.equals(c)
+    ensure
+      ac: a.equals(c)
+    end
+
 specify {ANY}
 
   law ok_not_error(r: RESULT[E, A])
@@ -508,6 +908,183 @@ specify {ANY}
   law and_then_error[B](e: E, f: A -> RESULT[E, B])
     ensure
       chain_err: Error(e).and_then(f) = Error(e)
+    end
+
+  law and_then_right_identity(res: RESULT[E, A])
+    ensure
+      right_id: res.and_then(fn(x: A): RESULT[E, A] do Ok(x) end) = res
+    end
+
+  law and_then_associative[B, C](res: RESULT[E, A], f: A -> RESULT[E, B], g: B -> RESULT[E, C])
+    ensure
+      assoc: res.and_then(f).and_then(g) =
+             res.and_then(fn(x: A): RESULT[E, C] do f(x).and_then(g) end)
+    end
+
+end
+
+functions LIST_OPS
+
+feature {ANY}
+
+  map[A, B](xs: LIST[A], f: A -> B): LIST[B]
+    variant
+      xs.length
+    do
+      if xs.length = 0 then
+        LIST.empty
+      else
+        LIST_OPS.map(xs.tail, f).prepend(f(xs.head))
+      end
+    ensure
+      same_length: Result.length = xs.length
+      empty_case: xs.length = 0 implies Result = LIST.empty
+      cons_case: xs.length > 0 implies Result = LIST_OPS.map(xs.tail, f).prepend(f(xs.head))
+    end
+
+  filter[A](xs: LIST[A], keep: A -> BOOL): LIST[A]
+    variant
+      xs.length
+    do
+      if xs.length = 0 then
+        LIST.empty
+      else
+        let rest = LIST_OPS.filter(xs.tail, keep)
+        if keep(xs.head) then
+          rest.prepend(xs.head)
+        else
+          rest
+        end
+      end
+    ensure
+      not_longer: Result.length <= xs.length
+      empty_case: xs.length = 0 implies Result = LIST.empty
+    end
+
+  fold_left[A, B](xs: LIST[A], f: (acc: B, x: A) -> B, init: B): B
+    variant
+      xs.length
+    do
+      if xs.length = 0 then
+        init
+      else
+        LIST_OPS.fold_left(xs.tail, f, f(init, xs.head))
+      end
+    ensure
+      empty_case: xs.length = 0 implies Result = init
+      cons_case: xs.length > 0 implies Result = LIST_OPS.fold_left(xs.tail, f, f(init, xs.head))
+    end
+
+  fold_right[A, B](xs: LIST[A], f: (x: A, acc: B) -> B, init: B): B
+    variant
+      xs.length
+    do
+      if xs.length = 0 then
+        init
+      else
+        f(xs.head, LIST_OPS.fold_right(xs.tail, f, init))
+      end
+    ensure
+      empty_case: xs.length = 0 implies Result = init
+      cons_case: xs.length > 0 implies Result = f(xs.head, LIST_OPS.fold_right(xs.tail, f, init))
+    end
+
+specify {ANY}
+
+  law map_empty[A, B](f: A -> B)
+    ensure
+      is_empty: LIST_OPS.map(LIST.empty, f) = LIST.empty
+    end
+
+  law map_singleton[A, B](x: A, f: A -> B)
+    ensure
+      is_single: LIST_OPS.map(LIST.empty.prepend(x), f) = LIST.empty.prepend(f(x))
+    end
+
+  law map_append[A, B](xs: LIST[A], ys: LIST[A], f: A -> B)
+    ensure
+      distributes: LIST_OPS.map(xs.append(ys), f) = LIST_OPS.map(xs, f).append(LIST_OPS.map(ys, f))
+    end
+
+  law filter_append[A](xs: LIST[A], ys: LIST[A], keep: A -> BOOL)
+    ensure
+      distributes: LIST_OPS.filter(xs.append(ys), keep) = LIST_OPS.filter(xs, keep).append(LIST_OPS.filter(ys, keep))
+    end
+
+  law fold_left_append[A, B](xs: LIST[A], ys: LIST[A], f: (acc: B, x: A) -> B, init: B)
+    ensure
+      chains: LIST_OPS.fold_left(xs.append(ys), f, init) = LIST_OPS.fold_left(ys, f, LIST_OPS.fold_left(xs, f, init))
+    end
+
+  law fold_right_append[A, B](xs: LIST[A], ys: LIST[A], f: (x: A, acc: B) -> B, init: B)
+    ensure
+      chains: LIST_OPS.fold_right(xs.append(ys), f, init) = LIST_OPS.fold_right(xs, f, LIST_OPS.fold_right(ys, f, init))
+    end
+
+  law fold_left_append_distributivity[A, B](xs: LIST[A], ys: LIST[A], f: (acc: B, x: A) -> B, init: B)
+    ensure
+      chains: LIST_OPS.fold_left(xs.append(ys), f, init) =
+              LIST_OPS.fold_left(ys, f, LIST_OPS.fold_left(xs, f, init))
+    end
+
+  law fold_map_fusion[A, B, C](xs: LIST[A], g: A -> B, f: (acc: C, b: B) -> C, init: C)
+    ensure
+      fused: LIST_OPS.fold_left(LIST_OPS.map(xs, g), f, init) =
+             LIST_OPS.fold_left(xs, fn(acc: C, x: A): C do f(acc, g(x)) end, init)
+    end
+
+end
+
+functions FUNCTION_OPS
+
+feature {ANY}
+
+  identity[A](x: A): A
+    do
+      x
+    ensure
+      is_id: Result = x
+    end
+
+  id_fn[A]: A -> A
+    do
+      fn(x: A): A do x end
+    ensure
+      pointwise_id: forall x: A. Result(x) = x
+    end
+
+  compose[A, B, C](f: B -> C, g: A -> B): A -> C
+    do
+      fn(x: A): C do f(g(x)) end
+    ensure
+      pointwise: forall x: A. Result(x) = f(g(x))
+    end
+
+specify {ANY}
+
+  law identity_law[A](x: A)
+    ensure
+      fixed: FUNCTION_OPS.identity(x) = x
+    end
+
+  law compose_pointwise[A, B, C](f: B -> C, g: A -> B, x: A)
+    ensure
+      applied: FUNCTION_OPS.compose(f, g)(x) = f(g(x))
+    end
+
+  law compose_left_identity[A, B](f: A -> B, x: A)
+    ensure
+      left_id: FUNCTION_OPS.compose(FUNCTION_OPS.id_fn, f)(x) = f(x)
+    end
+
+  law compose_right_identity[A, B](f: A -> B, x: A)
+    ensure
+      right_id: FUNCTION_OPS.compose(f, FUNCTION_OPS.id_fn)(x) = f(x)
+    end
+
+  law compose_associative[A, B, C, D](f: C -> D, g: B -> C, h: A -> B, x: A)
+    ensure
+      assoc: FUNCTION_OPS.compose(FUNCTION_OPS.compose(f, g), h)(x) = FUNCTION_OPS.compose(f, FUNCTION_OPS.compose(g, h))(x)
     end
 
 end
