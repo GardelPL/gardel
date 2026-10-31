@@ -2125,10 +2125,23 @@ impl Diagnostic {
 }
 
 fn escape_json(s: &str) -> String {
-    s.replace('\\', "\\\\")
-        .replace('"', "\\\"")
-        .replace('\n', "\\n")
-        .replace('\r', "\\r")
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            '\x08' => out.push_str("\\b"),
+            '\x0C' => out.push_str("\\f"),
+            c if (c as u32) < 0x20 => {
+                out.push_str(&format!("\\u{:04x}", c as u32));
+            }
+            c => out.push(c),
+        }
+    }
+    out
 }
 
 /// Resolves all transitively refined concepts for a `satisfies` list, checks
@@ -5831,6 +5844,295 @@ fn subst_block(stmts: &[Stmt], body: &Expr, substs: &[(String, Expr)]) -> (Vec<S
     (new_stmts, body_sub)
 }
 
+/// Expands an inline law instantiation call (e.g., `SEQ.concat_associative(a, b, c)` or local `law_name(a, b)`)
+/// inside a `check` or contract expression into the conjunction of its instantiated `ensure` predicates (§12).
+fn expand_law_call_in_expr(e: &Expr, m: &ModuleDecl) -> Option<Expr> {
+    let (recv_mod, lname, args) = match e {
+        Expr::Call(fname, args) => {
+            if m.feature_routines.iter().any(|(_, r)| r.name == *fname)
+                || m.specify_routines.iter().any(|(_, r)| r.name == *fname)
+                || m.create_routines.iter().any(|(_, r)| r.name == *fname)
+            {
+                return None;
+            }
+            (None, fname.as_str(), args.as_slice())
+        }
+        Expr::MethodCall(recv, mname, args) => {
+            if let Expr::Var(v) = &**recv {
+                if (v == &m.name || v == "Current")
+                    && (m.feature_routines.iter().any(|(_, r)| r.name == *mname)
+                        || m.specify_routines.iter().any(|(_, r)| r.name == *mname)
+                        || m.create_routines.iter().any(|(_, r)| r.name == *mname))
+                {
+                    return None;
+                }
+                (Some(v.as_str()), mname.as_str(), args.as_slice())
+            } else {
+                return None;
+            }
+        }
+        _ => return None,
+    };
+
+    // 1. Check module-local `specify_laws`
+    if recv_mod.is_none() || recv_mod == Some(m.name.as_str()) || recv_mod == Some("Current") {
+        for (_, law) in &m.specify_laws {
+            if law.name == lname && law.params.len() == args.len() && !law.ensures.is_empty() {
+                let substs: Vec<(String, Expr)> = law
+                    .params
+                    .iter()
+                    .zip(args.iter())
+                    .map(|((p, _), a)| (p.clone(), a.clone()))
+                    .collect();
+                let mut iter = law.ensures.iter().map(|(_, ens)| subst_expr_vars(ens, &substs));
+                let first = iter.next()?;
+                return Some(iter.fold(first, |acc, next| {
+                    Expr::BinOp("and".to_string(), Box::new(acc), Box::new(next))
+                }));
+            }
+        }
+    }
+
+    // 2. Check cross-module standard catalogue & concept laws (§9, §12)
+    let mod_name = recv_mod?;
+    match (mod_name, lname, args) {
+        ("SEQ", "concat_associative", [a, b, c]) => Some(Expr::MethodCall(
+            Box::new(Expr::MethodCall(
+                Box::new(Expr::MethodCall(
+                    Box::new(a.clone()),
+                    "concat".to_string(),
+                    vec![b.clone()],
+                )),
+                "concat".to_string(),
+                vec![c.clone()],
+            )),
+            "equals".to_string(),
+            vec![Expr::MethodCall(
+                Box::new(a.clone()),
+                "concat".to_string(),
+                vec![Expr::MethodCall(
+                    Box::new(b.clone()),
+                    "concat".to_string(),
+                    vec![c.clone()],
+                )],
+            )],
+        )),
+        ("SEQ", "concat_left_identity", [a]) => Some(Expr::MethodCall(
+            Box::new(Expr::MethodCall(
+                Box::new(Expr::MethodCall(
+                    Box::new(Expr::Var("SEQ".to_string())),
+                    "empty".to_string(),
+                    Vec::new(),
+                )),
+                "concat".to_string(),
+                vec![a.clone()],
+            )),
+            "equals".to_string(),
+            vec![a.clone()],
+        )),
+        ("SEQ", "concat_right_identity", [a]) => Some(Expr::MethodCall(
+            Box::new(Expr::MethodCall(
+                Box::new(a.clone()),
+                "concat".to_string(),
+                vec![Expr::MethodCall(
+                    Box::new(Expr::Var("SEQ".to_string())),
+                    "empty".to_string(),
+                    Vec::new(),
+                )],
+            )),
+            "equals".to_string(),
+            vec![a.clone()],
+        )),
+        ("SEQ", "concat_length_homomorphism", [a, b]) => Some(Expr::BinOp(
+            "=".to_string(),
+            Box::new(Expr::MethodCall(
+                Box::new(Expr::MethodCall(
+                    Box::new(a.clone()),
+                    "concat".to_string(),
+                    vec![b.clone()],
+                )),
+                "length".to_string(),
+                Vec::new(),
+            )),
+            Box::new(Expr::BinOp(
+                "+".to_string(),
+                Box::new(Expr::MethodCall(
+                    Box::new(a.clone()),
+                    "length".to_string(),
+                    Vec::new(),
+                )),
+                Box::new(Expr::MethodCall(
+                    Box::new(b.clone()),
+                    "length".to_string(),
+                    Vec::new(),
+                )),
+            )),
+        )),
+        ("SEQ", "map_identity", [s]) => Some(Expr::MethodCall(
+            Box::new(Expr::MethodCall(
+                Box::new(s.clone()),
+                "map".to_string(),
+                vec![Expr::MethodCall(
+                    Box::new(Expr::Var("FUNCTION_OPS".to_string())),
+                    "id_fn".to_string(),
+                    Vec::new(),
+                )],
+            )),
+            "equals".to_string(),
+            vec![s.clone()],
+        )),
+        ("SEQ", "map_fusion", [s, f, g]) => Some(Expr::MethodCall(
+            Box::new(Expr::MethodCall(
+                Box::new(Expr::MethodCall(
+                    Box::new(s.clone()),
+                    "map".to_string(),
+                    vec![g.clone()],
+                )),
+                "map".to_string(),
+                vec![f.clone()],
+            )),
+            "equals".to_string(),
+            vec![Expr::MethodCall(
+                Box::new(s.clone()),
+                "map".to_string(),
+                vec![Expr::MethodCall(
+                    Box::new(Expr::Var("FUNCTION_OPS".to_string())),
+                    "compose".to_string(),
+                    vec![f.clone(), g.clone()],
+                )],
+            )],
+        )),
+        ("EQ", "reflexive", [a]) => Some(Expr::MethodCall(
+            Box::new(a.clone()),
+            "equals".to_string(),
+            vec![a.clone()],
+        )),
+        ("EQ", "symmetric", [a, b]) => Some(Expr::BinOp(
+            "=".to_string(),
+            Box::new(Expr::MethodCall(
+                Box::new(a.clone()),
+                "equals".to_string(),
+                vec![b.clone()],
+            )),
+            Box::new(Expr::MethodCall(
+                Box::new(b.clone()),
+                "equals".to_string(),
+                vec![a.clone()],
+            )),
+        )),
+        ("EQ", "transitive", [a, b, c]) => Some(Expr::BinOp(
+            "implies".to_string(),
+            Box::new(Expr::BinOp(
+                "and".to_string(),
+                Box::new(Expr::MethodCall(
+                    Box::new(a.clone()),
+                    "equals".to_string(),
+                    vec![b.clone()],
+                )),
+                Box::new(Expr::MethodCall(
+                    Box::new(b.clone()),
+                    "equals".to_string(),
+                    vec![c.clone()],
+                )),
+            )),
+            Box::new(Expr::MethodCall(
+                Box::new(a.clone()),
+                "equals".to_string(),
+                vec![c.clone()],
+            )),
+        )),
+        ("CANONICAL_EQ", "agrees_with_structural", [a, b]) => Some(Expr::BinOp(
+            "=".to_string(),
+            Box::new(Expr::MethodCall(
+                Box::new(a.clone()),
+                "equals".to_string(),
+                vec![b.clone()],
+            )),
+            Box::new(Expr::BinOp(
+                "=".to_string(),
+                Box::new(a.clone()),
+                Box::new(b.clone()),
+            )),
+        )),
+        ("ORD", "irreflexive", [a]) => Some(Expr::UnaryNot(Box::new(Expr::MethodCall(
+            Box::new(a.clone()),
+            "less_than".to_string(),
+            vec![a.clone()],
+        )))),
+        ("ORD", "transitive", [a, b, c]) => Some(Expr::BinOp(
+            "implies".to_string(),
+            Box::new(Expr::BinOp(
+                "and".to_string(),
+                Box::new(Expr::MethodCall(
+                    Box::new(a.clone()),
+                    "less_than".to_string(),
+                    vec![b.clone()],
+                )),
+                Box::new(Expr::MethodCall(
+                    Box::new(b.clone()),
+                    "less_than".to_string(),
+                    vec![c.clone()],
+                )),
+            )),
+            Box::new(Expr::MethodCall(
+                Box::new(a.clone()),
+                "less_than".to_string(),
+                vec![c.clone()],
+            )),
+        )),
+        ("ORD", "total", [a, b]) => Some(Expr::BinOp(
+            "or".to_string(),
+            Box::new(Expr::BinOp(
+                "or".to_string(),
+                Box::new(Expr::MethodCall(
+                    Box::new(a.clone()),
+                    "less_than".to_string(),
+                    vec![b.clone()],
+                )),
+                Box::new(Expr::MethodCall(
+                    Box::new(a.clone()),
+                    "equals".to_string(),
+                    vec![b.clone()],
+                )),
+            )),
+            Box::new(Expr::MethodCall(
+                Box::new(b.clone()),
+                "less_than".to_string(),
+                vec![a.clone()],
+            )),
+        )),
+        ("LIST_OPS", "map_append", [xs, ys, f]) => Some(Expr::BinOp(
+            "=".to_string(),
+            Box::new(Expr::MethodCall(
+                Box::new(Expr::Var("LIST_OPS".to_string())),
+                "map".to_string(),
+                vec![
+                    Expr::MethodCall(
+                        Box::new(xs.clone()),
+                        "append".to_string(),
+                        vec![ys.clone()],
+                    ),
+                    f.clone(),
+                ],
+            )),
+            Box::new(Expr::MethodCall(
+                Box::new(Expr::MethodCall(
+                    Box::new(Expr::Var("LIST_OPS".to_string())),
+                    "map".to_string(),
+                    vec![xs.clone(), f.clone()],
+                )),
+                "append".to_string(),
+                vec![Expr::MethodCall(
+                    Box::new(Expr::Var("LIST_OPS".to_string())),
+                    "map".to_string(),
+                    vec![ys.clone(), f.clone()],
+                )],
+            )),
+        )),
+        _ => None,
+    }
+}
+
 pub fn emit_boogie_expr(
     e: &Expr,
     m: &ModuleDecl,
@@ -5850,6 +6152,16 @@ fn emit_boogie_expr_with_strings(
     fuel_var: &str,
     strings: &[String],
 ) -> String {
+    if let Some(expanded) = expand_law_call_in_expr(e, m) {
+        return emit_boogie_expr_with_strings(
+            &expanded,
+            m,
+            implicit_fields,
+            revealed,
+            fuel_var,
+            strings,
+        );
+    }
     match e {
         Expr::Int(n) => n.to_string(),
         Expr::Float(f) => format!("F64_lit_{}", f.to_bits()),
@@ -6781,7 +7093,65 @@ fn run_boogie_verification(
     Ok(parse_boogie_output(&full_out, m, src, input_path))
 }
 
-fn collect_routine_path_conditions(m: &ModuleDecl, routine: &str) -> Vec<String> {
+fn collect_branch_path_conditions_for_tag(
+    stmts: &[Stmt],
+    body: &Expr,
+    target_tag: &str,
+    pcs: &mut Vec<String>,
+) -> bool {
+    for st in stmts {
+        match st {
+            Stmt::Reveal(t) => {
+                pcs.push(format!("reveal {t}"));
+            }
+            Stmt::Let(v, e) => {
+                pcs.push(format!("let {v} = {}", format_gardel_expr(e)));
+            }
+            Stmt::Check(ctag, e) => {
+                if ctag == target_tag {
+                    return true;
+                }
+                pcs.push(format!("check {ctag}: {}", format_gardel_expr(e)));
+            }
+            Stmt::Assume(atag, e) => {
+                if atag == target_tag {
+                    return true;
+                }
+                pcs.push(format!("assume {atag}: {}", format_gardel_expr(e)));
+            }
+        }
+    }
+    match body {
+        Expr::If(c, ts, te, es, ee) => {
+            let mut t_pcs = vec![format_gardel_expr(c)];
+            if collect_branch_path_conditions_for_tag(ts, te, target_tag, &mut t_pcs) {
+                pcs.extend(t_pcs);
+                return true;
+            }
+            let mut e_pcs = vec![format!("!({})", format_gardel_expr(c))];
+            if collect_branch_path_conditions_for_tag(es, ee, target_tag, &mut e_pcs) {
+                pcs.extend(e_pcs);
+                return true;
+            }
+            false
+        }
+        Expr::Match(scrut, cases) => {
+            let scrut_s = format_gardel_expr(scrut);
+            for c in cases {
+                let mut c_pcs = vec![format!("{scrut_s} is {}", format_pattern(&c.pattern))];
+                if collect_branch_path_conditions_for_tag(&c.stmts, &c.body, target_tag, &mut c_pcs)
+                {
+                    pcs.extend(c_pcs);
+                    return true;
+                }
+            }
+            false
+        }
+        _ => false,
+    }
+}
+
+fn collect_routine_path_conditions(m: &ModuleDecl, routine: &str, tag: &str) -> Vec<String> {
     for (_, r) in m
         .create_routines
         .iter()
@@ -6793,10 +7163,23 @@ fn collect_routine_path_conditions(m: &ModuleDecl, routine: &str) -> Vec<String>
             for (_, req_e) in &r.requires {
                 pcs.push(format_gardel_expr(req_e));
             }
-            for st in &r.stmts {
-                if let Stmt::Reveal(t) = st {
-                    pcs.push(format!("reveal {t}"));
-                }
+            let _ = collect_branch_path_conditions_for_tag(&r.stmts, &r.body, tag, &mut pcs);
+            return pcs;
+        }
+    }
+    for (vis, law) in &m.specify_laws {
+        let vis_prefix = match vis {
+            Visibility::Modules(mods) if !mods.is_empty() => format!("{}_", mods.join("_")),
+            _ => String::new(),
+        };
+        let prefixed_name = format!("{vis_prefix}{}", law.name);
+        if law.name == routine || prefixed_name == routine {
+            let mut pcs = Vec::new();
+            for (_, req_e) in &law.requires {
+                pcs.push(format_gardel_expr(req_e));
+            }
+            if let Some(body) = &law.body {
+                let _ = collect_branch_path_conditions_for_tag(&law.stmts, body, tag, &mut pcs);
             }
             return pcs;
         }
@@ -6850,7 +7233,7 @@ pub fn parse_boogie_output(
             let cex = translate_z3_model_to_gardel(&raw_model, m);
             let sp = locate_span(src, input_path, &tag, &routine);
             let lemmas = find_relevant_lemmas_for_tag(m, &routine, &tag);
-            let pcs = collect_routine_path_conditions(m, &routine);
+            let pcs = collect_routine_path_conditions(m, &routine, &tag);
 
             let static_rule = match rule_kind.as_str() {
                 "overflow" => "Phase 3 Boogie (Arithmetic Overflow)",
@@ -6869,6 +7252,7 @@ pub fn parse_boogie_output(
                 tag.clone(),
                 format!("Formal verification condition `{tag}` failed in `{routine}`"),
             )
+            .with_module(&m.name)
             .with_ai_context(sp, pcs, cex, lemmas);
             diags.push(diag);
             continue;
@@ -6887,7 +7271,7 @@ pub fn parse_boogie_output(
                 let (routine, rule_kind, tag) = parse_msg_tag(line);
                 let sp = locate_span(src, input_path, &tag, &routine);
                 let lemmas = find_relevant_lemmas_for_tag(m, &routine, &tag);
-                let pcs = collect_routine_path_conditions(m, &routine);
+                let pcs = collect_routine_path_conditions(m, &routine, &tag);
                 let static_rule = match rule_kind.as_str() {
                     "overflow" => "Phase 3 Boogie (Arithmetic Overflow)",
                     "div_by_zero" => "Phase 3 Boogie (Division by Zero)",
@@ -6900,6 +7284,7 @@ pub fn parse_boogie_output(
                 };
                 diags.push(
                     Diagnostic::basic("error", static_rule, routine, tag, line.to_string())
+                        .with_module(&m.name)
                         .with_ai_context(sp, pcs, BTreeMap::new(), lemmas),
                 );
             }
@@ -6943,6 +7328,83 @@ fn parse_msg_tag(msg: &str) -> (String, String, String) {
     }
 }
 
+fn find_tagged_expr_in_expr<'a>(e: &'a Expr, target_tag: &str) -> Option<&'a Expr> {
+    match e {
+        Expr::If(c, ts, te, es, ee) => find_tagged_expr_in_expr(c, target_tag)
+            .or_else(|| find_tagged_expr_in_block(ts, te, target_tag))
+            .or_else(|| find_tagged_expr_in_block(es, ee, target_tag)),
+        Expr::Match(scrut, cases) => {
+            if let Some(found) = find_tagged_expr_in_expr(scrut, target_tag) {
+                return Some(found);
+            }
+            for c in cases {
+                if let Some(found) = find_tagged_expr_in_block(&c.stmts, &c.body, target_tag) {
+                    return Some(found);
+                }
+            }
+            None
+        }
+        Expr::Lambda(_, _, ls, lb) => find_tagged_expr_in_block(ls, lb, target_tag),
+        Expr::UnaryNot(inner) | Expr::UnaryNeg(inner) => {
+            find_tagged_expr_in_expr(inner, target_tag)
+        }
+        Expr::BinOp(_, l, r) => {
+            find_tagged_expr_in_expr(l, target_tag).or_else(|| find_tagged_expr_in_expr(r, target_tag))
+        }
+        Expr::Call(_, args) | Expr::TupleLit(args) => {
+            args.iter().find_map(|a| find_tagged_expr_in_expr(a, target_tag))
+        }
+        Expr::MethodCall(recv, _, args) => find_tagged_expr_in_expr(recv, target_tag)
+            .or_else(|| args.iter().find_map(|a| find_tagged_expr_in_expr(a, target_tag))),
+        Expr::RecordLit(fields) => fields
+            .iter()
+            .find_map(|(_, fe)| find_tagged_expr_in_expr(fe, target_tag)),
+        Expr::RecordUpdate(base, fields) => find_tagged_expr_in_expr(base, target_tag).or_else(|| {
+            fields
+                .iter()
+                .find_map(|(_, fe)| find_tagged_expr_in_expr(fe, target_tag))
+        }),
+        Expr::Forall(_, _, body) | Expr::Exists(_, _, body) => {
+            find_tagged_expr_in_expr(body, target_tag)
+        }
+        Expr::WithIo(stmts, final_e) => stmts
+            .iter()
+            .find_map(|s| match s {
+                IoStmt::Bind(_, se) | IoStmt::Action(se) => {
+                    find_tagged_expr_in_expr(se, target_tag)
+                }
+            })
+            .or_else(|| find_tagged_expr_in_expr(final_e, target_tag)),
+        _ => None,
+    }
+}
+
+fn find_tagged_expr_in_block<'a>(
+    stmts: &'a [Stmt],
+    body: &'a Expr,
+    target_tag: &str,
+) -> Option<&'a Expr> {
+    for st in stmts {
+        match st {
+            Stmt::Check(ctag, cexpr) | Stmt::Assume(ctag, cexpr) => {
+                if ctag == target_tag {
+                    return Some(cexpr);
+                }
+                if let Some(found) = find_tagged_expr_in_expr(cexpr, target_tag) {
+                    return Some(found);
+                }
+            }
+            Stmt::Let(_, se) => {
+                if let Some(found) = find_tagged_expr_in_expr(se, target_tag) {
+                    return Some(found);
+                }
+            }
+            Stmt::Reveal(_) => {}
+        }
+    }
+    find_tagged_expr_in_expr(body, target_tag)
+}
+
 fn find_relevant_lemmas_for_tag(m: &ModuleDecl, routine: &str, tag: &str) -> Vec<String> {
     for (_, r) in m
         .create_routines
@@ -6955,6 +7417,17 @@ fn find_relevant_lemmas_for_tag(m: &ModuleDecl, routine: &str, tag: &str) -> Vec
                 if etag == tag {
                     return find_relevant_lemmas(m, routine, eexpr);
                 }
+            }
+            if let Some(cexpr) = find_tagged_expr_in_block(&r.stmts, &r.body, tag) {
+                return find_relevant_lemmas(m, routine, cexpr);
+            }
+            for (rtag, rexpr) in &r.requires {
+                if rtag == tag {
+                    return find_relevant_lemmas(m, routine, rexpr);
+                }
+            }
+            if tag.starts_with("variant") && !r.variant.is_empty() {
+                return find_relevant_lemmas(m, routine, &r.variant[0]);
             }
         }
     }
@@ -6972,12 +7445,127 @@ fn find_relevant_lemmas_for_tag(m: &ModuleDecl, routine: &str, tag: &str) -> Vec
         if law.name == routine || prefixed_name == routine {
             for (etag, eexpr) in &law.ensures {
                 if etag == tag {
-                    return find_relevant_lemmas(m, routine, eexpr);
+                    return find_relevant_lemmas(m, &law.name, eexpr);
                 }
+            }
+            if let Some(body) = &law.body {
+                if let Some(cexpr) = find_tagged_expr_in_block(&law.stmts, body, tag) {
+                    return find_relevant_lemmas(m, &law.name, cexpr);
+                }
+            }
+            for (rtag, rexpr) in &law.requires {
+                if rtag == tag {
+                    return find_relevant_lemmas(m, &law.name, rexpr);
+                }
+            }
+            if tag.starts_with("variant") && !law.variant.is_empty() {
+                return find_relevant_lemmas(m, &law.name, &law.variant[0]);
             }
         }
     }
     Vec::new()
+}
+
+fn collect_binary_ops(e: &Expr) -> HashSet<String> {
+    let mut ops = HashSet::new();
+    match e {
+        Expr::BinOp(op, l, r) => {
+            ops.insert(op.clone());
+            ops.extend(collect_binary_ops(l));
+            ops.extend(collect_binary_ops(r));
+        }
+        Expr::UnaryNot(inner) | Expr::UnaryNeg(inner) => {
+            ops.extend(collect_binary_ops(inner));
+        }
+        Expr::Call(_, args) | Expr::TupleLit(args) => {
+            for a in args {
+                ops.extend(collect_binary_ops(a));
+            }
+        }
+        Expr::MethodCall(recv, _, args) => {
+            ops.extend(collect_binary_ops(recv));
+            for a in args {
+                ops.extend(collect_binary_ops(a));
+            }
+        }
+        Expr::If(c, ts, te, es, ee) => {
+            ops.extend(collect_binary_ops(c));
+            for st in ts.iter().chain(es.iter()) {
+                if let Stmt::Let(_, se) | Stmt::Check(_, se) | Stmt::Assume(_, se) = st {
+                    ops.extend(collect_binary_ops(se));
+                }
+            }
+            ops.extend(collect_binary_ops(te));
+            ops.extend(collect_binary_ops(ee));
+        }
+        Expr::Match(scrut, cases) => {
+            ops.extend(collect_binary_ops(scrut));
+            for c in cases {
+                for st in &c.stmts {
+                    if let Stmt::Let(_, se) | Stmt::Check(_, se) | Stmt::Assume(_, se) = st {
+                        ops.extend(collect_binary_ops(se));
+                    }
+                }
+                ops.extend(collect_binary_ops(&c.body));
+            }
+        }
+        Expr::RecordLit(fields) => {
+            for (_, fe) in fields {
+                ops.extend(collect_binary_ops(fe));
+            }
+        }
+        Expr::RecordUpdate(base, fields) => {
+            ops.extend(collect_binary_ops(base));
+            for (_, fe) in fields {
+                ops.extend(collect_binary_ops(fe));
+            }
+        }
+        Expr::Forall(_, _, body) | Expr::Exists(_, _, body) => {
+            ops.extend(collect_binary_ops(body));
+        }
+        Expr::WithIo(stmts, final_e) => {
+            for s in stmts {
+                match s {
+                    IoStmt::Bind(_, se) | IoStmt::Action(se) => {
+                        ops.extend(collect_binary_ops(se));
+                    }
+                }
+            }
+            ops.extend(collect_binary_ops(final_e));
+        }
+        Expr::Lambda(_, _, stmts, body) => {
+            for st in stmts {
+                if let Stmt::Let(_, se) | Stmt::Check(_, se) | Stmt::Assume(_, se) = st {
+                    ops.extend(collect_binary_ops(se));
+                }
+            }
+            ops.extend(collect_binary_ops(body));
+        }
+        _ => {}
+    }
+    ops
+}
+
+fn is_trivial_overlap_symbol(sym: &str) -> bool {
+    matches!(
+        sym,
+        "model"
+            | "length"
+            | "size"
+            | "True"
+            | "False"
+            | "None"
+            | "Some"
+            | "Ok"
+            | "Error"
+            | "empty"
+            | "LIST"
+            | "SEQ"
+            | "OPTION"
+            | "RESULT"
+            | "LIST_OPS"
+            | "FUNCTION_OPS"
+    )
 }
 
 /// Finds in-scope `specify` routines, laws, and `ensure` clauses sharing symbols with a failed goal (§12).
@@ -6986,17 +7574,61 @@ pub fn find_relevant_lemmas(
     current_routine: &str,
     goal_expr: &Expr,
 ) -> Vec<String> {
-    let goal_syms = collect_symbols(goal_expr);
+    let mut routine_locals: HashSet<String> = HashSet::new();
+    let mut already_revealed: HashSet<String> = HashSet::new();
+
+    for (_, r) in m
+        .create_routines
+        .iter()
+        .chain(m.feature_routines.iter())
+        .chain(m.specify_routines.iter())
+    {
+        if r.name == current_routine {
+            for (p, _) in &r.params {
+                routine_locals.insert(p.clone());
+            }
+            already_revealed.extend(collect_reveal_targets(&r.stmts, &r.body));
+            break;
+        }
+    }
+    for (_, law) in &m.specify_laws {
+        if law.name == current_routine {
+            for (p, _) in &law.params {
+                routine_locals.insert(p.clone());
+            }
+            if let Some(body) = &law.body {
+                already_revealed.extend(collect_reveal_targets(&law.stmts, body));
+            }
+            break;
+        }
+    }
+
+    let goal_syms = collect_symbols_scoped(goal_expr, &routine_locals);
+    let raw_syms = collect_symbols(goal_expr);
+    let goal_ops = collect_binary_ops(goal_expr);
     let mut lemmas = Vec::new();
 
     // 1. Concept Laws Indexing (§9, §12)
-    if goal_syms.contains("equals") {
+    let has_eq_concept = m.satisfies.as_ref().is_some_and(|s| {
+        s.concepts
+            .iter()
+            .any(|c| c == "EQ" || c == "CANONICAL_EQ" || c == "ORD")
+    });
+    if goal_syms.contains("equals")
+        || ((goal_ops.contains("=") || goal_ops.contains("!=")) && has_eq_concept)
+    {
         lemmas.push("EQ.reflexive".to_string());
         lemmas.push("EQ.symmetric".to_string());
         lemmas.push("EQ.transitive".to_string());
         lemmas.push("CANONICAL_EQ.agrees_with_structural".to_string());
     }
-    if goal_syms.contains("less_than") || goal_syms.contains("less_or_equal") {
+    if goal_syms.contains("less_than")
+        || goal_syms.contains("less_or_equal")
+        || goal_ops.contains("<")
+        || goal_ops.contains("<=")
+        || goal_ops.contains(">")
+        || goal_ops.contains(">=")
+    {
         lemmas.push("ORD.irreflexive".to_string());
         lemmas.push("ORD.transitive".to_string());
         lemmas.push("ORD.total".to_string());
@@ -7008,11 +7640,35 @@ pub fn find_relevant_lemmas(
         lemmas.push("law SEQ.concat_left_identity.left_id".to_string());
         lemmas.push("law SEQ.concat_right_identity.right_id".to_string());
         lemmas.push("law SEQ.concat_length_homomorphism.len_homo".to_string());
+        lemmas.push("law LIST_OPS.map_append.distributes".to_string());
+        lemmas.push("law LIST_OPS.filter_append.distributes".to_string());
+        lemmas.push("law LIST_OPS.fold_left_append.chains".to_string());
+        lemmas.push("law LIST_OPS.fold_right_append.chains".to_string());
     }
-    if goal_syms.contains("map") || goal_syms.contains("filter") {
+    if goal_syms.contains("map") {
         lemmas.push("law SEQ.map_identity.id_preserved".to_string());
         lemmas.push("law SEQ.map_fusion.fusion".to_string());
+        lemmas.push("law LIST_OPS.map_append.distributes".to_string());
+        if m.name == "OPTION"
+            || raw_syms.contains("OPTION")
+            || raw_syms.contains("Some")
+            || raw_syms.contains("None")
+        {
+            lemmas.push("law OPTION.map_identity.id_preserved".to_string());
+            lemmas.push("law OPTION.map_composition.composition".to_string());
+        }
+        if m.name == "RESULT"
+            || raw_syms.contains("RESULT")
+            || raw_syms.contains("Ok")
+            || raw_syms.contains("Error")
+        {
+            lemmas.push("law RESULT.map_identity.id_preserved".to_string());
+            lemmas.push("law RESULT.map_composition.composition".to_string());
+        }
+    }
+    if goal_syms.contains("filter") {
         lemmas.push("law SEQ.filter_conjunction.conjunction".to_string());
+        lemmas.push("law LIST_OPS.filter_append.distributes".to_string());
     }
     if goal_syms.contains("and_then") {
         lemmas.push("law OPTION.and_then_right_identity.right_id".to_string());
@@ -7023,24 +7679,93 @@ pub fn find_relevant_lemmas(
     if goal_syms.contains("fold_left") || goal_syms.contains("fold_right") {
         lemmas.push("law LIST_OPS.fold_left_append_distributivity.chains".to_string());
         lemmas.push("law LIST_OPS.fold_map_fusion.fused".to_string());
+        lemmas.push("law LIST_OPS.fold_left_append.chains".to_string());
+        lemmas.push("law LIST_OPS.fold_right_append.chains".to_string());
+        lemmas.push("law SEQ.fold_left_singleton.eval_left".to_string());
+        lemmas.push("law SEQ.fold_right_singleton.eval_right".to_string());
+    }
+    if goal_syms.contains("compose")
+        || goal_syms.contains("id_fn")
+        || goal_syms.contains("identity")
+    {
+        lemmas.push("law FUNCTION_OPS.compose_pointwise.applied".to_string());
+        lemmas.push("law FUNCTION_OPS.compose_left_identity.left_id".to_string());
+        lemmas.push("law FUNCTION_OPS.compose_right_identity.right_id".to_string());
+        lemmas.push("law FUNCTION_OPS.compose_associative.assoc".to_string());
     }
 
+    // 3. Transitive `specify_routines` Discovery & Filtering Already-Revealed Queries
+    let mut reachable_specify: HashSet<String> = HashSet::new();
+    let mut worklist: Vec<String> = m
+        .specify_routines
+        .iter()
+        .filter(|(_, sr)| goal_syms.contains(&sr.name))
+        .map(|(_, sr)| sr.name.clone())
+        .collect();
+    while let Some(sr_name) = worklist.pop() {
+        if reachable_specify.insert(sr_name.clone()) {
+            if let Some((_, sr_decl)) = m.specify_routines.iter().find(|(_, r)| r.name == sr_name) {
+                let mut sr_locals: HashSet<String> =
+                    sr_decl.params.iter().map(|(p, _)| p.clone()).collect();
+                sr_locals.insert("Current".to_string());
+                let mut called = collect_symbols_scoped(&sr_decl.body, &sr_locals);
+                for st in &sr_decl.stmts {
+                    match st {
+                        Stmt::Let(v, se) => {
+                            called.extend(collect_symbols_scoped(se, &sr_locals));
+                            sr_locals.insert(v.clone());
+                        }
+                        Stmt::Check(_, se) | Stmt::Assume(_, se) => {
+                            called.extend(collect_symbols_scoped(se, &sr_locals));
+                        }
+                        Stmt::Reveal(rev_t) => {
+                            called.insert(rev_t.clone());
+                        }
+                    }
+                }
+                for (_, next_sr) in &m.specify_routines {
+                    if called.contains(&next_sr.name) && !reachable_specify.contains(&next_sr.name)
+                    {
+                        worklist.push(next_sr.name.clone());
+                    }
+                }
+            }
+        }
+    }
+
+    let meaningful_goal_syms: HashSet<String> = goal_syms
+        .iter()
+        .filter(|s| !is_trivial_overlap_symbol(s))
+        .cloned()
+        .collect();
+
     for (_, sr) in &m.specify_routines {
-        if goal_syms.contains(&sr.name) {
+        if reachable_specify.contains(&sr.name) && !already_revealed.contains(&sr.name) {
             lemmas.push(format!("reveal {}", sr.name));
         }
+        let sr_locals: HashSet<String> = sr.params.iter().map(|(p, _)| p.clone()).collect();
         for (etag, eexpr) in &sr.ensures {
-            let esyms = collect_symbols(eexpr);
-            if !esyms.is_disjoint(&goal_syms) {
+            let esyms: HashSet<String> = collect_symbols_scoped(eexpr, &sr_locals)
+                .into_iter()
+                .filter(|s| !is_trivial_overlap_symbol(s))
+                .collect();
+            if goal_syms.contains(&sr.name) || !esyms.is_disjoint(&meaningful_goal_syms) {
                 lemmas.push(format!("{}.ensure.{}", sr.name, etag));
             }
         }
     }
 
     for (_, law) in &m.specify_laws {
+        if law.name == current_routine {
+            continue;
+        }
+        let law_locals: HashSet<String> = law.params.iter().map(|(p, _)| p.clone()).collect();
         for (etag, eexpr) in &law.ensures {
-            let esyms = collect_symbols(eexpr);
-            if !esyms.is_disjoint(&goal_syms) || goal_syms.contains(&law.name) {
+            let esyms: HashSet<String> = collect_symbols_scoped(eexpr, &law_locals)
+                .into_iter()
+                .filter(|s| !is_trivial_overlap_symbol(s))
+                .collect();
+            if !esyms.is_disjoint(&meaningful_goal_syms) || goal_syms.contains(&law.name) {
                 lemmas.push(format!("law {}.{}", law.name, etag));
             }
         }
@@ -7050,9 +7775,13 @@ pub fn find_relevant_lemmas(
         if fr.name == current_routine {
             continue;
         }
+        let fr_locals: HashSet<String> = fr.params.iter().map(|(p, _)| p.clone()).collect();
         for (etag, eexpr) in &fr.ensures {
-            let esyms = collect_symbols(eexpr);
-            if goal_syms.contains(&fr.name) || !esyms.is_disjoint(&goal_syms) {
+            let esyms: HashSet<String> = collect_symbols_scoped(eexpr, &fr_locals)
+                .into_iter()
+                .filter(|s| !is_trivial_overlap_symbol(s))
+                .collect();
+            if goal_syms.contains(&fr.name) || !esyms.is_disjoint(&meaningful_goal_syms) {
                 lemmas.push(format!("{}.ensure.{}", fr.name, etag));
             }
         }
@@ -7477,6 +8206,8 @@ fn eval_and_verify_block(
                         let sp = locate_span(src, input_path, tag, &r.name);
                         let mut lemmas = find_relevant_lemmas(m, &r.name, chk_e);
                         lemmas.push(format!("reveal {fn_name}"));
+                        lemmas.sort();
+                        lemmas.dedup();
                         return Some(
                             Diagnostic::basic(
                                 "error",
@@ -7576,6 +8307,8 @@ fn eval_and_verify_block(
                 let sp = locate_span(src, input_path, ens_tag, &r.name);
                 let mut lemmas = find_relevant_lemmas(m, &r.name, ens_e);
                 lemmas.push(format!("reveal {fn_name}"));
+                lemmas.sort();
+                lemmas.dedup();
                 return Some(
                     Diagnostic::basic(
                         "error",
@@ -8088,6 +8821,9 @@ fn eval_expr_symbolic(
     revealed: &HashSet<String>,
     fuel: usize,
 ) -> Result<GardelVal, EvalFault> {
+    if let Some(expanded) = expand_law_call_in_expr(e, m) {
+        return eval_expr_symbolic(&expanded, env, m, revealed, fuel);
+    }
     match e {
         Expr::Int(n) => Ok(GardelVal::Int(*n as i128)),
         Expr::Float(f) => Ok(GardelVal::Float(f.to_bits())),
@@ -10728,6 +11464,11 @@ fn main() {
             audit_mode,
             bounded_check,
         ));
+        for d in &mut mod_diags {
+            if d.module_name.is_empty() {
+                d.module_name = m.name.clone();
+            }
+        }
         diags.extend(mod_diags);
     }
     if inspect_mode {
@@ -10762,6 +11503,7 @@ fn main() {
         if has_errors {
             std::process::exit(1);
         }
+        return;
     } else {
         println!(
             "[1/6] Parsed {} concepts {:?}, group {:?}, and {:?} `{}` (type params: {:?}, satisfies: {:?}, laws: {}, fuel: {})",
@@ -12202,5 +12944,98 @@ end
         assert!(ord_lemmas.contains(&"ORD.total".to_string()));
         assert!(ord_lemmas.contains(&"ORD.transitive".to_string()));
         assert!(ord_lemmas.contains(&"ORD.irreflexive".to_string()));
+
+        // 4. Goal with map/filter should surface Functor laws
+        let map_goal = Expr::MethodCall(
+            Box::new(Expr::Var("s".to_string())),
+            "map".to_string(),
+            vec![Expr::Var("f".to_string())],
+        );
+        let map_lemmas = find_relevant_lemmas(seq_mod, "test_routine", &map_goal);
+        assert!(map_lemmas.contains(&"law SEQ.map_fusion.fusion".to_string()));
+        assert!(map_lemmas.contains(&"law SEQ.map_identity.id_preserved".to_string()));
+
+        // 5. Goal with and_then should surface Monad laws
+        let monad_goal = Expr::MethodCall(
+            Box::new(Expr::Var("opt".to_string())),
+            "and_then".to_string(),
+            vec![Expr::Var("f".to_string())],
+        );
+        let monad_lemmas = find_relevant_lemmas(seq_mod, "test_routine", &monad_goal);
+        assert!(monad_lemmas.contains(&"law OPTION.and_then_associative.assoc".to_string()));
+        assert!(monad_lemmas.contains(&"law RESULT.and_then_right_identity.right_id".to_string()));
+
+        // 6. Goal with fold_left / fold_right should surface Fold laws
+        let fold_goal = Expr::MethodCall(
+            Box::new(Expr::Var("xs".to_string())),
+            "fold_left".to_string(),
+            vec![Expr::Var("f".to_string()), Expr::Var("init".to_string())],
+        );
+        let fold_lemmas = find_relevant_lemmas(seq_mod, "test_routine", &fold_goal);
+        assert!(fold_lemmas.contains(&"law LIST_OPS.fold_left_append_distributivity.chains".to_string()));
+        assert!(fold_lemmas.contains(&"law LIST_OPS.fold_map_fusion.fused".to_string()));
+
+        // 7. Goal with compose should surface Combinator laws
+        let comp_goal = Expr::MethodCall(
+            Box::new(Expr::Var("FUNCTION_OPS".to_string())),
+            "compose".to_string(),
+            vec![Expr::Var("f".to_string()), Expr::Var("g".to_string())],
+        );
+        let comp_lemmas = find_relevant_lemmas(seq_mod, "test_routine", &comp_goal);
+        assert!(comp_lemmas.contains(&"law FUNCTION_OPS.compose_associative.assoc".to_string()));
+        assert!(comp_lemmas.contains(&"law FUNCTION_OPS.compose_left_identity.left_id".to_string()));
+
+        // 8. Filter-only goal does not pollute with OPTION/RESULT map laws
+        let filter_goal = Expr::MethodCall(
+            Box::new(Expr::Var("s".to_string())),
+            "filter".to_string(),
+            vec![Expr::Var("p".to_string())],
+        );
+        let filter_lemmas = find_relevant_lemmas(seq_mod, "test_routine", &filter_goal);
+        assert!(filter_lemmas.contains(&"law SEQ.filter_conjunction.conjunction".to_string()));
+        assert!(!filter_lemmas.contains(&"law OPTION.map_identity.id_preserved".to_string()));
+
+        // 9. Structural '=' on EQ-conforming module surfaces EQ & CANONICAL_EQ laws (Spec Payload 3)
+        let struct_eq_goal = Expr::BinOp(
+            "=".to_string(),
+            Box::new(Expr::Var("Result".to_string())),
+            Box::new(Expr::Var("Current".to_string())),
+        );
+        let struct_eq_lemmas = find_relevant_lemmas(seq_mod, "test_routine", &struct_eq_goal);
+        assert!(struct_eq_lemmas.contains(&"CANONICAL_EQ.agrees_with_structural".to_string()));
+        assert!(struct_eq_lemmas.contains(&"EQ.transitive".to_string()));
+
+        // 10. Transitive specify query opacity in BIGNAT (Spec Payload 4: model -> value_of)
+        let bignat_mod = stdlib.modules.iter().find(|m| m.name == "BIGNAT").unwrap();
+        let bignat_model_goal = Expr::BinOp(
+            "=".to_string(),
+            Box::new(Expr::MethodCall(
+                Box::new(Expr::Var("Result".to_string())),
+                "model".to_string(),
+                Vec::new(),
+            )),
+            Box::new(Expr::Int(0)),
+        );
+        let bignat_lemmas = find_relevant_lemmas(bignat_mod, "zero", &bignat_model_goal);
+        assert!(bignat_lemmas.contains(&"reveal model".to_string()));
+        assert!(bignat_lemmas.contains(&"reveal value_of".to_string()));
+
+        // 11. Law instantiation call expansion in check blocks (`SEQ.concat_associative(a, b, c)`)
+        let law_call_expr = Expr::MethodCall(
+            Box::new(Expr::Var("SEQ".to_string())),
+            "concat_associative".to_string(),
+            vec![
+                Expr::Var("a".to_string()),
+                Expr::Var("b".to_string()),
+                Expr::Var("c".to_string()),
+            ],
+        );
+        let expanded = expand_law_call_in_expr(&law_call_expr, seq_mod)
+            .expect("SEQ.concat_associative(a, b, c) must expand to its ensure predicate");
+        let bpl = emit_boogie_expr(&expanded, seq_mod, &HashSet::new(), &HashSet::new(), "DefaultFuel");
+        assert!(bpl.contains("fn_equals") && bpl.contains("fn_concat"));
+
+        // 12. RFC 8259 control character escaping in JSON diagnostics
+        assert_eq!(escape_json("a\tb\x07c"), "a\\tb\\u0007c");
     }
 }

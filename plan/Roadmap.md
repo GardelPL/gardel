@@ -136,9 +136,9 @@ flowchart TD
 - [x] Clean up contracts in §8 and §14 to eliminate accidental Leibniz equality assertions on collection types.
 - [x] Incorporate the Bird & Wadler algebraic law catalogue (Monoids, Functors, Monads, Folds, Orders) as normative concept laws.
 
-#### Task A.6: AI Diagnostic Law Surfacing in `--json-diagnostics` (§12)
-- Specify how `gardelc --json-diagnostics` indexes in-scope concept laws and catalogue lemmas and emits them in `relevant_lemmas`.
-- Document how AI coding agents utilize these indexed laws for program derivation and automated proof repair.
+#### Task A.6: AI Diagnostic Law Surfacing in `--json-diagnostics` (§12) [✅ Completed]
+- [x] Specify how `gardelc --json-diagnostics` indexes in-scope concept laws and catalogue lemmas and emits them in `relevant_lemmas`.
+- [x] Document how AI coding agents utilize these indexed laws for program derivation and automated proof repair.
 
 #### Task A.7: Synchronize Specification Roadmap (§16)
 - Mark Steps 1–4 as locked/completed in the v0.4 roadmap table.
