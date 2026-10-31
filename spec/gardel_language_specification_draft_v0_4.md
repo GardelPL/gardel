@@ -283,15 +283,37 @@ When types $M_1, M_2, \dots, M_n$ form a mutual dependency cycle inside `group {
 
 A `representation` block declares either a product (named fields) or a sum (variants), and its visibility list decides who may build and take apart values directly.
 
-- **Product.** Fields are declared as `name: Type`. A record literal is `{ f = v, g = w }` and a functional update is `{ x with f = v }`.
-- **Sum.** Variants are declared as `| Name(field: Type, ...)`. Clients in the visibility list may construct variants and use them in `match`.
-- **Local `let` bindings and statement blocks.** The body of any `do`, `then`, `else`, or `case` branch is a `Block` consisting of zero or more statements (`let name = expr`, `check`, `assume`, `reveal`) followed by a final result expression. `let` bindings are immutable and enter the proof context (`name = expr`) for all subsequent statements and the final expression.
-- **Refinement-aware matching.** Exhaustiveness is checked against the proof context. A branch that the context rules out (for example `None` under `require Current.is_some`) may be omitted. A reachable branch that is missing is an error. Omitted branches generate no code, and the verifier has proven they cannot run.
-- **Opaque and friend representations.** `representation {NONE}` hides the layout from every client. `representation {M1, M2}` shares it with named friends. Any direct construction outside the module triggers the invariant check of §6.
-- **Mutual recursion.** Types that refer to each other are declared in one `group { A, B }` file. The verifier treats the group as a single unit for termination and invariants (§4.3).
+### 5.1 Representation Forms and Matching Mechanics
+
+1. **Product Representations:**
+   Fields are declared as `name: Type`. A record literal is `{ f = v, g = w }` and a functional update is `{ x with f = v }`. Record construction sites verify representation invariants ($I_{\text{rep}}$) for the constructed record (§6).
+2. **Sum Representations:**
+   Variants are declared with the pipe prefix: `| Name(field: Type, ...)`. Parameterless variants are declared as `| Name`. Clients in the visibility list may construct variants directly (`Name(args...)`) and destructure them via `match`.
+3. **Visibility & Encapsulation:**
+   - `representation {ANY}`: Public representation. Any module in the program may construct variants or records directly and inspect them via `match`. Standard sum types (`OPTION[A]`, `RESULT[E, A]`) declare `{ANY}` visibility.
+   - `representation {NONE}`: Opaque representation. The internal layout is hidden from all clients; values can only be constructed and queried through exported `create` and `feature` routines.
+   - `representation {M1, M2}`: Friend visibility. The internal layout is shared exclusively with named friend modules.
+4. **Local `let` Bindings & Statement Blocks:**
+   The body of any `do`, `then`, `else`, or `case` branch is a `Block` consisting of zero or more statements (`let name = expr`, `check`, `assume`, `reveal`) followed by a final result expression. `let` bindings are immutable and enter the proof context (`name = expr`) for all subsequent statements and the final expression.
+5. **Refinement-Aware Matching & Dead Branch Elimination:**
+   Exhaustiveness is checked against the active proof context. A branch that the context rules out (for example, `case None` under `require Current.is_some`, or `case Error` under `require Current.is_ok`) MAY be safely omitted. A reachable branch that is missing is rejected by the compiler. Omitted dead branches generate no runtime code and require no fallback handling, because the verifier has proven they cannot be executed.
+6. **Mutual Recursion Barriers:**
+   Types whose representations or invariants refer to each other cyclically are declared within a `group { A, B }` block (§4.3), enabling simultaneous structural induction. Independent sum types reside in standard compilation units.
+
+---
+
+### 5.2 The Standard Prelude Sum Types: `OPTION[A]` and `RESULT[E, A]`
+
+Gardel provides two foundational, universally available sum types in the Standard Prelude (§4.1) for modeling partiality, presence, and fallibility:
+- **`OPTION[A]` (Absence):** Represents the possible absence of a value without error diagnostic information (`None | Some(value: A)`).
+- **`RESULT[E, A]` (Domain Fallibility):** Represents the outcome of an operation that can fail with structured error context `E` or succeed with value `A` (`Error(err: E) | Ok(val: A)`).
+
+Both prelude sum types delegate element comparisons in `equals` to behavioral equivalence (`v1.equals(v2)` and `e1.equals(e2)`), respecting the Strict Equality Semantics of §9. Furthermore, both conditionally satisfy `CANONICAL_EQ` whenever their generic parameters satisfy `CANONICAL_EQ`, ensuring their behavioral equality coincides with structural Leibniz equality (`equals(other) = (Current = other)`).
+
+#### 1. Specification of `module OPTION[A]`
 
 ```eiffel
-module OPTION[A]
+module OPTION[A] satisfies CANONICAL_EQ where A satisfies CANONICAL_EQ
 
 representation {ANY}
   | None
@@ -299,12 +321,28 @@ representation {ANY}
 
 feature {ANY}
 
+  equals(other: OPTION[A]): BOOL
+    do
+      match Current
+        case None then other.is_none
+        case Some(v1) then
+          match other
+            case None then False
+            case Some(v2) then v1.equals(v2)
+          end
+      end
+    ensure
+      sound: Result = (Current = other)
+    end
+
   is_some: BOOL
     do
       match Current
         case None    then False
         case Some(_) then True
       end
+    ensure
+      def: Result = (not (Current = None))
     end
 
   is_none: BOOL
@@ -314,7 +352,8 @@ feature {ANY}
         case Some(_) then False
       end
     ensure
-      definition: Result = not Current.is_some
+      def: Result = (not Current.is_some)
+      is_empty_variant: Result = (Current = None)
     end
 
   get: A
@@ -324,6 +363,8 @@ feature {ANY}
       match Current
         case Some(v) then v
       end
+    ensure
+      matches_some: Current = Some(Result)
     end
 
   unwrap_or(default: A): A
@@ -333,8 +374,8 @@ feature {ANY}
         case Some(v) then v
       end
     ensure
-      none_case: Current.is_none implies Result = default
-      some_case: Current.is_some implies Result = Current.get
+      when_some: Current.is_some implies Result = Current.get
+      when_none: Current.is_none implies Result = default
     end
 
   map[B](f: A -> B): OPTION[B]
@@ -344,8 +385,9 @@ feature {ANY}
         case Some(v) then Some(f(v))
       end
     ensure
-      preserves_status: Result.is_some = Current.is_some
-      mapped_val: Current.is_some implies Result.get = f(Current.get)
+      preserves_some: Result.is_some = Current.is_some
+      preserves_none: Result.is_none = Current.is_none
+      mapped_val: Current.is_some implies Result = Some(f(Current.get))
     end
 
   and_then[B](f: A -> OPTION[B]): OPTION[B]
@@ -355,26 +397,157 @@ feature {ANY}
         case Some(v) then f(v)
       end
     ensure
-      none_bind: Current.is_none implies Result = None
-      some_bind: Current.is_some implies Result = f(Current.get)
+      none_propagates: Current.is_none implies Result.is_none
+      some_chains: Current.is_some implies Result = f(Current.get)
+    end
+
+specify {CANONICAL_EQ}
+
+  law agrees_with_structural(a: OPTION[A], b: OPTION[A])
+    ensure
+      sound: a.equals(b) = (a = b)
+    end
+
+specify {EQ}
+
+  law reflexive(a: OPTION[A])
+    ensure
+      refl: a.equals(a)
+    end
+
+  law symmetric(a: OPTION[A], b: OPTION[A])
+    require
+      ab: a.equals(b)
+    ensure
+      ba: b.equals(a)
+    end
+
+  law transitive(a: OPTION[A], b: OPTION[A], c: OPTION[A])
+    require
+      ab: a.equals(b)
+      bc: b.equals(c)
+    ensure
+      ac: a.equals(c)
+    end
+
+specify {ANY}
+
+  law none_is_not_some(opt: OPTION[A])
+    ensure
+      disjoint: opt.is_none = (not opt.is_some)
+    end
+
+  law unwrap_or_some(v: A, default: A)
+    ensure
+      extracts: Some(v).unwrap_or(default) = v
+    end
+
+  law unwrap_or_none(default: A)
+    ensure
+      defaults: None.unwrap_or(default) = default
+    end
+
+  law map_preserves_none[B](f: A -> B)
+    ensure
+      none_mapped: None.map(f) = None
+    end
+
+  law map_some[B](v: A, f: A -> B)
+    ensure
+      some_mapped: Some(v).map(f) = Some(f(v))
+    end
+
+  law map_identity(opt: OPTION[A])
+    ensure
+      id_mapped: opt.map(fn(x: A): A do x end) = opt
+    end
+
+  law map_composition[B, C](opt: OPTION[A], f: B -> C, g: A -> B)
+    ensure
+      composed: opt.map(g).map(f) = opt.map(fn(x: A): C do f(g(x)) end)
+    end
+
+  law and_then_left_unit[B](v: A, f: A -> OPTION[B])
+    ensure
+      left_id: Some(v).and_then(f) = f(v)
+    end
+
+  law and_then_none[B](f: A -> OPTION[B])
+    ensure
+      absorbs: None.and_then(f) = None
+    end
+
+  law and_then_right_identity(opt: OPTION[A])
+    ensure
+      right_id: opt.and_then(fn(x: A): OPTION[A] do Some(x) end) = opt
+    end
+
+  law and_then_associative[B, C](opt: OPTION[A], f: A -> OPTION[B], g: B -> OPTION[C])
+    ensure
+      assoc: opt.and_then(f).and_then(g) =
+             opt.and_then(fn(x: A): OPTION[C] do f(x).and_then(g) end)
     end
 
 end
+```
 
-module RESULT[E, A]
+#### 2. Specification of `module RESULT[E, A]`
+
+`RESULT[E, A]` is parameterized by error type `E` first and value type `A` second, aligning the success channel with standard covariant functor and monad combinators. It provides factory creation routines (`RESULT.ok`, `RESULT.error`) alongside direct variant construction (`Ok(v)`, `Error(e)`), total safe fallback (`unwrap_or`), error adaptation (`map_error`), and error erasure (`to_option`).
+
+```eiffel
+module RESULT[E, A] satisfies CANONICAL_EQ where E satisfies CANONICAL_EQ, A satisfies CANONICAL_EQ
 
 representation {ANY}
   | Error(err: E)
   | Ok(val: A)
 
+create {ANY}
+
+  ok(v: A): RESULT[E, A]
+    do
+      Ok(v)
+    ensure
+      is_ok_res: Result.is_ok
+      val_set: Result.get = v
+    end
+
+  error(e: E): RESULT[E, A]
+    do
+      Error(e)
+    ensure
+      is_err_res: Result.is_error
+      err_set: Result.get_error = e
+    end
+
 feature {ANY}
+
+  equals(other: RESULT[E, A]): BOOL
+    do
+      match Current
+        case Error(e1) then
+          match other
+            case Error(e2) then e1.equals(e2)
+            case Ok(_)     then False
+          end
+        case Ok(v1) then
+          match other
+            case Error(_)  then False
+            case Ok(v2)    then v1.equals(v2)
+          end
+      end
+    ensure
+      sound: Result = (Current = other)
+    end
 
   is_ok: BOOL
     do
       match Current
-        case Ok(_)    then True
         case Error(_) then False
+        case Ok(_)    then True
       end
+    ensure
+      def: Result = (match Current case Error(_) then False case Ok(_) then True end)
     end
 
   is_error: BOOL
@@ -384,25 +557,29 @@ feature {ANY}
         case Ok(_)    then False
       end
     ensure
-      opposite: Result = not Current.is_ok
+      complement: Result = (not Current.is_ok)
     end
 
   get: A
     require
-      success: Current.is_ok
+      ok_present: Current.is_ok
     do
       match Current
         case Ok(v) then v
       end
+    ensure
+      matches_ok: Current = Ok(Result)
     end
 
   get_error: E
     require
-      failure: Current.is_error
+      err_present: Current.is_error
     do
       match Current
         case Error(e) then e
       end
+    ensure
+      matches_err: Current = Error(Result)
     end
 
   unwrap_or(default: A): A
@@ -412,47 +589,160 @@ feature {ANY}
         case Ok(v)    then v
       end
     ensure
-      err_case: Current.is_error implies Result = default
-      ok_case: Current.is_ok implies Result = Current.get
+      when_ok: Current.is_ok implies Result = Current.get
+      when_err: Current.is_error implies Result = default
+    end
+
+  to_option: OPTION[A]
+    do
+      match Current
+        case Error(_) then None
+        case Ok(v)    then Some(v)
+      end
+    ensure
+      preserves_status: Result.is_some = Current.is_ok
     end
 
   map[B](f: A -> B): RESULT[E, B]
     do
       match Current
-        case Ok(v)    then Ok(f(v))
         case Error(e) then Error(e)
+        case Ok(v)    then Ok(f(v))
       end
     ensure
-      preserves_status: Result.is_ok = Current.is_ok
-      mapped_val: Current.is_ok implies Result.get = f(Current.get)
-      preserved_err: Current.is_error implies Result.get_error = Current.get_error
+      preserves_ok: Result.is_ok = Current.is_ok
+      preserves_err: Current.is_error implies Result.get_error = Current.get_error
+      mapped_ok: Current.is_ok implies Result = Ok(f(Current.get))
     end
 
   map_error[F](f: E -> F): RESULT[F, A]
     do
       match Current
-        case Ok(v)    then Ok(v)
         case Error(e) then Error(f(e))
+        case Ok(v)    then Ok(v)
       end
     ensure
-      preserves_status: Result.is_ok = Current.is_ok
-      preserved_val: Current.is_ok implies Result.get = Current.get
-      mapped_err: Current.is_error implies Result.get_error = f(Current.get_error)
+      preserves_ok: Result.is_ok = Current.is_ok
+      preserves_val: Current.is_ok implies Result.get = Current.get
+      mapped_err: Current.is_error implies Result = Error(f(Current.get_error))
     end
 
   and_then[B](f: A -> RESULT[E, B]): RESULT[E, B]
     do
       match Current
-        case Ok(v)    then f(v)
         case Error(e) then Error(e)
+        case Ok(v)    then f(v)
       end
     ensure
-      bind_ok: Current.is_ok implies Result = f(Current.get)
-      bind_err: Current.is_error implies Result = Error(Current.get_error)
+      err_propagates: Current.is_error implies (Result.is_error and Result.get_error = Current.get_error)
+      ok_chains: Current.is_ok implies Result = f(Current.get)
+    end
+
+specify {CANONICAL_EQ}
+
+  law agrees_with_structural(a: RESULT[E, A], b: RESULT[E, A])
+    ensure
+      sound: a.equals(b) = (a = b)
+    end
+
+specify {EQ}
+
+  law reflexive(a: RESULT[E, A])
+    ensure
+      refl: a.equals(a)
+    end
+
+  law symmetric(a: RESULT[E, A], b: RESULT[E, A])
+    require
+      ab: a.equals(b)
+    ensure
+      ba: b.equals(a)
+    end
+
+  law transitive(a: RESULT[E, A], b: RESULT[E, A], c: RESULT[E, A])
+    require
+      ab: a.equals(b)
+      bc: b.equals(c)
+    ensure
+      ac: a.equals(c)
+    end
+
+specify {ANY}
+
+  law ok_not_error(r: RESULT[E, A])
+    ensure
+      dichotomy: r.is_error = (not r.is_ok)
+    end
+
+  law map_ok[B](v: A, f: A -> B)
+    ensure
+      ok_mapped: Ok(v).map(f) = Ok(f(v))
+    end
+
+  law map_preserves_error[B](e: E, f: A -> B)
+    ensure
+      err_untouched: Error(e).map(f) = Error(e)
+    end
+
+  law map_identity(res: RESULT[E, A])
+    ensure
+      id_mapped: res.map(fn(x: A): A do x end) = res
+    end
+
+  law map_composition[B, C](res: RESULT[E, A], f: B -> C, g: A -> B)
+    ensure
+      composed: res.map(g).map(f) = res.map(fn(x: A): C do f(g(x)) end)
+    end
+
+  law map_error_err[F](e: E, f: E -> F)
+    ensure
+      err_mapped: Error(e).map_error(f) = Error(f(e))
+    end
+
+  law map_error_preserves_ok[F](v: A, f: E -> F)
+    ensure
+      ok_untouched: Ok(v).map_error(f) = Ok(v)
+    end
+
+  law and_then_ok[B](v: A, f: A -> RESULT[E, B])
+    ensure
+      chain_ok: Ok(v).and_then(f) = f(v)
+    end
+
+  law and_then_error[B](e: E, f: A -> RESULT[E, B])
+    ensure
+      chain_err: Error(e).and_then(f) = Error(e)
+    end
+
+  law and_then_right_identity(res: RESULT[E, A])
+    ensure
+      right_id: res.and_then(fn(x: A): RESULT[E, A] do Ok(x) end) = res
+    end
+
+  law and_then_associative[B, C](res: RESULT[E, A], f: A -> RESULT[E, B], g: B -> RESULT[E, C])
+    ensure
+      assoc: res.and_then(f).and_then(g) =
+             res.and_then(fn(x: A): RESULT[E, C] do f(x).and_then(g) end)
     end
 
 end
 ```
+
+---
+
+### 5.3 Monadic Properties & First-Order SMT Formulations
+
+In Gardel, higher-order abstractions are formulated to ensure deterministic, decidable SMT verification:
+1. **Pointwise Combinators:** Higher-order routines (`map`, `and_then`, `map_error`) are specified pointwise on the underlying variants (`Result = Ok(f(Current.get))` or `Result = Error(e)`). This avoids higher-order function extensionality quantifiers that can trigger SMT solver non-termination.
+2. **First-Class Function Theory:** Function parameters (`f: A -> B`) translate to an uninterpreted function sort `Fn1 A B` in Boogie and Dafny, equipped with an application axiom `Fn1_app(f, x)`.
+3. **Verified Category-Theoretic Laws:**
+   - **Constructor Reduction:** `Ok(v).map(f) = Ok(f(v))` and `Error(e).map(f) = Error(e)`.
+   - **Functor Identity:** `res.map(fn(x: A): A do x end) = res` and `opt.map(fn(x: A): A do x end) = opt`.
+   - **Functor Composition (Map Fusion):** `res.map(g).map(f) = res.map(fn(x: A): C do f(g(x)) end)`.
+   - **Monad Left Unit:** `Ok(v).and_then(f) = f(v)`.
+   - **Monad Right Unit:** `res.and_then(fn(x: A): RESULT[E, A] do Ok(x) end) = res`.
+   - **Monad Associativity:** `res.and_then(f).and_then(g) = res.and_then(fn(x: A): RESULT[E, C] do f(x).and_then(g) end)`.
+   - **Error Absorption:** `Error(e).and_then(f) = Error(e)`.
 
 ---
 
@@ -860,72 +1150,197 @@ The Dual-Layer Model Refinement architecture provides three formal verification 
 
 ## 7. Contracts, ghost code and the proof boundary
 
-Contracts are never evaluated at runtime, so a program must be able to establish every precondition from data it actually has. Gardel provides five mechanisms for this and explicit rules for when the solver needs guidance.
+Contracts are never evaluated at runtime, so a program must be able to establish every precondition from data it actually has. Gardel provides five core boundary mechanisms and explicit rules for when the solver needs guidance.
 
-1. **Ghost versus runtime.** `specify` queries exist only for proofs. `feature` queries are compiled. Contracts may call both, and `do` bodies (outside `check`/`assume`) may call only runtime queries.
-2. **Path conditions.** The condition of an `if` and the pattern of a `match` enter the proof context of each branch, so a runtime test discharges a precondition:
+### 7.1 Boundary Verification Architecture & Core Mechanisms
+
+1. **Ghost versus Runtime:**
+   `specify` queries exist solely for mathematical specification and proofs, erased before compilation. `feature` queries generate runtime code. Contracts (`require`, `ensure`, `invariant`) may reference both ghost and runtime queries, whereas `do` bodies (outside explicit `check` and `assume` blocks) may invoke only runtime queries.
+2. **Path Conditions:**
+   The boolean guard of an `if` statement and the pattern-matched variant of a `match` expression automatically enter the proof context ($\Gamma \vdash P$) for the corresponding branch. A simple runtime test therefore discharges downstream preconditions statically:
 
    ```eiffel
    push_or_same(x: A): BOUNDED_STACK[A]
      do
-       if Current.count < Current.capacity
-         then Current.push(x)
-         else Current
+       if Current.count < Current.capacity then
+         Current.push(x)
+       else
+         Current
        end
      end
    ```
-3. **Runtime-checkable preconditions.** Write preconditions of exported routines with exported runtime queries, as `push` does with `count` and `capacity`. A precondition that uses only ghost symbols draws the warning `ghost_precondition`, because callers can then only discharge it statically.
-4. **Checked constructors at the boundary.** Untrusted data from outside becomes an invariant-carrying value only through a routine that returns `OPTION` or `RESULT`:
+3. **Runtime-Checkable Preconditions:**
+   Public preconditions of exported routines must be expressed via exported runtime queries (as `push` uses `count < capacity`). A precondition that references purely ghost symbols emits the static warning `ghost_precondition`, because external callers cannot establish it via runtime control flow.
+4. **Checked Constructors at the Boundary:**
+   Untrusted external data crosses the proof boundary into invariant-carrying verified ADTs strictly via total routines that return `RESULT[E, A]` or `OPTION[A]` (§7.2.2).
+5. **Opaque Bodies and Fuel:**
+   Outside its declaring module, a function is known to the SMT solver strictly by its signature, precondition, and `ensure` postconditions. Inside its module, recursive functions unfold up to a configurable `fuel` bound (default 2), and `reveal f` unfolds a definition fully for the scope of the enclosing block. Key inductive facts must be stated as explicit `ensure` clauses so callers can utilize them without body unfolding.
 
+---
+
+### 7.2 The Error Handling Doctrine
+
+Gardel enforces an architectural separation between **programmer specification bugs** and **runtime environmental fallibility**. There are no runtime exceptions (`throw`/`catch`), no `try/except` constructs, no `null`/`nil` references, and no uncatchable panics. All possible runtime failure modes are total, explicit, and strongly typed.
+
+#### 7.2.1 Philosophical Separation: Static Contract Bugs vs Dynamic Domain Fallibility
+
+The foundational doctrine rests on two distinct, complementary mechanisms:
+
+| Dimension | Preconditions (`require`) & Invariants (`invariant`) | Fallible Values (`RESULT[E, A]` & `OPTION[A]`) |
+| :--- | :--- | :--- |
+| **Domain** | Internal program logic, algorithmic contracts, representation invariants. | External boundary inputs, I/O, parsing, network, validation. |
+| **Meaning of Failure** | **Programmer bug.** The calling code broke the agreed contract. | **Expected runtime condition.** The world or input is imperfect. |
+| **Enforcement** | **Static proof (Compile-time).** Discharged by SMT (Boogie/Z3). | **Value propagation (Runtime).** Modeled as algebraic sum types. |
+| **Runtime Overhead** | **Zero.** Contract assertions generate no code in verified binaries. | **Predictable.** Efficient tag-and-payload variant dispatch. |
+| **Failure Recovery** | Not applicable; program does not compile if contracts fail. | Railway-oriented composition via `and_then`, `map`, `unwrap_or`. |
+
+1. **Preconditions (`require`): Bugs Rejected at Compile Time:**
+   Preconditions state the domain of total internal functions (e.g., non-empty stack for `pop`, non-zero divisor for division, valid index for array access). A precondition violation represents an internal software defect. Because `gardelc` mandates that all preconditions be verified statically before compilation, **runtime assertion checks and panic handlers do not exist in Gardel binaries.** If the solver cannot prove that a precondition always holds, the build fails.
+2. **Fallible Values (`RESULT[E, A]`): Total Domain Fallibility:**
+   Operations that process untrusted external inputs (such as parsing strings, decoding bytes, reading disk or network I/O, or validating user forms) cannot assume preconditions statically. These operations must be total functions returning the prelude sum type `RESULT[E, A]` (or `OPTION[A]` when error diagnostics are unneeded).
+
+#### 7.2.2 The Invariant Gateway Pattern (Boundary Ingestion & Invariant Establishment)
+
+Untrusted external data enters the verified core through the **Invariant Gateway Pattern**:
+1. External or untrusted raw data is ingested as unrefined boundary types (`BYTES`, raw integers, or untrusted strings).
+2. A boundary constructor (a "try-constructor") performs complete runtime validation without preconditions (`require True`) and returns `RESULT[E, TargetType]`.
+3. Inside the `Ok(val)` branch, the verifier knows that `val` satisfies `TargetType`'s module invariant ($I_{\text{rep}}$).
+4. All subsequent internal operations on `val` take `val` by its refined type, requiring preconditions that are proven statically from the invariant and preceding path conditions without any runtime overhead.
+
+```eiffel
+-- Boundary constructors on BOUNDED_STACK[A] (§6): total, enforce invariants
+  try_make(cap: NAT): OPTION[BOUNDED_STACK[A]]
+    do
+      if cap > 0 then
+        Some(BOUNDED_STACK.make(cap))
+      else
+        None
+      end
+    ensure
+      accepted: Result.is_some = (cap > 0)
+    end
+
+  try_make_result(cap: NAT): RESULT[STRING, BOUNDED_STACK[A]]
+    do
+      if cap > 0 then
+        Ok(BOUNDED_STACK.make(cap))
+      else
+        Error("capacity must be strictly positive")
+      end
+    ensure
+      accepted: Result.is_ok = (cap > 0)
+      err_spec: Result.is_error implies Result.get_error = "capacity must be strictly positive"
+    end
+```
+
+#### 7.2.3 Railway-Oriented Monadic Pipeline Architecture
+
+In Gardel, sequential fallible workflows compose using **Railway-Oriented Monadic Pipelines** without requiring special language syntax (such as Rust's `?`, Haskell's `do` notation, or Java's `try/catch`). Control flow is made explicit through standard method chaining on `RESULT[E, A]`:
+
+```mermaid
+flowchart LR
+    Input["Input: BYTES"] --> S1["STRING.from_utf8"]
+    S1 -- "Error(STRING_ERROR)" --> ME["map_error -> STRING"]
+    ME --> ErrTrack["Error Track: Error(STRING)"]
+    S1 -- "Ok(STRING)" --> S2["CONFIG_PARSER.parse_ast"]
+    S2 -- "Error(STRING)" --> ErrTrack
+    S2 -- "Ok(PARSED_AST)" --> S3["map: CONFIG_BUILDER.build"]
+    S3 -- "Ok(INTERMEDIATE_CONFIG)" --> S4["SERVER_CONFIG.validate"]
+    S4 -- "Error(STRING)" --> ErrTrack
+    S4 -- "Ok(SERVER_CONFIG)" --> OutTrack["Success Track: Ok(SERVER_CONFIG)"]
+```
+
+The pipeline operates on two distinct logical tracks:
+1. **The Success Track (`Ok`):** Carries intermediate values through successive transformations.
+2. **The Failure Track (`Error`):** Short-circuits remaining computation and carries the error diagnostic directly to the caller.
+
+##### Pipeline Combinator Toolbox
+
+- **`and_then[B](f: A -> RESULT[E, B]): RESULT[E, B]` (Monadic Bind):**
+  Chains a fallible computation. If `Current` is `Ok(v)`, it executes `f(v)`. If `Current` is `Error(e)`, execution skips `f` entirely and immediately propagates `Error(e)`.
+- **`map[B](f: A -> B): RESULT[E, B]` (Functor Transform):**
+  Applies a pure transformation `f` to the success value if `Current` is `Ok(v)`. Leaves `Error(e)` untouched.
+- **`map_error[F](f: E -> F): RESULT[F, A]` (Error Adaptation):**
+  Transforms error payloads across domain boundaries. Low-level I/O or parser errors are mapped to high-level application domain errors without disturbing the success channel.
+- **`to_option: OPTION[A]` (Absence Projection):**
+  Converts `Ok(v)` to `Some(v)` and `Error(_)` to `None`, discarding diagnostic details when callers only require presence/absence information.
+
+##### Concrete Railway Pipeline Example
+
+The following verified routine demonstrates an end-to-end railway pipeline ingesting raw untrusted bytes, decoding UTF-8, adapting the error type, parsing application configuration, and validating business rules:
+
+```eiffel
+module CONFIG_LOADER
+
+feature {ANY}
+
+  load_config(payload: BYTES): RESULT[STRING, SERVER_CONFIG]
+    do
+      STRING.from_utf8(payload)
+        .map_error(fn(err: STRING_ERROR): STRING do
+          "Malformed UTF-8 payload in config byte stream"
+        end)
+        .and_then(fn(text: STRING): RESULT[STRING, PARSED_AST] do
+          CONFIG_PARSER.parse_ast(text)
+        end)
+        .map(fn(ast: PARSED_AST): INTERMEDIATE_CONFIG do
+          CONFIG_BUILDER.build(ast)
+        end)
+        .and_then(fn(cfg: INTERMEDIATE_CONFIG): RESULT[STRING, SERVER_CONFIG] do
+          SERVER_CONFIG.validate(cfg)
+        end)
+    ensure
+      err_non_empty: Result.is_error implies Result.get_error.byte_length > 0
+    end
+
+end
+```
+
+#### 7.2.4 Checked Extraction vs Safe Fallbacks
+
+Gardel provides two complementary paradigms for consuming values from `RESULT[E, A]` and `OPTION[A]`:
+
+1. **Total Safe Fallback (`unwrap_or`):**
+   `unwrap_or(default: A): A` provides unconditional, total value extraction. If the receiver is `Ok(v)` or `Some(v)`, it yields `v`; if `Error(_)` or `None`, it returns `default`. It carries no preconditions and can never fail:
    ```eiffel
-   try_make(cap: NAT): OPTION[BOUNDED_STACK[A]]
-     do
-       if cap > 0
-         then Some(BOUNDED_STACK.make(cap))
-         else None
-       end
-     ensure
-       accepted: Result.is_some = (cap > 0)
-     end
-
-   try_make_result(cap: NAT): RESULT[STRING, BOUNDED_STACK[A]]
-     do
-       if cap > 0
-         then Ok(BOUNDED_STACK.make(cap))
-         else Error("capacity must be positive")
-       end
-     ensure
-       accepted: Result.is_ok = (cap > 0)
-       err_message: Result.is_error implies Result.get_error = "capacity must be positive"
-     end
+   let timeout = config.get_timeout.unwrap_or(30)
    ```
-5. **Opaque bodies and fuel.** Outside its module a function is known only by its signature and `ensure` clauses. Inside, recursive functions unfold up to a `fuel` limit (default 2), and `reveal f` unfolds one definition fully for the remainder of the current block. State key facts as `ensure` clauses so clients can use them without unfolding.
-
-### The Error Handling Doctrine
-
-Gardel strictly separates programmer specification defects from runtime environmental fallibility:
-
-1. **Preconditions (`require`): Bugs Rejected at Compile Time.**
-   Preconditions define caller obligations for total internal operations (e.g., non-empty queue, positive divisor, index in range). A precondition violation represents a programmer logic error. Because all preconditions are statically discharged by Z3 before compilation, verified binaries incur zero runtime checking overhead, and no runtime contract exceptions or panics can ever occur.
-2. **Fallible Values (`RESULT[E, A]`): Total Domain Fallibility.**
-   Operations that process untrusted external inputs (such as parsing strings, decoding bytes, reading disk or network I/O, or validating user forms) cannot assume preconditions statically. These operations must be total functions returning the prelude sum type `RESULT[E, A]` (or `OPTION[A]` when diagnostic reasons are unneeded). Gardel has no exceptions, `null`, or undefined behavior.
-3. **Railway-Oriented Monadic Composition:**
-   Fallible operations compose sequentially without special language syntax or early-return keywords. Using the Standard Prelude combinators `map`, `map_error`, and `and_then`, complex workflows form transparent, total, railway-oriented pipelines:
-
+2. **Statically Verified Checked Extraction (`get` & `get_error`):**
+   When a caller has established that a result succeeded (via an `if res.is_ok` branch or pattern match), `res.get` extracts the inner value with zero runtime checking overhead:
    ```eiffel
-   parse_and_verify(raw: BYTES): RESULT[STRING, PARSED_CONFIG]
-     do
-       STRING.from_utf8(raw).map_error(fn(e: STRING_ERROR): STRING do
-         "Invalid UTF-8 payload"
-       end).and_then(fn(s: STRING): RESULT[STRING, PARSED_CONFIG] do
-         CONFIG_PARSER.parse(s)
-       end)
-     end
+   if res.is_ok then
+     process(res.get)   -- Proven safe by SMT via path condition; no panic possible
+   else
+     log(res.get_error) -- Proven safe by SMT via negative path condition
+   end
    ```
+   Calling `res.get` without proving `res.is_ok` fails verification with `contract_tag: "ok_present"`, presenting an `Error(...)` counterexample in `--json-diagnostics` (§12).
 
-   Successful results (`Ok`) propagate through transformations, while failures (`Error`) short-circuit cleanly to the caller with full error context.
+#### 7.2.5 Formal Verification of Monadic Pipelines
 
-**When the solver returns unknown.** The build fails. The author or AI agent may add `check tag: pred end` hints, bind intermediate values with `let`, split the proof into lemmas under `specify`, or write `assume tag: predicate end`. An `assume` adds the fact without proof. `gardelc --audit` lists every `assume`, and `--strict` rejects them.
+Monadic composition in Gardel is fully transparent to the SMT solver:
+- The postconditions of `and_then`:
+  ```eiffel
+  ensure
+    err_propagates: Current.is_error implies (Result.is_error and Result.get_error = Current.get_error)
+    ok_chains: Current.is_ok implies Result = f(Current.get)
+  ```
+  provide exact equality substitution for Boogie/Z3. Calling `r.and_then(f)` when `r` is known to be `Ok(v)` allows the solver to replace the invocation with `f(v)` in a single deduction step.
+- The monad laws (`and_then_left_unit`, `and_then_right_identity`, `and_then_associative`) proven in `specify {ANY}` guarantee that refactoring a monolithic pipeline into helper functions or re-associating nested binds never alters the program's mathematical semantics or verification conditions.
+
+---
+
+### 7.3 Solver Guidance, Fuel & Proof Failure Handling
+
+When Boogie/Z3 returns `unknown` or fails to prove an obligation:
+1. **Compilation Fails:** The build terminates immediately; unverified code cannot be transpiled or executed.
+2. **Diagnostic Feedback:** `gardelc --json-diagnostics` emits counterexamples, the violated contract clause tag, and relevant concept laws (§12).
+3. **Programmer Guidance:**
+   - Add intermediate assertion steps: `check tag: predicate end`.
+   - Name intermediate values with `let` to split large expressions.
+   - Adjust function unfolding with `reveal f` or increase routine `fuel`.
+   - Formulate ghost lemmas in `specify` blocks proving inductive sub-goals.
+   - In rare exploratory phases, mark an unproven assumption with `assume tag: predicate end`. `gardelc --audit` lists all ambient assumptions, and production compilation (`--strict`) strictly rejects any remaining `assume` blocks.
 
 ---
 
@@ -1194,16 +1609,16 @@ Gardel incorporates a formal catalogue of algebraic equations across five primar
    - *Right Identity:* `a.concat(empty).equals(a)`
 2. **Functor Laws and Map Fusion:**
    For structure-preserving transformations (`map` on `SEQ`, `LIST`, `OPTION`, `RESULT`):
-   - *Identity Preservation:* `xs.map(FUNCTION_OPS.id_fn).equals(xs)`
-   - *Functor Composition / Map Fusion:* `xs.map(g).map(f).equals(xs.map(fn(x) do f(g(x)) end))`
+   - *Identity Preservation:* `xs.map(fn(x: A): A do x end).equals(xs)`
+   - *Functor Composition / Map Fusion:* `xs.map(g).map(f).equals(xs.map(fn(x: A): C do f(g(x)) end))`
 3. **Monad Laws:**
    For sequential monadic computation (`and_then` on `OPTION` and `RESULT`):
    - *Left Unit:* `Some(x).and_then(f) = f(x)` and `Ok(x).and_then(f) = f(x)`
-   - *Right Unit:* `m.and_then(fn(x) do Some(x) end) = m` and `m.and_then(fn(x) do Ok(x) end) = m`
-   - *Associativity:* `m.and_then(f).and_then(g) = m.and_then(fn(x) do f(x).and_then(g) end)`
+   - *Right Unit:* `m.and_then(fn(x: A): OPTION[A] do Some(x) end) = m` and `m.and_then(fn(x: A): RESULT[E, A] do Ok(x) end) = m`
+   - *Associativity:* `m.and_then(f).and_then(g) = m.and_then(fn(x: A): M[C] do f(x).and_then(g) end)`
 4. **Fold Laws and Homomorphisms:**
    For divide-and-conquer reductions and aggregations:
-   - *Fold-Map Fusion:* `xs.map(g).fold_left(f, init) = xs.fold_left(fn(acc, x) do f(acc, g(x)) end, init)`
+   - *Fold-Map Fusion:* `xs.map(g).fold_left(f, init) = xs.fold_left(fn(acc: C, x: A): C do f(acc, g(x)) end, init)`
    - *Homomorphism over Concatenation:* When `op` is associative with identity `id`:  
      `concat(xs, ys).fold_left(op, id) = op(xs.fold_left(op, id), ys.fold_left(op, id))`
    - *Duality:* For commutative operations, `xs.fold_left(op, id) = xs.fold_right(op, id)`
@@ -1439,7 +1854,8 @@ A compilation project comprises multiple `CompilationUnit` source files linked i
 TypeParams    ::= "[" TypeParam ( "," TypeParam )* "]"
 TypeParam     ::= UpperIdent ( ":" UpperIdent )?
 Satisfies     ::= "satisfies" UpperIdent ( "," UpperIdent )*
-                    ( "where" UpperIdent "satisfies" UpperIdent )?
+                    ( "where" WhereClause ( "," WhereClause )* )?
+WhereClause   ::= UpperIdent "satisfies" UpperIdent
 Refines       ::= "refines" UpperIdent ( "," UpperIdent )*
 
 VisList       ::= "{" UpperIdent ( "," UpperIdent )* "}"
@@ -1459,7 +1875,7 @@ Signature     ::= LowerIdent Params? ":" Type
 Params        ::= "(" Param ( "," Param )* ")"
 Param         ::= LowerIdent ":" Type
 
-LawDecl       ::= "law" LowerIdent Params
+LawDecl       ::= "law" LowerIdent TypeParams? Params
                     RequireBlock? TriggerBlock? VariantBlock?
                     ( "do" Block )?
                     EnsureBlock?

@@ -81,7 +81,7 @@ feature {ANY}
         case Some(v1) then
           match other
             case None then False
-            case Some(v2) then v1 = v2
+            case Some(v2) then v1.equals(v2)
           end
       end
     ensure
@@ -208,6 +208,16 @@ specify {ANY}
   law map_some[B](v: A, f: A -> B)
     ensure
       some_mapped: Some(v).map(f) = Some(f(v))
+    end
+
+  law map_identity(opt: OPTION[A])
+    ensure
+      id_mapped: opt.map(fn(x: A): A do x end) = opt
+    end
+
+  law map_composition[B, C](opt: OPTION[A], f: B -> C, g: A -> B)
+    ensure
+      composed: opt.map(g).map(f) = opt.map(fn(x: A): C do f(g(x)) end)
     end
 
   law and_then_left_unit[B](v: A, f: A -> OPTION[B])
@@ -733,13 +743,13 @@ feature {ANY}
       match Current
         case Error(e1) then
           match other
-            case Error(e2) then e1 = e2
+            case Error(e2) then e1.equals(e2)
             case Ok(_)     then False
           end
         case Ok(v1) then
           match other
             case Error(_)  then False
-            case Ok(v2)    then v1 = v2
+            case Ok(v2)    then v1.equals(v2)
           end
       end
     ensure
@@ -880,7 +890,7 @@ specify {ANY}
       dichotomy: r.is_error = (not r.is_ok)
     end
 
-  law map_ok[B](dummy: E, v: A, f: A -> B)
+  law map_ok[B](v: A, f: A -> B)
     ensure
       ok_mapped: Ok(v).map(f) = Ok(f(v))
     end
@@ -890,7 +900,17 @@ specify {ANY}
       err_untouched: Error(e).map(f) = Error(e)
     end
 
-  law map_error_err[F](dummy: A, e: E, f: E -> F)
+  law map_identity(res: RESULT[E, A])
+    ensure
+      id_mapped: res.map(fn(x: A): A do x end) = res
+    end
+
+  law map_composition[B, C](res: RESULT[E, A], f: B -> C, g: A -> B)
+    ensure
+      composed: res.map(g).map(f) = res.map(fn(x: A): C do f(g(x)) end)
+    end
+
+  law map_error_err[F](e: E, f: E -> F)
     ensure
       err_mapped: Error(e).map_error(f) = Error(f(e))
     end

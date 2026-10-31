@@ -107,15 +107,15 @@ flowchart TD
 - [x] Establish the **one-module-per-file** physical convention with globally unique top-level module names.
 - [x] Update §15 (Grammar) to clarify top-level compilation units.
 
-#### Task A.3: Standardize Prelude Sum Types & the Error Handling Doctrine (§5, §7)
-- Elevate `RESULT[E, A]` alongside `OPTION[A]` in §5 with its standard definition:
+#### Task A.3: Standardize Prelude Sum Types & the Error Handling Doctrine (§5, §7) [✅ Completed]
+- [x] Elevate `RESULT[E, A]` alongside `OPTION[A]` in §5 with its standard definition:
   ```eiffel
   module RESULT[E, A]
   representation {ANY}
     | Error(err: E)
     | Ok(val: A)
   ```
-- Formulate the **Error Handling Doctrine** in §7:
+- [x] Formulate the **Error Handling Doctrine** in §7:
   - **Preconditions (`require`):** Enforce programmer contracts and type invariants. A violation indicates a bug rejected statically by the verifier.
   - **Fallible Values (`RESULT[E, A]`):** Represent expected domain failures and untrusted boundary data. Total functions return `RESULT` without exceptions.
   - Detail `and_then` chaining for composable, railway-oriented monadic pipelines without special language syntax.

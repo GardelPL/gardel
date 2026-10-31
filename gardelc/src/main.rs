@@ -6217,6 +6217,31 @@ fn emit_boogie_expr_with_strings(
                 "first" => format!("Tuple2_first({r_str})"),
                 "second" => format!("Tuple2_second({r_str})"),
                 _ => {
+                    if mname == "equals"
+                        && args.len() == 1
+                        && (m.name == "OPTION" || m.name == "RESULT")
+                        && !matches!(
+                            &**recv,
+                            Expr::Var(v)
+                                if v == "Current"
+                                    || v == "other"
+                                    || v == "a"
+                                    || v == "b"
+                                    || v == "c"
+                                    || v == "opt"
+                                    || v == "res"
+                        )
+                    {
+                        let rhs = emit_boogie_expr_with_strings(
+                            &args[0],
+                            m,
+                            implicit_fields,
+                            revealed,
+                            fuel_var,
+                            strings,
+                        );
+                        return format!("({r_str} == {rhs})");
+                    }
                     if let ReprKind::Product(fields) = &m.repr {
                         if args.is_empty() && fields.iter().any(|(fnm, _)| fnm == mname) {
                             return format!("{}_{mname}({r_str})", m.name);
@@ -6227,7 +6252,15 @@ fn emit_boogie_expr_with_strings(
                     } else {
                         fuel_var
                     };
-                    let mut full_args = vec![call_fuel.to_string(), r_str];
+                    let recv_arg = if m.name == "RESULT"
+                        && (mname == "map" || mname == "map_error")
+                        && matches!(&**recv, Expr::Call(c, _) if c == "Ok" || c == "Error")
+                    {
+                        format!("({r_str} : (RESULT E A))")
+                    } else {
+                        r_str
+                    };
+                    let mut full_args = vec![call_fuel.to_string(), recv_arg];
                     for a in args {
                         full_args.push(emit_boogie_expr_with_strings(
                             a,
@@ -7827,7 +7860,10 @@ fn expr_calls_routine(e: &Expr, rname: &str) -> bool {
         Expr::BinOp(_, l, r) => expr_calls_routine(l, rname) || expr_calls_routine(r, rname),
         Expr::Call(f, args) => f == rname || args.iter().any(|a| expr_calls_routine(a, rname)),
         Expr::MethodCall(recv, mname, args) => {
-            mname == rname
+            let is_elem_eq = mname == "equals"
+                && rname == "equals"
+                && matches!(&**recv, Expr::Var(v) if v == "v1" || v == "e1");
+            (!is_elem_eq && mname == rname)
                 || expr_calls_routine(recv, rname)
                 || args.iter().any(|a| expr_calls_routine(a, rname))
         }
@@ -8264,6 +8300,18 @@ fn eval_expr_symbolic(
                 ("is_none", GardelVal::Variant(name, _)) => Ok(GardelVal::Bool(name == "None")),
                 ("is_ok", GardelVal::Variant(name, _)) => Ok(GardelVal::Bool(name == "Ok")),
                 ("is_error", GardelVal::Variant(name, _)) => Ok(GardelVal::Bool(name == "Error")),
+                (
+                    "equals",
+                    GardelVal::Int(_)
+                    | GardelVal::Bool(_)
+                    | GardelVal::Str(_)
+                    | GardelVal::Char(_)
+                    | GardelVal::Float(_)
+                    | GardelVal::Unit,
+                ) => {
+                    let rhs = eval_expr_symbolic(&args[0], env, m, revealed, fuel)?;
+                    Ok(GardelVal::Bool(r_val == rhs))
+                }
                 ("first", GardelVal::Tuple(es)) => es.first().cloned().ok_or(EvalFault::Unknown),
                 ("second", GardelVal::Tuple(es)) => es.get(1).cloned().ok_or(EvalFault::Unknown),
                 (_, GardelVal::Record(fields)) => {
@@ -9034,6 +9082,24 @@ fn emit_dafny_expr(e: &Expr, m: &ModuleDecl, implicit_fields: &HashSet<String>) 
                 ),
                 "length" if m.name != "SEQ" => format!("(|{r_str}| as U64)"),
                 _ => {
+                    if mname == "equals"
+                        && args.len() == 1
+                        && (m.name == "OPTION" || m.name == "RESULT")
+                        && !matches!(
+                            &**recv,
+                            Expr::Var(v)
+                                if v == "Current"
+                                    || v == "other"
+                                    || v == "a"
+                                    || v == "b"
+                                    || v == "c"
+                                    || v == "opt"
+                                    || v == "res"
+                        )
+                    {
+                        let rhs = emit_dafny_expr(&args[0], m, implicit_fields);
+                        return format!("({r_str} == {rhs})");
+                    }
                     if let ReprKind::Product(fields) = &m.repr {
                         if args.is_empty() && fields.iter().any(|(fnm, _)| fnm == mname) {
                             return format!("{r_str}.{mname}");
