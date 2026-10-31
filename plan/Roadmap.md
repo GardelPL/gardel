@@ -120,13 +120,13 @@ flowchart TD
   - **Fallible Values (`RESULT[E, A]`):** Represent expected domain failures and untrusted boundary data. Total functions return `RESULT` without exceptions.
   - Detail `and_then` chaining for composable, railway-oriented monadic pipelines without special language syntax.
 
-#### Task A.4: Define the Three-Layer Text Model & String Literals (§3, §11, §15)
-- Define the text hierarchy in §3:
+#### Task A.4: Define the Three-Layer Text Model & String Literals (§3, §11, §15) [✅ Completed]
+- [x] Define the text hierarchy in §3:
   1. `CHAR`: 32-bit Unicode scalar value primitive (`uint32_t`).
   2. `STRING`: Opaque prelude ADT (`representation {NONE}`) with ghost model `specify chars: LIST[CHAR]`.
   3. `BYTES`: Raw untrusted byte sequences at I/O and boundary interfaces.
-- Specify in §3 and §15 that string literals (`"..."`) desugar into verified `STRING` values whose `chars` model matches the sequence of Unicode scalar values.
-- In §11 (IO), specify boundary decoding: `STRING.from_utf8(bytes: BYTES): RESULT[STRING_ERROR, STRING]`.
+- [x] Specify in §3 and §15 that string literals (`"..."`) desugar into verified `STRING` values whose `chars` model matches the sequence of Unicode scalar values.
+- [x] In §11 (IO), specify boundary decoding: `STRING.from_utf8(bytes: BYTES): RESULT[STRING_ERROR, STRING]`.
 
 #### Task A.5: Standardize Strict Equality Semantics & Law Catalogue (§9)
 - Codify the three levels of equality in §9:

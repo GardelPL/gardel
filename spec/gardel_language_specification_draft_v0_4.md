@@ -110,23 +110,6 @@ Rules:
 - **Conversions are explicit.** `NAT.of(m)` from a `MATH_INT` requires a proof that `0 <= m and m <= NAT.max`.
 - **Large numbers.** A prelude library type `BIGNAT` stores limbs in a `SEQ[U64]` and has `MATH_INT` as its ghost model (Dual-Layer Model Refinement, §2).
 
-### Three-Layer Text Model and String Literals
-
-Text processing in Gardel is structured into three distinct layers to cleanly separate physical encoding performance from mathematical specification:
-
-1. **`CHAR` (Unicode Scalar Primitive):** A primitive 32-bit scalar value representing a valid Unicode code point (excluding surrogate halves).
-2. **`STRING` (Standard Prelude Text ADT):** An opaque prelude ADT (`representation {NONE}`) representing verified, immutable Unicode text. Internally, `STRING` may be stored as packed 64-bit words or a UTF-8 byte buffer with an inductive representation invariant `valid_utf8`. Externally, its specification is entirely governed by its ghost model `specify chars: LIST[CHAR]`.
-3. **`BYTES` (Raw Boundary Buffer):** Untrusted byte sequences at I/O and foreign boundaries. Unchecked external byte streams cannot enter the verified core as `STRING` without decoding via `STRING.from_utf8(bytes: BYTES): RESULT[STRING_ERROR, STRING]` (§11).
-
-**String Literal Desugaring:**
-String literals (`"..."`) in Gardel source code are syntactic sugar for verified prelude `STRING` values. The compiler validates the literal's UTF-8 encoding at compile time and emits a `STRING` instance whose ghost abstraction property is statically proven:
-```eiffel
--- Writing "hello" desugars to a verified prelude STRING literal:
-ensure
-  Result.chars = LIST.empty.prepend('o').prepend('l').prepend('l').prepend('e').prepend('h')
-```
-At runtime, string literals lower directly to pre-allocated, null-terminated static UTF-8 byte slices in the C11/BendRT backend with zero runtime allocation.
-
 The classic midpoint shows the effect. The version below verifies; `(lo + hi) / 2` is rejected because `lo + hi` may exceed `NAT.max`.
 
 ```eiffel
@@ -140,6 +123,93 @@ midpoint(lo: NAT, hi: NAT): NAT
     in_range: lo <= Result and Result <= hi
   end
 ```
+
+### 3.1 The Three-Layer Text Architecture and String Literals
+
+Text processing in Gardel is structured into three distinct layers to cleanly separate physical encoding performance from mathematical specification, preventing representation leaks and eliminating the conflation of code points, bytes, and user-perceived grapheme clusters:
+
+```mermaid
+flowchart TD
+    subgraph Layer1 ["Layer 1: Mathematical Text Model & Primitives"]
+        CHAR["CHAR (Unicode Scalar Value primitive, uint32_t)"]
+        GHOST["Ghost Model: specify chars: LIST[CHAR]"]
+    end
+
+    subgraph Layer2 ["Layer 2: Standard Prelude Verified Text ADT"]
+        STRING["STRING (Opaque representation {NONE})"]
+        REPR["Packed UTF-8 / Limb Buffers + valid_utf8 Invariant"]
+    end
+
+    subgraph Layer3 ["Layer 3: Untrusted Boundary Buffers"]
+        BYTES["BYTES (Raw byte sequence at I/O & FFI)"]
+    end
+
+    STRING -- "Model Refinement" --> GHOST
+    STRING -- "character_at(i)" --> CHAR
+    BYTES -- "STRING.from_utf8" --> STRING
+    STRING -- "to_utf8" --> BYTES
+```
+
+#### 1. Layer 1: `CHAR` (Unicode Scalar Primitive)
+- **Runtime Representation:** Standard 32-bit machine scalar value (`uint32_t`).
+- **Domain & Invariant:** A valid Unicode scalar value is an integer in $[0, 0\text{xD7FF}] \cup [0\text{xE000}, 0\text{x10FFFF}]$. High and low surrogate code points ($[0\text{xD800}, 0\text{xDFFF}]$) are strictly excluded.
+- **Literal Syntax:** Enclosed in single quotes: `'a'`, `'Z'`, `'\n'`, `'世'`, `'\u{1F980}'`.
+- **Supported Escape Sequences:**
+  - `\n` (newline, U+000A)
+  - `\r` (carriage return, U+000D)
+  - `\t` (horizontal tab, U+0009)
+  - `\\` (literal backslash, U+005C)
+  - `\'` (single quote, U+0027)
+  - `\"` (double quote, U+0022)
+  - `\0` (null character, U+0000)
+  - `\u{H...}` (arbitrary Unicode scalar value, where `H...` is 1 to 6 hexadecimal digits specifying a valid Unicode scalar value).
+- **Semantics & Distinction:** `CHAR` denotes exactly one Unicode scalar value (code point). It is fundamentally distinct from physical bytes (which vary with encoding) and user-perceived grapheme clusters (which may comprise multiple code points, such as an accented character `'e'` followed by combining mark `\u{0301}`, or multi-part emoji sequences).
+- **Standard Operations:**
+  - `c.code: NAT`: receiver query on `CHAR` yielding the numeric Unicode scalar value in $[0, 0\text{xD7FF}] \cup [0\text{xE000}, 0\text{x10FFFF}]$.
+  - `CHAR.from_code(n: NAT): OPTION[CHAR]`: total creation routine returning `Some(c)` (with `c.code = n`) if $n \le 0\text{xD7FF} \lor (0\text{xE000} \le n \land n \le 0\text{x10FFFF})$, and `None` otherwise.
+  - Conforms natively to `CANONICAL_EQ` and `ORD`.
+
+#### 2. Layer 2: `STRING` (Standard Prelude Text ADT)
+- **Opaque Representation (`representation {NONE}`):** `STRING` is an immutable Standard Prelude ADT whose physical layout is hidden from all client modules. Whether implemented using 64-bit word lists, packed contiguous UTF-8 byte arrays, or balanced ropes, client code is completely decoupled from physical storage.
+- **Dual-Layer Ghost Model (`specify chars: LIST[CHAR]`):**
+  The mathematical specification of `STRING` is governed by an inductive ghost sequence of Unicode scalar values projecting the internal UTF-8 representation:
+  ```eiffel
+  specify {ANY}
+    chars: LIST[CHAR]
+      do
+        decode_utf8(Current.bytes)
+      end
+  ```
+  Every public query and transformer establishes its postconditions against `chars`:
+  - `code_point_count: NAT`: Returns the number of Unicode scalar values (distinct from byte length and grapheme cluster count). Postcondition: `Result = Current.chars.length`.
+  - `byte_length: NAT`: Returns the number of bytes required by its physical UTF-8 encoding.
+  - `is_empty: BOOL`: Equivalent to `Current.code_point_count = 0`. Postcondition: `Result = (Current.chars = LIST.empty)`.
+  - `character_at(index: NAT): CHAR`: Indexed code-point lookup. Precondition: `require in_bounds: index < Current.code_point_count`. Postcondition: `Result = LIST_OPS.at(Current.chars, index)`.
+  - `concat(other: STRING): STRING`: String concatenation. Postcondition: `Result.chars = Current.chars.append(other.chars)`.
+  - `equals(other: STRING): BOOL`: Behavioral text equality (`STRING satisfies EQ`). Postcondition: `Result = (Current.chars = other.chars)`. Because two `STRING` values with identical `chars` may differ in hidden physical metadata (such as buffer capacity `limit` or internal tree balance), `STRING` conforms to `EQ` (and `ORD`) rather than `CANONICAL_EQ` (§9).
+- **Internal Invariant Encapsulation:** The module's internal representation invariant (such as inductive UTF-8 validity `valid_utf8` and capacity constraints) is proven once and for all within `STRING`. Callers reason purely about `Current.chars`, enjoying complete immunity from low-level byte corruption or encoding invariants.
+
+#### 3. Layer 3: `BYTES` (Untrusted Boundary Buffers)
+- **Definition:** `module BYTES` is an opaque Standard Prelude ADT (`representation {NONE}`) encapsulating a sequence of 8-bit octets (`bytes: SEQ[U64]` with module invariant requiring every element $< 256$) and exposing the canonical ghost model `specify model: LIST[U64]`.
+- **Boundary Role:** All external input from the outside world (network streams, disk files, command-line arguments, environment variables) enters the runtime as untrusted `BYTES` (§11).
+- **Boundary Decoding:** Raw byte buffers cannot be cast directly to `STRING`. They must cross the verification boundary via explicit decoding:
+  ```eiffel
+  STRING.from_utf8(bytes: BYTES): RESULT[STRING_ERROR, STRING]
+  ```
+  If the byte stream is well-formed UTF-8, it yields `Ok(s)` where `s.chars` matches the decoded scalar sequence. If any byte sequence is malformed, truncated, overlong, or decodes to an unpaired surrogate half, it returns `Error(err)` with a specific `STRING_ERROR` variant (`InvalidByte(offset, byte_val)`, `TruncatedSequence(offset, expected)`, `OverlongEncoding(offset)`, or `UnpairedSurrogate(offset)`, §11) without exceptions or crashes.
+- **Safe Serialization:** Verified strings can be serialized safely and totally to bytes via the feature query `to_utf8: BYTES` (`str.to_utf8`), guaranteed to produce a canonically encoded UTF-8 byte sequence.
+
+#### 4. String Literal Desugaring
+String literals (`"..."`) in Gardel source code are syntactic sugar for verified prelude `STRING` values.
+
+- **Compile-Time Validation:** At compile time, `gardelc` parses the literal contents, verifies that the string contains well-formed UTF-8 scalar values with valid escape sequences, and rejects malformed escape sequences or surrogate halves with static compiler errors.
+- **Model Refinement Equivalence:** The compiler emits a `STRING` instance whose ghost abstraction property is statically proven:
+  ```eiffel
+  -- Writing "hello" desugars to a verified prelude STRING literal:
+  ensure
+    Result.chars = LIST.empty.prepend('o').prepend('l').prepend('l').prepend('e').prepend('h')
+  ```
+- **Zero-Allocation Runtime Lowering:** At runtime, string literals lower directly to pre-allocated, null-terminated static UTF-8 byte slices in the C11/BendRT backend (`static const uint8_t literal_0[] = "hello";`), avoiding dynamic heap allocation or runtime decoding overhead.
 
 ---
 
@@ -186,17 +256,19 @@ The Standard Prelude provides an irreducible core of verified concepts, algebrai
   - `concept CANONICAL_EQ refines EQ`: Axiomatizes that behavioral equality coincides with structural Leibniz equality (`equals(other) = (Current = other)`).
   - `concept ORD refines EQ`: Strict total ordering interface (`less_than`, `less_or_equal`) with irreflexivity, asymmetry, transitivity, and totality laws.
 
-- **Core Algebraic Data Types (§3, §5, §10):**
+- **Core Algebraic Data Types (§3, §5, §10, §11):**
   - `module OPTION[A]`: The canonical optionality sum type (`None | Some(val: A)`) providing total queries (`is_some`, `is_none`, `unwrap`) and monadic combinators (`map`, `and_then`).
   - `module RESULT[E, A]`: The canonical error-handling sum type (`Error(err: E) | Ok(val: A)`) underpinning Gardel's Error Handling Doctrine (§7).
   - `module SEQ[A]`: The standard parallel divide-and-conquer sequence ADT with balanced tree representation, stored `U64` length, and ghost model `specify model: LIST[A]` (§10).
   - `module STRING`: The standard opaque text ADT (`representation {NONE}`) with ghost model `specify chars: LIST[CHAR]` (§3). String literals (`"..."`) desugar directly to verified prelude `STRING` values.
-  - `module BIGNAT`: Arbitrary-precision natural numbers represented as limbs in `SEQ[U64]` with ghost model `specify math: MATH_INT` (§3).
+  - `module BYTES`: The standard opaque boundary byte buffer ADT (`representation {NONE}`) with ghost model `specify model: LIST[U64]` (§3.1, §11).
+  - `module STRING_ERROR` & `module IO_ERROR`: Standard boundary error sum types for text decoding (`STRING.from_utf8`) and external I/O operations (§11).
+  - `module BIGNAT`: Arbitrary-precision natural numbers represented as limbs in `SEQ[U64]` with ghost model `specify model: MATH_INT` (§3).
 
 - **Mathematical Ghost Types & Specification Modules (§2, §6, §8):**
   - `LIST[A]`: The canonical inductive ghost sequence ADT (`Nil | Cons(head: A, tail: LIST[A])`) used exclusively in specification contexts (`specify`, `require`, `ensure`, `invariant`) and erased at runtime.
   - `MATH_INT`: The built-in unbounded mathematical integer sort ($\mathbb{Z}$) mapping directly to native SMT linear integer arithmetic (`Int`).
-  - `functions LIST_OPS`: Inductive mathematical list operations over `LIST[A]` (`append`, `length`, `map`, `filter`, `fold_left`, `fold_right`, `reverse`) serving as reference targets for Dual-Layer Model Refinement (§2).
+  - `functions LIST_OPS`: Inductive mathematical list operations over `LIST[A]` (`append`, `length`, `at`, `map`, `filter`, `fold_left`, `fold_right`, `reverse`) serving as reference targets for Dual-Layer Model Refinement (§2).
   - `functions FUNCTION_OPS`: Pointwise combinators (`id_fn`, `compose`) with verified category-theoretic identity and associativity laws.
 
 #### 3. Namespace Collision, Shadowing & Bootstrap Rules
@@ -1051,10 +1123,10 @@ end
 ```
 Here, the local product invariant `size_matches` and `bounded_limbs` guarantees that `Current.size + 1` in `push_high_limb` never overflows `U64`, while `Result.model` refinements let callers reason in Z3's unbounded linear integer arithmetic (`MATH_INT`).
 
-##### C. `module STRING` refines to `LIST[CHAR]` with Inductive Byte Invariant
-The verified text type `STRING` encapsulates its byte representation behind `representation {NONE}`, enforcing byte range validity through the recursive ghost predicate `all_bytes_valid` and exposing `chars: LIST[CHAR]` as its logical text model:
+##### C. `module STRING` refines to `LIST[CHAR]` with Inductive UTF-8 / Byte Invariant
+The verified text type `STRING` encapsulates its byte representation behind `representation {NONE}`, enforcing byte range and UTF-8 validity through recursive ghost predicates (`all_bytes_valid`, `decode_utf8`) and exposing `chars: LIST[CHAR]` as its logical text model:
 ```eiffel
-module STRING
+module STRING satisfies EQ
 
 representation {NONE}
   bytes: LIST[U64]
@@ -1074,6 +1146,20 @@ specify {ANY}
       end
     end
 
+  decode_utf8(bs: LIST[U64]): LIST[CHAR]
+    variant
+      bs.length
+    do
+      if bs.length = 0 then
+        LIST.empty
+      else
+        match CHAR.from_code(bs.head)
+          case Some(c) then decode_utf8(bs.tail).prepend(c)
+          case None    then decode_utf8(bs.tail)
+        end
+      end
+    end
+
   byte_model: LIST[U64]
     do
       Current.bytes
@@ -1081,7 +1167,7 @@ specify {ANY}
 
   chars: LIST[CHAR]
     do
-      Current.bytes
+      decode_utf8(Current.bytes)
     end
 
 create {ANY}
@@ -1093,6 +1179,7 @@ create {ANY}
       { bytes = LIST.empty, size = 0, limit = cap }
     ensure
       empty_bytes: Result.byte_length = 0
+      empty_chars: Result.chars = LIST.empty
       empty_str: Result.is_empty
     end
 
@@ -1101,6 +1188,13 @@ feature {ANY}
   byte_length: NAT
     do
       Current.size
+    end
+
+  code_point_count: NAT
+    do
+      Current.size
+    ensure
+      def: Result = Current.chars.length
     end
 
   capacity: NAT
@@ -1112,19 +1206,27 @@ feature {ANY}
     do
       Current.size = 0
     ensure
-      def: Result = (Current.byte_length = 0)
+      def: Result = (Current.chars = LIST.empty)
     end
 
-  push_byte(b: U64): STRING
+  equals(other: STRING): BOOL
+    do
+      Current.bytes = other.bytes
+    ensure
+      def: Result = (Current.chars = other.chars)
+    end
+
+  push_ascii(c: CHAR): STRING
     require
-      is_byte: b < 256
+      is_ascii: c.code < 128
       has_room: Current.byte_length < Current.capacity
     do
-      { bytes = Current.bytes.prepend(b),
+      { bytes = Current.bytes.prepend(c.code),
         size = Current.size + 1,
         limit = Current.limit }
     ensure
       grew: Result.byte_length = Current.byte_length + 1
+      chars_prepended: Result.chars = Current.chars.prepend(c)
       non_empty: not Result.is_empty
     end
 
@@ -1136,7 +1238,7 @@ invariant
 
 end
 ```
-At the record construction site in `push_byte`, the precondition `b < 256` together with the assumed invariant `all_bytes_valid(Current.bytes)` allows Z3 to prove `all_bytes_valid(Current.bytes.prepend(b))` in one unfolding step.
+At the record construction site in `push_ascii`, the precondition `c.code < 128` together with the assumed invariant `all_bytes_valid(Current.bytes)` allows Z3 to prove `all_bytes_valid(Current.bytes.prepend(c.code))` and `Result.chars = Current.chars.prepend(c)` in one unfolding step, while `STRING satisfies EQ` compares logical `chars` models independently of `limit`.
 
 #### 5. Verification Decoupling and Proof Scalability
 
@@ -1357,6 +1459,22 @@ Functions are first-class values that carry contracts in their types, so librari
 functions LIST_OPS
 
 feature {ANY}
+
+  at[A](xs: LIST[A], index: NAT): A
+    require
+      in_bounds: index < xs.length
+    variant
+      index
+    do
+      if index = 0 then
+        xs.head
+      else
+        LIST_OPS.at(xs.tail, index - 1)
+      end
+    ensure
+      zero_case: index = 0 implies Result = xs.head
+      step_case: index > 0 implies Result = LIST_OPS.at(xs.tail, index - 1)
+    end
 
   map[A, B](xs: LIST[A], f: A -> B): LIST[B]
     variant
@@ -1658,11 +1776,42 @@ Gardel keeps a pure core and moves all input and output to the program boundary 
    - Binding statement `x <- e`: requires $e : \text{IO}[A]$, and binds $x : A$ in all subsequent statements of the block.
    - Bare statement $e$: requires $e : \text{IO}[\text{UNIT}]$, executing the effect and discarding the unit result.
    - Final expression: the trailing expression $e_{\text{final}}$ of `with IO ... end` must have type $\text{IO}[R]$, making the entire `with IO` block evaluate to $\text{IO}[R]$.
-4. **External data is untrusted and boundary-decoded.** External inputs (network packets, file bytes, environment variables, command-line arguments) enter as raw untrusted byte buffers (`BYTES`). They become invariant-carrying ADTs only through boundary routines returning `RESULT` (§7). Specifically, text decoding enforces:
+4. **External data is untrusted and boundary-decoded.** External inputs (network packets, file bytes, environment variables, command-line arguments) enter as raw untrusted byte buffers (`BYTES`). They become invariant-carrying ADTs only through boundary routines returning `RESULT` (§7).
+
+   Text decoding strictly gates untrusted byte sequences before they can enter the verified core:
    ```eiffel
    STRING.from_utf8(bytes: BYTES): RESULT[STRING_ERROR, STRING]
    ```
-   If the byte sequence contains invalid UTF-8 byte sequences or surrogate codepoints, `from_utf8` returns `Error(STRING_ERROR.invalid_utf8)`. If valid, it returns `Ok(str)` where `str` satisfies the representation invariant `valid_utf8` and establishes `str.chars` equal to the parsed Unicode scalar sequence.
+   where `STRING_ERROR` is a Standard Prelude ADT representing specific decoding failure modes:
+   ```eiffel
+   module STRING_ERROR
+   representation {ANY}
+     | InvalidByte(offset: NAT, byte_val: U64)
+     | TruncatedSequence(offset: NAT, expected: NAT)
+     | OverlongEncoding(offset: NAT)
+     | UnpairedSurrogate(offset: NAT)
+   end
+   ```
+   If `bytes` contains malformed byte sequences, truncated multi-byte sequences, overlong encodings (such as non-shortest UTF-8 sequences), or surrogate halves ($[0\text{xD800}, 0\text{xDFFF}]$), `from_utf8` returns `Error(...)` identifying the precise failure mode and byte offset. If valid, it returns `Ok(str)` where `str` satisfies the internal representation invariant `valid_utf8` and establishes that `str.chars` equals the parsed Unicode scalar sequence.
+
+   Conversely, verified `STRING` instances are safely and totally serialized back to raw boundary bytes via:
+   ```eiffel
+   str.to_utf8: BYTES
+   ```
+   guaranteeing round-trip model and behavioral idempotency (in accordance with the Strict Equality Hierarchy of §9):
+   ```eiffel
+   match STRING.from_utf8(str.to_utf8)
+     case Ok(decoded) then decoded.chars = str.chars and decoded.equals(str)
+     case Error(_)    then False
+   end
+   ```
+
+   Standard text and binary I/O operations maintain this strict separation:
+   - `IO.print(s: STRING): IO[UNIT]`: emits verified text to standard output.
+   - `IO.print_line(s: STRING): IO[UNIT]`: emits verified text followed by a newline.
+   - `IO.read_line: IO[RESULT[IO_ERROR, STRING]]`: reads a line from standard input, performing boundary UTF-8 decoding.
+   - `IO.read_file(path: STRING): IO[RESULT[IO_ERROR, BYTES]]`: reads raw binary contents from a file path.
+   - `IO.write_file(path: STRING, data: BYTES): IO[RESULT[IO_ERROR, UNIT]]`: writes raw binary data to a file path.
 5. **Limited specifications.** Contracts on an `IO` routine cover its pure arguments and result. The verifier does not model the outside world.
 
 ```eiffel
@@ -1670,12 +1819,19 @@ program GREETER
 
 feature {ANY}
 
-  main(args: LIST[STRING]): IO[EXIT_CODE]
+  main(args: SEQ[STRING]): IO[EXIT_CODE]
     do
       with IO
-        name <- IO.read_line
-        IO.print("Hello, " + name)
-        IO.exit(0)
+        line_res <- IO.read_line
+        match line_res
+          case Ok(name) then
+            with IO
+              IO.print_line("Hello, ".concat(name))
+              IO.exit(0)
+            end
+          case Error(_) then
+            IO.exit(1)
+        end
       end
     end
 
@@ -1848,7 +2004,7 @@ ConceptDecl   ::= "concept" UpperIdent TypeParams? Refines?
                   "end"
 ```
 
-A compilation project comprises multiple `CompilationUnit` source files linked into a flat, global module namespace. While the grammar permits `ModuleUnit+` for bootstrap bundles, test fixtures, and co-located helpers, standard user code follows the one-module-per-file physical convention (§4.2, enforced by `W0201: file_module_name_mismatch`). Mutually recursive types are co-declared in a single file prefixed by `GroupDecl`, establishing a simultaneous structural induction and termination boundary for the SMT solver (§4.3). Unless `--no-prelude` is active, the Standard Prelude (`OPTION`, `RESULT`, `SEQ`, `STRING`, `BIGNAT`, `LIST`, `MATH_INT`, `EQ`, `CANONICAL_EQ`, `ORD`, `LIST_OPS`, `FUNCTION_OPS`) is implicitly injected into every compilation run (§4.1). String literals (`"..."`) desugar into verified instances of prelude `STRING` with `chars: LIST[CHAR]` (§3).
+A compilation project comprises multiple `CompilationUnit` source files linked into a flat, global module namespace. While the grammar permits `ModuleUnit+` for bootstrap bundles, test fixtures, and co-located helpers, standard user code follows the one-module-per-file physical convention (§4.2, enforced by `W0201: file_module_name_mismatch`). Mutually recursive types are co-declared in a single file prefixed by `GroupDecl`, establishing a simultaneous structural induction and termination boundary for the SMT solver (§4.3). Unless `--no-prelude` is active, the Standard Prelude (`OPTION`, `RESULT`, `SEQ`, `STRING`, `BYTES`, `STRING_ERROR`, `IO_ERROR`, `BIGNAT`, `LIST`, `MATH_INT`, `EQ`, `CANONICAL_EQ`, `ORD`, `LIST_OPS`, `FUNCTION_OPS`) is implicitly injected into every compilation run (§4.1). String literals (`"..."`) desugar into verified instances of prelude `STRING` with `chars: LIST[CHAR]` (§3).
 
 ```ebnf
 TypeParams    ::= "[" TypeParam ( "," TypeParam )* "]"
@@ -1921,7 +2077,42 @@ AssumeBlock   ::= "assume" TaggedPred+ "end"
 UpperIdent    ::= [A-Z] [A-Za-z0-9_]*      (* Types, Modules, Concepts, Variant Constructors *)
 LowerIdent    ::= [a-z] [a-z0-9_]*        (* Routines, Parameters, Variables, Fields, Contract Tags *)
 Literal       ::= Integer | Float | String | Char | Bool | "()"
+
+BinOp         ::= "+" | "-" | "*" | "/" | "%" | "+%" | "-%" | "*%"
+                | "&" | "|" | "^" | "<<" | ">>"
+                | "=" | "!=" | "<" | "<=" | ">" | ">="
+                | "and" | "or" | "implies"
+UnOp          ::= "-" | "not" | "~"
+
+Integer       ::= DecInt | HexInt | BinInt
+DecInt        ::= "0" | [1-9] ( "_"? [0-9] )*
+HexInt        ::= "0x" HexDigit ( "_"? HexDigit )*
+BinInt        ::= "0b" [01] ( "_"? [01] )*
+Float         ::= [0-9] ( "_"? [0-9] )* "." [0-9] ( "_"? [0-9] )* ( [eE] [+-]? [0-9] ( "_"? [0-9] )* )?
+Bool          ::= "True" | "False"
+Char          ::= "'" ( [^'\\\n\r] | EscapeSeq ) "'"
+String        ::= '"' ( [^"\\\n\r] | EscapeSeq )* '"'
+EscapeSeq     ::= "\\" ( "n" | "r" | "t" | "\\" | "'" | '"' | "0" | UnicodeEscape )
+UnicodeEscape ::= "u{" HexDigit ( HexDigit ( HexDigit ( HexDigit ( HexDigit HexDigit? )? )? )? )? "}"
+HexDigit      ::= [0-9a-fA-F]
 ```
+
+#### String and Character Literal Lexical Semantics & Desugaring
+
+1. **Character Literals (`Char`):**
+   - Syntactically enclosed in single quotes `'...'`.
+   - Denotes a 32-bit Unicode scalar value primitive (`CHAR`, range $[0, 0\text{xD7FF}] \cup [0\text{xE000}, 0\text{x10FFFF}]$).
+   - Valid escape sequences include `\n` (newline), `\r` (carriage return), `\t` (horizontal tab), `\\` (backslash), `\'` (single quote), `\"` (double quote), `\0` (null), and `\u{H...}` where `H...` represents 1 to 6 hexadecimal digits specifying a valid Unicode scalar value.
+   - Surrogate code points ($0\text{xD800}$ through $0\text{xDFFF}$) and codepoints exceeding $0\text{x10FFFF}$ are rejected at compile time.
+
+2. **String Literals (`String`):**
+   - Syntactically enclosed in double quotes `"..."`.
+   - String literals are desugared at compile time into immutable, verified instances of the Standard Prelude `STRING` ADT (§3).
+   - During AST elaboration, `gardelc` parses the literal into a canonical sequence of Unicode scalar values $[c_0, c_1, \dots, c_{n-1}]$, statically proving that the resulting `STRING` satisfies its representation invariant `valid_utf8` and establishing the ghost postcondition:
+     ```eiffel
+     Result.chars = LIST.empty.prepend(c_{n-1})...prepend(c_0)
+     ```
+   - In target C11 / BendRT code generation, string literals are lowered directly to static read-only UTF-8 byte buffers (`static const uint8_t literal_k[] = "...";`) with precomputed length, requiring zero dynamic allocation and zero runtime decoding overhead.
 
 ---
 
