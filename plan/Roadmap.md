@@ -101,11 +101,11 @@ flowchart TD
 - [x] Specify that runtime operations establish abstraction refinement postconditions (`Result.model = MODEL_OPS.op(Current.model, ...)`), enabling simple structural induction in SMT while executing in parallel on BendRT.
 - [x] Update §6 to document how ghost models interact with hereditary representation invariants.
 
-#### Task A.2: Specify the Standard Prelude & Multi-File Architecture (§4, §15)
-- Formalize the **Standard Prelude**: types (`OPTION`, `RESULT`, `SEQ`, `STRING`, `BIGNAT`) and concepts (`EQ`, `CANONICAL_EQ`, `ORD`) are automatically in scope for all modules.
-- Re-scope `group { A, B }`: define it strictly as a **mutual-recursion verification unit** for interdependent types, not an ambient file container.
-- Establish the **one-module-per-file** physical convention with globally unique top-level module names.
-- Update §15 (Grammar) to clarify top-level compilation units.
+#### Task A.2: Specify the Standard Prelude & Multi-File Architecture (§4, §15) [✅ Completed]
+- [x] Formalize the **Standard Prelude**: types (`OPTION`, `RESULT`, `SEQ`, `STRING`, `BIGNAT`) and concepts (`EQ`, `CANONICAL_EQ`, `ORD`) are automatically in scope for all modules.
+- [x] Re-scope `group { A, B }`: define it strictly as a **mutual-recursion verification unit** for interdependent types, not an ambient file container.
+- [x] Establish the **one-module-per-file** physical convention with globally unique top-level module names.
+- [x] Update §15 (Grammar) to clarify top-level compilation units.
 
 #### Task A.3: Standardize Prelude Sum Types & the Error Handling Doctrine (§5, §7)
 - Elevate `RESULT[E, A]` alongside `OPTION[A]` in §5 with its standard definition:

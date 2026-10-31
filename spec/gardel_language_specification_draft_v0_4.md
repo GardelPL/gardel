@@ -168,23 +168,114 @@ Sections may appear in any order, and `feature` and `specify` may repeat with di
 
 A `functions` module has `feature` and `specify` sections only. A `program` has a `main` routine and is the only module that may use `IO` (§11).
 
-### Standard Prelude
+### 4.1 The Standard Prelude
 
-Every Gardel compilation run automatically loads and injects the **Standard Prelude** into the global symbol table. User programs and modules access standard concepts, types, and operations directly without copy-pasting library declarations or writing explicit import statements:
+Every standard Gardel compilation run automatically loads and injects the **Standard Prelude** ($\Gamma_{\text{prelude}}$) into the global symbol table. User programs and modules access standard concepts, types, and operations directly without copy-pasting library declarations or writing explicit `import` statements.
 
-- **Core Concepts:** `EQ`, `CANONICAL_EQ`, `ORD` (§9).
-- **Core Algebraic Data Types:** `OPTION[A]`, `RESULT[E, A]` (§5), `SEQ[A]` (§10), `STRING` (§3), and `BIGNAT` (§3).
-- **Foundational Specification Modules:** `functions LIST_OPS`, `functions FUNCTION_OPS` (§8).
+#### 1. Automatic Scope Injection
+The Standard Prelude is ambiently present in the root typing environment $\Gamma_0$ and the underlying SMT verification context:
+- All prelude types, variant constructors, and concept definitions are registered prior to user AST ingestion.
+- Prelude routines, axioms, and ghost lemmas are accessible across all user modules without namespace qualification or header directives.
+- Source code remains clean and free of boilerplate imports, preserving Eiffel's concise, declaration-focused aesthetic.
 
-When `gardelc` compiles user source files, prelude declarations are seamlessly merged into the typing context and Boogie verification prelude. User code never needs to redefine `OPTION` or fake ambient library wrappers.
+#### 2. Normative Prelude Inventory
+The Standard Prelude provides an irreducible core of verified concepts, algebraic data types, and mathematical specification abstractions:
 
-### Compilation Units, Project Organization and `group` Scope
+- **Foundational Concepts (§9):**
+  - `concept EQ`: Behavioral equivalence interface (`equals(other: Current): BOOL`) with reflexive, symmetric, and transitive algebraic laws.
+  - `concept CANONICAL_EQ refines EQ`: Axiomatizes that behavioral equality coincides with structural Leibniz equality (`equals(other) = (Current = other)`).
+  - `concept ORD refines EQ`: Strict total ordering interface (`less_than`, `less_or_equal`) with irreflexivity, asymmetry, transitivity, and totality laws.
 
-Gardel enforces clean physical modularization across projects:
+- **Core Algebraic Data Types (§3, §5, §10):**
+  - `module OPTION[A]`: The canonical optionality sum type (`None | Some(val: A)`) providing total queries (`is_some`, `is_none`, `unwrap`) and monadic combinators (`map`, `and_then`).
+  - `module RESULT[E, A]`: The canonical error-handling sum type (`Error(err: E) | Ok(val: A)`) underpinning Gardel's Error Handling Doctrine (§7).
+  - `module SEQ[A]`: The standard parallel divide-and-conquer sequence ADT with balanced tree representation, stored `U64` length, and ghost model `specify model: LIST[A]` (§10).
+  - `module STRING`: The standard opaque text ADT (`representation {NONE}`) with ghost model `specify chars: LIST[CHAR]` (§3). String literals (`"..."`) desugar directly to verified prelude `STRING` values.
+  - `module BIGNAT`: Arbitrary-precision natural numbers represented as limbs in `SEQ[U64]` with ghost model `specify math: MATH_INT` (§3).
 
-1. **One Module Per File:** By physical convention, each source file (`.gdl`) defines exactly one top-level module (`module`, `functions`, or `program`) whose identifier matches the file name (e.g., `bounded_stack.gdl` defines `module BOUNDED_STACK`). Top-level module names are globally unique across a project.
-2. **Multi-File Project Compilation:** A project consists of multiple `.gdl` files compiled together (e.g., `gardelc src/*.gdl`). The compiler links all modules into a unified global namespace prior to type-checking and verification condition generation.
-3. **Strict Scope of `group { A, B }`:** The `group` construct is **strictly a mutual-recursion verification barrier** for interdependent types and co-inductive invariants. It defines a joint induction hypothesis and well-founded termination order across the enclosed types in SMT. It is **not** an ambient file container or multi-module packaging wrapper. Regular independent modules MUST NOT be enclosed in `group` blocks.
+- **Mathematical Ghost Types & Specification Modules (§2, §6, §8):**
+  - `LIST[A]`: The canonical inductive ghost sequence ADT (`Nil | Cons(head: A, tail: LIST[A])`) used exclusively in specification contexts (`specify`, `require`, `ensure`, `invariant`) and erased at runtime.
+  - `MATH_INT`: The built-in unbounded mathematical integer sort ($\mathbb{Z}$) mapping directly to native SMT linear integer arithmetic (`Int`).
+  - `functions LIST_OPS`: Inductive mathematical list operations over `LIST[A]` (`append`, `length`, `map`, `filter`, `fold_left`, `fold_right`, `reverse`) serving as reference targets for Dual-Layer Model Refinement (§2).
+  - `functions FUNCTION_OPS`: Pointwise combinators (`id_fn`, `compose`) with verified category-theoretic identity and associativity laws.
+
+#### 3. Namespace Collision, Shadowing & Bootstrap Rules
+- **No Prelude Shadowing:** Prelude types and concepts reside in the root namespace. In standard compilation mode, user modules, functions, or concepts CANNOT redeclare or shadow any prelude identifier. Attempting to declare a top-level `module OPTION` or `concept EQ` is rejected by the compiler with fatal error `E0101: duplicate_prelude_symbol`.
+- **Standard Library Bootstrap (`--no-prelude`):** When compiling or verifying the Standard Prelude source files themselves (e.g., `stdlib/*.gdl` or `--stdlib`), the compiler operates in `--no-prelude` bootstrap mode, suppressing automatic prelude injection so prelude modules can be defined and verified from source without self-collision.
+- **Lexical Scoping of Type Parameters:** Type parameters (such as `[A]`, `[E]`, `[T]`) are lexically scoped to their declaring module or routine. A generic parameter `[A]` in `module STACK[A]` shadows any ambient type `A` strictly within the syntactic bounds of that module.
+
+#### 4. Verification Decoupling
+Prelude modules are verified against their contracts and algebraic laws. During user project compilation, the compiler injects sound background axioms and verified inductive lemmas for prelude abstractions into the SMT solver, eliminating re-verification overhead while guaranteeing sound cross-module reasoning.
+
+---
+
+### 4.2 Multi-File Architecture & Project Organization
+
+Gardel establishes a clear separation between logical modularity and physical file layout, designed for scalable verification and AI-assisted pair programming.
+
+#### 1. One-Module-Per-File Physical Convention
+- **1:1 Mapping Convention:** By normative convention, each standalone top-level unit (`module`, `concept`, `functions`, or `program`) resides in its own dedicated source file (`.gdl`).
+- **File Naming Rule:** The file basename should match the lowercase `snake_case` of the primary declared module or concept identifier:
+  - `module BOUNDED_STACK` $\longrightarrow$ `bounded_stack.gdl`
+  - `concept NUMERIC` $\longrightarrow$ `numeric.gdl`
+  - `functions MATH_UTILS` $\longrightarrow$ `math_utils.gdl`
+  - `program MAIN` $\longrightarrow$ `main.gdl`
+- **Static Linting & Diagnostics:** This physical layout is enforced as a static analysis rule rather than a rigid syntactic restriction in the parser. In standard compilation mode, a mismatch between the file basename and a standalone module emits style warning `W0201: file_module_name_mismatch`. In `--strict` verification mode, this convention is enforced as an error.
+
+#### 2. Flat Global Project Namespace
+- **No Path Imports:** Gardel source code contains no lexical path imports (`import "./sub/foo"` or `using a.b.c`).
+- **Global Uniqueness:** All top-level module, concept, and free function identifiers within a project exist in a flat, globally unique namespace.
+- **Direct Cross-Module Referencing:** Any module `M` in a project may reference any other module `N` by its identifier directly (e.g., `let s: BOUNDED_STACK[I64] = ...`), subject strictly to the `{Vis}` visibility annotations declared on `N`'s sections.
+- **Duplicate Detection:** Defining the same top-level module or concept identifier across two distinct files in a project triggers fatal error `E0102: duplicate_module_name`.
+
+#### 3. Multi-File Compilation Workflow
+A Gardel project is verified and transpiled by passing all constituent source files to `gardelc` (§13):
+```bash
+gardelc src/*.gdl --strict          # Verify all project modules with Boogie/Z3
+gardelc src/*.gdl --run             # Verify, transpile to C11/Bend v2, and execute
+```
+The multi-file compilation pipeline proceeds through five deterministic stages:
+1. **Source Ingestion & Parsing:** All `.gdl` files are parsed independently into `CompilationUnit` AST nodes (§15).
+2. **Global Namespace Registration:** The compiler registers all declared top-level symbols across files and verifies global identifier uniqueness (`E0102`).
+3. **Prelude Injection:** Unless `--no-prelude` is active, the Standard Prelude ($\Gamma_{\text{prelude}}$) is merged into the global symbol table.
+4. **Representation DAG & Type Checking:** The compiler checks routine signatures and types across the global symbol table. Cross-module references in routine signatures are freely permitted across files, whereas cyclic nesting in **data representations** (`representation` fields or sum variants) is rejected unless the participating types are co-declared within an explicit `group` block (§4.3).
+5. **Modular Verification Condition Generation (VCG):** For each module (or mutual `group`), the verifier constructs Boogie proof obligations using the public contracts, ghost models, and visible invariants of referenced dependencies, verifying units independently or in parallel.
+
+---
+
+### 4.3 Semantic Re-Scoping of `group { A, B }`
+
+In earlier language drafts and prototypes, `group { ... }` was occasionally placed at the head of files (such as `stdlib.gdl`) as an ambient file container or multi-module package header. **In Gardel v0.4, this ambient usage is formally obsolete.**
+
+#### 1. Strict Purpose: Mutual-Recursion Verification Barrier
+The `group` construct is **strictly a mutual-recursion verification barrier** for interdependent types and routines whose representations, invariants, or termination proofs depend cyclically on one another.
+- Independent modules that do not form a mutual representation or recursive verification cycle SHOULD NOT be enclosed in `group` blocks.
+- When two or more ADTs exhibit cyclic structural references in their `representation` sections (e.g., abstract syntax trees where `EXPR` contains `STMT` and `STMT` contains `EXPR`, or mutually recursive `TREE` and `FOREST` types), they MUST be declared together in a single file headed by `group { M1, M2, ... }`.
+
+#### 2. SMT & Simultaneous Inductive Semantics
+Because Gardel is purely functional and values are immutable, a module invariant $I_M(x)$ is a refinement type predicate defining the set of valid values of type $M$ (§6). There is no in-place mutation and no temporal "invariant relaxation": every constructed value of type $M$ must satisfy $I_M$ at the point of construction.
+
+When types $M_1, M_2, \dots, M_n$ form a mutual dependency cycle inside `group { M1, M2, ... }`, the verifier treats the group as a single **simultaneous inductive unit**:
+1. **Simultaneous Structural Induction for Invariants:** The representation invariants $I_{M_1}, \dots, I_{M_n}$ may mutually reference one another (e.g., $I_{\text{EXPR}}(e)$ asserts that sub-statements satisfy $I_{\text{STMT}}(s)$, and vice versa). The Boogie translation axiomatizes and verifies $I_{M_1}, \dots, I_{M_n}$ via simultaneous structural induction over the mutually recursive constructors of the group.
+2. **Mutual Termination & Explicit `variant` Measures:** To prove termination of mutually recursive routines across grouped modules (e.g., `EXPR.eval` calling `STMT.exec` which calls `EXPR.eval`), every routine in the mutual call cycle must decrease along a shared well-founded ordering:
+   - For direct structural descent over mutually recursive ADTs, `variant Current` decreases along the simultaneous subterm ordering of the grouped representations.
+   - For general mutual recursion, routines must declare compatible `variant` expressions (such as a shared non-negative `MATH_INT` size metric or lexicographical tuple `variant rank, metric`) that the SMT solver verifies to strictly decrease at every intra-group recursive call site.
+
+#### 3. Group Physical Organization
+- A source file defining mutually recursive modules begins with the `group` header:
+  ```eiffel
+  group { EXPR, STMT }
+
+  module EXPR
+    -- ...
+  end
+
+  module STMT
+    -- ...
+  end
+  ```
+- **Group Membership Check:** Every module identifier listed in `group { M1, M2, ... }` must be defined in that file (enforced by `check_group_packaging`), and a `group` header must list at least two interdependent modules ($n \ge 2$). Co-located helper `concept` or `functions` declarations closely tied to the mutually recursive group may reside in the same compilation unit.
+- **File Naming for Groups:** The file name reflects the collective domain or primary abstraction (e.g., `ast_nodes.gdl` or `expr_stmt.gdl`).
 
 ---
 
@@ -197,7 +288,7 @@ A `representation` block declares either a product (named fields) or a sum (vari
 - **Local `let` bindings and statement blocks.** The body of any `do`, `then`, `else`, or `case` branch is a `Block` consisting of zero or more statements (`let name = expr`, `check`, `assume`, `reveal`) followed by a final result expression. `let` bindings are immutable and enter the proof context (`name = expr`) for all subsequent statements and the final expression.
 - **Refinement-aware matching.** Exhaustiveness is checked against the proof context. A branch that the context rules out (for example `None` under `require Current.is_some`) may be omitted. A reachable branch that is missing is an error. Omitted branches generate no code, and the verifier has proven they cannot run.
 - **Opaque and friend representations.** `representation {NONE}` hides the layout from every client. `representation {M1, M2}` shares it with named friends. Any direct construction outside the module triggers the invariant check of §6.
-- **Mutual recursion.** Types that refer to each other are declared in one `group { A, B }` file. The verifier treats the group as a single unit for termination and invariants.
+- **Mutual recursion.** Types that refer to each other are declared in one `group { A, B }` file. The verifier treats the group as a single unit for termination and invariants (§4.3).
 
 ```eiffel
 module OPTION[A]
@@ -1325,10 +1416,10 @@ What the verifier and compiler do:
 Block syntax is locked to `end`-delimited blocks to maximize structural accuracy during LLM code generation and automated proof repair.
 
 ```ebnf
-File          ::= GroupDecl? ModuleUnit+
-ModuleUnit    ::= ModuleDecl | FunctionsDecl | ProgramDecl | ConceptDecl
+CompilationUnit ::= GroupDecl? ModuleUnit+
 
-GroupDecl     ::= "group" "{" UpperIdent ( "," UpperIdent )* "}"
+GroupDecl       ::= "group" "{" UpperIdent ( "," UpperIdent )+ "}"
+ModuleUnit      ::= ModuleDecl | FunctionsDecl | ProgramDecl | ConceptDecl
 
 ModuleDecl    ::= "module" UpperIdent TypeParams? Satisfies?
                     ( RepresentationSection | CreateSection
@@ -1342,7 +1433,7 @@ ConceptDecl   ::= "concept" UpperIdent TypeParams? Refines?
                   "end"
 ```
 
-A compilation project comprises multiple `File` units linked in a flat, global module namespace. The Standard Prelude (`OPTION`, `RESULT`, `SEQ`, `STRING`, `BIGNAT`, `EQ`, `CANONICAL_EQ`, `ORD`, `LIST_OPS`, `FUNCTION_OPS`) is implicitly injected into every compilation run (§4). String literals (`"..."`) desugar into verified instances of prelude `STRING` with `chars: LIST[CHAR]` (§3).
+A compilation project comprises multiple `CompilationUnit` source files linked into a flat, global module namespace. While the grammar permits `ModuleUnit+` for bootstrap bundles, test fixtures, and co-located helpers, standard user code follows the one-module-per-file physical convention (§4.2, enforced by `W0201: file_module_name_mismatch`). Mutually recursive types are co-declared in a single file prefixed by `GroupDecl`, establishing a simultaneous structural induction and termination boundary for the SMT solver (§4.3). Unless `--no-prelude` is active, the Standard Prelude (`OPTION`, `RESULT`, `SEQ`, `STRING`, `BIGNAT`, `LIST`, `MATH_INT`, `EQ`, `CANONICAL_EQ`, `ORD`, `LIST_OPS`, `FUNCTION_OPS`) is implicitly injected into every compilation run (§4.1). String literals (`"..."`) desugar into verified instances of prelude `STRING` with `chars: LIST[CHAR]` (§3).
 
 ```ebnf
 TypeParams    ::= "[" TypeParam ( "," TypeParam )* "]"
