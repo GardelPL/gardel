@@ -14,7 +14,7 @@ Gardel is a pure, total, deterministic, statically verified language designed fo
 | Local bindings | Grammar had no `let` binding, forcing repeated expressions and preventing intermediate `check` references | Added `Block` (`Stmt* Expr`) supporting `let x = e`, `check`, `assume`, and `reveal` inside `do`, `then`, `else`, and `case` branches (§5, §15) |
 | Closures | Closures capturing closures were marked affine due to HVM2 lambda-duplication anomalies | Compile-time closure conversion (lambda lifting to first-order ADT records) allows unrestricted closure use and parallel duplication (§8, §13) |
 | Invariant visibility | A friend module in `representation {FRIEND}` could fail to verify if the invariant called private queries | Added Visibility Rule 5: every symbol in an `invariant` must be visible to at least the representation's visibility list (§4) |
-| Standard Prelude & Modules | Ambient file containers (`group`) forced library code duplication in user programs | Implicit Standard Prelude (`OPTION`, `RESULT`, `SEQ`, `STRING`, `BIGNAT`, `EQ`, `ORD`); `group` re-scoped to mutual-recursion verification barriers; one module per file convention (§4, §5) |
+| Standard Prelude & Modules | Ambient file containers (`group`) forced library code duplication in user programs | Implicit Standard Prelude (`OPTION`, `RESULT`, `SEQ`, `STRING`, `BYTES`, `STRING_ERROR`, `IO_ERROR`, `BIGNAT`, `LIST`, `MATH_INT`, `EQ`, `CANONICAL_EQ`, `ORD`, `LIST_OPS`, `FUNCTION_OPS`) with `--no-prelude` bootstrap mode; `group` re-scoped to mutual-recursion verification barriers; one module per file convention (§4, §5, §15) |
 | Error Handling | Inconsistent mix of preconditions, partial functions, and ad-hoc error handling | Error Handling Doctrine: preconditions (`require`) reject programmer bugs statically; fallible operations return monadic `RESULT[E, A]` (§5, §7) |
 | Text & Strings | Strings tied directly to byte buffers; missing Unicode character abstraction | Three-layer text model (`CHAR`, `STRING`, `BYTES`) with Unicode scalar ghost model (`LIST[CHAR]`) and string literal desugaring (§3, §11, §15) |
 | Dual-Layer Model Refinement | Ad-hoc verification tricks for data structures | Principle 9: Dual-Layer Model Refinement pairing parallel structures (`SEQ`, `BIGNAT`, `STRING`) with inductive ghost models (`LIST`, `MATH_INT`, `LIST[CHAR]`) (§2, §6) |
@@ -108,7 +108,7 @@ Rules:
 - **Deterministic floating point.** `F64` operations follow strict IEEE-754 evaluation order matching the syntactic expression tree. Compiler re-association (such as `-ffast-math` contractions or fused multiply-add `fma` synthesis across distinct operations) is strictly forbidden (`-ffp-contract=off`), and quiet/signaling NaN representations are canonicalized, ensuring that execution along a given expression tree is deterministic across CPU and GPU backends. However, because floating-point addition and multiplication are mathematically non-associative ($(a+b)+c \neq a+(b+c)$), parallel reductions do not claim bit-for-bit equivalence across dynamically re-partitioned trees; exact Church-Rosser confluence is guaranteed for discrete types (`NAT`, `INT`, `MATH_INT`, `BOOL`, `CHAR`, and ADTs).
 - **Unit type.** `UNIT` is a primitive type with exactly one value, written `()`. It represents computations evaluated purely for sequenced effects (such as `IO.print(...) : IO[UNIT]`), and erases at runtime.
 - **Conversions are explicit.** `NAT.of(m)` from a `MATH_INT` requires a proof that `0 <= m and m <= NAT.max`.
-- **Large numbers.** A prelude library type `BIGNAT` stores limbs in a `SEQ[U64]` and has `MATH_INT` as its ghost model (Dual-Layer Model Refinement, §2).
+- **Large numbers.** A prelude library type `BIGNAT` stores little-endian limbs in a `LIST[U64]` and has `MATH_INT` as its ghost model (Dual-Layer Model Refinement, §2).
 
 The classic midpoint shows the effect. The version below verifies; `(lo + hi) / 2` is rejected because `lo + hi` may exceed `NAT.max`.
 
@@ -166,7 +166,8 @@ flowchart TD
 - **Semantics & Distinction:** `CHAR` denotes exactly one Unicode scalar value (code point). It is fundamentally distinct from physical bytes (which vary with encoding) and user-perceived grapheme clusters (which may comprise multiple code points, such as an accented character `'e'` followed by combining mark `\u{0301}`, or multi-part emoji sequences).
 - **Standard Operations:**
   - `c.code: NAT`: receiver query on `CHAR` yielding the numeric Unicode scalar value in $[0, 0\text{xD7FF}] \cup [0\text{xE000}, 0\text{x10FFFF}]$.
-  - `CHAR.from_code(n: NAT): OPTION[CHAR]`: total creation routine returning `Some(c)` (with `c.code = n`) if $n \le 0\text{xD7FF} \lor (0\text{xE000} \le n \land n \le 0\text{x10FFFF})$, and `None` otherwise.
+  - `CHAR.from_code(n: NAT): OPTION[CHAR]`: total creation routine returning `Some(c)` (with `c.code = n`) if $n \le 0\text{xD7FF} \lor (0\text{xE000} \le n \land n \le 0\text{x10FFFF})$, and `None` otherwise. This is the boundary form for unvalidated integers.
+  - `CHAR.from_scalar(n: NAT): CHAR`: partial creation routine for integers already known to be scalar values. Precondition: `require valid_scalar: n <= 0xD7FF or (0xE000 <= n and n <= 0x10FFFF)`. Postcondition: `ensure Result.code = n`. It is injective (`a.code = b.code` implies `a = b`) and lowers to a plain `uint32_t` conversion with no runtime check.
   - Conforms natively to `CANONICAL_EQ` and `ORD`.
 
 #### 2. Layer 2: `STRING` (Standard Prelude Text ADT)
@@ -210,6 +211,7 @@ String literals (`"..."`) in Gardel source code are syntactic sugar for verified
     Result.chars = LIST.empty.prepend('o').prepend('l').prepend('l').prepend('e').prepend('h')
   ```
 - **Zero-Allocation Runtime Lowering:** At runtime, string literals lower directly to pre-allocated, null-terminated static UTF-8 byte slices in the C11/BendRT backend (`static const uint8_t literal_0[] = "hello";`), avoiding dynamic heap allocation or runtime decoding overhead.
+- **Bootstrap realization (Roadmap Task B.3).** While the prelude `STRING` is the ASCII subset of UTF-8 (§6.4.C), a literal containing a non-ASCII scalar is rejected at compile time (`E0303: non_ascii_string_literal`, lifted by Task C.2); malformed escapes (`E0302`) and surrogates (`E0304`) are always rejected. A literal $[c_0, \dots, c_{n-1}]$ denotes `STRING.make_empty(max(n, 1)).push_ascii(c_{n-1})...push_ascii(c_0)`: in Boogie it is a constant *defined* by that term of verified prelude routines (no other axiom), and a per-literal lemma proves the routine preconditions, the `STRING` invariant, `Result.chars = LIST.empty.prepend(c_{n-1})...prepend(c_0)` and `Result.byte_length = n`. Because `STRING` is not `CANONICAL_EQ`, `=` with a `STRING` operand is rejected (`E0311`; use `equals` or compare `chars`), as are `+` on `STRING` (`E0312`) and string-literal `match` patterns (`E0313`).
 
 ---
 
@@ -263,12 +265,12 @@ The Standard Prelude provides an irreducible core of verified concepts, algebrai
   - `module STRING`: The standard opaque text ADT (`representation {NONE}`) with ghost model `specify chars: LIST[CHAR]` (§3). String literals (`"..."`) desugar directly to verified prelude `STRING` values.
   - `module BYTES`: The standard opaque boundary byte buffer ADT (`representation {NONE}`) with ghost model `specify model: LIST[U64]` (§3.1, §11).
   - `module STRING_ERROR` & `module IO_ERROR`: Standard boundary error sum types for text decoding (`STRING.from_utf8`) and external I/O operations (§11).
-  - `module BIGNAT`: Arbitrary-precision natural numbers represented as limbs in `SEQ[U64]` with ghost model `specify model: MATH_INT` (§3).
+  - `module BIGNAT`: Arbitrary-precision natural numbers represented as little-endian limbs in `LIST[U64]` with ghost model `specify model: MATH_INT` (§3, §6.4.B).
 
 - **Mathematical Ghost Types & Specification Modules (§2, §6, §8):**
-  - `LIST[A]`: The canonical inductive ghost sequence ADT (`Nil | Cons(head: A, tail: LIST[A])`) used exclusively in specification contexts (`specify`, `require`, `ensure`, `invariant`) and erased at runtime.
-  - `MATH_INT`: The built-in unbounded mathematical integer sort ($\mathbb{Z}$) mapping directly to native SMT linear integer arithmetic (`Int`).
-  - `functions LIST_OPS`: Inductive mathematical list operations over `LIST[A]` (`append`, `length`, `at`, `map`, `filter`, `fold_left`, `fold_right`, `reverse`) serving as reference targets for Dual-Layer Model Refinement (§2).
+  - `LIST[A]`: The canonical inductive sequence ADT (`Nil | Cons(head: A, tail: LIST[A])`). `LIST` has **dual status**: it is the canonical ghost model of Dual-Layer Model Refinement (§2) *and* an ordinary sequential runtime structure that may appear in `representation` sections (e.g., `BOUNDED_STACK.items`, `BIGNAT.limbs`, `STRING.bytes`) and in runtime `do` bodies. Only its use as a model (inside `specify` queries and contracts) is erased.
+  - `MATH_INT`: The built-in unbounded mathematical integer sort ($\mathbb{Z}$) mapping directly to native SMT linear integer arithmetic (`Int`). Unlike `LIST`, `MATH_INT` is **strictly ghost-only** (§3).
+  - `functions LIST_OPS`: Inductive list operations over `LIST[A]` (`append`, `length`, `at`, `map`, `filter`, `fold_left`, `fold_right`, `reverse`) serving as reference targets for Dual-Layer Model Refinement (§2). Its `feature {ANY}` routines are executable (sequential, $O(n)$); its `specify` laws are erased.
   - `functions FUNCTION_OPS`: Pointwise combinators (`id_fn`, `compose`) with verified category-theoretic identity and associativity laws.
 
 #### 3. Namespace Collision, Shadowing & Bootstrap Rules
@@ -312,6 +314,12 @@ The multi-file compilation pipeline proceeds through five deterministic stages:
 3. **Prelude Injection:** Unless `--no-prelude` is active, the Standard Prelude ($\Gamma_{\text{prelude}}$) is merged into the global symbol table.
 4. **Representation DAG & Type Checking:** The compiler checks routine signatures and types across the global symbol table. Cross-module references in routine signatures are freely permitted across files, whereas cyclic nesting in **data representations** (`representation` fields or sum variants) is rejected unless the participating types are co-declared within an explicit `group` block (§4.3).
 5. **Modular Verification Condition Generation (VCG):** For each module (or mutual `group`), the verifier constructs Boogie proof obligations using the public contracts, ghost models, and visible invariants of referenced dependencies, verifying units independently or in parallel.
+
+**CLI input rules (`gardelc`, Task B.4):**
+- Input operands may be any number of `.gdl` files, directories, and wildcard patterns. A directory stands for its top-level `*.gdl` files (not recursive, sorted by name). A wildcard in the file-name part of an operand (`src/*.gdl`) is expanded by `gardelc` itself when the shell has not expanded it (e.g. PowerShell, `cmd`). Files named twice are compiled once.
+- A run with more than one file, a directory, or a wildcard operand is a *project run*: the files share one flat namespace (`E0102`), each file is checked for `W0201`, and each module is verified once, in a context that holds the background theories (contracts, invariants, laws) of the other-file modules it references, transitively. Those contracts are trusted only because the referenced modules are verified in the same run; calls assert the callee's `require` clauses.
+- A single-file run is unchanged and does not apply `W0201`.
+- **Acyclic cross-file dependencies:** user modules in different files that reference each other in a cycle are rejected with fatal error `E0103: cyclic_module_dependency`, because each module's proof would trust the other's contracts. Mutually dependent modules must be co-declared in one file under `group` (§4.3). Modules in the same file are not linked to each other by `gardelc` yet; simultaneous `group` verification is not yet implemented.
 
 ---
 
@@ -382,6 +390,8 @@ Gardel provides two foundational, universally available sum types in the Standar
 
 Both prelude sum types delegate element comparisons in `equals` to behavioral equivalence (`v1.equals(v2)` and `e1.equals(e2)`), respecting the Strict Equality Semantics of §9. Furthermore, both conditionally satisfy `CANONICAL_EQ` whenever their generic parameters satisfy `CANONICAL_EQ`, ensuring their behavioral equality coincides with structural Leibniz equality (`equals(other) = (Current = other)`).
 
+The `feature {ANY}` postconditions of `equals` are therefore stated **case-wise**, delegating to the element `equals`. The unconditional clause `Result = (Current = other)` is deliberately *not* a feature postcondition: it is false whenever a type argument has a coarser behavioral equality than term identity (e.g., `OPTION[SEQ[U64]]`, where two differently balanced trees are `equals` but not `=`). It is proven only as `law agrees_with_structural` in `specify {CANONICAL_EQ}`, which is in force exactly when the `where` bound holds.
+
 #### 1. Specification of `module OPTION[A]`
 
 ```eiffel
@@ -404,7 +414,9 @@ feature {ANY}
           end
       end
     ensure
-      sound: Result = (Current = other)
+      none_eq: (Current.is_none and other.is_none) implies Result
+      some_eq: (Current.is_some and other.is_some) implies (Result = Current.get.equals(other.get))
+      variant_mismatch: (Current.is_some = other.is_none) implies not Result
     end
 
   is_some: BOOL
@@ -609,7 +621,9 @@ feature {ANY}
           end
       end
     ensure
-      sound: Result = (Current = other)
+      err_eq: (Current.is_error and other.is_error) implies (Result = Current.get_error.equals(other.get_error))
+      ok_eq: (Current.is_ok and other.is_ok) implies (Result = Current.get.equals(other.get))
+      variant_mismatch: (Current.is_ok = other.is_error) implies not Result
     end
 
   is_ok: BOOL
@@ -970,10 +984,16 @@ $$\alpha(f_T(x, u)) = f_M(\alpha(x), \beta(u))$$
 
 The three verified Standard Prelude modules below (`stdlib/stdlib.gdl`) demonstrate how ghost models and representation invariants work together in practice.
 
+> [!NOTE]
+> **Abridged listings.** The `SEQ[A]` and `BIGNAT` listings below are abridged to the refinement-relevant members. Their concept members — `SEQ.equals` with `specify {EQ}`, and `BIGNAT.equals` / `less_than` / `less_or_equal` with `specify {EQ}` and `specify {ORD}` — appear in full in `stdlib/stdlib.gdl` and in the §9 law catalogue. Every module that declares `satisfies C` must discharge all laws of `C` (and of every concept `C` refines); omission is rejected as `Phase 2 (Missing Law Proof)`.
+
+> [!NOTE]
+> **Visibility Rule 3 applies without exception (resolved in Roadmap Task B.5b).** The former bootstrap exemption that let the runtime bodies of `SEQ.equals`, `BIGNAT.equals`, and `BIGNAT.less_than` read the ghost query `model` has been removed from `gardelc`. `SEQ.equals` compares the runtime list views `to_list` (with `ensure is_model: Result = Current.model`), and `BIGNAT.equals` / `less_than` compare limb counts and then limbs from the most significant end. Their model postconditions (`Result = (Current.model = other.model)`, `Result = (Current.model < other.model)`) are proven, relying on the `BIGNAT` normalization invariant `no_zero_high_limb` (§6.4.B), under which equal models imply equal limb lists.
+
 ##### A. `module SEQ[A]` refines to `LIST[A]` via `LIST.append` and `functions LIST_OPS`
 The parallel collection `SEQ[A]` is a binary concatenation tree with $O(1)$ cached subtree lengths (`len: NAT`) and ghost model `model: LIST[A]`:
 ```eiffel
-module SEQ[A] satisfies EQ where A satisfies EQ
+module SEQ[A] satisfies EQ where A satisfies CANONICAL_EQ
 
 representation {ANY}
   | Empty
@@ -1104,9 +1124,10 @@ feature {ANY}
       Current.size
     end
 
-  push_high_limb(limb: U64): BIGNAT
+  shift_in_low_limb(limb: U64): BIGNAT
     require
       not_full: Current.limb_count < 1024
+      no_leading_zero: limb > 0 or Current.limb_count > 0
     do
       { limbs = Current.limbs.prepend(limb),
         size = Current.size + 1 }
@@ -1118,13 +1139,26 @@ feature {ANY}
 invariant
   size_matches: size = limbs.length
   bounded_limbs: size <= 1024
+  limbs_in_u64: limbs_in_range(limbs)
+  no_zero_high_limb: normalized(limbs)
 
 end
 ```
-Here, the local product invariant `size_matches` and `bounded_limbs` guarantees that `Current.size + 1` in `push_high_limb` never overflows `U64`, while `Result.model` refinements let callers reason in Z3's unbounded linear integer arithmetic (`MATH_INT`).
+Here, the local product invariant `size_matches` and `bounded_limbs` guarantees that `Current.size + 1` in `shift_in_low_limb` never overflows `U64`, while `Result.model` refinements let callers reason in Z3's unbounded linear integer arithmetic (`MATH_INT`).
+
+**Limb order.** `limbs.head` is the *least* significant limb: $\text{value\_of}(\ell_0 :: \ell_1 :: \dots) = \ell_0 + R \cdot \ell_1 + R^2 \cdot \ell_2 + \dots$ with $R = 2^{64}$. Prepending a limb therefore inserts it at the **low** end and shifts every existing limb up by one position, which is exactly `model_updated: Result.model = limb + R * Current.model`. As its name says, `shift_in_low_limb` does *not* append a new most-significant limb; it shifts the existing limbs up and inserts `limb` as the new least-significant limb (it was named `push_high_limb` before Roadmap Task B.5 renamed it). Appending a most-significant limb would instead be `limbs.append(LIST.empty.prepend(limb))` with model $\text{Current.model} + \text{limb} \cdot R^{\text{size}}$.
+
+**Normalization invariant.** `no_zero_high_limb: normalized(limbs)` requires the *last* element of `limbs` (the most significant limb) to be non-zero whenever `size > 0`; zero is represented only by the empty limb list. The ghost predicates `normalized(ls)` and `limbs_in_range(ls)` (every limb in $[0, 2^{64})$) are declared in `specify {ANY}` (abridged here). Normalization makes the representation canonical (without it `[5]` and `[5, 0]` would have equal models but different limb lists), so `equals` / `less_than` can compare limb counts and then limbs from the most significant end, with their model postconditions proven via the ghost lemmas `value_bounds` and `shorter_is_smaller`. Every construction site establishes the invariant: `zero` and `from_u64` (which maps `0` to the empty list) directly, and `shift_in_low_limb` through its precondition `no_leading_zero`, which forbids inserting a zero limb into an empty (zero) `BIGNAT`.
 
 ##### C. `module STRING` refines to `LIST[CHAR]` with Inductive UTF-8 / Byte Invariant
-The verified text type `STRING` encapsulates its byte representation behind `representation {NONE}`, enforcing byte range and UTF-8 validity through recursive ghost predicates (`all_bytes_valid`, `decode_utf8`) and exposing `chars: LIST[CHAR]` as its logical text model:
+The verified text type `STRING` encapsulates its byte representation behind `representation {NONE}`, enforcing byte validity through recursive ghost predicates (`all_bytes_valid`, `decode_utf8`) and exposing `chars: LIST[CHAR]` as its logical text model.
+
+**Bootstrap scope (ASCII subset of UTF-8).** The current prelude `STRING` stores one byte per list element and restricts every byte to the ASCII range $[0, 127]$. On that domain UTF-8 is a one-byte-per-scalar encoding, so:
+- `decode_utf8` below is the *exact* UTF-8 decoder for every representable value (not a Latin-1 approximation), and it never drops input;
+- `code_point_count` coincides with `byte_length` (proven by `same_length`, not assumed);
+- byte equality and `chars` equality coincide (proven by `law decode_injective`), so `equals` is sound.
+
+Multi-byte UTF-8 (2–4 byte sequences, rejection of overlong forms and surrogates, the `valid_utf8` invariant, and a cached `code_point_count` distinct from `byte_length`) is delivered by Task C.2 **without changing the public `chars`-based contracts** listed in §3.1. Until then, non-ASCII text cannot be represented by the bootstrap `STRING`.
 ```eiffel
 module STRING satisfies EQ
 
@@ -1142,22 +1176,34 @@ specify {ANY}
       if bs.length = 0 then
         True
       else
-        bs.head < 256 and all_bytes_valid(bs.tail)
+        bs.head < 128 and all_bytes_valid(bs.tail)
       end
     end
 
   decode_utf8(bs: LIST[U64]): LIST[CHAR]
+    require
+      ascii: all_bytes_valid(bs)
     variant
       bs.length
     do
       if bs.length = 0 then
         LIST.empty
       else
-        match CHAR.from_code(bs.head)
-          case Some(c) then decode_utf8(bs.tail).prepend(c)
-          case None    then decode_utf8(bs.tail)
-        end
+        decode_utf8(bs.tail).prepend(CHAR.from_scalar(bs.head))
       end
+    ensure
+      same_length: Result.length = bs.length
+    end
+
+  law decode_injective(xs: LIST[U64], ys: LIST[U64])
+    require
+      xs_ascii: all_bytes_valid(xs)
+      ys_ascii: all_bytes_valid(ys)
+      same_chars: decode_utf8(xs) = decode_utf8(ys)
+    variant
+      xs.length
+    ensure
+      same_bytes: xs = ys
     end
 
   byte_model: LIST[U64]
@@ -1181,6 +1227,7 @@ create {ANY}
       empty_bytes: Result.byte_length = 0
       empty_chars: Result.chars = LIST.empty
       empty_str: Result.is_empty
+      capacity_set: Result.capacity = cap
     end
 
 feature {ANY}
@@ -1213,7 +1260,8 @@ feature {ANY}
     do
       Current.bytes = other.bytes
     ensure
-      def: Result = (Current.chars = other.chars)
+      byte_equality: Result = (Current.byte_model = other.byte_model)
+      char_equality: Result = (Current.chars = other.chars)
     end
 
   push_ascii(c: CHAR): STRING
@@ -1228,6 +1276,29 @@ feature {ANY}
       grew: Result.byte_length = Current.byte_length + 1
       chars_prepended: Result.chars = Current.chars.prepend(c)
       non_empty: not Result.is_empty
+      same_capacity: Result.capacity = Current.capacity
+    end
+
+specify {EQ}
+
+  law reflexive(a: STRING)
+    ensure
+      refl: a.equals(a)
+    end
+
+  law symmetric(a: STRING, b: STRING)
+    require
+      ab: a.equals(b)
+    ensure
+      ba: b.equals(a)
+    end
+
+  law transitive(a: STRING, b: STRING, c: STRING)
+    require
+      ab: a.equals(b)
+      bc: b.equals(c)
+    ensure
+      ac: a.equals(c)
     end
 
 invariant
@@ -1238,7 +1309,7 @@ invariant
 
 end
 ```
-At the record construction site in `push_ascii`, the precondition `c.code < 128` together with the assumed invariant `all_bytes_valid(Current.bytes)` allows Z3 to prove `all_bytes_valid(Current.bytes.prepend(c.code))` and `Result.chars = Current.chars.prepend(c)` in one unfolding step, while `STRING satisfies EQ` compares logical `chars` models independently of `limit`.
+At the record construction site in `push_ascii`, the precondition `c.code < 128` together with the assumed invariant `all_bytes_valid(Current.bytes)` allows Z3 to prove `all_bytes_valid(Current.bytes.prepend(c.code))` and, using `CHAR.from_scalar(c.code) = c` (from `Result.code = n` and `CHAR` injectivity, §3.1), `Result.chars = Current.chars.prepend(c)` in one unfolding step. `STRING satisfies EQ` compares logical `chars` models independently of `limit`: the forward direction of `char_equality` follows from congruence of `decode_utf8`, and the backward direction from `law decode_injective`.
 
 #### 5. Verification Decoupling and Proof Scalability
 
@@ -1331,7 +1402,7 @@ Untrusted external data enters the verified core through the **Invariant Gateway
       end
     ensure
       accepted: Result.is_ok = (cap > 0)
-      err_spec: Result.is_error implies Result.get_error = "capacity must be strictly positive"
+      err_spec: Result.is_error implies Result.get_error.equals("capacity must be strictly positive")
     end
 ```
 
@@ -1796,7 +1867,7 @@ Gardel incorporates a formal, normative catalogue of algebraic equations across 
 For associative binary operations with identity elements (such as `concat` on `SEQ[A]` with `SEQ.empty` and `append` on `LIST[A]` with `LIST.empty`):
 
 ```eiffel
--- Inside module SEQ[A] satisfies EQ where A satisfies EQ
+-- Inside module SEQ[A] satisfies EQ where A satisfies CANONICAL_EQ
 specify {ANY}
 
   law concat_associative(a: SEQ[A], b: SEQ[A], c: SEQ[A])
@@ -1836,7 +1907,7 @@ For structure-preserving mappings (`map` on `SEQ`, `LIST`, `OPTION`, `RESULT`):
 - **Base Case Refinement:** For unconstrained target types `B` (which need not satisfy `EQ`), empty and singleton preservation laws are stated using Level 3 ghost model equality (`.model = ...`).
 
 ```eiffel
--- Inside module SEQ[A] satisfies EQ where A satisfies EQ
+-- Inside module SEQ[A] satisfies EQ where A satisfies CANONICAL_EQ
 specify {ANY}
 
   law map_preserves_empty[B](f: A -> B)
@@ -1856,7 +1927,7 @@ specify {ANY}
 
   law map_fusion[B, C](s: SEQ[A], f: B -> C, g: A -> B)
     ensure
-      fusion: s.map(g).map(f).equals(s.map(FUNCTION_OPS.compose(f, g)))
+      fusion: s.map(g).map(f).model = s.map(FUNCTION_OPS.compose(f, g)).model
     end
 
   law filter_conjunction(s: SEQ[A], p: A -> BOOL, q: A -> BOOL)
@@ -2007,7 +2078,7 @@ end
 Rules for Concept Conformance and Law Verification:
 
 - **Proofs.** Each law is proven in a `specify {CONCEPT}` block, using structural recursion with a decreasing `variant` when the carrier type is recursive.
-- **Conditional Conformance.** `module SEQ[A] satisfies EQ where A satisfies EQ` establishes that the compound container conforms if and only if its type parameter conforms.
+- **Conditional Conformance.** `module SEQ[A] satisfies EQ where A satisfies CANONICAL_EQ` establishes that the container conforms exactly when its element type conforms to the stated concept. The bound is `CANONICAL_EQ`, not `EQ`, because `SEQ.equals` compares elements structurally (`Current.model = other.model` over `LIST[A]`): that coincides with behavioral element equality only for canonical elements. For `SEQ[SEQ[U64]]` or `SEQ[STRING]` it would distinguish behaviorally equal elements (two differently balanced inner trees, two strings with different capacity). The bound is enforced at use sites: calling a routine of a concept that a module lists *directly* in `satisfies` (e.g. `equals` of `EQ` on `SEQ[T]`) requires the type arguments to satisfy the `where` constraints, otherwise `gardelc` reports `E0314: unsatisfied_where_constraint`. Primitive scalars satisfy `CANONICAL_EQ` and `ORD`; a type parameter satisfies its declared bound (`[A: CANONICAL_EQ]`); a module type satisfies the concepts it lists when its own `where` constraints hold. (`OPTION`/`RESULT` list only `CANONICAL_EQ`; their `equals` delegates to the element's own `equals` (§5), so `OPTION[SEQ[U64]].equals` remains available.)
 - **Constrained Generics.** In `module SORTED_LIST[A: ORD]` or generic routines (`sort[A: ORD](xs: SEQ[A]): SEQ[A]`), the laws of `ORD` enter the Boogie proof context as quantified axioms about `A`.
 - **Triggers.** Each law is instantiated by an SMT trigger pattern. The default is the predicates of its `require` clause, and `trigger a.less_than(b)` overrides it to prevent quantifier instantiation loops.
 - **No Runtime Dictionaries.** All generic code and concept dispatch are monomorphized before Bend v2 / C11 codegen, incurring zero runtime dictionary or vtable overhead.
@@ -2052,6 +2123,17 @@ Gardel keeps a pure core and moves all input and output to the program boundary 
      | UnpairedSurrogate(offset: NAT)
    end
    ```
+   The I/O boundary routines below report failures through the companion prelude sum type `IO_ERROR`. Its current variant set (in `stdlib.gdl`) is:
+   ```eiffel
+   module IO_ERROR
+   representation {ANY}
+     | EndOfInput
+     | Decode(cause: STRING_ERROR)
+     | OsError(code: I64)
+   end
+   ```
+   Path-carrying variants (`NotFound(path: STRING)`, `PermissionDenied(path: STRING)`) are added together with `IO.read_file` / `IO.write_file` (Phase C).
+   `BYTES` (§3.1) is the opaque boundary byte buffer (`representation {NONE}`, `bytes: SEQ[U64]` with every element $< 256$). Its public surface is `length: NAT`, `at(i: NAT): U64` (`require i < Current.length`, `ensure Result < 256`), and the ghost model `specify model: LIST[U64]` with `length` and `at` refining to `model.length` and `LIST_OPS.at(model, i)`. `BYTES` satisfies `EQ` via `Result = (Current.model = other.model)`.
    If `bytes` contains malformed byte sequences, truncated multi-byte sequences, overlong encodings (such as non-shortest UTF-8 sequences), or surrogate halves ($[0\text{xD800}, 0\text{xDFFF}]$), `from_utf8` returns `Error(...)` identifying the precise failure mode and byte offset. If valid, it returns `Ok(str)` where `str` satisfies the internal representation invariant `valid_utf8` and establishes that `str.chars` equals the parsed Unicode scalar sequence.
 
    Conversely, verified `STRING` instances are safely and totally serialized back to raw boundary bytes via:
@@ -2069,7 +2151,7 @@ Gardel keeps a pure core and moves all input and output to the program boundary 
    Standard text and binary I/O operations maintain this strict separation:
    - `IO.print(s: STRING): IO[UNIT]`: emits verified text to standard output.
    - `IO.print_line(s: STRING): IO[UNIT]`: emits verified text followed by a newline.
-   - `IO.read_line: IO[RESULT[IO_ERROR, STRING]]`: reads a line from standard input, performing boundary UTF-8 decoding.
+   - `IO.read_line: IO[RESULT[IO_ERROR, STRING]]`: reads a line from standard input, performing boundary UTF-8 decoding. The line may have any length; a trailing `\n` or `\r\n` is removed. End of input before any byte yields `Error(EndOfInput)`, a read failure yields `Error(OsError(errno))`, and a byte the `STRING` cannot represent yields `Error(Decode(InvalidByte(offset, byte_val)))`. With the bootstrap ASCII `STRING` (§6.4.C), that is any byte $\ge 128$. Only a valid line becomes `Ok(s)`. The verifier models each read as a fresh, unknown value (two reads are never assumed equal) and assumes only that an `Ok` payload satisfies the `STRING` invariant; the runtime check above is what justifies that assumption.
    - `IO.read_file(path: STRING): IO[RESULT[IO_ERROR, BYTES]]`: reads raw binary contents from a file path.
    - `IO.write_file(path: STRING, data: BYTES): IO[RESULT[IO_ERROR, UNIT]]`: writes raw binary data to a file path.
 5. **Limited specifications.** Contracts on an `IO` routine cover its pure arguments and result. The verifier does not model the outside world.
@@ -2086,7 +2168,8 @@ feature {ANY}
         match line_res
           case Ok(name) then
             with IO
-              IO.print_line("Hello, ".concat(name))
+              IO.print("Hello, ")
+              IO.print_line(name)
               IO.exit(0)
             end
           case Error(_) then
@@ -2241,7 +2324,7 @@ When a postcondition references a ghost query (`model`) that transitively depend
     "level": "error",
     "rule": "Phase 3 Boogie (Postcondition Violation)",
     "module": "BIGNAT",
-    "routine": "push_high_limb",
+    "routine": "shift_in_low_limb",
     "tag": "model_updated",
     "contract_tag": "model_updated",
     "span": { "file": "bignat.gdl", "line": 52, "column": 5, "end_line": 52, "end_column": 78 },
@@ -2253,11 +2336,11 @@ When a postcondition references a ghost query (`model`) that transitively depend
       "reveal model",
       "reveal value_of"
     ],
-    "message": "Formal verification condition `model_updated` failed in `push_high_limb`"
+    "message": "Formal verification condition `model_updated` failed in `shift_in_low_limb`"
   }
 ]
 ```
-*AI Action:* The agent adds `reveal value_of` (or `reveal model`) to the body of `push_high_limb`.
+*AI Action:* The agent adds `reveal value_of` (or `reveal model`) to the body of `shift_in_low_limb`.
 
 ---
 
@@ -2285,7 +2368,7 @@ The cross-module algebraic law catalogue codified in §9 is indexed by foundatio
 | `map` | `law SEQ.map_identity.id_preserved`<br>`law SEQ.map_fusion.fusion`<br>`law LIST_OPS.map_append.distributes`<br>*(plus `OPTION.map_*` / `RESULT.map_*` when `OPTION` / `RESULT` is in scope)* | Functor Composition & Map Fusion |
 | `filter` | `law SEQ.filter_conjunction.conjunction`<br>`law LIST_OPS.filter_append.distributes` | Filter Fusion & Distributivity |
 | `and_then` | `law OPTION.and_then_right_identity.right_id`<br>`law OPTION.and_then_associative.assoc`<br>`law RESULT.and_then_right_identity.right_id`<br>`law RESULT.and_then_associative.assoc` | Monad Laws & Kleisli Composition |
-| `fold_left`, `fold_right` | `law LIST_OPS.fold_left_append_distributivity.chains`<br>`law LIST_OPS.fold_map_fusion.fused`<br>`law LIST_OPS.fold_left_append.chains`<br>`law LIST_OPS.fold_right_append.chains`<br>`law SEQ.fold_left_singleton.eval_left`<br>`law SEQ.fold_right_singleton.eval_right` | Fold Homomorphisms & Dualities |
+| `fold_left`, `fold_right` | `law LIST_OPS.fold_map_fusion.fused`<br>`law LIST_OPS.fold_left_append.chains`<br>`law LIST_OPS.fold_right_append.chains`<br>`law SEQ.fold_left_singleton.single_folded`<br>`law SEQ.fold_right_singleton.single_folded` | Fold Homomorphisms & Dualities |
 | `compose`, `id_fn`, `identity` | `law FUNCTION_OPS.compose_pointwise.applied`<br>`law FUNCTION_OPS.compose_left_identity.left_id`<br>`law FUNCTION_OPS.compose_right_identity.right_id`<br>`law FUNCTION_OPS.compose_associative.assoc` | Category & Combinator Laws |
 
 #### 4. Module-Local Ghost Queries, Postconditions, and Invariants
@@ -2332,6 +2415,8 @@ SMT solvers (Z3) struggle with automatic quantifier instantiation across recursi
 ```eiffel
 feature {ANY}
   combine_trees(a: SEQ[U64], b: SEQ[U64], c: SEQ[U64]): SEQ[U64]
+    require
+      fits: a.length + b.length + c.length <= 18446744073709551615
     do
       (a.concat(b)).concat(c)
     ensure
@@ -2345,6 +2430,8 @@ Surfaces `"contract_tag": "associative_match"`, with `"relevant_lemmas": ["law S
 ```eiffel
 feature {ANY}
   combine_trees(a: SEQ[U64], b: SEQ[U64], c: SEQ[U64]): SEQ[U64]
+    require
+      fits: a.length + b.length + c.length <= 18446744073709551615
     do
       check assoc: SEQ.concat_associative(a, b, c) end
       (a.concat(b)).concat(c)
@@ -2352,7 +2439,7 @@ feature {ANY}
       associative_match: Result.equals(a.concat(b.concat(c)))
     end
 ```
-In `check` blocks, law instantiation calls (`SEQ.concat_associative(a, b, c)`) automatically desugar into the law's instantiated `ensure` predicate (`a.concat(b).concat(c).equals(a.concat(b.concat(c)))`). Equivalently, the agent may write the expanded boolean predicate directly. Either form provides the exact lemma trigger required by Boogie/Z3, discharging the postcondition instantly.
+The precondition `fits` (evaluated in `MATH_INT`, §3) is required in both versions: it discharges the `fits` precondition of all four `concat` calls and the four `no_overflow_*` preconditions of `law concat_associative`. Without it, the example fails with precondition violations before the associativity goal is even attempted. In `check` blocks, law instantiation calls (`SEQ.concat_associative(a, b, c)`) automatically desugar into the law's instantiated `ensure` predicate (`a.concat(b).concat(c).equals(a.concat(b.concat(c)))`). Equivalently, the agent may write the expanded boolean predicate directly. Either form provides the exact lemma trigger required by Boogie/Z3, discharging the postcondition instantly.
 
 ##### Pattern 2: Ghost Query Opacity Repair via `reveal`
 To maintain modular verification performance, Gardel keeps recursive ghost functions uninterpreted by default (§4). When an agent receives a postcondition violation paired with a `reveal <name>` hint:
@@ -2558,7 +2645,7 @@ Signature     ::= LowerIdent Params? ":" Type
 Params        ::= "(" Param ( "," Param )* ")"
 Param         ::= LowerIdent ":" Type
 
-LawDecl       ::= "law" LowerIdent TypeParams? Params
+LawDecl       ::= "law" LowerIdent TypeParams? Params?
                     RequireBlock? TriggerBlock? VariantBlock?
                     ( "do" Block )?
                     EnsureBlock?
@@ -2578,6 +2665,7 @@ Stmt          ::= "let" LowerIdent ( ":" Type )? "=" Expr
                 | "reveal" LowerIdent
 
 Type          ::= UpperIdent TypeArgs?
+                | "()"                                  (* alias of UNIT, §3 *)
                 | Type "->" Type
                 | "(" ( Param ( "," Param )* )? ")" "->" Type RequireBlock? EnsureBlock?
 TypeArgs      ::= "[" Type ( "," Type )* "]"
@@ -2645,30 +2733,121 @@ HexDigit      ::= [0-9a-fA-F]
 
 ## 16. Open questions and roadmap
 
-The table below records the architectural decisions locked in v0.4 alongside the remaining items for experimentation.
+### 16.1 Architectural Decisions & Baseline Foundations Status
 
-| Question | Decision / Default in v0.4 | Status |
+The table below records the architectural decisions locked in v0.4 alongside the completed Phase 4 standard library remediation milestones (Steps 1–4) and remaining runtime benchmarking items.
+
+| Decision / Milestone | Decision / Default in v0.4 | Status |
 | --- | --- | --- |
-| Block syntax | `end`-delimited blocks | **Locked in v0.4** (optimal for LLM patching) |
-| Execution backend | Bend v2 / BendRT (portable C11 + CUDA + Metal) | **Locked in v0.4** (replaces HVM2) |
-| Recursion primitives | Standard `match` + `variant` + parallel `let` | **Locked in v0.4** (`fold`/`unfold` removed) |
-| Closure semantics | Unrestricted via compile-time closure conversion | **Locked in v0.4** (replaces affine rule) |
-| Verifier backend | Boogie and Z3 (with Phase 0 Dafny prototype) | Active |
-| Memory management in C | Perceus reference counting with in-place reuse vs. BendRT arena | To benchmark in Phase 1 |
-| Gradual verification | None; `assume` audited by `--audit` / `--strict` | **Locked in v0.4** (failure-as-value `RESULT[E, A]` standardized with full combinators and verified algebraic laws) |
-| Step 1: Foundations | Horner polynomial `value_of` on `BIGNAT`, non-overflow `concat` on `SEQ`, valid UTF-8 invariant on `STRING` | **Locked in v0.4** (Verified with 0 errors/warnings) |
-| Step 2: Sum Types & Combinators | `RESULT[E, A]` and `OPTION[A]` verified constructors, extractors, and monadic combinators (`map`, `and_then`) | **Locked in v0.4** (Verified with 0 errors/warnings) |
-| Step 3: Verified Functional Core | Dual-layer model refinement (`SEQ` over `LIST_OPS`), homomorphism laws, pointwise composition (`FUNCTION_OPS`) | **Locked in v0.4** (Verified with 0 errors/warnings) |
-| Step 4: Algebraic Law Catalogue & Concepts | Standard concepts (`EQ`, `CANONICAL_EQ`, `ORD`), conditional conformance (`satisfies ... where ...`), Bird & Wadler algebraic catalogue across `SEQ`/`OPTION`/`RESULT`/`LIST_OPS`/`FUNCTION_OPS`, SMT diagnostics & relevant lemma surfacing | **Locked in v0.4** (Verified with 0 errors, 0 warnings under strict mode; 36/36 tests passing) |
-| Standard Prelude & Module System | Automatic prelude injection (`OPTION`, `RESULT`, `SEQ`, `STRING`, `BIGNAT`, `EQ`, `ORD`); `group` scoped to mutual recursion | **Locked in v0.4** (Harmonized in Spec §4) |
-| Dual-Layer Model Refinement | Principle 9: Pairing high-performance parallel structures with canonical inductive ghost models | **Locked in v0.4** (Harmonized in Spec §2, §6) |
-| Three-Layer Text Model & Strings | `CHAR` scalar primitive, opaque `STRING` ADT with `chars: LIST[CHAR]`, raw `BYTES`, string literal desugaring | **Locked in v0.4** (Harmonized in Spec §3, §11, §15) |
+| Block syntax | `end`-delimited blocks | **Locked in v0.4** (optimal for LLM patching and structured block analysis) |
+| Execution backend | Bend v2 / BendRT (portable C11 + CUDA + Metal) | **Locked in v0.4** (replaces HVM2; unlocks C single-core speed & parallel scaling) |
+| Recursion primitives | Standard `match` + `variant` + parallel `let` | **Locked in v0.4** (`fold`/`unfold`/`fork`/`Subject` removed; clean induction) |
+| Closure semantics | Unrestricted via compile-time closure conversion | **Locked in v0.4** (lambda lifting to first-order ADTs replaces affine restriction) |
+| Verifier backend | Boogie and Z3 (with native SMT diagnostic indexing) | **Locked in v0.4** (Direct Boogie/Z3 pipeline replaces Phase 0 Dafny prototype; verified under `gardelc --strict`) |
+| Memory management in C | Perceus reference counting with in-place reuse vs. BendRT arena | Active (to benchmark in Phase C runtime integration) |
+| Gradual verification | None; `assume` audited by `--audit` / `--strict` | **Locked in v0.4** (failure-as-value `RESULT[E, A]` standardized with full combinators) |
+| Standard Prelude & Module System | Automatic prelude injection (`OPTION`, `RESULT`, `SEQ`, `STRING`, `BYTES`, `STRING_ERROR`, `IO_ERROR`, `BIGNAT`, `LIST`, `MATH_INT`, `EQ`, `CANONICAL_EQ`, `ORD`, `LIST_OPS`, `FUNCTION_OPS`) with `--no-prelude` bootstrap flag; `group` scoped strictly to mutual recursion | **Locked in v0.4** (Formalized in Spec §4, §15) |
+| Dual-Layer Model Refinement | Principle 9: Pairing high-performance parallel structures with canonical inductive ghost models | **Locked in v0.4** (Formalized in Spec §2, §6) |
+| Three-Layer Text Model & Strings | `CHAR` scalar primitive, opaque `STRING` ADT with `chars: LIST[CHAR]`, raw `BYTES`, string literal desugaring | **Locked in v0.4** (Formalized in Spec §3, §11, §15) |
+| Strict Equality Hierarchy | Structural Leibniz `=` restricted to primitives & `CANONICAL_EQ`; `.equals()` for `EQ`; ghost model equality `a.model = b.model` | **Locked in v0.4** (Formalized in Spec §9) |
+| **Step 1: Foundations** | Horner polynomial `value_of` on `BIGNAT`, non-overflow `concat` on `SEQ`, inductive byte invariant on `STRING` (ASCII subset of UTF-8; full `valid_utf8` in Task C.2) | **Locked in v0.4** (Verified with 0 errors/warnings) |
+| **Step 2: Sum Types & Combinators** | `RESULT[E, A]` and `OPTION[A]` verified constructors, extractors, and monadic combinators (`map`, `and_then`) | **Locked in v0.4** (Verified with 0 errors/warnings) |
+| **Step 3: Verified Functional Core** | Dual-Layer model refinement (`SEQ` over `LIST_OPS`), homomorphism laws, pointwise composition (`FUNCTION_OPS`) | **Locked in v0.4** (Verified with 0 errors/warnings) |
+| **Step 4: Algebraic Law Catalogue & Concepts** | Standard concepts (`EQ`, `CANONICAL_EQ`, `ORD`), conditional conformance (`satisfies ... where ...`), Bird & Wadler algebraic catalogue across `SEQ`/`OPTION`/`RESULT`/`LIST_OPS`/`FUNCTION_OPS`, SMT diagnostics & relevant lemma surfacing | **Locked in v0.4** (Verified with 0 errors, 0 warnings under strict mode; 36/36 tests passing) |
 
-**Consolidated Evolution Roadmap**
+---
 
-1. **Phase A: Language Specification Harmonization (`spec v0.4`).** [**COMPLETED**]  
-   Formalized Dual-Layer Model Refinement (§2, §6), Standard Prelude & multi-file compilation (§4, §15), `RESULT[E, A]` & Error Handling Doctrine (§5, §7), Three-Layer Text Model & literal desugaring (§3, §11, §15), Strict Equality & Bird-Wadler Law Catalogue (§9), and AI Diagnostic Law Surfacing in `--json-diagnostics` (§12).
-2. **Phase B: Compiler Engine & Prelude Tooling (`gardelc`).** [**IN PROGRESS**]  
-   Automatic prelude AST injection (`phase4_stdlib_source()`), cleanup of example programs (`greeter.gdl`, `peano_ord.gdl`), compiler desugaring of string literals to prelude `STRING`, and multi-file project CLI compilation (`gardelc src/*.gdl`).
-3. **Phase C: Standard Library Modularization & Smart String Implementation.** [**PLANNED**]  
-   Physical file decomposition of `stdlib/` into modular subdirectories (`concepts/`, `core/`, `collections/`, `numeric/`, `text/`, `functional/`), packed UTF-8 Smart String implementation, and comprehensive SMT benchmark regression testing with zero errors and zero warnings.
+### 16.2 Compiler & Verification Architecture Roadmap (Phases 0–4)
+
+The `gardelc` compiler pipeline (§13) and its `--json-diagnostics` `"rule"` taxonomy (§12) are organized around five incremental compiler and library engineering phases:
+
+1. **Phase 0: Feasibility & Parallel Prototype — [✅ Locked in v0.4]**
+   - Core subset (`U64`, ADTs, `let`, `match`, contracts) verified and executed in parallel on CPU and GPU (CUDA/Metal) across the canonical benchmark routines `TREE.from_range` and `TREE.max_value` (§14).
+2. **Phase 1: Front-End, Visibility Rules & C11/Bend Emitter — [✅ Locked in v0.4]**
+   - Lexer, EBNF parser (§15), name resolution, enforcement of Visibility Rules 1–5 (§4), compile-time closure conversion via lambda lifting (§8), and direct Bend v2 / BendRT C11 code generation (§13).
+3. **Phase 2: Concepts, Conditional Conformance & Monomorphization — [✅ Locked in v0.4]**
+   - `concept` declarations, `refines` hierarchies, conditional module conformance (`satisfies ... where ...`), concept law proof obligations, SMT quantifier `trigger` attributes, and zero-overhead monomorphization (§9, §13). Static and verification diagnostics emit `"Phase 2 (...)"` rules (§12).
+4. **Phase 3: Direct Boogie Verifier & AI Diagnostic Tooling — [✅ Locked in v0.4]**
+   - Direct Boogie (`.bpl`) verification condition generation, Z3 discharge, fuel-bounded recursive unfolding, `reveal` directives for opaque `specify` queries (§7.5), counterexample translation, and deterministic `--json-diagnostics` with `relevant_lemmas` law indexing (§12). Verification diagnostics emit `"Phase 3 (...)"` and `"Phase 3 Boogie (...)"` rules.
+5. **Phase 4: Standard Library & Linear IO Architecture — [🔄 Steps 1–4 Completed; Consolidated Evolution Plan Phases A–C Active]**
+   - Standard Prelude package (`phase4_stdlib_source()`), linear `IO[A]` boundary and branch enforcement emitting `"Phase 4 (IO Boundary Violation)"` and `"Phase 4 (Linear IO Violation)"` diagnostics (§11), foundational library remediation (**Steps 1–4**, §16.3), and modular packaging & tooling (**Phases A–C**, §16.4).
+
+---
+
+### 16.3 Phase 4 Standard Library Milestones (Steps 1–4 Completed)
+
+Within **Phase 4 (Standard Library & IO)**, Steps 1 through 4 completed the verification and algebraic foundation of `stdlib.gdl`, all locked in v0.4:
+
+1. **Step 1 — Foundations Remediation (`BIGNAT`, `SEQ`, `STRING`):**
+   - Repaired `BIGNAT` with a true Horner polynomial evaluation `value_of(limbs)` over radix $2^{64}$ yielding an unbounded `MATH_INT` ghost model.
+   - Repaired `SEQ[A]` with $O(1)$ cached subtree lengths (`Concat(l, r, len)`) and non-overflow preconditions on `concat`. `SEQ[A]` declares **no** `invariant` block: cached-length consistency is maintained inductively through constructor and transformer postconditions (`len_sum: Result.length = Current.length + other.length`, `same_length`), because a shallow `len = l.length + r.length` invariant is not hereditary (§6, *Shallow Pattern Matches on Recursive Sum Types Are Not Hereditary*).
+   - Established the inductive `all_bytes_valid` representation invariant on `STRING` (ASCII subset of UTF-8, §6.4.C). The full multi-byte `valid_utf8` invariant is Task C.2.
+
+2. **Step 2 — Sum Types & Composable Fallibility (`RESULT[E, A]`, `OPTION[A]`):**
+   - Standardized `RESULT[E, A]` (`Error(err: E) | Ok(val: A)`) and `OPTION[A]` (`None | Some(val: A)`) with verified constructors, total predicates, safe extractors (`unwrap`, `unwrap_or`), and railway-oriented monadic combinators (`map`, `map_error`, `and_then`, §5, §7).
+
+3. **Step 3 — Verified Functional Core (`LIST_OPS`, `SEQ[A]`, `FUNCTION_OPS`):**
+   - Implemented canonical inductive list operations in `functions LIST_OPS` (`append`, `length`, `at`, `map`, `filter`, `fold_left`, `fold_right`, `reverse`).
+   - Proved Dual-Layer Model Refinement postconditions on parallel divide-and-conquer `SEQ[A]` routines against `LIST_OPS` (`Result.model = LIST_OPS.op(Current.model, ...)`, §2, §6, §10.5).
+   - Added pointwise function combinators in `functions FUNCTION_OPS` (`id_fn`, `compose`).
+
+4. **Step 4 — Algebraic Law Catalogue, Concept Conformance & AI Diagnostics (§9, §12):**
+   - **Standard Concept Hierarchy (§9.2–§9.4):** Defined `concept EQ` (`reflexive`, `symmetric`, `transitive`), `concept CANONICAL_EQ refines EQ` (`agrees_with_structural`: `a.equals(b) = (a = b)`), and `concept ORD refines EQ` (`irreflexive`, `transitive`, `total` over `less_than` and `equals`).
+   - **Conditional Conformance & Equivalence Soundness (§9.1, §9.5):**
+     - Conditional conformance follows the §15 EBNF syntax `module M[T] satisfies C where T satisfies C` (concepts operate on `Current` without type arguments).
+     - `module SEQ[A] satisfies EQ where A satisfies CANONICAL_EQ` (bound tightened from `EQ` in Task B.8; enforced by `E0314`) defines behavioral equivalence via canonical **Ghost Model Equality** (`Result = (Current.model = other.model)` over `LIST[A]`, §9.1 Tier 3), avoiding false-negative SMT contradictions on distinct balanced tree shapes.
+     - `module OPTION[A] satisfies CANONICAL_EQ where A satisfies CANONICAL_EQ` and `module RESULT[E, A] satisfies CANONICAL_EQ where E satisfies CANONICAL_EQ, A satisfies CANONICAL_EQ` prove full agreement with structural Leibniz equality (`=`).
+     - `module BIGNAT satisfies ORD` (where `concept ORD refines EQ`) proves total ordering via `less_than` and `less_or_equal` refining to `<` and `<=` on its `model: MATH_INT` (`value_of(limbs)`).
+   - **Bird & Wadler Algebraic Law Catalogue (§9.6):**
+     - **Monoid Laws:** Associativity (`concat_associative`, `append_associative`), left/right identity (`concat_left_identity`, `concat_right_identity`), and the length homomorphism (`concat_length_homomorphism`) on `SEQ[A]` and `LIST[A]`.
+     - **Functor Laws & Map Fusion:** Identity preservation (`s.map(id_fn).equals(s)`) and composition fusion (`s.map(g).map(f).equals(s.map(FUNCTION_OPS.compose(f, g)))` on `SEQ[A]`, and `LIST_OPS.map(LIST_OPS.map(xs, g), f) = LIST_OPS.map(xs, FUNCTION_OPS.compose(f, g))` on `LIST[A]`, where `compose(f, g)(x) = f(g(x))`).
+     - **Monad Laws:** Left unit (`and_then_left_unit` on `OPTION`, `and_then_ok` on `RESULT`), right identity (`and_then_right_identity`), and associativity (`and_then_associative`) for `OPTION[A]` and `RESULT[E, A]`.
+     - **Fold & Filter Laws:** Accumulator chaining over concatenation (`fold_left_append`: `LIST_OPS.fold_left(xs.append(ys), f, init) = LIST_OPS.fold_left(ys, f, LIST_OPS.fold_left(xs, f, init))` and `fold_right_append`: `LIST_OPS.fold_right(xs.append(ys), f, init) = LIST_OPS.fold_right(xs, f, LIST_OPS.fold_right(ys, f, init))`), fold-map fusion (`fold_map_fusion`), and filter conjunction/commutativity (`filter_conjunction`, `filter_map_commute`).
+     - **Order & Valuation Laws:** Reflexivity, symmetry, transitivity of `BIGNAT.equals` and irreflexivity, transitivity, totality of `BIGNAT.less_than` via `BIGNAT.model: MATH_INT`.
+   - **AI Diagnostic Law Surfacing Engine (§12):** Indexed in-scope concept laws, catalogue lemmas, and transitive opaque ghost query `reveal` hints into `--json-diagnostics` `relevant_lemmas`, supporting inline law instantiation in `check` blocks (`check tag: MODULE.law_name(args) end`) and automated Bird-Wadler program derivation.
+
+---
+
+### 16.4 Consolidated Three-Phase Evolution Roadmap (Phases A–C)
+
+To complete Phase 4's transition from a single-file bootstrap prototype into a multi-file, prelude-injected production environment, ongoing work is organized into three synchronized evolution phases:
+
+```mermaid
+flowchart LR
+    A["Phase A: Language Spec Harmonization (spec v0.4)\n[✅ COMPLETED]"] --> B["Phase B: Compiler Engine & Prelude Tooling (gardelc)\n[🚀 IN PROGRESS]"]
+    B --> C["Phase C: Stdlib Modularization & Smart String\n[📋 PLANNED]"]
+```
+
+#### Phase A: Language Specification Harmonization (`spec v0.4`) — [✅ Completed]
+Formalized all foundational principles, standard prelude semantics, and verification architecture:
+- **Task A.1 (§2, §6):** Formalized Dual-Layer Model Refinement as Principle 9.
+- **Task A.2 (§4, §15):** Specified Standard Prelude, one-module-per-file convention (`W0201`), `--no-prelude` bootstrap mode, and scoped `group` strictly to mutual recursion.
+- **Task A.3 (§5, §7):** Standardized Prelude `RESULT[E, A]` sum type and the railway-oriented Error Handling Doctrine.
+- **Task A.4 (§3, §11, §15):** Defined the Three-Layer Text Model (`CHAR`, `STRING`, `BYTES`) and compile-time string literal desugaring.
+- **Task A.5 (§9):** Codified the Strict Equality Hierarchy and Bird & Wadler algebraic law catalogue.
+- **Task A.6 (§12):** Specified AI Diagnostic Law Surfacing in `--json-diagnostics` wire format, inline law call desugaring, and repair patterns.
+- **Task A.7 (§16):** Synchronized the architectural decision table, Phases 0–4 compiler/verification taxonomy, Step 1–4 standard library milestones, and Phases A–C evolution roadmap.
+- **Task A.8 (Phase A review remediation):** Restated bootstrap `STRING` as the ASCII subset of UTF-8 with a length-preserving `decode_utf8`, `law decode_injective`, and `specify {EQ}` (§6.4.C); added `CHAR.from_scalar` (§3.1); made `OPTION`/`RESULT.equals` postconditions case-wise (§5); clarified the dual runtime/ghost status of `LIST` and the `LIST[U64]` limbs of `BIGNAT` (§3, §4.1, §6.4.B); documented the Visibility Rule 3 bootstrap deviation (§6.4); added `IO_ERROR` and the `BYTES` surface (§11); fixed the §7.2.2 and §12 examples and law tags; made `LawDecl` parameters optional and added the `()` type (§15); and corrected the §16.3 claims about `SEQ` invariants and law names.
+
+#### Phase B: Compiler Engine & Prelude Tooling (`gardelc`) — [🚀 In Progress]
+Enhancing the compiler pipeline to provide a seamless developer experience without library duplication:
+- **Task B.1:** Automatic prelude AST injection (`phase4_stdlib_source()`) into the symbol table, concept map, and Boogie verification context during user program compilation, bypassed when `--no-prelude` or `--stdlib` bootstrap mode is active (or when compiling the standard library source directly, §4.1).
+- **Task B.2:** Cleanup of example programs (`examples/greeter.gdl`, `examples/peano_ord.gdl`, `examples/bounded_stack.gdl`) to eliminate redundant stdlib definitions and obsolete ambient `group` headers.
+- **Task B.3:** Compiler AST elaboration and desugaring of string literals (`"..."`) into prelude `STRING` instances with C11 runtime integration.
+- **Task B.4:** Multi-file project CLI compilation support (`gardelc src/*.gdl --strict`) linking multiple source files into a unified verification run.
+- **Task B.5:** Stdlib/compiler conformance with the Phase A review: remove the `equals`/`less_than` ghost-access exemption (§4 Rule 3) by giving `SEQ`/`BIGNAT` executable comparison bodies (with a `BIGNAT` normalization invariant); remove the hard-coded `decode_utf8` identity axiom from the Boogie emitter in favour of the proven `same_length`/`decode_injective` lemmas; align `stdlib.gdl` `STRING` with §6.4.C (ASCII bound, `decode_utf8` precondition, `CHAR.from_scalar` precondition); drop the unconditional `sound` postcondition from `OPTION`/`RESULT.equals`; remove the duplicate law `LIST_OPS.fold_left_append_distributivity`; and rename `BIGNAT.push_high_limb` to `shift_in_low_limb`.
+
+#### Phase C: Standard Library Modularization & Smart String Implementation — [📋 Planned]
+Decomposing the monolithic standard library into physical 1:1 module files (satisfying §4.2 `W0201` under `--strict`) and delivering production text performance:
+- **Task C.1:** Physical 1:1 file decomposition of `stdlib/` into modular directories:
+  - `stdlib/concepts/`: `eq.gdl` (`concept EQ`), `canonical_eq.gdl` (`concept CANONICAL_EQ`), `ord.gdl` (`concept ORD`)
+  - `stdlib/core/`: `option.gdl` (`module OPTION[A]`), `result.gdl` (`module RESULT[E, A]`), `io_error.gdl` (`module IO_ERROR`)
+  - `stdlib/collections/`: `list_ops.gdl` (`functions LIST_OPS`), `seq.gdl` (`module SEQ[A]`)
+  - `stdlib/numeric/`: `bignat.gdl` (`module BIGNAT`)
+  - `stdlib/text/`: `string.gdl` (`module STRING`), `bytes.gdl` (`module BYTES`), `string_error.gdl` (`module STRING_ERROR`)
+  - `stdlib/functional/`: `function_ops.gdl` (`functions FUNCTION_OPS`)
+- **Task C.2:** High-performance Smart String implementation in `stdlib/text/string.gdl` (packed 64-bit words / UTF-8 byte buffer, `valid_utf8` invariant, zero-allocation literals, `chars: LIST[CHAR]` model, and boundary decoding `STRING.from_utf8(bytes: BYTES): RESULT[STRING_ERROR, STRING]`).
+- **Task C.3:** Comprehensive regression verification and performance benchmarking:
+  - 100% test pass rate in `cargo test`.
+  - Zero verification errors and zero warnings across all modular `stdlib/` files and `examples/` under `gardelc --strict`.
+  - End-to-end execution of compiled examples on C11 / BendRT backends.

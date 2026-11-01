@@ -151,7 +151,7 @@ feature {ANY}
       Current.size
     end
 
-  push_high_limb(limb: U64): BIGNAT
+  shift_in_low_limb(limb: U64): BIGNAT
     require
       not_full: Current.limb_count < 1024
     do

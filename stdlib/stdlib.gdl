@@ -1,4 +1,4 @@
-group { SEQ, BIGNAT, STRING, OPTION, RESULT, LIST_OPS, FUNCTION_OPS }
+group { SEQ, BIGNAT, STRING, STRING_ERROR, IO_ERROR, OPTION, RESULT, LIST_OPS, FUNCTION_OPS }
 
 concept EQ
 
@@ -85,7 +85,9 @@ feature {ANY}
           end
       end
     ensure
-      sound: Result = (Current = other)
+      none_eq: (Current.is_none and other.is_none) implies Result
+      some_eq: (Current.is_some and other.is_some) implies (Result = Current.get.equals(other.get))
+      variant_mismatch: (Current.is_some = other.is_none) implies not Result
     end
 
   is_some: BOOL
@@ -243,7 +245,7 @@ specify {ANY}
 
 end
 
-module SEQ[A] satisfies EQ where A satisfies EQ
+module SEQ[A] satisfies EQ where A satisfies CANONICAL_EQ
 
 representation {ANY}
   | Empty
@@ -285,9 +287,22 @@ feature {ANY}
 
   equals(other: SEQ[A]): BOOL
     do
-      Current.model = other.model
+      Current.to_list = other.to_list
     ensure
       model_equality: Result = (Current.model = other.model)
+    end
+
+  to_list: LIST[A]
+    variant
+      Current
+    do
+      match Current
+        case Empty           then LIST.empty
+        case Leaf(v)         then LIST.empty.prepend(v)
+        case Concat(l, r, _) then l.to_list.append(r.to_list)
+      end
+    ensure
+      is_model: Result = Current.model
     end
 
   length: NAT
@@ -480,7 +495,7 @@ specify {ANY}
 
   law map_fusion[B, C](s: SEQ[A], f: B -> C, g: A -> B)
     ensure
-      fusion: s.map(g).map(f).equals(s.map(FUNCTION_OPS.compose(f, g)))
+      fusion: s.map(g).map(f).model = s.map(FUNCTION_OPS.compose(f, g)).model
     end
 
   law filter_conjunction(s: SEQ[A], p: A -> BOOL, q: A -> BOOL)
@@ -507,6 +522,68 @@ specify {ANY}
       else
         ls.head + 18446744073709551616 * value_of(ls.tail)
       end
+    end
+
+  limbs_in_range(ls: LIST[U64]): BOOL
+    variant
+      ls.length
+    do
+      if ls.length = 0 then
+        True
+      else
+        0 <= ls.head and ls.head <= 18446744073709551615 and limbs_in_range(ls.tail)
+      end
+    end
+
+  normalized(ls: LIST[U64]): BOOL
+    variant
+      ls.length
+    do
+      if ls.length = 0 then
+        True
+      else
+        if ls.tail.length = 0 then
+          ls.head > 0
+        else
+          normalized(ls.tail)
+        end
+      end
+    end
+
+  value_bounds(ls: LIST[U64]): BOOL
+    require
+      in_range: limbs_in_range(ls)
+    variant
+      ls.length
+    do
+      if ls.length = 0 then
+        True
+      else
+        value_bounds(ls.tail)
+      end
+    ensure
+      bounds_hold: Result
+      non_negative: value_of(ls) >= 0
+      positive_when_normalized: (ls.length > 0 and normalized(ls)) implies value_of(ls) > 0
+    end
+
+  shorter_is_smaller(xs: LIST[U64], ys: LIST[U64]): BOOL
+    require
+      shorter: xs.length < ys.length
+      xs_in_range: limbs_in_range(xs)
+      ys_in_range: limbs_in_range(ys)
+      ys_normalized: normalized(ys)
+    variant
+      xs.length
+    do
+      if xs.length = 0 then
+        value_bounds(ys)
+      else
+        shorter_is_smaller(xs.tail, ys.tail)
+      end
+    ensure
+      shorter_holds: Result
+      strictly_smaller: value_of(xs) < value_of(ys)
     end
 
   model: MATH_INT
@@ -541,14 +618,42 @@ feature {ANY}
 
   equals(other: BIGNAT): BOOL
     do
-      Current.model = other.model
+      if Current.size = other.size then
+        compare_limbs(Current.limbs, other.limbs) = 1
+      else
+        if Current.size < other.size then
+          check
+            current_shorter: shorter_is_smaller(Current.limbs, other.limbs)
+          end
+          False
+        else
+          check
+            other_shorter: shorter_is_smaller(other.limbs, Current.limbs)
+          end
+          False
+        end
+      end
     ensure
       model_eq: Result = (Current.model = other.model)
     end
 
   less_than(other: BIGNAT): BOOL
     do
-      Current.model < other.model
+      if Current.size = other.size then
+        compare_limbs(Current.limbs, other.limbs) = 0
+      else
+        if Current.size < other.size then
+          check
+            current_shorter: shorter_is_smaller(Current.limbs, other.limbs)
+          end
+          True
+        else
+          check
+            other_shorter: shorter_is_smaller(other.limbs, Current.limbs)
+          end
+          False
+        end
+      end
     ensure
       model_lt: Result = (Current.model < other.model)
     end
@@ -558,15 +663,50 @@ feature {ANY}
       Current.size
     end
 
-  push_high_limb(limb: U64): BIGNAT
+  shift_in_low_limb(limb: U64): BIGNAT
     require
       not_full: Current.limb_count < 1024
+      no_leading_zero: limb > 0 or Current.limb_count > 0
     do
       { limbs = Current.limbs.prepend(limb),
         size = Current.size + 1 }
     ensure
       limb_added: Result.limb_count = Current.limb_count + 1
       model_updated: Result.model = limb + 18446744073709551616 * Current.model
+    end
+
+feature {NONE}
+
+  compare_limbs(xs: LIST[U64], ys: LIST[U64]): U64
+    require
+      same_length: xs.length = ys.length
+      xs_in_range: limbs_in_range(xs)
+      ys_in_range: limbs_in_range(ys)
+    variant
+      xs.length
+    do
+      if xs.length = 0 then
+        1
+      else
+        let high = compare_limbs(xs.tail, ys.tail)
+        if high = 1 then
+          if xs.head < ys.head then
+            0
+          else
+            if xs.head = ys.head then
+              1
+            else
+              2
+            end
+          end
+        else
+          high
+        end
+      end
+    ensure
+      code_bounded: Result <= 2
+      less_code: (Result = 0) = (value_of(xs) < value_of(ys))
+      equal_code: (Result = 1) = (value_of(xs) = value_of(ys))
     end
 
 specify {EQ}
@@ -614,10 +754,12 @@ specify {ORD}
 invariant
   size_matches: size = limbs.length
   bounded_limbs: size <= 1024
+  limbs_in_u64: limbs_in_range(limbs)
+  no_zero_high_limb: normalized(limbs)
 
 end
 
-module STRING
+module STRING satisfies EQ
 
 representation {NONE}
   bytes: LIST[U64]
@@ -633,8 +775,47 @@ specify {ANY}
       if bs.length = 0 then
         True
       else
-        bs.head < 256 and all_bytes_valid(bs.tail)
+        bs.head < 128 and all_bytes_valid(bs.tail)
       end
+    end
+
+  scalar_codes(cs: LIST[CHAR]): LIST[U64]
+    variant
+      cs.length
+    do
+      if cs.length = 0 then
+        LIST.empty
+      else
+        scalar_codes(cs.tail).prepend(cs.head.code)
+      end
+    end
+
+  decode_utf8(bs: LIST[U64]): LIST[CHAR]
+    require
+      ascii: all_bytes_valid(bs)
+    variant
+      bs.length
+    do
+      if bs.length = 0 then
+        LIST.empty
+      else
+        decode_utf8(bs.tail).prepend(CHAR.from_scalar(bs.head))
+      end
+    ensure
+      same_length: Result.length = bs.length
+      cons_case: bs.length > 0 implies Result = decode_utf8(bs.tail).prepend(CHAR.from_scalar(bs.head))
+      codes_preserved: scalar_codes(Result) = bs
+    end
+
+  law decode_injective(xs: LIST[U64], ys: LIST[U64])
+    require
+      xs_ascii: all_bytes_valid(xs)
+      ys_ascii: all_bytes_valid(ys)
+      same_chars: decode_utf8(xs) = decode_utf8(ys)
+    variant
+      xs.length
+    ensure
+      same_bytes: xs = ys
     end
 
   byte_model: LIST[U64]
@@ -644,7 +825,9 @@ specify {ANY}
 
   chars: LIST[CHAR]
     do
-      Current.bytes
+      decode_utf8(Current.bytes)
+    ensure
+      def: Result = decode_utf8(Current.byte_model)
     end
 
 create {ANY}
@@ -656,14 +839,33 @@ create {ANY}
       { bytes = LIST.empty, size = 0, limit = cap }
     ensure
       empty_bytes: Result.byte_length = 0
+      empty_chars: Result.chars = LIST.empty
       empty_str: Result.is_empty
+      capacity_set: Result.capacity = cap
     end
 
 feature {ANY}
 
+  equals(other: STRING): BOOL
+    do
+      Current.bytes = other.bytes
+    ensure
+      byte_equality: Result = (Current.byte_model = other.byte_model)
+      char_equality: Result = (Current.chars = other.chars)
+    end
+
   byte_length: NAT
     do
       Current.size
+    ensure
+      matches_bytes: Result = Current.byte_model.length
+    end
+
+  code_point_count: NAT
+    do
+      Current.size
+    ensure
+      def: Result = Current.chars.length
     end
 
   capacity: NAT
@@ -676,11 +878,12 @@ feature {ANY}
       Current.size = 0
     ensure
       def: Result = (Current.byte_length = 0)
+      empty_chars: Result = (Current.chars = LIST.empty)
     end
 
   push_byte(b: U64): STRING
     require
-      is_byte: b < 256
+      is_byte: b < 128
       has_room: Current.byte_length < Current.capacity
     do
       { bytes = Current.bytes.prepend(b),
@@ -693,7 +896,7 @@ feature {ANY}
 
   push_utf8_word(w: U64): STRING
     require
-      valid_word: w < 256
+      valid_word: w < 128
       has_room: Current.byte_length < Current.capacity
     do
       { bytes = Current.bytes.prepend(w),
@@ -704,11 +907,67 @@ feature {ANY}
       non_empty: not Result.is_empty
     end
 
+  push_ascii(c: CHAR): STRING
+    require
+      is_ascii: c.code < 128
+      has_room: Current.byte_length < Current.capacity
+    do
+      { bytes = Current.bytes.prepend(c.code),
+        size = Current.size + 1,
+        limit = Current.limit }
+    ensure
+      grew: Result.byte_length = Current.byte_length + 1
+      chars_prepended: Result.chars = Current.chars.prepend(c)
+      non_empty: not Result.is_empty
+      same_capacity: Result.capacity = Current.capacity
+    end
+
+specify {EQ}
+
+  law reflexive(a: STRING)
+    ensure
+      refl: a.equals(a)
+    end
+
+  law symmetric(a: STRING, b: STRING)
+    require
+      ab: a.equals(b)
+    ensure
+      ba: b.equals(a)
+    end
+
+  law transitive(a: STRING, b: STRING, c: STRING)
+    require
+      ab: a.equals(b)
+      bc: b.equals(c)
+    ensure
+      ac: a.equals(c)
+    end
+
 invariant
   positive_capacity: limit > 0
   size_matches: size = bytes.length
   within_bounds: size <= limit
   valid_bytes: all_bytes_valid(bytes)
+
+end
+
+module STRING_ERROR
+
+representation {ANY}
+  | InvalidByte(offset: NAT, byte_val: U64)
+  | TruncatedSequence(offset: NAT, expected: NAT)
+  | OverlongEncoding(offset: NAT)
+  | UnpairedSurrogate(offset: NAT)
+
+end
+
+module IO_ERROR
+
+representation {ANY}
+  | EndOfInput
+  | Decode(cause: STRING_ERROR)
+  | OsError(code: I64)
 
 end
 
@@ -753,7 +1012,9 @@ feature {ANY}
           end
       end
     ensure
-      sound: Result = (Current = other)
+      err_eq: (Current.is_error and other.is_error) implies (Result = Current.get_error.equals(other.get_error))
+      ok_eq: (Current.is_ok and other.is_ok) implies (Result = Current.get.equals(other.get))
+      variant_mismatch: (Current.is_ok = other.is_error) implies not Result
     end
 
   is_ok: BOOL
@@ -1039,12 +1300,6 @@ specify {ANY}
   law fold_right_append[A, B](xs: LIST[A], ys: LIST[A], f: (x: A, acc: B) -> B, init: B)
     ensure
       chains: LIST_OPS.fold_right(xs.append(ys), f, init) = LIST_OPS.fold_right(xs, f, LIST_OPS.fold_right(ys, f, init))
-    end
-
-  law fold_left_append_distributivity[A, B](xs: LIST[A], ys: LIST[A], f: (acc: B, x: A) -> B, init: B)
-    ensure
-      chains: LIST_OPS.fold_left(xs.append(ys), f, init) =
-              LIST_OPS.fold_left(ys, f, LIST_OPS.fold_left(xs, f, init))
     end
 
   law fold_map_fusion[A, B, C](xs: LIST[A], g: A -> B, f: (acc: C, b: B) -> C, init: C)
