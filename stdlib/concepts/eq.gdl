@@ -1,0 +1,26 @@
+concept EQ
+
+  equals(other: Current): BOOL
+
+  law reflexive(a: Current)
+    ensure
+      refl: a.equals(a)
+    end
+
+  law symmetric(a: Current, b: Current)
+    require
+      ab: a.equals(b)
+    ensure
+      ba: b.equals(a)
+    end
+
+  law transitive(a: Current, b: Current, c: Current)
+    require
+      ab: a.equals(b)
+      bc: b.equals(c)
+    ensure
+      ac: a.equals(c)
+    end
+
+end
+

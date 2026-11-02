@@ -1,6 +1,6 @@
 # The Gardel Programming Guide
 
-Welcome to the definitive guide to **Gardel**, a pure, total, statically verified programming language that fuses **Eiffel's Design by Contract**, **Dafny's automated SMT verification**, and **Bend's massively parallel runtime**.
+Welcome to the definitive guide to **Gardel**, a pure, total, statically verified programming language that fuses **Eiffel's Design by Contract**, **Dafny-style automated SMT verification** (carried out by Boogie and Z3), and **Bend's massively parallel runtime**.
 
 This guide is written for two audiences:
 1. **Software engineers** seeking mathematical certainty, zero-cost static contracts, and lock-free parallel execution on modern CPUs and GPUs.
@@ -23,6 +23,7 @@ This guide is written for two audiences:
   - [Checked Operators & Overflow Proofs](#checked-operators--overflow-proofs)
   - [Wrapping and Bitwise Operators](#wrapping-and-bitwise-operators)
   - [Deterministic Floating Point (`F64`)](#deterministic-floating-point-f64)
+  - [Text: `CHAR` and `STRING`](#text-char-and-string)
 - [4. Statements, Blocks, and Local Proof State](#4-statements-blocks-and-local-proof-state)
   - [Immutable `let` Bindings](#immutable-let-bindings)
   - [Intermediate Verifier Directives: `check`, `assume`, and `reveal`](#intermediate-verifier-directives-check-assume-and-reveal)
@@ -47,6 +48,9 @@ This guide is written for two audiences:
   - [The Totality Requirement (No Infinite Loops)](#the-totality-requirement-no-infinite-loops)
   - [Structural Induction with `variant`](#structural-induction-with-variant)
   - [Well-Founded Arithmetic Metrics](#well-founded-arithmetic-metrics)
+  - [Lexicographic Variants](#lexicographic-variants)
+  - [Mutual Recursion](#mutual-recursion)
+  - [No Recursion Through Function Values](#no-recursion-through-function-values)
 - [10. Automatic Deterministic Parallelism](#10-automatic-deterministic-parallelism)
   - [Divide-and-Conquer Parallel Fork-Join](#divide-and-conquer-parallel-fork-join)
   - [Church-Rosser Confluence](#church-rosser-confluence)
@@ -59,11 +63,14 @@ This guide is written for two audiences:
 - [12. Concepts, Laws, and Mathematical Conformance](#12-concepts-laws-and-mathematical-conformance)
   - [Declaring a `concept` and Laws](#declaring-a-concept-and-laws)
   - [Proving Laws in `specify`](#proving-laws-in-specify)
-  - [Equivalence Relations (`EQ`) vs SMT Identity (`=`)](#equivalence-relations-eq-vs-smt-identity-)
+  - [Inductive Law Proofs](#inductive-law-proofs)
+  - [The Equality Hierarchy: `=`, `!=`, `equals`, and Models](#the-equality-hierarchy---equals-and-models)
   - [Total Orders (`ORD`)](#total-orders-ord)
+  - [Conditional Conformance (`where`)](#conditional-conformance-where)
 - [13. The Linear IO Firewall](#13-the-linear-io-firewall)
   - [Why Pure Modules Forbid Effects](#why-pure-modules-forbid-effects)
   - [Linear `IO[A]` Actions and `with IO`](#linear-ioa-actions-and-with-io)
+  - [Reading Input: `IO.read_line`](#reading-input-ioread_line)
   - [Boundary Ingestion: Untrusted Data to Verified ADTs](#boundary-ingestion-untrusted-data-to-verified-adts)
 - [14. SMT Proofs & AI Agent Verification Workflow](#14-smt-proofs--ai-agent-verification-workflow)
   - [The Boogie / Z3 Verification Engine](#the-boogie--z3-verification-engine)
@@ -74,7 +81,11 @@ This guide is written for two audiences:
   - [Example A: `BOUNDED_STACK[A]`](#example-a-bounded_stacka)
   - [Example B: Verified Parallel Tree Construction & Maximum](#example-b-verified-parallel-tree-construction--maximum)
   - [Example C: Peano Numbers with Formally Verified Total Ordering](#example-c-peano-numbers-with-formally-verified-total-ordering)
-- [16. Compiler CLI Cheatsheet & Grammar Reference](#16-compiler-cli-cheatsheet--grammar-reference)
+- [16. Projects and the Standard Prelude](#16-projects-and-the-standard-prelude)
+  - [The Prelude Is Always There](#the-prelude-is-always-there)
+  - [Multi-File Projects](#multi-file-projects)
+  - [The Standard Library Sources (`stdlib/`)](#the-standard-library-sources-stdlib)
+- [17. Compiler CLI Cheatsheet & Grammar Reference](#17-compiler-cli-cheatsheet--grammar-reference)
   - [CLI Commands](#cli-commands)
   - [Formal Grammar (EBNF Summary)](#formal-grammar-ebnf-summary)
   - [Comparison Matrix: Gardel vs Bend vs Eiffel vs Rust vs Dafny](#comparison-matrix-gardel-vs-bend-vs-eiffel-vs-rust-vs-dafny)
@@ -99,8 +110,8 @@ Modern programming languages force developers into compromises:
                                      │
          ┌───────────────────────────┼───────────────────────────┐
          ▼                           ▼                           ▼
-  [ Eiffel Heritage ]         [ Dafny Engine ]            [ Bend Backend ]
-  • Design by Contract        • Automated SMT (Z3)        • Automatic Fork-Join
+  [ Eiffel Heritage ]         [ Dafny Heritage ]          [ Bend Backend ]
+  • Design by Contract        • SMT proofs (Boogie + Z3)  • Automatic Fork-Join
   • require / ensure          • Proofs erased at runtime  • Massive Parallelism
   • Class Invariants          • Refinement types          • CPU (C11), GPU (CUDA/Metal)
   • Uniform Access & Current  • Inductive ghost models    • Church-Rosser Confluence
@@ -118,7 +129,7 @@ In Gardel:
 In languages like Python, C++, or standard Eiffel, contracts are often run as debug assertions (`assert x > 0`) which slow down execution and get turned off in production.
 
 In Gardel, **contracts are never executed at runtime**:
-- Contracts are translated into mathematical first-order logic formulas discharged by the **Boogie** and **Z3** automated theorem provers during compilation.
+- Contracts are translated into mathematical first-order logic formulas discharged by the **Boogie** and **Z3** automated theorem provers during compilation. Boogie is Gardel's only verifier: there is no second, unchecked backend whose verdict could disagree.
 - Once verified, contracts are **completely erased**. The resulting C11 / Bend code has zero runtime assertion checks, zero overhead, and maximum speed.
 
 ---
@@ -165,7 +176,7 @@ Confirm that all compiler components (parser, visibility rules, concept laws, Bo
 
 ```bash
 cargo test
-# Output: test result: ok. 36 passed; 0 failed
+# Output: test result: ok. 73 passed; 0 failed
 ```
 
 #### 4. Installing `gardelc` to Your PATH
@@ -198,11 +209,16 @@ Test that `gardelc` is installed and verify the entire built-in Standard Prelude
 gardelc --stdlib --strict
 ```
 
-You should see:
+You should see (run from the repository root; from `gardelc/` the tree is shown as `../stdlib`):
 ```text
-[1/6] Parsed 3 concepts ["EQ", "CANONICAL_EQ", "ORD"], ...
-[2/6] Checked §4 Visibility, §9 Concept Laws, §11 IO Boundary & §12 Direct Verification:
+[stdlib] Verifying the source tree `stdlib` (12 files).
+[0/5] Bootstrap mode (--no-prelude): Standard Prelude not injected
+[1/5] Linked project of 12 files into one flat namespace (§4.2): 9 modules [...], 3 concepts ["EQ", "CANONICAL_EQ", "ORD"], fuel: 2
+[2/5] Checked §4 Visibility, §9 Concept Laws, §11 IO Boundary & §12 Direct Verification:
       0 errors, 0 warnings — all visibility, concept laws, IO linearity, overflow, and contract obligations satisfied.
+[3/5] Emitted direct Boogie VCs & fuel axioms -> build/....bpl (one per module; ...)
+[4/5] Emitted monomorphized Bend v2 target    -> build/....bend
+[5/5] Emitted C11 runtime target              -> build/....c
 ```
 
 ---
@@ -216,10 +232,10 @@ program HELLO
 
 feature {ANY}
 
-  main(args: LIST[STRING]): IO[EXIT_CODE]
+  main(args: SEQ[STRING]): IO[EXIT_CODE]
     do
       with IO
-        IO.print("Hello, world! Welcome to Gardel.\n")
+        IO.print_line("Hello, world! Welcome to Gardel.")
         IO.exit(0)
       end
     end
@@ -231,8 +247,10 @@ end
 
 The Gardel compiler is `gardelc`:
 
+No imports are needed: the Standard Prelude (`STRING`, `SEQ`, `OPTION`, `RESULT`, `IO_ERROR`, ...) is available in every program (§16).
+
 ```bash
-# Verify all contracts, concept laws, and proofs statically (emits C11/Bend/Boogie to build/):
+# Verify all contracts, concept laws, and proofs statically (emits Boogie/Bend/C11 to build/):
 gardelc hello.gdl
 
 # Strict verification (rejects any unproven 'assume' blocks):
@@ -318,6 +336,23 @@ When implementing cryptographic algorithms, hashing, or low-level encodings wher
 Floating-point math in Gardel follows strict syntactic expression-tree evaluation order:
 - Compiler re-association (such as `-ffast-math`) and uncoordinated fused multiply-add (`fma`) synthesis are prohibited.
 - For discrete types (`NAT`, `INT`, `BOOL`, ADTs), Church-Rosser confluence guarantees exact bit-for-bit equivalence regardless of parallel thread scheduling.
+
+### Text: `CHAR` and `STRING`
+
+`CHAR` is a Unicode scalar value. `STRING` is a prelude module (`stdlib/text/string.gdl`) whose ghost model is `chars: LIST[CHAR]`.
+
+> [!NOTE]
+> The current `STRING` is the **ASCII bootstrap**: every byte is `< 128`. Full multi-byte UTF-8 arrives with Roadmap Task C.2 without changing the public `chars` contracts.
+
+String literals are ordinary verified values. `"Hi"` is defined as a chain of verified prelude calls (`STRING.make_empty(2).push_ascii('i').push_ascii('H')`), so the verifier knows `"Hi".chars` and `"Hi".byte_length = 2` with no extra trust. The compiler enforces the bootstrap rules:
+
+| Code | Rejected | Use instead |
+| :--- | :--- | :--- |
+| `E0303` | A literal with a non-ASCII character | ASCII text until Task C.2 |
+| `E0302` / `E0304` | Malformed escapes / surrogate code points | Valid escapes |
+| `E0311` | `=` with a `STRING` operand (`STRING` is not `CANONICAL_EQ`: two strings with different capacities are equal text) | `a.equals(b)` or `a.chars = b.chars` |
+| `E0312` | `+` on `STRING` | Print the pieces with separate `IO.print` calls |
+| `E0313` | String literals as `match` patterns | `if s.equals("...") then ... else ... end` |
 
 ---
 
@@ -634,6 +669,12 @@ Gardel has no `while`, `for`, or `loop` keywords. All repetition is expressed th
 To guarantee that programs never hang or crash:
 > **Every recursive routine must prove termination at compile-time via a `variant` clause.**
 
+The verifier builds the module's **call graph** and finds its recursive groups: a routine that calls itself, or routines that call each other in a cycle. At every call inside a group:
+- both the caller and the callee must declare a `variant`, otherwise the call is rejected with `variant_missing`;
+- the callee's variant, evaluated at the call's arguments, must be strictly smaller than the caller's current variant (`variant_decrease`), and an integer variant must stay non-negative (`variant_non_negative`).
+
+A recursive routine without a `variant` never verifies, whatever its `ensure` claims. Without this rule, `f(n) do f(n) end` could "prove" any postcondition through its own non-terminating definition.
+
 ### Structural Induction with `variant`
 
 When traversing inductive ADTs (like lists or trees), declare `variant Current` or `variant parameter_name`. The verifier proves that each recursive call operates on a strictly smaller subterm:
@@ -676,6 +717,86 @@ binary_search_range(lo: NAT, hi: NAT, target: NAT): BOOL
 ```
 
 Tail-recursive calls are automatically lowered by `gardelc` into **zero-allocation native C `while` loops** and BendRT tail jumps.
+
+### Lexicographic Variants
+
+A `variant` may list several metrics. They are compared lexicographically: a call is fine when the first metric decreases, or the first stays equal and the second decreases, and so on.
+
+```eiffel
+-- Empties n, then refills it from m: n may grow (to 100), but only while m shrinks.
+drain(m: NAT, n: NAT): NAT
+  variant
+    m, n
+  do
+    if n > 0 then
+      drain(m, n - 1)        -- m equal, n smaller
+    else
+      if m > 0 then
+        drain(m - 1, 100)    -- m smaller (n may grow)
+      else
+        0
+      end
+    end
+  ensure
+    empty: Result = 0
+  end
+```
+
+Writing `drain(m, 100)` in the refill branch is rejected with `variant_decrease`: neither metric goes down.
+
+A structural variant (`variant Current`, or a parameter of the module's own type) is measured by the size of the value, so recursing into a subterm decreases it.
+
+### Mutual Recursion
+
+Routines that call each other form one recursive group. Each must declare a `variant`, and every call between them must decrease it:
+
+```eiffel
+functions EVENODD
+
+feature {ANY}
+
+  is_even(n: NAT): BOOL
+    variant
+      n
+    do
+      if n = 0 then True else is_odd(n - 1) end
+    end
+
+  is_odd(n: NAT): BOOL
+    variant
+      n
+    do
+      if n = 0 then False else is_even(n - 1) end
+    end
+
+end
+```
+
+Replacing `is_even(n - 1)` with `is_even(n)` is rejected with `variant_decrease` in `is_odd`. Dropping either `variant` is rejected with `variant_missing`.
+
+### No Recursion Through Function Values
+
+A variant can only be checked at a **direct call**, where the arguments are known. A call hidden inside a lambda, or a routine passed around as a function value, may be applied anywhere and at any argument. So inside its own recursive group a routine may only be reached by direct calls:
+
+```eiffel
+-- REJECTED (E0315: higher_order_recursion): `f` is passed as a value inside its own group
+f(n: NAT): NAT
+  variant
+    n
+  do
+    apply(f, n)
+  end
+
+-- REJECTED as well: the recursive call is inside a lambda
+g(n: NAT): NAT
+  variant
+    n
+  do
+    apply(fn(x: NAT): NAT do g(x) end, n)
+  end
+```
+
+Passing *non-recursive* routines and lambdas to higher-order routines (`map`, `filter`, `apply`, ...) is unrestricted.
 
 ---
 
@@ -755,6 +876,9 @@ In many functional runtimes, closures capturing free variables require garbage c
 - Any lambda capturing variables is transformed into an explicit first-order record struct (the environment) paired with a top-level pure combinator.
 - Environments are standard immutable ADTs that can be freely duplicated and dispatched across parallel threads without affine restrictions or heap leaks.
 
+> [!IMPORTANT]
+> Termination is checked only through direct calls: a routine may not reach its own recursive group through a lambda or a function value (`E0315`, see §9).
+
 ---
 
 ## 12. Concepts, Laws, and Mathematical Conformance
@@ -817,11 +941,41 @@ specify {MONOID}
 end
 ```
 
-### Equivalence Relations (`EQ`) vs SMT Identity (`=`)
+### Inductive Law Proofs
 
-- `=` in contracts represents built-in **structural Leibniz equality** in SMT.
-- The `EQ` concept defines **behavioral equivalence** (`equals(other)`). This allows non-canonical representations (such as quotient types, rational numbers `2/4 == 1/2`, or unordered sets) to conform soundly.
-- The subconcept `CANONICAL_EQ` guarantees that behavioral equality coincides with structural term identity (`a.equals(b) = (a = b)`).
+A law with a `do` body is proved by **structural induction**. A recursive call to the law inside its own body is the induction hypothesis. Like any recursive call it must respect the law's `require` clauses and decrease its `variant`, and the verifier then assumes the law's conclusion for those smaller arguments:
+
+```eiffel
+specify {EQ}
+
+  law reflexive(a: PEANO)
+    variant
+      a
+    do
+      match a
+        case Zero then True
+        case Succ(p) then reflexive(p)   -- induction hypothesis: p.equals(p)
+      end
+    ensure
+      refl: a.equals(a)
+    end
+```
+
+### The Equality Hierarchy: `=`, `!=`, `equals`, and Models
+
+Gardel distinguishes three kinds of equality:
+
+| Form | Meaning | Allowed on |
+| :--- | :--- | :--- |
+| `a = b` | Structural (Leibniz) identity | Primitives except `F64`, ghost models such as `LIST[A]`, and types satisfying `CANONICAL_EQ` |
+| `a.equals(b)` | Behavioral equivalence (the `EQ` concept) | Every `EQ` type, including non-canonical ones such as `SEQ[A]`, `BIGNAT`, `STRING` |
+| `a.model = b.model` | Equality of canonical ghost models | Non-canonical runtime types with a ghost model (`SEQ.model`, `STRING.chars`) |
+
+- **Why the split:** a balanced tree or a string buffer can represent the same value in several physical shapes. Using `=` on such a type would make the solver call equal values different, so it is rejected (for `STRING`: `E0311`).
+- **`CANONICAL_EQ`** refines `EQ` with the law `a.equals(b) = (a = b)`: behavioral equality *is* structural identity.
+- **`a != b`** is shorthand for `not (a = b)` and follows exactly the same rules as `=`.
+- **Equality on a type parameter** uses the element type's own equality: for `[A: EQ]`, `x = y` on two `A` values means `A`'s equivalence, with reflexivity, symmetry and transitivity available as axioms.
+- Parenthesize a negated comparison operand: write `Result = (not (a = b))`, not `Result = not (a = b)`.
 
 ### Total Orders (`ORD`)
 
@@ -829,21 +983,54 @@ The `ORD` concept refines `EQ` and requires irreflexivity, transitivity, and tot
 
 ```eiffel
 concept ORD refines EQ
+
   less_than(other: Current): BOOL
 
+  less_or_equal(other: Current): BOOL
+    do
+      Current.less_than(other) or Current.equals(other)
+    ensure
+      definition: Result = (Current.less_than(other) or Current.equals(other))
+    end
+
   law irreflexive(a: Current)
-    ensure not a.less_than(a) end
+    ensure
+      not_less_than_self: not a.less_than(a)
+    end
 
   law transitive(a: Current, b: Current, c: Current)
-    require a.less_than(b); b.less_than(c)
-    ensure a.less_than(c) end
+    require
+      a_lt_b: a.less_than(b)
+      b_lt_c: b.less_than(c)
+    ensure
+      a_lt_c: a.less_than(c)
+    end
 
   law total(a: Current, b: Current)
-    ensure a.less_than(b) or a.equals(b) or b.less_than(a) end
+    ensure
+      comparable: a.less_than(b) or a.equals(b) or b.less_than(a)
+    end
+
 end
 ```
 
+This is the prelude's own `stdlib/concepts/ord.gdl`; `EQ`, `CANONICAL_EQ` and `ORD` are available everywhere without declaring them.
+
 Generic modules like `SORTED_LIST[A: ORD]` can safely assume these laws as axioms during sorting and lookup proofs.
+
+> [!NOTE]
+> A module's laws are axioms only for its **clients**. While the module itself is verified, its laws are proof obligations, never assumptions, so a law cannot be used to prove itself.
+
+### Conditional Conformance (`where`)
+
+A generic module can conform to a concept only when its type arguments do:
+
+```eiffel
+module SEQ[A] satisfies EQ where A satisfies CANONICAL_EQ
+module RESULT[E, A] satisfies CANONICAL_EQ where E satisfies CANONICAL_EQ, A satisfies CANONICAL_EQ
+```
+
+The constraint is enforced where the concept's routines are used. `SEQ.equals` compares elements structurally, which is behavioral equality only for canonical elements, so `SEQ[U64].equals` is accepted while `SEQ[STRING].equals` and `SEQ[SEQ[U64]].equals` are rejected with `E0314: unsatisfied_where_constraint`. Primitives satisfy `CANONICAL_EQ` and `ORD`, a type parameter satisfies its declared bound (`[A: CANONICAL_EQ]`), and a module type satisfies the concepts it lists when its own `where` constraints hold.
 
 ---
 
@@ -867,12 +1054,20 @@ program ECHO
 
 feature {ANY}
 
-  main(args: LIST[STRING]): IO[EXIT_CODE]
+  main(args: SEQ[STRING]): IO[EXIT_CODE]
     do
       with IO
-        line <- IO.read_line
-        IO.print("You said: " + line + "\n")
-        IO.exit(0)
+        line_res <- IO.read_line
+        match line_res
+          case Ok(line) then
+            with IO
+              IO.print("You said: ")
+              IO.print_line(line)
+              IO.exit(0)
+            end
+          case Error(_) then
+            IO.exit(1)
+        end
       end
     end
 
@@ -882,13 +1077,27 @@ end
 Inside `with IO ... end`:
 - `x <- e`: Monadic bind. Evaluates an IO action $e$ of type `IO[T]` and binds the result $x : T$.
 - `e`: Statement step. Evaluates an action of type `IO[UNIT]` for its effect.
-- The trailing expression must return `IO[R]`.
+- The trailing expression must return `IO[R]`; it may be a `match` whose branches are `IO` actions or nested `with IO` blocks.
+
+### Reading Input: `IO.read_line`
+
+```eiffel
+IO.read_line : IO[RESULT[IO_ERROR, STRING]]
+```
+
+Reading can fail, so the result is a `RESULT` that must be matched:
+- `Ok(line)`: one line without its `\n` / `\r\n` terminator, of any length.
+- `Error(EndOfInput)`: the input is exhausted.
+- `Error(OsError(code))`: the operating system reported an error.
+- `Error(Decode(cause))`: the line is not valid text (in the ASCII bootstrap: a byte `>= 128`), with a `STRING_ERROR` cause such as `InvalidByte(offset, byte_val)`.
+
+For the verifier, every `<- IO.read_line` is a **fresh, unknown value**: two reads are never assumed equal. The only thing assumed is the boundary guarantee that an `Ok` payload is a valid `STRING`. The native C runtime establishes that guarantee by validating every byte before building the `STRING`.
 
 ### Boundary Ingestion: Untrusted Data to Verified ADTs
 
 External data (network packets, command line inputs, disk files) is inherently untrusted.
 
-Untrusted data cannot be cast directly into an invariant-carrying ADT. It must pass through a **boundary constructor** returning `OPTION[T]` or `RESULT[T, E]`:
+Untrusted data cannot be cast directly into an invariant-carrying ADT. It must pass through a **boundary constructor** returning `OPTION[T]` or `RESULT[E, T]` (error type first):
 
 ```eiffel
 -- Safe boundary parser:
@@ -929,11 +1138,14 @@ Gardel is specifically engineered for autonomous collaboration between human arc
 ```
 
 Every function generates verification conditions (VCs):
-1. **Preconditions of callees**: Caller must satisfy callee's `require`.
+1. **Preconditions of callees**: Caller must satisfy callee's `require`, for calls into the same module, other project files, and the Standard Prelude alike.
 2. **Postconditions**: Routine body must establish its `ensure`.
 3. **Invariants**: Every constructed value must satisfy its `invariant`.
 4. **Numerics**: Arithmetic operations must not overflow or divide by zero.
-5. **Termination**: Recursive calls must decrease the `variant`.
+5. **Termination**: Every call inside a recursive group must decrease the `variant` (§9).
+6. **Concept laws**: Every law of every concept a module `satisfies` must be proved.
+
+**One false contract never hides another failure.** A routine's verified contracts are used as facts when checking its callers. If a contract is false, that "fact" would be a contradiction from which anything follows, so it could hide every other failure that depends on it. `gardelc` therefore verifies to a fixpoint: each failed postcondition clause (or the whole contract of a routine that fails in another way) is withdrawn, and verification repeats until no new failure appears. Every reported failure is genuine, and none is masked.
 
 ### The AI Autonomous Repair Loop (`--json-diagnostics`)
 
@@ -943,30 +1155,27 @@ When verification fails, run `gardelc --json-diagnostics` to receive structured,
 gardelc stack.gdl --json-diagnostics
 ```
 
+The output is a JSON array with one object per diagnostic (abridged here; the raw solver model in `counterexample` can be long):
+
 ```json
-{
-  "status": "error",
-  "diagnostics": [
-    {
-      "file": "stack.gdl",
-      "line": 42,
-      "column": 9,
-      "kind": "postcondition_violation",
-      "contract_tag": "count_incremented",
-      "formula": "Result.count = Current.count + 1",
-      "path_conditions": [
-        "Current.count < Current.capacity",
-        "Current.size = Current.count"
-      ],
-      "counterexample": {
-        "Current": { "size": 0, "limit": 10, "items": [] },
-        "Result": { "size": 0, "limit": 10, "items": ["item_1"] }
-      },
-      "hint": "Size field was not updated in record construction."
-    }
-  ]
-}
+[
+  {
+    "level": "error",
+    "rule": "Phase 3 Boogie (Postcondition Violation)",
+    "module": "BOUNDED_STACK",
+    "routine": "push",
+    "tag": "count_incremented",
+    "contract_tag": "count_incremented",
+    "span": { "file": "stack.gdl", "line": 42, "column": 7, "end_line": 42, "end_column": 51 },
+    "path_conditions": [],
+    "counterexample": { "Current.size": "0", "Result.size": "0", "x": "7" },
+    "relevant_lemmas": [],
+    "message": "Formal verification condition `count_incremented` failed in `push`"
+  }
+]
 ```
+
+`rule` names the kind of failure, `routine` and `tag` locate the exact clause, and `span` points at it in the source.
 
 ### Reading Counterexample Models
 
@@ -978,13 +1187,18 @@ The counterexample gives the exact input state where the theorem fails:
 
 When repairing failing Gardel code:
 
-| Diagnostic Failure | Common Root Cause | Recommended AI Fix |
+| Diagnostic (`rule` / `tag`) | Common Root Cause | Recommended AI Fix |
 | :--- | :--- | :--- |
-| `overflow_add` | Unchecked addition `a + b` | Add `require a <= NAT.max - b` or rewrite using subtraction `diff = hi - lo` |
-| `not_decreasing` | Recursive `variant` not shrinking | Check recursive arguments; verify decreasing metric (e.g., `variant hi - lo` where `mid = lo + (hi - lo) / 2`) |
-| `invariant_violation` | Record literal misses constraint | Insert a `check` statement to prove intermediate lemma, or add a guard `if` |
-| `precondition_violation` | Callee requires condition | Wrap callee in a branch `if precondition_test then ... else ...` |
-| `postcondition_violation` | Result formula does not match | Inspect counterexample model values to spot omitted field updates |
+| Arithmetic Overflow / `overflow_add`, `overflow_sub`, `overflow_mul` | Unchecked `a + b`, `a - b`, `a * b` | Add a `require` bound or rewrite (e.g. `lo + (hi - lo) / 2`) |
+| Division by Zero / `div_by_zero` | Divisor not proven non-zero | Add `require d > 0` or branch on `d = 0` |
+| Termination Variant Violation / `variant_decrease` | A recursive call does not shrink the `variant` | Check the call's arguments; pick a metric that decreases on every call in the group |
+| Termination Variant Violation / `variant_missing` | A routine in a recursive group has no `variant` | Add a `variant` to every routine of the group |
+| Termination Variant Violation / `variant_non_negative` | An integer metric can go below 0 | Strengthen `require` or choose a `NAT` metric |
+| `E0315: higher_order_recursion` | Recursion through a lambda or function value | Call the routine directly |
+| Invariant Violation / invariant tag | Constructed value breaks the `invariant` | Insert a `check` to prove the intermediate lemma, or add a guard `if` |
+| Precondition Violation / callee's `require` tag | Callee requires a condition the caller does not establish | Wrap the call in `if precondition_test then ... else ... end` |
+| Postcondition Violation / `ensure` tag | Result does not match the claim | Inspect counterexample values to spot omitted field updates |
+| `E0314: unsatisfied_where_constraint` | `equals` on e.g. `SEQ[STRING]` | Compare models (`a.model = b.model`) or use canonical elements |
 
 ---
 
@@ -1064,6 +1278,9 @@ end
 
 Constructs a balanced binary tree over `[lo, hi]` in parallel and computes the maximum leaf value in parallel:
 
+> [!NOTE]
+> `examples/tree.gdl` currently reports 5 unproven postconditions (`max_value` and `from_range`): the verifier's `LIST` theory still lacks a few lemmas (e.g. about `has` on singleton and empty lists). These are genuine gaps in what can be proved yet, not hidden errors.
+
 ```eiffel
 module TREE
 
@@ -1133,33 +1350,10 @@ end
 
 ### Example C: Peano Numbers with Formally Verified Total Ordering
 
-Demonstrating algebraic concepts, total orders (`ORD`), and structural induction proofs:
+Demonstrating algebraic concepts, total orders (`ORD`), and structural induction proofs. The concepts come from the prelude; the module proves every law of `EQ`, `CANONICAL_EQ` and `ORD` by induction (abridged from `examples/peano_ord.gdl`, which verifies with 0 errors):
 
 ```eiffel
-concept EQ
-  equals(other: Current): BOOL
-  law agrees_with_structural(a: Current, b: Current)
-    ensure sound: a.equals(b) = (a = b) end
-end
-
-concept ORD refines EQ
-  less_than(other: Current): BOOL
-
-  less_or_equal(other: Current): BOOL
-    do Current.less_than(other) or Current.equals(other) end
-
-  law irreflexive(a: Current)
-    ensure not a.less_than(a) end
-
-  law transitive(a: Current, b: Current, c: Current)
-    require a.less_than(b); b.less_than(c)
-    ensure a.less_than(c) end
-
-  law total(a: Current, b: Current)
-    ensure a.less_than(b) or a = b or b.less_than(a) end
-end
-
-module PEANO satisfies ORD
+module PEANO satisfies ORD, CANONICAL_EQ
 
 representation {ANY}
   | Zero
@@ -1168,17 +1362,18 @@ representation {ANY}
 feature {ANY}
 
   equals(other: PEANO): BOOL
-    variant Current
+    variant
+      Current
     do
       match Current
         case Zero then
           match other
-            case Zero    then True
+            case Zero then True
             case Succ(_) then False
           end
         case Succ(p) then
           match other
-            case Zero    then False
+            case Zero then False
             case Succ(q) then p.equals(q)
           end
       end
@@ -1187,26 +1382,44 @@ feature {ANY}
     end
 
   less_than(other: PEANO): BOOL
-    variant Current
+    variant
+      Current
     do
       match Current
         case Zero then
           match other
-            case Zero    then False
+            case Zero then False
             case Succ(_) then True
           end
         case Succ(p) then
           match other
-            case Zero    then False
+            case Zero then False
             case Succ(q) then p.less_than(q)
           end
       end
     end
 
-specify {ORD}
+specify {EQ}
+
+  law reflexive(a: PEANO)
+    variant
+      a
+    do
+      match a
+        case Zero then True
+        case Succ(p) then reflexive(p)
+      end
+    ensure
+      refl: a.equals(a)
+    end
+
+  -- symmetric and transitive follow the same pattern
+
+specify {CANONICAL_EQ}
 
   law agrees_with_structural(a: PEANO, b: PEANO)
-    variant a
+    variant
+      a
     do
       match a
         case Zero then True
@@ -1216,14 +1429,106 @@ specify {ORD}
             case Succ(q) then agrees_with_structural(p, q)
           end
       end
+    ensure
+      sound: a.equals(b) = (a = b)
     end
+
+specify {ORD}
+
+  law irreflexive(a: PEANO)
+    variant
+      a
+    do
+      match a
+        case Zero then True
+        case Succ(p) then irreflexive(p)
+      end
+    ensure
+      not_less_than_self: not a.less_than(a)
+    end
+
+  law total(a: PEANO, b: PEANO)
+    variant
+      a
+    do
+      match a
+        case Zero then True
+        case Succ(p) then
+          match b
+            case Zero then True
+            case Succ(q) then total(p, q)
+          end
+      end
+    ensure
+      comparable: a.less_than(b) or a.equals(b) or b.less_than(a)
+    end
+
+  -- transitive follows the same pattern
 
 end
 ```
 
+Each recursive law call (`reflexive(p)`, `total(p, q)`, ...) is the induction hypothesis for the smaller argument (§12).
+
 ---
 
-## 16. Compiler CLI Cheatsheet & Grammar Reference
+## 16. Projects and the Standard Prelude
+
+### The Prelude Is Always There
+
+Every program automatically sees the **Standard Prelude**:
+
+| Kind | Names |
+| :--- | :--- |
+| Concepts | `EQ`, `CANONICAL_EQ`, `ORD` |
+| Core types | `OPTION[A]`, `RESULT[E, A]`, `IO_ERROR` |
+| Collections | `SEQ[A]`, `LIST_OPS` |
+| Numbers | `BIGNAT` |
+| Text | `STRING`, `STRING_ERROR` |
+| Functions | `FUNCTION_OPS` |
+
+The prelude is verified once, on its own (`gardelc --stdlib`). In user programs its contracts and laws are trusted facts, and calls into it must still establish its preconditions. Declaring a top-level name that the prelude already uses is an error (`E0101: duplicate_prelude_symbol`). Pass `--no-prelude` only to build a prelude-free program on purpose.
+
+### Multi-File Projects
+
+Give `gardelc` several files, a directory (searched recursively, skipping `build/` and `target/`), or a wildcard pattern, and they form **one project** with a flat module namespace:
+
+```bash
+gardelc src/                  # every .gdl file under src/
+gardelc src/*.gdl --strict    # a wildcard pattern
+gardelc a.gdl b.gdl           # explicit files
+```
+
+Rules:
+- **One module per file**, named after it: `module BANK_ACCOUNT` lives in `bank_account.gdl`. Otherwise you get `W0201: file_module_name_mismatch`, which `--strict` turns into a failure.
+- **No duplicates:** two files declaring the same module is `E0102`.
+- **No cycles between files:** each file's proofs trust the contracts of the files it uses, so a cycle would let two modules prove each other. Cross-file cycles are rejected with `E0103: cyclic_module_dependency`; genuinely mutually dependent modules belong in one file.
+
+### The Standard Library Sources (`stdlib/`)
+
+The prelude's source code lives in the repository's `stdlib/` folder, one module or concept per file, and is embedded into `gardelc` when the compiler is built:
+
+```text
+stdlib/
+├── concepts/      eq.gdl, canonical_eq.gdl, ord.gdl
+├── core/          option.gdl, result.gdl, io_error.gdl
+├── collections/   list_ops.gdl, seq.gdl
+├── numeric/       bignat.gdl
+├── text/          string.gdl, string_error.gdl
+└── functional/    function_ops.gdl
+```
+
+When working on the standard library itself:
+- **Verify it with `gardelc --stdlib --strict`.** This always verifies the tree `gardelc` was built from (it prints which one), never a `stdlib/` folder that happens to be in the current directory.
+- **Any stdlib file means the whole tree.** `gardelc stdlib` or `gardelc stdlib/core/option.gdl` verify the whole tree too: the modules depend on each other (`RESULT` uses `OPTION`, everything uses the concepts), so a file on its own could not be checked.
+- **Stdlib files are recognized by their location**, so an edited file is still treated as part of the prelude. Stdlib files cannot be mixed with user files in one run.
+- **Rebuild after editing.** Programs get the copy embedded at build time. After editing a stdlib file, `--stdlib` notes that it differs from the embedded copy; run `cargo build` so programs see the change.
+- **The file list must match.** If the files on disk and the embedded list disagree (a new file not yet added to `STDLIB_SOURCES` and `phase4_stdlib_source()` in `gardelc/src/main.rs`, or a missing one), `--stdlib` fails with an error instead of verifying a different set than it ships.
+- **`gardelc --emit-stdlib [DIR]`** writes the embedded copy to `build/stdlib/` (or `DIR`). It never overwrites a file whose content differs: it refuses and writes nothing.
+
+---
+
+## 17. Compiler CLI Cheatsheet & Grammar Reference
 
 ### Building & Installing from Source
 
@@ -1246,8 +1551,16 @@ gardelc --stdlib --strict
 ### CLI Commands
 
 ```bash
-# Verify all contracts, concept laws, and proofs statically (emits C11, Bend, Boogie to build/)
+# Verify all contracts, concept laws, and proofs statically (emits Boogie, Bend, C11 to build/)
 gardelc <file.gdl>
+
+# Verify a multi-file project: several files, a directory, or a wildcard pattern
+gardelc <file.gdl> <other.gdl> ...
+gardelc <DIR>
+gardelc 'src/*.gdl'
+
+# Verify the Standard Prelude sources (stdlib/) as one linked project
+gardelc --stdlib --strict
 
 # Run verification with structured JSON diagnostics for AI agents
 gardelc <file.gdl> --json-diagnostics
@@ -1260,11 +1573,34 @@ gardelc <file.gdl> --strict
 
 # Inspect public contract interface of a module (like Eiffel 'short')
 gardelc --inspect <file.gdl>
+gardelc --stdlib --inspect [MODULE]
+
+# Unfold recursive definitions to depth N for the solver (default 2)
+gardelc <file.gdl> --fuel <N>
+
+# Compile without the Standard Prelude (bootstrap mode)
+gardelc <file.gdl> --no-prelude
+
+# Bounded symbolic checking instead of the Boogie/Z3 proof
+gardelc <file.gdl> --bounded-check
 
 # Compile, verify, and run immediately via the backend
 gardelc <file.gdl> --run
+```
 
-# Emit the bundled Standard Prelude files to stdlib/ directory
+A normal run reports five steps:
+
+```text
+[0/5] Standard Prelude injected (or bootstrap mode)
+[1/5] Parsed / linked the input files
+[2/5] Checked visibility, concept laws, IO boundary, and Boogie/Z3 verification -> errors and warnings
+[3/5] Emitted Boogie VCs        -> build/<module>.bpl
+[4/5] Emitted Bend v2 target    -> build/<module>.bend
+[5/5] Emitted C11 runtime target -> build/<module>.c
+```
+
+```bash
+# Write the Standard Prelude embedded in gardelc to build/stdlib/ (or --emit-stdlib <DIR>); never overwrites edited files
 gardelc --emit-stdlib
 ```
 
@@ -1273,7 +1609,7 @@ gardelc --emit-stdlib
 ```ebnf
 File          ::= GroupDecl? ( ModuleDecl | FunctionsDecl | ProgramDecl | ConceptDecl )+
 
-ModuleDecl    ::= "module" UpperIdent TypeParams? Satisfies?
+ModuleDecl    ::= "module" UpperIdent TypeParams? Satisfies? WhereClause?
                     ( RepresentationSection | CreateSection
                     | FeatureSection | SpecifySection )*
                     InvariantBlock?
@@ -1284,6 +1620,11 @@ ProgramDecl   ::= "program" UpperIdent FeatureSection* "end"
 ConceptDecl   ::= "concept" UpperIdent TypeParams? Refines?
                     ( Signature | RoutineDecl | LawDecl )*
                   "end"
+
+Satisfies     ::= "satisfies" UpperIdent ( "," UpperIdent )*
+WhereClause   ::= "where" UpperIdent "satisfies" UpperIdent
+                    ( "," UpperIdent "satisfies" UpperIdent )*
+TypeParams    ::= "[" UpperIdent ( ":" UpperIdent )? ( "," UpperIdent ( ":" UpperIdent )? )* "]"
 
 VisList       ::= "{" UpperIdent ( "," UpperIdent )* "}"
 RepresentationSection ::= "representation" VisList ( FieldDecl+ | VariantDecl+ )
@@ -1327,6 +1668,12 @@ WithIoExpr    ::= "with" "IO" ( IoStmt ( "\n" | ";" )+ )* Expr "end"
 IoStmt        ::= LowerIdent "<-" Expr | Expr
 RecordLit     ::= "{" LowerIdent "=" Expr ( "," LowerIdent "=" Expr )* "}"
 RecordUpdate  ::= "{" Expr "with" LowerIdent "=" Expr ( "," LowerIdent "=" Expr )* "}"
+
+BinOp         ::= "and" | "or" | "implies"
+                | "=" | "!=" | "<" | "<=" | ">" | ">="       -- a != b  means  not (a = b)
+                | "+" | "-" | "*" | "/" | "%" | "+%" | "-%" | "*%"
+                | "&" | "|" | "^" | "<<" | ">>"
+UnOp          ::= "not" | "-"
 ```
 
 ---

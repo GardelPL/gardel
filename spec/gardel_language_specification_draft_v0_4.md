@@ -275,7 +275,7 @@ The Standard Prelude provides an irreducible core of verified concepts, algebrai
 
 #### 3. Namespace Collision, Shadowing & Bootstrap Rules
 - **No Prelude Shadowing:** Prelude types and concepts reside in the root namespace. In standard compilation mode, user modules, functions, or concepts CANNOT redeclare or shadow any prelude identifier. Attempting to declare a top-level `module OPTION` or `concept EQ` is rejected by the compiler with fatal error `E0101: duplicate_prelude_symbol`.
-- **Standard Library Bootstrap (`--no-prelude`):** When compiling or verifying the Standard Prelude source files themselves (e.g., `stdlib/*.gdl` or `--stdlib`), the compiler operates in `--no-prelude` bootstrap mode, suppressing automatic prelude injection so prelude modules can be defined and verified from source without self-collision.
+- **Standard Library Bootstrap (`--no-prelude`):** When compiling or verifying the Standard Prelude source files themselves, the compiler operates in `--no-prelude` bootstrap mode, suppressing automatic prelude injection so prelude modules can be defined and verified from source without self-collision. The prelude sources are the one-module-per-file tree `stdlib/` (`concepts/`, `core/`, `collections/`, `numeric/`, `text/`, `functional/`), embedded into `gardelc` at build time. A file is recognized as a prelude source by its location in that tree, not by its text. Because the prelude modules depend on each other, `gardelc --stdlib`, `gardelc stdlib/` and `gardelc stdlib/<dir>/<file>.gdl` all verify the whole tree as one linked project (§4.2); prelude files cannot be compiled together with user files. A copy of a prelude file elsewhere is an ordinary user file and collides with the prelude (`E0101`).
 - **Lexical Scoping of Type Parameters:** Type parameters (such as `[A]`, `[E]`, `[T]`) are lexically scoped to their declaring module or routine. A generic parameter `[A]` in `module STACK[A]` shadows any ambient type `A` strictly within the syntactic bounds of that module.
 
 #### 4. Verification Decoupling
@@ -820,7 +820,7 @@ end
 
 In Gardel, higher-order abstractions are formulated to ensure deterministic, decidable SMT verification:
 1. **Pointwise Combinators:** Higher-order routines (`map`, `and_then`, `map_error`) are specified pointwise on the underlying variants (`Result = Ok(f(Current.get))` or `Result = Error(e)`). This avoids higher-order function extensionality quantifiers that can trigger SMT solver non-termination.
-2. **First-Class Function Theory:** Function parameters (`f: A -> B`) translate to an uninterpreted function sort `Fn1 A B` in Boogie and Dafny, equipped with an application axiom `Fn1_app(f, x)`.
+2. **First-Class Function Theory:** Function parameters (`f: A -> B`) translate to an uninterpreted function sort `Fn1 A B` in Boogie, equipped with an application axiom `Fn1_app(f, x)`.
 3. **Verified Category-Theoretic Laws:**
    - **Constructor Reduction:** `Ok(v).map(f) = Ok(f(v))` and `Error(e).map(f) = Error(e)`.
    - **Functor Identity:** `res.map(fn(x: A): A do x end) = res` and `opt.map(fn(x: A): A do x end) = opt`.
@@ -982,7 +982,7 @@ $$\alpha(f_T(x, u)) = f_M(\alpha(x), \beta(u))$$
 
 #### 4. The Standard Prelude Core Triad in Detail
 
-The three verified Standard Prelude modules below (`stdlib/stdlib.gdl`) demonstrate how ghost models and representation invariants work together in practice.
+The three verified Standard Prelude modules below (`stdlib/collections/seq.gdl`, `stdlib/numeric/bignat.gdl`, `stdlib/text/string.gdl`) demonstrate how ghost models and representation invariants work together in practice.
 
 > [!NOTE]
 > **Abridged listings.** The `SEQ[A]` and `BIGNAT` listings below are abridged to the refinement-relevant members. Their concept members — `SEQ.equals` with `specify {EQ}`, and `BIGNAT.equals` / `less_than` / `less_or_equal` with `specify {EQ}` and `specify {ORD}` — appear in full in `stdlib/stdlib.gdl` and in the §9 law catalogue. Every module that declares `satisfies C` must discharge all laws of `C` (and of every concept `C` refines); omission is rejected as `Phase 2 (Missing Law Proof)`.
@@ -1524,6 +1524,7 @@ Functions are first-class values that carry contracts in their types, so librari
 - **Function types.** `A -> B` is a total, pure function. A refined function type names its parameter and adds clauses: `(x: NAT) -> NAT require small: x < 100 ensure bounded: Result <= x`.
 - **Lambdas.** `fn(x: NAT): NAT do x + 1 end` is checked against the contract of the expected function type at the point of use.
 - **Totality.** Function arguments must be total. There are no partial functions and no exceptions.
+- **Recursion only through direct calls.** A `variant` is checked at each direct call within a recursive call group (§7), by relating the callee's variant at the call's arguments to the caller's. A call that sits inside a lambda body, or a routine passed as a function value, can be applied anywhere and at any argument, so no variant can be checked for it. Inside its own recursive group, a routine may therefore be reached only by direct calls; a call to the group inside a lambda, or a reference to a group member as a function value (`apply(f, n)` inside `f`), is rejected with `E0315: higher_order_recursion`. Passing non-recursive routines and lambdas to higher-order routines is unrestricted.
 - **Compile-time closure conversion (lambda lifting).** Any lambda that captures variables from its enclosing scope is transformed by `gardelc` into a first-order environment ADT record paired with a top-level combinator function before Bend v2 / C emission. Because environments are standard first-order values ( satisfying their captured types' invariants), closures may be freely duplicated across parallel branches without affine restrictions or interaction-net superposition anomalies.
 
 ```eiffel
@@ -1861,7 +1862,7 @@ This guarantees that caller routines discharge functional specifications through
 
 ### The Bird & Wadler Algebraic Law Catalogue
 
-Gardel incorporates a formal, normative catalogue of algebraic equations across five primary mathematical families (`stdlib/stdlib.gdl`). Codified as concept laws and module specifications, these equations are verified by SMT and indexed into `--json-diagnostics` for AI-guided program derivation and automated proof repair (§12):
+Gardel incorporates a formal, normative catalogue of algebraic equations across five primary mathematical families (the Standard Prelude sources under `stdlib/`). Codified as concept laws and module specifications, these equations are verified by SMT and indexed into `--json-diagnostics` for AI-guided program derivation and automated proof repair (§12):
 
 #### 1. Monoid Laws & Length Homomorphisms
 For associative binary operations with identity elements (such as `concat` on `SEQ[A]` with `SEQ.empty` and `append` on `LIST[A]` with `LIST.empty`):
@@ -2123,7 +2124,7 @@ Gardel keeps a pure core and moves all input and output to the program boundary 
      | UnpairedSurrogate(offset: NAT)
    end
    ```
-   The I/O boundary routines below report failures through the companion prelude sum type `IO_ERROR`. Its current variant set (in `stdlib.gdl`) is:
+   The I/O boundary routines below report failures through the companion prelude sum type `IO_ERROR`. Its current variant set (in `stdlib/core/io_error.gdl`) is:
    ```eiffel
    module IO_ERROR
    representation {ANY}
@@ -2743,7 +2744,7 @@ The table below records the architectural decisions locked in v0.4 alongside the
 | Execution backend | Bend v2 / BendRT (portable C11 + CUDA + Metal) | **Locked in v0.4** (replaces HVM2; unlocks C single-core speed & parallel scaling) |
 | Recursion primitives | Standard `match` + `variant` + parallel `let` | **Locked in v0.4** (`fold`/`unfold`/`fork`/`Subject` removed; clean induction) |
 | Closure semantics | Unrestricted via compile-time closure conversion | **Locked in v0.4** (lambda lifting to first-order ADTs replaces affine restriction) |
-| Verifier backend | Boogie and Z3 (with native SMT diagnostic indexing) | **Locked in v0.4** (Direct Boogie/Z3 pipeline replaces Phase 0 Dafny prototype; verified under `gardelc --strict`) |
+| Verifier backend | Boogie and Z3 (with native SMT diagnostic indexing) | **Locked in v0.4** (Direct Boogie/Z3 pipeline replaces Phase 0 Dafny prototype; verified under `gardelc --strict`. The Dafny emitter was removed in Roadmap Task B.12: Boogie is the only verifier) |
 | Memory management in C | Perceus reference counting with in-place reuse vs. BendRT arena | Active (to benchmark in Phase C runtime integration) |
 | Gradual verification | None; `assume` audited by `--audit` / `--strict` | **Locked in v0.4** (failure-as-value `RESULT[E, A]` standardized with full combinators) |
 | Standard Prelude & Module System | Automatic prelude injection (`OPTION`, `RESULT`, `SEQ`, `STRING`, `BYTES`, `STRING_ERROR`, `IO_ERROR`, `BIGNAT`, `LIST`, `MATH_INT`, `EQ`, `CANONICAL_EQ`, `ORD`, `LIST_OPS`, `FUNCTION_OPS`) with `--no-prelude` bootstrap flag; `group` scoped strictly to mutual recursion | **Locked in v0.4** (Formalized in Spec §4, §15) |
@@ -2776,7 +2777,7 @@ The `gardelc` compiler pipeline (§13) and its `--json-diagnostics` `"rule"` tax
 
 ### 16.3 Phase 4 Standard Library Milestones (Steps 1–4 Completed)
 
-Within **Phase 4 (Standard Library & IO)**, Steps 1 through 4 completed the verification and algebraic foundation of `stdlib.gdl`, all locked in v0.4:
+Within **Phase 4 (Standard Library & IO)**, Steps 1 through 4 completed the verification and algebraic foundation of the standard library (then the single file `stdlib.gdl`, split into the `stdlib/` tree by Task C.1), all locked in v0.4:
 
 1. **Step 1 — Foundations Remediation (`BIGNAT`, `SEQ`, `STRING`):**
    - Repaired `BIGNAT` with a true Horner polynomial evaluation `value_of(limbs)` over radix $2^{64}$ yielding an unbounded `MATH_INT` ghost model.
@@ -2837,14 +2838,14 @@ Enhancing the compiler pipeline to provide a seamless developer experience witho
 - **Task B.4:** Multi-file project CLI compilation support (`gardelc src/*.gdl --strict`) linking multiple source files into a unified verification run.
 - **Task B.5:** Stdlib/compiler conformance with the Phase A review: remove the `equals`/`less_than` ghost-access exemption (§4 Rule 3) by giving `SEQ`/`BIGNAT` executable comparison bodies (with a `BIGNAT` normalization invariant); remove the hard-coded `decode_utf8` identity axiom from the Boogie emitter in favour of the proven `same_length`/`decode_injective` lemmas; align `stdlib.gdl` `STRING` with §6.4.C (ASCII bound, `decode_utf8` precondition, `CHAR.from_scalar` precondition); drop the unconditional `sound` postcondition from `OPTION`/`RESULT.equals`; remove the duplicate law `LIST_OPS.fold_left_append_distributivity`; and rename `BIGNAT.push_high_limb` to `shift_in_low_limb`.
 
-#### Phase C: Standard Library Modularization & Smart String Implementation — [📋 Planned]
+#### Phase C: Standard Library Modularization & Smart String Implementation — [🚧 In progress: C.1 completed]
 Decomposing the monolithic standard library into physical 1:1 module files (satisfying §4.2 `W0201` under `--strict`) and delivering production text performance:
-- **Task C.1:** Physical 1:1 file decomposition of `stdlib/` into modular directories:
+- **Task C.1 (completed):** Physical 1:1 file decomposition of `stdlib/` into modular directories:
   - `stdlib/concepts/`: `eq.gdl` (`concept EQ`), `canonical_eq.gdl` (`concept CANONICAL_EQ`), `ord.gdl` (`concept ORD`)
   - `stdlib/core/`: `option.gdl` (`module OPTION[A]`), `result.gdl` (`module RESULT[E, A]`), `io_error.gdl` (`module IO_ERROR`)
   - `stdlib/collections/`: `list_ops.gdl` (`functions LIST_OPS`), `seq.gdl` (`module SEQ[A]`)
   - `stdlib/numeric/`: `bignat.gdl` (`module BIGNAT`)
-  - `stdlib/text/`: `string.gdl` (`module STRING`), `bytes.gdl` (`module BYTES`), `string_error.gdl` (`module STRING_ERROR`)
+  - `stdlib/text/`: `string.gdl` (`module STRING`), `string_error.gdl` (`module STRING_ERROR`); `bytes.gdl` (`module BYTES`) arrives with Task C.2
   - `stdlib/functional/`: `function_ops.gdl` (`functions FUNCTION_OPS`)
 - **Task C.2:** High-performance Smart String implementation in `stdlib/text/string.gdl` (packed 64-bit words / UTF-8 byte buffer, `valid_utf8` invariant, zero-allocation literals, `chars: LIST[CHAR]` model, and boundary decoding `STRING.from_utf8(bytes: BYTES): RESULT[STRING_ERROR, STRING]`).
 - **Task C.3:** Comprehensive regression verification and performance benchmarking:

@@ -1,0 +1,10 @@
+module STRING_ERROR
+
+representation {ANY}
+  | InvalidByte(offset: NAT, byte_val: U64)
+  | TruncatedSequence(offset: NAT, expected: NAT)
+  | OverlongEncoding(offset: NAT)
+  | UnpairedSurrogate(offset: NAT)
+
+end
+

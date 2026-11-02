@@ -1,0 +1,31 @@
+concept ORD refines EQ
+
+  less_than(other: Current): BOOL
+
+  less_or_equal(other: Current): BOOL
+    do
+      Current.less_than(other) or Current.equals(other)
+    ensure
+      definition: Result = (Current.less_than(other) or Current.equals(other))
+    end
+
+  law irreflexive(a: Current)
+    ensure
+      not_less_than_self: not a.less_than(a)
+    end
+
+  law transitive(a: Current, b: Current, c: Current)
+    require
+      a_lt_b: a.less_than(b)
+      b_lt_c: b.less_than(c)
+    ensure
+      a_lt_c: a.less_than(c)
+    end
+
+  law total(a: Current, b: Current)
+    ensure
+      comparable: a.less_than(b) or a.equals(b) or b.less_than(a)
+    end
+
+end
+

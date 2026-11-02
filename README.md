@@ -16,7 +16,7 @@
 1. **Axiomatic Semantics (Hoare Logic & Contracts)**:
    Grounded in Tony Hoare's axiomatic basis of computer programming ($\{P\}\;C\;\{Q\}$), every module defines an Abstract Data Type (ADT) with preconditions (`require`), postconditions (`ensure`), and class `invariant` clauses. Routine queries use `Current` and `Result` with uniform access and selective export (`{NONE}`, `{ANY}`, `{FRIENDS}`).
 2. **Proofs, Not Runtime Checks**:
-   Contracts are discharged statically by SMT solvers (Boogie / Z3 / Dafny) and **erased** at runtime. Verified code executes with zero runtime assertion overhead.
+   Contracts are discharged statically by SMT solvers (Boogie / Z3) and **erased** at runtime. Verified code executes with zero runtime assertion overhead.
 3. **Pure, Total & Deterministic**:
    All functions are pure transformers and proven to terminate (via well-founded `variant` expressions). By Church-Rosser confluence, evaluation order never alters computation results.
 4. **Automatic Parallelism via Bend v2 & C11**:
@@ -117,12 +117,19 @@ end
 │   └── install_tools.sh   # Linux/macOS Bash installer
 ├── examples/              # Standalone Gardel (.gdl) example programs
 │   ├── bounded_stack.gdl
+│   ├── greeter.gdl
 │   ├── peano_ord.gdl
 │   └── tree.gdl
+├── stdlib/                # Standard Prelude sources, one module per file (embedded into gardelc)
+│   ├── concepts/          # EQ, CANONICAL_EQ, ORD
+│   ├── core/              # OPTION, RESULT, IO_ERROR
+│   ├── collections/       # LIST_OPS, SEQ
+│   ├── numeric/           # BIGNAT
+│   ├── text/              # STRING, STRING_ERROR
+│   └── functional/        # FUNCTION_OPS
 ├── gardelc/               # The self-contained Gardel Rust compiler
 │   ├── Cargo.toml
-│   ├── src/main.rs        # Parser, type checker, SMT verifier & code generators
-│   └── stdlib/            # Extracted Phase 4 standard library bundle
+│   └── src/main.rs        # Parser, type checker, Boogie/Z3 verifier & code generators
 └── SETUP.md               # Tooling setup and workflow commands
 ```
 
@@ -135,11 +142,11 @@ end
 ### Prerequisites
 
 * [Rust 1.81+](https://www.rust-lang.org/)
-* *(Optional for direct verification & `--run`)*: [Boogie](https://github.com/boogie-org/boogie), [Z3](https://github.com/Z3Prover/z3), and [Dafny](https://github.com/dafny-lang/dafny)
+* *(Optional for direct verification & `--run`)*: [Boogie](https://github.com/boogie-org/boogie), and [Z3](https://github.com/Z3Prover/z3). Boogie is the only verifier; Dafny is installed only as a convenient source of a bundled Z3
 
 #### Automated Tools Setup Scripts
 
-Automated setup scripts are provided in `scripts/` to install Dafny (with bundled Z3) and Boogie:
+Automated setup scripts are provided in `scripts/` to install Boogie and Z3 (via a Dafny distribution, used only for its bundled Z3):
 
 * **Windows (PowerShell)**:
   ```powershell
@@ -176,7 +183,7 @@ From the `gardelc` folder:
 ```bash
 cd gardelc
 
-# Compile and verify the embedded standard library (SEQ, BIGNAT, STRING, OPTION)
+# Verify the standard library sources in ../stdlib/ (all 12 files, linked as one project)
 cargo run -- --stdlib
 
 # Inspect the public contract interface of all modules (short view)
@@ -191,7 +198,7 @@ cargo run -- ../examples/bounded_stack.gdl --inspect
 # Compile and run an example program
 cargo run -- ../examples/greeter.gdl
 
-# Emit the embedded standard library to standalone .gdl files
+# Write the embedded standard library to build/stdlib/ (or --emit-stdlib <DIR>); never overwrites edited files
 cargo run -- --emit-stdlib
 ```
 

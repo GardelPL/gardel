@@ -1,0 +1,106 @@
+functions LIST_OPS
+
+feature {ANY}
+
+  map[A, B](xs: LIST[A], f: A -> B): LIST[B]
+    variant
+      xs.length
+    do
+      if xs.length = 0 then
+        LIST.empty
+      else
+        LIST_OPS.map(xs.tail, f).prepend(f(xs.head))
+      end
+    ensure
+      same_length: Result.length = xs.length
+      empty_case: xs.length = 0 implies Result = LIST.empty
+      cons_case: xs.length > 0 implies Result = LIST_OPS.map(xs.tail, f).prepend(f(xs.head))
+    end
+
+  filter[A](xs: LIST[A], keep: A -> BOOL): LIST[A]
+    variant
+      xs.length
+    do
+      if xs.length = 0 then
+        LIST.empty
+      else
+        let rest = LIST_OPS.filter(xs.tail, keep)
+        if keep(xs.head) then
+          rest.prepend(xs.head)
+        else
+          rest
+        end
+      end
+    ensure
+      not_longer: Result.length <= xs.length
+      empty_case: xs.length = 0 implies Result = LIST.empty
+    end
+
+  fold_left[A, B](xs: LIST[A], f: (acc: B, x: A) -> B, init: B): B
+    variant
+      xs.length
+    do
+      if xs.length = 0 then
+        init
+      else
+        LIST_OPS.fold_left(xs.tail, f, f(init, xs.head))
+      end
+    ensure
+      empty_case: xs.length = 0 implies Result = init
+      cons_case: xs.length > 0 implies Result = LIST_OPS.fold_left(xs.tail, f, f(init, xs.head))
+    end
+
+  fold_right[A, B](xs: LIST[A], f: (x: A, acc: B) -> B, init: B): B
+    variant
+      xs.length
+    do
+      if xs.length = 0 then
+        init
+      else
+        f(xs.head, LIST_OPS.fold_right(xs.tail, f, init))
+      end
+    ensure
+      empty_case: xs.length = 0 implies Result = init
+      cons_case: xs.length > 0 implies Result = f(xs.head, LIST_OPS.fold_right(xs.tail, f, init))
+    end
+
+specify {ANY}
+
+  law map_empty[A, B](f: A -> B)
+    ensure
+      is_empty: LIST_OPS.map(LIST.empty, f) = LIST.empty
+    end
+
+  law map_singleton[A, B](x: A, f: A -> B)
+    ensure
+      is_single: LIST_OPS.map(LIST.empty.prepend(x), f) = LIST.empty.prepend(f(x))
+    end
+
+  law map_append[A, B](xs: LIST[A], ys: LIST[A], f: A -> B)
+    ensure
+      distributes: LIST_OPS.map(xs.append(ys), f) = LIST_OPS.map(xs, f).append(LIST_OPS.map(ys, f))
+    end
+
+  law filter_append[A](xs: LIST[A], ys: LIST[A], keep: A -> BOOL)
+    ensure
+      distributes: LIST_OPS.filter(xs.append(ys), keep) = LIST_OPS.filter(xs, keep).append(LIST_OPS.filter(ys, keep))
+    end
+
+  law fold_left_append[A, B](xs: LIST[A], ys: LIST[A], f: (acc: B, x: A) -> B, init: B)
+    ensure
+      chains: LIST_OPS.fold_left(xs.append(ys), f, init) = LIST_OPS.fold_left(ys, f, LIST_OPS.fold_left(xs, f, init))
+    end
+
+  law fold_right_append[A, B](xs: LIST[A], ys: LIST[A], f: (x: A, acc: B) -> B, init: B)
+    ensure
+      chains: LIST_OPS.fold_right(xs.append(ys), f, init) = LIST_OPS.fold_right(xs, f, LIST_OPS.fold_right(ys, f, init))
+    end
+
+  law fold_map_fusion[A, B, C](xs: LIST[A], g: A -> B, f: (acc: C, b: B) -> C, init: C)
+    ensure
+      fused: LIST_OPS.fold_left(LIST_OPS.map(xs, g), f, init) =
+             LIST_OPS.fold_left(xs, fn(acc: C, x: A): C do f(acc, g(x)) end, init)
+    end
+
+end
+

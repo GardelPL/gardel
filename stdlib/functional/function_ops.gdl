@@ -1,0 +1,54 @@
+functions FUNCTION_OPS
+
+feature {ANY}
+
+  identity[A](x: A): A
+    do
+      x
+    ensure
+      is_id: Result = x
+    end
+
+  id_fn[A]: A -> A
+    do
+      fn(x: A): A do x end
+    ensure
+      pointwise_id: forall x: A. Result(x) = x
+    end
+
+  compose[A, B, C](f: B -> C, g: A -> B): A -> C
+    do
+      fn(x: A): C do f(g(x)) end
+    ensure
+      pointwise: forall x: A. Result(x) = f(g(x))
+    end
+
+specify {ANY}
+
+  law identity_law[A](x: A)
+    ensure
+      fixed: FUNCTION_OPS.identity(x) = x
+    end
+
+  law compose_pointwise[A, B, C](f: B -> C, g: A -> B, x: A)
+    ensure
+      applied: FUNCTION_OPS.compose(f, g)(x) = f(g(x))
+    end
+
+  law compose_left_identity[A, B](f: A -> B, x: A)
+    ensure
+      left_id: FUNCTION_OPS.compose(FUNCTION_OPS.id_fn, f)(x) = f(x)
+    end
+
+  law compose_right_identity[A, B](f: A -> B, x: A)
+    ensure
+      right_id: FUNCTION_OPS.compose(f, FUNCTION_OPS.id_fn)(x) = f(x)
+    end
+
+  law compose_associative[A, B, C, D](f: C -> D, g: B -> C, h: A -> B, x: A)
+    ensure
+      assoc: FUNCTION_OPS.compose(FUNCTION_OPS.compose(f, g), h)(x) = FUNCTION_OPS.compose(f, FUNCTION_OPS.compose(g, h))(x)
+    end
+
+end
+

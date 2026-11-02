@@ -1,0 +1,260 @@
+module SEQ[A] satisfies EQ where A satisfies CANONICAL_EQ
+
+representation {ANY}
+  | Empty
+  | Leaf(value: A)
+  | Concat(left: SEQ[A], right: SEQ[A], len: NAT)
+
+specify {ANY}
+
+  model: LIST[A]
+    variant
+      Current
+    do
+      match Current
+        case Empty           then LIST.empty
+        case Leaf(v)         then LIST.empty.prepend(v)
+        case Concat(l, r, _) then l.model.append(r.model)
+      end
+    end
+
+create {ANY}
+
+  empty: SEQ[A]
+    do
+      Empty
+    ensure
+      empty_len: Result.length = 0
+      empty_model: Result.model = LIST.empty
+    end
+
+  singleton(x: A): SEQ[A]
+    do
+      Leaf(x)
+    ensure
+      unit_len: Result.length = 1
+      unit_model: Result.model = LIST.empty.prepend(x)
+    end
+
+feature {ANY}
+
+  equals(other: SEQ[A]): BOOL
+    do
+      Current.to_list = other.to_list
+    ensure
+      model_equality: Result = (Current.model = other.model)
+    end
+
+  to_list: LIST[A]
+    variant
+      Current
+    do
+      match Current
+        case Empty           then LIST.empty
+        case Leaf(v)         then LIST.empty.prepend(v)
+        case Concat(l, r, _) then l.to_list.append(r.to_list)
+      end
+    ensure
+      is_model: Result = Current.model
+    end
+
+  length: NAT
+    variant
+      Current
+    do
+      match Current
+        case Empty            then 0
+        case Leaf(_)          then 1
+        case Concat(_, _, ln) then ln
+      end
+    end
+
+  is_empty: BOOL
+    do
+      Current.length = 0
+    ensure
+      def: Result = (Current.length = 0)
+    end
+
+  concat(other: SEQ[A]): SEQ[A]
+    require
+      fits: Current.length <= 18446744073709551615 - other.length
+    do
+      Concat(Current, other, Current.length + other.length)
+    ensure
+      len_sum: Result.length = Current.length + other.length
+      model_concat: Result.model = Current.model.append(other.model)
+    end
+
+  map[B](f: A -> B): SEQ[B]
+    variant
+      Current
+    do
+      match Current
+        case Empty then
+          Empty
+        case Leaf(v) then
+          Leaf(f(v))
+        case Concat(l, r, ln) then
+          let ml = l.map(f)
+          let mr = r.map(f)
+          Concat(ml, mr, ln)
+      end
+    ensure
+      same_length: Result.length = Current.length
+      model_map: Result.model = LIST_OPS.map(Current.model, f)
+    end
+
+  filter(keep: A -> BOOL): SEQ[A]
+    variant
+      Current
+    do
+      match Current
+        case Empty then
+          Empty
+        case Leaf(v) then
+          if keep(v) then
+            Leaf(v)
+          else
+            Empty
+          end
+        case Concat(l, r, _) then
+          let fl = l.filter(keep)
+          let fr = r.filter(keep)
+          Concat(fl, fr, fl.length + fr.length)
+      end
+    ensure
+      not_longer: Result.length <= Current.length
+      model_filter: Result.model = LIST_OPS.filter(Current.model, keep)
+    end
+
+  fold_left[B](f: (acc: B, x: A) -> B, init: B): B
+    variant
+      Current
+    do
+      match Current
+        case Empty then
+          init
+        case Leaf(v) then
+          f(init, v)
+        case Concat(l, r, _) then
+          r.fold_left(f, l.fold_left(f, init))
+      end
+    ensure
+      model_fold_left: Result = LIST_OPS.fold_left(Current.model, f, init)
+    end
+
+  fold_right[B](f: (x: A, acc: B) -> B, init: B): B
+    variant
+      Current
+    do
+      match Current
+        case Empty then
+          init
+        case Leaf(v) then
+          f(v, init)
+        case Concat(l, r, _) then
+          l.fold_right(f, r.fold_right(f, init))
+      end
+    ensure
+      model_fold_right: Result = LIST_OPS.fold_right(Current.model, f, init)
+    end
+
+specify {EQ}
+
+  law reflexive(a: SEQ[A])
+    ensure
+      refl: a.equals(a)
+    end
+
+  law symmetric(a: SEQ[A], b: SEQ[A])
+    require
+      ab: a.equals(b)
+    ensure
+      ba: b.equals(a)
+    end
+
+  law transitive(a: SEQ[A], b: SEQ[A], c: SEQ[A])
+    require
+      ab: a.equals(b)
+      bc: b.equals(c)
+    ensure
+      ac: a.equals(c)
+    end
+
+specify {ANY}
+
+  law empty_is_empty
+    ensure
+      empty_check: SEQ.empty.is_empty
+    end
+
+  law singleton_not_empty(x: A)
+    ensure
+      non_empty: not SEQ.singleton(x).is_empty
+    end
+
+  law map_preserves_empty[B](f: A -> B)
+    ensure
+      empty_mapped: SEQ.empty.map(f).model = LIST.empty
+    end
+
+  law map_singleton_refines[B](x: A, f: A -> B)
+    ensure
+      single_mapped: SEQ.singleton(x).map(f).model = LIST.empty.prepend(f(x))
+    end
+
+  law fold_left_singleton[B](x: A, f: (acc: B, item: A) -> B, init: B)
+    ensure
+      single_folded: SEQ.singleton(x).fold_left(f, init) = f(init, x)
+    end
+
+  law fold_right_singleton[B](x: A, f: (item: A, acc: B) -> B, init: B)
+    ensure
+      single_folded: SEQ.singleton(x).fold_right(f, init) = f(x, init)
+    end
+
+  law concat_associative(a: SEQ[A], b: SEQ[A], c: SEQ[A])
+    require
+      no_overflow_1: a.length <= 18446744073709551615 - b.length
+      no_overflow_2: (a.length + b.length) <= 18446744073709551615 - c.length
+      no_overflow_3: b.length <= 18446744073709551615 - c.length
+      no_overflow_4: a.length <= 18446744073709551615 - (b.length + c.length)
+    ensure
+      assoc: a.concat(b).concat(c).equals(a.concat(b.concat(c)))
+    end
+
+  law concat_left_identity(a: SEQ[A])
+    ensure
+      left_id: SEQ.empty.concat(a).equals(a)
+    end
+
+  law concat_right_identity(a: SEQ[A])
+    ensure
+      right_id: a.concat(SEQ.empty).equals(a)
+    end
+
+  law concat_length_homomorphism(a: SEQ[A], b: SEQ[A])
+    require
+      no_overflow: a.length <= 18446744073709551615 - b.length
+    ensure
+      len_homo: a.concat(b).length = a.length + b.length
+    end
+
+  law map_identity(s: SEQ[A])
+    ensure
+      id_preserved: s.map(FUNCTION_OPS.id_fn).equals(s)
+    end
+
+  law map_fusion[B, C](s: SEQ[A], f: B -> C, g: A -> B)
+    ensure
+      fusion: s.map(g).map(f).model = s.map(FUNCTION_OPS.compose(f, g)).model
+    end
+
+  law filter_conjunction(s: SEQ[A], p: A -> BOOL, q: A -> BOOL)
+    ensure
+      conjunction: s.filter(p).filter(q).equals(s.filter(fn(x: A): BOOL do p(x) and q(x) end))
+    end
+
+end
+

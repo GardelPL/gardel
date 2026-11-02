@@ -1,0 +1,233 @@
+module RESULT[E, A] satisfies CANONICAL_EQ where E satisfies CANONICAL_EQ, A satisfies CANONICAL_EQ
+
+representation {ANY}
+  | Error(err: E)
+  | Ok(val: A)
+
+create {ANY}
+
+  ok(v: A): RESULT[E, A]
+    do
+      Ok(v)
+    ensure
+      is_ok_res: Result.is_ok
+      val_set: Result.get = v
+    end
+
+  error(e: E): RESULT[E, A]
+    do
+      Error(e)
+    ensure
+      is_err_res: Result.is_error
+      err_set: Result.get_error = e
+    end
+
+feature {ANY}
+
+  equals(other: RESULT[E, A]): BOOL
+    do
+      match Current
+        case Error(e1) then
+          match other
+            case Error(e2) then e1.equals(e2)
+            case Ok(_)     then False
+          end
+        case Ok(v1) then
+          match other
+            case Error(_)  then False
+            case Ok(v2)    then v1.equals(v2)
+          end
+      end
+    ensure
+      err_eq: (Current.is_error and other.is_error) implies (Result = Current.get_error.equals(other.get_error))
+      ok_eq: (Current.is_ok and other.is_ok) implies (Result = Current.get.equals(other.get))
+      variant_mismatch: (Current.is_ok = other.is_error) implies not Result
+    end
+
+  is_ok: BOOL
+    do
+      match Current
+        case Error(_) then False
+        case Ok(_)    then True
+      end
+    ensure
+      def: Result = (match Current case Error(_) then False case Ok(_) then True end)
+    end
+
+  is_error: BOOL
+    do
+      match Current
+        case Error(_) then True
+        case Ok(_)    then False
+      end
+    ensure
+      complement: Result = (not Current.is_ok)
+    end
+
+  get: A
+    require
+      ok_present: Current.is_ok
+    do
+      match Current
+        case Ok(v) then v
+      end
+    ensure
+      matches_ok: Current = Ok(Result)
+    end
+
+  get_error: E
+    require
+      err_present: Current.is_error
+    do
+      match Current
+        case Error(e) then e
+      end
+    ensure
+      matches_err: Current = Error(Result)
+    end
+
+  unwrap_or(default: A): A
+    do
+      match Current
+        case Error(_) then default
+        case Ok(v)    then v
+      end
+    ensure
+      when_ok: Current.is_ok implies Result = Current.get
+      when_err: Current.is_error implies Result = default
+    end
+
+  to_option: OPTION[A]
+    do
+      match Current
+        case Error(_) then None
+        case Ok(v)    then Some(v)
+      end
+    ensure
+      preserves_status: Result.is_some = Current.is_ok
+    end
+
+  map[B](f: A -> B): RESULT[E, B]
+    do
+      match Current
+        case Error(e) then Error(e)
+        case Ok(v)    then Ok(f(v))
+      end
+    ensure
+      preserves_ok: Result.is_ok = Current.is_ok
+      preserves_err: Current.is_error implies Result.get_error = Current.get_error
+      mapped_ok: Current.is_ok implies Result = Ok(f(Current.get))
+    end
+
+  map_error[F](f: E -> F): RESULT[F, A]
+    do
+      match Current
+        case Error(e) then Error(f(e))
+        case Ok(v)    then Ok(v)
+      end
+    ensure
+      preserves_ok: Result.is_ok = Current.is_ok
+      preserves_val: Current.is_ok implies Result.get = Current.get
+      mapped_err: Current.is_error implies Result = Error(f(Current.get_error))
+    end
+
+  and_then[B](f: A -> RESULT[E, B]): RESULT[E, B]
+    do
+      match Current
+        case Error(e) then Error(e)
+        case Ok(v)    then f(v)
+      end
+    ensure
+      err_propagates: Current.is_error implies (Result.is_error and Result.get_error = Current.get_error)
+      ok_chains: Current.is_ok implies Result = f(Current.get)
+    end
+
+specify {CANONICAL_EQ}
+
+  law agrees_with_structural(a: RESULT[E, A], b: RESULT[E, A])
+    ensure
+      sound: a.equals(b) = (a = b)
+    end
+
+specify {EQ}
+
+  law reflexive(a: RESULT[E, A])
+    ensure
+      refl: a.equals(a)
+    end
+
+  law symmetric(a: RESULT[E, A], b: RESULT[E, A])
+    require
+      ab: a.equals(b)
+    ensure
+      ba: b.equals(a)
+    end
+
+  law transitive(a: RESULT[E, A], b: RESULT[E, A], c: RESULT[E, A])
+    require
+      ab: a.equals(b)
+      bc: b.equals(c)
+    ensure
+      ac: a.equals(c)
+    end
+
+specify {ANY}
+
+  law ok_not_error(r: RESULT[E, A])
+    ensure
+      dichotomy: r.is_error = (not r.is_ok)
+    end
+
+  law map_ok[B](v: A, f: A -> B)
+    ensure
+      ok_mapped: Ok(v).map(f) = Ok(f(v))
+    end
+
+  law map_preserves_error[B](e: E, f: A -> B)
+    ensure
+      err_untouched: Error(e).map(f) = Error(e)
+    end
+
+  law map_identity(res: RESULT[E, A])
+    ensure
+      id_mapped: res.map(fn(x: A): A do x end) = res
+    end
+
+  law map_composition[B, C](res: RESULT[E, A], f: B -> C, g: A -> B)
+    ensure
+      composed: res.map(g).map(f) = res.map(fn(x: A): C do f(g(x)) end)
+    end
+
+  law map_error_err[F](e: E, f: E -> F)
+    ensure
+      err_mapped: Error(e).map_error(f) = Error(f(e))
+    end
+
+  law map_error_preserves_ok[F](v: A, f: E -> F)
+    ensure
+      ok_untouched: Ok(v).map_error(f) = Ok(v)
+    end
+
+  law and_then_ok[B](v: A, f: A -> RESULT[E, B])
+    ensure
+      chain_ok: Ok(v).and_then(f) = f(v)
+    end
+
+  law and_then_error[B](e: E, f: A -> RESULT[E, B])
+    ensure
+      chain_err: Error(e).and_then(f) = Error(e)
+    end
+
+  law and_then_right_identity(res: RESULT[E, A])
+    ensure
+      right_id: res.and_then(fn(x: A): RESULT[E, A] do Ok(x) end) = res
+    end
+
+  law and_then_associative[B, C](res: RESULT[E, A], f: A -> RESULT[E, B], g: B -> RESULT[E, C])
+    ensure
+      assoc: res.and_then(f).and_then(g) =
+             res.and_then(fn(x: A): RESULT[E, C] do f(x).and_then(g) end)
+    end
+
+end
+

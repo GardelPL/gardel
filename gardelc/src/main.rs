@@ -354,6 +354,8 @@ pub enum Token {
     Le,
     Gt,
     Ge,
+    /// `!=`, desugared by the parser to `not (a = b)`.
+    Ne,
     Eof,
 }
 
@@ -660,6 +662,11 @@ pub fn tokenize_with_lines(src: &str) -> Result<(Vec<Token>, Vec<usize>), LexErr
                 }
                 '=' => {
                     tokens.push(Token::Eq);
+                    lines.push(start_line);
+                }
+                '!' if i + 1 < chars.len() && chars[i + 1] == '=' => {
+                    tokens.push(Token::Ne);
+                    i += 1;
                     lines.push(start_line);
                 }
                 '<' => {
@@ -1665,12 +1672,22 @@ impl Parser {
                 Token::Le => "<=",
                 Token::Gt => ">",
                 Token::Ge => ">=",
+                Token::Ne => "!=",
                 _ => break,
             };
             let op_str = op.to_string();
             self.next();
             let right = self.parse_bitwise_or()?;
-            left = Expr::BinOp(op_str, Box::new(left), Box::new(right));
+            left = if op_str == "!=" {
+                // `a != b` is `not (a = b)`, so it uses exactly the equality of `=` (§9).
+                Expr::UnaryNot(Box::new(Expr::BinOp(
+                    "=".into(),
+                    Box::new(left),
+                    Box::new(right),
+                )))
+            } else {
+                Expr::BinOp(op_str, Box::new(left), Box::new(right))
+            };
         }
         Ok(left)
     }
@@ -2620,14 +2637,19 @@ fn expr_has_io_bind(e: &Expr) -> bool {
             expr_has_io_bind(scrut)
                 || cases.iter().any(|c| {
                     expr_has_io_bind(&c.body)
-                        || c.stmts.iter().any(|st| matches!(st, Stmt::Let(_, x) if expr_has_io_bind(x)))
+                        || c.stmts
+                            .iter()
+                            .any(|st| matches!(st, Stmt::Let(_, x) if expr_has_io_bind(x)))
                 })
         }
         Expr::If(c, ts, te, es, ee) => {
             expr_has_io_bind(c)
                 || expr_has_io_bind(te)
                 || expr_has_io_bind(ee)
-                || ts.iter().chain(es.iter()).any(|st| matches!(st, Stmt::Let(_, x) if expr_has_io_bind(x)))
+                || ts
+                    .iter()
+                    .chain(es.iter())
+                    .any(|st| matches!(st, Stmt::Let(_, x) if expr_has_io_bind(x)))
         }
         _ => false,
     }
@@ -3179,7 +3201,7 @@ pub fn format_pattern(p: &Pattern) -> String {
 }
 
 /// Re-escapes the decoded contents of a string literal (§15 `EscapeSeq`) for emission inside
-/// double quotes (Gardel diagnostics, Dafny and Bend targets).
+/// double quotes (Gardel diagnostics and the Bend target).
 fn escape_string_literal(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for c in s.chars() {
@@ -3301,9 +3323,84 @@ pub fn format_gardel_expr(e: &Expr) -> String {
 // 5. PHASE 4 STANDARD LIBRARY (`SEQ`, `BIGNAT`, `STRING`, `OPTION`, `IO`)
 // ============================================================================
 
+pub const STDLIB_SOURCES: &[(&str, &str)] = &[
+    (
+        "stdlib/concepts/eq.gdl",
+        include_str!("../../stdlib/concepts/eq.gdl"),
+    ),
+    (
+        "stdlib/concepts/canonical_eq.gdl",
+        include_str!("../../stdlib/concepts/canonical_eq.gdl"),
+    ),
+    (
+        "stdlib/concepts/ord.gdl",
+        include_str!("../../stdlib/concepts/ord.gdl"),
+    ),
+    (
+        "stdlib/core/option.gdl",
+        include_str!("../../stdlib/core/option.gdl"),
+    ),
+    (
+        "stdlib/collections/seq.gdl",
+        include_str!("../../stdlib/collections/seq.gdl"),
+    ),
+    (
+        "stdlib/numeric/bignat.gdl",
+        include_str!("../../stdlib/numeric/bignat.gdl"),
+    ),
+    (
+        "stdlib/text/string.gdl",
+        include_str!("../../stdlib/text/string.gdl"),
+    ),
+    (
+        "stdlib/text/string_error.gdl",
+        include_str!("../../stdlib/text/string_error.gdl"),
+    ),
+    (
+        "stdlib/core/io_error.gdl",
+        include_str!("../../stdlib/core/io_error.gdl"),
+    ),
+    (
+        "stdlib/core/result.gdl",
+        include_str!("../../stdlib/core/result.gdl"),
+    ),
+    (
+        "stdlib/collections/list_ops.gdl",
+        include_str!("../../stdlib/collections/list_ops.gdl"),
+    ),
+    (
+        "stdlib/functional/function_ops.gdl",
+        include_str!("../../stdlib/functional/function_ops.gdl"),
+    ),
+];
+
 /// Returns the canonical Gardel v0.4 Phase 4 Standard Library source package (§3, §5, §10.5, §11, §16).
 pub fn phase4_stdlib_source() -> &'static str {
-    include_str!("../../stdlib/stdlib.gdl")
+    concat!(
+        include_str!("../../stdlib/concepts/eq.gdl"),
+        "\n",
+        include_str!("../../stdlib/concepts/canonical_eq.gdl"),
+        "\n",
+        include_str!("../../stdlib/concepts/ord.gdl"),
+        "\n",
+        include_str!("../../stdlib/core/option.gdl"),
+        "\n",
+        include_str!("../../stdlib/collections/seq.gdl"),
+        "\n",
+        include_str!("../../stdlib/numeric/bignat.gdl"),
+        "\n",
+        include_str!("../../stdlib/text/string.gdl"),
+        "\n",
+        include_str!("../../stdlib/text/string_error.gdl"),
+        "\n",
+        include_str!("../../stdlib/core/io_error.gdl"),
+        "\n",
+        include_str!("../../stdlib/core/result.gdl"),
+        "\n",
+        include_str!("../../stdlib/collections/list_ops.gdl"),
+        "\n",
+        include_str!("../../stdlib/functional/function_ops.gdl"),
+    )
 }
 
 /// Parses and returns all Phase 4 standard library modules (`OPTION`, `SEQ`, `BIGNAT`, `STRING`, `RESULT`).
@@ -3871,7 +3968,8 @@ fn conditional_canonical_tps(m: &ModuleDecl) -> Vec<String> {
                 .iter()
                 // Only parameters whose bound was resolved (so `<tp>_eq` is declared).
                 .filter(|(tp, c)| {
-                    c == "CANONICAL_EQ" && m.type_bounds.get(tp).is_some_and(|b| b == "CANONICAL_EQ")
+                    c == "CANONICAL_EQ"
+                        && m.type_bounds.get(tp).is_some_and(|b| b == "CANONICAL_EQ")
                 })
                 .map(|(tp, _)| tp.clone())
                 .collect()
@@ -3927,14 +4025,22 @@ fn elem_receiver_type(e: &Expr, m: &ModuleDecl) -> Option<String> {
         // Static call `M.r(..)` / unqualified call `r(..)` of a routine of the module.
         Expr::MethodCall(recv, r, _) if matches!(&**recv, Expr::Var(v) if v == &m.name) => {
             let (rd, _) = find_module_routine(m, r)?;
-            Some(if rd.ret_type == "Current" { module_self_type(m) } else { rd.ret_type.clone() })
+            Some(if rd.ret_type == "Current" {
+                module_self_type(m)
+            } else {
+                rd.ret_type.clone()
+            })
         }
         Expr::Call(f, _) => {
             if module_has_variant(m, f) {
                 return Some(module_self_type(m));
             }
             let (rd, _) = find_module_routine(m, f)?;
-            Some(if rd.ret_type == "Current" { module_self_type(m) } else { rd.ret_type.clone() })
+            Some(if rd.ret_type == "Current" {
+                module_self_type(m)
+            } else {
+                rd.ret_type.clone()
+            })
         }
         Expr::MethodCall(recv, r, args) if args.is_empty() => {
             let rt = elem_receiver_type(recv, m)?;
@@ -3942,7 +4048,11 @@ fn elem_receiver_type(e: &Expr, m: &ModuleDecl) -> Option<String> {
                 return None;
             }
             let (rd, _) = find_module_routine(m, r)?;
-            Some(if rd.ret_type == "Current" { module_self_type(m) } else { rd.ret_type.clone() })
+            Some(if rd.ret_type == "Current" {
+                module_self_type(m)
+            } else {
+                rd.ret_type.clone()
+            })
         }
         _ => None,
     }
@@ -3978,7 +4088,10 @@ fn emit_boogie_concept_axioms(m: &ModuleDecl) -> String {
         format!("{quant_tps} ")
     };
 
-    let has_eq = sat.concepts.iter().any(|c| c == "EQ" || c == "CANONICAL_EQ" || c == "ORD");
+    let has_eq = sat
+        .concepts
+        .iter()
+        .any(|c| c == "EQ" || c == "CANONICAL_EQ" || c == "ORD");
     let has_ord = sat.concepts.iter().any(|c| c == "ORD");
 
     if has_eq {
@@ -4053,15 +4166,24 @@ pub fn standard_prelude() -> &'static StandardPrelude {
     })
 }
 
-/// True when `src` is the Standard Prelude source itself (always compiled in bootstrap mode).
-pub fn is_standard_prelude_source(src: &str) -> bool {
-    src.replace("\r\n", "\n").trim() == phase4_stdlib_source().replace("\r\n", "\n").trim()
+/// True when `path` is a file of the stdlib source tree this gardelc was built from. Those
+/// files are the Standard Prelude itself and always compile in bootstrap mode (§4.1.3). This is
+/// decided by location, not by comparing text with the embedded copy: an edited stdlib file is
+/// still a stdlib file, and a user file that happens to equal one is still a user file.
+pub fn path_in_stdlib_tree(path: &str) -> bool {
+    let (Ok(file), Ok(dir)) = (
+        std::path::Path::new(path).canonicalize(),
+        stdlib_source_dir().canonicalize(),
+    ) else {
+        return false;
+    };
+    file.starts_with(dir)
 }
 
-/// Prelude injection is on unless in bootstrap mode: `--stdlib`, `--no-prelude`, or the
-/// compiled source is the Standard Prelude itself (§4.1.3).
-pub fn prelude_mode_enabled(stdlib_only: bool, no_prelude: bool, src: &str) -> bool {
-    !stdlib_only && !no_prelude && !is_standard_prelude_source(src)
+/// Prelude injection is on unless in bootstrap mode: `--stdlib` (which covers compiling files
+/// of the stdlib tree, see `path_in_stdlib_tree`) or `--no-prelude` (§4.1.3).
+pub fn prelude_mode_enabled(stdlib_only: bool, no_prelude: bool) -> bool {
+    !stdlib_only && !no_prelude
 }
 
 /// Span of the declaration header `<kw> <name>` (e.g. `module STACK`) in `src`.
@@ -4250,7 +4372,11 @@ pub fn check_module_dependency_cycles(units: &[SourceUnit], table: &LinkTable) -
         .iter()
         .take(cycle.len().saturating_sub(1))
         .map(|n| {
-            let f = table.file_of.get(n).and_then(|&i| units.get(i)).map(|u| u.path.as_str());
+            let f = table
+                .file_of
+                .get(n)
+                .and_then(|&i| units.get(i))
+                .map(|u| u.path.as_str());
             format!("{n} ({})", f.unwrap_or("?"))
         })
         .collect();
@@ -4278,8 +4404,15 @@ pub fn check_module_dependency_cycles(units: &[SourceUnit], table: &LinkTable) -
 /// `STRING` is injected for modules that mention it, contain string literals or use `IO`
 /// (Task B.3: literals denote prelude `STRING` values); `LIST_OPS` / `FUNCTION_OPS` are realized by the built-in
 /// `Seq_*` / `Fn1_*` preamble theories already present in every Boogie file.
-const BOOGIE_INJECTED_PRELUDE: [&str; 7] =
-    ["OPTION", "RESULT", "SEQ", "BIGNAT", "STRING", "STRING_ERROR", "IO_ERROR"];
+const BOOGIE_INJECTED_PRELUDE: [&str; 7] = [
+    "OPTION",
+    "RESULT",
+    "SEQ",
+    "BIGNAT",
+    "STRING",
+    "STRING_ERROR",
+    "IO_ERROR",
+];
 
 /// Marker on the opaque declaration of another prelude module's sort that a module's
 /// representation refers to (e.g. `IO_ERROR.Decode(cause: STRING_ERROR)`). Needed when the
@@ -4292,12 +4425,19 @@ fn repr_prelude_deps(m: &ModuleDecl) -> Vec<String> {
     let prelude = standard_prelude();
     let field_types: Vec<&String> = match &m.repr {
         ReprKind::Product(fields) => fields.iter().map(|(_, t)| t).collect(),
-        ReprKind::Sum(vs) => vs.iter().flat_map(|v| v.fields.iter().map(|(_, t)| t)).collect(),
+        ReprKind::Sum(vs) => vs
+            .iter()
+            .flat_map(|v| v.fields.iter().map(|(_, t)| t))
+            .collect(),
     };
     let mut deps = Vec::new();
     for t in field_types {
         for tok in t.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_')) {
-            if !tok.is_empty() && tok != m.name && prelude.module(tok).is_some() && !deps.contains(&tok.to_string()) {
+            if !tok.is_empty()
+                && tok != m.name
+                && prelude.module(tok).is_some()
+                && !deps.contains(&tok.to_string())
+            {
                 deps.push(tok.to_string());
             }
         }
@@ -4353,7 +4493,7 @@ impl BoogiePreludeCtx {
         }
         let mut modules: Vec<ModuleDecl> = BOOGIE_INJECTED_PRELUDE
             .iter()
-            .filter(|n| wanted.contains(*n))
+            .filter(|n| wanted.contains(*n) && !linked.iter().any(|lm| lm.name == **n))
             .filter_map(|n| prelude.module(n).cloned())
             .collect();
         let mut ctor_owner = HashMap::new();
@@ -4367,11 +4507,17 @@ impl BoogiePreludeCtx {
         for n in &linked {
             if let ReprKind::Sum(vs) = &n.repr {
                 for v in vs {
-                    ctor_owner.entry(v.name.clone()).or_insert_with(|| n.name.clone());
+                    ctor_owner
+                        .entry(v.name.clone())
+                        .or_insert_with(|| n.name.clone());
                 }
             }
         }
-        modules.extend(linked);
+        for n in linked {
+            if !modules.iter().any(|m| m.name == n.name) {
+                modules.push(n);
+            }
+        }
         BoogiePreludeCtx {
             modules,
             ctor_owner,
@@ -4438,7 +4584,8 @@ fn prelude_modules_wanted(m: &ModuleDecl) -> HashSet<&'static str> {
             let string_use = name == "STRING"
                 && (idents.contains("IO") || !collect_module_strings(m).is_empty());
             // `IO.read_line: IO[RESULT[IO_ERROR, STRING]]` (§11).
-            let read_line_use = matches!(name, "RESULT" | "IO_ERROR") && idents.contains("read_line");
+            let read_line_use =
+                matches!(name, "RESULT" | "IO_ERROR") && idents.contains("read_line");
             if idents.contains(name) || ctor_used || string_use || read_line_use {
                 wanted.insert(name);
             }
@@ -4503,6 +4650,7 @@ impl LinkTable {
         self.modules
             .iter()
             .filter(|n| n.name != m.name && self.file_of.get(&n.name) != Some(&mf))
+            .filter(|n| n.name != "LIST_OPS" && n.name != "FUNCTION_OPS")
             .filter(|n| {
                 idents.contains(&n.name)
                     || matches!(&n.repr, ReprKind::Sum(vs) if vs.iter().any(|v| {
@@ -4521,7 +4669,10 @@ impl LinkTable {
             .map(|m| {
                 (
                     m.name.as_str(),
-                    self.direct_links(m).into_iter().map(|n| n.name.as_str()).collect(),
+                    self.direct_links(m)
+                        .into_iter()
+                        .map(|n| n.name.as_str())
+                        .collect(),
                 )
             })
             .collect();
@@ -4619,7 +4770,11 @@ fn linked_user_modules_for(m: &ModuleDecl) -> Vec<ModuleDecl> {
 /// dependencies), restoring the caller's context and type environment afterwards.
 fn in_own_boogie_ctx<T>(n: &ModuleDecl, f: impl FnOnce() -> T) -> T {
     let ctx = Rc::new(BoogiePreludeCtx::for_module(n));
-    let own = if ctx.modules.is_empty() { None } else { Some(ctx) };
+    let own = if ctx.modules.is_empty() {
+        None
+    } else {
+        Some(ctx)
+    };
     let saved_ctx = BOOGIE_PRELUDE_CTX.with(|c| c.replace(own));
     let saved_env = BOOGIE_TYPE_ENV.with(|e| std::mem::take(&mut *e.borrow_mut()));
     let out = f();
@@ -4640,7 +4795,9 @@ fn linked_contract_interface(n: &ModuleDecl) -> Rc<(String, HashSet<String>)> {
     }
     let result = Rc::new(in_own_boogie_ctx(n, || emit_prelude_contract_interface(n)));
     if let Some(t) = table {
-        t.iface_cache.borrow_mut().insert(n.name.clone(), result.clone());
+        t.iface_cache
+            .borrow_mut()
+            .insert(n.name.clone(), result.clone());
     }
     result
 }
@@ -4708,7 +4865,11 @@ fn set_boogie_type_env(m: &ModuleDecl, params: &[(String, String)], ret: Option<
         let mut env = env.borrow_mut();
         env.clear();
         for (pn, pt) in params {
-            let t = if pt == "Current" { me.clone() } else { pt.clone() };
+            let t = if pt == "Current" {
+                me.clone()
+            } else {
+                pt.clone()
+            };
             env.insert(pn.clone(), t);
         }
     });
@@ -4719,11 +4880,19 @@ fn set_boogie_type_env(m: &ModuleDecl, params: &[(String, String)], ret: Option<
         let mut env = env.borrow_mut();
         env.clear();
         for (pn, pt) in params {
-            let t = if pt == "Current" { me.clone() } else { pt.clone() };
+            let t = if pt == "Current" {
+                me.clone()
+            } else {
+                pt.clone()
+            };
             env.insert(pn.clone(), t);
         }
         if let Some(rt) = ret {
-            let t = if rt == "Current" { me.clone() } else { rt.to_string() };
+            let t = if rt == "Current" {
+                me.clone()
+            } else {
+                rt.to_string()
+            };
             env.insert("Result".to_string(), t);
         }
     });
@@ -4782,21 +4951,35 @@ fn concept_closure(c: &str) -> Vec<String> {
 /// constraints hold for the type arguments.
 fn type_satisfies(ty: &str, concept: &str, m: &ModuleDecl, ctx: &BoogiePreludeCtx) -> bool {
     let ty = ty.trim();
-    if matches!(ty, "U64" | "NAT" | "I64" | "INT" | "BOOL" | "CHAR" | "UNIT" | "()" | "EXIT_CODE") {
+    if matches!(
+        ty,
+        "U64" | "NAT" | "I64" | "INT" | "BOOL" | "CHAR" | "UNIT" | "()" | "EXIT_CODE"
+    ) {
         return matches!(concept, "EQ" | "CANONICAL_EQ" | "ORD");
     }
     if m.type_params.iter().any(|tp| tp == ty) {
-        return m.type_bounds.get(ty).is_some_and(|b| concept_closure(b).iter().any(|c| c == concept));
+        return m
+            .type_bounds
+            .get(ty)
+            .is_some_and(|b| concept_closure(b).iter().any(|c| c == concept));
     }
     let (head, args) = split_type_app(ty);
-    let owner = if head == m.name { Some(m) } else { ctx.module(head) };
+    let owner = if head == m.name {
+        Some(m)
+    } else {
+        ctx.module(head)
+    };
     let Some(owner) = owner else {
         return false;
     };
     let Some(sat) = &owner.satisfies else {
         return false;
     };
-    if !sat.concepts.iter().any(|c| concept_closure(c).iter().any(|x| x == concept)) {
+    if !sat
+        .concepts
+        .iter()
+        .any(|c| concept_closure(c).iter().any(|x| x == concept))
+    {
         return false;
     }
     sat.where_constraints.iter().all(|(tp, req)| {
@@ -4814,6 +4997,77 @@ fn type_satisfies(ty: &str, concept: &str, m: &ModuleDecl, ctx: &BoogiePreludeCt
 /// the `where` constraints. Example: `SEQ[A] satisfies EQ where A satisfies CANONICAL_EQ`, so
 /// `s.equals(t)` on `SEQ[SEQ[U64]]` is rejected: `SEQ.equals` compares elements
 /// structurally, which is behavioral equality only for canonical elements.
+/// Termination through function values (§7, §8): a routine in a recursive call group may
+/// reach its group only by direct calls, whose arguments the `variant` obligations can relate
+/// to the caller's variant. A group member called inside a lambda body, or passed around as a
+/// function value, could be applied anywhere and at any argument, so no variant can be checked
+/// for it: such recursion is rejected (E0315) instead of being left to the backend.
+pub fn check_higher_order_recursion(
+    m: &ModuleDecl,
+    src: &str,
+    input_path: &str,
+) -> Vec<Diagnostic> {
+    let prev = prelude_injection_enabled().then(|| {
+        let ctx = Rc::new(BoogiePreludeCtx::for_module(m));
+        BOOGIE_PRELUDE_CTX.with(|c| c.replace(Some(ctx)))
+    });
+    let groups = compute_recursive_groups(m);
+    let routines: Vec<&RoutineDecl> = m
+        .create_routines
+        .iter()
+        .chain(m.feature_routines.iter())
+        .chain(m.specify_routines.iter())
+        .map(|(_, r)| r)
+        .collect();
+    let mut found: Vec<(String, String)> = Vec::new();
+    for r in routines {
+        let Some(group) = groups.get(&r.name) else {
+            continue;
+        };
+        set_boogie_type_env(m, &r.params, Some(&r.ret_type));
+        for (callee, kind) in routine_uses(r, m) {
+            if kind == RoutineUse::Call || !group.contains(&callee) {
+                continue;
+            }
+            let how = match kind {
+                RoutineUse::InClosure => "is called inside a lambda",
+                _ => "is used as a function value",
+            };
+            let mut members: Vec<&String> = group.iter().collect();
+            members.sort();
+            let members: Vec<String> = members.iter().map(|n| format!("`{n}`")).collect();
+            found.push((
+                r.name.clone(),
+                format!(
+                    "`{callee}` {how} inside its own recursive call group ({}); a `variant` can only be checked across direct calls, so recursion through function values cannot be shown to terminate — call `{callee}` directly",
+                    members.join(", ")
+                ),
+            ));
+        }
+    }
+    clear_boogie_type_env();
+    if let Some(prev) = prev {
+        BOOGIE_PRELUDE_CTX.with(|c| *c.borrow_mut() = prev);
+    }
+    found.sort();
+    found.dedup();
+    found
+        .into_iter()
+        .map(|(rn, msg)| {
+            let sp = locate_span(src, input_path, "higher_order_recursion", &rn);
+            Diagnostic::basic(
+                "error",
+                "E0315: higher_order_recursion",
+                rn,
+                "higher_order_recursion".to_string(),
+                msg,
+            )
+            .with_module(&m.name)
+            .with_ai_context(sp, Vec::new(), BTreeMap::new(), Vec::new())
+        })
+        .collect()
+}
+
 pub fn check_where_constraints(m: &ModuleDecl, src: &str, input_path: &str) -> Vec<Diagnostic> {
     if !prelude_injection_enabled() || standard_prelude().declares(&m.name) {
         return Vec::new();
@@ -4822,7 +5076,13 @@ pub fn check_where_constraints(m: &ModuleDecl, src: &str, input_path: &str) -> V
     let prev = BOOGIE_PRELUDE_CTX.with(|c| c.replace(Some(ctx.clone())));
     let prelude = standard_prelude();
 
-    fn walk(e: &Expr, rn: &str, m: &ModuleDecl, ctx: &BoogiePreludeCtx, out: &mut Vec<(String, String)>) {
+    fn walk(
+        e: &Expr,
+        rn: &str,
+        m: &ModuleDecl,
+        ctx: &BoogiePreludeCtx,
+        out: &mut Vec<(String, String)>,
+    ) {
         let walk_stmts = |stmts: &[Stmt], out: &mut Vec<(String, String)>| {
             for st in stmts {
                 match st {
@@ -4845,7 +5105,11 @@ pub fn check_where_constraints(m: &ModuleDecl, src: &str, input_path: &str) -> V
                     return;
                 };
                 let (head, targs) = split_type_app(&t);
-                let owner = if head == m.name { Some(m) } else { ctx.module(head) };
+                let owner = if head == m.name {
+                    Some(m)
+                } else {
+                    ctx.module(head)
+                };
                 let Some(owner) = owner else {
                     return;
                 };
@@ -4855,7 +5119,10 @@ pub fn check_where_constraints(m: &ModuleDecl, src: &str, input_path: &str) -> V
                 // The concept (listed directly) that declares this routine.
                 let prelude = standard_prelude();
                 let declaring = sat.concepts.iter().find(|c| {
-                    prelude.concepts.iter().any(|cd| &cd.name == *c && cd.signatures.iter().any(|s| &s.name == rname))
+                    prelude
+                        .concepts
+                        .iter()
+                        .any(|cd| &cd.name == *c && cd.signatures.iter().any(|s| &s.name == rname))
                 });
                 if declaring.is_none() {
                     return;
@@ -4940,7 +5207,12 @@ pub fn check_where_constraints(m: &ModuleDecl, src: &str, input_path: &str) -> V
         .collect();
     for r in routines {
         set_boogie_type_env(m, &r.params, Some(&r.ret_type));
-        let mut exprs: Vec<&Expr> = r.requires.iter().chain(r.ensures.iter()).map(|(_, e)| e).collect();
+        let mut exprs: Vec<&Expr> = r
+            .requires
+            .iter()
+            .chain(r.ensures.iter())
+            .map(|(_, e)| e)
+            .collect();
         exprs.push(&r.body);
         for st in &r.stmts {
             if let Stmt::Let(_, x) | Stmt::Check(_, x) | Stmt::Assume(_, x) = st {
@@ -4966,9 +5238,15 @@ pub fn check_where_constraints(m: &ModuleDecl, src: &str, input_path: &str) -> V
         .into_iter()
         .map(|(rn, msg)| {
             let sp = locate_span(src, input_path, "unsatisfied_where_constraint", &rn);
-            Diagnostic::basic("error", "E0314: unsatisfied_where_constraint", rn, "unsatisfied_where_constraint".to_string(), msg)
-                .with_module(&m.name)
-                .with_ai_context(sp, Vec::new(), BTreeMap::new(), Vec::new())
+            Diagnostic::basic(
+                "error",
+                "E0314: unsatisfied_where_constraint",
+                rn,
+                "unsatisfied_where_constraint".to_string(),
+                msg,
+            )
+            .with_module(&m.name)
+            .with_ai_context(sp, Vec::new(), BTreeMap::new(), Vec::new())
         })
         .collect()
 }
@@ -5176,7 +5454,10 @@ fn split_type_app(ty: &str) -> (&str, Vec<&str>) {
     if split_top_level_arrow(ty).is_none() {
         if let Some(idx) = ty.find('[') {
             if ty.ends_with(']') {
-                return (ty[..idx].trim(), split_top_level_commas(&ty[idx + 1..ty.len() - 1]));
+                return (
+                    ty[..idx].trim(),
+                    split_top_level_commas(&ty[idx + 1..ty.len() - 1]),
+                );
             }
         }
     }
@@ -5228,7 +5509,11 @@ fn instantiate_ret_type(
     }
     for ((_, pt), at) in r.params.iter().zip(arg_tys.iter()) {
         if let Some(at) = at {
-            let pt = if pt == "Current" { self_ty.clone() } else { pt.clone() };
+            let pt = if pt == "Current" {
+                self_ty.clone()
+            } else {
+                pt.clone()
+            };
             unify_type(&pt, at, &tps, &mut map);
         }
     }
@@ -5241,11 +5526,7 @@ fn instantiate_ret_type(
     let unresolved = type_tokens(&ret).into_iter().any(|t| {
         tps.iter().any(|tp| tp == t) && !map.contains_key(t) && !in_scope.iter().any(|s| s == t)
     });
-    if unresolved {
-        None
-    } else {
-        Some(inst)
-    }
+    if unresolved { None } else { Some(inst) }
 }
 
 /// Best-effort Gardel type of `e` inside user module `m` (used only to route calls on
@@ -5259,11 +5540,21 @@ fn infer_gardel_type(e: &Expr, m: &ModuleDecl, ctx: &BoogiePreludeCtx) -> Option
         Expr::MethodCall(recv, r, _)
             if r == "read_line" && matches!(&**recv, Expr::Var(v) if v == "IO") =>
         {
-            Some(if ctx.module("RESULT").is_some() { READ_LINE_RESULT_TYPE } else { "STRING" }.to_string())
+            Some(
+                if ctx.module("RESULT").is_some() {
+                    READ_LINE_RESULT_TYPE
+                } else {
+                    "STRING"
+                }
+                .to_string(),
+            )
         }
         Expr::Bool(_) | Expr::UnaryNot(_) => Some("BOOL".to_string()),
         Expr::BinOp(op, l, _) => {
-            if matches!(op.as_str(), "+" | "-" | "*" | "/" | "%" | "+%" | "-%" | "*%" | "&" | "|" | "^" | "<<" | ">>") {
+            if matches!(
+                op.as_str(),
+                "+" | "-" | "*" | "/" | "%" | "+%" | "-%" | "*%" | "&" | "|" | "^" | "<<" | ">>"
+            ) {
                 infer_gardel_type(l, m, ctx).or_else(|| Some("NAT".to_string()))
             } else {
                 Some("BOOL".to_string())
@@ -5405,7 +5696,11 @@ fn resolve_prelude_receiver(
     {
         return None;
     }
-    let cands: Vec<&ModuleDecl> = ctx.modules.iter().filter(|p| has_instance_routine(p)).collect();
+    let cands: Vec<&ModuleDecl> = ctx
+        .modules
+        .iter()
+        .filter(|p| has_instance_routine(p))
+        .collect();
     if cands.len() == 1 {
         Some(cands[0].name.clone())
     } else {
@@ -5429,7 +5724,11 @@ fn prelude_law_markers(p: &ModuleDecl) -> Vec<(usize, &LawDecl)> {
 
 /// Resolves a call expression in user module `m` to an injected prelude routine:
 /// `(module, routine, has_current_receiver)`.
-fn prelude_call_target(e: &Expr, m: &ModuleDecl, ctx: &BoogiePreludeCtx) -> Option<(String, String, bool)> {
+fn prelude_call_target(
+    e: &Expr,
+    m: &ModuleDecl,
+    ctx: &BoogiePreludeCtx,
+) -> Option<(String, String, bool)> {
     let Expr::MethodCall(recv, r, _) = e else {
         return None;
     };
@@ -5460,7 +5759,10 @@ fn emit_boogie_prelude_ref(
     };
     match e {
         Expr::Var(v) => {
-            if implicit_fields.contains(v) || boogie_env_type(v).is_some() || module_has_variant(m, v) {
+            if implicit_fields.contains(v)
+                || boogie_env_type(v).is_some()
+                || module_has_variant(m, v)
+            {
                 return None;
             }
             let (p, var) = prelude_variant_for(v, m)?;
@@ -5493,7 +5795,10 @@ fn emit_boogie_prelude_ref(
                         let (idx, _) = prelude_law_markers(p)
                             .into_iter()
                             .find(|(_, law)| &law.name == r && law.params.len() == args.len())?;
-                        if !prelude_contract_interface(p).1.contains(&format!("law_{idx}_{r}")) {
+                        if !prelude_contract_interface(p)
+                            .1
+                            .contains(&format!("law_{idx}_{r}"))
+                        {
                             return None;
                         }
                         let a: Vec<String> = args.iter().map(emit).collect();
@@ -5560,7 +5865,10 @@ fn boogie_declared_names(text: &str) -> HashSet<String> {
             }
             r
         } else if let Some(r) = t.strip_prefix("const ") {
-            r.trim_start().strip_prefix("unique ").unwrap_or(r).trim_start()
+            r.trim_start()
+                .strip_prefix("unique ")
+                .unwrap_or(r)
+                .trim_start()
         } else if let Some(r) = t.strip_prefix("type ") {
             r.trim_start()
         } else {
@@ -5637,7 +5945,14 @@ fn emit_prelude_contract_interface(p: &ModuleDecl) -> (String, HashSet<String>) 
     let empty_fields = HashSet::new();
     let empty_revealed = HashSet::new();
     let emit = |e: &Expr| {
-        emit_boogie_expr_with_strings(e, p, &empty_fields, &empty_revealed, "DefaultFuel", &strings)
+        emit_boogie_expr_with_strings(
+            e,
+            p,
+            &empty_fields,
+            &empty_revealed,
+            "DefaultFuel",
+            &strings,
+        )
     };
     // Boogie type parameters must occur in the signature; a declaration whose body
     // mentions a type parameter absent from its signature is not emitted.
@@ -5645,7 +5960,9 @@ fn emit_prelude_contract_interface(p: &ModuleDecl) -> (String, HashSet<String>) 
         let all: Vec<&String> = p.type_params.iter().chain(extra.iter()).collect();
         let mut tps: Vec<String> = Vec::new();
         for tp in &all {
-            let used = param_tys.iter().any(|t| type_tokens(t).contains(&tp.as_str()));
+            let used = param_tys
+                .iter()
+                .any(|t| type_tokens(t).contains(&tp.as_str()));
             if used && !tps.contains(tp) {
                 tps.push((*tp).clone());
             }
@@ -5668,16 +5985,12 @@ fn emit_prelude_contract_interface(p: &ModuleDecl) -> (String, HashSet<String>) 
         "// --- {}: routine preconditions (definitions) & trusted law markers ---\n",
         p.name
     ));
-    let routines = p
-        .create_routines
-        .iter()
-        .map(|(_, r)| (r, false))
-        .chain(
-            p.feature_routines
-                .iter()
-                .chain(p.specify_routines.iter())
-                .map(|(_, r)| (r, p.kind == ModuleKind::Module)),
-        );
+    let routines = p.create_routines.iter().map(|(_, r)| (r, false)).chain(
+        p.feature_routines
+            .iter()
+            .chain(p.specify_routines.iter())
+            .map(|(_, r)| (r, p.kind == ModuleKind::Module)),
+    );
     for (r, has_current) in routines {
         let mut params = Vec::new();
         let mut tys = Vec::new();
@@ -5710,10 +6023,22 @@ fn emit_prelude_contract_interface(p: &ModuleDecl) -> (String, HashSet<String>) 
             .iter()
             .map(|(pn, pt)| format!("{pn}: {}", map_boogie_type(pt, p)))
             .collect();
-        let tys: Vec<String> = law.params.iter().map(|(_, pt)| map_boogie_type(pt, p)).collect();
+        let tys: Vec<String> = law
+            .params
+            .iter()
+            .map(|(_, pt)| map_boogie_type(pt, p))
+            .collect();
         let args: Vec<String> = law.params.iter().map(|(pn, _)| pn.clone()).collect();
-        let ens: Vec<String> = law.ensures.iter().map(|(_, e)| format!("({})", emit(e))).collect();
-        let reqs: Vec<String> = law.requires.iter().map(|(_, e)| format!("({})", emit(e))).collect();
+        let ens: Vec<String> = law
+            .ensures
+            .iter()
+            .map(|(_, e)| format!("({})", emit(e)))
+            .collect();
+        let reqs: Vec<String> = law
+            .requires
+            .iter()
+            .map(|(_, e)| format!("({})", emit(e)))
+            .collect();
         let body = format!("{} {}", ens.join(" && "), reqs.join(" "));
         if type_tokens(&body).contains(&"Current") {
             continue;
@@ -5845,13 +6170,16 @@ pub fn emit_boogie(m: &ModuleDecl, fuel_limit: usize) -> String {
             injected.push_str(&emit_prelude_background_theory(p, fuel_limit));
         }
     }
-    let prev = BOOGIE_PRELUDE_CTX.with(|c| c.replace(Some(ctx)));
+    let prev = BOOGIE_PRELUDE_CTX.with(|c| c.replace(Some(ctx.clone())));
     let parts = emit_boogie_parts(m, fuel_limit);
     BOOGIE_PRELUDE_CTX.with(|c| *c.borrow_mut() = prev);
+    let has_option_module = ctx.modules.iter().any(|p| p.name == "OPTION");
     let mut s = parts.preamble;
     s.push_str(&injected);
     s.push_str(&parts.theory);
-    s.push_str(&parts.option_shim);
+    if !has_option_module {
+        s.push_str(&parts.option_shim);
+    }
     s.push_str(&parts.procedures);
     s
 }
@@ -5910,7 +6238,9 @@ fn emit_boogie_parts(m: &ModuleDecl, fuel_limit: usize) -> BoogieParts {
     // module-wide; see `canonical_where_guard`.
     let conditional_tps = conditional_canonical_tps(m);
     for (tp, bound) in &m.type_bounds {
-        let is_adt_tp = matches!(m.repr, ReprKind::Sum(_)) && m.type_params.contains(tp);
+        // Module type parameters are the holes of `type M A ...;` and are quantified (`<A>`) in every
+        // module function, so they must not also be declared as global types.
+        let is_adt_tp = m.type_params.contains(tp);
         if !is_adt_tp {
             out.push_str(&format!("type {tp};\n"));
             if bound == "EQ" || bound == "ORD" || bound == "CANONICAL_EQ" {
@@ -5980,7 +6310,9 @@ fn emit_boogie_parts(m: &ModuleDecl, fuel_limit: usize) -> BoogieParts {
     for dep in repr_prelude_deps(m) {
         let injected = boogie_prelude_ctx().is_some_and(|ctx| ctx.module(&dep).is_some());
         if !injected {
-            let arity = standard_prelude().module(&dep).map_or(0, |d| d.type_params.len());
+            let arity = standard_prelude()
+                .module(&dep)
+                .map_or(0, |d| d.type_params.len());
             let holes = " _".repeat(arity);
             out.push_str(&format!("type {dep}{holes}; {FOREIGN_PRELUDE_TYPE_MARK}\n"));
         }
@@ -6008,7 +6340,9 @@ fn emit_boogie_parts(m: &ModuleDecl, fuel_limit: usize) -> BoogieParts {
     let strings = collect_module_strings(m);
     let string_mode = prelude_string_mode();
     if !string_mode {
-        out.push_str("function Str_concat(a: GardelString, b: GardelString) returns (GardelString);\n");
+        out.push_str(
+            "function Str_concat(a: GardelString, b: GardelString) returns (GardelString);\n",
+        );
         out.push_str("function Str_length(s: GardelString) returns (int);\n");
         out.push_str("axiom (forall s: GardelString :: { Str_length(s) } 0 <= Str_length(s));\n");
         out.push_str("const unique str_lit_empty: GardelString;\n");
@@ -6027,14 +6361,22 @@ fn emit_boogie_parts(m: &ModuleDecl, fuel_limit: usize) -> BoogieParts {
             ));
         }
     }
-    let str_ty = if string_mode { "STRING" } else { "GardelString" };
+    let str_ty = if string_mode {
+        "STRING"
+    } else {
+        "GardelString"
+    };
     if !string_mode {
         // Legacy (`--no-prelude`) opaque line. In prelude mode `x <- IO.read_line` is a
         // fresh `havoc` per read (never a constant function: two reads may differ).
         out.push_str(&format!("function IO_read_line() returns ({str_ty});\n"));
     }
-    out.push_str(&format!("function IO_print(s: {str_ty}) returns (IO int);\n"));
-    out.push_str(&format!("function IO_print_line(s: {str_ty}) returns (IO int);\n"));
+    out.push_str(&format!(
+        "function IO_print(s: {str_ty}) returns (IO int);\n"
+    ));
+    out.push_str(&format!(
+        "function IO_print_line(s: {str_ty}) returns (IO int);\n"
+    ));
     out.push_str("function IO_exit(code: int) returns (IO int);\n\n");
 
     out.push_str("function Seq_empty<T>() returns (Seq T);\n");
@@ -6063,7 +6405,7 @@ fn emit_boogie_parts(m: &ModuleDecl, fuel_limit: usize) -> BoogieParts {
     out.push_str(
         "axiom (forall<T> xs: Seq T :: { Seq_append(xs, (Seq_empty() : Seq T)) } Seq_append(xs, (Seq_empty() : Seq T)) == xs);\n",
     );
-out.push_str(
+    out.push_str(
         "axiom (forall<T> xs: Seq T, ys: Seq T, zs: Seq T :: { Seq_append(Seq_append(xs, ys), zs) } Seq_append(Seq_append(xs, ys), zs) == Seq_append(xs, Seq_append(ys, zs)));\n",
     );
     out.push_str(
@@ -6102,7 +6444,9 @@ out.push_str(
     out.push_str("axiom (forall<A, B> f: Fn1 A B :: { Seq_map(Seq_empty() : Seq A, f) } Seq_map(Seq_empty() : Seq A, f) == (Seq_empty() : Seq B));\n");
     out.push_str("axiom (forall<A, B> x: A, xs: Seq A, f: Fn1 A B :: { Seq_map(Seq_prepend(x, xs), f) } Seq_map(Seq_prepend(x, xs), f) == Seq_prepend(Fn1_app(f, x), Seq_map(xs, f)));\n");
     out.push_str("axiom (forall<A, B> xs: Seq A, ys: Seq A, f: Fn1 A B :: { Seq_map(Seq_append(xs, ys), f) } Seq_map(Seq_append(xs, ys), f) == Seq_append(Seq_map(xs, f), Seq_map(ys, f)));\n");
-    out.push_str("axiom (forall<A> xs: Seq A :: { Seq_map(xs, Fn1_id()) } Seq_map(xs, Fn1_id()) == xs);\n");
+    out.push_str(
+        "axiom (forall<A> xs: Seq A :: { Seq_map(xs, Fn1_id()) } Seq_map(xs, Fn1_id()) == xs);\n",
+    );
     out.push_str("axiom (forall<A, B, C> xs: Seq A, f: Fn1 B C, g: Fn1 A B :: { Seq_map(Seq_map(xs, g), f) } Seq_map(Seq_map(xs, g), f) == Seq_map(xs, Fn1_compose(f, g)));\n\n");
 
     out.push_str("function Seq_filter<A>(xs: Seq A, keep: Fn1 A bool) returns (Seq A);\n");
@@ -6158,7 +6502,9 @@ out.push_str(
         out.push_str("function is_None<A>(x: (OPTION A)) returns (bool);\n");
         out.push_str("function is_Some<A>(x: (OPTION A)) returns (bool);\n");
         out.push_str("axiom (forall<A> :: { (None() : (OPTION A)) } is_None((None() : (OPTION A))) && !is_Some((None() : (OPTION A))));\n");
-        out.push_str("axiom (forall<A> v: A :: { Some(v) } is_Some(Some(v)) && !is_None(Some(v)));\n");
+        out.push_str(
+            "axiom (forall<A> v: A :: { Some(v) } is_Some(Some(v)) && !is_None(Some(v)));\n",
+        );
         out.push_str("function fn_is_some<A>(fuel: Fuel, Current: (OPTION A)) returns (bool);\n");
         out.push_str("axiom (forall<A> f: Fuel, Current: (OPTION A) :: { fn_is_some(f, Current) } fn_is_some(f, Current) == is_Some(Current));\n\n");
         option_shim = std::mem::replace(&mut out, theory_so_far);
@@ -6315,8 +6661,16 @@ out.push_str(
                     } else {
                         format!("{{ ({c1} : {mod_bpl_ty}), ({c2} : {mod_bpl_ty}) }}")
                     };
-                    let c1_app = if m.type_params.is_empty() { c1.clone() } else { format!("({c1} : {mod_bpl_ty})") };
-                    let c2_app = if m.type_params.is_empty() { c2.clone() } else { format!("({c2} : {mod_bpl_ty})") };
+                    let c1_app = if m.type_params.is_empty() {
+                        c1.clone()
+                    } else {
+                        format!("({c1} : {mod_bpl_ty})")
+                    };
+                    let c2_app = if m.type_params.is_empty() {
+                        c2.clone()
+                    } else {
+                        format!("({c2} : {mod_bpl_ty})")
+                    };
                     out.push_str(&format!(
                         "axiom (forall{tp_quant} {}, {} :: {inj_trig} {c1_app} == {c2_app} ==> ({}));\n",
                         p1.join(", "),
@@ -6460,7 +6814,8 @@ out.push_str(
     // nor its body mentions `Current`/a field, except through calls to other
     // receiver-independent routines (or itself). Such routines get a
     // Current-independence axiom and no receiver-invariant guard.
-    let mut current_indep: HashSet<String> = all_routines.iter().map(|(r, _)| r.name.clone()).collect();
+    let mut current_indep: HashSet<String> =
+        all_routines.iter().map(|(r, _)| r.name.clone()).collect();
     loop {
         let dependent: Vec<String> = all_routines
             .iter()
@@ -6545,7 +6900,8 @@ out.push_str(
         let fn_step_two_app = format!("fn_{}({})", r.name, call_args_step_two.join(", "));
         let fn_succ_app = format!("fn_{}({})", r.name, call_args_succ.join(", "));
         let fn_f_app = format!("fn_{}({})", r.name, call_args_f.join(", "));
-        let body_expr = emit_boogie_block_expr(&r.stmts, &r.body, m, &empty_fields, "_fuel", &strings);
+        let body_expr =
+            emit_boogie_block_expr(&r.stmts, &r.body, m, &empty_fields, "_fuel", &strings);
         let guard_str = if pre_guards.is_empty() {
             String::new()
         } else {
@@ -6561,14 +6917,21 @@ out.push_str(
         } else {
             format!("{{ ({fn_succ_app} : {ret_bty}) }}")
         };
-        let fn_f_trigger = if r_all_tps.is_empty() || r_all_tps.iter().all(|tp| q_params.iter().any(|qp| qp.contains(tp))) {
+        let fn_f_trigger = if r_all_tps.is_empty()
+            || r_all_tps
+                .iter()
+                .all(|tp| q_params.iter().any(|qp| qp.contains(tp)))
+        {
             format!("{{ {fn_f_app} }}")
         } else {
             format!("{{ ({fn_f_app} : {ret_bty}) }}")
         };
         // A routine that binds values from the outside world (`x <- IO.read_line`) is not a
         // function of its arguments: it gets no definitional axiom (it stays opaque).
-        let binds_io = r.stmts.iter().any(|st| matches!(st, Stmt::Let(_, e) if expr_has_io_bind(e)))
+        let binds_io = r
+            .stmts
+            .iter()
+            .any(|st| matches!(st, Stmt::Let(_, e) if expr_has_io_bind(e)))
             || expr_has_io_bind(&r.body);
         if !binds_io {
             out.push_str(&format!(
@@ -6617,7 +6980,9 @@ out.push_str(
             post_clauses.push(format!("{}_Invariant({fn_f_app})", m.name));
         }
         if m.name == "SEQ" && r.name == "length" {
-            post_clauses.push(format!("{fn_f_app} == Seq_length(fn_model(_fuel, Current))"));
+            post_clauses.push(format!(
+                "{fn_f_app} == Seq_length(fn_model(_fuel, Current))"
+            ));
             post_clauses.push(format!("0 <= {fn_f_app}"));
         }
         let mut model_decoupled_ens = Vec::new();
@@ -6625,7 +6990,8 @@ out.push_str(
         for (ens_tag, ens_e) in &r.ensures {
             // A postcondition clause that failed in an earlier pass is not stated as an axiom
             // (see `run_boogie_verification`); the clauses that verified remain available.
-            if UNTRUSTED_CONTRACTS.with(|u| u.borrow().contains(&format!("{}::{ens_tag}", r.name))) {
+            if UNTRUSTED_CONTRACTS.with(|u| u.borrow().contains(&format!("{}::{ens_tag}", r.name)))
+            {
                 continue;
             }
             let ens_bpl = emit_boogie_expr_with_strings(
@@ -6652,7 +7018,10 @@ out.push_str(
                     .rev()
                     .collect();
                 let model_fn = format!("{qualifier}fn_model");
-                let decoupled = ens_bpl.replace(&format!("{model_fn}(_fuel, "), &format!("{model_fn}(_f_query, "));
+                let decoupled = ens_bpl.replace(
+                    &format!("{model_fn}(_fuel, "),
+                    &format!("{model_fn}(_f_query, "),
+                );
                 model_decoupled_fn = model_fn;
                 model_decoupled_ens.push(decoupled);
             }
@@ -6667,7 +7036,9 @@ out.push_str(
                 post_clauses.join(" && ")
             ));
         }
-        let mentions_all_tps = r_all_tps.iter().all(|tp| q_params.iter().any(|qp| qp.contains(tp)));
+        let mentions_all_tps = r_all_tps
+            .iter()
+            .all(|tp| q_params.iter().any(|qp| qp.contains(tp)));
         if trusted && mentions_all_tps && !model_decoupled_ens.is_empty() {
             let mut decoupled_q_params = vec!["_f_query: Fuel".to_string()];
             decoupled_q_params.extend(q_params.clone());
@@ -6693,7 +7064,12 @@ out.push_str(
     if !m.specify_laws.is_empty() {
         out.push_str("// --- 6. Concept Law Quantified Axioms & Triggers (§9) ---\n");
         for (law_vis, law) in &m.specify_laws {
-            if law.name == "reflexive" || law.name == "symmetric" || law.name == "transitive" || law.name == "irreflexive" || law.name == "total" {
+            if law.name == "reflexive"
+                || law.name == "symmetric"
+                || law.name == "transitive"
+                || law.name == "irreflexive"
+                || law.name == "total"
+            {
                 continue;
             }
             if law.triggers.is_empty() {
@@ -6854,7 +7230,9 @@ out.push_str(
     }
 
     if prelude_string_mode() {
-        out.push_str(&emit_boogie_string_literal_procedures(&collect_module_strings(m)));
+        out.push_str(&emit_boogie_string_literal_procedures(
+            &collect_module_strings(m),
+        ));
     }
 
     BoogieParts {
@@ -6891,7 +7269,10 @@ fn string_literal_capacity(s: &str) -> usize {
 /// routines: `STRING.make_empty(cap).push_ascii(c_{n-1})...push_ascii(c_0)` (`push_ascii`
 /// prepends, so the scalars are pushed last-to-first).
 fn boogie_string_literal_term(s: &str) -> String {
-    let mut t = format!("STRING__fn_make_empty(DefaultFuel, {})", string_literal_capacity(s));
+    let mut t = format!(
+        "STRING__fn_make_empty(DefaultFuel, {})",
+        string_literal_capacity(s)
+    );
     for c in s.chars().rev() {
         t = format!("STRING__fn_push_ascii(DefaultFuel, {t}, {})", c as u32);
     }
@@ -6905,7 +7286,8 @@ fn boogie_string_literal_term(s: &str) -> String {
 /// `chars` model follow from the bootstrap-verified `make_empty` / `push_ascii` contracts and
 /// are re-proven per literal by `Verify_string_literal_k`.
 fn emit_boogie_string_literal_decls(strings: &[String]) -> String {
-    let mut out = String::from("// --- String literals (Task B.3, §3.1.4): prelude STRING constants ---\n");
+    let mut out =
+        String::from("// --- String literals (Task B.3, §3.1.4): prelude STRING constants ---\n");
     for (idx, s) in strings.iter().enumerate() {
         // Intermediate construction steps are named (`str_lit_k_s<j>`) to keep the
         // emitted terms linear in the literal length.
@@ -6992,7 +7374,10 @@ fn emit_boogie_string_literal_procedures(strings: &[String]) -> String {
 /// `STRING` invariant, the §3.1.4 `chars` model and the byte length.
 fn string_literal_facts(idx: usize, s: &str) -> Vec<(&'static str, String)> {
     vec![
-        ("invariant::string_invariant", format!("STRING__STRING_Invariant(str_lit_{idx})")),
+        (
+            "invariant::string_invariant",
+            format!("STRING__STRING_Invariant(str_lit_{idx})"),
+        ),
         (
             "ensure::chars_model",
             format!(
@@ -7002,7 +7387,10 @@ fn string_literal_facts(idx: usize, s: &str) -> Vec<(&'static str, String)> {
         ),
         (
             "ensure::byte_length",
-            format!("STRING__fn_byte_length(DefaultFuel, str_lit_{idx}) == {}", s.len()),
+            format!(
+                "STRING__fn_byte_length(DefaultFuel, str_lit_{idx}) == {}",
+                s.len()
+            ),
         ),
     ]
 }
@@ -7044,7 +7432,11 @@ fn routine_uses_current(
         || expr_uses_current(&r.body, field_names, indep)
 }
 
-fn stmts_use_current(stmts: &[Stmt], field_names: &HashSet<String>, indep: &HashSet<String>) -> bool {
+fn stmts_use_current(
+    stmts: &[Stmt],
+    field_names: &HashSet<String>,
+    indep: &HashSet<String>,
+) -> bool {
     stmts.iter().any(|st| match st {
         Stmt::Let(_, e) | Stmt::Check(_, e) | Stmt::Assume(_, e) => {
             expr_uses_current(e, field_names, indep)
@@ -7066,8 +7458,7 @@ fn expr_uses_current(e: &Expr, field_names: &HashSet<String>, indep: &HashSet<St
             expr_uses_current(inner, field_names, indep)
         }
         Expr::BinOp(_, l, r) => {
-            expr_uses_current(l, field_names, indep)
-                || expr_uses_current(r, field_names, indep)
+            expr_uses_current(l, field_names, indep) || expr_uses_current(r, field_names, indep)
         }
         Expr::Call(fname, args) => {
             !indep.contains(fname)
@@ -7099,9 +7490,7 @@ fn expr_uses_current(e: &Expr, field_names: &HashSet<String>, indep: &HashSet<St
         Expr::TupleLit(es) => es
             .iter()
             .any(|el| expr_uses_current(el, field_names, indep)),
-        Expr::Forall(_, _, b) | Expr::Exists(_, _, b) => {
-            expr_uses_current(b, field_names, indep)
-        }
+        Expr::Forall(_, _, b) | Expr::Exists(_, _, b) => expr_uses_current(b, field_names, indep),
         Expr::WithIo(_, _) | Expr::Lambda(_, _, _, _) => true,
     }
 }
@@ -7187,8 +7576,19 @@ fn map_boogie_type(ty: &str, m: &ModuleDecl) -> String {
         return map_boogie_type("Current", m);
     }
     if let Some((arg_str, ret_str)) = split_top_level_arrow(ty) {
-        let arg_cleaned = arg_str.trim().trim_start_matches('(').trim_end_matches(')').trim();
-        let ret_cleaned = ret_str.split(" require ").next().unwrap().split(" ensure ").next().unwrap().trim();
+        let arg_cleaned = arg_str
+            .trim()
+            .trim_start_matches('(')
+            .trim_end_matches(')')
+            .trim();
+        let ret_cleaned = ret_str
+            .split(" require ")
+            .next()
+            .unwrap()
+            .split(" ensure ")
+            .next()
+            .unwrap()
+            .trim();
         let parts = split_top_level_commas(arg_cleaned);
         let param_types: Vec<String> = parts
             .into_iter()
@@ -7209,7 +7609,11 @@ fn map_boogie_type(ty: &str, m: &ModuleDecl) -> String {
                 map_boogie_type(ret_cleaned, m)
             );
         } else if param_types.len() == 1 {
-            return format!("(Fn1 {} {})", param_types[0], map_boogie_type(ret_cleaned, m));
+            return format!(
+                "(Fn1 {} {})",
+                param_types[0],
+                map_boogie_type(ret_cleaned, m)
+            );
         } else {
             return format!("(Fn1 () {})", map_boogie_type(ret_cleaned, m));
         }
@@ -7299,9 +7703,11 @@ fn emit_boogie_verify_routine(
             && (pt == &m.name || pt == "Current" || pt.starts_with(&format!("{}[", m.name)))
         {
             s.push_str(&format!("  requires {}_Invariant({pn});\n", m.name));
-        } else if let Some(p) = boogie_prelude_ctx()
-            .and_then(|ctx| ctx.module(type_head(pt)).filter(|p| !p.invariants.is_empty()).cloned())
-        {
+        } else if let Some(p) = boogie_prelude_ctx().and_then(|ctx| {
+            ctx.module(type_head(pt))
+                .filter(|p| !p.invariants.is_empty())
+                .cloned()
+        }) {
             // Values of a prelude type satisfy its (bootstrap-verified) type invariant.
             s.push_str(&format!("  requires {0}__{0}_Invariant({pn});\n", p.name));
         }
@@ -7333,7 +7739,9 @@ fn emit_boogie_verify_routine(
     }
     s.push_str(&emit_string_literal_lemma_calls(strings));
     for (_, req_e) in &r.requires {
-        s.push_str(&emit_from_scalar_obligation(req_e, &r.name, m, &revealed, "  ", strings));
+        s.push_str(&emit_from_scalar_obligation(
+            req_e, &r.name, m, &revealed, "  ", strings,
+        ));
     }
 
     s.push_str(&emit_boogie_proc_stmts_and_ret(
@@ -7358,7 +7766,9 @@ fn emit_boogie_verify_routine(
         }
     }
     for (tag, ens_e) in &r.ensures {
-        s.push_str(&emit_from_scalar_obligation(ens_e, &r.name, m, &revealed, "  ", strings));
+        s.push_str(&emit_from_scalar_obligation(
+            ens_e, &r.name, m, &revealed, "  ", strings,
+        ));
         s.push_str(&format!(
             "  assert {{:msg \"{}::ensure::{tag}\"}} {};\n",
             r.name,
@@ -7377,7 +7787,12 @@ fn emit_boogie_verify_routine(
     s
 }
 
-fn emit_boogie_verify_law(vis: &Visibility, law: &LawDecl, m: &ModuleDecl, strings: &[String]) -> String {
+fn emit_boogie_verify_law(
+    vis: &Visibility,
+    law: &LawDecl,
+    m: &ModuleDecl,
+    strings: &[String],
+) -> String {
     let mut s = String::new();
     let vis_prefix = match vis {
         Visibility::Modules(mods) if !mods.is_empty() => format!("{}_", mods.join("_")),
@@ -7431,11 +7846,15 @@ fn emit_boogie_verify_law(vis: &Visibility, law: &LawDecl, m: &ModuleDecl, strin
     s.push_str(&emit_string_literal_lemma_calls(strings));
     let law_ctx = format!("{vis_prefix}{}", law.name);
     for (_, req_e) in &law.requires {
-        s.push_str(&emit_from_scalar_obligation(req_e, &law_ctx, m, &revealed, "  ", strings));
+        s.push_str(&emit_from_scalar_obligation(
+            req_e, &law_ctx, m, &revealed, "  ", strings,
+        ));
     }
     for st in &law.stmts {
         if let Stmt::Check(_, e) | Stmt::Assume(_, e) = st {
-            s.push_str(&emit_from_scalar_obligation(e, &law_ctx, m, &revealed, "  ", strings));
+            s.push_str(&emit_from_scalar_obligation(
+                e, &law_ctx, m, &revealed, "  ", strings,
+            ));
         }
         match st {
             Stmt::Check(tag, e) => {
@@ -7500,7 +7919,9 @@ fn emit_boogie_verify_law(vis: &Visibility, law: &LawDecl, m: &ModuleDecl, strin
         }
     }
     for (tag, ens_e) in &law.ensures {
-        s.push_str(&emit_from_scalar_obligation(ens_e, &law_ctx, m, &revealed, "  ", strings));
+        s.push_str(&emit_from_scalar_obligation(
+            ens_e, &law_ctx, m, &revealed, "  ", strings,
+        ));
         s.push_str(&format!(
             "  assert {{:msg \"{vis_prefix}{}::ensure::{tag}\"}} {};\n",
             law.name,
@@ -7538,7 +7959,11 @@ fn emit_boogie_verify_law(vis: &Visibility, law: &LawDecl, m: &ModuleDecl, strin
     // canonical instantiation. (A quantified `requires` over the procedure's own type
     // parameter is not usable by Z3 under Boogie's polymorphic type encodings.)
     let canon = conditional_canonical_tps(m);
-    let kept: Vec<String> = all_tps.iter().filter(|tp| !canon.contains(tp)).cloned().collect();
+    let kept: Vec<String> = all_tps
+        .iter()
+        .filter(|tp| !canon.contains(tp))
+        .cloned()
+        .collect();
     let tp_quant = if kept.is_empty() {
         String::new()
     } else {
@@ -7592,62 +8017,178 @@ fn module_call_target(e: &Expr, m: &ModuleDecl) -> Option<String> {
     }
 }
 
-fn collect_module_calls(e: &Expr, m: &ModuleDecl, out: &mut HashSet<String>) {
-    fn stmts_calls(stmts: &[Stmt], m: &ModuleDecl, out: &mut HashSet<String>) {
-        for st in stmts {
-            if let Stmt::Let(_, x) = st {
-                collect_module_calls(x, m, out);
-            }
+/// How a routine of the module is used inside a routine body.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RoutineUse {
+    /// A direct, fully applied call: covered by the `variant` obligations.
+    Call,
+    /// A call inside a lambda body: it happens whenever (and wherever) the closure is applied.
+    InClosure,
+    /// The routine is used as a function value (named but not applied).
+    Reference,
+}
+
+fn pattern_binders(p: &Pattern, out: &mut Vec<String>) {
+    match p {
+        Pattern::Bind(v) => out.push(v.clone()),
+        Pattern::Variant(_, ps) | Pattern::Tuple(ps) => {
+            ps.iter().for_each(|q| pattern_binders(q, out))
+        }
+        Pattern::Wildcard | Pattern::Lit(_) => {}
+    }
+}
+
+/// Visits `let` bindings and then `body`, with the `let` names in scope for what follows.
+fn visit_routine_uses_block(
+    stmts: &[Stmt],
+    body: &Expr,
+    m: &ModuleDecl,
+    bound: &mut Vec<String>,
+    in_closure: bool,
+    f: &mut dyn FnMut(&str, RoutineUse),
+) {
+    let mark = bound.len();
+    for st in stmts {
+        if let Stmt::Let(v, x) = st {
+            visit_routine_uses(x, m, bound, in_closure, f);
+            bound.push(v.clone());
         }
     }
-    if let Some(t) = module_call_target(e, m) {
-        out.insert(t);
-    }
+    visit_routine_uses(body, m, bound, in_closure, f);
+    bound.truncate(mark);
+}
+
+/// Reports every use of a routine of `m` inside `e`. `bound` holds the local names in scope
+/// (parameters, `let`, `match`, quantifier, IO-bind and lambda binders), which shadow routine
+/// names; `in_closure` is set inside lambda bodies.
+fn visit_routine_uses(
+    e: &Expr,
+    m: &ModuleDecl,
+    bound: &mut Vec<String>,
+    in_closure: bool,
+    f: &mut dyn FnMut(&str, RoutineUse),
+) {
+    let kind_of = |callee: &str, nargs: usize| {
+        if in_closure {
+            RoutineUse::InClosure
+        } else if find_module_routine(m, callee).is_some_and(|(rd, _)| rd.params.len() != nargs) {
+            RoutineUse::Reference
+        } else {
+            RoutineUse::Call
+        }
+    };
     match e {
-        Expr::UnaryNot(x) | Expr::UnaryNeg(x) => collect_module_calls(x, m, out),
-        Expr::BinOp(_, l, r) => {
-            collect_module_calls(l, m, out);
-            collect_module_calls(r, m, out);
-        }
-        Expr::Call(_, args) => args.iter().for_each(|a| collect_module_calls(a, m, out)),
-        Expr::MethodCall(recv, _, args) => {
-            collect_module_calls(recv, m, out);
-            args.iter().for_each(|a| collect_module_calls(a, m, out));
-        }
-        Expr::If(c, ts, te, es, ee) => {
-            collect_module_calls(c, m, out);
-            stmts_calls(ts, m, out);
-            collect_module_calls(te, m, out);
-            stmts_calls(es, m, out);
-            collect_module_calls(ee, m, out);
-        }
-        Expr::Match(s, cases) => {
-            collect_module_calls(s, m, out);
-            for c in cases {
-                stmts_calls(&c.stmts, m, out);
-                collect_module_calls(&c.body, m, out);
+        Expr::Var(v) => {
+            if !bound.contains(v)
+                && find_module_routine(m, v).is_some()
+                && !module_has_variant(m, v)
+            {
+                f(
+                    v,
+                    if in_closure {
+                        RoutineUse::InClosure
+                    } else {
+                        RoutineUse::Reference
+                    },
+                );
             }
         }
-        Expr::RecordLit(fs) => fs.iter().for_each(|(_, x)| collect_module_calls(x, m, out)),
-        Expr::RecordUpdate(b, fs) => {
-            collect_module_calls(b, m, out);
-            fs.iter().for_each(|(_, x)| collect_module_calls(x, m, out));
+        Expr::UnaryNot(x) | Expr::UnaryNeg(x) => visit_routine_uses(x, m, bound, in_closure, f),
+        Expr::BinOp(_, l, r) => {
+            visit_routine_uses(l, m, bound, in_closure, f);
+            visit_routine_uses(r, m, bound, in_closure, f);
         }
-        Expr::TupleLit(xs) => xs.iter().for_each(|x| collect_module_calls(x, m, out)),
-        Expr::WithIo(stmts, fin) => {
-            for s in stmts {
-                match s {
-                    IoStmt::Bind(_, x) | IoStmt::Action(x) => collect_module_calls(x, m, out),
+        Expr::Call(fname, args) => {
+            if !bound.contains(fname) {
+                if let Some(t) = module_call_target(e, m) {
+                    f(&t, kind_of(&t, args.len()));
                 }
             }
-            collect_module_calls(fin, m, out);
+            for a in args {
+                visit_routine_uses(a, m, bound, in_closure, f);
+            }
         }
-        Expr::Lambda(_, _, stmts, body) => {
-            stmts_calls(stmts, m, out);
-            collect_module_calls(body, m, out);
+        Expr::MethodCall(recv, _, args) => {
+            if let Some(t) = module_call_target(e, m) {
+                f(&t, kind_of(&t, args.len()));
+            }
+            visit_routine_uses(recv, m, bound, in_closure, f);
+            for a in args {
+                visit_routine_uses(a, m, bound, in_closure, f);
+            }
         }
-        _ => {}
+        Expr::If(c, ts, te, es, ee) => {
+            visit_routine_uses(c, m, bound, in_closure, f);
+            visit_routine_uses_block(ts, te, m, bound, in_closure, f);
+            visit_routine_uses_block(es, ee, m, bound, in_closure, f);
+        }
+        Expr::Match(s, cases) => {
+            visit_routine_uses(s, m, bound, in_closure, f);
+            for c in cases {
+                let mark = bound.len();
+                pattern_binders(&c.pattern, bound);
+                visit_routine_uses_block(&c.stmts, &c.body, m, bound, in_closure, f);
+                bound.truncate(mark);
+            }
+        }
+        Expr::RecordLit(fs) => {
+            for (_, x) in fs {
+                visit_routine_uses(x, m, bound, in_closure, f);
+            }
+        }
+        Expr::RecordUpdate(b, fs) => {
+            visit_routine_uses(b, m, bound, in_closure, f);
+            for (_, x) in fs {
+                visit_routine_uses(x, m, bound, in_closure, f);
+            }
+        }
+        Expr::TupleLit(xs) => {
+            for x in xs {
+                visit_routine_uses(x, m, bound, in_closure, f);
+            }
+        }
+        Expr::Forall(v, _, b) | Expr::Exists(v, _, b) => {
+            bound.push(v.clone());
+            visit_routine_uses(b, m, bound, in_closure, f);
+            bound.pop();
+        }
+        Expr::WithIo(stmts, fin) => {
+            let mark = bound.len();
+            for s in stmts {
+                match s {
+                    IoStmt::Bind(v, x) => {
+                        visit_routine_uses(x, m, bound, in_closure, f);
+                        bound.push(v.clone());
+                    }
+                    IoStmt::Action(x) => visit_routine_uses(x, m, bound, in_closure, f),
+                }
+            }
+            visit_routine_uses(fin, m, bound, in_closure, f);
+            bound.truncate(mark);
+        }
+        Expr::Lambda(params, _, stmts, body) => {
+            let mark = bound.len();
+            bound.extend(params.iter().map(|(p, _)| p.clone()));
+            visit_routine_uses_block(stmts, body, m, bound, true, f);
+            bound.truncate(mark);
+        }
+        Expr::Int(_)
+        | Expr::Float(_)
+        | Expr::Char(_)
+        | Expr::Unit
+        | Expr::Bool(_)
+        | Expr::Str(_) => {}
     }
+}
+
+/// Every use of a routine of `m` in the body (and `let` bindings) of `r`.
+fn routine_uses(r: &RoutineDecl, m: &ModuleDecl) -> Vec<(String, RoutineUse)> {
+    let mut bound: Vec<String> = r.params.iter().map(|(p, _)| p.clone()).collect();
+    let mut out = Vec::new();
+    visit_routine_uses_block(&r.stmts, &r.body, m, &mut bound, false, &mut |n, k| {
+        out.push((n.to_string(), k))
+    });
+    out
 }
 
 /// Recursive call groups of `m`: two routines are in the same group when each reaches the
@@ -7663,20 +8204,16 @@ fn compute_recursive_groups(m: &ModuleDecl) -> HashMap<String, HashSet<String>> 
     let mut edges: HashMap<String, HashSet<String>> = HashMap::new();
     for r in &routines {
         set_boogie_type_env(m, &r.params, Some(&r.ret_type));
-        let mut calls = HashSet::new();
-        for st in &r.stmts {
-            if let Stmt::Let(_, x) = st {
-                collect_module_calls(x, m, &mut calls);
-            }
-        }
-        collect_module_calls(&r.body, m, &mut calls);
+        let calls: HashSet<String> = routine_uses(r, m).into_iter().map(|(n, _)| n).collect();
         edges.insert(r.name.clone(), calls);
     }
     clear_boogie_type_env();
     let reach = |from: &str| -> HashSet<String> {
         let mut seen = HashSet::new();
-        let mut stack: Vec<String> =
-            edges.get(from).map(|s| s.iter().cloned().collect()).unwrap_or_default();
+        let mut stack: Vec<String> = edges
+            .get(from)
+            .map(|s| s.iter().cloned().collect())
+            .unwrap_or_default();
         while let Some(n) = stack.pop() {
             if seen.insert(n.clone()) {
                 if let Some(next) = edges.get(&n) {
@@ -7686,8 +8223,10 @@ fn compute_recursive_groups(m: &ModuleDecl) -> HashMap<String, HashSet<String>> 
         }
         seen
     };
-    let reaches: HashMap<String, HashSet<String>> =
-        routines.iter().map(|r| (r.name.clone(), reach(&r.name))).collect();
+    let reaches: HashMap<String, HashSet<String>> = routines
+        .iter()
+        .map(|r| (r.name.clone(), reach(&r.name)))
+        .collect();
     let mut groups = HashMap::new();
     for r in &routines {
         let from_r = &reaches[&r.name];
@@ -7721,8 +8260,11 @@ fn emit_group_call_termination(
     strings: &[String],
     pad: &str,
 ) -> String {
-    let in_group = RECURSIVE_GROUPS
-        .with(|g| g.borrow().get(&r.name).is_some_and(|s| s.contains(callee_name)));
+    let in_group = RECURSIVE_GROUPS.with(|g| {
+        g.borrow()
+            .get(&r.name)
+            .is_some_and(|s| s.contains(callee_name))
+    });
     if !in_group {
         return String::new();
     }
@@ -7730,7 +8272,11 @@ fn emit_group_call_termination(
         return String::new();
     };
     if r.variant.is_empty() || callee.variant.is_empty() {
-        let who = if r.variant.is_empty() { &r.name } else { &callee.name };
+        let who = if r.variant.is_empty() {
+            &r.name
+        } else {
+            &callee.name
+        };
         return format!(
             "{pad}assert {{:msg \"{}::variant::variant_missing\"}} false; // recursive call to `{callee_name}`, but `{who}` declares no variant\n",
             r.name
@@ -7760,7 +8306,8 @@ fn emit_group_call_termination(
         .collect();
     substs.push((
         "Current".to_string(),
-        recv.cloned().unwrap_or_else(|| Expr::Var("Current".to_string())),
+        recv.cloned()
+            .unwrap_or_else(|| Expr::Var("Current".to_string())),
     ));
     let mut s = String::new();
     let k = r.variant.len().min(callee.variant.len());
@@ -7791,8 +8338,9 @@ fn emit_group_call_termination(
     }
     let mut disj = Vec::new();
     for i in 0..k {
-        let mut conj: Vec<String> =
-            (0..i).map(|j| format!("({} == {})", next[j], curr[j])).collect();
+        let mut conj: Vec<String> = (0..i)
+            .map(|j| format!("({} == {})", next[j], curr[j]))
+            .collect();
         conj.push(format!("({} < {})", next[i], curr[i]));
         disj.push(format!("({})", conj.join(" && ")));
     }
@@ -7819,8 +8367,14 @@ struct LawProofCtx<'a> {
 
 impl LawProofCtx<'_> {
     fn emit(&self, e: &Expr) -> String {
-        let mut out =
-            emit_boogie_expr_with_strings(e, self.m, &HashSet::new(), self.revealed, "DefaultFuel", self.strings);
+        let mut out = emit_boogie_expr_with_strings(
+            e,
+            self.m,
+            &HashSet::new(),
+            self.revealed,
+            "DefaultFuel",
+            self.strings,
+        );
         for (g, b) in self.scope.iter().rev() {
             out = replace_whole_ident(&out, g, b);
         }
@@ -7832,7 +8386,10 @@ impl LawProofCtx<'_> {
     fn measure(&self, v: &Expr) -> (String, bool) {
         if let Expr::Var(x) = v {
             let is_adt = self.law.params.iter().any(|(pn, pt)| {
-                pn == x && (pt == &self.m.name || pt == "Current" || pt.starts_with(&format!("{}[", self.m.name)))
+                pn == x
+                    && (pt == &self.m.name
+                        || pt == "Current"
+                        || pt.starts_with(&format!("{}[", self.m.name)))
             });
             if is_adt {
                 return (format!("{}_adt_size({})", self.m.name, self.emit(v)), true);
@@ -7848,8 +8405,12 @@ impl LawProofCtx<'_> {
         if args.len() != law.params.len() {
             return s;
         }
-        let substs: Vec<(String, Expr)> =
-            law.params.iter().zip(args.iter()).map(|((pn, _), a)| (pn.clone(), a.clone())).collect();
+        let substs: Vec<(String, Expr)> = law
+            .params
+            .iter()
+            .zip(args.iter())
+            .map(|((pn, _), a)| (pn.clone(), a.clone()))
+            .collect();
         for (tag, req) in &law.requires {
             s.push_str(&format!(
                 "{pad}assert {{:msg \"{}::require::{tag}\"}} {};\n",
@@ -7886,7 +8447,9 @@ impl LawProofCtx<'_> {
         }
         let mut disj = Vec::new();
         for i in 0..curr.len() {
-            let mut conj: Vec<String> = (0..i).map(|j| format!("({} == {})", next[j], curr[j])).collect();
+            let mut conj: Vec<String> = (0..i)
+                .map(|j| format!("({} == {})", next[j], curr[j]))
+                .collect();
             conj.push(format!("({} < {})", next[i], curr[i]));
             disj.push(format!("({})", conj.join(" && ")));
         }
@@ -7897,7 +8460,10 @@ impl LawProofCtx<'_> {
         ));
         // Induction hypothesis: the law holds for the strictly smaller arguments.
         for (_, ens) in &law.ensures {
-            s.push_str(&format!("{pad}assume {};\n", self.emit(&subst_expr_vars(ens, &substs))));
+            s.push_str(&format!(
+                "{pad}assume {};\n",
+                self.emit(&subst_expr_vars(ens, &substs))
+            ));
         }
         s
     }
@@ -7935,13 +8501,17 @@ impl LawProofCtx<'_> {
                     };
                     let kw = if first { "if" } else { "} else if" };
                     first = false;
-                    s.push_str(&format!("{pad}{kw} ({prefix}is_{}({scrut_bpl})) {{\n", c.ctor()));
+                    s.push_str(&format!(
+                        "{pad}{kw} ({prefix}is_{}({scrut_bpl})) {{\n",
+                        c.ctor()
+                    ));
                     let inner = format!("{pad}  ");
                     let depth = self.scope.len();
                     for (opt_b, (fname, fty)) in c.top_bindings().iter().zip(vdecl.fields.iter()) {
                         if let Some(b) = opt_b {
                             let local = format!("_lb{}_{b}", self.locals.len());
-                            self.locals.push((local.clone(), map_boogie_type(fty, self.m)));
+                            self.locals
+                                .push((local.clone(), map_boogie_type(fty, self.m)));
                             s.push_str(&format!(
                                 "{inner}{local} := {prefix}{}_{fname}({scrut_bpl});\n",
                                 c.ctor()
@@ -7975,7 +8545,9 @@ fn emit_boogie_canonical_witness_types(m: &ModuleDecl) -> String {
     if !has_canonical_law {
         return String::new();
     }
-    let mut out = String::from("// Witness types for conditional CANONICAL_EQ laws (where-bound hypothesis)\n");
+    let mut out = String::from(
+        "// Witness types for conditional CANONICAL_EQ laws (where-bound hypothesis)\n",
+    );
     for tp in conditional_canonical_tps(m) {
         out.push_str(&format!("type {tp}__Canon;\n"));
         out.push_str(&format!(
@@ -8024,7 +8596,12 @@ fn collect_proc_locals(
                     if let (false, Some(ctx)) = (proj_prefix.is_empty(), ctx.as_ref()) {
                         if let Some(owner) = ctx.module(proj_prefix.trim_end_matches('_')) {
                             if let Some(st) = infer_gardel_type(scrut, m, ctx) {
-                                unify_type(&module_self_type(owner), &st, &owner.type_params, &mut inst);
+                                unify_type(
+                                    &module_self_type(owner),
+                                    &st,
+                                    &owner.type_params,
+                                    &mut inst,
+                                );
                             }
                         }
                     }
@@ -8046,7 +8623,9 @@ fn collect_proc_locals(
             for s in io_stmts {
                 if let IoStmt::Bind(v, e) = s {
                     // Record the Gardel type too, so a later `match v` instantiates binders.
-                    if let Some(gty) = boogie_prelude_ctx().and_then(|ctx| infer_gardel_type(e, m, &ctx)) {
+                    if let Some(gty) =
+                        boogie_prelude_ctx().and_then(|ctx| infer_gardel_type(e, m, &ctx))
+                    {
                         bind_boogie_env_type(v, &gty);
                     }
                     let bty = infer_boogie_expr_type(e, r, m);
@@ -8164,7 +8743,9 @@ fn emit_boogie_proc_stmts_and_ret(
 
     for st in stmts {
         if let Stmt::Let(_, e) | Stmt::Check(_, e) | Stmt::Assume(_, e) = st {
-            s.push_str(&emit_from_scalar_obligation(e, &r.name, m, revealed, &pad, strings));
+            s.push_str(&emit_from_scalar_obligation(
+                e, &r.name, m, revealed, &pad, strings,
+            ));
         }
         match st {
             Stmt::Let(v, e) => {
@@ -8227,7 +8808,9 @@ fn emit_boogie_proc_stmts_and_ret(
         Expr::Match(scrut, _) => &**scrut,
         _ => body,
     };
-    s.push_str(&emit_from_scalar_obligation(wf_target, &r.name, m, revealed, &pad, strings));
+    s.push_str(&emit_from_scalar_obligation(
+        wf_target, &r.name, m, revealed, &pad, strings,
+    ));
 
     match body {
         Expr::If(c, ts, te, es, ee) => {
@@ -8259,7 +8842,9 @@ fn emit_boogie_proc_stmts_and_ret(
                 "DefaultFuel",
                 strings,
             );
-            let on_prelude_adt = cases.iter().any(|c| prelude_variant_for(c.ctor(), m).is_some());
+            let on_prelude_adt = cases
+                .iter()
+                .any(|c| prelude_variant_for(c.ctor(), m).is_some());
             if let (ReprKind::Sum(variants), false) = (&m.repr, on_prelude_adt) {
                 let covered: HashSet<String> = cases.iter().map(|c| c.ctor().to_string()).collect();
                 for v in variants {
@@ -8321,8 +8906,12 @@ fn emit_boogie_proc_stmts_and_ret(
             for io_st in io_stmts {
                 match io_st {
                     IoStmt::Bind(v, e) => {
-                        s.push_str(&emit_from_scalar_obligation(e, &r.name, m, revealed, &pad, strings));
-                        s.push_str(&emit_boogie_expr_obligations(e, r, m, revealed, indent, strings));
+                        s.push_str(&emit_from_scalar_obligation(
+                            e, &r.name, m, revealed, &pad, strings,
+                        ));
+                        s.push_str(&emit_boogie_expr_obligations(
+                            e, r, m, revealed, indent, strings,
+                        ));
                         if is_io_read_line(e) {
                             // Every read yields a fresh value from the outside world (§11).
                             s.push_str(&format!("{pad}havoc {v};\n"));
@@ -8346,8 +8935,12 @@ fn emit_boogie_proc_stmts_and_ret(
                         }
                     }
                     IoStmt::Action(e) => {
-                        s.push_str(&emit_from_scalar_obligation(e, &r.name, m, revealed, &pad, strings));
-                        s.push_str(&emit_boogie_expr_obligations(e, r, m, revealed, indent, strings));
+                        s.push_str(&emit_from_scalar_obligation(
+                            e, &r.name, m, revealed, &pad, strings,
+                        ));
+                        s.push_str(&emit_boogie_expr_obligations(
+                            e, r, m, revealed, indent, strings,
+                        ));
                         // The action's effect is not modeled, but its expression must still
                         // type-check (e.g. `IO.print_line(r)` with `r: RESULT[..]` is rejected).
                         let act = emit_boogie_expr_with_strings(
@@ -8358,12 +8951,22 @@ fn emit_boogie_proc_stmts_and_ret(
                             "DefaultFuel",
                             strings,
                         );
-                        s.push_str(&format!("{pad}assume ({act}) == ({act}); // linear IO action\n"));
+                        s.push_str(&format!(
+                            "{pad}assume ({act}) == ({act}); // linear IO action\n"
+                        ));
                     }
                 }
             }
             // The trailing expression may itself branch (`match`/`if`) or nest `with IO`.
-            s.push_str(&emit_boogie_proc_stmts_and_ret(&[], final_e, r, m, revealed, indent, strings));
+            s.push_str(&emit_boogie_proc_stmts_and_ret(
+                &[],
+                final_e,
+                r,
+                m,
+                revealed,
+                indent,
+                strings,
+            ));
         }
         _ => {
             let substs: Vec<(String, Expr)> = stmts
@@ -8491,15 +9094,17 @@ fn from_scalar_wf(e: &Expr) -> Option<Expr> {
             }
             acc
         }
-        Expr::Call(_, args) | Expr::TupleLit(args) => {
-            args.iter().fold(None, |acc, a| and_wf(acc, from_scalar_wf(a)))
-        }
+        Expr::Call(_, args) | Expr::TupleLit(args) => args
+            .iter()
+            .fold(None, |acc, a| and_wf(acc, from_scalar_wf(a))),
         Expr::RecordLit(fields) => fields
             .iter()
             .fold(None, |acc, (_, fe)| and_wf(acc, from_scalar_wf(fe))),
-        Expr::RecordUpdate(base, fields) => fields
-            .iter()
-            .fold(from_scalar_wf(base), |acc, (_, fe)| and_wf(acc, from_scalar_wf(fe))),
+        Expr::RecordUpdate(base, fields) => {
+            fields.iter().fold(from_scalar_wf(base), |acc, (_, fe)| {
+                and_wf(acc, from_scalar_wf(fe))
+            })
+        }
         Expr::If(c, ts, te, es, ee) => {
             let wc = from_scalar_wf(c);
             let wt = guarded_wf((**c).clone(), from_scalar_wf_block(ts, te));
@@ -8527,13 +9132,11 @@ fn from_scalar_wf(e: &Expr) -> Option<Expr> {
         Expr::Forall(v, ty, body) | Expr::Exists(v, ty, body) => {
             from_scalar_wf(body).map(|w| Expr::Forall(v.clone(), ty.clone(), Box::new(w)))
         }
-        Expr::Lambda(params, _, stmts, body) => {
-            from_scalar_wf_block(stmts, body).map(|w| {
-                params.iter().rev().fold(w, |acc, (pn, pt)| {
-                    Expr::Forall(pn.clone(), pt.clone(), Box::new(acc))
-                })
+        Expr::Lambda(params, _, stmts, body) => from_scalar_wf_block(stmts, body).map(|w| {
+            params.iter().rev().fold(w, |acc, (pn, pt)| {
+                Expr::Forall(pn.clone(), pt.clone(), Box::new(acc))
             })
-        }
+        }),
         Expr::WithIo(io_stmts, final_e) => {
             let mut acc = None;
             for st in io_stmts {
@@ -8562,7 +9165,14 @@ fn emit_from_scalar_obligation(
         None => String::new(),
         Some(wf) => format!(
             "{pad}assert {{:msg \"{ctx}::require::valid_scalar\"}} {};\n",
-            emit_boogie_expr_with_strings(&wf, m, &HashSet::new(), revealed, "DefaultFuel", strings)
+            emit_boogie_expr_with_strings(
+                &wf,
+                m,
+                &HashSet::new(),
+                revealed,
+                "DefaultFuel",
+                strings
+            )
         ),
     }
 }
@@ -8618,7 +9228,14 @@ fn emit_local_call_precondition_obligations(
         s.push_str(&format!(
             "{pad}assert {{:msg \"{}::require::{tag}\"}} {};\n",
             r.name,
-            emit_boogie_expr_with_strings(&inst, m, &HashSet::new(), revealed, "DefaultFuel", strings)
+            emit_boogie_expr_with_strings(
+                &inst,
+                m,
+                &HashSet::new(),
+                revealed,
+                "DefaultFuel",
+                strings
+            )
         ));
     }
     s
@@ -8841,7 +9458,11 @@ fn emit_boogie_expr_obligations(
                 let has_current = find_module_routine(m, fname).is_some_and(|(_, hc)| hc);
                 s.push_str(&emit_local_call_precondition_obligations(
                     fname,
-                    if has_current { Some(&implicit_recv) } else { None },
+                    if has_current {
+                        Some(&implicit_recv)
+                    } else {
+                        None
+                    },
                     args,
                     r,
                     m,
@@ -9165,7 +9786,10 @@ fn expand_law_call_in_expr(e: &Expr, m: &ModuleDecl) -> Option<Expr> {
                     .zip(args.iter())
                     .map(|((p, _), a)| (p.clone(), a.clone()))
                     .collect();
-                let mut iter = law.ensures.iter().map(|(_, ens)| subst_expr_vars(ens, &substs));
+                let mut iter = law
+                    .ensures
+                    .iter()
+                    .map(|(_, ens)| subst_expr_vars(ens, &substs));
                 let first = iter.next()?;
                 return Some(iter.fold(first, |acc, next| {
                     Expr::BinOp("and".to_string(), Box::new(acc), Box::new(next))
@@ -9388,11 +10012,7 @@ fn expand_law_call_in_expr(e: &Expr, m: &ModuleDecl) -> Option<Expr> {
                 Box::new(Expr::Var("LIST_OPS".to_string())),
                 "map".to_string(),
                 vec![
-                    Expr::MethodCall(
-                        Box::new(xs.clone()),
-                        "append".to_string(),
-                        vec![ys.clone()],
-                    ),
+                    Expr::MethodCall(Box::new(xs.clone()), "append".to_string(), vec![ys.clone()]),
                     f.clone(),
                 ],
             )),
@@ -9582,12 +10202,11 @@ fn emit_boogie_expr_with_strings(
             )
         }
         Expr::Call(fname, args) => {
-            let is_ctor =
-                matches!(&m.repr, ReprKind::Sum(vs) if vs.iter().any(|v| v.name == *fname))
-                    || fname == "Some"
-                    || fname == "None"
-                    || fname == "Ok"
-                    || fname == "Error";
+            let is_ctor = matches!(&m.repr, ReprKind::Sum(vs) if vs.iter().any(|v| v.name == *fname))
+                || fname == "Some"
+                || fname == "None"
+                || fname == "Ok"
+                || fname == "Error";
             let a_str: Vec<String> = args
                 .iter()
                 .map(|a| {
@@ -9686,8 +10305,18 @@ fn emit_boogie_expr_with_strings(
                     match mname.as_str() {
                         "map" => return format!("Seq_map({}, {})", a_str[0], a_str[1]),
                         "filter" => return format!("Seq_filter({}, {})", a_str[0], a_str[1]),
-                        "fold_left" => return format!("Seq_fold_left({}, {}, {})", a_str[0], a_str[1], a_str[2]),
-                        "fold_right" => return format!("Seq_fold_right({}, {}, {})", a_str[0], a_str[1], a_str[2]),
+                        "fold_left" => {
+                            return format!(
+                                "Seq_fold_left({}, {}, {})",
+                                a_str[0], a_str[1], a_str[2]
+                            );
+                        }
+                        "fold_right" => {
+                            return format!(
+                                "Seq_fold_right({}, {}, {})",
+                                a_str[0], a_str[1], a_str[2]
+                            );
+                        }
                         _ => {}
                     }
                 } else if v == "FUNCTION_OPS" {
@@ -10071,13 +10700,33 @@ fn emit_boogie_expr_with_strings(
                 if let Expr::BinOp(op, l, r) = &**body {
                     if op == "and" {
                         let l_p = match &**l {
-                            Expr::Call(fn_name, args) if args.len() == 1 && matches!(&args[0], Expr::Var(v) if v == p0) => Some(fn_name.clone()),
-                            Expr::MethodCall(recv, mname, args) if args.is_empty() && matches!(&**recv, Expr::Var(v) if v == p0) => Some(mname.clone()),
+                            Expr::Call(fn_name, args)
+                                if args.len() == 1
+                                    && matches!(&args[0], Expr::Var(v) if v == p0) =>
+                            {
+                                Some(fn_name.clone())
+                            }
+                            Expr::MethodCall(recv, mname, args)
+                                if args.is_empty()
+                                    && matches!(&**recv, Expr::Var(v) if v == p0) =>
+                            {
+                                Some(mname.clone())
+                            }
                             _ => None,
                         };
                         let r_q = match &**r {
-                            Expr::Call(fn_name, args) if args.len() == 1 && matches!(&args[0], Expr::Var(v) if v == p0) => Some(fn_name.clone()),
-                            Expr::MethodCall(recv, mname, args) if args.is_empty() && matches!(&**recv, Expr::Var(v) if v == p0) => Some(mname.clone()),
+                            Expr::Call(fn_name, args)
+                                if args.len() == 1
+                                    && matches!(&args[0], Expr::Var(v) if v == p0) =>
+                            {
+                                Some(fn_name.clone())
+                            }
+                            Expr::MethodCall(recv, mname, args)
+                                if args.is_empty()
+                                    && matches!(&**recv, Expr::Var(v) if v == p0) =>
+                            {
+                                Some(mname.clone())
+                            }
                             _ => None,
                         };
                         if let (Some(p_fn), Some(q_fn)) = (l_p, r_q) {
@@ -10089,7 +10738,14 @@ fn emit_boogie_expr_with_strings(
                     if mname == "and_then" && args.len() == 1 {
                         if let Expr::Call(fname, fargs) = &**recv {
                             if fargs.len() == 1 && matches!(&fargs[0], Expr::Var(v) if v == p0) {
-                                let g_arg = emit_boogie_expr_with_strings(&args[0], m, implicit_fields, revealed, fuel_var, strings);
+                                let g_arg = emit_boogie_expr_with_strings(
+                                    &args[0],
+                                    m,
+                                    implicit_fields,
+                                    revealed,
+                                    fuel_var,
+                                    strings,
+                                );
                                 if m.name == "OPTION" {
                                     return format!("Fn1_option_kleisli({fname}, {g_arg})");
                                 } else if m.name == "RESULT" {
@@ -10133,7 +10789,10 @@ fn emit_boogie_match_case(
     }
     // Binders of the module's own variants have the declared field types (e.g. `A`), so
     // `v1.equals(v2)` on them is recognized as element equality.
-    if let Some(("", vdecl)) = boogie_match_variant(c.ctor(), m).as_ref().map(|(p, v)| (p.as_str(), v)) {
+    if let Some(("", vdecl)) = boogie_match_variant(c.ctor(), m)
+        .as_ref()
+        .map(|(p, v)| (p.as_str(), v))
+    {
         for (opt_b, (_, fty)) in c.top_bindings().iter().zip(vdecl.fields.iter()) {
             if let Some(b) = opt_b {
                 elem_env_bind(b, fty);
@@ -10329,9 +10988,9 @@ pub fn find_solvers() -> (Option<String>, Option<String>) {
     });
 
     let z3 = env::var("Z3_EXE").ok().or_else(|| {
-        let dafny_z3 = r"C:\home\Learn\Gardel\tools\dafny\z3\bin\z3-4.12.1.exe";
-        if std::path::Path::new(dafny_z3).exists() {
-            return Some(dafny_z3.to_string());
+        let bundled_z3 = r"C:\home\Learn\Gardel\tools\dafny\z3\bin\z3-4.12.1.exe";
+        if std::path::Path::new(bundled_z3).exists() {
+            return Some(bundled_z3.to_string());
         }
         which_solver("z3")
     });
@@ -10384,7 +11043,8 @@ fn run_boogie_verification(
     let mut untrusted: HashSet<String> = HashSet::new();
     loop {
         let prev = UNTRUSTED_CONTRACTS.with(|u| u.replace(untrusted.clone()));
-        let pass = run_boogie_verification_once(m, fuel_limit, boogie_path, z3_path, src, input_path);
+        let pass =
+            run_boogie_verification_once(m, fuel_limit, boogie_path, z3_path, src, input_path);
         UNTRUSTED_CONTRACTS.with(|u| *u.borrow_mut() = prev);
         let pass = pass?;
         // A failed postcondition clause withdraws that clause only; any other failure of a
@@ -10402,7 +11062,10 @@ fn run_boogie_verification(
             .filter(|k| !untrusted.contains(k))
             .collect();
         for d in pass {
-            if !all.iter().any(|a| a.routine == d.routine && a.tag == d.tag && a.rule == d.rule) {
+            if !all
+                .iter()
+                .any(|a| a.routine == d.routine && a.tag == d.tag && a.rule == d.rule)
+            {
                 all.push(d);
             }
         }
@@ -10632,14 +11295,19 @@ pub fn parse_boogie_output(
         // 1b. A timed-out / inconclusive procedure is *not* verified: report it instead of
         // silently counting it as a success.
         if line.contains("Verification of '")
-            && (line.contains("timed out") || line.contains("inconclusive") || line.contains("out of"))
+            && (line.contains("timed out")
+                || line.contains("inconclusive")
+                || line.contains("out of"))
         {
             let proc_name = line
                 .split("Verification of '")
                 .nth(1)
                 .and_then(|r| r.split('\'').next())
                 .unwrap_or("");
-            let routine = proc_name.strip_prefix("Verify_").unwrap_or(proc_name).to_string();
+            let routine = proc_name
+                .strip_prefix("Verify_")
+                .unwrap_or(proc_name)
+                .to_string();
             let sp = locate_span(src, input_path, &routine, &routine);
             diags.push(
                 Diagnostic::basic(
@@ -10747,22 +11415,27 @@ fn find_tagged_expr_in_expr<'a>(e: &'a Expr, target_tag: &str) -> Option<&'a Exp
         Expr::UnaryNot(inner) | Expr::UnaryNeg(inner) => {
             find_tagged_expr_in_expr(inner, target_tag)
         }
-        Expr::BinOp(_, l, r) => {
-            find_tagged_expr_in_expr(l, target_tag).or_else(|| find_tagged_expr_in_expr(r, target_tag))
+        Expr::BinOp(_, l, r) => find_tagged_expr_in_expr(l, target_tag)
+            .or_else(|| find_tagged_expr_in_expr(r, target_tag)),
+        Expr::Call(_, args) | Expr::TupleLit(args) => args
+            .iter()
+            .find_map(|a| find_tagged_expr_in_expr(a, target_tag)),
+        Expr::MethodCall(recv, _, args) => {
+            find_tagged_expr_in_expr(recv, target_tag).or_else(|| {
+                args.iter()
+                    .find_map(|a| find_tagged_expr_in_expr(a, target_tag))
+            })
         }
-        Expr::Call(_, args) | Expr::TupleLit(args) => {
-            args.iter().find_map(|a| find_tagged_expr_in_expr(a, target_tag))
-        }
-        Expr::MethodCall(recv, _, args) => find_tagged_expr_in_expr(recv, target_tag)
-            .or_else(|| args.iter().find_map(|a| find_tagged_expr_in_expr(a, target_tag))),
         Expr::RecordLit(fields) => fields
             .iter()
             .find_map(|(_, fe)| find_tagged_expr_in_expr(fe, target_tag)),
-        Expr::RecordUpdate(base, fields) => find_tagged_expr_in_expr(base, target_tag).or_else(|| {
-            fields
-                .iter()
-                .find_map(|(_, fe)| find_tagged_expr_in_expr(fe, target_tag))
-        }),
+        Expr::RecordUpdate(base, fields) => {
+            find_tagged_expr_in_expr(base, target_tag).or_else(|| {
+                fields
+                    .iter()
+                    .find_map(|(_, fe)| find_tagged_expr_in_expr(fe, target_tag))
+            })
+        }
         Expr::Forall(_, _, body) | Expr::Exists(_, _, body) => {
             find_tagged_expr_in_expr(body, target_tag)
         }
@@ -11265,6 +11938,8 @@ pub fn verify_module_phase3(
     let mut string_diags = check_string_semantics(m, src, input_path);
     // §9 conditional conformance: concept routines need the `where` constraints to hold.
     string_diags.extend(check_where_constraints(m, src, input_path));
+    // §7/§8: recursion through closures or function values has no checkable variant.
+    string_diags.extend(check_higher_order_recursion(m, src, input_path));
     if !string_diags.is_empty() {
         diags.extend(string_diags);
         return diags;
@@ -12380,9 +13055,15 @@ fn eval_expr_symbolic(
             }
             if env.contains_key(fname) && !eval_args.is_empty() {
                 if m.name == "OPTION" {
-                    return Ok(GardelVal::Variant("Some".to_string(), vec![eval_args[0].clone()]));
+                    return Ok(GardelVal::Variant(
+                        "Some".to_string(),
+                        vec![eval_args[0].clone()],
+                    ));
                 } else if m.name == "RESULT" {
-                    return Ok(GardelVal::Variant("Ok".to_string(), vec![eval_args[0].clone()]));
+                    return Ok(GardelVal::Variant(
+                        "Ok".to_string(),
+                        vec![eval_args[0].clone()],
+                    ));
                 }
                 return Ok(eval_args[0].clone());
             }
@@ -12694,703 +13375,7 @@ fn invoke_routine_symbolic(
 }
 
 // ============================================================================
-// 9. BACKEND 1: DAFNY VERIFICATION EMITTER (Refinement Invariants + Laws + IO)
-// ============================================================================
-
-pub fn emit_dafny(m: &ModuleDecl) -> String {
-    let mut out = String::new();
-    out.push_str("// Automatically generated by gardelc (Phase 4 -> Dafny Verifier)\n");
-    out.push_str("newtype U64 = x: int | 0 <= x < 0x1_0000_0000_0000_0000\n\n");
-
-    let tp = if m.type_params.is_empty() {
-        String::new()
-    } else {
-        format!("<{}>", m.type_params.join(", "))
-    };
-
-    let has_inv = !m.invariants.is_empty();
-    let raw_name = if has_inv {
-        format!("{}_Raw", m.name)
-    } else {
-        m.name.clone()
-    };
-
-    if m.kind == ModuleKind::Module {
-        match &m.repr {
-            ReprKind::Sum(variants) => {
-                out.push_str(&format!("datatype {raw_name}{tp} = \n"));
-                for v in variants {
-                    if v.fields.is_empty() {
-                        out.push_str(&format!("  | {}\n", v.name));
-                    } else {
-                        let f_str: Vec<String> = v
-                            .fields
-                            .iter()
-                            .map(|(fnm, fty)| format!("{}: {}", fnm, map_dafny_type(fty, m)))
-                            .collect();
-                        out.push_str(&format!("  | {}({})\n", v.name, f_str.join(", ")));
-                    }
-                }
-            }
-            ReprKind::Product(fields) => {
-                let f_str: Vec<String> = fields
-                    .iter()
-                    .map(|(fnm, fty)| format!("{}: {}", fnm, map_dafny_type(fty, m)))
-                    .collect();
-                out.push_str(&format!(
-                    "datatype {raw_name}{tp} = {}_Ctor({})\n",
-                    m.name,
-                    f_str.join(", ")
-                ));
-            }
-        }
-        out.push('\n');
-    }
-
-    if has_inv {
-        let mut field_names = HashSet::new();
-        if let ReprKind::Product(fields) = &m.repr {
-            for (fnm, _) in fields {
-                field_names.insert(fnm.clone());
-            }
-        }
-
-        out.push_str(&format!(
-            "ghost predicate {}_Invariant{tp}(Current: {raw_name}{tp})\n{{\n",
-            m.name
-        ));
-        let inv_clauses: Vec<String> = m
-            .invariants
-            .iter()
-            .map(|(tag, expr)| {
-                format!(
-                    "  ({}) /* {} */",
-                    emit_dafny_expr(expr, m, &field_names),
-                    tag
-                )
-            })
-            .collect();
-        out.push_str(&inv_clauses.join(" &&\n"));
-        out.push_str("\n}\n\n");
-
-        out.push_str(&format!(
-            "type {}{tp} = x: {raw_name}{tp} | {}_Invariant(x) witness *\n\n",
-            m.name, m.name
-        ));
-    }
-
-    let empty_fields = HashSet::new();
-    let is_adt = m.kind == ModuleKind::Module;
-
-    for (_, r) in &m.specify_routines {
-        out.push_str(&emit_dafny_routine(r, true, is_adt, m, &empty_fields));
-    }
-
-    for (_, r) in &m.feature_routines {
-        out.push_str(&emit_dafny_routine(r, false, is_adt, m, &empty_fields));
-    }
-
-    for (_, r) in &m.create_routines {
-        out.push_str(&emit_dafny_routine(r, false, false, m, &empty_fields));
-    }
-
-    for (vis, law) in &m.specify_laws {
-        out.push_str(&emit_dafny_law(vis, law, m, &empty_fields));
-    }
-
-    out
-}
-
-fn map_dafny_type(ty: &str, m: &ModuleDecl) -> String {
-    let ty = ty.trim();
-    match ty {
-        "NAT" | "U64" | "EXIT_CODE" => return "U64".to_string(),
-        "MATH_INT" | "INT" | "I64" => return "int".to_string(),
-        "BOOL" => return "bool".to_string(),
-        "CHAR" => return "char".to_string(),
-        "STRING" => {
-            if m.name == "STRING" {
-                return "STRING".to_string();
-            }
-            return "string".to_string();
-        }
-        "Current" => return m.name.clone(),
-        _ => {}
-    }
-    if let Some((arg_str, ret_str)) = split_top_level_arrow(ty) {
-        let arg_cleaned = arg_str.trim().trim_start_matches('(').trim_end_matches(')').trim();
-        let ret_cleaned = ret_str.split(" require ").next().unwrap().split(" ensure ").next().unwrap().trim();
-        let parts = split_top_level_commas(arg_cleaned);
-        let param_types: Vec<String> = parts
-            .into_iter()
-            .map(|p| {
-                let t = if let Some((_, ty_part)) = p.split_once(':') {
-                    ty_part.trim()
-                } else {
-                    p.trim()
-                };
-                map_dafny_type(t, m)
-            })
-            .collect();
-        return format!("({}) -> {}", param_types.join(", "), map_dafny_type(ret_cleaned, m));
-    }
-    if let Some(inner) = ty.strip_prefix("LIST[").and_then(|s| s.strip_suffix(']')) {
-        return format!("seq<{}>", map_dafny_type(inner, m));
-    }
-    if let Some(inner) = ty.strip_prefix("IO[").and_then(|s| s.strip_suffix(']')) {
-        return map_dafny_type(inner, m);
-    }
-    if let Some(inner) = ty.strip_prefix("TUPLE[").and_then(|s| s.strip_suffix(']')) {
-        let parts: Vec<String> = inner
-            .split(',')
-            .map(|p| map_dafny_type(p.trim(), m))
-            .collect();
-        return format!("({})", parts.join(", "));
-    }
-    if let Some(idx) = ty.find('[') {
-        let base = &ty[..idx];
-        let inner = &ty[idx + 1..ty.len() - 1];
-        let parts: Vec<String> = inner
-            .split(',')
-            .map(|p| map_dafny_type(p.trim(), m))
-            .collect();
-        return format!("{base}<{}>", parts.join(", "));
-    }
-    ty.to_string()
-}
-
-fn emit_dafny_law(vis: &Visibility, law: &LawDecl, m: &ModuleDecl, implicit_fields: &HashSet<String>) -> String {
-    let mut s = String::new();
-    let vis_prefix = match vis {
-        Visibility::Modules(mods) if !mods.is_empty() => format!("{}_", mods.join("_")),
-        _ => String::new(),
-    };
-    let mut all_tps = m.type_params.clone();
-    for tp in &law.type_params {
-        if !all_tps.contains(tp) {
-            all_tps.push(tp.clone());
-        }
-    }
-    let tp = if all_tps.is_empty() {
-        String::new()
-    } else {
-        format!("<{}>", all_tps.join(", "))
-    };
-    let params: Vec<String> = law
-        .params
-        .iter()
-        .map(|(pname, pty)| format!("{}: {}", pname, map_dafny_type(pty, m)))
-        .collect();
-    s.push_str(&format!("lemma {vis_prefix}{}{tp}({})\n", law.name, params.join(", ")));
-
-    for (tag, req) in &law.requires {
-        s.push_str(&format!(
-            "  requires {} // {}\n",
-            emit_dafny_expr(req, m, implicit_fields),
-            tag
-        ));
-    }
-    if !law.variant.is_empty() {
-        let vars: Vec<String> = law
-            .variant
-            .iter()
-            .map(|v| emit_dafny_expr(v, m, implicit_fields))
-            .collect();
-        s.push_str(&format!("  decreases {}\n", vars.join(", ")));
-    }
-    for (tag, ens) in &law.ensures {
-        s.push_str(&format!(
-            "  ensures {} // {}\n",
-            emit_dafny_expr(ens, m, implicit_fields),
-            tag
-        ));
-    }
-
-    s.push_str("{\n");
-    if let Some(body) = &law.body {
-        s.push_str(&emit_dafny_lemma_stmt_expr(
-            &law.stmts,
-            body,
-            &law.name,
-            &vis_prefix,
-            m,
-            implicit_fields,
-            2,
-        ));
-    }
-    s.push_str("}\n\n");
-    s
-}
-
-fn emit_dafny_lemma_stmt_expr(
-    stmts: &[Stmt],
-    body: &Expr,
-    law_name: &str,
-    vis_prefix: &str,
-    m: &ModuleDecl,
-    implicit_fields: &HashSet<String>,
-    indent: usize,
-) -> String {
-    let pad = " ".repeat(indent);
-    let mut s = String::new();
-    for st in stmts {
-        match st {
-            Stmt::Check(tag, e) => {
-                s.push_str(&format!(
-                    "{}assert {}; // {}\n",
-                    pad,
-                    emit_dafny_expr(e, m, implicit_fields),
-                    tag
-                ));
-            }
-            Stmt::Assume(tag, e) => {
-                s.push_str(&format!(
-                    "{}assume {}; // {}\n",
-                    pad,
-                    emit_dafny_expr(e, m, implicit_fields),
-                    tag
-                ));
-            }
-            Stmt::Reveal(target) => {
-                s.push_str(&format!("{pad}reveal {target}();\n"));
-            }
-            Stmt::Let(v, e) => {
-                s.push_str(&format!(
-                    "{pad}var {v} := {};\n",
-                    emit_dafny_expr(e, m, implicit_fields)
-                ));
-            }
-        }
-    }
-    match body {
-        Expr::Bool(_) | Expr::Int(_) | Expr::Str(_) | Expr::Var(_) => {}
-        Expr::Call(fname, args) => {
-            let a_str: Vec<String> = args
-                .iter()
-                .map(|a| emit_dafny_expr(a, m, implicit_fields))
-                .collect();
-            let target_fn = if fname == law_name {
-                format!("{vis_prefix}{fname}")
-            } else {
-                fname.clone()
-            };
-            s.push_str(&format!("{pad}{target_fn}({});\n", a_str.join(", ")));
-        }
-        Expr::Match(scrut, cases) => {
-            s.push_str(&format!(
-                "{}match {}\n",
-                pad,
-                emit_dafny_expr(scrut, m, implicit_fields)
-            ));
-            for c in cases {
-                let pat = format_pattern(&c.pattern);
-                s.push_str(&format!("{pad}  case {pat} =>\n"));
-                s.push_str(&emit_dafny_lemma_stmt_expr(
-                    &c.stmts,
-                    &c.body,
-                    law_name,
-                    vis_prefix,
-                    m,
-                    implicit_fields,
-                    indent + 4,
-                ));
-            }
-        }
-        Expr::If(c, ts, te, es, ee) => {
-            s.push_str(&format!(
-                "{}if {} {{\n{}{pad}}} else {{\n{}{pad}}}\n",
-                pad,
-                emit_dafny_expr(c, m, implicit_fields),
-                emit_dafny_lemma_stmt_expr(ts, te, law_name, vis_prefix, m, implicit_fields, indent + 2),
-                emit_dafny_lemma_stmt_expr(es, ee, law_name, vis_prefix, m, implicit_fields, indent + 2),
-            ));
-        }
-        _ => {}
-    }
-    s
-}
-
-fn emit_dafny_routine(
-    r: &RoutineDecl,
-    is_ghost: bool,
-    has_current: bool,
-    m: &ModuleDecl,
-    implicit_fields: &HashSet<String>,
-) -> String {
-    let mut s = String::new();
-    let kw = if is_ghost {
-        "ghost function"
-    } else {
-        "function"
-    };
-    let m_tp = if m.type_params.is_empty() {
-        String::new()
-    } else {
-        format!("<{}>", m.type_params.join(", "))
-    };
-    let mut all_tps = m.type_params.clone();
-    for tp in &r.type_params {
-        if !all_tps.contains(tp) {
-            all_tps.push(tp.clone());
-        }
-    }
-    let r_tp = if all_tps.is_empty() {
-        String::new()
-    } else {
-        format!("<{}>", all_tps.join(", "))
-    };
-
-    let mut params = Vec::new();
-    if has_current {
-        params.push(format!("Current: {}{m_tp}", m.name));
-    }
-    for (pname, pty) in &r.params {
-        params.push(format!("{pname}: {}", map_dafny_type(pty, m)));
-    }
-    s.push_str(&format!(
-        "{} {}{r_tp}({}): (Result: {})\n",
-        kw,
-        r.name,
-        params.join(", "),
-        map_dafny_type(&r.ret_type, m)
-    ));
-
-    for (tag, req) in &r.requires {
-        s.push_str(&format!(
-            "  requires {} // {}\n",
-            emit_dafny_expr(req, m, implicit_fields),
-            tag
-        ));
-    }
-    if !r.variant.is_empty() {
-        let vars: Vec<String> = r
-            .variant
-            .iter()
-            .map(|v| emit_dafny_expr(v, m, implicit_fields))
-            .collect();
-        s.push_str(&format!("  decreases {}\n", vars.join(", ")));
-    }
-    for (tag, ens) in &r.ensures {
-        s.push_str(&format!(
-            "  ensures {} // {}\n",
-            emit_dafny_expr(ens, m, implicit_fields),
-            tag
-        ));
-    }
-
-    s.push_str("{\n");
-    s.push_str(&emit_dafny_block(&r.stmts, &r.body, m, implicit_fields, 2));
-    s.push_str("}\n\n");
-    s
-}
-
-fn emit_dafny_block(
-    stmts: &[Stmt],
-    body: &Expr,
-    m: &ModuleDecl,
-    implicit_fields: &HashSet<String>,
-    indent: usize,
-) -> String {
-    let pad = " ".repeat(indent);
-    let mut s = String::new();
-    for st in stmts {
-        match st {
-            Stmt::Let(v, e) => {
-                s.push_str(&format!(
-                    "{pad}var {v} := {};\n",
-                    emit_dafny_expr(e, m, implicit_fields)
-                ));
-            }
-            Stmt::Check(tag, e) => {
-                s.push_str(&format!(
-                    "{pad}assert {}; // {tag}\n",
-                    emit_dafny_expr(e, m, implicit_fields)
-                ));
-            }
-            Stmt::Assume(tag, e) => {
-                s.push_str(&format!(
-                    "{pad}assume {}; // {tag}\n",
-                    emit_dafny_expr(e, m, implicit_fields)
-                ));
-            }
-            Stmt::Reveal(target) => {
-                s.push_str(&format!("{pad}reveal {target}();\n"));
-            }
-        }
-    }
-    s.push_str(&format!(
-        "{pad}{}\n",
-        emit_dafny_expr(body, m, implicit_fields)
-    ));
-    s
-}
-
-fn emit_dafny_expr(e: &Expr, m: &ModuleDecl, implicit_fields: &HashSet<String>) -> String {
-    match e {
-        Expr::Int(n) => format!("({n} as U64)"),
-        Expr::Float(f) => format!("({f} as real)"),
-        Expr::Char(c) => format!("'{}'", char::from_u32(*c).unwrap_or('?')),
-        Expr::Unit => "()".to_string(),
-        Expr::Bool(b) => b.to_string(),
-        Expr::Str(s) => format!("\"{}\"", escape_string_literal(s)),
-        Expr::Var(v) => {
-            if implicit_fields.contains(v) {
-                format!("Current.{v}")
-            } else {
-                v.clone()
-            }
-        }
-        Expr::UnaryNot(inner) => {
-            format!("(!{})", emit_dafny_expr(inner, m, implicit_fields))
-        }
-        Expr::UnaryNeg(inner) => {
-            format!("(-{})", emit_dafny_expr(inner, m, implicit_fields))
-        }
-        Expr::BinOp(op, l, r) => {
-            let d_op = match op.as_str() {
-                "=" => "==",
-                "and" => "&&",
-                "or" => "||",
-                "implies" => "==>",
-                other => other,
-            };
-
-            let is_cmp = matches!(op.as_str(), "=" | "<" | "<=" | ">" | ">=");
-            let l_len = matches!(&**l, Expr::MethodCall(_, mname, _) if mname == "length");
-            let r_len = matches!(&**r, Expr::MethodCall(_, mname, _) if mname == "length");
-
-            if is_cmp && (l_len || r_len) {
-                let emit_len_side = |side: &Expr| -> String {
-                    if let Expr::MethodCall(recv, mname, _) = side {
-                        if mname == "length" && m.name != "SEQ" {
-                            return format!("|{}|", emit_dafny_expr(recv, m, implicit_fields));
-                        }
-                    }
-                    if let Expr::Int(n) = side {
-                        return n.to_string();
-                    }
-                    format!("({} as int)", emit_dafny_expr(side, m, implicit_fields))
-                };
-                return format!("({} {d_op} {})", emit_len_side(l), emit_len_side(r));
-            }
-
-            format!(
-                "({} {d_op} {})",
-                emit_dafny_expr(l, m, implicit_fields),
-                emit_dafny_expr(r, m, implicit_fields)
-            )
-        }
-        Expr::Call(fname, args) => {
-            let a_str: Vec<String> = args
-                .iter()
-                .map(|a| emit_dafny_expr(a, m, implicit_fields))
-                .collect();
-            format!("{fname}({})", a_str.join(", "))
-        }
-        Expr::MethodCall(recv, mname, args) => {
-            if let Expr::Var(v) = &**recv {
-                if v == "LIST" {
-                    match mname.as_str() {
-                        "empty" => return "[]".to_string(),
-                        "singleton" => {
-                            return format!("[{}]", emit_dafny_expr(&args[0], m, implicit_fields));
-                        }
-                        _ => {}
-                    }
-                } else if v == "SEQ" {
-                    match mname.as_str() {
-                        "empty" => return "Empty".to_string(),
-                        "singleton" => {
-                            return format!("Leaf({})", emit_dafny_expr(&args[0], m, implicit_fields));
-                        }
-                        _ => {}
-                    }
-                } else if v == "LIST_OPS" {
-                    let a_str: Vec<String> = args
-                        .iter()
-                        .map(|a| emit_dafny_expr(a, m, implicit_fields))
-                        .collect();
-                    return format!("{mname}({})", a_str.join(", "));
-                } else if v == "FUNCTION_OPS" {
-                    let a_str: Vec<String> = args
-                        .iter()
-                        .map(|a| emit_dafny_expr(a, m, implicit_fields))
-                        .collect();
-                    match mname.as_str() {
-                        "id_fn" => return "((x) => x)".to_string(),
-                        "compose" => return format!("((x) => {}({}(x)))", a_str[0], a_str[1]),
-                        "identity" => return a_str[0].clone(),
-                        _ => {}
-                    }
-                } else if v == "CHAR" && mname == "from_scalar" && !args.is_empty() {
-                    return format!("({} as char)", emit_dafny_expr(&args[0], m, implicit_fields));
-                } else if v == "IO" {
-                    if mname == "read_line" {
-                        return "\"input\"".to_string();
-                    } else if mname == "exit" && !args.is_empty() {
-                        return emit_dafny_expr(&args[0], m, implicit_fields);
-                    }
-                    return "(0 as U64)".to_string();
-                }
-            }
-            let r_str = emit_dafny_expr(recv, m, implicit_fields);
-            if mname == "apply" {
-                let a_str: Vec<String> = args
-                    .iter()
-                    .map(|a| emit_dafny_expr(a, m, implicit_fields))
-                    .collect();
-                return format!("{r_str}({})", a_str.join(", "));
-            }
-            match mname.as_str() {
-                "append" => format!(
-                    "({r_str} + {})",
-                    emit_dafny_expr(&args[0], m, implicit_fields)
-                ),
-                "prepend" => format!(
-                    "([{}] + {r_str})",
-                    emit_dafny_expr(&args[0], m, implicit_fields)
-                ),
-                "head" => format!("{r_str}[0]"),
-                "tail" => format!("{r_str}[1..]"),
-                "first" => format!("{r_str}.0"),
-                "second" => format!("{r_str}.1"),
-                "code" if args.is_empty() => format!("({r_str} as U64)"),
-                "has" => format!(
-                    "({} in {r_str})",
-                    emit_dafny_expr(&args[0], m, implicit_fields)
-                ),
-                "length" if m.name != "SEQ" => format!("(|{r_str}| as U64)"),
-                _ => {
-                    if mname == "equals"
-                        && args.len() == 1
-                        && (m.name == "OPTION" || m.name == "RESULT")
-                        && !matches!(
-                            &**recv,
-                            Expr::Var(v)
-                                if v == "Current"
-                                    || v == "other"
-                                    || v == "a"
-                                    || v == "b"
-                                    || v == "c"
-                                    || v == "opt"
-                                    || v == "res"
-                        )
-                    {
-                        let rhs = emit_dafny_expr(&args[0], m, implicit_fields);
-                        return format!("({r_str} == {rhs})");
-                    }
-                    if let ReprKind::Product(fields) = &m.repr {
-                        if args.is_empty() && fields.iter().any(|(fnm, _)| fnm == mname) {
-                            return format!("{r_str}.{mname}");
-                        }
-                    }
-                    let mut all_args = vec![r_str];
-                    for a in args {
-                        all_args.push(emit_dafny_expr(a, m, implicit_fields));
-                    }
-                    format!("{mname}({})", all_args.join(", "))
-                }
-            }
-        }
-        Expr::If(c, ts, te, es, ee) => {
-            format!(
-                "if {} then\n{}  else\n{}",
-                emit_dafny_expr(c, m, implicit_fields),
-                emit_dafny_block(ts, te, m, implicit_fields, 4),
-                emit_dafny_block(es, ee, m, implicit_fields, 4)
-            )
-        }
-        Expr::Match(scrut, cases) => {
-            let mut s = format!("(match {}\n", emit_dafny_expr(scrut, m, implicit_fields));
-            for c in cases {
-                let pat = format_pattern(&c.pattern);
-                s.push_str(&format!(
-                    "    case {pat} =>\n{}",
-                    emit_dafny_block(&c.stmts, &c.body, m, implicit_fields, 6)
-                ));
-            }
-            s.push(')');
-            s
-        }
-        Expr::RecordLit(fields) => {
-            if let ReprKind::Product(decl_fields) = &m.repr {
-                let args: Vec<String> = decl_fields
-                    .iter()
-                    .map(|(fnm, _)| {
-                        if let Some((_, fe)) = fields.iter().find(|(k, _)| k == fnm) {
-                            emit_dafny_expr(fe, m, implicit_fields)
-                        } else {
-                            "0".to_string()
-                        }
-                    })
-                    .collect();
-                format!("{}_Ctor({})", m.name, args.join(", "))
-            } else {
-                let args: Vec<String> = fields
-                    .iter()
-                    .map(|(_, fe)| emit_dafny_expr(fe, m, implicit_fields))
-                    .collect();
-                format!("{}_Ctor({})", m.name, args.join(", "))
-            }
-        }
-        Expr::RecordUpdate(base, fields) => {
-            let b_str = emit_dafny_expr(base, m, implicit_fields);
-            let updates: Vec<String> = fields
-                .iter()
-                .map(|(fnm, fe)| format!("{fnm} := {}", emit_dafny_expr(fe, m, implicit_fields)))
-                .collect();
-            format!("{b_str}.({})", updates.join(", "))
-        }
-        Expr::TupleLit(elems) => {
-            let es: Vec<String> = elems
-                .iter()
-                .map(|el| emit_dafny_expr(el, m, implicit_fields))
-                .collect();
-            format!("({})", es.join(", "))
-        }
-        Expr::Forall(v, ty, body) => {
-            format!(
-                "(forall {v}: {} :: {})",
-                map_dafny_type(ty, m),
-                emit_dafny_expr(body, m, implicit_fields)
-            )
-        }
-        Expr::Exists(v, ty, body) => {
-            format!(
-                "(exists {v}: {} :: {})",
-                map_dafny_type(ty, m),
-                emit_dafny_expr(body, m, implicit_fields)
-            )
-        }
-        Expr::WithIo(stmts, final_e) => {
-            let mut s = String::new();
-            for st in stmts {
-                if let IoStmt::Bind(v, se) = st {
-                    s.push_str(&format!(
-                        "var {v} := {}; ",
-                        emit_dafny_expr(se, m, implicit_fields)
-                    ));
-                }
-            }
-            s.push_str(&emit_dafny_expr(final_e, m, implicit_fields));
-            s
-        }
-        Expr::Lambda(ps, _, _, body) => {
-            let p_str: Vec<String> = ps
-                .iter()
-                .map(|(n, t)| format!("{n}: {}", map_dafny_type(t, m)))
-                .collect();
-            format!(
-                "(({}) => {})",
-                p_str.join(", "),
-                emit_dafny_expr(body, m, implicit_fields)
-            )
-        }
-    }
-}
-
-// ============================================================================
-// 10. BACKEND 2: BEND v2 EMITTER (.bend)
+// 9. BACKEND 1: BEND v2 EMITTER (.bend)
 // ============================================================================
 
 pub fn emit_bend_v2(m: &ModuleDecl) -> String {
@@ -13672,7 +13657,7 @@ pub fn is_tail_recursive_routine(r: &RoutineDecl) -> bool {
 }
 
 // ============================================================================
-// 11. BACKEND 3: C11 RUNTIME EMITTER (.c) (Phase 4 Stdlib: SEQ, BIGNAT, STRING, IO)
+// 10. BACKEND 2: C11 RUNTIME EMITTER (.c) (Phase 4 Stdlib: SEQ, BIGNAT, STRING, IO)
 // ============================================================================
 
 pub fn emit_c11(m: &ModuleDecl) -> String {
@@ -14264,7 +14249,9 @@ fn emit_c11_string_literal_table(strings: &[String]) -> String {
     if strings.is_empty() {
         return out;
     }
-    out.push_str("/* String literals (Task B.3): static read-only UTF-8, zero runtime decoding */\n");
+    out.push_str(
+        "/* String literals (Task B.3): static read-only UTF-8, zero runtime decoding */\n",
+    );
     for (idx, s) in strings.iter().enumerate() {
         let bytes: Vec<String> = s
             .as_bytes()
@@ -14317,14 +14304,21 @@ fn c_prelude_sum_variants(ty: &str) -> Option<Vec<(String, Vec<(String, String)>
     if p.type_params.len() != args.len() {
         return None;
     }
-    let map: HashMap<String, String> =
-        p.type_params.iter().cloned().zip(args.iter().map(|a| a.trim().to_string())).collect();
+    let map: HashMap<String, String> = p
+        .type_params
+        .iter()
+        .cloned()
+        .zip(args.iter().map(|a| a.trim().to_string()))
+        .collect();
     Some(
         vs.iter()
             .map(|v| {
                 (
                     v.name.clone(),
-                    v.fields.iter().map(|(f, t)| (f.clone(), subst_type_idents(t, &map))).collect(),
+                    v.fields
+                        .iter()
+                        .map(|(f, t)| (f.clone(), subst_type_idents(t, &map)))
+                        .collect(),
                 )
             })
             .collect(),
@@ -14382,8 +14376,15 @@ fn emit_c11_prelude_instances(roots: &[&str]) -> String {
         }
         out.push_str(&format!("}} {cname};\n"));
         for (v, fields) in &vs {
-            let params: Vec<String> = fields.iter().map(|(f, ft)| format!("{} {f}", c_field_type(ft))).collect();
-            let params = if params.is_empty() { "void".to_string() } else { params.join(", ") };
+            let params: Vec<String> = fields
+                .iter()
+                .map(|(f, ft)| format!("{} {f}", c_field_type(ft)))
+                .collect();
+            let params = if params.is_empty() {
+                "void".to_string()
+            } else {
+                params.join(", ")
+            };
             out.push_str(&format!(
                 "static inline struct {cname}* make_{cname}_{v}({params}) {{\n    struct {cname}* r = (struct {cname}*)gardel_alloc(sizeof(struct {cname}));\n    r->tag = TAG_{cname}_{v};\n"
             ));
@@ -14444,7 +14445,8 @@ static struct {r}* gardel_io_read_line_result(void) {{
 fn c11_record_bind_type(v: &str, e: &Expr) {
     if is_io_read_line(e) {
         C11_TYPE_ENV.with(|env| {
-            env.borrow_mut().insert(v.to_string(), READ_LINE_RESULT_TYPE.to_string());
+            env.borrow_mut()
+                .insert(v.to_string(), READ_LINE_RESULT_TYPE.to_string());
         });
     }
 }
@@ -14488,19 +14490,30 @@ fn emit_c11_prelude_match(scrut: &Expr, cases: &[MatchCase], mod_name: &str) -> 
         }
         for st in &c.stmts {
             if let Stmt::Let(v, e) = st {
-                body.push_str(&format!("__auto_type {v} = {}; ", emit_c11_expr(e, mod_name)));
+                body.push_str(&format!(
+                    "__auto_type {v} = {}; ",
+                    emit_c11_expr(e, mod_name)
+                ));
             }
         }
         body.push_str(&format!("{}; }})", emit_c11_expr(&c.body, mod_name)));
         arms.push((tag, body));
     }
     // Nested conditional over the tags; the last arm is the fallback (matches are exhaustive).
-    let mut expr = arms.last().map(|(_, b)| b.clone()).unwrap_or_else(|| "0".to_string());
+    let mut expr = arms
+        .last()
+        .map(|(_, b)| b.clone())
+        .unwrap_or_else(|| "0".to_string());
     for (tag, body) in arms.iter().rev().skip(1) {
-        let cond = tag.clone().map_or("0".to_string(), |t| format!("{sv}->tag == {t}"));
+        let cond = tag
+            .clone()
+            .map_or("0".to_string(), |t| format!("{sv}->tag == {t}"));
         expr = format!("({cond} ? {body} : {expr})");
     }
-    format!("({{ __auto_type {sv} = {}; {expr}; }})", emit_c11_expr(scrut, mod_name))
+    format!(
+        "({{ __auto_type {sv} = {}; {expr}; }})",
+        emit_c11_expr(scrut, mod_name)
+    )
 }
 
 pub fn emit_c11_general_module(m: &ModuleDecl) -> String {
@@ -14521,7 +14534,12 @@ pub fn emit_c11_general_module(m: &ModuleDecl) -> String {
         // (e.g. `main(args: SEQ[STRING])`), so they are not scoped to a parameter list.
         let mut fwd: Vec<String> = Vec::new();
         for (_, r) in &m.feature_routines {
-            for ty in r.params.iter().map(|(_, t)| t).chain(std::iter::once(&r.ret_type)) {
+            for ty in r
+                .params
+                .iter()
+                .map(|(_, t)| t)
+                .chain(std::iter::once(&r.ret_type))
+            {
                 let ct = map_c_type(ty);
                 if let Some(name) = ct.strip_prefix("struct ").and_then(|t| t.strip_suffix('*')) {
                     let decl = format!("struct {name};\n");
@@ -14641,7 +14659,10 @@ pub fn emit_c11_general_module(m: &ModuleDecl) -> String {
         if let Some((_, r)) = m.feature_routines.iter().find(|(_, r)| r.name == "main") {
             // `args: SEQ[STRING]` is not yet marshalled from argv (passed as NULL).
             let args: Vec<&str> = r.params.iter().map(|_| "NULL").collect();
-            out.push_str(&format!("    return (int)main_routine({});\n", args.join(", ")));
+            out.push_str(&format!(
+                "    return (int)main_routine({});\n",
+                args.join(", ")
+            ));
         } else {
             out.push_str("    return 0;\n");
         }
@@ -14760,7 +14781,11 @@ fn emit_c11_expr(e: &Expr, mod_name: &str) -> String {
             match idx {
                 Some(idx) => format!("string_from_utf8(gardel_str_lit_{idx}, {}ULL)", s.len()),
                 None => {
-                    let bytes: Vec<String> = s.bytes().map(|b| b.to_string()).chain(std::iter::once("0".to_string())).collect();
+                    let bytes: Vec<String> = s
+                        .bytes()
+                        .map(|b| b.to_string())
+                        .chain(std::iter::once("0".to_string()))
+                        .collect();
                     format!(
                         "string_from_utf8((const uint8_t[]){{ {} }}, {}ULL)",
                         bytes.join(", "),
@@ -14879,7 +14904,10 @@ fn emit_c11_expr(e: &Expr, mod_name: &str) -> String {
                 match io_st {
                     IoStmt::Bind(v, se) => {
                         c11_record_bind_type(v, se);
-                        s.push_str(&format!("__auto_type {v} = {}; ", emit_c11_expr(se, mod_name)));
+                        s.push_str(&format!(
+                            "__auto_type {v} = {}; ",
+                            emit_c11_expr(se, mod_name)
+                        ));
                     }
                     IoStmt::Action(se) => s.push_str(&format!("{}; ", emit_c11_expr(se, mod_name))),
                 }
@@ -14893,7 +14921,7 @@ fn emit_c11_expr(e: &Expr, mod_name: &str) -> String {
 }
 
 // ============================================================================
-// 12. CLI DRIVER (Supports --stdlib, Boogie, --fuel, --audit, --strict, --run)
+// 11. CLI DRIVER (Supports --stdlib, Boogie, --fuel, --audit, --strict, --run)
 // ============================================================================
 
 /// Formats the public contract interface of a module (Eiffel-style `short` view, §4 & §7.5),
@@ -15050,12 +15078,154 @@ fn ens_is_visible(ens: &Expr, m: &ModuleDecl, routine_vis: &Visibility) -> bool 
     true
 }
 
-/// Writes the embedded Phase 4 standard library out to standalone `.gdl` files in `out_dir`.
+/// Default output directory of `gardelc --emit-stdlib` (inside `build/`, which directory
+/// scans skip, so the copy is never mistaken for the stdlib sources).
+pub const EMIT_STDLIB_DEFAULT_DIR: &str = "build/stdlib";
+
+fn normalized_source(s: &str) -> String {
+    s.replace("\r\n", "\n").trim().to_string()
+}
+
+/// Writes the Standard Prelude sources embedded in this gardelc to `out_dir`, one file per
+/// module. A file that already exists with different content is never overwritten: the
+/// `stdlib/` sources are edited by hand and the embedded copy may be older than them, so the
+/// whole emission is refused instead (nothing is written).
 pub fn emit_stdlib_files(out_dir: &str) -> Result<Vec<String>, String> {
-    fs::create_dir_all(out_dir).map_err(|e| e.to_string())?;
-    let bundle_path = format!("{out_dir}/stdlib.gdl");
-    fs::write(&bundle_path, phase4_stdlib_source().trim_start()).map_err(|e| e.to_string())?;
-    Ok(vec![bundle_path])
+    let plan: Vec<(String, &str)> = STDLIB_SOURCES
+        .iter()
+        .map(|(rel_path, content)| {
+            let sub = rel_path.strip_prefix("stdlib/").unwrap_or(rel_path);
+            (format!("{out_dir}/{sub}"), content.trim_start())
+        })
+        .collect();
+    let conflicts: Vec<&str> = plan
+        .iter()
+        .filter(|(dest, content)| {
+            std::path::Path::new(dest).exists()
+                && fs::read_to_string(dest)
+                    .map(|s| normalized_source(&s) != normalized_source(content))
+                    .unwrap_or(true)
+        })
+        .map(|(dest, _)| dest.as_str())
+        .collect();
+    if !conflicts.is_empty() {
+        return Err(format!(
+            "refusing to overwrite {} file(s) that differ from the stdlib embedded in this gardelc: {}. Emit into an empty directory (`--emit-stdlib <DIR>`, default `{EMIT_STDLIB_DEFAULT_DIR}`) or remove them first",
+            conflicts.len(),
+            conflicts.join(", ")
+        ));
+    }
+    let mut written = Vec::new();
+    for (dest, content) in &plan {
+        if !std::path::Path::new(dest).exists() {
+            if let Some(parent) = std::path::Path::new(dest).parent() {
+                fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+            }
+            fs::write(dest, content).map_err(|e| e.to_string())?;
+        }
+        written.push(dest.clone());
+    }
+    Ok(written)
+}
+
+/// The `stdlib/` source tree this gardelc was built from: the files its `include_str!`s embed.
+fn stdlib_source_dir() -> std::path::PathBuf {
+    std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("..")
+        .join("stdlib")
+}
+
+/// `p` relative to the working directory when it lies under it (or under its parent), for
+/// readable paths in diagnostics; otherwise the absolute path.
+fn display_path(p: &std::path::Path) -> String {
+    let clean = |s: &std::path::Path| {
+        let s = s.to_string_lossy().replace('\\', "/");
+        s.strip_prefix("//?/").map(str::to_string).unwrap_or(s)
+    };
+    let Ok(abs) = p.canonicalize() else {
+        return clean(p);
+    };
+    if let Ok(cwd) = std::env::current_dir().and_then(|c| c.canonicalize()) {
+        if let Ok(rel) = abs.strip_prefix(&cwd) {
+            let r = clean(rel);
+            return if r.is_empty() { ".".to_string() } else { r };
+        }
+        if let Some(parent) = cwd.parent() {
+            if let Ok(rel) = abs.strip_prefix(parent) {
+                return format!("../{}", clean(rel));
+            }
+        }
+    }
+    clean(&abs)
+}
+
+/// What `gardelc --stdlib` verifies.
+enum StdlibInputs {
+    /// The source tree this gardelc was built from, with informational notes.
+    Disk { paths: Vec<String>, notes: Vec<String> },
+    /// That tree is not available (gardelc moved or installed elsewhere): the embedded copy.
+    Embedded { note: String },
+}
+
+/// Resolves the `--stdlib` inputs. It always verifies the tree the compiler was built from,
+/// never a `stdlib/` that happens to be in the working directory, and it is an error when that
+/// tree and the embedded file list disagree (a module verified but not shipped, or the reverse).
+fn resolve_stdlib_inputs() -> Result<StdlibInputs, (String, String)> {
+    let dir = stdlib_source_dir();
+    if !dir.is_dir() {
+        return Ok(StdlibInputs::Embedded {
+            note: format!(
+                "[stdlib] The source tree this gardelc was built from (`{}`) is not available; verifying the copy embedded in this gardelc build instead.",
+                display_path(&dir)
+            ),
+        });
+    }
+    let shown = display_path(&dir);
+    let files = gdl_files_in_dir(&shown, None).map_err(|e| (e, shown.clone()))?;
+    let prefix = format!("{shown}/");
+    let on_disk: BTreeMap<String, String> = files
+        .iter()
+        .map(|f| (format!("stdlib/{}", f.strip_prefix(&prefix).unwrap_or(f)), f.clone()))
+        .collect();
+    let embedded: BTreeMap<&str, &str> = STDLIB_SOURCES.iter().copied().collect();
+    let mut problems = Vec::new();
+    for k in embedded.keys().filter(|k| !on_disk.contains_key(**k)) {
+        problems.push(format!("`{k}` is embedded in gardelc but missing on disk"));
+    }
+    for k in on_disk.keys().filter(|k| !embedded.contains_key(k.as_str())) {
+        problems.push(format!(
+            "`{k}` is on disk but not embedded in gardelc (add it to `STDLIB_SOURCES` and `phase4_stdlib_source()` in gardelc/src/main.rs, or user programs will not get it)"
+        ));
+    }
+    if !problems.is_empty() {
+        return Err((
+            format!(
+                "The stdlib source tree `{shown}` and the Standard Prelude embedded in gardelc disagree: {}",
+                problems.join("; ")
+            ),
+            shown,
+        ));
+    }
+    let stale: Vec<&str> = on_disk
+        .iter()
+        .filter(|(k, f)| {
+            fs::read_to_string(f)
+                .map(|s| normalized_source(&s) != normalized_source(embedded[k.as_str()]))
+                .unwrap_or(true)
+        })
+        .map(|(k, _)| k.as_str())
+        .collect();
+    let mut notes = vec![format!("[stdlib] Verifying the source tree `{shown}` ({} files).", files.len())];
+    if !stale.is_empty() {
+        notes.push(format!(
+            "[stdlib] Note: {} differ(s) from the copy embedded in this gardelc build; user programs get the embedded copy until gardelc is rebuilt (`cargo build`).",
+            stale.join(", ")
+        ));
+    }
+    Ok(StdlibInputs::Disk {
+        paths: on_disk.into_values().collect(),
+        notes,
+    })
 }
 
 /// Validates that every module declared in a `group { ... }` package header is present (§5, §16).
@@ -15130,28 +15300,40 @@ fn wildcard_match(pattern: &str, name: &str) -> bool {
     pi == p.len()
 }
 
-/// The `.gdl` files of a directory (top level only, not recursive), sorted by name.
+/// The `.gdl` files of a directory and its subdirectories, sorted by path.
 fn gdl_files_in_dir(dir: &str, pattern: Option<&str>) -> Result<Vec<String>, String> {
-    let rd = fs::read_dir(if dir.is_empty() { "." } else { dir })
-        .map_err(|e| format!("Failed to read directory '{dir}': {e}"))?;
-    let mut names: Vec<String> = rd
-        .filter_map(|e| e.ok())
-        .filter(|e| e.path().is_file())
-        .map(|e| e.file_name().to_string_lossy().to_string())
-        .filter(|n| match pattern {
-            Some(p) => wildcard_match(p, n),
-            None => n.to_ascii_lowercase().ends_with(".gdl"),
-        })
-        .collect();
-    names.sort();
-    let prefix = if dir.is_empty() {
-        String::new()
-    } else if dir.ends_with('/') || dir.ends_with('\\') {
-        dir.to_string()
-    } else {
-        format!("{dir}/")
-    };
-    Ok(names.into_iter().map(|n| format!("{prefix}{n}")).collect())
+    let mut files = Vec::new();
+    collect_gdl_files(dir, pattern, &mut files)?;
+    files.sort();
+    Ok(files)
+}
+
+fn collect_gdl_files(
+    dir: &str,
+    pattern: Option<&str>,
+    out: &mut Vec<String>,
+) -> Result<(), String> {
+    let path = if dir.is_empty() { "." } else { dir };
+    let rd = fs::read_dir(path).map_err(|e| format!("Failed to read directory '{dir}': {e}"))?;
+    for entry in rd.filter_map(|e| e.ok()) {
+        let p = entry.path();
+        if p.is_dir() {
+            let name = entry.file_name().to_string_lossy().to_string();
+            if !name.starts_with('.') && name != "target" && name != "build" {
+                collect_gdl_files(&p.to_string_lossy(), pattern, out)?;
+            }
+        } else if p.is_file() {
+            let fname = entry.file_name().to_string_lossy().to_string();
+            let matches = match pattern {
+                Some(pat) => wildcard_match(pat, &fname),
+                None => fname.to_ascii_lowercase().ends_with(".gdl"),
+            };
+            if matches {
+                out.push(p.to_string_lossy().replace('\\', "/"));
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Resolves the CLI input operands (Task B.4) into source file paths. A directory stands for
@@ -15381,7 +15563,10 @@ fn exit_with_fatal(diags: &[Diagnostic], json_mode: bool, default_path: &str) ->
         println!("]");
     } else {
         for d in diags {
-            let sp = d.span.clone().unwrap_or_else(|| Span::unknown(default_path));
+            let sp = d
+                .span
+                .clone()
+                .unwrap_or_else(|| Span::unknown(default_path));
             eprintln!(
                 "[ERROR] {} at {}:{}:{}: {}",
                 d.rule, sp.file, sp.line, sp.column, d.message
@@ -15413,19 +15598,24 @@ fn main() {
     let args: Vec<String> = env::args().collect();
     if args.len() < 2 {
         eprintln!(
-            "Usage: gardelc <input.gdl ... | DIR | --stdlib> [--no-prelude] [--inspect [MODULE]] [--emit-stdlib] [--json-diagnostics] [--fuel <N>] [--audit] [--strict] [--bounded-check] [--run]"
+            "Usage: gardelc <input.gdl ... | DIR | --stdlib> [--no-prelude] [--inspect [MODULE]] [--emit-stdlib [DIR]] [--json-diagnostics] [--fuel <N>] [--audit] [--strict] [--bounded-check] [--run]"
         );
         eprintln!(
             "  --no-prelude  bootstrap mode: do not inject the Standard Prelude (implied by --stdlib and when compiling the prelude source itself, §4.1)"
         );
         eprintln!(
-            "  several files, a directory (its top-level *.gdl files) or a wildcard pattern such as src/*.gdl form one project with a flat module namespace (§4.2)"
+            "  several files, a directory (its *.gdl files, searched recursively, skipping build/ and target/) or a wildcard pattern such as src/*.gdl form one project with a flat module namespace (§4.2)"
         );
         std::process::exit(1);
     }
 
-    if args.iter().any(|a| a == "--emit-stdlib") {
-        match emit_stdlib_files("stdlib") {
+    if let Some(i) = args.iter().position(|a| a == "--emit-stdlib") {
+        let out_dir = args
+            .get(i + 1)
+            .filter(|a| !a.starts_with("--"))
+            .map(String::as_str)
+            .unwrap_or(EMIT_STDLIB_DEFAULT_DIR);
+        match emit_stdlib_files(out_dir) {
             Ok(files) => {
                 println!("Emitted standalone Phase 4 standard library files: {files:?}");
                 return;
@@ -15438,7 +15628,7 @@ fn main() {
     }
 
     let inspect_mode = args.iter().any(|a| a == "--inspect");
-    let stdlib_only = args.iter().any(|a| a == "--stdlib")
+    let mut stdlib_only = args.iter().any(|a| a == "--stdlib")
         || (inspect_mode && args.get(1).is_some_and(|a| a.starts_with("--")));
 
     let json_mode = args.iter().any(|a| a == "--json-diagnostics");
@@ -15449,9 +15639,20 @@ fn main() {
     let fuel_limit = parse_fuel_arg(&args);
 
     // Task B.4: input operands (files, directories, wildcard patterns).
-    let (input_paths, project_mode): (Vec<String>, bool) = if stdlib_only {
-        (vec!["<phase4_stdlib.gdl>".to_string()], false)
-    } else {
+    // `--stdlib` verifies the source tree this gardelc was built from (see `resolve_stdlib_inputs`);
+    // only when that tree is unavailable does it verify the embedded copy, and it says so.
+    let say = |line: &str| {
+        if json_mode {
+            eprintln!("{line}");
+        } else {
+            println!("{line}");
+        }
+    };
+    // Explicit operands. Files of the stdlib tree depend on each other (concepts, `OPTION` in
+    // `RESULT`, ...), so asking for any of them verifies the whole tree, as `--stdlib` does;
+    // mixing them with user files is an error (a user program gets the stdlib as its prelude).
+    let mut user_inputs: Option<(Vec<String>, bool)> = None;
+    if !stdlib_only {
         let ops = input_operands(&args);
         if ops.is_empty() {
             exit_with_frontend_error(
@@ -15459,20 +15660,69 @@ fn main() {
                 "IO",
                 "file",
                 "io_error",
-                "No input file given (expected <input.gdl ...>, a directory, or --stdlib)".to_string(),
+                "No input file given (expected <input.gdl ...>, a directory, or --stdlib)"
+                    .to_string(),
                 "<none>",
             );
         }
-        match resolve_input_operands(&ops) {
+        let (paths, project) = match resolve_input_operands(&ops) {
             Ok(r) => r,
             Err(e) => exit_with_frontend_error(json_mode, "IO", "file", "io_error", e, &ops[0]),
+        };
+        let inside: Vec<&String> = paths.iter().filter(|p| path_in_stdlib_tree(p)).collect();
+        if inside.is_empty() {
+            user_inputs = Some((paths, project));
+        } else if inside.len() < paths.len() {
+            exit_with_frontend_error(
+                json_mode,
+                "IO",
+                "file",
+                "io_error",
+                format!(
+                    "Standard Prelude files ({}) cannot be compiled together with user files: user programs receive the stdlib as their prelude. Verify the stdlib with `gardelc --stdlib`",
+                    inside.iter().map(|p| format!("`{p}`")).collect::<Vec<_>>().join(", ")
+                ),
+                inside[0],
+            );
+        } else {
+            let which = if inside.len() <= 3 {
+                inside.iter().map(|p| format!("`{p}`")).collect::<Vec<_>>().join(", ")
+            } else {
+                format!("{} files", inside.len())
+            };
+            say(&format!(
+                "[stdlib] {which} belong(s) to the Standard Prelude, whose modules depend on each other: verifying the whole stdlib tree (as `--stdlib`)."
+            ));
+            stdlib_only = true;
+        }
+    }
+
+    // `--stdlib` verifies the source tree this gardelc was built from (see `resolve_stdlib_inputs`);
+    // only when that tree is unavailable does it verify the embedded copy, and it says so.
+    let mut stdlib_embedded: HashMap<String, &'static str> = HashMap::new();
+    let (input_paths, project_mode): (Vec<String>, bool) = if let Some(r) = user_inputs {
+        r
+    } else {
+        match resolve_stdlib_inputs() {
+            Ok(StdlibInputs::Disk { paths, notes }) => {
+                notes.iter().for_each(|n| say(n));
+                (paths, true)
+            }
+            Ok(StdlibInputs::Embedded { note }) => {
+                say(&note);
+                for (p, c) in STDLIB_SOURCES {
+                    stdlib_embedded.insert(p.to_string(), c);
+                }
+                (STDLIB_SOURCES.iter().map(|(p, _)| p.to_string()).collect(), true)
+            }
+            Err((msg, path)) => exit_with_frontend_error(json_mode, "IO", "file", "io_error", msg, &path),
         }
     };
 
     let mut units: Vec<SourceUnit> = Vec::new();
     for input_path in &input_paths {
-        let src = if stdlib_only {
-            phase4_stdlib_source().to_string()
+        let src = if let Some(content) = stdlib_embedded.get(input_path) {
+            content.to_string()
         } else {
             match fs::read_to_string(input_path) {
                 Ok(s) => s,
@@ -15506,7 +15756,14 @@ fn main() {
                 } else {
                     e.to_string()
                 };
-                exit_with_frontend_error(json_mode, "Parser", "parser", "parse_error", msg, input_path)
+                exit_with_frontend_error(
+                    json_mode,
+                    "Parser",
+                    "parser",
+                    "parse_error",
+                    msg,
+                    input_path,
+                )
             }
         };
         units.push(SourceUnit {
@@ -15521,7 +15778,7 @@ fn main() {
     // or when a file being compiled is the prelude source itself).
     let prelude_mode = units
         .iter()
-        .all(|u| prelude_mode_enabled(stdlib_only, no_prelude_flag, &u.src));
+        .all(|_| prelude_mode_enabled(stdlib_only, no_prelude_flag));
 
     // E0101 (prelude shadowing) and E0102 (cross-file duplicates) are fatal (§4.1, §4.2).
     let namespace_errors = check_project_namespace(&units, prelude_mode);
@@ -15626,20 +15883,26 @@ fn main() {
         if prelude_mode {
             let p = standard_prelude();
             println!(
-                "[0/6] Standard Prelude injected (§4.1): {} modules {:?}, {} concepts (trusted, verified in --stdlib bootstrap mode)",
+                "[0/5] Standard Prelude injected (§4.1): {} modules {:?}, {} concepts (trusted, verified in --stdlib bootstrap mode)",
                 p.modules.len(),
-                p.modules.iter().map(|m| m.name.as_str()).collect::<Vec<_>>(),
+                p.modules
+                    .iter()
+                    .map(|m| m.name.as_str())
+                    .collect::<Vec<_>>(),
                 p.concepts.len()
             );
         } else {
-            println!("[0/6] Bootstrap mode (--no-prelude): Standard Prelude not injected");
+            println!("[0/5] Bootstrap mode (--no-prelude): Standard Prelude not injected");
         }
         if project_mode {
             println!(
-                "[1/6] Linked project of {} files into one flat namespace (§4.2): {} modules {:?}, {} concepts {:?}, fuel: {}",
+                "[1/5] Linked project of {} files into one flat namespace (§4.2): {} modules {:?}, {} concepts {:?}, fuel: {}",
                 units.len(),
                 all_modules.len(),
-                all_modules.iter().map(|m| m.name.as_str()).collect::<Vec<_>>(),
+                all_modules
+                    .iter()
+                    .map(|m| m.name.as_str())
+                    .collect::<Vec<_>>(),
                 concept_map.len(),
                 concept_map.keys().collect::<Vec<_>>(),
                 fuel_limit
@@ -15658,7 +15921,7 @@ fn main() {
             }
         } else {
             println!(
-                "[1/6] Parsed {} concepts {:?}, group {:?}, and {:?} `{}` (type params: {:?}, satisfies: {:?}, laws: {}, fuel: {})",
+                "[1/5] Parsed {} concepts {:?}, group {:?}, and {:?} `{}` (type params: {:?}, satisfies: {:?}, laws: {}, fuel: {})",
                 concept_map.len(),
                 concept_map.keys().collect::<Vec<_>>(),
                 units[0].ast.group,
@@ -15671,7 +15934,7 @@ fn main() {
             );
         }
         println!(
-            "[2/6] Checked §4 Visibility, §9 Concept Laws, §11 IO Boundary & §12 Direct Verification:"
+            "[2/5] Checked §4 Visibility, §9 Concept Laws, §11 IO Boundary & §12 Direct Verification:"
         );
         if diags.is_empty() {
             println!(
@@ -15734,7 +15997,6 @@ fn main() {
     }
 
     let mut primary_bpl = String::new();
-    let mut primary_dfy = String::new();
     let mut primary_bend = String::new();
     let mut primary_c = String::new();
     let mut primary_exe = String::new();
@@ -15743,7 +16005,6 @@ fn main() {
     for m in &all_modules {
         let stem = m.name.to_lowercase();
         let bpl_path = format!("build/{stem}.bpl");
-        let dfy_path = format!("build/{stem}.dfy");
         let bend_path = format!("build/{stem}.bend");
         let c_path = format!("build/{stem}.c");
 
@@ -15755,12 +16016,6 @@ fn main() {
             std::process::exit(1);
         }
         emitted_bpl.push(bpl_path.clone());
-
-        let dfy_code = emit_dafny(m);
-        if let Err(e) = fs::write(&dfy_path, dfy_code) {
-            eprintln!("[ERROR] Failed to write Dafny output '{dfy_path}': {e}");
-            std::process::exit(1);
-        }
 
         let mono_module = if m.type_params.is_empty() {
             (*m).clone()
@@ -15802,7 +16057,6 @@ fn main() {
 
         if m.name == module.name {
             primary_bpl = bpl_path;
-            primary_dfy = dfy_path;
             primary_bend = bend_path;
             primary_c = c_path;
             primary_exe = format!("build/{stem}_bin.exe");
@@ -15821,16 +16075,15 @@ fn main() {
     if !json_mode {
         if project_mode {
             println!(
-                "[3/6] Emitted direct Boogie VCs & fuel axioms -> {} (one per module; primary `{}`)",
+                "[3/5] Emitted direct Boogie VCs & fuel axioms -> {} (one per module; primary `{}`)",
                 emitted_bpl.join(", "),
                 module.name
             );
         } else {
-            println!("[3/6] Emitted direct Boogie VCs & fuel axioms -> {primary_bpl}");
+            println!("[3/5] Emitted direct Boogie VCs & fuel axioms -> {primary_bpl}");
         }
-        println!("[4/6] Emitted Dafny refinement & law lemmas   -> {primary_dfy}");
-        println!("[5/6] Emitted monomorphized Bend v2 target    -> {primary_bend}");
-        println!("[6/6] Emitted C11 runtime target              -> {primary_c}");
+        println!("[4/5] Emitted monomorphized Bend v2 target    -> {primary_bend}");
+        println!("[5/5] Emitted C11 runtime target              -> {primary_c}");
         if gcc_compiled {
             println!("      Compiled native executable              -> {primary_exe}");
         }
@@ -15865,23 +16118,15 @@ fn main() {
             }
         }
 
-        println!("\n=== [1] Dafny Formal Verification (Routines + Concept Laws) ===");
-        let mut cmd = Command::new("dafny");
-        cmd.args(["verify", &primary_dfy]);
-        if let Some(solver) = found_solver {
-            cmd.args(["--solver-path", solver]);
-        }
-        let _ = cmd.status();
-
         if gcc_compiled && std::path::Path::new(&primary_exe).exists() {
-            println!("\n=== [2] Executing Native Executable ({primary_exe}) ===");
+            println!("\n=== [1] Executing Native Executable ({primary_exe}) ===");
             let _ = Command::new(&primary_exe).status();
         }
     }
 }
 
 // ============================================================================
-// 13. PHASE 3 & 4 UNIT TESTS (Boogie, Fuel, Reveal, SEQ, BIGNAT, STRING, IO)
+// 12. PHASE 3 & 4 UNIT TESTS (Boogie, Fuel, Reveal, SEQ, BIGNAT, STRING, IO)
 // ============================================================================
 
 #[cfg(test)]
@@ -16062,20 +16307,8 @@ end
     #[test]
     fn test_phase4_stdlib_package_verifies_all_modules() {
         let stdlib = parse_phase4_stdlib().expect("Phase 4 stdlib should parse");
-        assert_eq!(
-            stdlib.group,
-            Some(vec![
-                "SEQ".to_string(),
-                "BIGNAT".to_string(),
-                "STRING".to_string(),
-                "STRING_ERROR".to_string(),
-                "IO_ERROR".to_string(),
-                "OPTION".to_string(),
-                "RESULT".to_string(),
-                "LIST_OPS".to_string(),
-                "FUNCTION_OPS".to_string(),
-            ])
-        );
+        assert_eq!(stdlib.group, None);
+        assert_eq!(stdlib.concepts.len(), 3);
         assert_eq!(stdlib.modules.len(), 9);
         for m in &stdlib.modules {
             let mut diags = check_visibility_and_semantics(m);
@@ -16098,6 +16331,104 @@ end
             let c11 = emit_c11(m);
             assert!(c11.contains("int main(void)"));
         }
+    }
+
+    #[test]
+    fn test_c1_stdlib_modular_files_match_module_names_w0201() {
+        // Every decomposed stdlib file satisfies the one-module-per-file naming convention (§4.2).
+        for (rel_path, content) in STDLIB_SOURCES {
+            let tokens = tokenize(content).expect("lexing stdlib file should succeed");
+            let mut parser = Parser::new(tokens);
+            let ast = parser
+                .parse_file()
+                .expect("parsing stdlib file should succeed");
+            let unit = SourceUnit {
+                path: rel_path.to_string(),
+                src: content.to_string(),
+                ast,
+            };
+            let diags = check_file_module_name(&unit, true);
+            assert!(
+                diags.is_empty(),
+                "Stdlib file `{rel_path}` must match its module name under W0201 (strict), got: {diags:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_c1_embedded_stdlib_lists_agree_with_source_tree() {
+        // The prelude bundle (`concat!`) and `STDLIB_SOURCES` are the same files in the same order.
+        let joined: Vec<&str> = STDLIB_SOURCES.iter().map(|(_, c)| *c).collect();
+        assert_eq!(phase4_stdlib_source(), joined.join("\n"));
+        // `--stdlib` verifies the tree gardelc was built from, and it matches the embedded copy.
+        match resolve_stdlib_inputs() {
+            Ok(StdlibInputs::Disk { paths, notes }) => {
+                assert_eq!(paths.len(), STDLIB_SOURCES.len(), "got: {paths:?}");
+                assert_eq!(notes.len(), 1, "embedded copy must be current, got: {notes:?}");
+            }
+            Ok(StdlibInputs::Embedded { note }) => panic!("source tree missing: {note}"),
+            Err((msg, _)) => panic!("{msg}"),
+        }
+    }
+
+    #[test]
+    fn test_c1_emit_stdlib_never_overwrites_edited_sources() {
+        let dir = std::env::temp_dir().join(format!("gardel_emit_stdlib_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let out = dir.to_string_lossy().replace('\\', "/");
+        let files = emit_stdlib_files(&out).expect("emitting into an empty directory");
+        assert_eq!(files.len(), STDLIB_SOURCES.len());
+        // Re-emitting identical files is a no-op.
+        emit_stdlib_files(&out).expect("re-emitting identical files");
+        // An edited file is never overwritten, and nothing else is written either.
+        let edited = format!("{out}/numeric/bignat.gdl");
+        let mut src = fs::read_to_string(&edited).unwrap();
+        src.push_str("\n-- local edit\n");
+        fs::write(&edited, &src).unwrap();
+        let removed = format!("{out}/core/option.gdl");
+        fs::remove_file(&removed).unwrap();
+        let err = emit_stdlib_files(&out).expect_err("must refuse to overwrite an edited file");
+        assert!(err.contains("numeric/bignat.gdl"), "got: {err}");
+        assert_eq!(fs::read_to_string(&edited).unwrap(), src);
+        assert!(!std::path::Path::new(&removed).exists(), "refused emission must write nothing");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_c1_stdlib_project_verification_zero_warnings_strict() {
+        // Multi-file stdlib project verifies in project mode with dependencies linked and 0 warnings under --strict.
+        let mut units = Vec::new();
+        for (rel_path, content) in STDLIB_SOURCES {
+            let tokens = tokenize(content).expect("lexing stdlib file should succeed");
+            let mut parser = Parser::new(tokens);
+            let ast = parser
+                .parse_file()
+                .expect("parsing stdlib file should succeed");
+            units.push(SourceUnit {
+                path: rel_path.to_string(),
+                src: content.to_string(),
+                ast,
+            });
+        }
+        let opts = VerifyOptions {
+            prelude_mode: false,
+            project_mode: true,
+            fuel_limit: 2,
+            strict: true,
+            audit: false,
+            bounded_check: false,
+        };
+        let checked = check_and_verify_project(&mut units, opts);
+        assert!(
+            checked.fatal.is_empty(),
+            "Stdlib multi-file project must have 0 fatal errors, got: {:?}",
+            checked.fatal
+        );
+        assert!(
+            checked.diags.is_empty(),
+            "Stdlib multi-file project must verify with 0 errors and 0 warnings under --strict, got: {:?}",
+            checked.diags
+        );
     }
 
     #[test]
@@ -16330,9 +16661,6 @@ end
         let bpl = emit_boogie(&m, 2);
         assert!(bpl.contains("is_Lit"));
         assert!(bpl.contains("is_Pair"));
-        let dfy = emit_dafny(&m);
-        assert!(dfy.contains("case Lit(x) =>"));
-        assert!(dfy.contains("case Pair(a, b) =>"));
         let bend = emit_bend_v2(&m);
         assert!(bend.contains("case EVAL_MATCH/Lit { x }:"));
         assert!(bend.contains("case EVAL_MATCH/Pair { a, b }:"));
@@ -16366,8 +16694,6 @@ end
         let bpl = emit_boogie(&m, 2);
         assert!(bpl.contains("ack::variant::variant_non_negative"));
         assert!(bpl.contains("ack::variant::variant_decrease"));
-        let dfy = emit_dafny(&m);
-        assert!(dfy.contains("decreases m, n"));
     }
 
     #[test]
@@ -16430,10 +16756,19 @@ end
         let m = parse_single_module(src);
         assert_eq!(m.type_bounds.get("T"), Some(&"ORD".to_string()));
         let bpl = emit_boogie(&m, 2);
-        assert!(bpl.contains("function T_eq(x: T, y: T) returns (bool);"));
-        assert!(bpl.contains("function T_less(x: T, y: T) returns (bool);"));
-        assert!(bpl.contains("axiom (forall x: T :: { T_eq(x, x) } T_eq(x, x));"));
-        assert!(bpl.contains("axiom (forall x: T :: { T_less(x, x) } !T_less(x, x));"));
+        // `T` is a hole of `type GENERIC_CONTAINER T;`, so its theory is polymorphic in `T`
+        // rather than declared over a global `type T;` (which Boogie rejects as a clash).
+        assert!(
+            !bpl.contains(
+                "
+type T;"
+            ),
+            "module type parameter declared as a global type"
+        );
+        assert!(bpl.contains("function T_eq<T>(x: T, y: T) returns (bool);"));
+        assert!(bpl.contains("function T_less<T>(x: T, y: T) returns (bool);"));
+        assert!(bpl.contains("axiom (forall<T> x: T :: { T_eq(x, x) } T_eq(x, x));"));
+        assert!(bpl.contains("axiom (forall<T> x: T :: { T_less(x, x) } !T_less(x, x));"));
     }
 
     #[test]
@@ -16634,7 +16969,12 @@ end
         let bignat = stdlib.modules.iter().find(|m| m.name == "BIGNAT").unwrap();
         // size_matches, bounded_limbs + B.5b limbs_in_u64, no_zero_high_limb
         assert_eq!(bignat.invariants.len(), 4);
-        assert!(bignat.invariants.iter().any(|(tag, _)| tag == "no_zero_high_limb"));
+        assert!(
+            bignat
+                .invariants
+                .iter()
+                .any(|(tag, _)| tag == "no_zero_high_limb")
+        );
         assert!(
             bignat
                 .specify_routines
@@ -16666,11 +17006,33 @@ end
         let opt_mod = stdlib.modules.iter().find(|m| m.name == "OPTION").unwrap();
         let res_mod = stdlib.modules.iter().find(|m| m.name == "RESULT").unwrap();
 
-        let opt_diags = verify_module_phase3(opt_mod, phase4_stdlib_source(), "stdlib.gdl", 2, true, false, false);
-        assert!(opt_diags.is_empty(), "OPTION must verify with 0 errors, got: {opt_diags:?}");
+        let opt_diags = verify_module_phase3(
+            opt_mod,
+            phase4_stdlib_source(),
+            "stdlib.gdl",
+            2,
+            true,
+            false,
+            false,
+        );
+        assert!(
+            opt_diags.is_empty(),
+            "OPTION must verify with 0 errors, got: {opt_diags:?}"
+        );
 
-        let res_diags = verify_module_phase3(res_mod, phase4_stdlib_source(), "stdlib.gdl", 2, true, false, false);
-        assert!(res_diags.is_empty(), "RESULT must verify with 0 errors, got: {res_diags:?}");
+        let res_diags = verify_module_phase3(
+            res_mod,
+            phase4_stdlib_source(),
+            "stdlib.gdl",
+            2,
+            true,
+            false,
+            false,
+        );
+        assert!(
+            res_diags.is_empty(),
+            "RESULT must verify with 0 errors, got: {res_diags:?}"
+        );
 
         // Negative test: An invalid postcondition in RESULT (e.g. ok claims to be is_error) is caught by Z3
         let unsafe_src = r#"
@@ -16696,7 +17058,15 @@ feature {ANY}
 end
 "#;
         let unsafe_mod = parse_single_module(unsafe_src);
-        let diags = verify_module_phase3(&unsafe_mod, unsafe_src, "test_unsafe.gdl", 2, false, false, false);
+        let diags = verify_module_phase3(
+            &unsafe_mod,
+            unsafe_src,
+            "test_unsafe.gdl",
+            2,
+            false,
+            false,
+            false,
+        );
         assert!(
             !diags.is_empty(),
             "Invalid contract `bad_err` on `ok` must trigger a verification failure"
@@ -16711,17 +17081,58 @@ end
     fn test_step3_verified_functional_core_positive_and_refinement() {
         let stdlib = parse_phase4_stdlib().expect("stdlib parses cleanly");
         let seq_mod = stdlib.modules.iter().find(|m| m.name == "SEQ").unwrap();
-        let list_ops_mod = stdlib.modules.iter().find(|m| m.name == "LIST_OPS").unwrap();
-        let fn_ops_mod = stdlib.modules.iter().find(|m| m.name == "FUNCTION_OPS").unwrap();
+        let list_ops_mod = stdlib
+            .modules
+            .iter()
+            .find(|m| m.name == "LIST_OPS")
+            .unwrap();
+        let fn_ops_mod = stdlib
+            .modules
+            .iter()
+            .find(|m| m.name == "FUNCTION_OPS")
+            .unwrap();
 
-        let seq_diags = verify_module_phase3(seq_mod, phase4_stdlib_source(), "stdlib.gdl", 2, true, false, false);
-        assert!(seq_diags.is_empty(), "SEQ combinators & laws must verify with 0 errors, got: {seq_diags:?}");
+        let seq_diags = verify_module_phase3(
+            seq_mod,
+            phase4_stdlib_source(),
+            "stdlib.gdl",
+            2,
+            true,
+            false,
+            false,
+        );
+        assert!(
+            seq_diags.is_empty(),
+            "SEQ combinators & laws must verify with 0 errors, got: {seq_diags:?}"
+        );
 
-        let list_diags = verify_module_phase3(list_ops_mod, phase4_stdlib_source(), "stdlib.gdl", 2, true, false, false);
-        assert!(list_diags.is_empty(), "LIST_OPS combinators & laws must verify with 0 errors, got: {list_diags:?}");
+        let list_diags = verify_module_phase3(
+            list_ops_mod,
+            phase4_stdlib_source(),
+            "stdlib.gdl",
+            2,
+            true,
+            false,
+            false,
+        );
+        assert!(
+            list_diags.is_empty(),
+            "LIST_OPS combinators & laws must verify with 0 errors, got: {list_diags:?}"
+        );
 
-        let fn_diags = verify_module_phase3(fn_ops_mod, phase4_stdlib_source(), "stdlib.gdl", 2, true, false, false);
-        assert!(fn_diags.is_empty(), "FUNCTION_OPS combinators & pointwise laws must verify with 0 errors, got: {fn_diags:?}");
+        let fn_diags = verify_module_phase3(
+            fn_ops_mod,
+            phase4_stdlib_source(),
+            "stdlib.gdl",
+            2,
+            true,
+            false,
+            false,
+        );
+        assert!(
+            fn_diags.is_empty(),
+            "FUNCTION_OPS combinators & pointwise laws must verify with 0 errors, got: {fn_diags:?}"
+        );
     }
 
     #[test]
@@ -16779,7 +17190,15 @@ feature {ANY}
 end
 "#;
         let mutated_mod = parse_single_module(mutated_map_src);
-        let diags = verify_module_phase3(&mutated_mod, mutated_map_src, "test_mutant.gdl", 2, false, false, false);
+        let diags = verify_module_phase3(
+            &mutated_mod,
+            mutated_map_src,
+            "test_mutant.gdl",
+            2,
+            false,
+            false,
+            false,
+        );
         assert!(
             !diags.is_empty(),
             "Swapped recursive subtrees in map must fail model_map refinement postcondition"
@@ -16794,25 +17213,47 @@ end
     fn test_step3_parallel_fork_join_lowering() {
         let stdlib = parse_phase4_stdlib().expect("stdlib parses cleanly");
         let seq_mod = stdlib.modules.iter().find(|m| m.name == "SEQ").unwrap();
-        let map_routine = seq_mod.feature_routines.iter().find(|(_, r)| r.name == "map").unwrap();
+        let map_routine = seq_mod
+            .feature_routines
+            .iter()
+            .find(|(_, r)| r.name == "map")
+            .unwrap();
 
         if let Expr::Match(_, cases) = &map_routine.1.body {
-            let concat_case = cases.iter().find(|c| c.ctor() == "Concat").expect("Concat case");
+            let concat_case = cases
+                .iter()
+                .find(|c| c.ctor() == "Concat")
+                .expect("Concat case");
             let groups = analyze_parallel_lets(&concat_case.stmts);
             assert_eq!(groups.len(), 1, "Expected 1 parallel group in SEQ.map");
-            assert_eq!(groups[0].len(), 2, "Expected 2 independent let bindings (ml, mr) for parallel fork-join");
+            assert_eq!(
+                groups[0].len(),
+                2,
+                "Expected 2 independent let bindings (ml, mr) for parallel fork-join"
+            );
             assert_eq!(groups[0][0].0, "ml");
             assert_eq!(groups[0][1].0, "mr");
         } else {
             panic!("Expected match expression in SEQ.map");
         }
 
-        let filter_routine = seq_mod.feature_routines.iter().find(|(_, r)| r.name == "filter").unwrap();
+        let filter_routine = seq_mod
+            .feature_routines
+            .iter()
+            .find(|(_, r)| r.name == "filter")
+            .unwrap();
         if let Expr::Match(_, cases) = &filter_routine.1.body {
-            let concat_case = cases.iter().find(|c| c.ctor() == "Concat").expect("Concat case");
+            let concat_case = cases
+                .iter()
+                .find(|c| c.ctor() == "Concat")
+                .expect("Concat case");
             let groups = analyze_parallel_lets(&concat_case.stmts);
             assert_eq!(groups.len(), 1, "Expected 1 parallel group in SEQ.filter");
-            assert_eq!(groups[0].len(), 2, "Expected 2 independent let bindings (fl, fr) for parallel fork-join");
+            assert_eq!(
+                groups[0].len(),
+                2,
+                "Expected 2 independent let bindings (fl, fr) for parallel fork-join"
+            );
             assert_eq!(groups[0][0].0, "fl");
             assert_eq!(groups[0][1].0, "fr");
         } else {
@@ -16825,47 +17266,117 @@ end
         let stdlib = parse_phase4_stdlib().expect("stdlib parses cleanly");
 
         // 1. Verify standard concepts exist and refine correctly
-        let eq = stdlib.concepts.iter().find(|c| c.name == "EQ").expect("EQ concept exists");
+        let eq = stdlib
+            .concepts
+            .iter()
+            .find(|c| c.name == "EQ")
+            .expect("EQ concept exists");
         assert!(eq.refines.is_empty(), "EQ is base concept");
         assert!(eq.signatures.iter().any(|s| s.name == "equals"));
-        assert_eq!(eq.laws.len(), 3, "EQ must declare reflexive, symmetric, transitive");
+        assert_eq!(
+            eq.laws.len(),
+            3,
+            "EQ must declare reflexive, symmetric, transitive"
+        );
 
-        let canonical_eq = stdlib.concepts.iter().find(|c| c.name == "CANONICAL_EQ").expect("CANONICAL_EQ concept exists");
+        let canonical_eq = stdlib
+            .concepts
+            .iter()
+            .find(|c| c.name == "CANONICAL_EQ")
+            .expect("CANONICAL_EQ concept exists");
         assert_eq!(canonical_eq.refines, vec!["EQ".to_string()]);
-        assert!(canonical_eq.laws.iter().any(|l| l.name == "agrees_with_structural"));
+        assert!(
+            canonical_eq
+                .laws
+                .iter()
+                .any(|l| l.name == "agrees_with_structural")
+        );
 
-        let ord = stdlib.concepts.iter().find(|c| c.name == "ORD").expect("ORD concept exists");
+        let ord = stdlib
+            .concepts
+            .iter()
+            .find(|c| c.name == "ORD")
+            .expect("ORD concept exists");
         assert_eq!(ord.refines, vec!["EQ".to_string()]);
         assert!(ord.signatures.iter().any(|s| s.name == "less_than"));
-        assert!(ord.default_routines.iter().any(|r| r.name == "less_or_equal"));
+        assert!(
+            ord.default_routines
+                .iter()
+                .any(|r| r.name == "less_or_equal")
+        );
         assert!(ord.laws.iter().any(|l| l.name == "irreflexive"));
         assert!(ord.laws.iter().any(|l| l.name == "transitive"));
         assert!(ord.laws.iter().any(|l| l.name == "total"));
 
         // 2. Verify concept conformance declarations across stdlib
-        let seq_mod = stdlib.modules.iter().find(|m| m.name == "SEQ").expect("SEQ module exists");
+        let seq_mod = stdlib
+            .modules
+            .iter()
+            .find(|m| m.name == "SEQ")
+            .expect("SEQ module exists");
         let seq_sat = seq_mod.satisfies.as_ref().expect("SEQ satisfies clause");
         assert_eq!(seq_sat.concepts, vec!["EQ"]);
-        assert_eq!(seq_sat.where_constraints, vec![("A".to_string(), "CANONICAL_EQ".to_string())]);
+        assert_eq!(
+            seq_sat.where_constraints,
+            vec![("A".to_string(), "CANONICAL_EQ".to_string())]
+        );
 
-        let opt_mod = stdlib.modules.iter().find(|m| m.name == "OPTION").expect("OPTION module exists");
+        let opt_mod = stdlib
+            .modules
+            .iter()
+            .find(|m| m.name == "OPTION")
+            .expect("OPTION module exists");
         let opt_sat = opt_mod.satisfies.as_ref().expect("OPTION satisfies clause");
         assert_eq!(opt_sat.concepts, vec!["CANONICAL_EQ"]);
-        assert_eq!(opt_sat.where_constraints, vec![("A".to_string(), "CANONICAL_EQ".to_string())]);
+        assert_eq!(
+            opt_sat.where_constraints,
+            vec![("A".to_string(), "CANONICAL_EQ".to_string())]
+        );
 
-        let res_mod = stdlib.modules.iter().find(|m| m.name == "RESULT").expect("RESULT module exists");
+        let res_mod = stdlib
+            .modules
+            .iter()
+            .find(|m| m.name == "RESULT")
+            .expect("RESULT module exists");
         let res_sat = res_mod.satisfies.as_ref().expect("RESULT satisfies clause");
         assert_eq!(res_sat.concepts, vec!["CANONICAL_EQ"]);
-        assert_eq!(res_sat.where_constraints, vec![("E".to_string(), "CANONICAL_EQ".to_string()), ("A".to_string(), "CANONICAL_EQ".to_string())]);
+        assert_eq!(
+            res_sat.where_constraints,
+            vec![
+                ("E".to_string(), "CANONICAL_EQ".to_string()),
+                ("A".to_string(), "CANONICAL_EQ".to_string())
+            ]
+        );
 
-        let bignat_mod = stdlib.modules.iter().find(|m| m.name == "BIGNAT").expect("BIGNAT module exists");
-        let bignat_sat = bignat_mod.satisfies.as_ref().expect("BIGNAT satisfies clause");
+        let bignat_mod = stdlib
+            .modules
+            .iter()
+            .find(|m| m.name == "BIGNAT")
+            .expect("BIGNAT module exists");
+        let bignat_sat = bignat_mod
+            .satisfies
+            .as_ref()
+            .expect("BIGNAT satisfies clause");
         assert_eq!(bignat_sat.concepts, vec!["ORD"]);
-        assert!(bignat_mod.feature_routines.iter().any(|(_, r)| r.name == "less_or_equal"), "less_or_equal injected into BIGNAT");
+        assert!(
+            bignat_mod
+                .feature_routines
+                .iter()
+                .any(|(_, r)| r.name == "less_or_equal"),
+            "less_or_equal injected into BIGNAT"
+        );
 
         // 3. Verify Bird & Wadler algebraic law catalogue in LIST_OPS and FUNCTION_OPS
-        let list_ops = stdlib.modules.iter().find(|m| m.name == "LIST_OPS").expect("LIST_OPS module exists");
-        let list_laws: Vec<&str> = list_ops.specify_laws.iter().map(|(_, l)| l.name.as_str()).collect();
+        let list_ops = stdlib
+            .modules
+            .iter()
+            .find(|m| m.name == "LIST_OPS")
+            .expect("LIST_OPS module exists");
+        let list_laws: Vec<&str> = list_ops
+            .specify_laws
+            .iter()
+            .map(|(_, l)| l.name.as_str())
+            .collect();
         assert!(list_laws.contains(&"fold_left_append"));
         assert!(
             !list_laws.contains(&"fold_left_append_distributivity"),
@@ -16873,8 +17384,16 @@ end
         );
         assert!(list_laws.contains(&"fold_map_fusion"));
 
-        let fn_ops = stdlib.modules.iter().find(|m| m.name == "FUNCTION_OPS").expect("FUNCTION_OPS module exists");
-        let fn_laws: Vec<&str> = fn_ops.specify_laws.iter().map(|(_, l)| l.name.as_str()).collect();
+        let fn_ops = stdlib
+            .modules
+            .iter()
+            .find(|m| m.name == "FUNCTION_OPS")
+            .expect("FUNCTION_OPS module exists");
+        let fn_laws: Vec<&str> = fn_ops
+            .specify_laws
+            .iter()
+            .map(|(_, l)| l.name.as_str())
+            .collect();
         assert!(fn_laws.contains(&"compose_associative"));
         assert!(fn_laws.contains(&"compose_left_identity"));
         assert!(fn_laws.contains(&"compose_right_identity"));
@@ -16884,7 +17403,12 @@ end
         // 4. Verify all stdlib modules pass semantic & visibility checks
         for m in &stdlib.modules {
             let diags = check_visibility_and_semantics(m);
-            assert!(diags.is_empty(), "Module {} has semantic/visibility errors: {:?}", m.name, diags);
+            assert!(
+                diags.is_empty(),
+                "Module {} has semantic/visibility errors: {:?}",
+                m.name,
+                diags
+            );
         }
     }
 
@@ -16945,13 +17469,23 @@ specify {CANONICAL_EQ}
 end
 "#;
         let bad_mod = parse_single_module(bad_seq_src);
-        let diags = verify_module_phase3(&bad_mod, bad_seq_src, "test_bad_seq.gdl", 2, false, false, false);
+        let diags = verify_module_phase3(
+            &bad_mod,
+            bad_seq_src,
+            "test_bad_seq.gdl",
+            2,
+            false,
+            false,
+            false,
+        );
         assert!(
             !diags.is_empty(),
             "Observational sequence equivalence must fail CANONICAL_EQ.agrees_with_structural because structural equality does not match model equality"
         );
         assert!(
-            diags.iter().any(|d| d.tag.contains("sound") || d.tag.contains("agrees_with_structural")),
+            diags
+                .iter()
+                .any(|d| d.tag.contains("sound") || d.tag.contains("agrees_with_structural")),
             "Expected failure on sound postcondition of agrees_with_structural, got: {diags:?}"
         );
     }
@@ -17013,7 +17547,9 @@ end
             "Missing law proof for `total` in ORD must be rejected"
         );
         assert!(
-            diags.iter().any(|d| d.rule == "Phase 2 (Missing Law Proof)" && d.routine == "total" && d.tag == "ORD"),
+            diags.iter().any(|d| d.rule == "Phase 2 (Missing Law Proof)"
+                && d.routine == "total"
+                && d.tag == "ORD"),
             "Expected Phase 2 (Missing Law Proof) for `total`, got: {diags:?}"
         );
     }
@@ -17064,11 +17600,15 @@ end
             "Invalid type parameter and unknown concept in where constraints must be rejected"
         );
         assert!(
-            diags.iter().any(|d| d.rule == "Phase 2 (Invalid Type Constraint)" && d.routine == "B"),
+            diags
+                .iter()
+                .any(|d| d.rule == "Phase 2 (Invalid Type Constraint)" && d.routine == "B"),
             "Expected Invalid Type Constraint for undeclared B, got: {diags:?}"
         );
         assert!(
-            diags.iter().any(|d| d.rule == "Phase 2 (Unknown Concept)" && d.tag == "NONEXISTENT_CONCEPT"),
+            diags
+                .iter()
+                .any(|d| d.rule == "Phase 2 (Unknown Concept)" && d.tag == "NONEXISTENT_CONCEPT"),
             "Expected Unknown Concept for NONEXISTENT_CONCEPT, got: {diags:?}"
         );
     }
@@ -17098,7 +17638,9 @@ end
             "Expected concat_associative in relevant lemmas, got: {lemmas:?}"
         );
         assert!(
-            lemmas.iter().any(|l| l.contains("concat_length_homomorphism")),
+            lemmas
+                .iter()
+                .any(|l| l.contains("concat_length_homomorphism")),
             "Expected concat_length_homomorphism in relevant lemmas, got: {lemmas:?}"
         );
 
@@ -17155,7 +17697,11 @@ end
         );
         let fold_lemmas = find_relevant_lemmas(seq_mod, "test_routine", &fold_goal);
         assert!(fold_lemmas.contains(&"law LIST_OPS.fold_left_append.chains".to_string()));
-        assert!(!fold_lemmas.iter().any(|l| l.contains("fold_left_append_distributivity")));
+        assert!(
+            !fold_lemmas
+                .iter()
+                .any(|l| l.contains("fold_left_append_distributivity"))
+        );
         assert!(fold_lemmas.contains(&"law LIST_OPS.fold_map_fusion.fused".to_string()));
 
         // 7. Goal with compose should surface Combinator laws
@@ -17166,7 +17712,9 @@ end
         );
         let comp_lemmas = find_relevant_lemmas(seq_mod, "test_routine", &comp_goal);
         assert!(comp_lemmas.contains(&"law FUNCTION_OPS.compose_associative.assoc".to_string()));
-        assert!(comp_lemmas.contains(&"law FUNCTION_OPS.compose_left_identity.left_id".to_string()));
+        assert!(
+            comp_lemmas.contains(&"law FUNCTION_OPS.compose_left_identity.left_id".to_string())
+        );
 
         // 8. Filter-only goal does not pollute with OPTION/RESULT map laws
         let filter_goal = Expr::MethodCall(
@@ -17215,7 +17763,13 @@ end
         );
         let expanded = expand_law_call_in_expr(&law_call_expr, seq_mod)
             .expect("SEQ.concat_associative(a, b, c) must expand to its ensure predicate");
-        let bpl = emit_boogie_expr(&expanded, seq_mod, &HashSet::new(), &HashSet::new(), "DefaultFuel");
+        let bpl = emit_boogie_expr(
+            &expanded,
+            seq_mod,
+            &HashSet::new(),
+            &HashSet::new(),
+            "DefaultFuel",
+        );
         assert!(bpl.contains("fn_equals") && bpl.contains("fn_concat"));
 
         // 12. RFC 8259 control character escaping in JSON diagnostics
@@ -17267,7 +17821,8 @@ end
         assert!(bpl.contains("checked::require::valid_scalar"));
         assert!(bpl.contains("guarded::require::valid_scalar"));
 
-        let is_violation = |d: &Diagnostic, routine: &str| d.routine == routine && d.tag == "valid_scalar";
+        let is_violation =
+            |d: &Diagnostic, routine: &str| d.routine == routine && d.tag == "valid_scalar";
         // Formal (Boogie) path, falling back to bounded sampling when no solver is installed.
         let diags = verify_module_phase3(&m, FROM_SCALAR_SRC, "scalar.gdl", 2, true, false, false);
         assert!(
@@ -17278,8 +17833,14 @@ end
             diags.iter().any(|d| is_violation(d, "surrogate")),
             "surrogate code point 0xD800 passed to CHAR.from_scalar must be rejected, got {diags:?}"
         );
-        assert!(!diags.iter().any(|d| d.routine == "checked"), "got {diags:?}");
-        assert!(!diags.iter().any(|d| d.routine == "guarded"), "got {diags:?}");
+        assert!(
+            !diags.iter().any(|d| d.routine == "checked"),
+            "got {diags:?}"
+        );
+        assert!(
+            !diags.iter().any(|d| d.routine == "guarded"),
+            "got {diags:?}"
+        );
 
         // Bounded symbolic evaluator path.
         let sym = verify_module_phase3(&m, FROM_SCALAR_SRC, "scalar.gdl", 2, true, false, true);
@@ -17300,7 +17861,10 @@ end
             !bpl.contains("fn_decode_utf8(_fuel, Current, bs) == bs"),
             "hard-coded decode_utf8 identity axiom must not be emitted"
         );
-        for line in bpl.lines().filter(|l| l.starts_with("axiom") && l.contains(":: { fn_decode_utf8(")) {
+        for line in bpl
+            .lines()
+            .filter(|l| l.starts_with("axiom") && l.contains(":: { fn_decode_utf8("))
+        {
             assert!(
                 line.contains("fn_all_bytes_valid") || line.contains("_c1"),
                 "every decode_utf8 axiom must be its guarded definition/contract or receiver independence: {line}"
@@ -17318,10 +17882,26 @@ end
             .unwrap();
         assert!(decode.requires.iter().any(|(t, _)| t == "ascii"));
         assert!(decode.ensures.iter().any(|(t, _)| t == "same_length"));
-        assert!(str_mod.specify_laws.iter().any(|(_, l)| l.name == "decode_injective"));
+        assert!(
+            str_mod
+                .specify_laws
+                .iter()
+                .any(|(_, l)| l.name == "decode_injective")
+        );
 
-        let diags = verify_module_phase3(str_mod, phase4_stdlib_source(), "stdlib.gdl", 2, true, false, false);
-        assert!(diags.is_empty(), "STRING must verify without the decode axiom, got {diags:?}");
+        let diags = verify_module_phase3(
+            str_mod,
+            phase4_stdlib_source(),
+            "stdlib.gdl",
+            2,
+            true,
+            false,
+            false,
+        );
+        assert!(
+            diags.is_empty(),
+            "STRING must verify without the decode axiom, got {diags:?}"
+        );
     }
 
     #[test]
@@ -17346,8 +17926,20 @@ end
                 "{name}.equals must not export an unconditional `sound` clause:\n{iface}"
             );
             // Structural agreement survives only as the CANONICAL_EQ law, and still verifies.
-            assert!(m.specify_laws.iter().any(|(_, l)| l.name == "agrees_with_structural"));
-            let diags = verify_module_phase3(m, phase4_stdlib_source(), "stdlib.gdl", 2, true, false, false);
+            assert!(
+                m.specify_laws
+                    .iter()
+                    .any(|(_, l)| l.name == "agrees_with_structural")
+            );
+            let diags = verify_module_phase3(
+                m,
+                phase4_stdlib_source(),
+                "stdlib.gdl",
+                2,
+                true,
+                false,
+                false,
+            );
             assert!(diags.is_empty(), "{name} must verify, got {diags:?}");
         }
     }
@@ -17418,7 +18010,11 @@ end
         for c in &ast.concepts {
             cmap.insert(c.name.clone(), c.clone());
         }
-        let idx = ast.modules.iter().position(|m| m.name == name).expect("module present");
+        let idx = ast
+            .modules
+            .iter()
+            .position(|m| m.name == name)
+            .expect("module present");
         let mut m = ast.modules.swap_remove(idx);
         let _ = check_and_expand_concepts(&mut m, &cmap);
         m
@@ -17429,7 +18025,11 @@ end
         let base = phase4_stdlib_source();
         // Positive control: the shipped BIGNAT (limb-wise equals/less_than) verifies.
         let good = parse_stdlib_module_from(base, "BIGNAT");
-        assert!(good.invariants.iter().any(|(t, _)| t == "no_zero_high_limb"));
+        assert!(
+            good.invariants
+                .iter()
+                .any(|(t, _)| t == "no_zero_high_limb")
+        );
         let diags = verify_module_phase3(&good, base, "stdlib.gdl", 2, true, false, false);
         assert!(diags.is_empty(), "BIGNAT must verify, got {diags:?}");
 
@@ -17463,7 +18063,10 @@ end
         );
         let ok = parse_stdlib_module_from(&ok_src, "BIGNAT");
         let diags = verify_module_phase3(&ok, &ok_src, "stdlib.gdl", 2, true, false, false);
-        assert!(diags.is_empty(), "normalized single-limb construction must verify, got {diags:?}");
+        assert!(
+            diags.is_empty(),
+            "normalized single-limb construction must verify, got {diags:?}"
+        );
 
         // shift_in_low_limb(0) on a zero BIGNAT would build [0]; its precondition forbids it.
         let anchor = "feature {NONE}\n\n  compare_limbs";
@@ -17562,7 +18165,11 @@ end
         let mut parser = Parser::new(tokens);
         let mut ast = parser.parse_file().expect("parsing should succeed");
         let mut cmap = HashMap::new();
-        for c in standard_prelude().concepts.iter().chain(ast.concepts.iter()) {
+        for c in standard_prelude()
+            .concepts
+            .iter()
+            .chain(ast.concepts.iter())
+        {
             cmap.insert(c.name.clone(), c.clone());
         }
         let mut m = ast.modules.pop().expect("expected one module");
@@ -17572,7 +18179,7 @@ end
 
     #[test]
     fn test_b1_prelude_injection_verifies_user_module() {
-        assert!(prelude_mode_enabled(false, false, B1_PRELUDE_CLIENT));
+        assert!(prelude_mode_enabled(false, false));
         let m = parse_user_module_with_prelude(B1_PRELUDE_CLIENT);
         let bpl = with_prelude_injection(true, || emit_boogie(&m, DEFAULT_FUEL));
 
@@ -17590,16 +18197,38 @@ end
             assert!(bpl.contains(sym), "injected context must contain `{sym}`");
         }
         // ... but no prelude obligation is re-proven: only the user's own procedures exist.
-        let procs: Vec<&str> = bpl.lines().filter(|l| l.starts_with("procedure ")).collect();
-        assert_eq!(procs.len(), m.feature_routines.len(), "procedures: {procs:?}");
+        let procs: Vec<&str> = bpl
+            .lines()
+            .filter(|l| l.starts_with("procedure "))
+            .collect();
+        assert_eq!(
+            procs.len(),
+            m.feature_routines.len(),
+            "procedures: {procs:?}"
+        );
         for (_, r) in &m.feature_routines {
-            assert!(procs.iter().any(|p| p.starts_with(&format!("procedure Verify_{}(", r.name))));
+            assert!(
+                procs
+                    .iter()
+                    .any(|p| p.starts_with(&format!("procedure Verify_{}(", r.name)))
+            );
         }
 
         let diags = with_prelude_injection(true, || {
-            verify_module_phase3(&m, B1_PRELUDE_CLIENT, "prelude_client.gdl", DEFAULT_FUEL, true, false, false)
+            verify_module_phase3(
+                &m,
+                B1_PRELUDE_CLIENT,
+                "prelude_client.gdl",
+                DEFAULT_FUEL,
+                true,
+                false,
+                false,
+            )
         });
-        assert!(diags.is_empty(), "prelude client must verify with 0 errors, got: {diags:?}");
+        assert!(
+            diags.is_empty(),
+            "prelude client must verify with 0 errors, got: {diags:?}"
+        );
     }
 
     #[test]
@@ -17611,14 +18240,26 @@ end
             .replace("is_v: Result = v", "is_v: Result = d");
         let m = parse_user_module_with_prelude(&src);
         let diags = with_prelude_injection(true, || {
-            verify_module_phase3(&m, &src, "prelude_client_bad.gdl", DEFAULT_FUEL, true, false, false)
+            verify_module_phase3(
+                &m,
+                &src,
+                "prelude_client_bad.gdl",
+                DEFAULT_FUEL,
+                true,
+                false,
+                false,
+            )
         });
         assert!(
-            diags.iter().any(|d| d.routine == "safe_get" && d.tag == "present"),
+            diags
+                .iter()
+                .any(|d| d.routine == "safe_get" && d.tag == "present"),
             "missing prelude precondition must be reported, got: {diags:?}"
         );
         assert!(
-            diags.iter().any(|d| d.routine == "extract" && d.tag == "is_v"),
+            diags
+                .iter()
+                .any(|d| d.routine == "extract" && d.tag == "is_v"),
             "false postcondition must be reported, got: {diags:?}"
         );
         assert_eq!(diags.len(), 2, "no other failures expected, got: {diags:?}");
@@ -17626,15 +18267,25 @@ end
 
     #[test]
     fn test_b1_no_prelude_leaves_prelude_symbols_unknown() {
-        assert!(!prelude_mode_enabled(false, true, B1_PRELUDE_CLIENT));
+        assert!(!prelude_mode_enabled(false, true));
         let m = parse_user_module_with_prelude(B1_PRELUDE_CLIENT);
         let bpl = with_prelude_injection(false, || emit_boogie(&m, DEFAULT_FUEL));
         assert!(!bpl.contains("OPTION__") && !bpl.contains("type OPTION"));
         let diags = with_prelude_injection(false, || {
-            verify_module_phase3(&m, B1_PRELUDE_CLIENT, "prelude_client.gdl", DEFAULT_FUEL, true, false, false)
+            verify_module_phase3(
+                &m,
+                B1_PRELUDE_CLIENT,
+                "prelude_client.gdl",
+                DEFAULT_FUEL,
+                true,
+                false,
+                false,
+            )
         });
         assert!(
-            diags.iter().any(|d| d.message.contains("undeclared type: OPTION")),
+            diags
+                .iter()
+                .any(|d| d.message.contains("undeclared type: OPTION")),
             "under --no-prelude, OPTION must be an unknown symbol, got: {diags:?}"
         );
     }
@@ -17645,39 +18296,73 @@ end
         let ast = Parser::new(tokenize(src).unwrap()).parse_file().unwrap();
         let diags = check_prelude_collisions(&ast, src, "dup.gdl");
         assert_eq!(diags.len(), 2, "got: {diags:?}");
-        assert!(diags.iter().all(|d| d.level == "error" && d.rule.starts_with("E0101")));
-        let opt = diags.iter().find(|d| d.routine == "OPTION").expect("OPTION collision");
+        assert!(
+            diags
+                .iter()
+                .all(|d| d.level == "error" && d.rule.starts_with("E0101"))
+        );
+        let opt = diags
+            .iter()
+            .find(|d| d.routine == "OPTION")
+            .expect("OPTION collision");
         assert_eq!(opt.tag, "duplicate_prelude_symbol");
         assert_eq!(opt.span.as_ref().map(|s| s.line), Some(1));
-        let eq = diags.iter().find(|d| d.routine == "EQ").expect("EQ collision");
+        let eq = diags
+            .iter()
+            .find(|d| d.routine == "EQ")
+            .expect("EQ collision");
         assert_eq!(eq.span.as_ref().map(|s| s.line), Some(9));
         // A user file without collisions is accepted.
-        let ok = Parser::new(tokenize(B1_PRELUDE_CLIENT).unwrap()).parse_file().unwrap();
+        let ok = Parser::new(tokenize(B1_PRELUDE_CLIENT).unwrap())
+            .parse_file()
+            .unwrap();
         assert!(check_prelude_collisions(&ok, B1_PRELUDE_CLIENT, "ok.gdl").is_empty());
     }
 
     #[test]
     fn test_b1_stdlib_bootstrap_is_not_double_injected() {
-        // `--stdlib` and the prelude source itself always compile in bootstrap mode.
-        assert!(!prelude_mode_enabled(true, false, phase4_stdlib_source()));
-        assert!(!prelude_mode_enabled(false, false, phase4_stdlib_source()));
-        assert!(is_standard_prelude_source(&phase4_stdlib_source().replace('\n', "\r\n")));
+        // `--stdlib` (which files of the stdlib tree switch on) compiles in bootstrap mode.
+        assert!(!prelude_mode_enabled(true, false));
+        assert!(prelude_mode_enabled(false, false));
+        // Stdlib files are recognized by location, not text: an edited one still is one, and a
+        // user file with the same text elsewhere is not.
+        let tree = stdlib_source_dir();
+        for (rel, _) in STDLIB_SOURCES {
+            let f = tree.join(rel.strip_prefix("stdlib/").unwrap());
+            assert!(path_in_stdlib_tree(&f.to_string_lossy()), "{rel} must be in the stdlib tree");
+        }
+        assert!(!path_in_stdlib_tree(concat!(env!("CARGO_MANIFEST_DIR"), "/../examples/greeter.gdl")));
         // Even with injection forced on, prelude modules are emitted exactly as in bootstrap
         // mode (no self-injection, no namespaced duplicates).
         let stdlib = parse_phase4_stdlib().expect("stdlib parses");
         for m in &stdlib.modules {
             let plain = with_prelude_injection(false, || emit_boogie(m, DEFAULT_FUEL));
             let forced = with_prelude_injection(true, || emit_boogie(m, DEFAULT_FUEL));
-            assert_eq!(plain, forced, "prelude module {} must not be re-injected", m.name);
+            assert_eq!(
+                plain, forced,
+                "prelude module {} must not be re-injected",
+                m.name
+            );
             assert!(!plain.contains(&format!("{}__", m.name)));
         }
         // Bootstrap verification of the prelude still succeeds with 0 diagnostics.
         for name in ["OPTION", "SEQ"] {
             let m = stdlib.modules.iter().find(|m| m.name == name).unwrap();
             let diags = with_prelude_injection(true, || {
-                verify_module_phase3(m, phase4_stdlib_source(), "<phase4_stdlib.gdl>", DEFAULT_FUEL, true, false, false)
+                verify_module_phase3(
+                    m,
+                    phase4_stdlib_source(),
+                    "<phase4_stdlib.gdl>",
+                    DEFAULT_FUEL,
+                    true,
+                    false,
+                    false,
+                )
             });
-            assert!(diags.is_empty(), "{name} must verify in bootstrap mode, got: {diags:?}");
+            assert!(
+                diags.is_empty(),
+                "{name} must verify in bootstrap mode, got: {diags:?}"
+            );
         }
     }
 
@@ -17749,8 +18434,13 @@ end
         assert!(!bpl.contains("const unique str_lit_0: GardelString;"));
         // The only per-literal axioms are definitions by verified prelude constructors.
         let strings = collect_module_strings(&m);
-        let hi = strings.iter().position(|s| s == "hi").expect("literal collected");
-        assert!(bpl.contains(&format!("axiom str_lit_{hi}_s0 == STRING__fn_make_empty(DefaultFuel, 2);")));
+        let hi = strings
+            .iter()
+            .position(|s| s == "hi")
+            .expect("literal collected");
+        assert!(bpl.contains(&format!(
+            "axiom str_lit_{hi}_s0 == STRING__fn_make_empty(DefaultFuel, 2);"
+        )));
         assert!(bpl.contains(&format!(
             "axiom str_lit_{hi}_s1 == STRING__fn_push_ascii(DefaultFuel, str_lit_{hi}_s0, 105);"
         )));
@@ -17762,7 +18452,9 @@ end
             .filter(|l| l.starts_with("axiom") && !l.contains("forall") && l.contains("str_lit_"))
         {
             assert!(
-                line.starts_with("axiom str_lit_") && !line.contains("chars") && !line.contains("Invariant"),
+                line.starts_with("axiom str_lit_")
+                    && !line.contains("chars")
+                    && !line.contains("Invariant"),
                 "unexpected trusted literal fact: {line}"
             );
         }
@@ -17773,7 +18465,10 @@ end
         )));
 
         let (_, diags) = verify_with_prelude(B3_LITERAL_CLIENT, "literal_client.gdl");
-        assert!(diags.is_empty(), "literal client must verify, got: {diags:?}");
+        assert!(
+            diags.is_empty(),
+            "literal client must verify, got: {diags:?}"
+        );
     }
 
     #[test]
@@ -17781,9 +18476,18 @@ end
         // Wrong models / lengths / equalities about literals must be rejected (one false
         // clause per routine: Boogie reports the first failing assertion of a procedure).
         let src = B3_LITERAL_CLIENT
-            .replace("bytes: Result.byte_length = 2", "bytes: Result.byte_length = 3")
-            .replace("no_chars: Result.chars = LIST.empty", "no_chars: Result.chars = LIST.empty.prepend(' ')")
-            .replace("differs: not Result.equals(\"hi\")", "differs: Result.equals(\"hi\")")
+            .replace(
+                "bytes: Result.byte_length = 2",
+                "bytes: Result.byte_length = 3",
+            )
+            .replace(
+                "no_chars: Result.chars = LIST.empty",
+                "no_chars: Result.chars = LIST.empty.prepend(' ')",
+            )
+            .replace(
+                "differs: not Result.equals(\"hi\")",
+                "differs: Result.equals(\"hi\")",
+            )
             .replace(
                 "by_chars: Result = (s.chars = LIST.empty.prepend('i').prepend('h'))",
                 "by_chars: Result = (s.chars = LIST.empty.prepend('h').prepend('i'))",
@@ -17805,7 +18509,8 @@ end
     #[test]
     fn test_b3_literal_lexing_and_validation() {
         // Escapes are decoded at compile time.
-        let toks = tokenize(r#""a\"\\\n\t\r\0\u{41}\u{7F}" '\u{1F980}' '\'' '"'"#).expect("valid literals");
+        let toks = tokenize(r#""a\"\\\n\t\r\0\u{41}\u{7F}" '\u{1F980}' '\'' '"'"#)
+            .expect("valid literals");
         assert_eq!(toks[0], Token::Str("a\"\\\n\t\r\0A\u{7F}".to_string()));
         assert_eq!(toks[1], Token::Char('\u{1F980}'));
         assert_eq!(toks[2], Token::Char('\''));
@@ -17814,13 +18519,19 @@ end
         // Non-ASCII scalars (raw or escaped) cannot be represented by the bootstrap STRING.
         for src in ["\"caf\u{E9}\"", r#""\u{E9}""#, "\"\u{1F980}\""] {
             let err = tokenize(src).expect_err("non-ASCII literal must be rejected");
-            assert!(err.message.starts_with("E0303: non_ascii_string_literal"), "{err}");
+            assert!(
+                err.message.starts_with("E0303: non_ascii_string_literal"),
+                "{err}"
+            );
             assert!(err.message.contains("Task C.2"), "{err}");
         }
         // Surrogates are not scalar values (in strings and chars).
         for src in [r#""\u{D800}""#, r#"'\u{DFFF}'"#] {
             let err = tokenize(src).expect_err("surrogate must be rejected");
-            assert!(err.message.starts_with("E0304: surrogate_in_literal"), "{err}");
+            assert!(
+                err.message.starts_with("E0304: surrogate_in_literal"),
+                "{err}"
+            );
         }
         // Malformed escapes.
         for src in [
@@ -17835,7 +18546,10 @@ end
             r#"'\q'"#,
         ] {
             let err = tokenize(src).expect_err("malformed escape must be rejected");
-            assert!(err.message.starts_with("E0302: malformed_escape_sequence"), "{src}: {err}");
+            assert!(
+                err.message.starts_with("E0302: malformed_escape_sequence"),
+                "{src}: {err}"
+            );
         }
         // Raw line breaks are not allowed inside a string literal (§15).
         let err = tokenize("\"ab\ncd\"").expect_err("raw newline must be rejected");
@@ -17845,24 +18559,39 @@ end
     #[test]
     fn test_b3_structural_string_equality_and_plus_are_rejected() {
         let src = B3_LITERAL_CLIENT
-            .replace("same_text: Result.equals(\"hi\")", "same_text: Result = \"hi\"")
+            .replace(
+                "same_text: Result.equals(\"hi\")",
+                "same_text: Result = \"hi\"",
+            )
             .replace("      s.equals(\"hi\")\n", "      s = \"hi\"\n");
         let (_, diags) = verify_with_prelude(&src, "literal_client_eq.gdl");
         assert!(
-            diags.iter().any(|d| d.routine == "greeting" && d.rule.starts_with("E0311")),
+            diags
+                .iter()
+                .any(|d| d.routine == "greeting" && d.rule.starts_with("E0311")),
             "Result = \"hi\" must be rejected, got: {diags:?}"
         );
         assert!(
-            diags.iter().any(|d| d.routine == "is_hi" && d.rule.starts_with("E0311")),
+            diags
+                .iter()
+                .any(|d| d.routine == "is_hi" && d.rule.starts_with("E0311")),
             "s = \"hi\" must be rejected, got: {diags:?}"
         );
         // `chars` (a LIST, canonical) may be compared with `=`: no diagnostic for `by_chars`.
-        assert!(diags.iter().all(|d| d.rule.starts_with("E0311")), "got: {diags:?}");
+        assert!(
+            diags.iter().all(|d| d.rule.starts_with("E0311")),
+            "got: {diags:?}"
+        );
 
-        let plus = B3_LITERAL_CLIENT.replace("      \"hi\"\n    ensure", "      \"h\" + \"i\"\n    ensure");
+        let plus = B3_LITERAL_CLIENT.replace(
+            "      \"hi\"\n    ensure",
+            "      \"h\" + \"i\"\n    ensure",
+        );
         let (_, diags) = verify_with_prelude(&plus, "literal_client_plus.gdl");
         assert!(
-            diags.iter().any(|d| d.routine == "greeting" && d.rule.starts_with("E0312")),
+            diags
+                .iter()
+                .any(|d| d.routine == "greeting" && d.rule.starts_with("E0312")),
             "string + must be rejected, got: {diags:?}"
         );
     }
@@ -17875,14 +18604,40 @@ end
         let strings = collect_module_strings(&m);
         let a = strings.iter().position(|s| s == "Hi\n").unwrap();
         let b = strings.iter().position(|s| s == "Hi").unwrap();
-        assert!(c.contains(&format!("static const uint8_t gardel_str_lit_{a}[4] = {{ 72, 105, 10, 0 }};")), "{c}");
-        assert!(c.contains(&format!("static const uint8_t gardel_str_lit_{b}[3] = {{ 72, 105, 0 }};")), "{c}");
-        assert!(c.contains(&format!("gardel_io_print(string_from_utf8(gardel_str_lit_{a}, 3ULL))")), "{c}");
-        assert!(c.contains(&format!("gardel_io_print_line(string_from_utf8(gardel_str_lit_{b}, 2ULL))")), "{c}");
+        assert!(
+            c.contains(&format!(
+                "static const uint8_t gardel_str_lit_{a}[4] = {{ 72, 105, 10, 0 }};"
+            )),
+            "{c}"
+        );
+        assert!(
+            c.contains(&format!(
+                "static const uint8_t gardel_str_lit_{b}[3] = {{ 72, 105, 0 }};"
+            )),
+            "{c}"
+        );
+        assert!(
+            c.contains(&format!(
+                "gardel_io_print(string_from_utf8(gardel_str_lit_{a}, 3ULL))"
+            )),
+            "{c}"
+        );
+        assert!(
+            c.contains(&format!(
+                "gardel_io_print_line(string_from_utf8(gardel_str_lit_{b}, 2ULL))"
+            )),
+            "{c}"
+        );
         // The runtime constructor wraps the static buffer: no allocation, no decoding.
-        let ctor = c.split("static inline GardelString string_from_utf8(").nth(1).unwrap();
+        let ctor = c
+            .split("static inline GardelString string_from_utf8(")
+            .nth(1)
+            .unwrap();
         let ctor = &ctor[..ctor.find('}').unwrap()];
-        assert!(!ctor.contains("alloc") && !ctor.contains("memcpy"), "{ctor}");
+        assert!(
+            !ctor.contains("alloc") && !ctor.contains("memcpy"),
+            "{ctor}"
+        );
         // The program body is lowered from the source (no canned template).
         assert!(c.contains("return (int)main_routine(NULL);"));
         assert!(!c.contains("Hello, %s"));
@@ -17962,7 +18717,9 @@ end
             .iter()
             .map(|(path, src)| {
                 let tokens = tokenize(src).expect("lexing should succeed");
-                let ast = Parser::new(tokens).parse_file().expect("parsing should succeed");
+                let ast = Parser::new(tokens)
+                    .parse_file()
+                    .expect("parsing should succeed");
                 SourceUnit {
                     path: path.to_string(),
                     src: src.to_string(),
@@ -18015,7 +18772,10 @@ end
                 "the callee precondition must be asserted at the call site"
             );
             assert!(!bpl.contains("procedure Verify_make"));
-            assert_eq!(bpl.lines().filter(|l| l.starts_with("procedure ")).count(), 2);
+            assert_eq!(
+                bpl.lines().filter(|l| l.starts_with("procedure ")).count(),
+                2
+            );
         }
     }
 
@@ -18026,8 +18786,11 @@ end
             .replace("Result.current_value = 5", "Result.current_value = 500");
         let mut units = b4_units(&[("counter.gdl", B4_COUNTER), ("client.gdl", &bad)]);
         let checked = check_and_verify_project(&mut units, b4_opts(true, true));
-        let errs: Vec<&(usize, Diagnostic)> =
-            checked.diags.iter().filter(|(_, d)| d.level == "error").collect();
+        let errs: Vec<&(usize, Diagnostic)> = checked
+            .diags
+            .iter()
+            .filter(|(_, d)| d.level == "error")
+            .collect();
         assert_eq!(errs.len(), 1, "got {:?}", checked.diags);
         let (ui, d) = errs[0];
         assert_eq!(*ui, 1);
@@ -18036,7 +18799,10 @@ end
         assert_eq!(d.tag, "small_start");
         assert_eq!(d.module_name, "CLIENT");
         assert_eq!(d.span.as_ref().unwrap().file, "client.gdl");
-        assert!(d.to_json("CLIENT", "client.gdl").contains("\"file\": \"client.gdl\""));
+        assert!(
+            d.to_json("CLIENT", "client.gdl")
+                .contains("\"file\": \"client.gdl\"")
+        );
     }
 
     #[test]
@@ -18049,7 +18815,11 @@ end
         assert_eq!(diags[0].level, "error");
         let sp = diags[0].span.as_ref().unwrap();
         assert_eq!((sp.file.as_str(), sp.line), ("other/counter.gdl", 1));
-        assert!(diags[0].message.contains("already declared in `counter.gdl`"));
+        assert!(
+            diags[0]
+                .message
+                .contains("already declared in `counter.gdl`")
+        );
         // Distinct names: no E0102.
         let units = b4_units(&[("counter.gdl", B4_COUNTER), ("client.gdl", B4_CLIENT)]);
         assert!(check_project_namespace(&units, true).is_empty());
@@ -18078,8 +18848,10 @@ end
         assert_eq!(to_snake_case("BoundedStack"), "bounded_stack");
 
         // Emitted by a project run; as a warning it does not fail the run.
-        let mut units =
-            b4_units(&[("src/main_client.gdl", B4_CLIENT), ("src/counter.gdl", B4_COUNTER)]);
+        let mut units = b4_units(&[
+            ("src/main_client.gdl", B4_CLIENT),
+            ("src/counter.gdl", B4_COUNTER),
+        ]);
         let checked = check_and_verify_project(&mut units, b4_opts(true, false));
         let rules: Vec<&str> = checked.diags.iter().map(|(_, d)| d.rule).collect();
         assert_eq!(rules, vec!["W0201: file_module_name_mismatch"]);
@@ -18091,7 +18863,10 @@ end
         let pong = "functions PONG\nfeature {ANY}\n  pong(n: NAT): NAT\n    do\n      PING.ping(n)\n    end\nend\n";
         let mut units = b4_units(&[("ping.gdl", ping), ("pong.gdl", pong)]);
         let checked = check_and_verify_project(&mut units, b4_opts(true, true));
-        assert!(checked.diags.is_empty(), "nothing is verified when the link graph is cyclic");
+        assert!(
+            checked.diags.is_empty(),
+            "nothing is verified when the link graph is cyclic"
+        );
         assert_eq!(checked.fatal.len(), 1);
         assert_eq!(checked.fatal[0].rule, "E0103: cyclic_module_dependency");
         assert_eq!(checked.fatal[0].span.as_ref().unwrap().file, "ping.gdl");
@@ -18105,10 +18880,18 @@ end
         let checked = check_and_verify_project(&mut units, b4_opts(false, true));
         assert!(checked.link.is_none());
         assert!(checked.diags.is_empty(), "got {:?}", checked.diags);
-        let args: Vec<String> = ["gardelc", "a.gdl", "--fuel", "3", "--inspect", "STACK", "--strict"]
-            .iter()
-            .map(|s| s.to_string())
-            .collect();
+        let args: Vec<String> = [
+            "gardelc",
+            "a.gdl",
+            "--fuel",
+            "3",
+            "--inspect",
+            "STACK",
+            "--strict",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
         assert_eq!(input_operands(&args), vec!["a.gdl".to_string()]);
         let (files, project) = resolve_input_operands(&["a.gdl".to_string()]).unwrap();
         assert_eq!((files, project), (vec!["a.gdl".to_string()], false));
@@ -18117,14 +18900,15 @@ end
         assert!(!wildcard_match("*.gdl", "notes.txt"));
     }
 
-
     // ---------------------------------------------------------------------------------
     // Soundness regressions (review of Phase B, items 1-3 + inductive law proofs).
     // ---------------------------------------------------------------------------------
 
     fn soundness_verify(src: &str, file: &str) -> Vec<Diagnostic> {
         let m = parse_user_module_with_prelude(src);
-        with_prelude_injection(true, || verify_module_phase3(&m, src, file, DEFAULT_FUEL, true, false, false))
+        with_prelude_injection(true, || {
+            verify_module_phase3(&m, src, file, DEFAULT_FUEL, true, false, false)
+        })
     }
 
     #[test]
@@ -18141,13 +18925,18 @@ end
         );
         let diags = soundness_verify(src, "badeq.gdl");
         assert!(
-            diags.iter().any(|d| d.routine == "EQ_reflexive" && d.tag == "refl"),
+            diags
+                .iter()
+                .any(|d| d.routine == "EQ_reflexive" && d.tag == "refl"),
             "non-reflexive equals must fail EQ.reflexive, got: {diags:?}"
         );
         // Clients still receive the (separately verified) prelude concept axioms.
         let client = "functions USES_OPT\n\nfeature {ANY}\n\n  refl(o: OPTION[U64]): BOOL\n    do\n      o.equals(o)\n    ensure\n      holds: Result\n    end\n\nend\n";
         let diags = soundness_verify(client, "uses_opt.gdl");
-        assert!(diags.is_empty(), "client use of prelude reflexivity must verify, got: {diags:?}");
+        assert!(
+            diags.is_empty(),
+            "client use of prelude reflexivity must verify, got: {diags:?}"
+        );
     }
 
     #[test]
@@ -18160,20 +18949,34 @@ end
         let src = "functions OPTSEQ\n\nfeature {ANY}\n\n  wrap_differs(s1: SEQ[U64], s2: SEQ[U64]): BOOL\n    require\n      behaviourally_equal: s1.equals(s2)\n      different_shape: not (s1 = s2)\n    do\n      Some(s1).equals(Some(s2))\n    ensure\n      claims_unequal: Result = False\n    end\n\nend\n";
         let diags = soundness_verify(src, "optseq.gdl");
         assert!(
-            diags.iter().any(|d| d.routine == "wrap_differs" && d.tag == "claims_unequal"),
+            diags
+                .iter()
+                .any(|d| d.routine == "wrap_differs" && d.tag == "claims_unequal"),
             "false claim about OPTION[SEQ] equality must be rejected, got: {diags:?}"
         );
         // Canonical instantiations stay complete.
         let src_u64 = "functions OPTU64\n\nfeature {ANY}\n\n  same_wrap(x: U64, y: U64): BOOL\n    require\n      equal: x = y\n    do\n      Some(x).equals(Some(y))\n    ensure\n      wraps_equal: Result\n    end\n\n  diff_wrap(x: U64, y: U64): BOOL\n    require\n      differ: not (x = y)\n    do\n      Some(x).equals(Some(y))\n    ensure\n      wraps_differ: not Result\n    end\n\nend\n";
         let diags = soundness_verify(src_u64, "optu64.gdl");
-        assert!(diags.is_empty(), "OPTION[U64] equality must remain provable, got: {diags:?}");
+        assert!(
+            diags.is_empty(),
+            "OPTION[U64] equality must remain provable, got: {diags:?}"
+        );
         // The stdlib's own conditional laws are proven only under the where-hypothesis.
         let prelude = standard_prelude();
-        let opt = prelude.modules.iter().find(|m| m.name == "OPTION").expect("OPTION");
+        let opt = prelude
+            .modules
+            .iter()
+            .find(|m| m.name == "OPTION")
+            .expect("OPTION");
         let bpl = emit_boogie(opt, DEFAULT_FUEL);
-        assert!(!bpl.contains("A_eq(x, y) <==> (x == y)"), "no module-wide canonical axiom");
+        assert!(
+            !bpl.contains("A_eq(x, y) <==> (x == y)"),
+            "no module-wide canonical axiom"
+        );
         assert!(bpl.contains("type A__Canon;"));
-        assert!(bpl.contains("Verify_law_CANONICAL_EQ_agrees_with_structural(a: (OPTION A__Canon)"));
+        assert!(
+            bpl.contains("Verify_law_CANONICAL_EQ_agrees_with_structural(a: (OPTION A__Canon)")
+        );
     }
 
     #[test]
@@ -18183,7 +18986,9 @@ end
         let src = "module BOX3\n\nrepresentation {NONE}\n  v: NAT\n\ncreate {ANY}\n\n  make(x: NAT): BOX3\n    require\n      small: x < 10\n    do\n      { v = x }\n    end\n\nfeature {ANY}\n\n  value: NAT\n    do\n      Current.v\n    end\n\n  ok_use: NAT\n    do\n      let b = BOX3.make(5)\n      b.value\n    end\n\n  bad2: NAT\n    do\n      let b = BOX3.make(50)\n      b.value\n    end\n\ninvariant\n  small_v: v < 10\n\nend\n";
         let diags = soundness_verify(src, "box3.gdl");
         assert!(
-            diags.iter().any(|d| d.routine == "bad2" && d.tag == "small" && d.rule.contains("Precondition")),
+            diags.iter().any(|d| d.routine == "bad2"
+                && d.tag == "small"
+                && d.rule.contains("Precondition")),
             "violated same-module precondition must be reported, got: {diags:?}"
         );
         assert!(
@@ -18198,25 +19003,39 @@ end
         // calls = induction hypotheses guarded by a decreasing variant), not assumed.
         let peano = include_str!("../../examples/peano_ord.gdl");
         let diags = soundness_verify(peano, "peano_ord.gdl");
-        assert!(diags.is_empty(), "peano_ord must verify by induction, got: {diags:?}");
+        assert!(
+            diags.is_empty(),
+            "peano_ord must verify by induction, got: {diags:?}"
+        );
         // Circular "induction" on the same argument is rejected by the variant check.
-        let circular = peano.replacen("case Succ(p) then irreflexive(p)", "case Succ(p) then irreflexive(a)", 1);
+        let circular = peano.replacen(
+            "case Succ(p) then irreflexive(p)",
+            "case Succ(p) then irreflexive(a)",
+            1,
+        );
         assert_ne!(circular, peano);
         let diags = soundness_verify(&circular, "peano_circular.gdl");
         assert!(
-            diags.iter().any(|d| d.routine == "ORD_irreflexive" && d.tag == "variant_decrease"),
+            diags
+                .iter()
+                .any(|d| d.routine == "ORD_irreflexive" && d.tag == "variant_decrease"),
             "circular induction must be rejected, got: {diags:?}"
         );
         // A false law does not become provable through an inductive-looking body.
-        let false_law = peano.replacen("not_less_than_self: not a.less_than(a)", "not_less_than_self: a.less_than(a)", 1);
+        let false_law = peano.replacen(
+            "not_less_than_self: not a.less_than(a)",
+            "not_less_than_self: a.less_than(a)",
+            1,
+        );
         assert_ne!(false_law, peano);
         let diags = soundness_verify(&false_law, "peano_false.gdl");
         assert!(
-            diags.iter().any(|d| d.routine == "ORD_irreflexive" && d.tag == "not_less_than_self"),
+            diags
+                .iter()
+                .any(|d| d.routine == "ORD_irreflexive" && d.tag == "not_less_than_self"),
             "false law must be rejected, got: {diags:?}"
         );
     }
-
 
     // ---------------------------------------------------------------------------------
     // Item 4: `IO.read_line : IO[RESULT[IO_ERROR, STRING]]` (spec §11 IO boundary).
@@ -18229,18 +19048,45 @@ end
         let m = parse_user_module_with_prelude(READ_LINE_PROBE);
         let bpl = with_prelude_injection(true, || emit_boogie(&m, DEFAULT_FUEL));
         // No constant `IO_read_line()` function: every read is a fresh value.
-        assert!(!bpl.contains("function IO_read_line()"), "read_line must not be a constant");
+        assert!(
+            !bpl.contains("function IO_read_line()"),
+            "read_line must not be a constant"
+        );
         assert!(bpl.contains("havoc r;") && bpl.contains("havoc r2;"));
         assert!(bpl.contains("var r: (RESULT IO_ERROR STRING);"));
-        assert!(bpl.contains("var s: STRING;"), "Ok binder must be typed STRING");
+        assert!(
+            bpl.contains("var s: STRING;"),
+            "Ok binder must be typed STRING"
+        );
         let diags = with_prelude_injection(true, || {
-            verify_module_phase3(&m, READ_LINE_PROBE, "ioprobe.gdl", DEFAULT_FUEL, true, false, false)
+            verify_module_phase3(
+                &m,
+                READ_LINE_PROBE,
+                "ioprobe.gdl",
+                DEFAULT_FUEL,
+                true,
+                false,
+                false,
+            )
         });
         // Input is arbitrary: neither emptiness nor equality of two reads is provable.
-        assert!(diags.iter().any(|d| d.routine == "main" && d.tag == "empty"), "got: {diags:?}");
-        assert!(diags.iter().any(|d| d.routine == "main" && d.tag == "equal_reads"), "two reads must not be provably equal, got: {diags:?}");
+        assert!(
+            diags
+                .iter()
+                .any(|d| d.routine == "main" && d.tag == "empty"),
+            "got: {diags:?}"
+        );
+        assert!(
+            diags
+                .iter()
+                .any(|d| d.routine == "main" && d.tag == "equal_reads"),
+            "two reads must not be provably equal, got: {diags:?}"
+        );
         // But an `Ok` payload is a valid STRING (the runtime validates it).
-        assert!(!diags.iter().any(|d| d.tag == "fits"), "Ok payload must satisfy the STRING invariant, got: {diags:?}");
+        assert!(
+            !diags.iter().any(|d| d.tag == "fits"),
+            "Ok payload must satisfy the STRING invariant, got: {diags:?}"
+        );
         assert_eq!(diags.len(), 2, "got: {diags:?}");
 
         // Using the RESULT as if it were a STRING is a type error (IO actions are type-checked).
@@ -18249,7 +19095,10 @@ end
         let diags = with_prelude_injection(true, || {
             verify_module_phase3(&m, old, "old.gdl", DEFAULT_FUEL, true, false, false)
         });
-        assert!(diags.iter().any(|d| d.message.contains("IO_print_line")), "got: {diags:?}");
+        assert!(
+            diags.iter().any(|d| d.message.contains("IO_print_line")),
+            "got: {diags:?}"
+        );
     }
 
     #[test]
@@ -18259,14 +19108,26 @@ end
         let diags = with_prelude_injection(true, || {
             verify_module_phase3(&m, src, "greeter.gdl", DEFAULT_FUEL, true, false, false)
         });
-        assert!(diags.is_empty(), "spec §11 greeter must verify, got: {diags:?}");
+        assert!(
+            diags.is_empty(),
+            "spec §11 greeter must verify, got: {diags:?}"
+        );
         let c = emit_c11(&m);
         // Instantiated prelude sum types and their constructors.
         assert!(c.contains("typedef struct RESULT_IO_ERROR_STRING {"), "{c}");
-        assert!(c.contains("make_IO_ERROR_Decode(struct STRING_ERROR* cause)"), "{c}");
+        assert!(
+            c.contains("make_IO_ERROR_Decode(struct STRING_ERROR* cause)"),
+            "{c}"
+        );
         // The runtime validates input: only ASCII lines become Ok(STRING).
-        assert!(c.contains("if (b >= 128)") && c.contains("make_IO_ERROR_EndOfInput()"), "{c}");
-        assert!(c.contains("__auto_type line_res = gardel_io_read_line_result();"), "{c}");
+        assert!(
+            c.contains("if (b >= 128)") && c.contains("make_IO_ERROR_EndOfInput()"),
+            "{c}"
+        );
+        assert!(
+            c.contains("__auto_type line_res = gardel_io_read_line_result();"),
+            "{c}"
+        );
         // `match` uses the instance's tags and binds the pattern variable.
         assert!(c.contains("->tag == TAG_RESULT_IO_ERROR_STRING_Ok"), "{c}");
         assert!(c.contains("__auto_type name = _ms0->Ok.val;"), "{c}");
@@ -18275,7 +19136,6 @@ end
         assert!(!c.contains("TAG_GREETER_"), "{c}");
     }
 
-
     // ---------------------------------------------------------------------------------
     // Item 5: `SEQ[A] satisfies EQ where A satisfies CANONICAL_EQ`, enforced by E0314.
     // ---------------------------------------------------------------------------------
@@ -18283,17 +19143,33 @@ end
     #[test]
     fn test_item5_seq_equals_requires_canonical_elements() {
         let prelude = standard_prelude();
-        let seq = prelude.modules.iter().find(|m| m.name == "SEQ").expect("SEQ");
+        let seq = prelude
+            .modules
+            .iter()
+            .find(|m| m.name == "SEQ")
+            .expect("SEQ");
         let sat = seq.satisfies.as_ref().expect("SEQ satisfies EQ");
         assert_eq!(sat.concepts, vec!["EQ".to_string()]);
-        assert_eq!(sat.where_constraints, vec![("A".to_string(), "CANONICAL_EQ".to_string())]);
+        assert_eq!(
+            sat.where_constraints,
+            vec![("A".to_string(), "CANONICAL_EQ".to_string())]
+        );
 
         let src = "functions SEQEQ\n\nfeature {ANY}\n\n  nested(s: SEQ[SEQ[U64]], t: SEQ[SEQ[U64]]): BOOL\n    do\n      s.equals(t)\n    end\n\n  strings(s: SEQ[STRING], t: SEQ[STRING]): BOOL\n    do\n      s.equals(t)\n    end\n\n  flat(s: SEQ[U64], t: SEQ[U64]): BOOL\n    do\n      s.equals(t)\n    end\n\n  chars(s: SEQ[CHAR], t: SEQ[CHAR]): BOOL\n    do\n      s.equals(t)\n    end\n\nend\n";
         let m = parse_user_module_with_prelude(src);
         let diags = with_prelude_injection(true, || check_where_constraints(&m, src, "seqeq.gdl"));
         let flagged: Vec<&str> = diags.iter().map(|d| d.routine.as_str()).collect();
-        assert!(diags.iter().all(|d| d.rule == "E0314: unsatisfied_where_constraint"), "got: {diags:?}");
-        assert_eq!(flagged, vec!["nested", "strings"], "non-canonical elements must be rejected, canonical ones accepted");
+        assert!(
+            diags
+                .iter()
+                .all(|d| d.rule == "E0314: unsatisfied_where_constraint"),
+            "got: {diags:?}"
+        );
+        assert_eq!(
+            flagged,
+            vec!["nested", "strings"],
+            "non-canonical elements must be rejected, canonical ones accepted"
+        );
 
         // A generic element type needs the bound; a CANONICAL_EQ-bounded one satisfies it.
         let generic = "module HOLDER[A]\n\nrepresentation {ANY}\n  | Hold(items: SEQ[A])\n\nfeature {ANY}\n\n  same(other: HOLDER[A]): BOOL\n    do\n      match Current\n        case Hold(xs) then\n          match other\n            case Hold(ys) then xs.equals(ys)\n          end\n      end\n    end\n\nend\n";
@@ -18301,24 +19177,41 @@ end
         let ctx = with_prelude_injection(true, || BoogiePreludeCtx::for_module(&m));
         assert!(!type_satisfies("A", "CANONICAL_EQ", &m, &ctx));
         assert!(type_satisfies("U64", "CANONICAL_EQ", &m, &ctx));
-        assert!(!type_satisfies("SEQ[U64]", "CANONICAL_EQ", &m, &ctx), "SEQ is EQ, not CANONICAL_EQ");
+        assert!(
+            !type_satisfies("SEQ[U64]", "CANONICAL_EQ", &m, &ctx),
+            "SEQ is EQ, not CANONICAL_EQ"
+        );
         assert!(type_satisfies("SEQ[U64]", "EQ", &m, &ctx));
-        assert!(!type_satisfies("SEQ[STRING]", "EQ", &m, &ctx), "SEQ[STRING] fails SEQ's where constraint");
+        assert!(
+            !type_satisfies("SEQ[STRING]", "EQ", &m, &ctx),
+            "SEQ[STRING] fails SEQ's where constraint"
+        );
         assert!(type_satisfies("OPTION[U64]", "CANONICAL_EQ", &m, &ctx));
-        assert!(!type_satisfies("OPTION[SEQ[U64]]", "CANONICAL_EQ", &m, &ctx));
+        assert!(!type_satisfies(
+            "OPTION[SEQ[U64]]",
+            "CANONICAL_EQ",
+            &m,
+            &ctx
+        ));
         let bounded = generic.replace("module HOLDER[A]", "module HOLDER[A: CANONICAL_EQ]");
         let mb = parse_user_module_with_prelude(&bounded);
         let ctxb = with_prelude_injection(true, || BoogiePreludeCtx::for_module(&mb));
         assert!(type_satisfies("A", "CANONICAL_EQ", &mb, &ctxb));
-        assert!(type_satisfies("A", "EQ", &mb, &ctxb), "CANONICAL_EQ refines EQ");
+        assert!(
+            type_satisfies("A", "EQ", &mb, &ctxb),
+            "CANONICAL_EQ refines EQ"
+        );
 
         // OPTION lists only CANONICAL_EQ; its `equals` delegates to element `equals` (§5).
         let opt = "functions OPTSEQ2\n\nfeature {ANY}\n\n  w(s1: SEQ[U64], s2: SEQ[U64]): BOOL\n    do\n      Some(s1).equals(Some(s2))\n    end\n\nend\n";
         let m = parse_user_module_with_prelude(opt);
-        let diags = with_prelude_injection(true, || check_where_constraints(&m, opt, "optseq2.gdl"));
-        assert!(diags.is_empty(), "OPTION[SEQ[U64]].equals stays available, got: {diags:?}");
+        let diags =
+            with_prelude_injection(true, || check_where_constraints(&m, opt, "optseq2.gdl"));
+        assert!(
+            diags.is_empty(),
+            "OPTION[SEQ[U64]].equals stays available, got: {diags:?}"
+        );
     }
-
 
     // ---------------------------------------------------------------------------------
     // Item 6: a false contract must not mask other failures in the same module.
@@ -18330,8 +19223,16 @@ end
         // silently proved `g`'s (also false) postcondition, so only `f` was reported.
         let src = "functions SELFPROOF\n\nfeature {ANY}\n\n  f(n: NAT): NAT\n    do\n      0\n    ensure\n      bogus: Result = 7\n    end\n\n  g(n: NAT): NAT\n    do\n      f(n)\n    ensure\n      also_bogus: Result = 1\n    end\n\nend\n";
         let diags = soundness_verify(src, "selfproof.gdl");
-        assert!(diags.iter().any(|d| d.routine == "f" && d.tag == "bogus"), "got: {diags:?}");
-        assert!(diags.iter().any(|d| d.routine == "g" && d.tag == "also_bogus"), "masked failure must be reported, got: {diags:?}");
+        assert!(
+            diags.iter().any(|d| d.routine == "f" && d.tag == "bogus"),
+            "got: {diags:?}"
+        );
+        assert!(
+            diags
+                .iter()
+                .any(|d| d.routine == "g" && d.tag == "also_bogus"),
+            "masked failure must be reported, got: {diags:?}"
+        );
         assert_eq!(diags.len(), 2, "got: {diags:?}");
         // A correct caller of the broken routine is not reported (it verifies from `f`'s
         // definition, without `f`'s contract).
@@ -18362,10 +19263,15 @@ feature {ANY}
 end
 ";
         let diags = soundness_verify(rec, "recclause.gdl");
-        assert!(diags.iter().any(|d| d.routine == "f" && d.tag == "bogus"), "got: {diags:?}");
-        assert!(!diags.iter().any(|d| d.tag == "zero"), "true inductive clause must verify, got: {diags:?}");
+        assert!(
+            diags.iter().any(|d| d.routine == "f" && d.tag == "bogus"),
+            "got: {diags:?}"
+        );
+        assert!(
+            !diags.iter().any(|d| d.tag == "zero"),
+            "true inductive clause must verify, got: {diags:?}"
+        );
     }
-
 
     // ---------------------------------------------------------------------------------
     // Termination across the call graph: direct recursion without a variant and mutual
@@ -18376,24 +19282,142 @@ end
     fn test_termination_direct_and_mutual_recursion() {
         let selfloop = "functions SELFLOOP\n\nfeature {ANY}\n\n  f(n: NAT): NAT\n    do\n      f(n)\n    ensure\n      seven: Result = 7\n    end\n\nend\n";
         let diags = soundness_verify(selfloop, "selfloop.gdl");
-        assert!(diags.iter().any(|d| d.routine == "f" && d.tag == "variant_missing"), "got: {diags:?}");
+        assert!(
+            diags
+                .iter()
+                .any(|d| d.routine == "f" && d.tag == "variant_missing"),
+            "got: {diags:?}"
+        );
 
         let mutual = "functions MUTUAL\n\nfeature {ANY}\n\n  f(n: NAT): NAT\n    do\n      h(n)\n    ensure\n      seven: Result = 7\n    end\n\n  h(n: NAT): NAT\n    do\n      f(n)\n    end\n\nend\n";
         let diags = soundness_verify(mutual, "mutual.gdl");
-        assert!(diags.iter().any(|d| d.routine == "f" && d.tag == "variant_missing"), "got: {diags:?}");
-        assert!(diags.iter().any(|d| d.routine == "h" && d.tag == "variant_missing"), "got: {diags:?}");
+        assert!(
+            diags
+                .iter()
+                .any(|d| d.routine == "f" && d.tag == "variant_missing"),
+            "got: {diags:?}"
+        );
+        assert!(
+            diags
+                .iter()
+                .any(|d| d.routine == "h" && d.tag == "variant_missing"),
+            "got: {diags:?}"
+        );
 
         let even_odd = "functions EVENODD\n\nfeature {ANY}\n\n  is_even(n: NAT): BOOL\n    variant\n      n\n    do\n      if n = 0 then\n        True\n      else\n        is_odd(n - 1)\n      end\n    end\n\n  is_odd(n: NAT): BOOL\n    variant\n      n\n    do\n      if n = 0 then\n        False\n      else\n        is_even(n - 1)\n      end\n    end\n\nend\n";
         let diags = soundness_verify(even_odd, "evenodd.gdl");
-        assert!(diags.is_empty(), "decreasing mutual recursion must verify, got: {diags:?}");
+        assert!(
+            diags.is_empty(),
+            "decreasing mutual recursion must verify, got: {diags:?}"
+        );
         let bad = even_odd.replacen("        is_even(n - 1)", "        is_even(n)", 1);
         assert_ne!(bad, even_odd);
         let diags = soundness_verify(&bad, "evenodd_bad.gdl");
-        assert!(diags.iter().any(|d| d.routine == "is_odd" && d.tag == "variant_decrease"), "got: {diags:?}");
+        assert!(
+            diags
+                .iter()
+                .any(|d| d.routine == "is_odd" && d.tag == "variant_decrease"),
+            "got: {diags:?}"
+        );
 
         let m = parse_user_module_with_prelude(&bad);
         let groups = compute_recursive_groups(&m);
-        let g: HashSet<String> = ["is_even".to_string(), "is_odd".to_string()].into_iter().collect();
+        let g: HashSet<String> = ["is_even".to_string(), "is_odd".to_string()]
+            .into_iter()
+            .collect();
         assert_eq!(groups.get("is_even"), Some(&g));
+    }
+
+    #[test]
+    fn test_product_module_type_params_and_not_equal() {
+        // A bounded type parameter of a record module verifies, and its `EQ` theory is usable.
+        let pair = "module PAIR[A: EQ]\n\nrepresentation {ANY}\n  fst: A\n  snd: A\n\nfeature {ANY}\n\n  same: BOOL\n    do\n      Current.fst = Current.snd\n    ensure\n      sym: Result = (Current.snd = Current.fst)\n    end\n\n  distinct: BOOL\n    do\n      Current.fst != Current.snd\n    ensure\n      sym_ne: Result = (Current.snd != Current.fst)\n    end\n\n  twisted: BOOL\n    do\n      Current.fst = Current.snd\n    ensure\n      wrong: Result\n    end\n\nend\n";
+        let diags = soundness_verify(pair, "pair.gdl");
+        assert_eq!(
+            diags.len(),
+            1,
+            "only `twisted.wrong` may fail, got: {diags:?}"
+        );
+        assert!(
+            diags[0].routine == "twisted" && diags[0].tag == "wrong",
+            "got: {diags:?}"
+        );
+
+        // `a != b` is `not (a = b)`.
+        let m = parse_single_module(
+            "functions N\n\nfeature {ANY}\n\n  f(a: U64, b: U64): BOOL\n    do\n      a != b\n    end\n\nend\n",
+        );
+        let (_, r) = &m.feature_routines[0];
+        let expected = Expr::UnaryNot(Box::new(Expr::BinOp(
+            "=".into(),
+            Box::new(Expr::Var("a".into())),
+            Box::new(Expr::Var("b".into())),
+        )));
+        assert_eq!(r.body, expected);
+        let neq = "functions NEQ\n\nfeature {ANY}\n\n  differ(a: U64, b: U64): BOOL\n    do\n      a != b\n    ensure\n      def: Result = (not (a = b))\n      sym: Result = (b != a)\n    end\n\n  bad(a: U64): BOOL\n    do\n      a != a\n    ensure\n      wrong: Result\n    end\n\nend\n";
+        let diags = soundness_verify(neq, "neq.gdl");
+        assert!(
+            diags.len() == 1 && diags[0].routine == "bad" && diags[0].tag == "wrong",
+            "got: {diags:?}"
+        );
+    }
+
+    #[test]
+    fn test_termination_through_function_values_is_rejected() {
+        let check = |src: &str, file: &str| {
+            let m = parse_user_module_with_prelude(src);
+            with_prelude_injection(true, || check_higher_order_recursion(&m, src, file))
+        };
+        let apply = "  apply(g: NAT -> NAT, x: NAT): NAT\n    do\n      g(x)\n    end\n\n";
+        let module = |name: &str, body: &str| {
+            format!(
+                "functions {name}\n\nfeature {{ANY}}\n\n{apply}  f(n: NAT): NAT\n    variant\n      n\n    do\n      {body}\n    end\n\nend\n"
+            )
+        };
+        // Recursion inside a lambda, by passing itself, or by its qualified name.
+        for (name, body) in [
+            ("HOL", "apply(fn(x: NAT): NAT do f(x) end, n)"),
+            ("HOR", "apply(f, n)"),
+            ("HOQ", "HOQ.apply(HOQ.f, n)"),
+        ] {
+            let src = module(name, body);
+            let diags = check(&src, "ho.gdl");
+            assert!(
+                diags
+                    .iter()
+                    .any(|d| d.routine == "f" && d.tag == "higher_order_recursion"),
+                "{name}: recursion through a function value must be rejected, got: {diags:?}"
+            );
+            let m = parse_user_module_with_prelude(&src);
+            assert!(
+                compute_recursive_groups(&m)
+                    .get("f")
+                    .is_some_and(|g| g.contains("f"))
+            );
+        }
+        // Mutual recursion where one edge is a function value.
+        let mutual = format!(
+            "functions HOM\n\nfeature {{ANY}}\n\n{apply}  f(n: NAT): NAT\n    variant\n      n\n    do\n      apply(h, n)\n    end\n\n  h(n: NAT): NAT\n    variant\n      n\n    do\n      if n = 0 then 0 else f(n - 1) end\n    end\n\nend\n"
+        );
+        let diags = check(&mutual, "hom.gdl");
+        assert!(
+            diags
+                .iter()
+                .any(|d| d.routine == "f" && d.tag == "higher_order_recursion"),
+            "got: {diags:?}"
+        );
+
+        // Passing a non-recursive routine, a lambda that does not recurse, and parameters that
+        // shadow routine names are all fine.
+        let ok = format!(
+            "functions HOK\n\nfeature {{ANY}}\n\n{apply}  succ(x: NAT): NAT\n    require\n      small: x < 1000\n    do\n      x + 1\n    end\n\n  f(n: NAT): NAT\n    require\n      small: n < 10\n    do\n      apply(fn(x: NAT): NAT do x end, n)\n    end\n\n  h(succ: NAT): NAT\n    require\n      small: succ < 1000\n    do\n      succ + 1\n    end\n\nend\n"
+        );
+        let diags = check(&ok, "hok.gdl");
+        assert!(
+            diags.is_empty(),
+            "non-recursive higher-order use must pass, got: {diags:?}"
+        );
+        let m = parse_user_module_with_prelude(&ok);
+        assert!(compute_recursive_groups(&m).is_empty());
     }
 }

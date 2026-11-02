@@ -1,0 +1,9 @@
+module IO_ERROR
+
+representation {ANY}
+  | EndOfInput
+  | Decode(cause: STRING_ERROR)
+  | OsError(code: I64)
+
+end
+
