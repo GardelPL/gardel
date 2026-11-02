@@ -15152,7 +15152,8 @@ fn display_path(p: &std::path::Path) -> String {
         }
         if let Some(parent) = cwd.parent() {
             if let Ok(rel) = abs.strip_prefix(parent) {
-                return format!("../{}", clean(rel));
+                let r = clean(rel);
+                return if r.is_empty() { "..".to_string() } else { format!("../{r}") };
             }
         }
     }
@@ -15182,7 +15183,7 @@ fn resolve_stdlib_inputs() -> Result<StdlibInputs, (String, String)> {
     }
     let shown = display_path(&dir);
     let files = gdl_files_in_dir(&shown, None).map_err(|e| (e, shown.clone()))?;
-    let prefix = format!("{shown}/");
+    let prefix = format!("{}/", shown.trim_end_matches('/'));
     let on_disk: BTreeMap<String, String> = files
         .iter()
         .map(|f| (format!("stdlib/{}", f.strip_prefix(&prefix).unwrap_or(f)), f.clone()))
@@ -15386,12 +15387,15 @@ pub fn resolve_input_operands(operands: &[String]) -> Result<(Vec<String>, bool)
 
 /// Splits the command line into input operands (files, directories, wildcard patterns).
 /// The values of `--fuel <N>` and `--inspect [MODULE]` are not operands.
+/// Whether a command-line word names an input (file, directory or wildcard) rather than a
+/// module name such as the optional value of `--inspect`.
+fn looks_like_input(s: &str) -> bool {
+    s.to_ascii_lowercase().ends_with(".gdl")
+        || s.contains(['*', '?', '/', '\\'])
+        || std::path::Path::new(s).exists()
+}
+
 fn input_operands(args: &[String]) -> Vec<String> {
-    let looks_like_input = |s: &str| {
-        s.to_ascii_lowercase().ends_with(".gdl")
-            || s.contains(['*', '?', '/', '\\'])
-            || std::path::Path::new(s).exists()
-    };
     let mut ops = Vec::new();
     let mut i = 1;
     while i < args.len() {
@@ -15629,7 +15633,10 @@ fn main() {
 
     let inspect_mode = args.iter().any(|a| a == "--inspect");
     let mut stdlib_only = args.iter().any(|a| a == "--stdlib")
-        || (inspect_mode && args.get(1).is_some_and(|a| a.starts_with("--")));
+        || (inspect_mode && input_operands(&args).is_empty());
+    // Stdlib files named explicitly (e.g. `gardelc --inspect option.gdl`): the whole tree is
+    // verified, but `--inspect` shows only these files' modules.
+    let mut requested_stdlib_files: Vec<std::path::PathBuf> = Vec::new();
 
     let json_mode = args.iter().any(|a| a == "--json-diagnostics");
     let audit_mode = args.iter().any(|a| a == "--audit");
@@ -15693,6 +15700,7 @@ fn main() {
             say(&format!(
                 "[stdlib] {which} belong(s) to the Standard Prelude, whose modules depend on each other: verifying the whole stdlib tree (as `--stdlib`)."
             ));
+            requested_stdlib_files = inside.iter().filter_map(|p| fs::canonicalize(p).ok()).collect();
             stdlib_only = true;
         }
     }
@@ -15826,9 +15834,15 @@ fn main() {
             .iter()
             .position(|a| a == "--inspect")
             .and_then(|idx| args.get(idx + 1))
-            .filter(|val| !val.starts_with("--") && !input_paths.contains(val))
+            .filter(|val| !val.starts_with("--") && !looks_like_input(val))
             .cloned();
         for u in &units {
+            let requested = requested_stdlib_files.is_empty()
+                || filter_mod.is_some()
+                || fs::canonicalize(&u.path).is_ok_and(|p| requested_stdlib_files.contains(&p));
+            if !requested {
+                continue;
+            }
             for m in &u.ast.modules {
                 if filter_mod
                     .as_ref()
