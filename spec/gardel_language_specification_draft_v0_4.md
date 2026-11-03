@@ -178,27 +178,28 @@ flowchart TD
   specify {ANY}
     chars: LIST[CHAR]
       do
-        decode_utf8(Current.bytes)
+        BYTES.decode_utf8(Current.bytes)
       end
   ```
+  `BYTES.decode_utf8` is the exact RFC 3629 decoder over well-formed octet sequences (Layer 3). The prelude verification model stores the octets as `bytes: LIST[U64]` (one octet per element, invariant `BYTES.valid_utf8(bytes)`, plus `size`, the cached `char_count` and a builder capacity `limit`); the C11 runtime stores the same octets packed in one contiguous NUL-terminated buffer together with the byte length and the cached code-point count (`GardelString`).
   Every public query and transformer establishes its postconditions against `chars`:
   - `code_point_count: NAT`: Returns the number of Unicode scalar values (distinct from byte length and grapheme cluster count). Postcondition: `Result = Current.chars.length`.
   - `byte_length: NAT`: Returns the number of bytes required by its physical UTF-8 encoding.
   - `is_empty: BOOL`: Equivalent to `Current.code_point_count = 0`. Postcondition: `Result = (Current.chars = LIST.empty)`.
   - `character_at(index: NAT): CHAR`: Indexed code-point lookup. Precondition: `require in_bounds: index < Current.code_point_count`. Postcondition: `Result = LIST_OPS.at(Current.chars, index)`.
-  - `concat(other: STRING): STRING`: String concatenation. Postcondition: `Result.chars = Current.chars.append(other.chars)`.
+  - `concat(other: STRING): STRING`: String concatenation. Precondition: `require fits: Current.byte_length <= U64.max - other.byte_length` (the only one; capacity plays no role). Postconditions: `Result.chars = Current.chars.append(other.chars)`, byte length and code-point count add up. Input lines are shorter than $2^{48}$ bytes (§11), so `"Hello, ".concat(name)` on an `IO.read_line` result is provable.
   - `equals(other: STRING): BOOL`: Behavioral text equality (`STRING satisfies EQ`). Postcondition: `Result = (Current.chars = other.chars)`. Because two `STRING` values with identical `chars` may differ in hidden physical metadata (such as buffer capacity `limit` or internal tree balance), `STRING` conforms to `EQ` (and `ORD`) rather than `CANONICAL_EQ` (§9).
-- **Internal Invariant Encapsulation:** The module's internal representation invariant (such as inductive UTF-8 validity `valid_utf8` and capacity constraints) is proven once and for all within `STRING`. Callers reason purely about `Current.chars`, enjoying complete immunity from low-level byte corruption or encoding invariants.
+- **Internal Invariant Encapsulation:** The module's internal representation invariant (inductive UTF-8 validity `BYTES.valid_utf8`, the cached count and capacity constraints) is proven once and for all within `STRING`, using the UTF-8 laws that `BYTES` proves by induction (`utf8_octets`, `utf8_append`, `decode_injective`) and exports as verified contracts. No UTF-8 fact is axiomatized. Callers reason purely about `Current.chars`, enjoying complete immunity from low-level byte corruption or encoding invariants.
 
 #### 3. Layer 3: `BYTES` (Untrusted Boundary Buffers)
-- **Definition:** `module BYTES` is an opaque Standard Prelude ADT (`representation {NONE}`) encapsulating a sequence of 8-bit octets (`bytes: SEQ[U64]` with module invariant requiring every element $< 256$) and exposing the canonical ghost model `specify model: LIST[U64]`.
+- **Definition:** `module BYTES` is an opaque Standard Prelude ADT (`representation {NONE}`) encapsulating a sequence of 8-bit octets (`items: LIST[U64]` with module invariant `all_octets(items)`, every element $< 256$) and exposing the canonical ghost model `specify model: LIST[U64]`. It also hosts the UTF-8 theory of octet sequences: `valid_utf8(bs)` (RFC 3629 well-formedness: shortest form, no surrogates, at most U+10FFFF), the decoder `decode_utf8(bs): LIST[CHAR]` (requires `valid_utf8(bs)`), and three laws proven by structural induction: `utf8_octets` (well-formed sequences are octets), `utf8_append` (well-formedness is closed under concatenation and decoding distributes over it) and `decode_injective` (decoding is injective on well-formed sequences, which makes `STRING.equals` byte equality and character equality at once).
 - **Boundary Role:** All external input from the outside world (network streams, disk files, command-line arguments, environment variables) enters the runtime as untrusted `BYTES` (§11).
 - **Boundary Decoding:** Raw byte buffers cannot be cast directly to `STRING`. They must cross the verification boundary via explicit decoding:
   ```eiffel
   STRING.from_utf8(bytes: BYTES): RESULT[STRING_ERROR, STRING]
   ```
-  If the byte stream is well-formed UTF-8, it yields `Ok(s)` where `s.chars` matches the decoded scalar sequence. If any byte sequence is malformed, truncated, overlong, or decodes to an unpaired surrogate half, it returns `Error(err)` with a specific `STRING_ERROR` variant (`InvalidByte(offset, byte_val)`, `TruncatedSequence(offset, expected)`, `OverlongEncoding(offset)`, or `UnpairedSurrogate(offset)`, §11) without exceptions or crashes.
-- **Safe Serialization:** Verified strings can be serialized safely and totally to bytes via the feature query `to_utf8: BYTES` (`str.to_utf8`), guaranteed to produce a canonically encoded UTF-8 byte sequence.
+  It accepts exactly the well-formed inputs: `ensure ok_iff_valid: Result.is_ok = BYTES.valid_utf8(bytes.model)`. On success `s.chars = BYTES.decode_utf8(bytes.model)`. Otherwise it returns `Error(err)` with the first error found, as a `STRING_ERROR` variant (`InvalidByte(offset, byte_val)`, `TruncatedSequence(offset, expected)`, `OverlongEncoding(offset)`, or `UnpairedSurrogate(offset)`, §11), without exceptions or crashes. For a multi-byte lead byte the checks run in a fixed order: (1) every continuation byte present must be in `0x80..0xBF` (`InvalidByte` at its offset), (2) the sequence must be complete (`TruncatedSequence`), (3) the lead-specific second-byte range (`E0`/`F0` overlong, `ED` surrogate, `F4` above U+10FFFF as `InvalidByte`). Lead bytes `C0`/`C1` are `OverlongEncoding`; `80..BF` and `F5..FF` are `InvalidByte`. The C runtime decoder used by `IO.read_line` follows the same order.
+- **Safe Serialization:** Verified strings can be serialized safely and totally to bytes via the feature query `to_utf8: BYTES` (`str.to_utf8`), guaranteed to produce a canonically encoded UTF-8 byte sequence (`ensure Result.model = Current.byte_model` and `BYTES.valid_utf8(Result.model)`).
 
 #### 4. String Literal Desugaring
 String literals (`"..."`) in Gardel source code are syntactic sugar for verified prelude `STRING` values.
@@ -211,7 +212,7 @@ String literals (`"..."`) in Gardel source code are syntactic sugar for verified
     Result.chars = LIST.empty.prepend('o').prepend('l').prepend('l').prepend('e').prepend('h')
   ```
 - **Zero-Allocation Runtime Lowering:** At runtime, string literals lower directly to pre-allocated, null-terminated static UTF-8 byte slices in the C11/BendRT backend (`static const uint8_t literal_0[] = "hello";`), avoiding dynamic heap allocation or runtime decoding overhead.
-- **Bootstrap realization (Roadmap Task B.3).** While the prelude `STRING` is the ASCII subset of UTF-8 (§6.4.C), a literal containing a non-ASCII scalar is rejected at compile time (`E0303: non_ascii_string_literal`, lifted by Task C.2); malformed escapes (`E0302`) and surrogates (`E0304`) are always rejected. A literal $[c_0, \dots, c_{n-1}]$ denotes `STRING.make_empty(max(n, 1)).push_ascii(c_{n-1})...push_ascii(c_0)`: in Boogie it is a constant *defined* by that term of verified prelude routines (no other axiom), and a per-literal lemma proves the routine preconditions, the `STRING` invariant, `Result.chars = LIST.empty.prepend(c_{n-1})...prepend(c_0)` and `Result.byte_length = n`. Because `STRING` is not `CANONICAL_EQ`, `=` with a `STRING` operand is rejected (`E0311`; use `equals` or compare `chars`), as are `+` on `STRING` (`E0312`) and string-literal `match` patterns (`E0313`).
+- **Realization (Roadmap Tasks B.3, C.2).** Every Unicode scalar is allowed in a literal (`E0303` was removed by Task C.2); malformed escapes (`E0302`) and surrogates (`E0304`) are always rejected. A literal $[c_0, \dots, c_{n-1}]$ whose UTF-8 encoding has $b$ bytes denotes `STRING.make_empty(max(b, 1))` followed by one builder call per scalar, last to first: `push_ascii(c)` for a 1-byte scalar and `push_utf8_2/3/4(b0, ..)` with the scalar's encoded bytes otherwise. In Boogie it is a constant *defined* by that term of verified prelude routines (no other axiom), and a per-literal lemma proves the routine preconditions, the `STRING` invariant, `Result.chars = LIST.empty.prepend(c_{n-1})...prepend(c_0)`, `Result.byte_length = b` and `Result.code_point_count = n`. Because `STRING` is not `CANONICAL_EQ`, `=` with a `STRING` operand is rejected (`E0311`; use `equals` or compare `chars`), as are `+` on `STRING` (`E0312`) and string-literal `match` patterns (`E0313`).
 
 ---
 
@@ -1151,165 +1152,95 @@ Here, the local product invariant `size_matches` and `bounded_limbs` guarantees 
 **Normalization invariant.** `no_zero_high_limb: normalized(limbs)` requires the *last* element of `limbs` (the most significant limb) to be non-zero whenever `size > 0`; zero is represented only by the empty limb list. The ghost predicates `normalized(ls)` and `limbs_in_range(ls)` (every limb in $[0, 2^{64})$) are declared in `specify {ANY}` (abridged here). Normalization makes the representation canonical (without it `[5]` and `[5, 0]` would have equal models but different limb lists), so `equals` / `less_than` can compare limb counts and then limbs from the most significant end, with their model postconditions proven via the ghost lemmas `value_bounds` and `shorter_is_smaller`. Every construction site establishes the invariant: `zero` and `from_u64` (which maps `0` to the empty list) directly, and `shift_in_low_limb` through its precondition `no_leading_zero`, which forbids inserting a zero limb into an empty (zero) `BIGNAT`.
 
 ##### C. `module STRING` refines to `LIST[CHAR]` with Inductive UTF-8 / Byte Invariant
-The verified text type `STRING` encapsulates its byte representation behind `representation {NONE}`, enforcing byte validity through recursive ghost predicates (`all_bytes_valid`, `decode_utf8`) and exposing `chars: LIST[CHAR]` as its logical text model.
+The verified text type `STRING` (`stdlib/text/string.gdl`) encapsulates its byte representation behind `representation {NONE}` and exposes `chars: LIST[CHAR]` as its logical text model. Its UTF-8 theory lives in `BYTES` (`stdlib/text/bytes.gdl`, §3 Layer 3), where it is proven by induction once; `STRING` uses it only through the verified contracts and laws of `BYTES`, which reach `STRING`'s verification context as linked client axioms (§4.1). No UTF-8 property is axiomatized.
 
-**Bootstrap scope (ASCII subset of UTF-8).** The current prelude `STRING` stores one byte per list element and restricts every byte to the ASCII range $[0, 127]$. On that domain UTF-8 is a one-byte-per-scalar encoding, so:
-- `decode_utf8` below is the *exact* UTF-8 decoder for every representable value (not a Latin-1 approximation), and it never drops input;
-- `code_point_count` coincides with `byte_length` (proven by `same_length`, not assumed);
-- byte equality and `chars` equality coincide (proven by `law decode_injective`), so `equals` is sound.
+**Full RFC 3629 UTF-8 (Roadmap Task C.2).** The representation is an octet list (one octet per element) satisfying `BYTES.valid_utf8`: 1–4 byte sequences in shortest form, no surrogates (U+D800..U+DFFF), nothing above U+10FFFF. Consequently:
+- `BYTES.decode_utf8` is the *exact* UTF-8 decoder for every representable value and never drops input;
+- `code_point_count` is a cached field (`char_count = BYTES.decode_utf8(bytes).length` is an invariant), distinct from `byte_length`;
+- byte equality and `chars` equality coincide (`BYTES` law `decode_injective`), so `equals` is sound;
+- concatenation preserves validity and distributes over decoding (`BYTES` law `utf8_append`), so `concat` needs no precondition beyond byte-length overflow.
 
-Multi-byte UTF-8 (2–4 byte sequences, rejection of overlong forms and surrogates, the `valid_utf8` invariant, and a cached `code_point_count` distinct from `byte_length`) is delivered by Task C.2 **without changing the public `chars`-based contracts** listed in §3.1. Until then, non-ASCII text cannot be represented by the bootstrap `STRING`.
+Abridged listing (helper routines `nth_char` and `validate_and_count`, the `push_utf8_3/4` builders and some postconditions are omitted; the source files are normative):
 ```eiffel
+-- stdlib/text/bytes.gdl (UTF-8 theory, abridged)
+  valid_utf8(bs: LIST[U64]): BOOL          -- RFC 3629 well-formedness (Unicode Table 3-7)
+  decode_utf8(bs: LIST[U64]): LIST[CHAR]   -- require valid_utf8(bs)
+
+  law utf8_octets(xs: LIST[U64])           -- valid_utf8(xs) implies all_octets(xs)
+  law utf8_append(xs: LIST[U64], ys: LIST[U64])
+    require
+      xs_valid: valid_utf8(xs)
+      ys_valid: valid_utf8(ys)
+    trigger
+      xs.append(ys)
+    variant
+      xs.length
+    do
+      if xs.length = 0 then True
+      else
+        if xs.head < 128 then utf8_append(xs.tail, ys)
+        else
+          if xs.head <= 223 then utf8_append(xs.tail.tail, ys)
+          else ... end            -- 3- and 4-byte steps likewise
+        end
+      end
+    ensure
+      append_valid: valid_utf8(xs.append(ys))
+      chars_append: decode_utf8(xs.append(ys)) = decode_utf8(xs).append(decode_utf8(ys))
+    end
+  law decode_injective(xs: LIST[U64], ys: LIST[U64])
+    -- valid xs, ys with decode_utf8(xs) = decode_utf8(ys) imply xs = ys (same induction)
+
+-- stdlib/text/string.gdl (abridged)
 module STRING satisfies EQ
 
 representation {NONE}
   bytes: LIST[U64]
   size: NAT
+  char_count: NAT
   limit: NAT
 
 specify {ANY}
-
-  all_bytes_valid(bs: LIST[U64]): BOOL
-    variant
-      bs.length
-    do
-      if bs.length = 0 then
-        True
-      else
-        bs.head < 128 and all_bytes_valid(bs.tail)
-      end
-    end
-
-  decode_utf8(bs: LIST[U64]): LIST[CHAR]
-    require
-      ascii: all_bytes_valid(bs)
-    variant
-      bs.length
-    do
-      if bs.length = 0 then
-        LIST.empty
-      else
-        decode_utf8(bs.tail).prepend(CHAR.from_scalar(bs.head))
-      end
-    ensure
-      same_length: Result.length = bs.length
-    end
-
-  law decode_injective(xs: LIST[U64], ys: LIST[U64])
-    require
-      xs_ascii: all_bytes_valid(xs)
-      ys_ascii: all_bytes_valid(ys)
-      same_chars: decode_utf8(xs) = decode_utf8(ys)
-    variant
-      xs.length
-    ensure
-      same_bytes: xs = ys
-    end
-
-  byte_model: LIST[U64]
-    do
-      Current.bytes
-    end
-
   chars: LIST[CHAR]
     do
-      decode_utf8(Current.bytes)
+      BYTES.decode_utf8(Current.bytes)
     end
 
 create {ANY}
-
-  make_empty(cap: NAT): STRING
-    require
-      positive_cap: cap > 0
-    do
-      { bytes = LIST.empty, size = 0, limit = cap }
+  make_empty(cap: NAT): STRING                               -- require cap > 0
+  from_utf8(bytes: BYTES): RESULT[STRING_ERROR, STRING]
     ensure
-      empty_bytes: Result.byte_length = 0
-      empty_chars: Result.chars = LIST.empty
-      empty_str: Result.is_empty
-      capacity_set: Result.capacity = cap
-    end
+      ok_iff_valid: Result.is_ok = BYTES.valid_utf8(bytes.model)
+      ok_chars: Result.is_ok implies Result.get.chars = BYTES.decode_utf8(bytes.model)
 
 feature {ANY}
-
-  byte_length: NAT
-    do
-      Current.size
-    end
-
-  code_point_count: NAT
-    do
-      Current.size
-    ensure
-      def: Result = Current.chars.length
-    end
-
-  capacity: NAT
-    do
-      Current.limit
-    end
-
-  is_empty: BOOL
-    do
-      Current.size = 0
-    ensure
-      def: Result = (Current.chars = LIST.empty)
-    end
-
   equals(other: STRING): BOOL
     do
       Current.bytes = other.bytes
     ensure
       byte_equality: Result = (Current.byte_model = other.byte_model)
-      char_equality: Result = (Current.chars = other.chars)
+      char_equality: Result = (Current.chars = other.chars)    -- by decode_injective
     end
-
-  push_ascii(c: CHAR): STRING
-    require
-      is_ascii: c.code < 128
-      has_room: Current.byte_length < Current.capacity
-    do
-      { bytes = Current.bytes.prepend(c.code),
-        size = Current.size + 1,
-        limit = Current.limit }
-    ensure
-      grew: Result.byte_length = Current.byte_length + 1
-      chars_prepended: Result.chars = Current.chars.prepend(c)
-      non_empty: not Result.is_empty
-      same_capacity: Result.capacity = Current.capacity
-    end
-
-specify {EQ}
-
-  law reflexive(a: STRING)
-    ensure
-      refl: a.equals(a)
-    end
-
-  law symmetric(a: STRING, b: STRING)
-    require
-      ab: a.equals(b)
-    ensure
-      ba: b.equals(a)
-    end
-
-  law transitive(a: STRING, b: STRING, c: STRING)
-    require
-      ab: a.equals(b)
-      bc: b.equals(c)
-    ensure
-      ac: a.equals(c)
-    end
+  byte_length: NAT; code_point_count: NAT; is_empty: BOOL; capacity: NAT
+  character_at(index: NAT): CHAR             -- require index < Current.code_point_count
+  concat(other: STRING): STRING              -- require byte lengths fit in U64
+  to_utf8: BYTES
+  push_ascii(c: CHAR): STRING                -- literal builders (§3.1.4): each prepends
+  push_utf8_2(b0: U64, b1: U64): STRING      -- one complete encoded scalar
+  ...
 
 invariant
   positive_capacity: limit > 0
   size_matches: size = bytes.length
+  char_count_matches: char_count = BYTES.decode_utf8(bytes).length
+  char_count_bounded: char_count <= size
   within_bounds: size <= limit
-  valid_bytes: all_bytes_valid(bytes)
-
+  valid_bytes: BYTES.valid_utf8(bytes)
 end
 ```
-At the record construction site in `push_ascii`, the precondition `c.code < 128` together with the assumed invariant `all_bytes_valid(Current.bytes)` allows Z3 to prove `all_bytes_valid(Current.bytes.prepend(c.code))` and, using `CHAR.from_scalar(c.code) = c` (from `Result.code = n` and `CHAR` injectivity, §3.1), `Result.chars = Current.chars.prepend(c)` in one unfolding step. `STRING satisfies EQ` compares logical `chars` models independently of `limit`: the forward direction of `char_equality` follows from congruence of `decode_utf8`, and the backward direction from `law decode_injective`.
+**Proof structure.** Each `BYTES` law is proven by structural induction on `xs`, with one step per encoded scalar (1–4 bytes): the recursive call is the induction hypothesis on the shorter tail, and Z3 closes each step by unfolding the definitions once. In `law utf8_octets`, intermediate *proof steps* (`utf8_octets(xs.tail.tail) and all_octets(xs.tail)`) walk back one byte at a time, since a 4-byte step needs more unfoldings than the default fuel; a plain boolean term in a law's `do` body is asserted at that point and then known (§15, Law Proof Bodies). Injectivity rests on the shortest-form rules: the first scalar's value fixes its byte count (below 0x80, below 0x800, below 0x10000 or above), and the bounded continuation ranges then fix every byte. Removing any shortest-form rule makes `decode_injective` fail verification (`test_c2_utf8_laws_are_proven_not_assumed`).
+
+**Runtime representation.** The C11 runtime stores a `STRING` as a contiguous, NUL-terminated buffer of the same octets with its byte length and cached code-point count (`GardelString { data, len, chars }`): `byte_length`, `code_point_count` and `is_empty` are $O(1)$, `concat` copies both buffers, and `character_at` scans to the code point ($O(n)$, inherent to code-point indexing of UTF-8). The `LIST[U64]` representation is the verification model only.
 
 #### 5. Verification Decoupling and Proof Scalability
 
@@ -2152,7 +2083,7 @@ Gardel keeps a pure core and moves all input and output to the program boundary 
    Standard text and binary I/O operations maintain this strict separation:
    - `IO.print(s: STRING): IO[UNIT]`: emits verified text to standard output.
    - `IO.print_line(s: STRING): IO[UNIT]`: emits verified text followed by a newline.
-   - `IO.read_line: IO[RESULT[IO_ERROR, STRING]]`: reads a line from standard input, performing boundary UTF-8 decoding. The line may have any length; a trailing `\n` or `\r\n` is removed. End of input before any byte yields `Error(EndOfInput)`, a read failure yields `Error(OsError(errno))`, and a byte the `STRING` cannot represent yields `Error(Decode(InvalidByte(offset, byte_val)))`. With the bootstrap ASCII `STRING` (§6.4.C), that is any byte $\ge 128$. Only a valid line becomes `Ok(s)`. The verifier models each read as a fresh, unknown value (two reads are never assumed equal) and assumes only that an `Ok` payload satisfies the `STRING` invariant; the runtime check above is what justifies that assumption.
+   - `IO.read_line: IO[RESULT[IO_ERROR, STRING]]`: reads a line from standard input, performing boundary UTF-8 decoding. A line is shorter than $2^{48}$ bytes (a longer one yields `Error(OsError(EOVERFLOW))`; no 64-bit system can hold one anyway); a trailing `\n` or `\r\n` is removed. End of input before any byte yields `Error(EndOfInput)`, a read failure yields `Error(OsError(errno))`, and malformed UTF-8 yields `Error(Decode(e))` with the first `STRING_ERROR` in the check order of `STRING.from_utf8` (§3, Layer 3). Only a well-formed line becomes `Ok(s)`. The verifier models each read as a fresh, unknown value (two reads are never assumed equal) and assumes only that an `Ok` payload satisfies the `STRING` invariant and has `byte_length` $< 2^{48}$; the runtime checks above are what justify that assumption. The length bound is what lets a client prove that combining input with other text cannot overflow (e.g. `"Hello, ".concat(name)`).
    - `IO.read_file(path: STRING): IO[RESULT[IO_ERROR, BYTES]]`: reads raw binary contents from a file path.
    - `IO.write_file(path: STRING, data: BYTES): IO[RESULT[IO_ERROR, UNIT]]`: writes raw binary data to a file path.
 5. **Limited specifications.** Contracts on an `IO` routine cover its pure arguments and result. The verifier does not model the outside world.
@@ -2713,6 +2644,10 @@ UnicodeEscape ::= "u{" HexDigit ( HexDigit ( HexDigit ( HexDigit ( HexDigit HexD
 HexDigit      ::= [0-9a-fA-F]
 ```
 
+#### Law Proof Bodies
+
+A law's optional `do` block is its proof; it is checked, never trusted. Within it, `if` and `match` split the proof into cases, and `a and b` establishes `a`, then `b`. A *recursive* call `law(args)` is an induction hypothesis: the verifier checks the law's preconditions at `args` and that the `variant` strictly decreases (lexicographically; structural size for parameters of the module's own type), then assumes the law's conclusion at `args`. Any other boolean term is an intermediate proof step: it is asserted at that point (so it must be provable from what is known there) and is known afterwards. `True` and calls to *other* laws contribute nothing, so no law can be assumed through another one (which could be circular). A law is never assumed in its own module's verification context; with a `trigger`, it reaches client modules as a quantified axiom guarded by its preconditions (§9).
+
 #### String and Character Literal Lexical Semantics & Desugaring
 
 1. **Character Literals (`Char`):**
@@ -2782,7 +2717,7 @@ Within **Phase 4 (Standard Library & IO)**, Steps 1 through 4 completed the veri
 1. **Step 1 — Foundations Remediation (`BIGNAT`, `SEQ`, `STRING`):**
    - Repaired `BIGNAT` with a true Horner polynomial evaluation `value_of(limbs)` over radix $2^{64}$ yielding an unbounded `MATH_INT` ghost model.
    - Repaired `SEQ[A]` with $O(1)$ cached subtree lengths (`Concat(l, r, len)`) and non-overflow preconditions on `concat`. `SEQ[A]` declares **no** `invariant` block: cached-length consistency is maintained inductively through constructor and transformer postconditions (`len_sum: Result.length = Current.length + other.length`, `same_length`), because a shallow `len = l.length + r.length` invariant is not hereditary (§6, *Shallow Pattern Matches on Recursive Sum Types Are Not Hereditary*).
-   - Established the inductive `all_bytes_valid` representation invariant on `STRING` (ASCII subset of UTF-8, §6.4.C). The full multi-byte `valid_utf8` invariant is Task C.2.
+   - Established the inductive `all_bytes_valid` representation invariant on `STRING` (ASCII subset of UTF-8, §6.4.C). The full multi-byte `valid_utf8` invariant was delivered by Task C.2.
 
 2. **Step 2 — Sum Types & Composable Fallibility (`RESULT[E, A]`, `OPTION[A]`):**
    - Standardized `RESULT[E, A]` (`Error(err: E) | Ok(val: A)`) and `OPTION[A]` (`None | Some(val: A)`) with verified constructors, total predicates, safe extractors (`unwrap`, `unwrap_or`), and railway-oriented monadic combinators (`map`, `map_error`, `and_then`, §5, §7).
@@ -2845,9 +2780,9 @@ Decomposing the monolithic standard library into physical 1:1 module files (sati
   - `stdlib/core/`: `option.gdl` (`module OPTION[A]`), `result.gdl` (`module RESULT[E, A]`), `io_error.gdl` (`module IO_ERROR`)
   - `stdlib/collections/`: `list_ops.gdl` (`functions LIST_OPS`), `seq.gdl` (`module SEQ[A]`)
   - `stdlib/numeric/`: `bignat.gdl` (`module BIGNAT`)
-  - `stdlib/text/`: `string.gdl` (`module STRING`), `string_error.gdl` (`module STRING_ERROR`); `bytes.gdl` (`module BYTES`) arrives with Task C.2
+  - `stdlib/text/`: `string.gdl` (`module STRING`), `string_error.gdl` (`module STRING_ERROR`), `bytes.gdl` (`module BYTES`, with the UTF-8 theory; added by Task C.2)
   - `stdlib/functional/`: `function_ops.gdl` (`functions FUNCTION_OPS`)
-- **Task C.2:** High-performance Smart String implementation in `stdlib/text/string.gdl` (packed 64-bit words / UTF-8 byte buffer, `valid_utf8` invariant, zero-allocation literals, `chars: LIST[CHAR]` model, and boundary decoding `STRING.from_utf8(bytes: BYTES): RESULT[STRING_ERROR, STRING]`).
+- **Task C.2 (completed):** Full RFC 3629 UTF-8 `STRING` (§6.4.C): `BYTES.valid_utf8` invariant with the UTF-8 laws proven by induction in `BYTES`, cached `code_point_count`, `chars: LIST[CHAR]` model, `character_at`, `concat`, `to_utf8`, multi-byte literals, and exact boundary decoding `STRING.from_utf8(bytes: BYTES): RESULT[STRING_ERROR, STRING]` (§3, §11). The verification model is an octet list; the C11 runtime stores the octets in one contiguous buffer with cached length and code-point count.
 - **Task C.3:** Comprehensive regression verification and performance benchmarking:
   - 100% test pass rate in `cargo test`.
   - Zero verification errors and zero warnings across all modular `stdlib/` files and `examples/` under `gardelc --strict`.

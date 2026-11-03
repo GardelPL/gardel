@@ -64,6 +64,22 @@ feature {ANY}
       cons_case: xs.length > 0 implies Result = f(xs.head, LIST_OPS.fold_right(xs.tail, f, init))
     end
 
+  at[A](xs: LIST[A], i: NAT): A
+    require
+      in_bounds: i < xs.length
+    variant
+      i
+    do
+      if i = 0 then
+        xs.head
+      else
+        LIST_OPS.at(xs.tail, i - 1)
+      end
+    ensure
+      head_case: i = 0 implies Result = xs.head
+      step_case: i > 0 implies Result = LIST_OPS.at(xs.tail, i - 1)
+    end
+
 specify {ANY}
 
   law map_empty[A, B](f: A -> B)

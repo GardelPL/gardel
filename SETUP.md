@@ -9,7 +9,7 @@ This document records the exact steps and commands used to set up the `gardelc` 
 Create the new Rust binary project:
 
 ```powershell
-# From the workspace root: c:\home\Learn\Gardel
+# From the repository root
 cargo new gardelc
 ```
 
@@ -23,13 +23,13 @@ Clone the skills and copy them into the workspace `.agents/skills/` directory:
 
 ```powershell
 # Create skills destination directory
-New-Item -ItemType Directory -Force -Path "c:\home\Learn\Gardel\.agents\skills"
+New-Item -ItemType Directory -Force -Path ".agents\skills"
 
 # Clone BeautifulRust temporarily
 git clone --depth 1 https://github.com/morganlinton/BeautifulRust.git BeautifulRust-tmp
 
 # Copy skills to .agents/skills/
-Copy-Item -Recurse -Force "BeautifulRust-tmp\skills\*" "c:\home\Learn\Gardel\.agents\skills\"
+Copy-Item -Recurse -Force "BeautifulRust-tmp\skills\*" ".agents\skills\"
 
 # Clean up temporary clone
 Remove-Item -Recurse -Force "BeautifulRust-tmp"

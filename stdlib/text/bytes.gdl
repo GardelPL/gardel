@@ -1,0 +1,313 @@
+module BYTES satisfies EQ
+
+representation {NONE}
+  items: LIST[U64]
+  size: NAT
+
+create {ANY}
+
+  all_octets(bs: LIST[U64]): BOOL
+    variant
+      bs.length
+    do
+      if bs.length = 0 then
+        True
+      else
+        bs.head < 256 and all_octets(bs.tail)
+      end
+    end
+
+  -- RFC 3629 well-formedness of an octet sequence (Unicode Table 3-7): shortest form only,
+  -- no surrogates (U+D800..U+DFFF), nothing above U+10FFFF.
+  valid_utf8(bs: LIST[U64]): BOOL
+    variant
+      bs.length
+    do
+      if bs.length = 0 then
+        True
+      else
+        if bs.head < 128 then
+          valid_utf8(bs.tail)
+        else
+          if bs.head >= 194 and bs.head <= 223 then
+            if bs.length >= 2 then
+              (bs.tail.head >= 128 and bs.tail.head <= 191) and
+              valid_utf8(bs.tail.tail)
+            else
+              False
+            end
+          else
+            if bs.head >= 224 and bs.head <= 239 then
+              if bs.length >= 3 then
+                (if bs.head = 224 then (bs.tail.head >= 160 and bs.tail.head <= 191)
+                 else if bs.head = 237 then (bs.tail.head >= 128 and bs.tail.head <= 159)
+                 else (bs.tail.head >= 128 and bs.tail.head <= 191) end end) and
+                (bs.tail.tail.head >= 128 and bs.tail.tail.head <= 191) and
+                valid_utf8(bs.tail.tail.tail)
+              else
+                False
+              end
+            else
+              if bs.head >= 240 and bs.head <= 244 then
+                if bs.length >= 4 then
+                  (if bs.head = 240 then (bs.tail.head >= 144 and bs.tail.head <= 191)
+                   else if bs.head = 244 then (bs.tail.head >= 128 and bs.tail.head <= 143)
+                   else (bs.tail.head >= 128 and bs.tail.head <= 191) end end) and
+                  (bs.tail.tail.head >= 128 and bs.tail.tail.head <= 191) and
+                  (bs.tail.tail.tail.head >= 128 and bs.tail.tail.tail.head <= 191) and
+                  valid_utf8(bs.tail.tail.tail.tail)
+                else
+                  False
+                end
+              else
+                False
+              end
+            end
+          end
+        end
+      end
+    end
+
+  -- The exact UTF-8 decoder: the Unicode scalar values a well-formed sequence encodes.
+  decode_utf8(bs: LIST[U64]): LIST[CHAR]
+    require
+      valid: valid_utf8(bs)
+    variant
+      bs.length
+    do
+      if bs.length = 0 then
+        LIST.empty
+      else
+        if bs.head < 128 then
+          decode_utf8(bs.tail).prepend(CHAR.from_scalar(bs.head))
+        else
+          if bs.head <= 223 then
+            decode_utf8(bs.tail.tail).prepend(CHAR.from_scalar((bs.head - 192) * 64 + (bs.tail.head - 128)))
+          else
+            if bs.head <= 239 then
+              decode_utf8(bs.tail.tail.tail).prepend(CHAR.from_scalar((bs.head - 224) * 4096 + (bs.tail.head - 128) * 64 + (bs.tail.tail.head - 128)))
+            else
+              decode_utf8(bs.tail.tail.tail.tail).prepend(CHAR.from_scalar((bs.head - 240) * 262144 + (bs.tail.head - 128) * 4096 + (bs.tail.tail.head - 128) * 64 + (bs.tail.tail.tail.head - 128)))
+            end
+          end
+        end
+      end
+    ensure
+      length_bounded: Result.length <= bs.length
+      empty_iff: (Result.length = 0) = (bs.length = 0)
+    end
+
+  empty: BYTES
+    do
+      { items = LIST.empty, size = 0 }
+    ensure
+      empty_len: Result.length = 0
+      empty_model: Result.model = LIST.empty
+    end
+
+  from_list(xs: LIST[U64]): BYTES
+    require
+      octets: all_octets(xs)
+      fits: xs.length <= 18446744073709551615
+    do
+      { items = xs, size = xs.length }
+    ensure
+      len: Result.length = xs.length
+      model_eq: Result.model = xs
+    end
+
+create {NONE}
+
+  get_byte(bs: LIST[U64], i: NAT): U64
+    require
+      octets: all_octets(bs)
+      in_bounds: i < bs.length
+    variant
+      i
+    do
+      if i = 0 then
+        bs.head
+      else
+        get_byte(bs.tail, i - 1)
+      end
+    ensure
+      is_octet: Result < 256
+      matches_ops: Result = LIST_OPS.at(bs, i)
+    end
+
+specify {ANY}
+
+  model: LIST[U64]
+    do
+      Current.items
+    end
+
+  -- Every well-formed UTF-8 sequence consists of octets. The proof steps walk back from
+  -- the induction hypothesis one byte at a time (each step is a single unfolding).
+  law utf8_octets(xs: LIST[U64])
+    require
+      xs_valid: valid_utf8(xs)
+    trigger
+      valid_utf8(xs)
+    variant
+      xs.length
+    do
+      if xs.length = 0 then
+        True
+      else
+        if xs.head < 128 then
+          utf8_octets(xs.tail)
+        else
+          if xs.head <= 223 then
+            utf8_octets(xs.tail.tail) and
+            all_octets(xs.tail)
+          else
+            if xs.head <= 239 then
+              utf8_octets(xs.tail.tail.tail) and
+              all_octets(xs.tail.tail) and
+              all_octets(xs.tail)
+            else
+              utf8_octets(xs.tail.tail.tail.tail) and
+              all_octets(xs.tail.tail.tail) and
+              all_octets(xs.tail.tail) and
+              all_octets(xs.tail)
+            end
+          end
+        end
+      end
+    ensure
+      octets: all_octets(xs)
+    end
+
+  -- UTF-8 is closed under concatenation and decoding distributes over it.
+  law utf8_append(xs: LIST[U64], ys: LIST[U64])
+    require
+      xs_valid: valid_utf8(xs)
+      ys_valid: valid_utf8(ys)
+    trigger
+      xs.append(ys)
+    variant
+      xs.length
+    do
+      if xs.length = 0 then
+        True
+      else
+        if xs.head < 128 then
+          utf8_append(xs.tail, ys)
+        else
+          if xs.head <= 223 then
+            utf8_append(xs.tail.tail, ys)
+          else
+            if xs.head <= 239 then
+              utf8_append(xs.tail.tail.tail, ys)
+            else
+              utf8_append(xs.tail.tail.tail.tail, ys)
+            end
+          end
+        end
+      end
+    ensure
+      append_valid: valid_utf8(xs.append(ys))
+      chars_append: decode_utf8(xs.append(ys)) = decode_utf8(xs).append(decode_utf8(ys))
+    end
+
+  -- Decoding is injective on well-formed sequences: the shortest-form rules make the
+  -- encoding of every scalar unique.
+  law decode_injective(xs: LIST[U64], ys: LIST[U64])
+    require
+      xs_valid: valid_utf8(xs)
+      ys_valid: valid_utf8(ys)
+      same_chars: decode_utf8(xs) = decode_utf8(ys)
+    trigger
+      decode_utf8(xs), decode_utf8(ys)
+    variant
+      xs.length
+    do
+      if xs.length = 0 then
+        True
+      else
+        if xs.head < 128 then
+          decode_injective(xs.tail, ys.tail)
+        else
+          if xs.head <= 223 then
+            decode_injective(xs.tail.tail, ys.tail.tail)
+          else
+            if xs.head <= 239 then
+              decode_injective(xs.tail.tail.tail, ys.tail.tail.tail)
+            else
+              decode_injective(xs.tail.tail.tail.tail, ys.tail.tail.tail.tail)
+            end
+          end
+        end
+      end
+    ensure
+      same_bytes: xs = ys
+    end
+
+feature {ANY}
+
+  length: NAT
+    do
+      Current.size
+    ensure
+      def: Result = Current.model.length
+    end
+
+  is_empty: BOOL
+    do
+      Current.size = 0
+    ensure
+      def: Result = (Current.model = LIST.empty)
+    end
+
+  to_list: LIST[U64]
+    do
+      Current.items
+    ensure
+      is_model: Result = Current.model
+    end
+
+  at(i: NAT): U64
+    require
+      in_bounds: i < Current.length
+    do
+      get_byte(Current.items, i)
+    ensure
+      octet: Result < 256
+      model_at: Result = LIST_OPS.at(Current.model, i)
+    end
+
+  equals(other: BYTES): BOOL
+    do
+      Current.items = other.items
+    ensure
+      def: Result = (Current.model = other.model)
+    end
+
+specify {EQ}
+
+  law reflexive(a: BYTES)
+    ensure
+      refl: a.equals(a)
+    end
+
+  law symmetric(a: BYTES, b: BYTES)
+    require
+      ab: a.equals(b)
+    ensure
+      ba: b.equals(a)
+    end
+
+  law transitive(a: BYTES, b: BYTES, c: BYTES)
+    require
+      ab: a.equals(b)
+      bc: b.equals(c)
+    ensure
+      ac: a.equals(c)
+    end
+
+invariant
+  size_matches: size = items.length
+  valid_octets: all_octets(items)
+
+end
