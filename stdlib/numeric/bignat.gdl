@@ -1,0 +1,254 @@
+module BIGNAT satisfies ORD
+
+representation {NONE}
+  limbs: LIST[U64]
+  size: NAT
+
+specify {ANY}
+
+  value_of(ls: LIST[U64]): MATH_INT
+    variant
+      ls.length
+    do
+      if ls.length = 0 then
+        0
+      else
+        ls.head + 18446744073709551616 * value_of(ls.tail)
+      end
+    end
+
+  limbs_in_range(ls: LIST[U64]): BOOL
+    variant
+      ls.length
+    do
+      if ls.length = 0 then
+        True
+      else
+        0 <= ls.head and ls.head <= 18446744073709551615 and limbs_in_range(ls.tail)
+      end
+    end
+
+  normalized(ls: LIST[U64]): BOOL
+    variant
+      ls.length
+    do
+      if ls.length = 0 then
+        True
+      else
+        if ls.tail.length = 0 then
+          ls.head > 0
+        else
+          normalized(ls.tail)
+        end
+      end
+    end
+
+  value_bounds(ls: LIST[U64]): BOOL
+    require
+      in_range: limbs_in_range(ls)
+    variant
+      ls.length
+    do
+      if ls.length = 0 then
+        True
+      else
+        value_bounds(ls.tail)
+      end
+    ensure
+      bounds_hold: Result
+      non_negative: value_of(ls) >= 0
+      positive_when_normalized: (ls.length > 0 and normalized(ls)) implies value_of(ls) > 0
+    end
+
+  shorter_is_smaller(xs: LIST[U64], ys: LIST[U64]): BOOL
+    require
+      shorter: xs.length < ys.length
+      xs_in_range: limbs_in_range(xs)
+      ys_in_range: limbs_in_range(ys)
+      ys_normalized: normalized(ys)
+    variant
+      xs.length
+    do
+      if xs.length = 0 then
+        value_bounds(ys)
+      else
+        shorter_is_smaller(xs.tail, ys.tail)
+      end
+    ensure
+      shorter_holds: Result
+      strictly_smaller: value_of(xs) < value_of(ys)
+    end
+
+  model: MATH_INT
+    do
+      reveal value_of
+      value_of(Current.limbs)
+    end
+
+create {ANY}
+
+  zero: BIGNAT
+    do
+      { limbs = LIST.empty, size = 0 }
+    ensure
+      value_is_zero: Result.model = 0
+      zero_limbs: Result.limb_count = 0
+    end
+
+  from_u64(x: U64): BIGNAT
+    do
+      if x = 0 then
+        { limbs = LIST.empty, size = 0 }
+      else
+        { limbs = LIST.empty.prepend(x), size = 1 }
+      end
+    ensure
+      val: Result.model = x
+      count_bounded: Result.limb_count <= 1
+    end
+
+feature {ANY}
+
+  equals(other: BIGNAT): BOOL
+    do
+      if Current.size = other.size then
+        compare_limbs(Current.limbs, other.limbs) = 1
+      else
+        if Current.size < other.size then
+          check
+            current_shorter: shorter_is_smaller(Current.limbs, other.limbs)
+          end
+          False
+        else
+          check
+            other_shorter: shorter_is_smaller(other.limbs, Current.limbs)
+          end
+          False
+        end
+      end
+    ensure
+      model_eq: Result = (Current.model = other.model)
+    end
+
+  less_than(other: BIGNAT): BOOL
+    do
+      if Current.size = other.size then
+        compare_limbs(Current.limbs, other.limbs) = 0
+      else
+        if Current.size < other.size then
+          check
+            current_shorter: shorter_is_smaller(Current.limbs, other.limbs)
+          end
+          True
+        else
+          check
+            other_shorter: shorter_is_smaller(other.limbs, Current.limbs)
+          end
+          False
+        end
+      end
+    ensure
+      model_lt: Result = (Current.model < other.model)
+    end
+
+  limb_count: NAT
+    do
+      Current.size
+    end
+
+  shift_in_low_limb(limb: U64): BIGNAT
+    require
+      not_full: Current.limb_count < 1024
+      no_leading_zero: limb > 0 or Current.limb_count > 0
+    do
+      { limbs = Current.limbs.prepend(limb),
+        size = Current.size + 1 }
+    ensure
+      limb_added: Result.limb_count = Current.limb_count + 1
+      model_updated: Result.model = limb + 18446744073709551616 * Current.model
+    end
+
+feature {NONE}
+
+  compare_limbs(xs: LIST[U64], ys: LIST[U64]): U64
+    require
+      same_length: xs.length = ys.length
+      xs_in_range: limbs_in_range(xs)
+      ys_in_range: limbs_in_range(ys)
+    variant
+      xs.length
+    do
+      if xs.length = 0 then
+        1
+      else
+        let high = compare_limbs(xs.tail, ys.tail)
+        if high = 1 then
+          if xs.head < ys.head then
+            0
+          else
+            if xs.head = ys.head then
+              1
+            else
+              2
+            end
+          end
+        else
+          high
+        end
+      end
+    ensure
+      code_bounded: Result <= 2
+      less_code: (Result = 0) = (value_of(xs) < value_of(ys))
+      equal_code: (Result = 1) = (value_of(xs) = value_of(ys))
+    end
+
+specify {EQ}
+
+  law reflexive(a: BIGNAT)
+    ensure
+      refl: a.equals(a)
+    end
+
+  law symmetric(a: BIGNAT, b: BIGNAT)
+    require
+      ab: a.equals(b)
+    ensure
+      ba: b.equals(a)
+    end
+
+  law transitive(a: BIGNAT, b: BIGNAT, c: BIGNAT)
+    require
+      ab: a.equals(b)
+      bc: b.equals(c)
+    ensure
+      ac: a.equals(c)
+    end
+
+specify {ORD}
+
+  law irreflexive(a: BIGNAT)
+    ensure
+      not_less_than_self: not a.less_than(a)
+    end
+
+  law transitive(a: BIGNAT, b: BIGNAT, c: BIGNAT)
+    require
+      a_lt_b: a.less_than(b)
+      b_lt_c: b.less_than(c)
+    ensure
+      a_lt_c: a.less_than(c)
+    end
+
+  law total(a: BIGNAT, b: BIGNAT)
+    ensure
+      comparable: a.less_than(b) or a.equals(b) or b.less_than(a)
+    end
+
+invariant
+  size_matches: size = limbs.length
+  bounded_limbs: size <= 1024
+  limbs_in_u64: limbs_in_range(limbs)
+  no_zero_high_limb: normalized(limbs)
+
+end
+

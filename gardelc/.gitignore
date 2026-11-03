@@ -1,3 +1,6 @@
 /target
 /build
 *.exe
+
+# Old `gardelc --emit-stdlib` output location (it now writes build/stdlib/); the real stdlib is ../stdlib
+/stdlib/

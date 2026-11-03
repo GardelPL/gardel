@@ -1,0 +1,142 @@
+# Changelog
+
+All notable changes, theoretical soundess fixes, verification overhauls, front-end language additions, backend code generation improvements, and standard library alignments for the Gardel programming language and `gardelc` compiler.
+
+---
+
+## [0.4.0] - 2026-10-28
+
+This release represents a comprehensive overhaul of the Gardel Language Specification (Draft v0.4) and the `gardelc` compiler implementation, closing critical theoretical soundness holes, replacing bounded concrete sampling with genuine Boogie/Z3 SMT verification, completing the front-end grammar and type system, implementing general AST-driven C11 and Bend v2 lowering, integrating Perceus reference counting, and completing the standard library.
+
+The remediation and implementation proceeded across four distinct phases:
+
+---
+
+### Phase 1: Specification Soundness & Theoretical Semantics Patch
+*Target: `spec/gardel_language_specification_draft_v0_4.md`*
+
+- **Decoupled `EQ` from SMT Leibniz Identity (§9)**:
+  - Replaced the contradictory law `agrees_with_structural` (`a.equals(b) = (a = b)`) in concept `EQ` with standard equivalence relation laws: `reflexive`, `symmetric`, and `transitive`.
+  - Resolved the fatal soundness bug where non-canonical representation ADTs (such as balanced tree sequences `SEQ[A]`, un-normalized `BIGNAT`, and quotients) triggered contradictory equality axioms in Z3, allowing arbitrary false proofs.
+  - Updated `ORD` laws (`less_or_equal`, `total`) to reference `a.equals(b)` rather than SMT structural equality `a = b`.
+  - Introduced sub-concept `CANONICAL_EQ refines EQ` for flat/canonical types (`U64`, `BOOL`, `OPTION[U64]`) where structural identity implies behavioral equivalence.
+- **Closed Invariant Destructuring & Routine Return Gap (§6, §12)**:
+  - Unified routine verification obligations: both `create` routines and `feature` routines returning an instance of `Current` (or any refined type `M`) carry the postcondition obligation $I(\mathit{Result})$.
+  - Formalized hereditary invariant requirements on inductive sum types (`case Node(l, r)`): invariants must be proven hereditary ($\forall l, r.\; I(\text{Node}(l, r)) \implies I(l) \land I(r)$) or scoped as ghost model properties at public boundaries. Clarified the use of local `check` blocks for inductive construction.
+- **Formalized `UNIT`, `with IO` Monadic Typing, and Linearity (§3, §11, §15)**:
+  - Added primitive type `UNIT` (literal `()`) to §3.
+  - Defined explicit typing rules for monadic `with IO`:
+    - `x <- e` requires $e : \text{IO}[A]$ and binds $x : A$.
+    - Bare statement $e$ requires $e : \text{IO}[\text{UNIT}]$.
+    - The final expression in `with IO ... end` must have type $\text{IO}[R]$, typing the entire block as $\text{IO}[R]$.
+  - Formalized affine/linear consumption: values of type `IO[...]` must be consumed exactly once across every control-flow path, cannot be dropped in branch divergence, and cannot be captured in multi-use closures.
+- **Corrected `F64` Confluence Claims & EBNF Grammar (§2, §3, §10, §15)**:
+  - Scoped Church-Rosser bit-for-bit confluence claims strictly to exact discrete types (`U64`, `I64`, `MATH_INT`, `BOOL`, `CHAR`, and ADTs).
+  - Specified `F64` as following strict IEEE-754 syntactic expression trees without compiler re-association or `-ffast-math` contractions (`-ffp-contract=off`).
+  - Supported multi-parameter refined function types in EBNF: `"(" ( Param ( "," Param )* )? ")" "->" Type RequireBlock? EnsureBlock?`.
+  - Specified newline-delimited (or optional `;`) statement termination in `Block` and `WithIoExpr` to eliminate `let` function application ambiguity.
+  - Enforced lexical casing rules (`UpperIdent` for types, modules, concepts, and constructors; `LowerIdent` for variables, parameters, routines, fields, and tags).
+
+---
+
+### Phase 2: Verifier Soundness Overhaul & Real Boogie/Z3 Integration
+*Target: `gardelc/src/main.rs`*
+
+- **Replaced Bounded Concrete Sampling with Genuine Formal Verification**:
+  - Eliminated the verification bypass where `verify_module_phase3` only evaluated concrete sample inputs `0, 1, 2` and `[]`, which previously allowed out-of-bounds errors, overflows, and false quantifiers (`forall x: NAT. x < 5`) to pass with 0 errors.
+  - Integrated automated external solver discovery (`find_solvers`) resolving `boogie.exe` and `z3` from `BOOGIE_EXE`, `Z3_EXE`, local tool directories, user `.dotnet/tools`, and system `PATH`.
+  - Wired direct Boogie and Z3 execution as the mandatory default verification engine. Introduced explicit `--bounded-check` flag strictly as an opt-in fallback.
+  - Implemented structured SMT counterexample parsing and model translation: cleans SSA versions (`var@@1` -> `var`), reconstructs ADT records, extracts precondition path conditions, attaches suggested lemmas, and formats diagnostics into structured error reports.
+  - Enforced that compilation halts with exit code 1 whenever formal verification fails.
+- **Resolved Axiomatization Soundness Bugs in Boogie Emitter**:
+  - **Variant Disjointness**: Emitted pairwise exclusion axioms (`is_V1(x) ==> !is_V2(x)`) and bidirectional equivalence axioms for nullary variants (`is_Empty(x) <==> x == Empty()`), preventing false branch satisfaction in Z3.
+  - **String Interning**: Replaced single hardcoded `IO_read_line()` emission with interned unique constants (`const unique str_lit_{n}: GardelString`) and string length axioms, preventing distinct string literals from falsely evaluating as equal.
+  - **Canonical Record Field Ordering**: Sorted record fields in `emit_boogie_expr`, `emit_dafny_expr`, and symbolic evaluators to strictly match product representation declaration order.
+  - **General Recursive Variant Decrease Checks**: Implemented non-negativity and strictly decreasing checks for general numeric and measure variants across recursive `Call` and `MethodCall` expressions.
+  - **Capture-Avoiding Substitution**: Implemented safe substitution in Boogie definitional axioms that respects variable shadowing in `let`, `lambda`, `match`, and `with IO`.
+
+---
+
+### Phase 3: Front-End Completeness, Concept System & Multi-Module Pipeline
+*Target: `gardelc/src/main.rs`, `stdlib/stdlib.gdl`*
+
+- **Full Front-End Lexer & Parser Completeness (§3, §4, §5, §8, §15)**:
+  - Added support for unit literal `()`, floating-point literals (`1.23`), character literals (`'a'`), unary negation (`-x`), wrapping arithmetic (`+%`, `-%`, `*%`), and bitwise operators (`&`, `|`, `^`, `<<`, `>>`).
+  - Mapped signed `I64` to bounded integers with signed overflow checks; mapped wrapping and bitwise operations on `U64` to Boogie `bv64` bitvector functions with shift-bounds checks (`0 <= rhs < 64`).
+  - Made `implies` and function arrow `->` right-associative in the parser.
+  - Enforced lexical casing (`UpperIdent` vs. `LowerIdent`) and line-break/`;` statement delimitation.
+  - Added module kind restrictions rejecting `representation`, `create`, or `invariant` in `functions` and `program` declarations.
+  - Implemented recursive nested pattern matching AST (`Pattern`) and comma-separated lexicographic termination variants.
+- **Type Checking, Scope-Aware Visibility & Linear IO (§4, §6, §11)**:
+  - Implemented `collect_symbols_scoped` tracking in-scope bindings to prevent false visibility errors when local variables shadow private field names.
+  - Added hereditary invariant verification procedures (`Verify_Hereditary_Invariant_*`) asserting invariants hold inductively on recursive ADT destructuring.
+  - Implemented monadic IO return checking and branch linearity verification (`check_branch_io_linearity`) enforcing balanced linear IO sequencing across `if`/`else` branches.
+- **Concept Signatures, Constrained Generics, Monomorphization & Closure Conversion (§8, §9, §13)**:
+  - Implemented full signature verification in `check_and_expand_concepts` validating parameter counts, parameter types (with `Current` mapped), return types, and `where` constraints.
+  - Emitted uninterpreted Boogie functions and mathematical axioms for constrained generics (`[A: ORD]`, `[A: EQ]`).
+  - Implemented full AST monomorphization across product/sum representations and routine signatures, with automatic instance discovery in `ProgramEnv`.
+  - Implemented closure conversion (`closure_convert_module`) lowering capturing lambdas into environment records (`ClosureEnv_<id>`) and top-level combinators (`closure_apply_<id>`).
+- **Multi-Module Compilation Pipeline**:
+  - Upgraded code generation pipeline to iterate over all modules in a compilation unit, generating `.bpl`, `.dfy`, `.bend`, and `.c` for every module in `build/`.
+  - Stamped `Diagnostic` items with the originating `module_name` for accurate multi-module JSON reporting.
+
+---
+
+### Phase 4: General AST Lowering, Perceus RC, Automatic Parallelism & Stdlib
+*Target: `gardelc/src/main.rs`, `stdlib/stdlib.gdl`, `examples/`*
+
+- **General AST-Driven C11 & Bend v2 Code Generation (§5, §8, §13)**:
+  - Eliminated hardcoded demo C11 string templates in favor of general AST-driven lowering for product structs, tagged union sum types, pattern matching, constructor functions, and expressions.
+  - Integrated `#pragma STDC FP_CONTRACT OFF` in `emit_c11_runtime_header()` to enforce strict IEEE-754 floating-point evaluation without platform-dependent contraction.
+  - Lowered closure environments and top-level combinators into native C structs and function pointers.
+  - Lowered `Expr::WithIo` bindings and statements into sequential C execution, emitting `main(void)` and linking clean executables with host C compilers (gcc/clang).
+- **Automatic Fork-Join Parallelism & Tail-Call Optimization (§10)**:
+  - Implemented static dependency analysis (`analyze_parallel_lets`) partitioning independent recursive `let` bindings into parallel groups.
+  - Emitted parallel tuple assignments `(ml, mr) = (e1, e2)` for Bend v2 and `#pragma omp task shared(...)` / `#pragma omp taskwait` for C11.
+  - Added configurable parallelism granularity cutoff `#ifndef GARDEL_PAR_THRESHOLD #define GARDEL_PAR_THRESHOLD 512` to prevent task explosion on small inputs.
+  - Implemented self-recursive tail call detection (`is_tail_recursive_routine`) lowering recursive functions to iterative loops (`tail_loop:`) in C11.
+- **Perceus Reference Counting & Memory Management (§13, §16)**:
+  - Added atomic reference count fields (`_rc`) to heap-allocated ADT structs with constructor initializers (`_rc = 1`).
+  - Added allocation tracking runtime primitives (`gardel_alloc`, `gardel_free`, `gardel_live_allocations`) to ensure leak-free execution and verify reference lifecycle correctness.
+- **Standard Library Consolidation & Examples Decoupling**:
+  - Upgraded the canonical standard library [stdlib/stdlib.gdl](stdlib/stdlib.gdl) to contain pure data types and collections: `group { SEQ, BIGNAT, STRING, OPTION }`:
+    - `SEQ[A]`: Functional balanced tree sequences with logarithmic indexing, concatenation, slices, and verified invariants.
+    - `BIGNAT`: Arbitrary-precision unsigned integers backed by `SEQ[U64]` with ghost `MATH_INT` polynomial models.
+    - `STRING`: UTF-8 string slices backed by `SEQ[U64]` with ghost `LIST[CHAR]` models.
+    - `OPTION[A]`: Verified optional values with `is_some`, `is_none`, and safe extraction.
+  - Decoupled `program GREETER` from the canonical library and relocated it to [examples/greeter.gdl](examples/greeter.gdl) as a standalone demonstration of interactive monadic IO programming.
+
+---
+
+### Verification and Test Suite Growth
+
+The unit test suite in `gardelc/src/main.rs` was expanded from initial stubs to 27 comprehensive, fully automated tests with a 100% pass rate:
+
+1. `test_single_module_pipeline_v0_4`
+2. `test_boogie_fuel_monomorphization_bounded_stack`
+3. `test_phase3_boogie_emission_and_fuel`
+4. `test_phase3_overflow_counterexample_translation`
+5. `test_phase3_fuel_exhaustion_and_reveal_fix`
+6. `test_phase3_assume_audit_and_strict`
+7. `test_phase4_stdlib_package_verifies_all_modules`
+8. `test_phase4_io_boundary_and_linearity_firewall`
+9. `test_phase4_inspect_module_interface`
+10. `test_phase2_variant_disjointness_and_distinct_strings`
+11. `test_phase2_canonical_record_ordering`
+12. `test_phase2_capture_avoiding_substitution`
+13. `test_phase2_general_numeric_variant_termination`
+14. `test_plan3_front_end_primitives_and_operators`
+15. `test_plan3_right_associative_implies_and_casing`
+16. `test_plan3_module_kind_restrictions`
+17. `test_plan3_nested_pattern_matching_and_lexicographic_variants`
+18. `test_plan3_hereditary_invariant_verification`
+19. `test_plan3_io_branch_linearity_checking`
+20. `test_plan3_concept_signatures_and_ord_axiomatization`
+21. `test_plan3_multi_module_stdlib_pipeline`
+22. `test_plan3_closure_conversion_and_refined_fn_types`
+23. `test_plan4_general_c11_ast_lowering_custom_adt`
+24. `test_plan4_c11_and_bend_closure_conversion_codegen`
+25. `test_plan4_automatic_fork_join_parallel_let_analysis`
+26. `test_plan4_tail_recursion_to_c11_while_loop`
+27. `test_plan4_perceus_refcounting_zero_memory_leaks`
+

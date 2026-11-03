@@ -1,0 +1,9 @@
+concept CANONICAL_EQ refines EQ
+
+  law agrees_with_structural(a: Current, b: Current)
+    ensure
+      sound: a.equals(b) = (a = b)
+    end
+
+end
+

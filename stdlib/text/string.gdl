@@ -1,0 +1,193 @@
+module STRING satisfies EQ
+
+representation {NONE}
+  bytes: LIST[U64]
+  size: NAT
+  limit: NAT
+
+specify {ANY}
+
+  all_bytes_valid(bs: LIST[U64]): BOOL
+    variant
+      bs.length
+    do
+      if bs.length = 0 then
+        True
+      else
+        bs.head < 128 and all_bytes_valid(bs.tail)
+      end
+    end
+
+  scalar_codes(cs: LIST[CHAR]): LIST[U64]
+    variant
+      cs.length
+    do
+      if cs.length = 0 then
+        LIST.empty
+      else
+        scalar_codes(cs.tail).prepend(cs.head.code)
+      end
+    end
+
+  decode_utf8(bs: LIST[U64]): LIST[CHAR]
+    require
+      ascii: all_bytes_valid(bs)
+    variant
+      bs.length
+    do
+      if bs.length = 0 then
+        LIST.empty
+      else
+        decode_utf8(bs.tail).prepend(CHAR.from_scalar(bs.head))
+      end
+    ensure
+      same_length: Result.length = bs.length
+      cons_case: bs.length > 0 implies Result = decode_utf8(bs.tail).prepend(CHAR.from_scalar(bs.head))
+      codes_preserved: scalar_codes(Result) = bs
+    end
+
+  law decode_injective(xs: LIST[U64], ys: LIST[U64])
+    require
+      xs_ascii: all_bytes_valid(xs)
+      ys_ascii: all_bytes_valid(ys)
+      same_chars: decode_utf8(xs) = decode_utf8(ys)
+    variant
+      xs.length
+    ensure
+      same_bytes: xs = ys
+    end
+
+  byte_model: LIST[U64]
+    do
+      Current.bytes
+    end
+
+  chars: LIST[CHAR]
+    do
+      decode_utf8(Current.bytes)
+    ensure
+      def: Result = decode_utf8(Current.byte_model)
+    end
+
+create {ANY}
+
+  make_empty(cap: NAT): STRING
+    require
+      positive_cap: cap > 0
+    do
+      { bytes = LIST.empty, size = 0, limit = cap }
+    ensure
+      empty_bytes: Result.byte_length = 0
+      empty_chars: Result.chars = LIST.empty
+      empty_str: Result.is_empty
+      capacity_set: Result.capacity = cap
+    end
+
+feature {ANY}
+
+  equals(other: STRING): BOOL
+    do
+      Current.bytes = other.bytes
+    ensure
+      byte_equality: Result = (Current.byte_model = other.byte_model)
+      char_equality: Result = (Current.chars = other.chars)
+    end
+
+  byte_length: NAT
+    do
+      Current.size
+    ensure
+      matches_bytes: Result = Current.byte_model.length
+    end
+
+  code_point_count: NAT
+    do
+      Current.size
+    ensure
+      def: Result = Current.chars.length
+    end
+
+  capacity: NAT
+    do
+      Current.limit
+    end
+
+  is_empty: BOOL
+    do
+      Current.size = 0
+    ensure
+      def: Result = (Current.byte_length = 0)
+      empty_chars: Result = (Current.chars = LIST.empty)
+    end
+
+  push_byte(b: U64): STRING
+    require
+      is_byte: b < 128
+      has_room: Current.byte_length < Current.capacity
+    do
+      { bytes = Current.bytes.prepend(b),
+        size = Current.size + 1,
+        limit = Current.limit }
+    ensure
+      grew: Result.byte_length = Current.byte_length + 1
+      non_empty: not Result.is_empty
+    end
+
+  push_utf8_word(w: U64): STRING
+    require
+      valid_word: w < 128
+      has_room: Current.byte_length < Current.capacity
+    do
+      { bytes = Current.bytes.prepend(w),
+        size = Current.size + 1,
+        limit = Current.limit }
+    ensure
+      grew: Result.byte_length = Current.byte_length + 1
+      non_empty: not Result.is_empty
+    end
+
+  push_ascii(c: CHAR): STRING
+    require
+      is_ascii: c.code < 128
+      has_room: Current.byte_length < Current.capacity
+    do
+      { bytes = Current.bytes.prepend(c.code),
+        size = Current.size + 1,
+        limit = Current.limit }
+    ensure
+      grew: Result.byte_length = Current.byte_length + 1
+      chars_prepended: Result.chars = Current.chars.prepend(c)
+      non_empty: not Result.is_empty
+      same_capacity: Result.capacity = Current.capacity
+    end
+
+specify {EQ}
+
+  law reflexive(a: STRING)
+    ensure
+      refl: a.equals(a)
+    end
+
+  law symmetric(a: STRING, b: STRING)
+    require
+      ab: a.equals(b)
+    ensure
+      ba: b.equals(a)
+    end
+
+  law transitive(a: STRING, b: STRING, c: STRING)
+    require
+      ab: a.equals(b)
+      bc: b.equals(c)
+    ensure
+      ac: a.equals(c)
+    end
+
+invariant
+  positive_capacity: limit > 0
+  size_matches: size = bytes.length
+  within_bounds: size <= limit
+  valid_bytes: all_bytes_valid(bytes)
+
+end
+

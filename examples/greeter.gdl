@@ -1,0 +1,22 @@
+program GREETER
+
+feature {ANY}
+
+  main(args: SEQ[STRING]): IO[EXIT_CODE]
+    do
+      with IO
+        line_res <- IO.read_line
+        match line_res
+          case Ok(name) then
+            with IO
+              IO.print("Hello, ")
+              IO.print_line(name)
+              IO.exit(0)
+            end
+          case Error(_) then
+            IO.exit(1)
+        end
+      end
+    end
+
+end
