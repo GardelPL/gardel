@@ -297,18 +297,32 @@ Source: [review/review.md](review/review.md). The verification notes for each fi
   - **Docs:** spec §4.1 (bootstrap paragraph), §6 module listing, §9 law catalogue, §11 `IO_ERROR`, and §16 (C.1 completed, `bytes.gdl` moved to C.2) no longer point to `stdlib/stdlib.gdl`. The README repository tree shows the `stdlib/` layout, and `gardelc/stdlib/` is removed from it.
   - `cargo test` 73/73.
 
-#### Task C.2: High-Performance Smart String (`stdlib/text/string.gdl`)
-- Align `module STRING` with `Design Smart String.md` and the C runtime emitter:
-  - Representation: packed 64-bit words or UTF-8 byte buffer.
-  - Invariant: `valid_utf8` / `all_bytes_valid`.
-  - Ghost model: `specify chars: LIST[CHAR]`.
-  - Replace the bootstrap ASCII-subset representation (spec §6.4.C) with full multi-byte UTF-8: 2–4 byte `decode_utf8`, rejection of overlong forms and surrogates, and a cached code-point count. Keep the public `chars` contracts unchanged.
-  - Operations: `code_point_count: NAT`, `byte_length: NAT`, `is_empty: BOOL`, `character_at(index: NAT): CHAR`, `concat(other: STRING): STRING`, `to_utf8: BYTES`.
-  - Safe boundary conversion: `from_utf8(bytes: BYTES): RESULT[STRING_ERROR, STRING]`.
+#### Task C.2: High-Performance Smart String (`stdlib/text/string.gdl`) [✅ Completed]
+- [x] Full RFC 3629 UTF-8 `STRING` (spec §6.4.C), keeping the public `chars` contracts:
+  - [x] **Verification model:** `bytes: LIST[U64]` with one octet per element, plus `size`, the cached `char_count` and the builder capacity `limit`. Invariant: `BYTES.valid_utf8(bytes)`, `char_count = BYTES.decode_utf8(bytes).length`, `char_count <= size <= limit`, `limit > 0`. Ghost model `specify chars: LIST[CHAR]`. The model is not packed. The *runtime* representation is packed (see C11 below).
+  - [x] Operations: `code_point_count` (cached), `byte_length`, `is_empty`, `character_at(index: NAT): CHAR` with `require index < code_point_count` (as in `Design Smart String.md`; not `OPTION[CHAR]`), `concat`, `to_utf8: BYTES`, `equals` (byte equality = character equality).
+  - [x] Literal builders `push_ascii`, `push_utf8_2/3/4`; multi-byte string literals (`E0303` removed). The ASCII-only aliases `push_byte` / `push_utf8_word` were removed.
+  - [x] Boundary decoding `from_utf8(bytes: BYTES): RESULT[STRING_ERROR, STRING]` with `ok_iff_valid: Result.is_ok = BYTES.valid_utf8(bytes.model)`. Errors are reported in a fixed check order (continuation bytes present, then completeness, then the lead-specific range), shared with the C decoder.
+- [x] **UTF-8 theory in `module BYTES` (`stdlib/text/bytes.gdl`), proven, not axiomatized:** `valid_utf8`, `decode_utf8` and the laws `utf8_octets`, `utf8_append` and `decode_injective`, all proven by structural induction. They reach `STRING` as linked client axioms. `BYTES` also has `length`, `at`, `from_list`, `empty`, `to_list`, `is_empty`, `equals`.
+- [x] **`concat` is usable on input:** its only precondition is byte-length overflow. `IO.read_line` returns lines shorter than 2^48 bytes (`GARDEL_MAX_LINE_BYTES`; the C runtime returns `Error(OsError(EOVERFLOW))` otherwise, and the verifier assumes the bound). `"Hé, ".concat(name)` verifies.
+- [x] **C11:** `GardelString { data, len, chars }` is a packed UTF-8 buffer with cached code-point count. `STRING`/`BYTES` methods lower to `gardel_string_*` / `gardel_bytes_*`, dispatched on the receiver's C type with `_Generic` (the C emitter is untyped). `STRING.from_utf8` is supported. One RFC 3629 validator (`gardel_utf8_validate`) serves `read_line` and `from_utf8`. Expression-position blocks no longer emit `return`.
+- [x] **C.2 review fixes (verifier soundness):**
+  - **Non-exhaustive `match` on a prelude ADT verified anything.** C.2 had added `else { assume false; }` after every `match`, while exhaustiveness was asserted only for the module's own sum type. Now omitted constructors are asserted unreachable for prelude ADTs too (path-sensitive, spec §5), including `match` nested inside expressions, which was unchecked before C.2 as well. The `assume false` is emitted only after those assertions, where it is implied.
+  - **16 hand-written UTF-8 Boogie axioms removed** (they were keyed on the module name `STRING` and made `STRING`'s own laws prove themselves). Replaced by the `BYTES` proofs above.
+  - **Law proof steps:** a plain boolean term in a law's `do` body is asserted and then known (spec §15, Law Proof Bodies). This is needed for `utf8_octets`, where a 4-byte step exceeds the default fuel.
+  - Prelude contract interfaces are emitted in the prelude module's own context, so `STRING`'s preconditions that call `BYTES.*` resolve in client files. `Result` inside `BYTES` is typed by the routine's return type, not assumed to be `BYTES`.
+  - Receiver resolution decides "static call `T.r`" by the declarations in scope instead of capitalization.
+- [x] Debugging aid: `GARDEL_KEEP_BPL=1` keeps the temporary Boogie VC files.
+- [x] Tests: `test_c2_utf8_laws_are_proven_not_assumed` (mutations: a dropped shortest-form rule breaks `decode_injective`, a false `chars_append` is rejected, `concat` depends on the laws), `test_c2_from_utf8_accepts_exactly_valid_utf8`, `test_c2_match_exhaustiveness_on_prelude_adts`, `test_c2_utf8_strings_verify_and_run_natively` (verification, multi-byte literal facts, and a native run when `gcc` is available, checking code-point counts and the error classification of `ED C0`, `E0 41`, `E0 80`, `E0 80 80`, `C0 AF`, `ED A0 80`, `F4 90 80 80`, `FF`). The B.5a test was rewritten for the `BYTES` design with its deleted assertions restored, and the STRING invariant check is exact again. `cargo test` 77/77. `--stdlib --strict` 0/0. greeter, peano_ord and bounded_stack 0/0. `examples/tree.gdl` now reports 2 errors (was 5): C.2's `Seq_singleton`/`append` preamble axioms closed 3. The remaining two are `forall` postconditions that need lemmas, so they are incompleteness, not unsoundness.
+- **Known limits:**
+  - `character_at` is O(n) at run time, which is inherent to code-point indexing of UTF-8.
+  - `concat` allocates and nothing frees (no GC yet).
+  - `LIST_OPS.at`, like the other `LIST_OPS` functions, is realized by the built-in `Seq_at` preamble axioms (B.1 known limit).
+  - The C emitter still has no general type inference: text methods rely on `_Generic`, so a call on an unexpected type is a C compile error, not a wrong call.
 
 #### Task C.3: Regression Verification & Performance Benchmarking
 - Run complete test suite:
-  - `cd gardelc && cargo test` (all 71+ tests passing).
+  - `cd gardelc && cargo test` (all 77+ tests passing).
   - Verify all modular stdlib files under `gardelc --strict` with 0 errors and 0 warnings.
   - Verify all examples under `gardelc --strict` with 0 errors and 0 warnings.
   - Execute native C11 builds of `greeter` and `SEQ` parallel tree benchmarks.
@@ -329,5 +343,5 @@ Source: [review/review.md](review/review.md). The verification notes for each fi
 
 ## 6. Immediate Next Step
 
-With **Phase A: Language Specification Harmonization**, **Phase B: Compiler Engine & Prelude Tooling**, and **Task C.1: Physical Decomposition of `stdlib/`** completely executed and verified with 0 errors and 0 warnings under `--strict`, the immediate execution task is **Task C.2: High-Performance Smart String (`stdlib/text/string.gdl`)**.
+With **Phase A: Language Specification Harmonization**, **Phase B: Compiler Engine & Prelude Tooling**, **Task C.1: Physical Decomposition of `stdlib/`**, and **Task C.2: High-Performance Smart String (`stdlib/text/string.gdl`)** completely executed and verified with 0 errors and 0 warnings under `--strict`, the immediate execution task is **Task C.3: Regression Verification & Performance Benchmarking**.
 

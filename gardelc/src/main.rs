@@ -488,9 +488,8 @@ pub fn tokenize_with_lines(src: &str) -> Result<(Vec<Token>, Vec<usize>), LexErr
             lines.push(start_line);
         } else if c == '"' {
             // §3.1.4 / §15 String literal: decoded at compile time into its scalar sequence.
-            // Malformed escapes, surrogates and raw line breaks are rejected; because the
-            // bootstrap prelude `STRING` is the ASCII subset of UTF-8 (§6.4.C), so is every
-            // scalar outside the ASCII range (multi-byte text is Task C.2).
+            // Malformed escapes, surrogates and raw line breaks are rejected; every Unicode
+            // scalar is allowed (the prelude `STRING` is full UTF-8, §6.4.C, Task C.2).
             let start = i;
             let start_line = current_line;
             i += 1;
@@ -511,15 +510,6 @@ pub fn tokenize_with_lines(src: &str) -> Result<(Vec<Token>, Vec<usize>), LexErr
                     i += 1;
                     ch
                 };
-                if !ch.is_ascii() {
-                    return Err(LexError {
-                        message: format!(
-                            "E0303: non_ascii_string_literal: string literal on line {start_line} contains the non-ASCII scalar U+{:04X}; the bootstrap prelude STRING is the ASCII subset of UTF-8 (§6.4.C), so non-ASCII text in string literals requires Task C.2 (full UTF-8 STRING)",
-                            ch as u32
-                        ),
-                        position: start,
-                    });
-                }
                 s.push(ch);
             }
             if i >= chars.len() || chars[i] != '"' {
@@ -3349,20 +3339,24 @@ pub const STDLIB_SOURCES: &[(&str, &str)] = &[
         include_str!("../../stdlib/numeric/bignat.gdl"),
     ),
     (
-        "stdlib/text/string.gdl",
-        include_str!("../../stdlib/text/string.gdl"),
-    ),
-    (
         "stdlib/text/string_error.gdl",
         include_str!("../../stdlib/text/string_error.gdl"),
     ),
     (
-        "stdlib/core/io_error.gdl",
-        include_str!("../../stdlib/core/io_error.gdl"),
-    ),
-    (
         "stdlib/core/result.gdl",
         include_str!("../../stdlib/core/result.gdl"),
+    ),
+    (
+        "stdlib/text/bytes.gdl",
+        include_str!("../../stdlib/text/bytes.gdl"),
+    ),
+    (
+        "stdlib/text/string.gdl",
+        include_str!("../../stdlib/text/string.gdl"),
+    ),
+    (
+        "stdlib/core/io_error.gdl",
+        include_str!("../../stdlib/core/io_error.gdl"),
     ),
     (
         "stdlib/collections/list_ops.gdl",
@@ -3389,13 +3383,15 @@ pub fn phase4_stdlib_source() -> &'static str {
         "\n",
         include_str!("../../stdlib/numeric/bignat.gdl"),
         "\n",
-        include_str!("../../stdlib/text/string.gdl"),
-        "\n",
         include_str!("../../stdlib/text/string_error.gdl"),
         "\n",
-        include_str!("../../stdlib/core/io_error.gdl"),
-        "\n",
         include_str!("../../stdlib/core/result.gdl"),
+        "\n",
+        include_str!("../../stdlib/text/bytes.gdl"),
+        "\n",
+        include_str!("../../stdlib/text/string.gdl"),
+        "\n",
+        include_str!("../../stdlib/core/io_error.gdl"),
         "\n",
         include_str!("../../stdlib/collections/list_ops.gdl"),
         "\n",
@@ -4404,13 +4400,14 @@ pub fn check_module_dependency_cycles(units: &[SourceUnit], table: &LinkTable) -
 /// `STRING` is injected for modules that mention it, contain string literals or use `IO`
 /// (Task B.3: literals denote prelude `STRING` values); `LIST_OPS` / `FUNCTION_OPS` are realized by the built-in
 /// `Seq_*` / `Fn1_*` preamble theories already present in every Boogie file.
-const BOOGIE_INJECTED_PRELUDE: [&str; 7] = [
+const BOOGIE_INJECTED_PRELUDE: [&str; 8] = [
     "OPTION",
     "RESULT",
     "SEQ",
     "BIGNAT",
-    "STRING",
+    "BYTES",
     "STRING_ERROR",
+    "STRING",
     "IO_ERROR",
 ];
 
@@ -4420,16 +4417,22 @@ const BOOGIE_INJECTED_PRELUDE: [&str; 7] = [
 /// module's real theory is injected alongside.
 const FOREIGN_PRELUDE_TYPE_MARK: &str = "// foreign-prelude-type";
 
-/// Other prelude modules named by the representation field types of `m`.
+/// Other prelude modules named by the representation field types or routine signatures of `m`.
 fn repr_prelude_deps(m: &ModuleDecl) -> Vec<String> {
     let prelude = standard_prelude();
-    let field_types: Vec<&String> = match &m.repr {
+    let mut field_types: Vec<&String> = match &m.repr {
         ReprKind::Product(fields) => fields.iter().map(|(_, t)| t).collect(),
         ReprKind::Sum(vs) => vs
             .iter()
             .flat_map(|v| v.fields.iter().map(|(_, t)| t))
             .collect(),
     };
+    for (_, r) in m.create_routines.iter().chain(&m.feature_routines).chain(&m.specify_routines) {
+        for (_, pt) in &r.params {
+            field_types.push(pt);
+        }
+        field_types.push(&r.ret_type);
+    }
     let mut deps = Vec::new();
     for t in field_types {
         for tok in t.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_')) {
@@ -4469,7 +4472,13 @@ impl BoogiePreludeCtx {
             wanted.extend(prelude_modules_wanted(n));
         }
         // RESULT.to_option is stated over OPTION: inject the real OPTION theory alongside.
-        if wanted.contains("RESULT") {
+        if wanted.contains("RESULT") || m.name == "RESULT" {
+            wanted.insert("OPTION");
+        }
+        if wanted.contains("STRING") || m.name == "STRING" {
+            wanted.insert("BYTES");
+            wanted.insert("STRING_ERROR");
+            wanted.insert("RESULT");
             wanted.insert("OPTION");
         }
         let prelude = standard_prelude();
@@ -4857,10 +4866,25 @@ fn module_self_type(m: &ModuleDecl) -> String {
     }
 }
 
+thread_local! {
+    /// Return type of the routine being emitted (the type of `Result`), recorded in every
+    /// mode, including bootstrap emission without a prelude context.
+    static BOOGIE_RESULT_TYPE: std::cell::RefCell<Option<String>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+fn boogie_result_type() -> Option<String> {
+    BOOGIE_RESULT_TYPE.with(|t| t.borrow().clone())
+}
+
 /// Records the Gardel types of a routine's parameters (and `Result`) for receiver-type
-/// resolution of prelude calls. Only active while a prelude context is installed.
+/// resolution of prelude calls. Only active while a prelude context is installed (the
+/// return type is recorded in every mode, see `BOOGIE_RESULT_TYPE`).
 fn set_boogie_type_env(m: &ModuleDecl, params: &[(String, String)], ret: Option<&str>) {
     let me = module_self_type(m);
+    BOOGIE_RESULT_TYPE.with(|t| {
+        *t.borrow_mut() = ret.map(|rt| if rt == "Current" { me.clone() } else { rt.to_string() });
+    });
     ELEM_TYPE_ENV.with(|env| {
         let mut env = env.borrow_mut();
         env.clear();
@@ -4899,6 +4923,7 @@ fn set_boogie_type_env(m: &ModuleDecl, params: &[(String, String)], ret: Option<
 }
 
 fn clear_boogie_type_env() {
+    BOOGIE_RESULT_TYPE.with(|t| *t.borrow_mut() = None);
     ELEM_TYPE_ENV.with(|env| env.borrow_mut().clear());
     BOOGIE_TYPE_ENV.with(|env| env.borrow_mut().clear());
 }
@@ -5318,7 +5343,7 @@ pub fn check_string_semantics(m: &ModuleDecl, src: &str, input_path: &str) -> Ve
                         rn.to_string(),
                         "E0312: string_plus_operator",
                         format!(
-                            "E0312: string_plus_operator: `{}` applies `+` to STRING; `+` is not part of the prelude STRING API (§3.1) and the bootstrap prelude provides no verified concatenation (STRING.concat is not yet in the prelude); print the parts separately",
+                            "E0312: string_plus_operator: `{}` applies `+` to STRING; `+` is not part of the prelude STRING API (§3.1); use `a.concat(b)`",
                             format_gardel_expr(e)
                         ),
                     ));
@@ -5675,6 +5700,16 @@ fn resolve_prelude_receiver(
     m: &ModuleDecl,
     ctx: &BoogiePreludeCtx,
 ) -> Option<String> {
+    if let Expr::Var(v) = recv {
+        if v == "LIST" || v == "LIST_OPS" || v == "FUNCTION_OPS" || v == "SEQ" {
+            return None;
+        }
+        if v != "Current" && v != "Result" && boogie_env_type(v).is_none() {
+            if is_static_receiver_name(v, m) {
+                return None;
+            }
+        }
+    }
     let has_instance_routine =
         |p: &ModuleDecl| find_module_routine(p, mname).is_some_and(|(_, has_cur)| has_cur);
     if let Some(ty) = infer_gardel_type(recv, m, ctx) {
@@ -5733,9 +5768,15 @@ fn prelude_call_target(
         return None;
     };
     if let Expr::Var(v) = &**recv {
+        if v == "LIST" || v == "LIST_OPS" || v == "FUNCTION_OPS" || v == "SEQ" {
+            return None;
+        }
         if v != &m.name && v != "Current" && boogie_env_type(v).is_none() {
             if let Some(p) = ctx.module(v) {
                 return find_module_routine(p, r).map(|_| (v.clone(), r.clone(), false));
+            }
+            if is_static_receiver_name(v, m) {
+                return None;
             }
         }
     }
@@ -5781,6 +5822,9 @@ fn emit_boogie_prelude_ref(
         }
         Expr::MethodCall(recv, r, args) => {
             if let Expr::Var(v) = &**recv {
+                if v == "LIST" || v == "LIST_OPS" || v == "FUNCTION_OPS" || v == "SEQ" {
+                    return None;
+                }
                 if v != &m.name
                     && v != "Current"
                     && boogie_env_type(v).is_none()
@@ -5804,6 +5848,9 @@ fn emit_boogie_prelude_ref(
                         let a: Vec<String> = args.iter().map(emit).collect();
                         return Some(format!("{v}__law_{idx}_{r}({})", a.join(", ")));
                     }
+                    if is_static_receiver_name(v, m) {
+                        return None;
+                    }
                 }
             }
             let p = resolve_prelude_receiver(recv, r, m, &ctx)?;
@@ -5816,6 +5863,20 @@ fn emit_boogie_prelude_ref(
 }
 
 /// For a constructor not declared by `m`, its owning injected prelude module and variant.
+/// Whether a receiver variable `v` names a module or type (a static call `T.r(..)`), not a
+/// value. Decided by the declarations in scope, not by spelling: the module itself, a
+/// Standard Prelude module or concept, a linked module of the project, or a built-in type.
+fn is_static_receiver_name(v: &str, m: &ModuleDecl) -> bool {
+    v == m.name
+        || standard_prelude().declares(v)
+        || is_linked_user_module(v)
+        || matches!(
+            v,
+            "LIST" | "LIST_OPS" | "FUNCTION_OPS" | "MATH_INT" | "CHAR" | "IO" | "U64" | "I64"
+                | "NAT" | "F64" | "BOOL"
+        )
+}
+
 fn prelude_variant_for(ctor: &str, m: &ModuleDecl) -> Option<(String, VariantDecl)> {
     if module_has_variant(m, ctor) {
         return None;
@@ -5931,7 +5992,10 @@ fn prelude_contract_interface(p: &ModuleDecl) -> Rc<(String, HashSet<String>)> {
         return hit;
     }
     // Emit in the prelude module's own context, never through a user's prelude context.
-    let saved_ctx = BOOGIE_PRELUDE_CTX.with(|c| c.borrow_mut().take());
+    // That context still holds the prelude modules `p` itself refers to (e.g. STRING's
+    // contracts call `BYTES.valid_utf8`), so those calls resolve to their namespaced theory.
+    let own_ctx = Rc::new(BoogiePreludeCtx::for_module(p));
+    let saved_ctx = BOOGIE_PRELUDE_CTX.with(|c| c.replace(Some(own_ctx)));
     let saved_env = BOOGIE_TYPE_ENV.with(|e| std::mem::take(&mut *e.borrow_mut()));
     let result = Rc::new(emit_prelude_contract_interface(p));
     BOOGIE_PRELUDE_CTX.with(|c| *c.borrow_mut() = saved_ctx);
@@ -6162,6 +6226,7 @@ pub fn emit_boogie(m: &ModuleDecl, fuel_limit: usize) -> String {
     // Prelude theories are emitted exactly as in `--stdlib` bootstrap mode (no context),
     // then namespaced; none of their verification procedures are included. Linked user
     // modules of other files (Task B.4) are emitted in their own context, then namespaced.
+    let prev = BOOGIE_PRELUDE_CTX.with(|c| c.replace(Some(ctx.clone())));
     let mut injected = String::new();
     for p in &ctx.modules {
         if is_linked_user_module(&p.name) {
@@ -6170,7 +6235,6 @@ pub fn emit_boogie(m: &ModuleDecl, fuel_limit: usize) -> String {
             injected.push_str(&emit_prelude_background_theory(p, fuel_limit));
         }
     }
-    let prev = BOOGIE_PRELUDE_CTX.with(|c| c.replace(Some(ctx.clone())));
     let parts = emit_boogie_parts(m, fuel_limit);
     BOOGIE_PRELUDE_CTX.with(|c| *c.borrow_mut() = prev);
     let has_option_module = ctx.modules.iter().any(|p| p.name == "OPTION");
@@ -6199,6 +6263,7 @@ fn emit_boogie_parts(m: &ModuleDecl, fuel_limit: usize) -> BoogieParts {
     out.push_str("const U64_MAX: int;\n");
     out.push_str("axiom U64_MAX == 18446744073709551615;\n");
     out.push_str("function {:inline} in_u64(x: int) returns (bool) { 0 <= x && x <= U64_MAX }\n\n");
+    out.push_str("function {:inline} in_char(x: int) returns (bool) { 0 <= x && x <= 1114111 && (x < 55296 || x > 57343) }\n\n");
     out.push_str("const I64_MIN: int;\n");
     out.push_str("axiom I64_MIN == -9223372036854775808;\n");
     out.push_str("const I64_MAX: int;\n");
@@ -6307,14 +6372,16 @@ fn emit_boogie_parts(m: &ModuleDecl, fuel_limit: usize) -> BoogieParts {
     }
     // Representation fields typed by another prelude module: declare that sort opaquely
     // unless its real theory is injected into this context.
-    for dep in repr_prelude_deps(m) {
-        let injected = boogie_prelude_ctx().is_some_and(|ctx| ctx.module(&dep).is_some());
-        if !injected {
-            let arity = standard_prelude()
-                .module(&dep)
-                .map_or(0, |d| d.type_params.len());
-            let holes = " _".repeat(arity);
-            out.push_str(&format!("type {dep}{holes}; {FOREIGN_PRELUDE_TYPE_MARK}\n"));
+    if prelude_injection_enabled() || standard_prelude().declares(&m.name) {
+        for dep in repr_prelude_deps(m) {
+            let injected = boogie_prelude_ctx().is_some_and(|ctx| ctx.module(&dep).is_some());
+            if !injected {
+                let arity = standard_prelude()
+                    .module(&dep)
+                    .map_or(0, |d| d.type_params.len());
+                let holes = " _".repeat(arity);
+                out.push_str(&format!("type {dep}{holes}; {FOREIGN_PRELUDE_TYPE_MARK}\n"));
+            }
         }
     }
     theory.push_str(&std::mem::take(&mut out));
@@ -6386,7 +6453,11 @@ fn emit_boogie_parts(m: &ModuleDecl, fuel_limit: usize) -> BoogieParts {
     out.push_str("function Seq_head<T>(xs: Seq T) returns (T);\n");
     out.push_str("function Seq_tail<T>(xs: Seq T) returns (Seq T);\n");
     out.push_str("function Seq_length<T>(xs: Seq T) returns (int);\n");
-    out.push_str("function Seq_has<T>(xs: Seq T, x: T) returns (bool);\n\n");
+    out.push_str("function Seq_has<T>(xs: Seq T, x: T) returns (bool);\n");
+    out.push_str("function Seq_at<T>(xs: Seq T, i: int) returns (T);\n\n");
+    out.push_str("axiom (forall<T> x: T, xs: Seq T :: { Seq_at(Seq_prepend(x, xs), 0) } Seq_at(Seq_prepend(x, xs), 0) == x);\n");
+    out.push_str("axiom (forall<T> x: T, xs: Seq T, i: int :: { Seq_at(Seq_prepend(x, xs), i) } i > 0 ==> Seq_at(Seq_prepend(x, xs), i) == Seq_at(xs, i - 1));\n");
+    out.push_str("axiom (forall<T> xs: Seq T :: { Seq_at(xs, 0) } Seq_length(xs) > 0 ==> Seq_at(xs, 0) == Seq_head(xs));\n");
 
     out.push_str("axiom (forall<T> :: Seq_length(Seq_empty() : Seq T) == 0);\n");
     out.push_str("axiom (forall<T> xs: Seq T :: { Seq_length(xs) } 0 <= Seq_length(xs));\n");
@@ -6408,6 +6479,8 @@ fn emit_boogie_parts(m: &ModuleDecl, fuel_limit: usize) -> BoogieParts {
     out.push_str(
         "axiom (forall<T> xs: Seq T, ys: Seq T, zs: Seq T :: { Seq_append(Seq_append(xs, ys), zs) } Seq_append(Seq_append(xs, ys), zs) == Seq_append(xs, Seq_append(ys, zs)));\n",
     );
+    out.push_str("axiom (forall<T> x: T :: { Seq_singleton(x) } Seq_singleton(x) == Seq_prepend(x, (Seq_empty() : Seq T)));\n");
+    out.push_str("axiom (forall<T> x: T, xs: Seq T, ys: Seq T :: { Seq_append(Seq_prepend(x, xs), ys) } Seq_append(Seq_prepend(x, xs), ys) == Seq_prepend(x, Seq_append(xs, ys)));\n");
     out.push_str(
         "axiom (forall<T> x: T, y: T, xs: Seq T :: { Seq_has(Seq_prepend(y, xs), x) } Seq_has(Seq_prepend(y, xs), x) <==> (x == y || Seq_has(xs, x)));\n",
     );
@@ -6775,6 +6848,8 @@ fn emit_boogie_parts(m: &ModuleDecl, fuel_limit: usize) -> BoogieParts {
             for (fnm, fty) in fields {
                 if fty == "NAT" || fty == "U64" {
                     clauses.push(format!("  in_u64({}_{}(Current))", m.name, fnm));
+                } else if fty == "CHAR" {
+                    clauses.push(format!("  in_char({}_{}(Current))", m.name, fnm));
                 }
             }
         }
@@ -6873,6 +6948,8 @@ fn emit_boogie_parts(m: &ModuleDecl, fuel_limit: usize) -> BoogieParts {
             call_args_f.push(pn.clone());
             if pt == "NAT" || pt == "U64" {
                 pre_guards.push(format!("in_u64({pn})"));
+            } else if pt == "CHAR" {
+                pre_guards.push(format!("in_char({pn})"));
             } else if !m.invariants.is_empty()
                 && (pt == &m.name || pt == "Current" || pt.starts_with(&format!("{}[", m.name)))
             {
@@ -6973,6 +7050,8 @@ fn emit_boogie_parts(m: &ModuleDecl, fuel_limit: usize) -> BoogieParts {
         let mut post_clauses = Vec::new();
         if r.ret_type == "NAT" || r.ret_type == "U64" {
             post_clauses.push(format!("in_u64({fn_f_app})"));
+        } else if r.ret_type == "CHAR" {
+            post_clauses.push(format!("in_char({fn_f_app})"));
         } else if r.ret_type == m.name
             || r.ret_type == "Current"
             || r.ret_type.starts_with(&format!("{}[", m.name))
@@ -7266,15 +7345,39 @@ fn string_literal_capacity(s: &str) -> usize {
 }
 
 /// The `STRING` construction a literal desugars to (§3.1.4), built only from verified prelude
-/// routines: `STRING.make_empty(cap).push_ascii(c_{n-1})...push_ascii(c_0)` (`push_ascii`
-/// prepends, so the scalars are pushed last-to-first).
+/// routines: `STRING.make_empty(cap).push_ascii(c_{n-1})...push_ascii(c_0)` / `push_utf8_k`.
 fn boogie_string_literal_term(s: &str) -> String {
     let mut t = format!(
         "STRING__fn_make_empty(DefaultFuel, {})",
         string_literal_capacity(s)
     );
     for c in s.chars().rev() {
-        t = format!("STRING__fn_push_ascii(DefaultFuel, {t}, {})", c as u32);
+        let mut buf = [0u8; 4];
+        let bytes = c.encode_utf8(&mut buf).as_bytes();
+        match bytes.len() {
+            1 => {
+                t = format!("STRING__fn_push_ascii(DefaultFuel, {t}, {})", c as u32);
+            }
+            2 => {
+                t = format!(
+                    "STRING__fn_push_utf8_2(DefaultFuel, {t}, {}, {})",
+                    bytes[0], bytes[1]
+                );
+            }
+            3 => {
+                t = format!(
+                    "STRING__fn_push_utf8_3(DefaultFuel, {t}, {}, {}, {})",
+                    bytes[0], bytes[1], bytes[2]
+                );
+            }
+            4 => {
+                t = format!(
+                    "STRING__fn_push_utf8_4(DefaultFuel, {t}, {}, {}, {}, {})",
+                    bytes[0], bytes[1], bytes[2], bytes[3]
+                );
+            }
+            _ => unreachable!(),
+        }
     }
     t
 }
@@ -7283,7 +7386,7 @@ fn boogie_string_literal_term(s: &str) -> String {
 /// one constant `str_lit_k: STRING` and exactly one axiom, its *definition*
 /// `str_lit_k == <prelude construction term>` (a conservative extension: a fresh constant
 /// equated to a ground term). No property of the literal is axiomatized: its invariant and
-/// `chars` model follow from the bootstrap-verified `make_empty` / `push_ascii` contracts and
+/// `chars` model follow from the bootstrap-verified `make_empty` / `push_...` contracts and
 /// are re-proven per literal by `Verify_string_literal_k`.
 fn emit_boogie_string_literal_decls(strings: &[String]) -> String {
     let mut out =
@@ -7297,17 +7400,52 @@ fn emit_boogie_string_literal_decls(strings: &[String]) -> String {
         out.push_str(&format!(
             "axiom str_lit_{idx}_s0 == STRING__fn_make_empty(DefaultFuel, {cap});\n"
         ));
-        let n = s.chars().count();
-        for (j, c) in s.chars().rev().enumerate() {
-            out.push_str(&format!("const str_lit_{idx}_s{}: STRING;\n", j + 1));
-            out.push_str(&format!(
-                "axiom str_lit_{idx}_s{} == STRING__fn_push_ascii(DefaultFuel, str_lit_{idx}_s{j}, {});\n",
-                j + 1,
-                c as u32
-            ));
+        let mut step = 0;
+        for c in s.chars().rev() {
+            let mut buf = [0u8; 4];
+            let bytes = c.encode_utf8(&mut buf).as_bytes();
+            step += 1;
+            out.push_str(&format!("const str_lit_{idx}_s{step}: STRING;\n"));
+            match bytes.len() {
+                1 => {
+                    out.push_str(&format!(
+                        "axiom str_lit_{idx}_s{step} == STRING__fn_push_ascii(DefaultFuel, str_lit_{idx}_s{}, {});\n",
+                        step - 1,
+                        c as u32
+                    ));
+                }
+                2 => {
+                    out.push_str(&format!(
+                        "axiom str_lit_{idx}_s{step} == STRING__fn_push_utf8_2(DefaultFuel, str_lit_{idx}_s{}, {}, {});\n",
+                        step - 1,
+                        bytes[0],
+                        bytes[1]
+                    ));
+                }
+                3 => {
+                    out.push_str(&format!(
+                        "axiom str_lit_{idx}_s{step} == STRING__fn_push_utf8_3(DefaultFuel, str_lit_{idx}_s{}, {}, {}, {});\n",
+                        step - 1,
+                        bytes[0],
+                        bytes[1],
+                        bytes[2]
+                    ));
+                }
+                4 => {
+                    out.push_str(&format!(
+                        "axiom str_lit_{idx}_s{step} == STRING__fn_push_utf8_4(DefaultFuel, str_lit_{idx}_s{}, {}, {}, {}, {});\n",
+                        step - 1,
+                        bytes[0],
+                        bytes[1],
+                        bytes[2],
+                        bytes[3]
+                    ));
+                }
+                _ => unreachable!(),
+            }
         }
         out.push_str(&format!("const str_lit_{idx}: STRING;\n"));
-        out.push_str(&format!("axiom str_lit_{idx} == str_lit_{idx}_s{n};\n"));
+        out.push_str(&format!("axiom str_lit_{idx} == str_lit_{idx}_s{step};\n"));
     }
     out
 }
@@ -7337,7 +7475,7 @@ fn emit_boogie_string_literal_procedures(strings: &[String]) -> String {
     for (idx, s) in strings.iter().enumerate() {
         let ctx_name = format!("string_literal_{idx}");
         out.push_str(&format!(
-            "// \"{}\" desugars to STRING.make_empty(..).push_ascii(..)... (§3.1.4)\n",
+            "// \"{}\" desugars to STRING.make_empty(..).push_... (§3.1.4)\n",
             s.escape_debug()
         ));
         let facts = string_literal_facts(idx, s);
@@ -7354,13 +7492,23 @@ fn emit_boogie_string_literal_procedures(strings: &[String]) -> String {
                 "  assert {{:msg \"{ctx_name}::require::{tag}\"}} {pre}({cap});\n"
             ));
         }
-        for (j, c) in s.chars().rev().enumerate() {
-            let code = c as u32;
-            for (pre, tag) in pre_names("push_ascii") {
+        let mut j = 0;
+        for c in s.chars().rev() {
+            let mut buf = [0u8; 4];
+            let bytes = c.encode_utf8(&mut buf).as_bytes();
+            let (rname, args_bpl) = match bytes.len() {
+                1 => ("push_ascii", format!("{}", c as u32)),
+                2 => ("push_utf8_2", format!("{}, {}", bytes[0], bytes[1])),
+                3 => ("push_utf8_3", format!("{}, {}, {}", bytes[0], bytes[1], bytes[2])),
+                4 => ("push_utf8_4", format!("{}, {}, {}, {}", bytes[0], bytes[1], bytes[2], bytes[3])),
+                _ => unreachable!(),
+            };
+            for (pre, tag) in pre_names(rname) {
                 out.push_str(&format!(
-                    "  assert {{:msg \"{ctx_name}::require::{tag}\"}} {pre}(str_lit_{idx}_s{j}, {code});\n"
+                    "  assert {{:msg \"{ctx_name}::require::{tag}\"}} {pre}(str_lit_{idx}_s{j}, {args_bpl});\n"
                 ));
             }
+            j += 1;
         }
         for (tag, f) in &facts {
             out.push_str(&format!("  assert {{:msg \"{ctx_name}::{tag}\"}} {f};\n"));
@@ -7390,6 +7538,13 @@ fn string_literal_facts(idx: usize, s: &str) -> Vec<(&'static str, String)> {
             format!(
                 "STRING__fn_byte_length(DefaultFuel, str_lit_{idx}) == {}",
                 s.len()
+            ),
+        ),
+        (
+            "ensure::code_point_count",
+            format!(
+                "STRING__fn_code_point_count(DefaultFuel, str_lit_{idx}) == {}",
+                s.chars().count()
             ),
         ),
     ]
@@ -7699,6 +7854,8 @@ fn emit_boogie_verify_routine(
     for (pn, pt) in &r.params {
         if pt == "NAT" || pt == "U64" {
             s.push_str(&format!("  requires in_u64({pn});\n"));
+        } else if pt == "CHAR" {
+            s.push_str(&format!("  requires in_char({pn});\n"));
         } else if !m.invariants.is_empty()
             && (pt == &m.name || pt == "Current" || pt.starts_with(&format!("{}[", m.name)))
         {
@@ -7827,6 +7984,8 @@ fn emit_boogie_verify_law(
             s.push_str(&format!("  requires {}_Invariant({pn});\n", m.name));
         } else if pt == "NAT" || pt == "U64" {
             s.push_str(&format!("  requires in_u64({pn});\n"));
+        } else if pt == "CHAR" {
+            s.push_str(&format!("  requires in_char({pn});\n"));
         }
     }
     for (tag, req_e) in &law.requires {
@@ -8468,11 +8627,18 @@ impl LawProofCtx<'_> {
         s
     }
 
-    /// Translates a proof expression. Only `match`, `if`, `and` and recursive law calls carry
-    /// proof content; anything else contributes nothing (which is sound: no assumption).
+    /// Translates a proof expression. `match`, `if` and `and` structure the proof (`a and b`
+    /// establishes `a`, then `b`), a recursive law call is an induction hypothesis, and any
+    /// other boolean term is an intermediate proof step: it is asserted (so it must be
+    /// proven at that point) and is then known to the rest of the branch. `True` and calls
+    /// to *other* laws contribute nothing (no cross-law assumption, which could be circular).
     fn stmts(&mut self, e: &Expr, pad: &str) -> String {
         match e {
             Expr::Call(f, args) if f == &self.law.name => self.recursive_call(args, pad),
+            Expr::Bool(true) => String::new(),
+            Expr::Call(f, _) if self.m.specify_laws.iter().any(|(_, l)| &l.name == f) => {
+                String::new()
+            }
             Expr::BinOp(op, l, r) if op == "and" => {
                 let mut s = self.stmts(l, pad);
                 s.push_str(&self.stmts(r, pad));
@@ -8529,7 +8695,11 @@ impl LawProofCtx<'_> {
                 }
                 s
             }
-            _ => String::new(),
+            _ => format!(
+                "{pad}assert {{:msg \"{}::check::proof_step\"}} {};\n",
+                self.law_ctx,
+                self.emit(e)
+            ),
         }
     }
 }
@@ -8714,17 +8884,24 @@ fn is_io_read_line(e: &Expr) -> bool {
         if r == "read_line" && args.is_empty() && matches!(&**recv, Expr::Var(v) if v == "IO"))
 }
 
+/// Longest line `IO.read_line` returns, in bytes (exclusive bound, 2^48). The C runtime
+/// returns `Error(OsError(EOVERFLOW))` for a longer line, so the bound is enforced, not
+/// assumed (no 64-bit system can hold such a line anyway). It lets clients prove that
+/// combining input with other text cannot overflow, e.g. `"Hello, ".concat(name)`.
+pub const GARDEL_MAX_LINE_BYTES: u64 = 1 << 48;
+
 /// What the runtime guarantees about a value `v` bound by `v <- IO.read_line` (§11): it is
 /// a `RESULT[IO_ERROR, STRING]`, and an `Ok` payload is a valid prelude `STRING` (the C
-/// runtime decodes the line and returns `Error` instead of an invalid `STRING`). `None`
-/// outside prelude mode, where `read_line` has the legacy opaque string type.
+/// runtime decodes the line and returns `Error` instead of an invalid `STRING`) shorter
+/// than `GARDEL_MAX_LINE_BYTES`. `None` outside prelude mode, where `read_line` has the
+/// legacy opaque string type.
 fn read_line_result_wf(v: &str) -> Option<String> {
     let ctx = boogie_prelude_ctx()?;
     if ctx.module("RESULT").is_none() || ctx.module("STRING").is_none() {
         return None;
     }
     Some(format!(
-        "RESULT__RESULT_Invariant({v}) && (RESULT__is_Ok({v}) ==> STRING__STRING_Invariant(RESULT__Ok_val({v})))"
+        "RESULT__RESULT_Invariant({v}) && (RESULT__is_Ok({v}) ==> STRING__STRING_Invariant(RESULT__Ok_val({v})) && STRING__fn_byte_length(DefaultFuel, RESULT__Ok_val({v})) < {GARDEL_MAX_LINE_BYTES})"
     ))
 }
 
@@ -8842,19 +9019,14 @@ fn emit_boogie_proc_stmts_and_ret(
                 "DefaultFuel",
                 strings,
             );
-            let on_prelude_adt = cases
-                .iter()
-                .any(|c| prelude_variant_for(c.ctor(), m).is_some());
-            if let (ReprKind::Sum(variants), false) = (&m.repr, on_prelude_adt) {
-                let covered: HashSet<String> = cases.iter().map(|c| c.ctor().to_string()).collect();
-                for v in variants {
-                    if !covered.contains(&v.name) {
-                        s.push_str(&format!(
-                            "{pad}assert {{:msg \"{}::match::exhaustiveness_{}\"}} !is_{}({scrut_bpl});\n",
-                            r.name, v.name, v.name
-                        ));
-                    }
-                }
+            // Exhaustiveness (§5): every constructor the cases omit must be unreachable. This
+            // holds for the module's own sum type and for injected prelude ADTs alike; a
+            // catch-all case (`_` or a bare binder) covers every constructor.
+            for (prefix, ctor) in match_missing_ctors(cases, m) {
+                s.push_str(&format!(
+                    "{pad}assert {{:msg \"{}::match::exhaustiveness_{ctor}\"}} !{prefix}is_{ctor}({scrut_bpl});\n",
+                    r.name
+                ));
             }
             for (idx, c) in cases.iter().enumerate() {
                 let kw = if idx == 0 { "if" } else { "else if" };
@@ -8900,6 +9072,14 @@ fn emit_boogie_proc_stmts_and_ret(
                     strings,
                 ));
                 s.push_str(&format!("{pad}}}\n"));
+            }
+            // Every omitted constructor was asserted unreachable above, and the testers of
+            // a sum type are exhaustive (axiom `is_C1(x) || ... || is_Cn(x)`), so the
+            // fall-through is infeasible; stating it prunes that path for the prover.
+            if match_scrutinee_sum(cases, m).is_some() && !cases.is_empty() {
+                s.push_str(&format!(
+                    "{pad}else {{\n{pad}  assume false; // exhaustive (asserted above)\n{pad}}}\n"
+                ));
             }
         }
         Expr::WithIo(io_stmts, final_e) => {
@@ -9037,16 +9217,67 @@ fn guarded_wf(guard: Expr, wf: Option<Expr>) -> Option<Expr> {
     wf.map(|w| Expr::BinOp("implies".to_string(), Box::new(guard), Box::new(w)))
 }
 
+/// Which path-guarded well-formedness condition `wf_walk` collects.
+#[derive(Clone, Copy)]
+enum WfKind<'a> {
+    /// `valid_scalar(n)` for every `CHAR.from_scalar(n)` call.
+    FromScalar,
+    /// Reachable omitted constructors of every nested `match` (§5 exhaustiveness).
+    MatchExhaustive(&'a ModuleDecl),
+}
+
+/// Boogie tester prefix and variants of the scrutinee's sum type (the module's own, or an
+/// injected prelude ADT). `None` when a catch-all case (`_` or a bare binder) is present
+/// or the owning type cannot be determined.
+fn match_scrutinee_sum(
+    cases: &[MatchCase],
+    m: &ModuleDecl,
+) -> Option<(String, Vec<VariantDecl>)> {
+    if cases
+        .iter()
+        .any(|c| matches!(c.pattern, Pattern::Wildcard | Pattern::Bind(_)))
+    {
+        return None;
+    }
+    let prelude_owner = cases
+        .iter()
+        .find_map(|c| prelude_variant_for(c.ctor(), m).map(|(p, _)| p));
+    match &prelude_owner {
+        Some(p) => boogie_prelude_ctx().and_then(|ctx| match &ctx.module(p)?.repr {
+            ReprKind::Sum(vs) => Some((format!("{p}__"), vs.clone())),
+            ReprKind::Product(_) => None,
+        }),
+        None => match &m.repr {
+            ReprKind::Sum(vs) => Some((String::new(), vs.clone())),
+            ReprKind::Product(_) => None,
+        },
+    }
+}
+
+/// Constructors of the scrutinee's sum type that no case of `cases` names (empty when the
+/// type is unknown or a catch-all case is present).
+fn match_missing_ctors(cases: &[MatchCase], m: &ModuleDecl) -> Vec<(String, String)> {
+    let Some((prefix, variants)) = match_scrutinee_sum(cases, m) else {
+        return Vec::new();
+    };
+    let covered: HashSet<&str> = cases.iter().map(|c| c.ctor()).collect();
+    variants
+        .iter()
+        .filter(|v| !covered.contains(v.name.as_str()))
+        .map(|v| (prefix.clone(), v.name.clone()))
+        .collect()
+}
+
 /// Well-formedness of a block `stmts; body`: each `let` value must be
 /// well-formed, and later expressions see earlier `let`s substituted.
-fn from_scalar_wf_block(stmts: &[Stmt], body: &Expr) -> Option<Expr> {
+fn wf_walk_block(k: WfKind<'_>, stmts: &[Stmt], body: &Expr) -> Option<Expr> {
     let mut substs: Vec<(String, Expr)> = Vec::new();
     let mut acc = None;
     for st in stmts {
         match st {
             Stmt::Let(v, e) | Stmt::Check(v, e) | Stmt::Assume(v, e) => {
                 let e_sub = subst_expr_vars(e, &substs);
-                acc = and_wf(acc, from_scalar_wf(&e_sub));
+                acc = and_wf(acc, wf_walk(k, &e_sub));
                 if matches!(st, Stmt::Let(_, _)) {
                     substs.push((v.clone(), e_sub));
                 }
@@ -9054,7 +9285,7 @@ fn from_scalar_wf_block(stmts: &[Stmt], body: &Expr) -> Option<Expr> {
             Stmt::Reveal(_) => {}
         }
     }
-    and_wf(acc, from_scalar_wf(&subst_expr_vars(body, &substs)))
+    and_wf(acc, wf_walk(k, &subst_expr_vars(body, &substs)))
 }
 
 /// Builds the well-formedness condition for every `CHAR.from_scalar(n)` call
@@ -9062,7 +9293,7 @@ fn from_scalar_wf_block(stmts: &[Stmt], body: &Expr) -> Option<Expr> {
 /// `valid_scalar(n)` under the path condition that guards its evaluation
 /// (short-circuit `and`/`or`/`implies`, `if` branches, `match` cases, and
 /// binders). Returns `None` when `e` contains no such call.
-fn from_scalar_wf(e: &Expr) -> Option<Expr> {
+fn wf_walk(k: WfKind<'_>, e: &Expr) -> Option<Expr> {
     match e {
         Expr::Int(_)
         | Expr::Float(_)
@@ -9071,10 +9302,10 @@ fn from_scalar_wf(e: &Expr) -> Option<Expr> {
         | Expr::Bool(_)
         | Expr::Str(_)
         | Expr::Var(_) => None,
-        Expr::UnaryNot(inner) | Expr::UnaryNeg(inner) => from_scalar_wf(inner),
+        Expr::UnaryNot(inner) | Expr::UnaryNeg(inner) => wf_walk(k, inner),
         Expr::BinOp(op, l, r) => {
-            let wl = from_scalar_wf(l);
-            let wr = from_scalar_wf(r);
+            let wl = wf_walk(k, l);
+            let wr = wf_walk(k, r);
             let wr = match op.as_str() {
                 "and" | "implies" => guarded_wf((**l).clone(), wr),
                 "or" => guarded_wf(Expr::UnaryNot(l.clone()), wr),
@@ -9083,11 +9314,14 @@ fn from_scalar_wf(e: &Expr) -> Option<Expr> {
             and_wf(wl, wr)
         }
         Expr::MethodCall(recv, mname, args) => {
-            let mut acc = from_scalar_wf(recv);
+            let mut acc = wf_walk(k, recv);
             for a in args {
-                acc = and_wf(acc, from_scalar_wf(a));
+                acc = and_wf(acc, wf_walk(k, a));
             }
-            if matches!(&**recv, Expr::Var(v) if v == "CHAR") && mname == "from_scalar" {
+            if matches!(k, WfKind::FromScalar)
+                && matches!(&**recv, Expr::Var(v) if v == "CHAR")
+                && mname == "from_scalar"
+            {
                 if let Some(n) = args.first() {
                     acc = and_wf(acc, Some(valid_scalar_condition(n)));
                 }
@@ -9096,43 +9330,53 @@ fn from_scalar_wf(e: &Expr) -> Option<Expr> {
         }
         Expr::Call(_, args) | Expr::TupleLit(args) => args
             .iter()
-            .fold(None, |acc, a| and_wf(acc, from_scalar_wf(a))),
+            .fold(None, |acc, a| and_wf(acc, wf_walk(k, a))),
         Expr::RecordLit(fields) => fields
             .iter()
-            .fold(None, |acc, (_, fe)| and_wf(acc, from_scalar_wf(fe))),
+            .fold(None, |acc, (_, fe)| and_wf(acc, wf_walk(k, fe))),
         Expr::RecordUpdate(base, fields) => {
-            fields.iter().fold(from_scalar_wf(base), |acc, (_, fe)| {
-                and_wf(acc, from_scalar_wf(fe))
+            fields.iter().fold(wf_walk(k, base), |acc, (_, fe)| {
+                and_wf(acc, wf_walk(k, fe))
             })
         }
         Expr::If(c, ts, te, es, ee) => {
-            let wc = from_scalar_wf(c);
-            let wt = guarded_wf((**c).clone(), from_scalar_wf_block(ts, te));
-            let we = guarded_wf(Expr::UnaryNot(c.clone()), from_scalar_wf_block(es, ee));
+            let wc = wf_walk(k, c);
+            let wt = guarded_wf((**c).clone(), wf_walk_block(k, ts, te));
+            let we = guarded_wf(Expr::UnaryNot(c.clone()), wf_walk_block(k, es, ee));
             and_wf(and_wf(wc, wt), we)
         }
         Expr::Match(scrut, cases) => {
-            let ws = from_scalar_wf(scrut);
+            let ws = wf_walk(k, scrut);
             let case_wfs: Vec<Option<Expr>> = cases
                 .iter()
-                .map(|c| from_scalar_wf_block(&c.stmts, &c.body))
+                .map(|c| wf_walk_block(k, &c.stmts, &c.body))
                 .collect();
-            if case_wfs.iter().all(Option::is_none) {
+            // A nested `match` is lowered to an `if`-chain whose last arm is the fallback,
+            // so an omitted constructor would silently take that arm. In exhaustiveness mode
+            // every omitted constructor must be unreachable: a final `_ => False` arm.
+            let missing = match k {
+                WfKind::MatchExhaustive(m) => !match_missing_ctors(cases, m).is_empty(),
+                WfKind::FromScalar => false,
+            };
+            if !missing && case_wfs.iter().all(Option::is_none) {
                 return ws;
             }
-            let wf_cases: Vec<MatchCase> = cases
+            let mut wf_cases: Vec<MatchCase> = cases
                 .iter()
                 .zip(case_wfs)
                 .map(|(c, w)| {
                     MatchCase::new(c.pattern.clone(), Vec::new(), w.unwrap_or(Expr::Bool(true)))
                 })
                 .collect();
+            if missing {
+                wf_cases.push(MatchCase::new(Pattern::Wildcard, Vec::new(), Expr::Bool(false)));
+            }
             and_wf(ws, Some(Expr::Match(scrut.clone(), wf_cases)))
         }
         Expr::Forall(v, ty, body) | Expr::Exists(v, ty, body) => {
-            from_scalar_wf(body).map(|w| Expr::Forall(v.clone(), ty.clone(), Box::new(w)))
+            wf_walk(k, body).map(|w| Expr::Forall(v.clone(), ty.clone(), Box::new(w)))
         }
-        Expr::Lambda(params, _, stmts, body) => from_scalar_wf_block(stmts, body).map(|w| {
+        Expr::Lambda(params, _, stmts, body) => wf_walk_block(k, stmts, body).map(|w| {
             params.iter().rev().fold(w, |acc, (pn, pt)| {
                 Expr::Forall(pn.clone(), pt.clone(), Box::new(acc))
             })
@@ -9142,11 +9386,11 @@ fn from_scalar_wf(e: &Expr) -> Option<Expr> {
             for st in io_stmts {
                 match st {
                     IoStmt::Bind(_, ie) | IoStmt::Action(ie) => {
-                        acc = and_wf(acc, from_scalar_wf(ie));
+                        acc = and_wf(acc, wf_walk(k, ie));
                     }
                 }
             }
-            and_wf(acc, from_scalar_wf(final_e))
+            and_wf(acc, wf_walk(k, final_e))
         }
     }
 }
@@ -9161,20 +9405,26 @@ fn emit_from_scalar_obligation(
     pad: &str,
     strings: &[String],
 ) -> String {
-    match from_scalar_wf(e) {
-        None => String::new(),
-        Some(wf) => format!(
-            "{pad}assert {{:msg \"{ctx}::require::valid_scalar\"}} {};\n",
-            emit_boogie_expr_with_strings(
-                &wf,
-                m,
-                &HashSet::new(),
-                revealed,
-                "DefaultFuel",
-                strings
-            )
-        ),
+    let mut out = String::new();
+    for (kind, tag) in [
+        (WfKind::FromScalar, "require::valid_scalar"),
+        (WfKind::MatchExhaustive(m), "match::exhaustiveness"),
+    ] {
+        if let Some(wf) = wf_walk(kind, e) {
+            out.push_str(&format!(
+                "{pad}assert {{:msg \"{ctx}::{tag}\"}} {};\n",
+                emit_boogie_expr_with_strings(
+                    &wf,
+                    m,
+                    &HashSet::new(),
+                    revealed,
+                    "DefaultFuel",
+                    strings
+                )
+            ));
+        }
     }
+    out
 }
 
 /// Call-site precondition obligations for a call to a routine of the *same* module `m`
@@ -10045,6 +10295,37 @@ pub fn emit_boogie_expr(
     emit_boogie_expr_with_strings(e, m, implicit_fields, revealed, fuel_var, &strings)
 }
 
+fn is_bytes_expr(recv: &Expr, m: &ModuleDecl, implicit_fields: &HashSet<String>) -> bool {
+    if let Expr::Var(v) = recv {
+        if implicit_fields.contains(v) {
+            return false;
+        }
+        // `Result` has the routine's return type (a `BYTES` routine may return a `LIST`),
+        // so the type environment decides before the module-name shortcut for `Current`.
+        if let Some(t) = boogie_env_type(v) {
+            return t == "BYTES";
+        }
+        if v == "Result" {
+            if let Some(t) = boogie_result_type() {
+                return t == "BYTES";
+            }
+        }
+        if m.name == "BYTES" && v == "Current" {
+            return true;
+        }
+        let in_elem_env = ELEM_TYPE_ENV.with(|env| env.borrow().get(v).cloned());
+        if let Some(t) = in_elem_env {
+            return t == "BYTES";
+        }
+    }
+    if let Some(ctx) = boogie_prelude_ctx() {
+        if let Some(t) = infer_gardel_type(recv, m, &ctx) {
+            return t == "BYTES";
+        }
+    }
+    false
+}
+
 fn emit_boogie_expr_with_strings(
     e: &Expr,
     m: &ModuleDecl,
@@ -10317,6 +10598,9 @@ fn emit_boogie_expr_with_strings(
                                 a_str[0], a_str[1], a_str[2]
                             );
                         }
+                        "at" => {
+                            return format!("Seq_at({}, {})", a_str[0], a_str[1]);
+                        }
                         _ => {}
                     }
                 } else if v == "FUNCTION_OPS" {
@@ -10444,7 +10728,43 @@ fn emit_boogie_expr_with_strings(
                 ),
                 "head" => format!("Seq_head({r_str})"),
                 "tail" => format!("Seq_tail({r_str})"),
-                "length" if m.name != "SEQ" => format!("Seq_length({r_str})"),
+                "at" => {
+                    let idx = emit_boogie_expr_with_strings(
+                        &args[0],
+                        m,
+                        implicit_fields,
+                        revealed,
+                        fuel_var,
+                        strings,
+                    );
+                    if is_bytes_expr(recv, m, implicit_fields) {
+                        if m.name == "BYTES" {
+                            format!("fn_at({fuel_var}, {r_str}, {idx})")
+                        } else {
+                            format!("BYTES__fn_at({fuel_var}, {r_str}, {idx})")
+                        }
+                    } else {
+                        format!("Seq_at({r_str}, {idx})")
+                    }
+                }
+                "length" => {
+                    if is_bytes_expr(recv, m, implicit_fields) {
+                        if m.name == "BYTES" {
+                            format!("fn_length({fuel_var}, {r_str})")
+                        } else {
+                            format!("BYTES__fn_length({fuel_var}, {r_str})")
+                        }
+                    } else if m.name == "SEQ" {
+                        let call_fuel = if revealed.contains(mname) {
+                            "RevealFuel"
+                        } else {
+                            fuel_var
+                        };
+                        format!("fn_length({call_fuel}, {r_str})")
+                    } else {
+                        format!("Seq_length({r_str})")
+                    }
+                }
                 "has" => format!(
                     "Seq_has({r_str}, {})",
                     emit_boogie_expr_with_strings(
@@ -11117,7 +11437,10 @@ fn run_boogie_verification_once(
     let output = cmd
         .output()
         .map_err(|e| format!("Failed to spawn Boogie process: {e}"))?;
-    let _ = fs::remove_file(&temp_path);
+    // `GARDEL_KEEP_BPL=1` keeps the VC file for debugging the Boogie translation.
+    if env::var_os("GARDEL_KEEP_BPL").is_none() {
+        let _ = fs::remove_file(&temp_path);
+    }
 
     let stdout = String::from_utf8_lossy(&output.stdout).to_string();
     let stderr = String::from_utf8_lossy(&output.stderr).to_string();
@@ -14119,6 +14442,7 @@ pub fn map_c_type(ty: &str) -> String {
         "CHAR" => "uint32_t".to_string(),
         "UNIT" | "()" => "GARDEL_UNIT".to_string(),
         "STRING" => "GardelString".to_string(),
+        "BYTES" => "GardelBytes".to_string(),
         other if other.starts_with("IO[") => "int64_t".to_string(),
         other => {
             if let Some(inner) = other
@@ -14183,17 +14507,82 @@ uint64_t gardel_live_allocations(void) {
     return atomic_load(&g_gardel_live_allocs);
 }
 
+/* Runtime STRING (spec 6.4.C): a contiguous, NUL-terminated buffer of well-formed UTF-8
+   (one byte per octet) plus its length and its cached code-point count. The verification
+   model (stdlib/text/string.gdl) describes the same octets as LIST[U64]; every value of
+   this type was validated (literals at compile time, input by the IO boundary decoder). */
 typedef struct {
     const char* data;
     uint64_t len;
+    uint64_t chars;
 } GardelString;
 
+/* Runtime BYTES (spec 11): a read-only view of raw octets. */
+typedef struct {
+    const uint8_t* data;
+    uint64_t len;
+} GardelBytes;
+
+/* Number of scalars in well-formed UTF-8: every byte that is not a continuation byte. */
+static inline uint64_t gardel_utf8_count(const uint8_t* bytes, uint64_t len) {
+    uint64_t n = 0;
+    for (uint64_t i = 0; i < len; i++) {
+        if ((bytes[i] & 0xC0) != 0x80) n++;
+    }
+    return n;
+}
+
 /* Runtime STRING constructor for string literals (Task B.3, spec 3.1.4): wraps a static,
-   read-only, NUL-terminated UTF-8 byte buffer emitted by the compiler. No allocation, no
-   copy and no runtime decoding: the literal was validated and decoded at compile time. */
+   read-only, NUL-terminated UTF-8 byte buffer emitted by the compiler. No copy and no
+   decoding: the literal was validated at compile time. */
 static inline GardelString string_from_utf8(const uint8_t* bytes, uint64_t len) {
-    GardelString s = { (const char*)bytes, len };
+    GardelString s = { (const char*)bytes, len, gardel_utf8_count(bytes, len) };
     return s;
+}
+
+/* STRING operations (stdlib/text/string.gdl). Arguments satisfy the verified
+   preconditions, so no runtime checks are needed (spec 7). */
+static inline uint64_t gardel_string_byte_length(GardelString s) { return s.len; }
+static inline uint64_t gardel_string_code_point_count(GardelString s) { return s.chars; }
+static inline bool gardel_string_is_empty(GardelString s) { return s.len == 0; }
+static inline bool gardel_string_equals(GardelString a, GardelString b) {
+    return a.len == b.len && memcmp(a.data, b.data, (size_t)a.len) == 0;
+}
+static inline uint32_t gardel_string_character_at(GardelString s, uint64_t index) {
+    const uint8_t* p = (const uint8_t*)s.data;
+    uint64_t i = 0;
+    for (;;) {
+        uint8_t b0 = p[i];
+        uint64_t n = b0 < 0x80 ? 1 : b0 < 0xE0 ? 2 : b0 < 0xF0 ? 3 : 4;
+        if (index == 0) {
+            if (n == 1) return b0;
+            if (n == 2) return ((uint32_t)(b0 & 0x1F) << 6) | (p[i + 1] & 0x3F);
+            if (n == 3) return ((uint32_t)(b0 & 0x0F) << 12) | ((uint32_t)(p[i + 1] & 0x3F) << 6) | (p[i + 2] & 0x3F);
+            return ((uint32_t)(b0 & 0x07) << 18) | ((uint32_t)(p[i + 1] & 0x3F) << 12) | ((uint32_t)(p[i + 2] & 0x3F) << 6) | (p[i + 3] & 0x3F);
+        }
+        index--;
+        i += n;
+    }
+}
+static inline GardelString gardel_string_concat(GardelString a, GardelString b) {
+    char* buf = (char*)gardel_alloc((size_t)(a.len + b.len + 1));
+    memcpy(buf, a.data, (size_t)a.len);
+    memcpy(buf + a.len, b.data, (size_t)b.len);
+    buf[a.len + b.len] = '\0';
+    GardelString s = { buf, a.len + b.len, a.chars + b.chars };
+    return s;
+}
+static inline GardelBytes gardel_string_to_utf8(GardelString s) {
+    GardelBytes b = { (const uint8_t*)s.data, s.len };
+    return b;
+}
+
+/* BYTES operations (stdlib/text/bytes.gdl). */
+static inline uint64_t gardel_bytes_length(GardelBytes b) { return b.len; }
+static inline bool gardel_bytes_is_empty(GardelBytes b) { return b.len == 0; }
+static inline uint64_t gardel_bytes_at(GardelBytes b, uint64_t i) { return b.data[i]; }
+static inline bool gardel_bytes_equals(GardelBytes a, GardelBytes b) {
+    return a.len == b.len && memcmp(a.data, b.data, (size_t)a.len) == 0;
 }
 
 static inline const char* gardel_io_read_line(char* buf, size_t cap) {
@@ -14211,7 +14600,7 @@ static inline const char* gardel_io_read_line(char* buf, size_t cap) {
 static inline GardelString gardel_io_read_line_str(void) {
     static char line_buf[4096];
     const char* p = gardel_io_read_line(line_buf, sizeof(line_buf));
-    GardelString s = { p, (uint64_t)strlen(p) };
+    GardelString s = { p, (uint64_t)strlen(p), gardel_utf8_count((const uint8_t*)p, (uint64_t)strlen(p)) };
     return s;
 }
 
@@ -14398,12 +14787,15 @@ fn emit_c11_prelude_instances(roots: &[&str]) -> String {
     out
 }
 
-/// `IO.read_line` at the C boundary (spec §11): reads one line of any length and returns
-/// `RESULT[IO_ERROR, STRING]`. Only a line of ASCII bytes (the bootstrap `STRING` domain,
-/// §6.4.C) becomes `Ok(STRING)`; end of input, read failures and non-ASCII bytes become
-/// `Error(..)`. This is the runtime check that justifies the verifier's boundary assumption.
+/// `IO.read_line` at the C boundary (spec §11): reads one line (shorter than
+/// `GARDEL_MAX_LINE_BYTES`) and returns `RESULT[IO_ERROR, STRING]`. Only well-formed
+/// RFC 3629 UTF-8 becomes `Ok(STRING)`, decoded in the same check order as
+/// `STRING.validate_and_count`; end of input, read failures, over-long lines and malformed
+/// UTF-8 become `Error(..)`. This is the runtime check that justifies the verifier's
+/// boundary assumption (`read_line_result_wf`).
 fn emit_c11_read_line_runtime() -> String {
     let r = c_instance_name(READ_LINE_RESULT_TYPE);
+    let max_line = GARDEL_MAX_LINE_BYTES;
     format!(
         r#"#include <errno.h>
 /* IO boundary (spec 11): IO.read_line : IO[RESULT[IO_ERROR, STRING]] */
@@ -14415,6 +14807,7 @@ static struct {r}* gardel_io_read_line_result(void) {{
     while ((c = fgetc(stdin)) != EOF) {{
         saw_any = 1;
         if (c == '\n') break;
+        if ((uint64_t)len + 1 >= {max_line}ULL) {{ free(buf); return make_{r}_Error(make_IO_ERROR_OsError((int64_t)EOVERFLOW)); }}
         if (len + 1 >= cap) {{
             char* nb = (char*)realloc(buf, cap * 2);
             if (!nb) {{ free(buf); return make_{r}_Error(make_IO_ERROR_OsError((int64_t)ENOMEM)); }}
@@ -14426,15 +14819,75 @@ static struct {r}* gardel_io_read_line_result(void) {{
     if (ferror(stdin)) {{ free(buf); return make_{r}_Error(make_IO_ERROR_OsError((int64_t)errno)); }}
     if (!saw_any) {{ free(buf); return make_{r}_Error(make_IO_ERROR_EndOfInput()); }}
     if (len > 0 && buf[len - 1] == '\r') len--;
-    for (size_t i = 0; i < len; i++) {{
-        unsigned char b = (unsigned char)buf[i];
-        if (b >= 128) {{
-            free(buf);
-            return make_{r}_Error(make_IO_ERROR_Decode(make_STRING_ERROR_InvalidByte((uint64_t)i, (uint64_t)b)));
-        }}
-    }}
+    uint64_t chars = 0;
+    struct STRING_ERROR* derr = gardel_utf8_validate((const uint8_t*)buf, (uint64_t)len, &chars);
+    if (derr) {{ free(buf); return make_{r}_Error(make_IO_ERROR_Decode(derr)); }}
     buf[len] = '\0';
-    GardelString s = {{ buf, (uint64_t)len }};
+    GardelString s = {{ buf, (uint64_t)len, chars }};
+    return make_{r}_Ok(s);
+}}
+
+"#
+    )
+}
+
+/// The prelude result type of `STRING.from_utf8` (spec 11).
+const FROM_UTF8_RESULT_TYPE: &str = "RESULT[STRING_ERROR, STRING]";
+
+fn is_string_from_utf8(e: &Expr) -> bool {
+    matches!(e, Expr::MethodCall(recv, m, args)
+        if m == "from_utf8" && args.len() == 1 && matches!(&**recv, Expr::Var(v) if v == "STRING"))
+}
+
+/// RFC 3629 validator shared by `IO.read_line` and `STRING.from_utf8`. It reports the first
+/// error in the check order of `STRING.validate_and_count` (stdlib/text/string.gdl): for a
+/// multi-byte lead, (1) each continuation byte present must be 0x80..0xBF, (2) the sequence
+/// must be complete, (3) the lead-specific second-byte range. Returns NULL and the scalar
+/// count on success.
+fn emit_c11_utf8_validator() -> String {
+    r#"/* RFC 3629 UTF-8 validation (same check order as STRING.validate_and_count) */
+static struct STRING_ERROR* gardel_utf8_validate(const uint8_t* buf, uint64_t len, uint64_t* chars) {
+    uint64_t i = 0, n = 0;
+    while (i < len) {
+        uint8_t b0 = buf[i];
+        uint64_t need;
+        if (b0 < 0x80) { i += 1; n++; continue; }
+        else if (b0 >= 0xC2 && b0 <= 0xDF) need = 2;
+        else if (b0 >= 0xE0 && b0 <= 0xEF) need = 3;
+        else if (b0 >= 0xF0 && b0 <= 0xF4) need = 4;
+        else if (b0 == 0xC0 || b0 == 0xC1) return make_STRING_ERROR_OverlongEncoding(i);
+        else return make_STRING_ERROR_InvalidByte(i, b0);
+        for (uint64_t k = 1; k < need; k++) {
+            if (i + k >= len) return make_STRING_ERROR_TruncatedSequence(i, need);
+            uint8_t bk = buf[i + k];
+            if (bk < 0x80 || bk > 0xBF) return make_STRING_ERROR_InvalidByte(i + k, bk);
+        }
+        uint8_t b1 = buf[i + 1];
+        if (b0 == 0xE0 && b1 < 0xA0) return make_STRING_ERROR_OverlongEncoding(i);
+        if (b0 == 0xED && b1 >= 0xA0) return make_STRING_ERROR_UnpairedSurrogate(i);
+        if (b0 == 0xF0 && b1 < 0x90) return make_STRING_ERROR_OverlongEncoding(i);
+        if (b0 == 0xF4 && b1 > 0x8F) return make_STRING_ERROR_InvalidByte(i + 1, b1);
+        i += need;
+        n++;
+    }
+    *chars = n;
+    return NULL;
+}
+
+"#
+    .to_string()
+}
+
+/// `STRING.from_utf8(bytes)` at run time: validates and, on success, wraps the bytes
+/// (the input view is immutable, so no copy is needed).
+fn emit_c11_from_utf8_runtime() -> String {
+    let r = c_instance_name(FROM_UTF8_RESULT_TYPE);
+    format!(
+        r#"static struct {r}* gardel_string_from_utf8(GardelBytes b) {{
+    uint64_t chars = 0;
+    struct STRING_ERROR* err = gardel_utf8_validate(b.data, b.len, &chars);
+    if (err) return make_{r}_Error(err);
+    GardelString s = {{ (const char*)b.data, b.len, chars }};
     return make_{r}_Ok(s);
 }}
 
@@ -14443,12 +14896,16 @@ static struct {r}* gardel_io_read_line_result(void) {{
 }
 
 fn c11_record_bind_type(v: &str, e: &Expr) {
-    if is_io_read_line(e) {
-        C11_TYPE_ENV.with(|env| {
-            env.borrow_mut()
-                .insert(v.to_string(), READ_LINE_RESULT_TYPE.to_string());
-        });
-    }
+    let ty = if is_io_read_line(e) {
+        READ_LINE_RESULT_TYPE
+    } else if is_string_from_utf8(e) {
+        FROM_UTF8_RESULT_TYPE
+    } else {
+        return;
+    };
+    C11_TYPE_ENV.with(|env| {
+        env.borrow_mut().insert(v.to_string(), ty.to_string());
+    });
 }
 
 /// The instantiated prelude sum type of a `match` scrutinee, when known.
@@ -14456,6 +14913,7 @@ fn c11_scrutinee_type(scrut: &Expr) -> Option<String> {
     let ty = match scrut {
         Expr::Var(v) => C11_TYPE_ENV.with(|env| env.borrow().get(v).cloned())?,
         e if is_io_read_line(e) => READ_LINE_RESULT_TYPE.to_string(),
+        e if is_string_from_utf8(e) => FROM_UTF8_RESULT_TYPE.to_string(),
         _ => return None,
     };
     c_prelude_sum_variants(&ty).map(|_| ty)
@@ -14525,9 +14983,34 @@ pub fn emit_c11_general_module(m: &ModuleDecl) -> String {
     out.push_str(&emit_c11_string_literal_table(&strings));
     C11_STRING_LITERALS.with(|c| *c.borrow_mut() = strings);
     C11_TYPE_ENV.with(|env| env.borrow_mut().clear());
-    if format!("{m:?}").contains("\"read_line\"") {
-        out.push_str(&emit_c11_prelude_instances(&[READ_LINE_RESULT_TYPE]));
+    C11_MODULE_ROUTINES.with(|r| {
+        *r.borrow_mut() = m
+            .create_routines
+            .iter()
+            .chain(&m.feature_routines)
+            .chain(&m.specify_routines)
+            .map(|(_, rd)| rd.name.clone())
+            .collect();
+    });
+    let module_dbg = format!("{m:?}");
+    let uses_read_line = module_dbg.contains("\"read_line\"");
+    let uses_from_utf8 = module_dbg.contains("\"from_utf8\"");
+    let mut roots: Vec<&str> = Vec::new();
+    if uses_read_line {
+        roots.push(READ_LINE_RESULT_TYPE);
+    }
+    if uses_from_utf8 {
+        roots.push(FROM_UTF8_RESULT_TYPE);
+    }
+    if !roots.is_empty() {
+        out.push_str(&emit_c11_prelude_instances(&roots));
+        out.push_str(&emit_c11_utf8_validator());
+    }
+    if uses_read_line {
         out.push_str(&emit_c11_read_line_runtime());
+    }
+    if uses_from_utf8 {
+        out.push_str(&emit_c11_from_utf8_runtime());
     }
     if m.kind == ModuleKind::Program {
         // File-scope forward declarations for opaque struct types in routine signatures
@@ -14700,9 +15183,8 @@ fn emit_c11_routine(r: &RoutineDecl, has_current: bool, mod_name: &str) -> Strin
         s.push_str("tail_loop:\n");
     }
 
-    s.push_str(&emit_c11_block(
-        &r.stmts, &r.body, mod_name, is_tail, rname, 4,
-    ));
+    // The routine body returns its value (`true`: statement position, not an `if` branch).
+    s.push_str(&emit_c11_block(&r.stmts, &r.body, mod_name, true, rname, 4));
     s.push_str("}\n\n");
     s
 }
@@ -14711,7 +15193,7 @@ fn emit_c11_block(
     stmts: &[Stmt],
     body: &Expr,
     mod_name: &str,
-    _is_tail: bool,
+    is_tail: bool,
     _routine_name: &str,
     indent: usize,
 ) -> String {
@@ -14731,6 +15213,7 @@ fn emit_c11_block(
             s.push_str(&format!("{pad}#pragma omp taskwait;\n"));
         } else {
             for (v, e) in group {
+                c11_record_bind_type(&v, &e);
                 s.push_str(&format!(
                     "{pad}__auto_type {v} = {};\n",
                     emit_c11_expr(&e, mod_name)
@@ -14755,16 +15238,80 @@ fn emit_c11_block(
                     }
                 }
             }
-            s.push_str(&format!(
-                "{pad}return {};\n",
-                emit_c11_expr(final_e, mod_name)
-            ));
+            let v = emit_c11_expr(final_e, mod_name);
+            c11_finish_block(s, v, is_tail, &pad)
         }
         _ => {
-            s.push_str(&format!("{pad}return {};\n", emit_c11_expr(body, mod_name)));
+            let v = emit_c11_expr(body, mod_name);
+            c11_finish_block(s, v, is_tail, &pad)
         }
     }
-    s
+}
+
+/// A routine body returns its value; a block in expression position (an `if` branch)
+/// yields it, as a GNU statement expression when it has statements.
+fn c11_finish_block(mut s: String, v: String, is_tail: bool, pad: &str) -> String {
+    if is_tail {
+        s.push_str(&format!("{pad}return {v};\n"));
+        s
+    } else if s.is_empty() {
+        v
+    } else {
+        format!("({{ {} {v}; }})", s.trim())
+    }
+}
+
+/// Runtime functions implementing prelude `STRING` / `BYTES` methods (with their arity).
+const C11_STRING_METHODS: &[(&str, usize)] = &[
+    ("byte_length", 0),
+    ("code_point_count", 0),
+    ("is_empty", 0),
+    ("equals", 1),
+    ("character_at", 1),
+    ("concat", 1),
+    ("to_utf8", 0),
+];
+const C11_BYTES_METHODS: &[(&str, usize)] =
+    &[("length", 0), ("is_empty", 0), ("at", 1), ("equals", 1)];
+
+thread_local! {
+    /// Routine names of the module being lowered to C (a module routine of the same name
+    /// stays reachable through the `_Generic` default branch).
+    static C11_MODULE_ROUTINES: std::cell::RefCell<HashSet<String>> =
+        std::cell::RefCell::new(HashSet::new());
+}
+
+/// `recv.m(args)` for a prelude text method. The C emitter is untyped, so the call is
+/// dispatched on the receiver's C type with `_Generic` (the controlling expression is not
+/// evaluated): `GardelString` / `GardelBytes` select the runtime function, and a routine of
+/// the module with the same name is the default. With no default, a receiver of another
+/// type is a C compile error rather than a wrong call.
+fn emit_c11_text_method(recv: &Expr, m: &str, args: &[Expr], mod_name: &str) -> Option<String> {
+    let s_fn = C11_STRING_METHODS
+        .iter()
+        .any(|(n, k)| *n == m && *k == args.len())
+        .then(|| format!("gardel_string_{m}"));
+    let b_fn = C11_BYTES_METHODS
+        .iter()
+        .any(|(n, k)| *n == m && *k == args.len())
+        .then(|| format!("gardel_bytes_{m}"));
+    if s_fn.is_none() && b_fn.is_none() {
+        return None;
+    }
+    let r = emit_c11_expr(recv, mod_name);
+    let mut assoc = Vec::new();
+    if let Some(f) = s_fn {
+        assoc.push(format!("GardelString: {f}"));
+    }
+    if let Some(f) = b_fn {
+        assoc.push(format!("GardelBytes: {f}"));
+    }
+    if C11_MODULE_ROUTINES.with(|r| r.borrow().contains(m)) {
+        assoc.push(format!("default: {m}"));
+    }
+    let mut a = vec![r.clone()];
+    a.extend(args.iter().map(|x| emit_c11_expr(x, mod_name)));
+    Some(format!("_Generic(({r}), {})({})", assoc.join(", "), a.join(", ")))
 }
 
 fn emit_c11_expr(e: &Expr, mod_name: &str) -> String {
@@ -14833,8 +15380,14 @@ fn emit_c11_expr(e: &Expr, mod_name: &str) -> String {
                     }
                 }
             }
+            if is_string_from_utf8(e) {
+                return format!("gardel_string_from_utf8({})", emit_c11_expr(&args[0], mod_name));
+            }
             if mname == "code" && args.is_empty() {
                 return format!("((uint64_t)({}))", emit_c11_expr(recv, mod_name));
+            }
+            if let Some(call) = emit_c11_text_method(recv, mname, args, mod_name) {
+                return call;
             }
             if mname == "apply" {
                 let r_str = emit_c11_expr(recv, mod_name);
@@ -16323,7 +16876,7 @@ end
         let stdlib = parse_phase4_stdlib().expect("Phase 4 stdlib should parse");
         assert_eq!(stdlib.group, None);
         assert_eq!(stdlib.concepts.len(), 3);
-        assert_eq!(stdlib.modules.len(), 9);
+        assert_eq!(stdlib.modules.len(), 10);
         for m in &stdlib.modules {
             let mut diags = check_visibility_and_semantics(m);
             diags.extend(verify_module_phase3(
@@ -16813,7 +17366,7 @@ end
     #[test]
     fn test_plan3_multi_module_stdlib_pipeline() {
         let ast = parse_phase4_stdlib().expect("stdlib parses cleanly");
-        assert_eq!(ast.modules.len(), 9);
+        assert_eq!(ast.modules.len(), 10);
         let mut prog_env = ProgramEnv {
             modules: HashMap::new(),
             concepts: HashMap::new(),
@@ -16996,7 +17549,18 @@ end
                 .any(|(_, r)| r.name == "value_of" && r.ret_type == "MATH_INT")
         );
         let str_mod = stdlib.modules.iter().find(|m| m.name == "STRING").unwrap();
-        assert_eq!(str_mod.invariants.len(), 4);
+        let inv: Vec<&str> = str_mod.invariants.iter().map(|(t, _)| t.as_str()).collect();
+        assert_eq!(
+            inv,
+            [
+                "positive_capacity",
+                "size_matches",
+                "char_count_matches",
+                "char_count_bounded",
+                "within_bounds",
+                "valid_bytes"
+            ]
+        );
         assert!(
             str_mod
                 .specify_routines
@@ -17867,55 +18431,250 @@ end
 
     #[test]
     fn test_b5a_string_decode_axiom_removed_and_lemmas_proven() {
+        // Task C.2: the UTF-8 theory lives in BYTES and is proven there; STRING uses it only
+        // through BYTES's verified contracts and laws (linked client axioms, §4.1, B.6).
         let stdlib = parse_phase4_stdlib().expect("stdlib parses cleanly");
+        let bytes_mod = stdlib.modules.iter().find(|m| m.name == "BYTES").unwrap();
         let str_mod = stdlib.modules.iter().find(|m| m.name == "STRING").unwrap();
-        let bpl = emit_boogie(str_mod, 2);
-        // The trusted identity axiom on `decode_utf8` must be gone ...
-        assert!(
-            !bpl.contains("fn_decode_utf8(_fuel, Current, bs) == bs"),
-            "hard-coded decode_utf8 identity axiom must not be emitted"
-        );
-        for line in bpl
-            .lines()
-            .filter(|l| l.starts_with("axiom") && l.contains(":: { fn_decode_utf8("))
-        {
-            assert!(
-                line.contains("fn_all_bytes_valid") || line.contains("_c1"),
-                "every decode_utf8 axiom must be its guarded definition/contract or receiver independence: {line}"
-            );
-        }
-        // ... replaced by proven contracts, and `from_scalar` in the decoder is checked.
-        assert!(bpl.contains("decode_utf8::ensure::same_length"));
+
+        // BYTES: the decoder is a verified routine whose `from_scalar` calls are checked.
+        let bpl = emit_boogie(bytes_mod, 2);
+        assert!(bpl.contains("procedure Verify_decode_utf8"));
         assert!(bpl.contains("decode_utf8::require::valid_scalar"));
-        assert!(bpl.contains("procedure Verify_law_decode_injective"));
-        let decode = str_mod
-            .specify_routines
+        let decode = bytes_mod
+            .create_routines
             .iter()
             .map(|(_, r)| r)
             .find(|r| r.name == "decode_utf8")
             .unwrap();
-        assert!(decode.requires.iter().any(|(t, _)| t == "ascii"));
-        assert!(decode.ensures.iter().any(|(t, _)| t == "same_length"));
-        assert!(
-            str_mod
+        let req: Vec<&str> = decode.requires.iter().map(|(t, _)| t.as_str()).collect();
+        let ens: Vec<&str> = decode.ensures.iter().map(|(t, _)| t.as_str()).collect();
+        assert_eq!(req, ["valid"]);
+        assert_eq!(ens, ["length_bounded", "empty_iff"]);
+        // The laws are proven by induction in BYTES's own file and never assumed there.
+        for law in ["utf8_octets", "utf8_append", "decode_injective"] {
+            assert!(bpl.contains(&format!("procedure Verify_law_{law}")), "{law}");
+            let l = bytes_mod
                 .specify_laws
                 .iter()
-                .any(|(_, l)| l.name == "decode_injective")
+                .map(|(_, l)| l)
+                .find(|l| l.name == law)
+                .unwrap();
+            assert!(l.body.is_some() && !l.variant.is_empty(), "{law} needs an inductive proof");
+            assert!(!l.triggers.is_empty(), "{law} must reach clients as a triggered axiom");
+        }
+        assert!(
+            !bpl.lines().any(|l| l.starts_with("axiom") && l.contains("==> (xs == ys)")),
+            "decode_injective must not be an axiom of its own module"
         );
 
-        let diags = verify_module_phase3(
-            str_mod,
-            phase4_stdlib_source(),
-            "stdlib.gdl",
-            2,
-            true,
-            false,
-            false,
+        // STRING: no hand-written UTF-8 axioms and no local copy of the theory.
+        let bpl = emit_boogie(str_mod, 2);
+        assert!(!bpl.contains("fn_decode_utf8(_f,"), "hand-written axiom block is back");
+        assert!(!bpl.contains("function fn_valid_utf8("));
+        assert!(!bpl.contains("function fn_decode_utf8("));
+        assert!(bpl.contains("BYTES__fn_decode_utf8"));
+        assert!(str_mod.specify_laws.iter().all(|(_, l)| l.name != "decode_injective"));
+
+        for m in [bytes_mod, str_mod] {
+            let diags = verify_module_phase3(
+                m,
+                phase4_stdlib_source(),
+                "stdlib.gdl",
+                2,
+                true,
+                false,
+                false,
+            );
+            assert!(diags.is_empty(), "{} must verify, got {diags:?}", m.name);
+        }
+    }
+
+    /// Parses a (possibly mutated) copy of the bundled stdlib and verifies one module.
+    fn verify_mutated_stdlib_module(module: &str, from: &str, to: &str) -> Vec<Diagnostic> {
+        let src = phase4_stdlib_source();
+        assert!(src.contains(from), "mutation anchor not found: {from}");
+        let mutated = src.replacen(from, to, 1);
+        let ast = Parser::new(tokenize(&mutated).expect("lexes"))
+            .parse_file()
+            .expect("parses");
+        let m = ast.modules.iter().find(|m| m.name == module).unwrap();
+        verify_module_phase3(m, &mutated, "stdlib.gdl", 2, true, false, false)
+    }
+
+    #[test]
+    fn test_c2_utf8_laws_are_proven_not_assumed() {
+        // Without the shortest-form rule for E0, `E0 80 80` would decode like `00`: the
+        // injectivity proof must then fail (it is not discharged by an axiom).
+        let diags = verify_mutated_stdlib_module(
+            "BYTES",
+            "(if bs.head = 224 then (bs.tail.head >= 160 and bs.tail.head <= 191)",
+            "(if bs.head = 224 then (bs.tail.head >= 128 and bs.tail.head <= 191)",
         );
         assert!(
-            diags.is_empty(),
-            "STRING must verify without the decode axiom, got {diags:?}"
+            diags
+                .iter()
+                .any(|d| d.routine == "decode_injective" && d.tag == "same_bytes"),
+            "got {diags:?}"
         );
+        // A false law with a recursive-looking body is rejected.
+        let diags = verify_mutated_stdlib_module(
+            "BYTES",
+            "chars_append: decode_utf8(xs.append(ys)) = decode_utf8(xs).append(decode_utf8(ys))",
+            "chars_append: decode_utf8(xs.append(ys)) = decode_utf8(ys).append(decode_utf8(xs))",
+        );
+        assert!(
+            diags
+                .iter()
+                .any(|d| d.routine == "utf8_append" && d.tag == "chars_append"),
+            "got {diags:?}"
+        );
+        // STRING's contracts depend on the BYTES laws: concatenation order matters.
+        let diags = verify_mutated_stdlib_module(
+            "STRING",
+            "chars_model: Result.chars = Current.chars.append(other.chars)",
+            "chars_model: Result.chars = other.chars.append(Current.chars)",
+        );
+        assert!(
+            // Rejected as a counterexample or, under load, as a timeout (never "verified").
+            diags
+                .iter()
+                .any(|d| d.routine == "concat" && (d.tag == "chars_model" || d.tag == "timeout")),
+            "got {diags:?}"
+        );
+    }
+
+    #[test]
+    fn test_c2_from_utf8_accepts_exactly_valid_utf8() {
+        let stdlib = parse_phase4_stdlib().expect("stdlib parses cleanly");
+        let str_mod = stdlib.modules.iter().find(|m| m.name == "STRING").unwrap();
+        let from = str_mod
+            .create_routines
+            .iter()
+            .map(|(_, r)| r)
+            .find(|r| r.name == "from_utf8")
+            .unwrap();
+        assert!(from.ensures.iter().any(|(t, _)| t == "ok_iff_valid"));
+        // A validator that accepts an overlong `E0 9x` or a scalar above U+10FFFF (`F4 90`)
+        // no longer meets `valid_iff`.
+        for (from_s, to_s) in [
+            (
+                "if bs.head = 224 and bs.tail.head < 160 then",
+                "if bs.head = 224 and bs.tail.head < 150 then",
+            ),
+            (
+                "if bs.head = 244 and bs.tail.head > 143 then",
+                "if bs.head = 244 and bs.tail.head > 144 then",
+            ),
+        ] {
+            let diags = verify_mutated_stdlib_module("STRING", from_s, to_s);
+            assert!(
+                diags
+                    .iter()
+                    .any(|d| d.routine == "validate_and_count" && d.tag == "valid_iff"),
+                "mutation `{to_s}` must be rejected, got {diags:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_c2_match_exhaustiveness_on_prelude_adts() {
+        // A missing case of a prelude ADT is no longer an implicit `assume false`.
+        let src = "module PM\n\nrepresentation {ANY}\n  | Mk(x: U64)\n\nfeature {ANY}\n\n  top(r: RESULT[STRING_ERROR, U64]): U64\n    do\n      match r\n        case Ok(v) then 42\n      end\n    ensure\n      bogus: r.is_ok\n    end\n\n  nested(r: RESULT[STRING_ERROR, U64]): U64\n    do\n      let y = (match r\n        case Ok(v) then 42\n      end)\n      y\n    ensure\n      bogus2: r.is_ok\n    end\n\n  dead(r: RESULT[STRING_ERROR, U64]): U64\n    require\n      ok: r.is_ok\n    do\n      match r\n        case Ok(v) then 42\n      end\n    ensure\n      fine: Result = 42\n    end\n\n  full(r: RESULT[STRING_ERROR, U64]): U64\n    do\n      match r\n        case Ok(v) then 1\n        case Error(e) then 2\n      end\n    ensure\n      range: Result >= 1 and Result <= 2\n    end\n\nend\n";
+        let m = parse_user_module_with_prelude(src);
+        let diags = with_prelude_injection(true, || {
+            verify_module_phase3(&m, src, "pm.gdl", DEFAULT_FUEL, true, false, false)
+        });
+        let got: Vec<(&str, &str)> = diags
+            .iter()
+            .map(|d| (d.routine.as_str(), d.tag.as_str()))
+            .collect();
+        assert!(got.contains(&("top", "exhaustiveness_Error")), "got {diags:?}");
+        assert!(got.contains(&("nested", "exhaustiveness")), "got {diags:?}");
+        // The postconditions that only an omitted case could violate are not "proven".
+        assert!(!got.iter().any(|(r, _)| *r == "dead" || *r == "full"), "got {diags:?}");
+        assert!(
+            diags
+                .iter()
+                .all(|d| d.rule == "Phase 3 Boogie (Non-Exhaustive Match)"),
+            "got {diags:?}"
+        );
+    }
+
+    const C2_TEXT_PROGRAM: &str = "program TEXTDEMO\n\nfeature {ANY}\n\n  main(args: SEQ[STRING]): IO[EXIT_CODE]\n    do\n      with IO\n        line_res <- IO.read_line\n        match line_res\n          case Ok(name) then\n            let g = \"H\u{e9}, \".concat(name)\n            match STRING.from_utf8(g.to_utf8)\n              case Ok(h) then\n                with IO\n                  IO.print_line(h)\n                  IO.exit(if g.character_at(1).code = 233 and h.equals(g) then g.code_point_count else 99 end)\n                end\n              case Error(_) then\n                IO.exit(98)\n            end\n          case Error(e) then\n            match e\n              case Decode(se) then\n                match se\n                  case InvalidByte(o, b) then IO.exit(10 + o % 10)\n                  case TruncatedSequence(o, n) then IO.exit(20 + o % 10)\n                  case OverlongEncoding(o) then IO.exit(30 + o % 10)\n                  case UnpairedSurrogate(o) then IO.exit(40 + o % 10)\n                end\n              case EndOfInput then IO.exit(1)\n              case OsError(c) then IO.exit(2)\n            end\n        end\n      end\n    end\n\nend\n";
+
+    #[test]
+    fn test_c2_utf8_strings_verify_and_run_natively() {
+        let src = C2_TEXT_PROGRAM;
+        let m = parse_user_module_with_prelude(src);
+        let diags = with_prelude_injection(true, || {
+            verify_module_phase3(&m, src, "textdemo.gdl", DEFAULT_FUEL, true, false, false)
+        });
+        // `concat` on input verifies (read_line bound), as do `character_at`'s bound, the
+        // `from_utf8` round trip and the multi-byte literal facts.
+        assert!(diags.is_empty(), "got {diags:?}");
+
+        // Multi-byte literal facts are exact: "é" is 2 bytes and 1 scalar.
+        let probe = "functions LITS\n\nfeature {ANY}\n\n  ok_bytes: NAT\n    do\n      \"\u{e9}\".byte_length\n    ensure\n      two: Result = 2\n    end\n\n  bad_bytes: NAT\n    do\n      \"\u{e9}\".byte_length\n    ensure\n      one: Result = 1\n    end\n\n  scalars: NAT\n    do\n      \"\u{1F980}\u{e9}\".code_point_count\n    ensure\n      two_scalars: Result = 2\n    end\n\nend\n";
+        let pm = parse_user_module_with_prelude(probe);
+        let diags = with_prelude_injection(true, || {
+            verify_module_phase3(&pm, probe, "lits.gdl", DEFAULT_FUEL, true, false, false)
+        });
+        let tags: Vec<&str> = diags.iter().map(|d| d.tag.as_str()).collect();
+        assert_eq!(tags, ["one"], "got {diags:?}");
+
+        // C: STRING/BYTES methods lower to runtime functions chosen by the receiver's type.
+        let c = emit_c11(&m);
+        assert!(c.contains("_Generic((g), GardelString: gardel_string_character_at)"), "{c}");
+        assert!(c.contains("gardel_string_from_utf8("), "{c}");
+        assert!(c.contains("uint64_t chars;"), "cached code-point count");
+        assert!(!c.contains("return _Generic"), "if-branches must not `return`: {c}");
+
+        // Run it when a C compiler is available.
+        let dir = env::temp_dir().join(format!("gardel_c2_{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let c_path = dir.join("textdemo.c");
+        let exe = dir.join("textdemo.exe");
+        fs::write(&c_path, &c).unwrap();
+        let Ok(st) = Command::new("gcc")
+            .args(["-std=gnu11", "-O1", "-o"])
+            .arg(&exe)
+            .arg(&c_path)
+            .status()
+        else {
+            eprintln!("gcc not available: skipping the native part of this test");
+            return;
+        };
+        assert!(st.success(), "generated C must compile");
+        let run = |input: &[u8]| -> (i32, String) {
+            use std::io::Write;
+            let mut child = Command::new(&exe)
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::piped())
+                .spawn()
+                .unwrap();
+            child.stdin.take().unwrap().write_all(input).unwrap();
+            let out = child.wait_with_output().unwrap();
+            (
+                out.status.code().unwrap_or(-1),
+                // Windows text-mode stdout writes `\r\n`.
+                String::from_utf8_lossy(&out.stdout).trim_end().to_string(),
+            )
+        };
+        assert_eq!(run("Ana\n".as_bytes()), (7, "H\u{e9}, Ana".to_string()));
+        assert_eq!(run("\u{65e5}\u{1F980}\n".as_bytes()).0, 6);
+        assert_eq!(run(b"\n").0, 4);
+        assert_eq!(run(b"").0, 1);
+        // Error classification: the C decoder follows `validate_and_count`'s check order.
+        assert_eq!(run(b"\xED\xC0\n").0, 11, "ED C0: invalid continuation, not a surrogate");
+        assert_eq!(run(b"\xE0\x41\n").0, 11, "E0 41: invalid byte before truncation");
+        assert_eq!(run(b"\xE0\x80\n").0, 20, "E0 80: truncated");
+        assert_eq!(run(b"\xE0\x80\x80\n").0, 30, "E0 80 80: overlong");
+        assert_eq!(run(b"\xC0\xAF\n").0, 30, "C0: overlong lead");
+        assert_eq!(run(b"\xED\xA0\x80\n").0, 40, "surrogate");
+        assert_eq!(run(b"\xF4\x90\x80\x80\n").0, 11, "above U+10FFFF");
+        assert_eq!(run(b"ab\xFF\n").0, 12, "FF at offset 2");
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -18530,15 +19289,12 @@ end
         assert_eq!(toks[2], Token::Char('\''));
         assert_eq!(toks[3], Token::Char('"'));
 
-        // Non-ASCII scalars (raw or escaped) cannot be represented by the bootstrap STRING.
-        for src in ["\"caf\u{E9}\"", r#""\u{E9}""#, "\"\u{1F980}\""] {
-            let err = tokenize(src).expect_err("non-ASCII literal must be rejected");
-            assert!(
-                err.message.starts_with("E0303: non_ascii_string_literal"),
-                "{err}"
-            );
-            assert!(err.message.contains("Task C.2"), "{err}");
-        }
+        // Task C.2: non-ASCII scalars (raw or escaped) are supported in UTF-8 STRING.
+        let non_ascii_toks = tokenize("\"caf\u{E9}\" \"\\u{E9}\" \"\u{1F980}\"")
+            .expect("non-ASCII literals must be accepted in Task C.2");
+        assert_eq!(non_ascii_toks[0], Token::Str("caf\u{E9}".to_string()));
+        assert_eq!(non_ascii_toks[1], Token::Str("\u{E9}".to_string()));
+        assert_eq!(non_ascii_toks[2], Token::Str("\u{1F980}".to_string()));
         // Surrogates are not scalar values (in strings and chars).
         for src in [r#""\u{D800}""#, r#"'\u{DFFF}'"#] {
             let err = tokenize(src).expect_err("surrogate must be rejected");
@@ -19133,9 +19889,9 @@ end
             c.contains("make_IO_ERROR_Decode(struct STRING_ERROR* cause)"),
             "{c}"
         );
-        // The runtime validates input: only ASCII lines become Ok(STRING).
+        // The runtime validates input: Task C.2 validates full RFC 3629 UTF-8.
         assert!(
-            c.contains("if (b >= 128)") && c.contains("make_IO_ERROR_EndOfInput()"),
+            c.contains("b0 < 0x80") && c.contains("make_IO_ERROR_EndOfInput()"),
             "{c}"
         );
         assert!(

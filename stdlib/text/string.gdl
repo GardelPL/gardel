@@ -1,61 +1,213 @@
 module STRING satisfies EQ
 
+-- Verification model of the prelude text type (spec §6.4.C). The bytes are an RFC 3629
+-- UTF-8 sequence, one octet per list element; the logical value is the scalar sequence
+-- `chars = BYTES.decode_utf8(bytes)`. The C11 runtime stores the same octets packed in a
+-- contiguous buffer (`GardelString`), so the list is the model, not the memory layout.
+-- The UTF-8 theory (`valid_utf8`, `decode_utf8` and their proven laws) lives in BYTES.
 representation {NONE}
   bytes: LIST[U64]
   size: NAT
+  char_count: NAT
   limit: NAT
 
+create {ANY}
+
+  make_empty(cap: NAT): STRING
+    require
+      positive_cap: cap > 0
+    do
+      { bytes = LIST.empty, size = 0, char_count = 0, limit = cap }
+    ensure
+      empty_bytes: Result.byte_length = 0
+      empty_chars: Result.chars = LIST.empty
+      empty_count: Result.code_point_count = 0
+      empty_str: Result.is_empty
+      capacity_set: Result.capacity = cap
+    end
+
+  -- Boundary decoding (spec §11): accepts exactly the well-formed UTF-8 inputs.
+  from_utf8(bytes: BYTES): RESULT[STRING_ERROR, STRING]
+    do
+      match validate_and_count(bytes.to_list, 0)
+        case Error(e) then
+          Error(e)
+        case Ok(count) then
+          let cap = if bytes.length = 0 then 1 else bytes.length end
+          Ok({ bytes = bytes.to_list,
+               size = bytes.length,
+               char_count = count,
+               limit = cap })
+      end
+    ensure
+      ok_iff_valid: Result.is_ok = BYTES.valid_utf8(bytes.model)
+      ok_chars: Result.is_ok implies Result.get.chars = BYTES.decode_utf8(bytes.model)
+      ok_len: Result.is_ok implies Result.get.byte_length = bytes.length
+      ok_points: Result.is_ok implies Result.get.code_point_count = Result.get.chars.length
+    end
+
+create {NONE}
+
+  nth_char(bs: LIST[U64], i: NAT): CHAR
+    require
+      valid: BYTES.valid_utf8(bs)
+      in_bounds: i < BYTES.decode_utf8(bs).length
+    variant
+      bs.length
+    do
+      if bs.head < 128 then
+        if i = 0 then
+          CHAR.from_scalar(bs.head)
+        else
+          nth_char(bs.tail, i - 1)
+        end
+      else
+        if bs.head <= 223 then
+          if i = 0 then
+            CHAR.from_scalar((bs.head - 192) * 64 + (bs.tail.head - 128))
+          else
+            nth_char(bs.tail.tail, i - 1)
+          end
+        else
+          if bs.head <= 239 then
+            if i = 0 then
+              CHAR.from_scalar((bs.head - 224) * 4096 + (bs.tail.head - 128) * 64 + (bs.tail.tail.head - 128))
+            else
+              nth_char(bs.tail.tail.tail, i - 1)
+            end
+          else
+            if i = 0 then
+              CHAR.from_scalar((bs.head - 240) * 262144 + (bs.tail.head - 128) * 4096 + (bs.tail.tail.head - 128) * 64 + (bs.tail.tail.tail.head - 128))
+            else
+              nth_char(bs.tail.tail.tail.tail, i - 1)
+            end
+          end
+        end
+      end
+    ensure
+      matches_ops: Result = LIST_OPS.at(BYTES.decode_utf8(bs), i)
+    end
+
+  -- Validates `bs` and counts its scalars. `offset` is the position of `bs` in the whole
+  -- input (for error reports). For a multi-byte lead the checks run in a fixed order:
+  -- (1) each continuation byte that is present must be in 0x80..0xBF (`InvalidByte`),
+  -- (2) the sequence must be complete (`TruncatedSequence`), (3) the lead-specific
+  -- second-byte range (overlong `E0`/`F0`, surrogate `ED`, above U+10FFFF `F4`).
+  -- The C runtime decoder (`gardel_io_read_line_result`) uses the same order.
+  validate_and_count(bs: LIST[U64], offset: NAT): RESULT[STRING_ERROR, NAT]
+    require
+      fits: offset <= 18446744073709551615 - bs.length
+    variant
+      bs.length
+    do
+      if bs.length = 0 then
+        Ok(0)
+      else
+        if bs.head < 128 then
+          match validate_and_count(bs.tail, offset + 1)
+            case Error(e) then Error(e)
+            case Ok(n)    then Ok(n + 1)
+          end
+        else
+          if bs.head >= 194 and bs.head <= 223 then
+            if bs.length < 2 then
+              Error(TruncatedSequence(offset, 2))
+            else
+              if bs.tail.head < 128 or bs.tail.head > 191 then
+                Error(InvalidByte(offset + 1, bs.tail.head))
+              else
+                match validate_and_count(bs.tail.tail, offset + 2)
+                  case Error(e) then Error(e)
+                  case Ok(n)    then Ok(n + 1)
+                end
+              end
+            end
+          else
+            if bs.head >= 224 and bs.head <= 239 then
+              if bs.length < 2 then
+                Error(TruncatedSequence(offset, 3))
+              else
+                if bs.tail.head < 128 or bs.tail.head > 191 then
+                  Error(InvalidByte(offset + 1, bs.tail.head))
+                else
+                  if bs.length < 3 then
+                    Error(TruncatedSequence(offset, 3))
+                  else
+                    if bs.tail.tail.head < 128 or bs.tail.tail.head > 191 then
+                      Error(InvalidByte(offset + 2, bs.tail.tail.head))
+                    else
+                      if bs.head = 224 and bs.tail.head < 160 then
+                        Error(OverlongEncoding(offset))
+                      else
+                        if bs.head = 237 and bs.tail.head >= 160 then
+                          Error(UnpairedSurrogate(offset))
+                        else
+                          match validate_and_count(bs.tail.tail.tail, offset + 3)
+                            case Error(e) then Error(e)
+                            case Ok(n)    then Ok(n + 1)
+                          end
+                        end
+                      end
+                    end
+                  end
+                end
+              end
+            else
+              if bs.head >= 240 and bs.head <= 244 then
+                if bs.length < 2 then
+                  Error(TruncatedSequence(offset, 4))
+                else
+                  if bs.tail.head < 128 or bs.tail.head > 191 then
+                    Error(InvalidByte(offset + 1, bs.tail.head))
+                  else
+                    if bs.length < 3 then
+                      Error(TruncatedSequence(offset, 4))
+                    else
+                      if bs.tail.tail.head < 128 or bs.tail.tail.head > 191 then
+                        Error(InvalidByte(offset + 2, bs.tail.tail.head))
+                      else
+                        if bs.length < 4 then
+                          Error(TruncatedSequence(offset, 4))
+                        else
+                          if bs.tail.tail.tail.head < 128 or bs.tail.tail.tail.head > 191 then
+                            Error(InvalidByte(offset + 3, bs.tail.tail.tail.head))
+                          else
+                            if bs.head = 240 and bs.tail.head < 144 then
+                              Error(OverlongEncoding(offset))
+                            else
+                              if bs.head = 244 and bs.tail.head > 143 then
+                                Error(InvalidByte(offset + 1, bs.tail.head))
+                              else
+                                match validate_and_count(bs.tail.tail.tail.tail, offset + 4)
+                                  case Error(e) then Error(e)
+                                  case Ok(n)    then Ok(n + 1)
+                                end
+                              end
+                            end
+                          end
+                        end
+                      end
+                    end
+                  end
+                end
+              else
+                if bs.head >= 192 and bs.head <= 193 then
+                  Error(OverlongEncoding(offset))
+                else
+                  Error(InvalidByte(offset, bs.head))
+                end
+              end
+            end
+          end
+        end
+      end
+    ensure
+      valid_iff: Result.is_ok = BYTES.valid_utf8(bs)
+      ok_count: Result.is_ok implies (BYTES.decode_utf8(bs).length = Result.get)
+      ok_bounded: Result.is_ok implies (Result.get <= bs.length)
+    end
+
 specify {ANY}
-
-  all_bytes_valid(bs: LIST[U64]): BOOL
-    variant
-      bs.length
-    do
-      if bs.length = 0 then
-        True
-      else
-        bs.head < 128 and all_bytes_valid(bs.tail)
-      end
-    end
-
-  scalar_codes(cs: LIST[CHAR]): LIST[U64]
-    variant
-      cs.length
-    do
-      if cs.length = 0 then
-        LIST.empty
-      else
-        scalar_codes(cs.tail).prepend(cs.head.code)
-      end
-    end
-
-  decode_utf8(bs: LIST[U64]): LIST[CHAR]
-    require
-      ascii: all_bytes_valid(bs)
-    variant
-      bs.length
-    do
-      if bs.length = 0 then
-        LIST.empty
-      else
-        decode_utf8(bs.tail).prepend(CHAR.from_scalar(bs.head))
-      end
-    ensure
-      same_length: Result.length = bs.length
-      cons_case: bs.length > 0 implies Result = decode_utf8(bs.tail).prepend(CHAR.from_scalar(bs.head))
-      codes_preserved: scalar_codes(Result) = bs
-    end
-
-  law decode_injective(xs: LIST[U64], ys: LIST[U64])
-    require
-      xs_ascii: all_bytes_valid(xs)
-      ys_ascii: all_bytes_valid(ys)
-      same_chars: decode_utf8(xs) = decode_utf8(ys)
-    variant
-      xs.length
-    ensure
-      same_bytes: xs = ys
-    end
 
   byte_model: LIST[U64]
     do
@@ -64,27 +216,15 @@ specify {ANY}
 
   chars: LIST[CHAR]
     do
-      decode_utf8(Current.bytes)
+      BYTES.decode_utf8(Current.bytes)
     ensure
-      def: Result = decode_utf8(Current.byte_model)
-    end
-
-create {ANY}
-
-  make_empty(cap: NAT): STRING
-    require
-      positive_cap: cap > 0
-    do
-      { bytes = LIST.empty, size = 0, limit = cap }
-    ensure
-      empty_bytes: Result.byte_length = 0
-      empty_chars: Result.chars = LIST.empty
-      empty_str: Result.is_empty
-      capacity_set: Result.capacity = cap
+      def: Result = BYTES.decode_utf8(Current.byte_model)
     end
 
 feature {ANY}
 
+  -- Byte equality. Since decoding is injective on well-formed UTF-8 (BYTES law
+  -- `decode_injective`), it is exactly equality of the scalar sequences.
   equals(other: STRING): BOOL
     do
       Current.bytes = other.bytes
@@ -102,7 +242,7 @@ feature {ANY}
 
   code_point_count: NAT
     do
-      Current.size
+      Current.char_count
     ensure
       def: Result = Current.chars.length
     end
@@ -114,38 +254,47 @@ feature {ANY}
 
   is_empty: BOOL
     do
-      Current.size = 0
+      Current.char_count = 0
     ensure
       def: Result = (Current.byte_length = 0)
+      char_def: Result = (Current.code_point_count = 0)
       empty_chars: Result = (Current.chars = LIST.empty)
     end
 
-  push_byte(b: U64): STRING
+  character_at(index: NAT): CHAR
     require
-      is_byte: b < 128
-      has_room: Current.byte_length < Current.capacity
+      in_bounds: index < Current.code_point_count
     do
-      { bytes = Current.bytes.prepend(b),
-        size = Current.size + 1,
-        limit = Current.limit }
+      nth_char(Current.bytes, index)
     ensure
-      grew: Result.byte_length = Current.byte_length + 1
-      non_empty: not Result.is_empty
+      model_at: Result = LIST_OPS.at(Current.chars, index)
     end
 
-  push_utf8_word(w: U64): STRING
+  -- The only precondition is that the total byte length is representable.
+  concat(other: STRING): STRING
     require
-      valid_word: w < 128
-      has_room: Current.byte_length < Current.capacity
+      fits: Current.byte_length <= 18446744073709551615 - other.byte_length
     do
-      { bytes = Current.bytes.prepend(w),
-        size = Current.size + 1,
-        limit = Current.limit }
+      { bytes = Current.bytes.append(other.bytes),
+        size = Current.size + other.size,
+        char_count = Current.char_count + other.char_count,
+        limit = if Current.size + other.size = 0 then 1 else Current.size + other.size end }
     ensure
-      grew: Result.byte_length = Current.byte_length + 1
-      non_empty: not Result.is_empty
+      bytes_appended: Result.byte_length = Current.byte_length + other.byte_length
+      chars_appended: Result.code_point_count = Current.code_point_count + other.code_point_count
+      chars_model: Result.chars = Current.chars.append(other.chars)
     end
 
+  to_utf8: BYTES
+    do
+      BYTES.from_list(Current.bytes)
+    ensure
+      model_matches: Result.model = Current.byte_model
+      valid: BYTES.valid_utf8(Result.model)
+    end
+
+  -- Builders used by string-literal desugaring (§3.1.4). Each prepends one complete,
+  -- well-formed encoded scalar.
   push_ascii(c: CHAR): STRING
     require
       is_ascii: c.code < 128
@@ -153,10 +302,73 @@ feature {ANY}
     do
       { bytes = Current.bytes.prepend(c.code),
         size = Current.size + 1,
+        char_count = Current.char_count + 1,
         limit = Current.limit }
     ensure
       grew: Result.byte_length = Current.byte_length + 1
+      code_point_grew: Result.code_point_count = Current.code_point_count + 1
       chars_prepended: Result.chars = Current.chars.prepend(c)
+      non_empty: not Result.is_empty
+      same_capacity: Result.capacity = Current.capacity
+    end
+
+  push_utf8_2(b0: U64, b1: U64): STRING
+    require
+      valid_prefix: b0 >= 194 and b0 <= 223
+      valid_cont: b1 >= 128 and b1 <= 191
+      has_room: Current.byte_length + 2 <= Current.capacity
+    do
+      { bytes = Current.bytes.prepend(b1).prepend(b0),
+        size = Current.size + 2,
+        char_count = Current.char_count + 1,
+        limit = Current.limit }
+    ensure
+      grew: Result.byte_length = Current.byte_length + 2
+      code_point_grew: Result.code_point_count = Current.code_point_count + 1
+      chars_prepended: Result.chars = Current.chars.prepend(CHAR.from_scalar((b0 - 192) * 64 + (b1 - 128)))
+      non_empty: not Result.is_empty
+      same_capacity: Result.capacity = Current.capacity
+    end
+
+  push_utf8_3(b0: U64, b1: U64, b2: U64): STRING
+    require
+      valid_prefix: b0 >= 224 and b0 <= 239
+      valid_cont1: if b0 = 224 then (b1 >= 160 and b1 <= 191)
+                   else if b0 = 237 then (b1 >= 128 and b1 <= 159)
+                   else (b1 >= 128 and b1 <= 191) end end
+      valid_cont2: b2 >= 128 and b2 <= 191
+      has_room: Current.byte_length + 3 <= Current.capacity
+    do
+      { bytes = Current.bytes.prepend(b2).prepend(b1).prepend(b0),
+        size = Current.size + 3,
+        char_count = Current.char_count + 1,
+        limit = Current.limit }
+    ensure
+      grew: Result.byte_length = Current.byte_length + 3
+      code_point_grew: Result.code_point_count = Current.code_point_count + 1
+      chars_prepended: Result.chars = Current.chars.prepend(CHAR.from_scalar((b0 - 224) * 4096 + (b1 - 128) * 64 + (b2 - 128)))
+      non_empty: not Result.is_empty
+      same_capacity: Result.capacity = Current.capacity
+    end
+
+  push_utf8_4(b0: U64, b1: U64, b2: U64, b3: U64): STRING
+    require
+      valid_prefix: b0 >= 240 and b0 <= 244
+      valid_cont1: if b0 = 240 then (b1 >= 144 and b1 <= 191)
+                   else if b0 = 244 then (b1 >= 128 and b1 <= 143)
+                   else (b1 >= 128 and b1 <= 191) end end
+      valid_cont2: b2 >= 128 and b2 <= 191
+      valid_cont3: b3 >= 128 and b3 <= 191
+      has_room: Current.byte_length + 4 <= Current.capacity
+    do
+      { bytes = Current.bytes.prepend(b3).prepend(b2).prepend(b1).prepend(b0),
+        size = Current.size + 4,
+        char_count = Current.char_count + 1,
+        limit = Current.limit }
+    ensure
+      grew: Result.byte_length = Current.byte_length + 4
+      code_point_grew: Result.code_point_count = Current.code_point_count + 1
+      chars_prepended: Result.chars = Current.chars.prepend(CHAR.from_scalar((b0 - 240) * 262144 + (b1 - 128) * 4096 + (b2 - 128) * 64 + (b3 - 128)))
       non_empty: not Result.is_empty
       same_capacity: Result.capacity = Current.capacity
     end
@@ -186,8 +398,9 @@ specify {EQ}
 invariant
   positive_capacity: limit > 0
   size_matches: size = bytes.length
+  char_count_matches: char_count = BYTES.decode_utf8(bytes).length
+  char_count_bounded: char_count <= size
   within_bounds: size <= limit
-  valid_bytes: all_bytes_valid(bytes)
+  valid_bytes: BYTES.valid_utf8(bytes)
 
 end
-

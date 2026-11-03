@@ -28,3 +28,8 @@ tools/
 .DS_Store
 Thumbs.db
 desktop.ini
+
+# Local secrets (never commit credentials)
+*.key.txt
+*.key
+.env
