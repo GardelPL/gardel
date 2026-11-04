@@ -11841,6 +11841,49 @@ thread_local! {
     /// Routines whose contract axioms are withheld in the current verification pass.
     static UNTRUSTED_CONTRACTS: std::cell::RefCell<HashSet<String>> =
         std::cell::RefCell::new(HashSet::new());
+    /// Z3 random seed override for Boogie verification.
+    static BOOGIE_Z3_SEED: std::cell::RefCell<Option<u32>> = const { std::cell::RefCell::new(None) };
+    /// Z3 resource limit override for Boogie verification.
+    static BOOGIE_Z3_RLIMIT: std::cell::RefCell<Option<u64>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Z3 resources allowed per Boogie procedure. Unlike a time limit it counts solver work, so
+/// the verdict does not depend on machine load. See plan/Roadmap.md for the calibration.
+pub const DEFAULT_Z3_RLIMIT: u64 = 30_000_000;
+
+/// Backstop in seconds for a solver that stops counting resources. `DEFAULT_Z3_RLIMIT` is
+/// what ends a proof attempt; a run that reaches this limit has hung.
+const BOOGIE_TIME_BACKSTOP: u32 = 600;
+
+pub fn with_z3_rlimit<R>(rlimit: Option<u64>, f: impl FnOnce() -> R) -> R {
+    let prev = BOOGIE_Z3_RLIMIT.with(|s| s.replace(rlimit));
+    let res = f();
+    BOOGIE_Z3_RLIMIT.with(|s| *s.borrow_mut() = prev);
+    res
+}
+
+pub fn current_z3_rlimit() -> u64 {
+    BOOGIE_Z3_RLIMIT.with(|s| *s.borrow()).unwrap_or(DEFAULT_Z3_RLIMIT)
+}
+
+pub fn with_z3_seed<R>(seed: Option<u32>, f: impl FnOnce() -> R) -> R {
+    let prev = BOOGIE_Z3_SEED.with(|s| s.replace(seed));
+    let res = f();
+    BOOGIE_Z3_SEED.with(|s| *s.borrow_mut() = prev);
+    res
+}
+
+pub fn current_z3_seed() -> Option<u32> {
+    BOOGIE_Z3_SEED.with(|s| *s.borrow())
+}
+
+/// The Boogie options that give Z3 a fixed random seed. Every Boogie call site uses these,
+/// so a seeded run cannot apply the seed to one path and miss another.
+fn boogie_seed_args(seed: u32) -> [String; 2] {
+    [
+        format!("/proverOpt:O:smt.random_seed={seed}"),
+        format!("/proverOpt:O:sat.random_seed={seed}"),
+    ]
 }
 
 fn run_boogie_verification_once(
@@ -11868,8 +11911,12 @@ fn run_boogie_verification_once(
 
     let mut cmd = Command::new(boogie_path);
     cmd.arg(format!("/proverOpt:PROVER_PATH={z3_path}"));
+    if let Some(seed) = current_z3_seed() {
+        cmd.args(boogie_seed_args(seed));
+    }
     cmd.arg("/typeEncoding:p");
-    cmd.arg("/timeLimit:10");
+    cmd.arg(format!("/rlimit:{}", current_z3_rlimit()));
+    cmd.arg(format!("/timeLimit:{BOOGIE_TIME_BACKSTOP}"));
     cmd.arg("/mv:-");
     cmd.arg("/errorTrace:0");
     cmd.arg(&temp_path);
@@ -12057,15 +12104,17 @@ pub fn parse_boogie_output(
 
         // 1b. A timed-out / inconclusive procedure is *not* verified: report it instead of
         // silently counting it as a success.
-        if line.contains("Verification of '")
+        if line.contains("Verification ")
             && (line.contains("timed out")
                 || line.contains("inconclusive")
                 || line.contains("out of"))
         {
+            // `Verification of 'P' timed out ...` or `Verification inconclusive (P)`.
             let proc_name = line
                 .split("Verification of '")
                 .nth(1)
                 .and_then(|r| r.split('\'').next())
+                .or_else(|| line.rsplit('(').next().and_then(|r| r.split(')').next()))
                 .unwrap_or("");
             let routine = proc_name
                 .strip_prefix("Verify_")
@@ -12101,6 +12150,26 @@ pub fn parse_boogie_output(
                 let sp = locate_span(src, input_path, &tag, &routine);
                 let lemmas = find_relevant_lemmas_for_tag(m, &routine, &tag);
                 let pcs = collect_routine_path_conditions(m, &routine, &tag);
+                // Boogie prints a refutation with its model. An obligation with no model is
+                // one the solver gave up on: it is unproven, not shown false.
+                if !line.contains(": error:") && !line.contains(": Error:") {
+                    diags.push(
+                        Diagnostic::basic(
+                            "error",
+                            "Phase 3 Boogie (Verification Resource Limit)",
+                            routine.clone(),
+                            tag.clone(),
+                            format!(
+                                "`{routine}`: the solver gave up on `{tag}` at {} resources, so it is unproven (not shown false). Simplify the proof with a lemma, or raise the limit with --z3-rlimit",
+                                current_z3_rlimit()
+                            ),
+                        )
+                        .with_module(&m.name)
+                        .with_ai_context(sp, pcs, BTreeMap::new(), lemmas),
+                    );
+                    i += 1;
+                    continue;
+                }
                 let static_rule = match rule_kind.as_str() {
                     "overflow" => "Phase 3 Boogie (Arithmetic Overflow)",
                     "div_by_zero" => "Phase 3 Boogie (Division by Zero)",
@@ -12122,7 +12191,31 @@ pub fn parse_boogie_output(
 
         i += 1;
     }
+    // Passing needs Boogie's own clean summary. A crash, a missing summary or an outcome this
+    // parser does not know must never read as "verified".
+    if diags.is_empty() && !lines.iter().any(|l| is_clean_boogie_summary(l)) {
+        let tail: Vec<&str> = lines.iter().rev().map(|l| l.trim()).filter(|l| !l.is_empty()).take(2).collect();
+        diags.push(
+            Diagnostic::basic(
+                "error",
+                "Phase 3 Boogie (Verification Incomplete)",
+                m.name.clone(),
+                "incomplete".to_string(),
+                format!("Boogie did not report a clean result for `{}`, so nothing is proven: {}", m.name, tail.join(" | ")),
+            )
+            .with_module(&m.name),
+        );
+    }
     diags
+}
+
+/// `Boogie program verifier finished with N verified, 0 errors`, and nothing after it (Boogie
+/// appends `, 1 inconclusive`, `, 1 time out` and so on when something did not finish).
+fn is_clean_boogie_summary(line: &str) -> bool {
+    line.trim()
+        .strip_prefix("Boogie program verifier finished with ")
+        .and_then(|r| r.strip_suffix(" verified, 0 errors"))
+        .is_some_and(|n| n.parse::<u64>().is_ok())
 }
 
 fn parse_msg_tag(msg: &str) -> (String, String, String) {
@@ -14403,69 +14496,9 @@ pub fn analyze_parallel_lets(stmts: &[Stmt]) -> Vec<Vec<(String, Expr)>> {
     groups
 }
 
-/// Checks if a routine's body ends in a self-recursive tail call (§10.3).
-pub fn is_tail_recursive_routine(r: &RoutineDecl) -> bool {
-    fn expr_is_tail_call(e: &Expr, target: &str) -> bool {
-        match e {
-            Expr::Call(f, _) => f == target,
-            Expr::MethodCall(_, m, _) => m == target,
-            Expr::If(_, _, te, _, ee) => {
-                expr_is_tail_call(te, target) || expr_is_tail_call(ee, target)
-            }
-            Expr::Match(_, cases) => cases.iter().any(|c| expr_is_tail_call(&c.body, target)),
-            _ => false,
-        }
-    }
-    expr_is_tail_call(&r.body, &r.name)
-}
-
 // ============================================================================
-// 10. BACKEND 2: C11 RUNTIME EMITTER (.c) (Phase 4 Stdlib: SEQ, BIGNAT, STRING, IO)
+// 10. C11 RUNTIME SUPPORT (Header, UTF-8 validator, IO runtimes for c11_typed)
 // ============================================================================
-
-/// The untyped C emitter (kept for its unit tests). The CLI uses the typed backend,
-/// `c11_typed::emit_c11_typed`, for every C output.
-pub fn emit_c11(m: &ModuleDecl) -> String {
-    emit_c11_general_module(m)
-}
-
-pub fn map_c_type(ty: &str) -> String {
-    match ty {
-        "U64" | "NAT" | "EXIT_CODE" => "uint64_t".to_string(),
-        "I64" | "INT" => "int64_t".to_string(),
-        "F64" => "double".to_string(),
-        "BOOL" => "bool".to_string(),
-        "CHAR" => "uint32_t".to_string(),
-        "UNIT" | "()" => "GARDEL_UNIT".to_string(),
-        "STRING" => "GardelString".to_string(),
-        "BYTES" => "GardelBytes".to_string(),
-        other if other.starts_with("IO[") => "int64_t".to_string(),
-        other => {
-            if let Some(inner) = other
-                .strip_prefix("OPTION[")
-                .and_then(|s| s.strip_suffix(']'))
-            {
-                return format!("{}_ptr", map_c_type(inner));
-            }
-            if let Some(inner) = other
-                .strip_prefix("LIST[")
-                .and_then(|s| s.strip_suffix(']'))
-            {
-                return format!("struct LIST_{}*", map_c_type(inner));
-            }
-            if let Some(inner) = other.strip_prefix("SEQ[").and_then(|s| s.strip_suffix(']')) {
-                return format!("struct SEQ_{}*", map_c_type(inner));
-            }
-            if let Some(idx) = other.find('[') {
-                let base = &other[..idx];
-                let inner = &other[idx + 1..other.len() - 1];
-                let parts: Vec<String> = inner.split(',').map(|p| map_c_type(p.trim())).collect();
-                return format!("struct {}_{}*", base, parts.join("_"));
-            }
-            format!("struct {}*", other)
-        }
-    }
-}
 
 pub fn emit_c11_runtime_header() -> String {
     r#"#pragma STDC FP_CONTRACT OFF
@@ -14645,53 +14678,8 @@ static inline int64_t gardel_io_exit(uint64_t code) {
     .to_string()
 }
 
-thread_local! {
-    /// String literals of the module being lowered to C11 (index = static buffer number).
-    static C11_STRING_LITERALS: std::cell::RefCell<Vec<String>> =
-        const { std::cell::RefCell::new(Vec::new()) };
-}
-
-/// Static read-only UTF-8 buffers for the string literals of a module (Task B.3, §3.1.4):
-/// `static const uint8_t gardel_str_lit_k[] = { ..., 0 };` with the bytes computed at compile
-/// time (NUL-terminated; the length is passed explicitly, so embedded `\0` is preserved).
-fn emit_c11_string_literal_table(strings: &[String]) -> String {
-    let mut out = String::new();
-    if strings.is_empty() {
-        return out;
-    }
-    out.push_str(
-        "/* String literals (Task B.3): static read-only UTF-8, zero runtime decoding */\n",
-    );
-    for (idx, s) in strings.iter().enumerate() {
-        let bytes: Vec<String> = s
-            .as_bytes()
-            .iter()
-            .map(|b| b.to_string())
-            .chain(std::iter::once("0".to_string()))
-            .collect();
-        out.push_str(&format!(
-            "static const uint8_t gardel_str_lit_{idx}[{}] = {{ {} }}; /* \"{}\" */\n",
-            s.len() + 1,
-            bytes.join(", "),
-            s.escape_debug().to_string().replace("*/", "*\\/")
-        ));
-    }
-    out.push('\n');
-    out
-}
-
-// --- C11 lowering of instantiated prelude sum types (spec §11 IO boundary) -------------
-
-thread_local! {
-    /// Gardel types of locals while lowering one routine to C11: IO-bound values and
-    /// `match` binders whose type is an instantiated prelude sum type.
-    static C11_TYPE_ENV: std::cell::RefCell<HashMap<String, String>> =
-        std::cell::RefCell::new(HashMap::new());
-    static C11_MATCH_COUNTER: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
-}
-
 /// C identifier of an instantiated type: `RESULT[IO_ERROR, STRING]` -> `RESULT_IO_ERROR_STRING`.
-fn c_instance_name(ty: &str) -> String {
+pub(crate) fn c_instance_name(ty: &str) -> String {
     let mut out = String::new();
     for ch in ty.chars() {
         if ch.is_ascii_alphanumeric() || ch == '_' {
@@ -14703,118 +14691,13 @@ fn c_instance_name(ty: &str) -> String {
     out.trim_end_matches('_').to_string()
 }
 
-/// Variants of an instantiated prelude sum type with field types substituted:
-/// `RESULT[IO_ERROR, STRING]` -> `[(Error, [(err, IO_ERROR)]), (Ok, [(val, STRING)])]`.
-fn c_prelude_sum_variants(ty: &str) -> Option<Vec<(String, Vec<(String, String)>)>> {
-    let (head, args) = split_type_app(ty.trim());
-    let p = standard_prelude().module(head)?;
-    let ReprKind::Sum(vs) = &p.repr else {
-        return None;
-    };
-    if p.type_params.len() != args.len() {
-        return None;
-    }
-    let map: HashMap<String, String> = p
-        .type_params
-        .iter()
-        .cloned()
-        .zip(args.iter().map(|a| a.trim().to_string()))
-        .collect();
-    Some(
-        vs.iter()
-            .map(|v| {
-                (
-                    v.name.clone(),
-                    v.fields
-                        .iter()
-                        .map(|(f, t)| (f.clone(), subst_type_idents(t, &map)))
-                        .collect(),
-                )
-            })
-            .collect(),
-    )
-}
-
-fn c_field_type(ty: &str) -> String {
-    if c_prelude_sum_variants(ty).is_some() {
-        format!("struct {}*", c_instance_name(ty))
-    } else {
-        map_c_type(ty)
-    }
-}
-
-/// Struct definitions and constructors for `roots` and every prelude sum type they contain.
-fn emit_c11_prelude_instances(roots: &[&str]) -> String {
-    let mut order: Vec<String> = Vec::new();
-    let mut stack: Vec<String> = roots.iter().map(|r| r.to_string()).collect();
-    while let Some(t) = stack.pop() {
-        let name = c_instance_name(&t);
-        if order.iter().any(|o| c_instance_name(o) == name) {
-            continue;
-        }
-        if let Some(vs) = c_prelude_sum_variants(&t) {
-            order.push(t.clone());
-            for (_, fields) in vs {
-                for (_, ft) in fields {
-                    stack.push(ft);
-                }
-            }
-        }
-    }
-    let mut out = String::from("/* Instantiated prelude sum types (spec 5, 11) */\n");
-    for t in &order {
-        out.push_str(&format!("struct {};\n", c_instance_name(t)));
-    }
-    for t in &order {
-        let cname = c_instance_name(t);
-        let vs = c_prelude_sum_variants(t).unwrap_or_default();
-        out.push_str(&format!("typedef struct {cname} {{\n"));
-        let tags: Vec<String> = vs.iter().map(|(v, _)| format!("TAG_{cname}_{v}")).collect();
-        out.push_str(&format!("    enum {{ {} }} tag;\n", tags.join(", ")));
-        if vs.iter().any(|(_, f)| !f.is_empty()) {
-            out.push_str("    union {\n");
-            for (v, fields) in &vs {
-                if !fields.is_empty() {
-                    out.push_str("        struct {");
-                    for (f, ft) in fields {
-                        out.push_str(&format!(" {} {f};", c_field_type(ft)));
-                    }
-                    out.push_str(&format!(" }} {v};\n"));
-                }
-            }
-            out.push_str("    };\n");
-        }
-        out.push_str(&format!("}} {cname};\n"));
-        for (v, fields) in &vs {
-            let params: Vec<String> = fields
-                .iter()
-                .map(|(f, ft)| format!("{} {f}", c_field_type(ft)))
-                .collect();
-            let params = if params.is_empty() {
-                "void".to_string()
-            } else {
-                params.join(", ")
-            };
-            out.push_str(&format!(
-                "static inline struct {cname}* make_{cname}_{v}({params}) {{\n    struct {cname}* r = (struct {cname}*)gardel_alloc(sizeof(struct {cname}));\n    r->tag = TAG_{cname}_{v};\n"
-            ));
-            for (f, _) in fields {
-                out.push_str(&format!("    r->{v}.{f} = {f};\n"));
-            }
-            out.push_str("    return r;\n}\n");
-        }
-        out.push('\n');
-    }
-    out
-}
-
 /// `IO.read_line` at the C boundary (spec §11): reads one line (shorter than
 /// `GARDEL_MAX_LINE_BYTES`) and returns `RESULT[IO_ERROR, STRING]`. Only well-formed
 /// RFC 3629 UTF-8 becomes `Ok(STRING)`, decoded in the same check order as
 /// `STRING.validate_and_count`; end of input, read failures, over-long lines and malformed
 /// UTF-8 become `Error(..)`. This is the runtime check that justifies the verifier's
 /// boundary assumption (`read_line_result_wf`).
-fn emit_c11_read_line_runtime() -> String {
+pub fn emit_c11_read_line_runtime() -> String {
     let r = c_instance_name(READ_LINE_RESULT_TYPE);
     let max_line = GARDEL_MAX_LINE_BYTES;
     format!(
@@ -14856,20 +14739,15 @@ static struct {r}* gardel_io_read_line_result(void) {{
     )
 }
 
-/// The prelude result type of `STRING.from_utf8` (spec 11).
-const FROM_UTF8_RESULT_TYPE: &str = "RESULT[STRING_ERROR, STRING]";
-
-fn is_string_from_utf8(e: &Expr) -> bool {
-    matches!(e, Expr::MethodCall(recv, m, args)
-        if m == "from_utf8" && args.len() == 1 && matches!(&**recv, Expr::Var(v) if v == "STRING"))
-}
+/// The prelude result type of `STRING.from_utf8` (spec §11).
+pub const FROM_UTF8_RESULT_TYPE: &str = "RESULT[STRING_ERROR, STRING]";
 
 /// RFC 3629 validator shared by `IO.read_line` and `STRING.from_utf8`. It reports the first
 /// error in the check order of `STRING.validate_and_count` (stdlib/text/string.gdl): for a
 /// multi-byte lead, (1) each continuation byte present must be 0x80..0xBF, (2) the sequence
 /// must be complete, (3) the lead-specific second-byte range. Returns NULL and the scalar
 /// count on success.
-fn emit_c11_utf8_validator() -> String {
+pub fn emit_c11_utf8_validator() -> String {
     r#"/* RFC 3629 UTF-8 validation (same check order as STRING.validate_and_count) */
 static struct STRING_ERROR* gardel_utf8_validate(const uint8_t* buf, uint64_t len, uint64_t* chars) {
     uint64_t i = 0, n = 0;
@@ -14905,7 +14783,7 @@ static struct STRING_ERROR* gardel_utf8_validate(const uint8_t* buf, uint64_t le
 
 /// `STRING.from_utf8(bytes)` at run time: validates and, on success, wraps the bytes
 /// (the input view is immutable, so no copy is needed).
-fn emit_c11_from_utf8_runtime() -> String {
+pub fn emit_c11_from_utf8_runtime() -> String {
     let r = c_instance_name(FROM_UTF8_RESULT_TYPE);
     format!(
         r#"static struct {r}* gardel_string_from_utf8(GardelBytes b) {{
@@ -14922,583 +14800,16 @@ fn emit_c11_from_utf8_runtime() -> String {
     )
 }
 
-fn c11_record_bind_type(v: &str, e: &Expr) {
-    let ty = if is_io_read_line(e) {
-        READ_LINE_RESULT_TYPE
-    } else if is_string_from_utf8(e) {
-        FROM_UTF8_RESULT_TYPE
-    } else {
-        return;
-    };
-    C11_TYPE_ENV.with(|env| {
-        env.borrow_mut().insert(v.to_string(), ty.to_string());
-    });
-}
 
-/// The instantiated prelude sum type of a `match` scrutinee, when known.
-fn c11_scrutinee_type(scrut: &Expr) -> Option<String> {
-    let ty = match scrut {
-        Expr::Var(v) => C11_TYPE_ENV.with(|env| env.borrow().get(v).cloned())?,
-        e if is_io_read_line(e) => READ_LINE_RESULT_TYPE.to_string(),
-        e if is_string_from_utf8(e) => FROM_UTF8_RESULT_TYPE.to_string(),
-        _ => return None,
-    };
-    c_prelude_sum_variants(&ty).map(|_| ty)
-}
 
-/// `match` on an instantiated prelude sum type: the scrutinee is evaluated once, each case
-/// tests the instance's own tag and binds its pattern variables from the variant fields.
-fn emit_c11_prelude_match(scrut: &Expr, cases: &[MatchCase], mod_name: &str) -> String {
-    let ty = c11_scrutinee_type(scrut).unwrap_or_default();
-    let cname = c_instance_name(&ty);
-    let variants = c_prelude_sum_variants(&ty).unwrap_or_default();
-    let k = C11_MATCH_COUNTER.with(|c| {
-        let v = c.get();
-        c.set(v + 1);
-        v
-    });
-    let sv = format!("_ms{k}");
-    let mut arms: Vec<(Option<String>, String)> = Vec::new();
-    for c in cases {
-        let mut body = String::from("({ ");
-        let mut tag = None;
-        if let Some((vname, fields)) = variants.iter().find(|(v, _)| v == c.ctor()) {
-            tag = Some(format!("TAG_{cname}_{vname}"));
-            for (opt_b, (f, ft)) in c.top_bindings().iter().zip(fields.iter()) {
-                if let Some(b) = opt_b {
-                    if c_prelude_sum_variants(ft).is_some() {
-                        C11_TYPE_ENV.with(|env| env.borrow_mut().insert(b.clone(), ft.clone()));
-                    }
-                    body.push_str(&format!("__auto_type {b} = {sv}->{vname}.{f}; "));
-                }
-            }
-        }
-        for st in &c.stmts {
-            if let Stmt::Let(v, e) = st {
-                body.push_str(&format!(
-                    "__auto_type {v} = {}; ",
-                    emit_c11_expr(e, mod_name)
-                ));
-            }
-        }
-        body.push_str(&format!("{}; }})", emit_c11_expr(&c.body, mod_name)));
-        arms.push((tag, body));
-    }
-    // Nested conditional over the tags; the last arm is the fallback (matches are exhaustive).
-    let mut expr = arms
-        .last()
-        .map(|(_, b)| b.clone())
-        .unwrap_or_else(|| "0".to_string());
-    for (tag, body) in arms.iter().rev().skip(1) {
-        let cond = tag
-            .clone()
-            .map_or("0".to_string(), |t| format!("{sv}->tag == {t}"));
-        expr = format!("({cond} ? {body} : {expr})");
-    }
-    format!(
-        "({{ __auto_type {sv} = {}; {expr}; }})",
-        emit_c11_expr(scrut, mod_name)
-    )
-}
 
-pub fn emit_c11_general_module(m: &ModuleDecl) -> String {
-    let mut out = String::new();
-    out.push_str("// Automatically generated by gardelc (Phase 4 -> General C11 AST Lowering)\n");
-    out.push_str(&emit_c11_runtime_header());
-    out.push('\n');
-    let strings = collect_module_strings(m);
-    out.push_str(&emit_c11_string_literal_table(&strings));
-    C11_STRING_LITERALS.with(|c| *c.borrow_mut() = strings);
-    C11_TYPE_ENV.with(|env| env.borrow_mut().clear());
-    C11_MODULE_ROUTINES.with(|r| {
-        *r.borrow_mut() = m
-            .create_routines
-            .iter()
-            .chain(&m.feature_routines)
-            .chain(&m.specify_routines)
-            .map(|(_, rd)| rd.name.clone())
-            .collect();
-    });
-    let module_dbg = format!("{m:?}");
-    let uses_read_line = module_dbg.contains("\"read_line\"");
-    let uses_from_utf8 = module_dbg.contains("\"from_utf8\"");
-    let mut roots: Vec<&str> = Vec::new();
-    if uses_read_line {
-        roots.push(READ_LINE_RESULT_TYPE);
-    }
-    if uses_from_utf8 {
-        roots.push(FROM_UTF8_RESULT_TYPE);
-    }
-    if !roots.is_empty() {
-        out.push_str(&emit_c11_prelude_instances(&roots));
-        out.push_str(&emit_c11_utf8_validator());
-    }
-    if uses_read_line {
-        out.push_str(&emit_c11_read_line_runtime());
-    }
-    if uses_from_utf8 {
-        out.push_str(&emit_c11_from_utf8_runtime());
-    }
-    if m.kind == ModuleKind::Program {
-        // File-scope forward declarations for opaque struct types in routine signatures
-        // (e.g. `main(args: SEQ[STRING])`), so they are not scoped to a parameter list.
-        let mut fwd: Vec<String> = Vec::new();
-        for (_, r) in &m.feature_routines {
-            for ty in r
-                .params
-                .iter()
-                .map(|(_, t)| t)
-                .chain(std::iter::once(&r.ret_type))
-            {
-                let ct = map_c_type(ty);
-                if let Some(name) = ct.strip_prefix("struct ").and_then(|t| t.strip_suffix('*')) {
-                    let decl = format!("struct {name};\n");
-                    if !fwd.contains(&decl) {
-                        fwd.push(decl);
-                    }
-                }
-            }
-        }
-        out.push_str(&fwd.concat());
-    }
 
-    let mod_name = &m.name;
 
-    // 1. Types & Data Structures (Product / Sum)
-    if m.kind == ModuleKind::Module {
-        match &m.repr {
-            ReprKind::Product(fields) => {
-                out.push_str(&format!("typedef struct {mod_name} {{\n"));
-                out.push_str("    _Atomic uint64_t _rc;\n");
-                for (fnm, fty) in fields {
-                    out.push_str(&format!("    {} {fnm};\n", map_c_type(fty)));
-                }
-                out.push_str(&format!("}} {mod_name};\n\n"));
 
-                let param_decls: Vec<String> = fields
-                    .iter()
-                    .map(|(fnm, fty)| format!("{} {fnm}", map_c_type(fty)))
-                    .collect();
-                out.push_str(&format!(
-                    "static inline {mod_name}* make_{mod_name}({}) {{\n",
-                    param_decls.join(", ")
-                ));
-                out.push_str(&format!(
-                    "    {mod_name}* res = ({mod_name}*)gardel_alloc(sizeof({mod_name}));\n"
-                ));
-                out.push_str("    atomic_init(&res->_rc, 1);\n");
-                for (fnm, _) in fields {
-                    out.push_str(&format!("    res->{fnm} = {fnm};\n"));
-                }
-                out.push_str("    return res;\n}\n\n");
-            }
-            ReprKind::Sum(variants) => {
-                out.push_str(&format!("typedef struct {mod_name} {{\n"));
-                out.push_str("    _Atomic uint64_t _rc;\n");
-                let tag_names: Vec<String> = variants
-                    .iter()
-                    .map(|v| format!("TAG_{mod_name}_{}", v.name))
-                    .collect();
-                out.push_str(&format!("    enum {{ {} }} tag;\n", tag_names.join(", ")));
-                out.push_str("    union {\n");
-                for v in variants {
-                    if !v.fields.is_empty() {
-                        out.push_str(&format!("        struct {{\n"));
-                        for (fnm, fty) in &v.fields {
-                            out.push_str(&format!("            {} {fnm};\n", map_c_type(fty)));
-                        }
-                        out.push_str(&format!("        }} {};\n", v.name));
-                    }
-                }
-                out.push_str("    };\n");
-                out.push_str(&format!("}} {mod_name};\n\n"));
 
-                for v in variants {
-                    let vname = &v.name;
-                    let param_decls: Vec<String> = v
-                        .fields
-                        .iter()
-                        .map(|(fnm, fty)| format!("{} {fnm}", map_c_type(fty)))
-                        .collect();
-                    out.push_str(&format!(
-                        "static inline {mod_name}* make_{mod_name}_{vname}({}) {{\n",
-                        param_decls.join(", ")
-                    ));
-                    out.push_str(&format!(
-                        "    {mod_name}* res = ({mod_name}*)gardel_alloc(sizeof({mod_name}));\n"
-                    ));
-                    out.push_str("    atomic_init(&res->_rc, 1);\n");
-                    out.push_str(&format!("    res->tag = TAG_{mod_name}_{vname};\n"));
-                    for (fnm, _) in &v.fields {
-                        out.push_str(&format!("    res->{vname}.{fnm} = {fnm};\n"));
-                    }
-                    out.push_str("    return res;\n}\n\n");
-                }
-            }
-        }
-    }
 
-    // 2. Closure conversion
-    let (_, combinators) = closure_convert_module(m);
-    for comb in &combinators {
-        if let Some((env_name, env_fields)) = &comb.env_struct {
-            out.push_str(&format!("typedef struct {env_name} {{\n"));
-            out.push_str("    _Atomic uint64_t _rc;\n");
-            for (fnm, fty) in env_fields {
-                out.push_str(&format!("    {} {fnm};\n", map_c_type(fty)));
-            }
-            out.push_str(&format!("}} {env_name};\n\n"));
-        }
-        out.push_str(&emit_c11_routine(&comb.routine, false, mod_name));
-    }
 
-    // 3. Create Routines
-    for (_, r) in &m.create_routines {
-        out.push_str(&emit_c11_routine(r, false, mod_name));
-    }
 
-    // 4. Feature Routines
-    let is_adt = m.kind == ModuleKind::Module;
-    for (_, r) in &m.feature_routines {
-        out.push_str(&emit_c11_routine(r, is_adt, mod_name));
-    }
-
-    // 5. Program Entry Point if Program
-    if m.kind == ModuleKind::Program {
-        out.push_str("int main(void) {\n");
-        if let Some((_, r)) = m.feature_routines.iter().find(|(_, r)| r.name == "main") {
-            // `args: SEQ[STRING]` is not yet marshalled from argv (passed as NULL).
-            let args: Vec<&str> = r.params.iter().map(|_| "NULL").collect();
-            out.push_str(&format!(
-                "    return (int)main_routine({});\n",
-                args.join(", ")
-            ));
-        } else {
-            out.push_str("    return 0;\n");
-        }
-        out.push_str("}\n");
-    } else {
-        out.push_str("int main(void) { return 0; }\n");
-    }
-
-    out
-}
-
-fn emit_c11_routine(r: &RoutineDecl, has_current: bool, mod_name: &str) -> String {
-    let mut s = String::new();
-    let ret_type = map_c_type(&r.ret_type);
-    let mut param_strs = Vec::new();
-    if has_current {
-        param_strs.push(format!("struct {mod_name}* Current"));
-    }
-    for (pname, pty) in &r.params {
-        param_strs.push(format!("{} {pname}", map_c_type(pty)));
-    }
-    let rname = if r.name == "main" {
-        "main_routine"
-    } else {
-        &r.name
-    };
-    s.push_str(&format!(
-        "{ret_type} {rname}({}) {{\n",
-        param_strs.join(", ")
-    ));
-
-    // Check tail recursion
-    let is_tail = is_tail_recursive_routine(r);
-    if is_tail {
-        s.push_str("tail_loop:\n");
-    }
-
-    // The routine body returns its value (`true`: statement position, not an `if` branch).
-    s.push_str(&emit_c11_block(&r.stmts, &r.body, mod_name, true, rname, 4));
-    s.push_str("}\n\n");
-    s
-}
-
-fn emit_c11_block(
-    stmts: &[Stmt],
-    body: &Expr,
-    mod_name: &str,
-    is_tail: bool,
-    _routine_name: &str,
-    indent: usize,
-) -> String {
-    let pad = " ".repeat(indent);
-    let mut s = String::new();
-
-    let groups = analyze_parallel_lets(stmts);
-    for group in groups {
-        if group.len() > 1 {
-            for (v, e) in &group {
-                s.push_str(&format!("{pad}__auto_type {v};\n"));
-                s.push_str(&format!(
-                    "{pad}#pragma omp task shared({v})\n{pad}{v} = {};\n",
-                    emit_c11_expr(e, mod_name)
-                ));
-            }
-            s.push_str(&format!("{pad}#pragma omp taskwait;\n"));
-        } else {
-            for (v, e) in group {
-                c11_record_bind_type(&v, &e);
-                s.push_str(&format!(
-                    "{pad}__auto_type {v} = {};\n",
-                    emit_c11_expr(&e, mod_name)
-                ));
-            }
-        }
-    }
-
-    match body {
-        Expr::WithIo(io_stmts, final_e) => {
-            for io_st in io_stmts {
-                match io_st {
-                    IoStmt::Bind(v, se) => {
-                        c11_record_bind_type(v, se);
-                        s.push_str(&format!(
-                            "{pad}__auto_type {v} = {};\n",
-                            emit_c11_expr(se, mod_name)
-                        ));
-                    }
-                    IoStmt::Action(se) => {
-                        s.push_str(&format!("{pad}{};\n", emit_c11_expr(se, mod_name)));
-                    }
-                }
-            }
-            let v = emit_c11_expr(final_e, mod_name);
-            c11_finish_block(s, v, is_tail, &pad)
-        }
-        _ => {
-            let v = emit_c11_expr(body, mod_name);
-            c11_finish_block(s, v, is_tail, &pad)
-        }
-    }
-}
-
-/// A routine body returns its value; a block in expression position (an `if` branch)
-/// yields it, as a GNU statement expression when it has statements.
-fn c11_finish_block(mut s: String, v: String, is_tail: bool, pad: &str) -> String {
-    if is_tail {
-        s.push_str(&format!("{pad}return {v};\n"));
-        s
-    } else if s.is_empty() {
-        v
-    } else {
-        format!("({{ {} {v}; }})", s.trim())
-    }
-}
-
-/// Runtime functions implementing prelude `STRING` / `BYTES` methods (with their arity).
-const C11_STRING_METHODS: &[(&str, usize)] = &[
-    ("byte_length", 0),
-    ("code_point_count", 0),
-    ("is_empty", 0),
-    ("equals", 1),
-    ("character_at", 1),
-    ("concat", 1),
-    ("to_utf8", 0),
-];
-const C11_BYTES_METHODS: &[(&str, usize)] =
-    &[("length", 0), ("is_empty", 0), ("at", 1), ("equals", 1)];
-
-thread_local! {
-    /// Routine names of the module being lowered to C (a module routine of the same name
-    /// stays reachable through the `_Generic` default branch).
-    static C11_MODULE_ROUTINES: std::cell::RefCell<HashSet<String>> =
-        std::cell::RefCell::new(HashSet::new());
-}
-
-/// `recv.m(args)` for a prelude text method. The C emitter is untyped, so the call is
-/// dispatched on the receiver's C type with `_Generic` (the controlling expression is not
-/// evaluated): `GardelString` / `GardelBytes` select the runtime function, and a routine of
-/// the module with the same name is the default. With no default, a receiver of another
-/// type is a C compile error rather than a wrong call.
-fn emit_c11_text_method(recv: &Expr, m: &str, args: &[Expr], mod_name: &str) -> Option<String> {
-    let s_fn = C11_STRING_METHODS
-        .iter()
-        .any(|(n, k)| *n == m && *k == args.len())
-        .then(|| format!("gardel_string_{m}"));
-    let b_fn = C11_BYTES_METHODS
-        .iter()
-        .any(|(n, k)| *n == m && *k == args.len())
-        .then(|| format!("gardel_bytes_{m}"));
-    if s_fn.is_none() && b_fn.is_none() {
-        return None;
-    }
-    let r = emit_c11_expr(recv, mod_name);
-    let mut assoc = Vec::new();
-    if let Some(f) = s_fn {
-        assoc.push(format!("GardelString: {f}"));
-    }
-    if let Some(f) = b_fn {
-        assoc.push(format!("GardelBytes: {f}"));
-    }
-    if C11_MODULE_ROUTINES.with(|r| r.borrow().contains(m)) {
-        assoc.push(format!("default: {m}"));
-    }
-    let mut a = vec![r.clone()];
-    a.extend(args.iter().map(|x| emit_c11_expr(x, mod_name)));
-    Some(format!("_Generic(({r}), {})({})", assoc.join(", "), a.join(", ")))
-}
-
-fn emit_c11_expr(e: &Expr, mod_name: &str) -> String {
-    match e {
-        Expr::Int(n) => format!("{n}ULL"),
-        Expr::Float(f) => format!("{f}"),
-        Expr::Char(c) => format!("{c}U"),
-        Expr::Unit => "UNIT_VAL".to_string(),
-        Expr::Bool(b) => (if *b { "true" } else { "false" }).to_string(),
-        Expr::Str(s) => {
-            // Task B.3: a literal is its static UTF-8 buffer wrapped by the runtime
-            // constructor (no allocation, no decoding).
-            let idx = C11_STRING_LITERALS.with(|c| c.borrow().iter().position(|x| x == s));
-            match idx {
-                Some(idx) => format!("string_from_utf8(gardel_str_lit_{idx}, {}ULL)", s.len()),
-                None => {
-                    let bytes: Vec<String> = s
-                        .bytes()
-                        .map(|b| b.to_string())
-                        .chain(std::iter::once("0".to_string()))
-                        .collect();
-                    format!(
-                        "string_from_utf8((const uint8_t[]){{ {} }}, {}ULL)",
-                        bytes.join(", "),
-                        s.len()
-                    )
-                }
-            }
-        }
-        Expr::Var(v) => v.clone(),
-        Expr::UnaryNot(inner) => format!("(!{})", emit_c11_expr(inner, mod_name)),
-        Expr::UnaryNeg(inner) => format!("(-{})", emit_c11_expr(inner, mod_name)),
-        Expr::BinOp(op, l, r) => {
-            let c_op = match op.as_str() {
-                "=" => "==",
-                "+%" => "+",
-                "-%" => "-",
-                "*%" => "*",
-                "and" => "&&",
-                "or" => "||",
-                other => other,
-            };
-            format!(
-                "({} {c_op} {})",
-                emit_c11_expr(l, mod_name),
-                emit_c11_expr(r, mod_name)
-            )
-        }
-        Expr::Call(fname, args) => {
-            let a_str: Vec<String> = args.iter().map(|a| emit_c11_expr(a, mod_name)).collect();
-            format!("{fname}({})", a_str.join(", "))
-        }
-        Expr::MethodCall(recv, mname, args) => {
-            if let Expr::Var(v) = &**recv {
-                if v == "CHAR" && mname == "from_scalar" && !args.is_empty() {
-                    return format!("((uint32_t)({}))", emit_c11_expr(&args[0], mod_name));
-                }
-                if v == "IO" {
-                    if (mname == "print" || mname == "print_line") && !args.is_empty() {
-                        let arg = emit_c11_expr(&args[0], mod_name);
-                        return format!("gardel_io_{mname}({arg})");
-                    } else if mname == "read_line" {
-                        return "gardel_io_read_line_result()".to_string();
-                    } else if mname == "exit" && !args.is_empty() {
-                        return format!("gardel_io_exit({})", emit_c11_expr(&args[0], mod_name));
-                    }
-                }
-            }
-            if is_string_from_utf8(e) {
-                return format!("gardel_string_from_utf8({})", emit_c11_expr(&args[0], mod_name));
-            }
-            if mname == "code" && args.is_empty() {
-                return format!("((uint64_t)({}))", emit_c11_expr(recv, mod_name));
-            }
-            if let Some(call) = emit_c11_text_method(recv, mname, args, mod_name) {
-                return call;
-            }
-            if mname == "apply" {
-                let r_str = emit_c11_expr(recv, mod_name);
-                let a_str: Vec<String> = args.iter().map(|a| emit_c11_expr(a, mod_name)).collect();
-                return format!("{r_str}({})", a_str.join(", "));
-            }
-            let r_str = emit_c11_expr(recv, mod_name);
-            let mut a_str = vec![r_str];
-            for a in args {
-                a_str.push(emit_c11_expr(a, mod_name));
-            }
-            format!("{mname}({})", a_str.join(", "))
-        }
-        Expr::If(c, ts, te, es, ee) => {
-            format!(
-                "({} ? ({}) : ({}))",
-                emit_c11_expr(c, mod_name),
-                emit_c11_block(ts, te, mod_name, false, "", 0).trim(),
-                emit_c11_block(es, ee, mod_name, false, "", 0).trim()
-            )
-        }
-        Expr::Match(scrut, cases) if c11_scrutinee_type(scrut).is_some() => {
-            emit_c11_prelude_match(scrut, cases, mod_name)
-        }
-        Expr::Match(scrut, cases) => {
-            let s_str = emit_c11_expr(scrut, mod_name);
-            let mut s = format!("({s_str}->tag == 0 ? 0 : 0)");
-            if !cases.is_empty() {
-                let mut cond_expr = String::new();
-                for (idx, c) in cases.iter().enumerate() {
-                    let ctor = c.ctor();
-                    let tag_name = format!("TAG_{mod_name}_{ctor}");
-                    let val = emit_c11_expr(&c.body, mod_name);
-                    if idx + 1 == cases.len() {
-                        cond_expr.push_str(&val);
-                    } else {
-                        cond_expr.push_str(&format!("({s_str}->tag == {tag_name} ? ({val}) : "));
-                    }
-                }
-                for _ in 0..cases.len() - 1 {
-                    cond_expr.push(')');
-                }
-                s = cond_expr;
-            }
-            s
-        }
-        Expr::RecordLit(fields) => {
-            let vals: Vec<String> = fields
-                .iter()
-                .map(|(_, fe)| emit_c11_expr(fe, mod_name))
-                .collect();
-            format!("make_{mod_name}({})", vals.join(", "))
-        }
-        Expr::RecordUpdate(base, _fields) => {
-            let b_str = emit_c11_expr(base, mod_name);
-            format!("/* update */ {b_str}")
-        }
-        Expr::TupleLit(elems) => {
-            let es: Vec<String> = elems.iter().map(|el| emit_c11_expr(el, mod_name)).collect();
-            format!("({})", es.join(", "))
-        }
-        // A nested `with IO` is a GNU statement expression: its actions run in order and its
-        // value is the trailing expression (previously the actions were dropped).
-        Expr::WithIo(io_stmts, final_e) => {
-            let mut s = String::from("({ ");
-            for io_st in io_stmts {
-                match io_st {
-                    IoStmt::Bind(v, se) => {
-                        c11_record_bind_type(v, se);
-                        s.push_str(&format!(
-                            "__auto_type {v} = {}; ",
-                            emit_c11_expr(se, mod_name)
-                        ));
-                    }
-                    IoStmt::Action(se) => s.push_str(&format!("{}; ", emit_c11_expr(se, mod_name))),
-                }
-            }
-            s.push_str(&format!("{}; }})", emit_c11_expr(final_e, mod_name)));
-            s
-        }
-        Expr::Lambda(_, _, _, _) => "/* lifted closure */ 0".to_string(),
-        Expr::Forall(_, _, _) | Expr::Exists(_, _, _) => "0".to_string(),
-    }
-}
 
 // ============================================================================
 // 11. CLI DRIVER (Supports --stdlib, Boogie, --fuel, --audit, --strict, --run)
@@ -15853,6 +15164,57 @@ fn parse_fuel_arg(args: &[String]) -> usize {
     DEFAULT_FUEL
 }
 
+fn parse_z3_seed_value(val: &str, source: &str) -> Result<u32, String> {
+    val.parse::<u32>().map_err(|_| {
+        format!(
+            "{source}: invalid Z3 seed `{val}` (expected an integer from 0 to {})",
+            u32::MAX
+        )
+    })
+}
+
+/// The Z3 seed of a run: the last `--z3-seed` option, else `env_seed` (`GARDEL_Z3_SEED`).
+/// A value that is missing or invalid is an error. Ignoring it would verify on Z3's default
+/// seed and report a seed sweep that never happened.
+fn parse_z3_seed(args: &[String], env_seed: Option<&str>) -> Result<Option<u32>, String> {
+    let mut seed = None;
+    for (idx, arg) in args.iter().enumerate() {
+        if arg == "--z3-seed" {
+            let val = args
+                .get(idx + 1)
+                .ok_or("--z3-seed: expected a seed value after the option")?;
+            seed = Some(parse_z3_seed_value(val, "--z3-seed")?);
+        } else if let Some(val) = arg.strip_prefix("--z3-seed=") {
+            seed = Some(parse_z3_seed_value(val, "--z3-seed")?);
+        }
+    }
+    match (seed, env_seed) {
+        (None, Some(val)) => parse_z3_seed_value(val, "GARDEL_Z3_SEED").map(Some),
+        _ => Ok(seed),
+    }
+}
+
+/// The last `--z3-rlimit` option. A missing, invalid or zero value is an error (zero would
+/// mean "no limit" to Z3).
+fn parse_z3_rlimit(args: &[String]) -> Result<Option<u64>, String> {
+    let parse = |val: &str| match val.parse::<u64>() {
+        Ok(n) if n > 0 => Ok(n),
+        _ => Err(format!("--z3-rlimit: invalid resource limit `{val}` (expected a positive integer)")),
+    };
+    let mut rlimit = None;
+    for (idx, arg) in args.iter().enumerate() {
+        if arg == "--z3-rlimit" {
+            let val = args
+                .get(idx + 1)
+                .ok_or("--z3-rlimit: expected a resource limit after the option")?;
+            rlimit = Some(parse(val)?);
+        } else if let Some(val) = arg.strip_prefix("--z3-rlimit=") {
+            rlimit = Some(parse(val)?);
+        }
+    }
+    Ok(rlimit)
+}
+
 /// Matches a file name against a shell wildcard pattern (`*`, `?`).
 fn wildcard_match(pattern: &str, name: &str) -> bool {
     let p: Vec<char> = pattern.chars().collect();
@@ -15980,7 +15342,7 @@ fn input_operands(args: &[String]) -> Vec<String> {
     let mut i = 1;
     while i < args.len() {
         let a = &args[i];
-        if a == "--fuel" {
+        if a == "--fuel" || a == "--z3-seed" || a == "--z3-rlimit" {
             i += 2;
             continue;
         }
@@ -16026,6 +15388,8 @@ pub struct VerifyOptions {
     pub strict: bool,
     pub audit: bool,
     pub bounded_check: bool,
+    pub z3_seed: Option<u32>,
+    pub z3_rlimit: Option<u64>,
 }
 
 /// Outcome of checking and verifying all modules of a run.
@@ -16109,15 +15473,19 @@ pub fn check_and_verify_project(units: &mut [SourceUnit], opts: VerifyOptions) -
             let mut mod_diags = std::mem::take(&mut pre[ui][mi]);
             mod_diags.extend(with_prelude_injection(opts.prelude_mode, || {
                 with_link_table(link.clone(), || {
-                    verify_module_phase3(
-                        m,
-                        &u.src,
-                        &u.path,
-                        opts.fuel_limit,
-                        opts.strict,
-                        opts.audit,
-                        opts.bounded_check,
-                    )
+                    with_z3_seed(opts.z3_seed, || {
+                        with_z3_rlimit(opts.z3_rlimit, || {
+                            verify_module_phase3(
+                                m,
+                                &u.src,
+                                &u.path,
+                                opts.fuel_limit,
+                                opts.strict,
+                                opts.audit,
+                                opts.bounded_check,
+                            )
+                        })
+                    })
                 })
             }));
             for d in &mut mod_diags {
@@ -16182,7 +15550,7 @@ fn main() {
     let args: Vec<String> = env::args().collect();
     if args.len() < 2 {
         eprintln!(
-            "Usage: gardelc <input.gdl ... | DIR | --stdlib> [--no-prelude] [--inspect [MODULE]] [--emit-stdlib [DIR]] [--json-diagnostics] [--fuel <N>] [--audit] [--strict] [--bounded-check] [--run]"
+            "Usage: gardelc <input.gdl ... | DIR | --stdlib> [--no-prelude] [--inspect [MODULE]] [--emit-stdlib [DIR]] [--json-diagnostics] [--fuel <N>] [--z3-seed <N>] [--z3-rlimit <N>] [--audit] [--strict] [--bounded-check] [--run]"
         );
         eprintln!(
             "  --no-prelude  bootstrap mode: do not inject the Standard Prelude (implied by --stdlib and when compiling the prelude source itself, §4.1)"
@@ -16224,6 +15592,21 @@ fn main() {
     let bounded_check = args.iter().any(|a| a == "--bounded-check");
     let no_prelude_flag = args.iter().any(|a| a == "--no-prelude");
     let fuel_limit = parse_fuel_arg(&args);
+    let env_seed = env::var_os("GARDEL_Z3_SEED").map(|v| v.to_string_lossy().into_owned());
+    let z3_seed = match parse_z3_seed(&args, env_seed.as_deref()) {
+        Ok(seed) => seed,
+        Err(e) => {
+            eprintln!("[ERROR] {e}");
+            std::process::exit(1);
+        }
+    };
+    let z3_rlimit = match parse_z3_rlimit(&args) {
+        Ok(rlimit) => rlimit,
+        Err(e) => {
+            eprintln!("[ERROR] {e}");
+            std::process::exit(1);
+        }
+    };
 
     // Task B.4: input operands (files, directories, wildcard patterns).
     // `--stdlib` verifies the source tree this gardelc was built from (see `resolve_stdlib_inputs`);
@@ -16397,6 +15780,8 @@ fn main() {
         strict: strict_mode,
         audit: audit_mode,
         bounded_check,
+        z3_seed,
+        z3_rlimit,
     };
     let checked = check_and_verify_project(&mut units, opts);
     if !checked.fatal.is_empty() {
@@ -16710,6 +16095,9 @@ fn main() {
         if let Some(solver) = found_solver {
             boogie_cmd.arg(format!("/proverOpt:PROVER_PATH={solver}"));
         }
+        if let Some(seed) = z3_seed {
+            boogie_cmd.args(boogie_seed_args(seed));
+        }
 
         if let Ok(output) = boogie_cmd.output() {
             println!("\n=== [0] Direct Boogie + Z3 Verification ({primary_bpl}) ===");
@@ -16933,9 +16321,6 @@ end
             );
             let bpl = emit_boogie(m, 2);
             assert!(bpl.contains(&format!("// Module: {}", m.name)));
-            let c11 = emit_c11(m);
-            // `int main(void)`, or `int main(int argc, ...)` for the SEQ benchmark (Task C.3).
-            assert!(c11.contains("int main("));
         }
     }
 
@@ -17023,6 +16408,8 @@ end
             strict: true,
             audit: false,
             bounded_check: false,
+            z3_seed: None,
+            z3_rlimit: None,
         };
         let checked = check_and_verify_project(&mut units, opts);
         assert!(
@@ -17446,8 +16833,9 @@ feature {ANY}
 end
 "#;
         let m = parse_single_module(src);
-        let c_code = emit_c11(&m);
-        assert!(c_code.contains("typedef struct CUSTOM_CONTAINER"));
+        let (c_code, errs) = emit_c11_typed(&m, &[]);
+        assert!(errs.is_empty(), "{errs:?}");
+        assert!(c_code.contains("struct CUSTOM_CONTAINER"));
         assert!(c_code.contains("TAG_CUSTOM_CONTAINER_Empty"));
         assert!(c_code.contains("TAG_CUSTOM_CONTAINER_Entry"));
         assert!(c_code.contains("make_CUSTOM_CONTAINER_Entry"));
@@ -17474,9 +16862,6 @@ end
         assert!(!combinators.is_empty());
         let bend = emit_bend_v2(&converted);
         assert!(bend.contains("apply_multiplier"));
-        let c_code = emit_c11(&m);
-        assert!(c_code.contains("ClosureEnv_"));
-        assert!(c_code.contains("closure_apply_"));
     }
 
     #[test]
@@ -17495,30 +16880,6 @@ end
         ];
         let dep_groups = analyze_parallel_lets(&dependent_stmts);
         assert_eq!(dep_groups.len(), 2);
-    }
-
-    #[test]
-    fn test_plan4_tail_recursion_to_c11_while_loop() {
-        let src = r#"
-module TAIL_REC
-representation {ANY}
-  dummy: U64
-feature {ANY}
-  countdown(n: U64): U64
-    do
-      if n = 0 then
-        0
-      else
-        countdown(n - 1)
-      end
-    end
-end
-"#;
-        let m = parse_single_module(src);
-        let r = &m.feature_routines[0].1;
-        assert!(is_tail_recursive_routine(r));
-        let c_code = emit_c11(&m);
-        assert!(c_code.contains("tail_loop:"));
     }
 
     #[test]
@@ -17606,15 +16967,6 @@ end
                 .iter()
                 .any(|(_, r)| r.name == "chars" && r.ret_type == "LIST[CHAR]")
         );
-    }
-
-    #[test]
-    fn test_plan4_whole_program_multi_module_c11_link_and_run() {
-        let stdlib = parse_phase4_stdlib().expect("stdlib parses cleanly");
-        for m in &stdlib.modules {
-            let c_code = emit_c11(m);
-            assert!(!c_code.is_empty());
-        }
     }
 
     #[test]
@@ -18845,7 +18197,8 @@ end
         // The modules that used to get a hand-written C program are lowered from source.
         for name in ["TREE", "BOUNDED_STACK", "PEANO", "SEQ", "BIGNAT", "STRING"] {
             let src = format!("module {name}\n\nrepresentation {{ANY}}\n  v: U64\n\nend\n");
-            let c = emit_c11(&parse_single_module(&src));
+            let (c, errs) = emit_c11_typed(&parse_single_module(&src), &[]);
+            assert!(errs.is_empty(), "{name}: {errs:?}");
             assert!(!c.contains("HAND-WRITTEN"), "{name}");
         }
         for (path, src) in [
@@ -19009,6 +18362,127 @@ end
     }
 
     #[test]
+    fn test_d_self_tail_calls_are_loops() {
+        // Spec §10: no stack frame per iteration, even when a local must be released after
+        // the call (then it is not a C tail call, and the optimizer cannot help).
+        let nats = include_str!("../tests/c_backend/tail_nats.gdl");
+        let prog = include_str!("../tests/c_backend/tail_prog.gdl");
+        let mut units = b4_units(&[("tail_nats.gdl", nats), ("tail_prog.gdl", prog)]);
+        let checked = check_and_verify_project(&mut units, b4_opts(true, true));
+        assert!(checked.fatal.is_empty());
+        let diags: Vec<&Diagnostic> = checked.diags.iter().map(|(_, d)| d).collect();
+        assert!(diags.is_empty(), "{diags:?}");
+        let lib_m = units[0].ast.modules[0].clone();
+        let prog_m = units[1].ast.modules[0].clone();
+        let (c, errs) = emit_c11_typed(&prog_m, &[&lib_m]);
+        assert!(errs.is_empty(), "{errs:?}");
+        // Every tail call site, and not `not_tail`, whose call is an operand of `+%`.
+        assert_eq!(c.matches("goto _tail").count(), 8, "tail call sites");
+        if let Some(runs) = c3_native_runs(&c, "tailprog", &[b""]) {
+            assert_eq!(runs[0].0, 0, "tail_prog: first failing check");
+        }
+        if let Some((first, after)) = c3_live_after(&c, "tailleak", "TAIL_PROG__first_failure(1000ULL)") {
+            assert_eq!((first, after), (0, 0), "locals, scrutinees and parameters must be freed");
+        }
+    }
+
+    #[test]
+    fn test_d_match_evaluates_its_scrutinee_once() {
+        // Copying `fib_pair(n - 1)` into each column made this O(2^n): `fib_pair(90)` would
+        // not finish. Literal columns repeated the call the same way.
+        let src = include_str!("../tests/c_backend/match_once.gdl");
+        let c = c3_verify_and_emit(src, "match_once.gdl");
+        if let Some(runs) = c3_native_runs(&c, "matchonce", &[b""]) {
+            assert_eq!(runs[0].0, 0, "match_once: first failing check");
+        }
+        if let Some((first, after)) = c3_live_after(&c, "matchonceleak", "MATCH_ONCE__first_failure()") {
+            assert_eq!((first, after), (0, 0));
+        }
+    }
+
+    #[test]
+    fn test_d_match_binder_does_not_capture_its_scrutinee() {
+        // `case (p, q)` on `p` read `q` from the new `p`. Boogie has no `let` that shadows a
+        // parameter yet, so this is checked on the C backend alone.
+        let src = "program SHADOW\n\nfeature {ANY}\n\n  second(p: TUPLE[U64, U64]): U64\n    do\n      match p\n        case (p, q) then q\n      end\n    end\n\n  diff(p: TUPLE[U64, U64]): U64\n    do\n      match p\n        case (q, p) then q -% p\n      end\n    end\n\n  nested(p: TUPLE[TUPLE[U64, U64], TUPLE[U64, U64]]): U64\n    do\n      match p\n        case (p, q) then q.first\n      end\n    end\n\n  main(args: SEQ[STRING]): IO[EXIT_CODE]\n    do\n      IO.exit(if second((3, 4)) != 4 then 1 else if diff((9, 2)) != 7 then 2 else if nested(((1, 2), (5, 6))) != 5 then 3 else 0 end end end)\n    end\n\nend\n";
+        let m = parse_user_module_with_prelude(src);
+        let (c, errs) = emit_c11_typed(&m, &[]);
+        assert!(errs.is_empty(), "{errs:?}");
+        if let Some(runs) = c3_native_runs(&c, "matchshadow", &[b""]) {
+            assert_eq!(runs[0].0, 0, "first failing check");
+        }
+        // A plain scrutinee with no such binder is not rebound, so proofs keep their shape.
+        let mut plain = parse_user_module_with_prelude(
+            "functions PLAIN\n\nfeature {ANY}\n\n  f(p: TUPLE[U64, U64]): U64\n    do\n      match p\n        case (a, b) then a\n      end\n    end\n\nend\n",
+        );
+        patterns::desugar_patterns(&mut plain);
+        let r = &plain.feature_routines[0].1;
+        let text = format!("{:?}", r.body);
+        assert!(!text.contains("_pm"), "{text}");
+    }
+
+    #[test]
+    fn test_d_generic_call_inside_its_module_uses_the_right_instance() {
+        // `BOX.make(..)` inside `BOX[A].map[B]` builds a `BOX[B]`, not the caller's `BOX[A]`.
+        let box_src = include_str!("../tests/c_backend/box.gdl");
+        let prog = include_str!("../tests/c_backend/box_prog.gdl");
+        let mut units = b4_units(&[("box.gdl", box_src), ("box_prog.gdl", prog)]);
+        let checked = check_and_verify_project(&mut units, b4_opts(true, true));
+        assert!(checked.fatal.is_empty());
+        let diags: Vec<&Diagnostic> = checked.diags.iter().map(|(_, d)| d).collect();
+        assert!(diags.is_empty(), "{diags:?}");
+        let lib_m = units[0].ast.modules[0].clone();
+        let prog_m = units[1].ast.modules[0].clone();
+        let (c, errs) = emit_c11_typed(&prog_m, &[&lib_m]);
+        assert!(errs.is_empty(), "{errs:?}");
+        for inst in ["BOX_U64__map__BOOL", "BOX_U64__map__I64", "BOX_U64__map__STRING", "BOX_BOOL__make", "BOX_I64__make", "BOX_STRING__make"] {
+            assert!(c.contains(inst), "missing instance {inst}");
+        }
+        if let Some(runs) = c3_native_runs(&c, "boxprog", &[b""]) {
+            assert_eq!(runs[0].0, 0, "box_prog: first failing check");
+        }
+        if let Some((first, after)) = c3_live_after(&c, "boxleak", "BOX_PROG__first_failure()") {
+            assert_eq!((first, after), (0, 0), "every instance must be freed");
+        }
+    }
+
+    #[test]
+    fn test_d_untyped_numbers_take_their_type_from_use() {
+        // A number with no annotation must not default to U64 next to an I64: C would then
+        // compare as unsigned, and the binary would disagree with the verified contract.
+        let src = include_str!("../tests/c_backend/signed.gdl");
+        let c = c3_verify_and_emit(src, "signed.gdl");
+        if let Some(runs) = c3_native_runs(&c, "signed", &[b""]) {
+            assert_eq!(runs[0].0, 0, "signed: first failing check");
+        }
+    }
+
+    #[test]
+    fn test_d_mixed_signedness_is_refused_not_converted() {
+        // No literal to retype: these must become errors, never C's implicit conversion.
+        let cases = [
+            ("x < u", "BOOL", "a `U64` value is used where `I64` is required"),
+            ("(if x < 0 then x else u end) > 0", "BOOL", "is used where"),
+            ("id(u)", "I64", "a `U64` value is used where `I64` is required"),
+            ("-u", "U64", "unary `-` on the unsigned type"),
+        ];
+        for (body, ret, want) in cases {
+            let src = format!(
+                "program MIX\n\nfeature {{ANY}}\n\n  id(v: I64): I64\n    do\n      v\n    end\n\n  r(x: I64, u: U64): {ret}\n    do\n      {body}\n    end\n\n  main(args: SEQ[STRING]): IO[EXIT_CODE]\n    do\n      let v = r(1, 2)\n      IO.exit(0)\n    end\n\nend\n"
+            );
+            let m = parse_user_module_with_prelude(&src);
+            let (c, errs) = emit_c11_typed(&m, &[]);
+            assert!(errs.iter().any(|e| e.contains(want)), "`{body}`: {errs:?}");
+            assert!(c.lines().nth(1).is_some_and(|l| l.starts_with("#error")), "`{body}` must not compile");
+        }
+        // A negative literal cannot become unsigned, even through a `let`.
+        let src = "program NEG\n\nfeature {ANY}\n\n  r(u: U64): BOOL\n    do\n      let m = -1\n      u > m\n    end\n\n  main(args: SEQ[STRING]): IO[EXIT_CODE]\n    do\n      let v = r(1)\n      IO.exit(0)\n    end\n\nend\n";
+        let m = parse_user_module_with_prelude(src);
+        let (_, errs) = emit_c11_typed(&m, &[]);
+        assert!(errs.iter().any(|e| e.contains("-1") || e.contains("is used")), "{errs:?}");
+    }
+
+    #[test]
     fn test_d_typed_backend_refuses_specification_code() {
         // Specification-only routines have no executable form: the C file starts with #error.
         let src = "program GHOST\n\nfeature {ANY}\n\n  main(args: SEQ[STRING]): IO[EXIT_CODE]\n    do\n      IO.exit(if SEQ.singleton(1).model.length = 1 then 0 else 1 end)\n    end\n\nend\n";
@@ -19076,59 +18550,6 @@ end
         });
         let tags: Vec<&str> = diags.iter().map(|d| d.tag.as_str()).collect();
         assert_eq!(tags, ["one"], "got {diags:?}");
-
-        // C: STRING/BYTES methods lower to runtime functions chosen by the receiver's type.
-        let c = emit_c11(&m);
-        assert!(c.contains("_Generic((g), GardelString: gardel_string_character_at)"), "{c}");
-        assert!(c.contains("gardel_string_from_utf8("), "{c}");
-        assert!(c.contains("uint64_t chars;"), "cached code-point count");
-        assert!(!c.contains("return _Generic"), "if-branches must not `return`: {c}");
-
-        // Run it when a C compiler is available.
-        let dir = env::temp_dir().join(format!("gardel_c2_{}", std::process::id()));
-        fs::create_dir_all(&dir).unwrap();
-        let c_path = dir.join("textdemo.c");
-        let exe = dir.join("textdemo.exe");
-        fs::write(&c_path, &c).unwrap();
-        let Ok(st) = Command::new("gcc")
-            .args(["-std=gnu11", "-O1", "-o"])
-            .arg(&exe)
-            .arg(&c_path)
-            .status()
-        else {
-            eprintln!("gcc not available: skipping the native part of this test");
-            return;
-        };
-        assert!(st.success(), "generated C must compile");
-        let run = |input: &[u8]| -> (i32, String) {
-            use std::io::Write;
-            let mut child = Command::new(&exe)
-                .stdin(std::process::Stdio::piped())
-                .stdout(std::process::Stdio::piped())
-                .spawn()
-                .unwrap();
-            child.stdin.take().unwrap().write_all(input).unwrap();
-            let out = child.wait_with_output().unwrap();
-            (
-                out.status.code().unwrap_or(-1),
-                // Windows text-mode stdout writes `\r\n`.
-                String::from_utf8_lossy(&out.stdout).trim_end().to_string(),
-            )
-        };
-        assert_eq!(run("Ana\n".as_bytes()), (7, "H\u{e9}, Ana".to_string()));
-        assert_eq!(run("\u{65e5}\u{1F980}\n".as_bytes()).0, 6);
-        assert_eq!(run(b"\n").0, 4);
-        assert_eq!(run(b"").0, 1);
-        // Error classification: the C decoder follows `validate_and_count`'s check order.
-        assert_eq!(run(b"\xED\xC0\n").0, 11, "ED C0: invalid continuation, not a surrogate");
-        assert_eq!(run(b"\xE0\x41\n").0, 11, "E0 41: invalid byte before truncation");
-        assert_eq!(run(b"\xE0\x80\n").0, 20, "E0 80: truncated");
-        assert_eq!(run(b"\xE0\x80\x80\n").0, 30, "E0 80 80: overlong");
-        assert_eq!(run(b"\xC0\xAF\n").0, 30, "C0: overlong lead");
-        assert_eq!(run(b"\xED\xA0\x80\n").0, 40, "surrogate");
-        assert_eq!(run(b"\xF4\x90\x80\x80\n").0, 11, "above U+10FFFF");
-        assert_eq!(run(b"ab\xFF\n").0, 12, "FF at offset 2");
-        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -19824,34 +19245,12 @@ end
     fn test_b3_c11_literals_are_static_utf8_buffers() {
         let src = "program HELLO\n\nfeature {ANY}\n\n  main(args: SEQ[STRING]): IO[EXIT_CODE]\n    do\n      with IO\n        IO.print(\"Hi\\n\")\n        IO.print_line(\"Hi\")\n        IO.exit(0)\n      end\n    end\n\nend\n";
         let m = parse_user_module_with_prelude(src);
-        let c = emit_c11(&m);
-        let strings = collect_module_strings(&m);
-        let a = strings.iter().position(|s| s == "Hi\n").unwrap();
-        let b = strings.iter().position(|s| s == "Hi").unwrap();
-        assert!(
-            c.contains(&format!(
-                "static const uint8_t gardel_str_lit_{a}[4] = {{ 72, 105, 10, 0 }};"
-            )),
-            "{c}"
-        );
-        assert!(
-            c.contains(&format!(
-                "static const uint8_t gardel_str_lit_{b}[3] = {{ 72, 105, 0 }};"
-            )),
-            "{c}"
-        );
-        assert!(
-            c.contains(&format!(
-                "gardel_io_print(string_from_utf8(gardel_str_lit_{a}, 3ULL))"
-            )),
-            "{c}"
-        );
-        assert!(
-            c.contains(&format!(
-                "gardel_io_print_line(string_from_utf8(gardel_str_lit_{b}, 2ULL))"
-            )),
-            "{c}"
-        );
+        let (c, errs) = emit_c11_typed(&m, &[]);
+        assert!(errs.is_empty(), "{errs:?}");
+        assert!(c.contains("72, 105, 10, 0"), "{c}");
+        assert!(c.contains("72, 105, 0"), "{c}");
+        assert!(c.contains("gardel_io_print("), "{c}");
+        assert!(c.contains("gardel_io_print_line("), "{c}");
         // The runtime constructor wraps the static buffer: no allocation, no decoding.
         let ctor = c
             .split("static inline GardelString string_from_utf8(")
@@ -19862,9 +19261,69 @@ end
             !ctor.contains("alloc") && !ctor.contains("memcpy"),
             "{ctor}"
         );
-        // The program body is lowered from the source (no canned template).
-        assert!(c.contains("return (int)main_routine(NULL);"));
         assert!(!c.contains("Hello, %s"));
+    }
+
+    #[test]
+    fn test_boogie_inconclusive_is_never_a_pass() {
+        let m = parse_user_module_with_prelude(B3_LITERAL_CLIENT);
+        let out = "x.bpl(934,11): Verification inconclusive (Verify_greeting)\n\nBoogie program verifier finished with 2 verified, 0 errors, 1 inconclusive\n";
+        let diags = parse_boogie_output(out, &m, B3_LITERAL_CLIENT, "literal_client.gdl");
+        assert!(diags.iter().any(|d| d.level == "error" && d.routine == "greeting"), "{diags:?}");
+        // Anything other than a clean summary fails closed.
+        for out in [
+            "",
+            "Fatal Error: ProverException: Unable to start the process z3\n",
+            "Boogie program verifier finished with 2 verified, 0 errors, 1 time out\n",
+            "Boogie program verifier finished with 2 verified, 0 errors, 1 out of resource\n",
+            "Boogie program verifier finished with 2 verified, 0 errors, 1 something new\n",
+        ] {
+            let diags = parse_boogie_output(out, &m, B3_LITERAL_CLIENT, "literal_client.gdl");
+            assert!(diags.iter().any(|d| d.level == "error"), "`{out}` must not pass");
+        }
+        let clean = "Boogie program verifier finished with 3 verified, 0 errors\n";
+        assert!(parse_boogie_output(clean, &m, B3_LITERAL_CLIENT, "literal_client.gdl").is_empty());
+    }
+
+    #[test]
+    fn test_solver_giving_up_is_unproven_not_refuted() {
+        // A failed obligation with no model: the solver ran out of resources. It stays an
+        // error and keeps its tag (contract withdrawal needs it), but does not claim a refutation.
+        let m = parse_user_module_with_prelude(B3_LITERAL_CLIENT);
+        let out = "greeting::ensure::exact\nBoogie program verifier finished with 2 verified, 1 error\n";
+        let diags = parse_boogie_output(out, &m, B3_LITERAL_CLIENT, "literal_client.gdl");
+        assert_eq!(diags.len(), 1, "{diags:?}");
+        assert_eq!(diags[0].rule, "Phase 3 Boogie (Verification Resource Limit)");
+        assert_eq!((diags[0].routine.as_str(), diags[0].tag.as_str()), ("greeting", "exact"));
+        // A real refutation carries a model and keeps its usual rule.
+        let out = "greeting::ensure::exact\n*** MODEL\nx -> 1\n*** END_MODEL\nBoogie program verifier finished with 2 verified, 1 error\n";
+        let diags = parse_boogie_output(out, &m, B3_LITERAL_CLIENT, "literal_client.gdl");
+        assert!(diags.iter().any(|d| d.rule == "Phase 3 Boogie (Postcondition Violation)"), "{diags:?}");
+    }
+
+    #[test]
+    fn test_z3_rlimit_verdict_is_decided_by_the_limit() {
+        let args = |extra: &[&str]| -> Vec<String> {
+            ["gardelc", "a.gdl"].iter().chain(extra).map(|s| s.to_string()).collect()
+        };
+        assert_eq!(parse_z3_rlimit(&args(&[])), Ok(None));
+        assert_eq!(parse_z3_rlimit(&args(&["--z3-rlimit", "5"])), Ok(Some(5)));
+        assert_eq!(parse_z3_rlimit(&args(&["--z3-rlimit=5"])), Ok(Some(5)));
+        for bad in ["abc", "-1", "0", ""] {
+            assert!(parse_z3_rlimit(&args(&["--z3-rlimit", bad])).is_err(), "`{bad}`");
+        }
+        assert!(parse_z3_rlimit(&args(&["--z3-rlimit"])).is_err());
+        assert_eq!(input_operands(&args(&["--z3-rlimit", "5"])), vec!["a.gdl".to_string()]);
+        // End to end: too small a limit is an error and never a pass.
+        let src = "functions RL\n\nfeature {ANY}\n\n  twice(x: U64): U64\n    require\n      small: x < 100\n    do\n      x + x\n    ensure\n      doubled: Result = 2 * x\n    end\n\nend\n";
+        let m = parse_user_module_with_prelude(src);
+        let run = |limit| {
+            with_z3_rlimit(limit, || {
+                with_prelude_injection(true, || verify_module_phase3(&m, src, "rl.gdl", DEFAULT_FUEL, true, false, false))
+            })
+        };
+        assert!(run(None).is_empty(), "{:?}", run(None));
+        assert!(run(Some(1)).iter().any(|d| d.level == "error"), "a starved solver must not pass");
     }
 
     #[test]
@@ -19961,6 +19420,8 @@ end
             strict,
             audit: false,
             bounded_check: false,
+            z3_seed: None,
+            z3_rlimit: None,
         }
     }
 
@@ -20336,28 +19797,89 @@ end
             diags.is_empty(),
             "spec §11 greeter must verify, got: {diags:?}"
         );
-        let c = emit_c11(&m);
-        // Instantiated prelude sum types and their constructors.
-        assert!(c.contains("typedef struct RESULT_IO_ERROR_STRING {"), "{c}");
-        assert!(
-            c.contains("make_IO_ERROR_Decode(struct STRING_ERROR* cause)"),
-            "{c}"
-        );
-        // The runtime validates input: Task C.2 validates full RFC 3629 UTF-8.
+        let (c, errs) = emit_c11_typed(&m, &[]);
+        assert!(errs.is_empty(), "{errs:?}");
         assert!(
             c.contains("b0 < 0x80") && c.contains("make_IO_ERROR_EndOfInput()"),
             "{c}"
         );
-        assert!(
-            c.contains("__auto_type line_res = gardel_io_read_line_result();"),
-            "{c}"
+        assert!(c.contains("gardel_io_read_line"), "{c}");
+        assert!(c.contains("gardel_io_print_line"), "{c}");
+    }
+
+    #[test]
+    fn test_z3_seed_option_verification() {
+        let src = r#"
+module SEED_TEST
+representation {ANY}
+  val: U64
+feature {ANY}
+  identity(x: U64): U64
+    do
+      x
+    ensure
+      id_eq: Result = x
+    end
+end
+"#;
+        let m = parse_single_module(src);
+        let diags = with_z3_seed(Some(42), || {
+            verify_module_phase3(&m, src, "seed_test.gdl", 1, true, false, false)
+        });
+        assert!(diags.is_empty(), "seeded run should verify cleanly: {diags:?}");
+        assert_eq!(current_z3_seed(), None, "thread local seed should be restored");
+    }
+
+    #[test]
+    fn test_z3_seed_invalid_values_are_errors() {
+        let args = |extra: &[&str]| -> Vec<String> {
+            ["gardelc", "a.gdl"]
+                .iter()
+                .chain(extra)
+                .map(|s| s.to_string())
+                .collect()
+        };
+        // Valid: the option, its `=` form, the largest value, and the last option winning.
+        assert_eq!(parse_z3_seed(&args(&[]), None), Ok(None));
+        assert_eq!(parse_z3_seed(&args(&["--z3-seed", "7"]), None), Ok(Some(7)));
+        assert_eq!(parse_z3_seed(&args(&["--z3-seed=7"]), None), Ok(Some(7)));
+        assert_eq!(
+            parse_z3_seed(&args(&["--z3-seed", "4294967295"]), None),
+            Ok(Some(u32::MAX))
         );
-        // `match` uses the instance's tags and binds the pattern variable.
-        assert!(c.contains("->tag == TAG_RESULT_IO_ERROR_STRING_Ok"), "{c}");
-        assert!(c.contains("__auto_type name = _ms0->Ok.val;"), "{c}");
-        // The nested `with IO` keeps its actions.
-        assert!(c.contains("gardel_io_print_line(name);"), "{c}");
-        assert!(!c.contains("TAG_GREETER_"), "{c}");
+        assert_eq!(
+            parse_z3_seed(&args(&["--z3-seed", "1", "--z3-seed=2"]), None),
+            Ok(Some(2))
+        );
+        // Invalid or missing option values stop the run, and the message names the value.
+        for bad in ["abc", "-1", "4294967296", "1.5", ""] {
+            let err = parse_z3_seed(&args(&["--z3-seed", bad]), None).unwrap_err();
+            assert!(err.contains(&format!("`{bad}`")), "{err}");
+            assert!(parse_z3_seed(&args(&[&format!("--z3-seed={bad}")]), None).is_err());
+        }
+        assert!(parse_z3_seed(&args(&["--z3-seed"]), None).is_err());
+        assert!(parse_z3_seed(&args(&["--z3-seed", "--strict"]), None).is_err());
+        // A later valid option does not excuse an earlier invalid one.
+        assert!(parse_z3_seed(&args(&["--z3-seed", "x", "--z3-seed", "2"]), None).is_err());
+        // The environment is used only without the option, and is checked the same way.
+        assert_eq!(parse_z3_seed(&args(&[]), Some("9")), Ok(Some(9)));
+        assert_eq!(
+            parse_z3_seed(&args(&["--z3-seed", "7"]), Some("9")),
+            Ok(Some(7))
+        );
+        let err = parse_z3_seed(&args(&[]), Some("abc")).unwrap_err();
+        assert!(err.contains("GARDEL_Z3_SEED"), "{err}");
+    }
+
+    #[test]
+    fn test_z3_seed_args_set_both_solver_seeds() {
+        assert_eq!(
+            boogie_seed_args(7),
+            [
+                "/proverOpt:O:smt.random_seed=7".to_string(),
+                "/proverOpt:O:sat.random_seed=7".to_string()
+            ]
+        );
     }
 
     // ---------------------------------------------------------------------------------

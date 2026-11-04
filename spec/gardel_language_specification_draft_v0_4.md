@@ -2751,8 +2751,8 @@ To complete Phase 4's transition from a single-file bootstrap prototype into a m
 
 ```mermaid
 flowchart LR
-    A["Phase A: Language Spec Harmonization (spec v0.4)\n[✅ COMPLETED]"] --> B["Phase B: Compiler Engine & Prelude Tooling (gardelc)\n[🚀 IN PROGRESS]"]
-    B --> C["Phase C: Stdlib Modularization & Smart String\n[📋 PLANNED]"]
+    A["Phase A: Language Spec Harmonization (spec v0.4)\n[✅ COMPLETED]"] --> B["Phase B: Compiler Engine & Prelude Tooling (gardelc)\n[✅ COMPLETED]"]
+    B --> C["Phase C: Stdlib Modularization & Smart String\n[✅ COMPLETED]"]
 ```
 
 #### Phase A: Language Specification Harmonization (`spec v0.4`) — [✅ Completed]
@@ -2766,7 +2766,7 @@ Formalized all foundational principles, standard prelude semantics, and verifica
 - **Task A.7 (§16):** Synchronized the architectural decision table, Phases 0–4 compiler/verification taxonomy, Step 1–4 standard library milestones, and Phases A–C evolution roadmap.
 - **Task A.8 (Phase A review remediation):** Restated bootstrap `STRING` as the ASCII subset of UTF-8 with a length-preserving `decode_utf8`, `law decode_injective`, and `specify {EQ}` (§6.4.C); added `CHAR.from_scalar` (§3.1); made `OPTION`/`RESULT.equals` postconditions case-wise (§5); clarified the dual runtime/ghost status of `LIST` and the `LIST[U64]` limbs of `BIGNAT` (§3, §4.1, §6.4.B); documented the Visibility Rule 3 bootstrap deviation (§6.4); added `IO_ERROR` and the `BYTES` surface (§11); fixed the §7.2.2 and §12 examples and law tags; made `LawDecl` parameters optional and added the `()` type (§15); and corrected the §16.3 claims about `SEQ` invariants and law names.
 
-#### Phase B: Compiler Engine & Prelude Tooling (`gardelc`) — [🚀 In Progress]
+#### Phase B: Compiler Engine & Prelude Tooling (`gardelc`) — [✅ Completed]
 Enhancing the compiler pipeline to provide a seamless developer experience without library duplication:
 - **Task B.1:** Automatic prelude AST injection (`phase4_stdlib_source()`) into the symbol table, concept map, and Boogie verification context during user program compilation, bypassed when `--no-prelude` or `--stdlib` bootstrap mode is active (or when compiling the standard library source directly, §4.1).
 - **Task B.2:** Cleanup of example programs (`examples/greeter.gdl`, `examples/peano_ord.gdl`, `examples/bounded_stack.gdl`) to eliminate redundant stdlib definitions and obsolete ambient `group` headers.
@@ -2774,7 +2774,7 @@ Enhancing the compiler pipeline to provide a seamless developer experience witho
 - **Task B.4:** Multi-file project CLI compilation support (`gardelc src/*.gdl --strict`) linking multiple source files into a unified verification run.
 - **Task B.5:** Stdlib/compiler conformance with the Phase A review: remove the `equals`/`less_than` ghost-access exemption (§4 Rule 3) by giving `SEQ`/`BIGNAT` executable comparison bodies (with a `BIGNAT` normalization invariant); remove the hard-coded `decode_utf8` identity axiom from the Boogie emitter in favour of the proven `same_length`/`decode_injective` lemmas; align `stdlib.gdl` `STRING` with §6.4.C (ASCII bound, `decode_utf8` precondition, `CHAR.from_scalar` precondition); drop the unconditional `sound` postcondition from `OPTION`/`RESULT.equals`; remove the duplicate law `LIST_OPS.fold_left_append_distributivity`; and rename `BIGNAT.push_high_limb` to `shift_in_low_limb`.
 
-#### Phase C: Standard Library Modularization & Smart String Implementation — [🚧 In progress: C.1 completed]
+#### Phase C: Standard Library Modularization & Smart String Implementation — [✅ Completed: C.1, C.2, C.3 completed; C.4 planned]
 Decomposing the monolithic standard library into physical 1:1 module files (satisfying §4.2 `W0201` under `--strict`) and delivering production text performance:
 - **Task C.1 (completed):** Physical 1:1 file decomposition of `stdlib/` into modular directories:
   - `stdlib/concepts/`: `eq.gdl` (`concept EQ`), `canonical_eq.gdl` (`concept CANONICAL_EQ`), `ord.gdl` (`concept ORD`)
@@ -2785,10 +2785,11 @@ Decomposing the monolithic standard library into physical 1:1 module files (sati
   - `stdlib/functional/`: `function_ops.gdl` (`functions FUNCTION_OPS`)
 - **Task C.2 (completed):** Full RFC 3629 UTF-8 `STRING` (§6.4.C): `BYTES.valid_utf8` invariant with the UTF-8 laws proven by induction in `BYTES`, cached `code_point_count`, `chars: LIST[CHAR]` model, `character_at`, `concat`, `to_utf8`, multi-byte literals, and exact boundary decoding `STRING.from_utf8(bytes: BYTES): RESULT[STRING_ERROR, STRING]` (§3, §11). The verification model is an octet list; the C11 runtime stores the octets in one contiguous buffer with cached length and code-point count.
 - **Task C.3 (completed):** Comprehensive regression verification and performance benchmarking:
-  - 100% test pass rate in `cargo test` (85/85 unit and mutation tests passing).
+  - 100% test pass rate in `cargo test` (92/92 unit and mutation tests passing).
   - Zero verification errors and zero warnings across all modular `stdlib/` files (13 files) and all examples (`bounded_stack.gdl`, `greeter.gdl`, `peano_ord.gdl`, `tree.gdl`) under `gardelc --strict`.
   - Added list membership base-case axiom `!Seq_has(Seq_empty(), x)` in Boogie prelude, proving the inductive postconditions in `examples/tree.gdl` without weakening.
   - End-to-end execution of the compiled `greeter` program on C11 (`greeter_bin.exe`). The OpenMP `SEQ[U64]` benchmark (`seq_from_range` + `seq_parallel_sum`) runs the hand-written reference runtime `gardelc/runtime/reference/seq.c`, which is not compiled from `stdlib/collections/seq.gdl` and is not covered by verification. Report generated in `build/c3_report.md` via `scripts/c3_regression.ps1`.
   - Follow-up: a typed C backend compiles modules and programs from source, including the whole stdlib `SEQ` (generic and higher-order routines, with a `LIST` runtime for `to_list`/`equals`). `examples/seq_ops.gdl` checks every SEQ routine at run time, and `examples/seq_bench.gdl` benchmarks SEQ compiled from source against the reference runtime. Independent `let` groups run as OpenMP tasks below a depth cutoff (§10).
   - Follow-up 2: reference-counted memory (every heap value is freed when its last reference goes), closures, compiled literal/tuple/nested patterns (for the verifier and the C backend), validated command-line arguments (§11), and no hand-written C: every module compiles from source.
   - Not done: BendRT execution (`.bend` files are emitted but not run).
+- **Task C.4 (planned):** Memory management performance: skip freeing at program exit, faster allocator (size-classed free lists or mimalloc), optimized reference counting (ownership transfer, reuse, non-atomic counts for unshared values), and bump-pointer per-step arena for reactive programs.

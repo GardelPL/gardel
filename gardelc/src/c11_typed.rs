@@ -62,6 +62,40 @@ fn need(e: &str) -> bool {
     e.starts_with(NEED_TYPE)
 }
 
+/// Asks the block that declares a `let` of an unannotated number to lower it again at a
+/// type found from a later use. Followed by `<variable>\0<type>`.
+const RETYPE: &str = "\u{0}retype:";
+
+fn retype(var: &str, ty: &str) -> String {
+    format!("{RETYPE}{var}\u{0}{ty}")
+}
+
+fn retype_request(e: &str) -> Option<(&str, &str)> {
+    e.strip_prefix(RETYPE)?.split_once('\u{0}')
+}
+
+/// Operators whose result has the type of their operands.
+fn is_arith_op(op: &str) -> bool {
+    matches!(op, "+" | "-" | "*" | "/" | "%" | "+%" | "-%" | "*%" | "&" | "|" | "^" | "<<" | ">>")
+}
+
+/// True when C would convert between `a` and `b` and change what the value means, while the
+/// verifier treats both as mathematical numbers.
+fn numeric_conflict(a: &str, b: &str) -> bool {
+    let class = |t: &str| {
+        if is_unsigned(t) {
+            Some(0)
+        } else if is_signed(t) {
+            Some(1)
+        } else if t == "F64" {
+            Some(2)
+        } else {
+            None
+        }
+    };
+    matches!((class(a), class(b)), (Some(x), Some(y)) if x != y)
+}
+
 const C_KEYWORDS: &[&str] = &[
     "auto", "break", "case", "char", "const", "continue", "default", "do", "double", "else",
     "enum", "extern", "float", "for", "goto", "if", "inline", "int", "long", "register",
@@ -193,6 +227,8 @@ struct Local {
     name: String,
     cname: String,
     ty: String,
+    /// A `let` of an unannotated number: its type is only the default, so a use may change it.
+    soft: bool,
 }
 
 #[derive(Clone)]
@@ -206,6 +242,17 @@ struct Ctx {
     locals: Vec<Local>,
     /// C names already used in the current C function.
     used: HashSet<String>,
+    /// The next expression lowered is in tail position of the routine being emitted.
+    tail: bool,
+    /// The next `lower_call` is that tail expression.
+    tail_site: bool,
+    /// Owned values in scope at the current tail position, outermost first. A tail call
+    /// releases them before it jumps, as the blocks it leaves would have.
+    tail_drops: Vec<(String, String)>,
+    /// C name of the routine being emitted (empty inside a lambda).
+    fn_cname: String,
+    /// The routine's C parameters, `Current` first.
+    params: Vec<(String, String)>,
 }
 
 impl Ctx {
@@ -232,8 +279,39 @@ impl Ctx {
             name: name.to_string(),
             cname: cname.clone(),
             ty: ty.to_string(),
+            soft: false,
         });
         cname
+    }
+    fn bind_let(&mut self, name: &str, ty: &str, soft: bool) -> String {
+        let cname = self.bind(name, ty);
+        if let Some(l) = self.locals.last_mut() {
+            l.soft = soft;
+        }
+        cname
+    }
+    /// True for a number with no type of its own: literals, soft `let`s and arithmetic on them.
+    fn untyped_num(&self, e: &Expr) -> bool {
+        match e {
+            Expr::Int(_) => true,
+            Expr::UnaryNeg(x) => self.untyped_num(x),
+            Expr::Var(v) => self.local(v).is_some_and(|l| l.soft),
+            Expr::BinOp(op, l, r) => is_arith_op(op) && self.untyped_num(l) && self.untyped_num(r),
+            Expr::If(_, ts, te, es, ee) => {
+                ts.is_empty() && es.is_empty() && self.untyped_num(te) && self.untyped_num(ee)
+            }
+            _ => false,
+        }
+    }
+    /// A soft `let` that decides the type of `e`, if any.
+    fn soft_var(&self, e: &Expr) -> Option<String> {
+        match e {
+            Expr::Var(v) if self.local(v).is_some_and(|l| l.soft) => Some(v.clone()),
+            Expr::UnaryNeg(x) => self.soft_var(x),
+            Expr::BinOp(op, l, r) if is_arith_op(op) => self.soft_var(l).or_else(|| self.soft_var(r)),
+            Expr::If(_, _, te, _, ee) => self.soft_var(te).or_else(|| self.soft_var(ee)),
+            _ => None,
+        }
     }
 }
 
@@ -270,6 +348,8 @@ pub(crate) struct TypedC<'a> {
     counter: usize,
     needs_validator: bool,
     needs_read_line: bool,
+    /// The routine being emitted jumped to its own start (spec §10: tail calls are loops).
+    tail_used: bool,
     needs_from_utf8: bool,
     pub(crate) errors: Vec<String>,
 }
@@ -304,6 +384,7 @@ impl<'a> TypedC<'a> {
             counter: 0,
             needs_validator: false,
             needs_read_line: false,
+            tail_used: false,
             needs_from_utf8: false,
             errors: Vec::new(),
         }
@@ -832,17 +913,25 @@ static bool {inst}__has(struct {inst}* xs, {ce} x) {{\n\
             tmap: tmap.clone(),
             locals: Vec::new(),
             used: HashSet::new(),
+            tail: true,
+            tail_site: false,
+            tail_drops: Vec::new(),
+            fn_cname: req.cname.clone(),
+            params: Vec::new(),
         };
+        self.tail_used = false;
         cx.used.insert("Current".into());
         let mut params = Vec::new();
         if has_cur {
             params.push(format!("{} Current", self.ctype(&self_ty)?));
+            cx.params.push(("Current".to_string(), self_ty.clone()));
         }
         for (p, t) in &rd.params {
             let ty = subst(t, &tmap);
             let ct = self.ctype(&ty)?;
             let cn = cx.bind(p, &ty);
             params.push(format!("{ct} {cn}"));
+            cx.params.push((cn, ty));
         }
         let ret = subst(&rd.ret_type, &tmap);
         let cret = self.ctype(&ret)?;
@@ -854,8 +943,15 @@ static bool {inst}__has(struct {inst}* xs, {ce} x) {{\n\
             if params.is_empty() { "void".to_string() } else { params.join(", ") }
         );
         self.protos.push(format!("{sig};\n"));
+        let code = if self.tail_used {
+            // Parameters are borrowed on the first iteration and owned after a tail call.
+            let drops = self.param_drops(&cx)?;
+            format!("    bool _owned = false;\n_tail:;\n    {cret} _res = {body};\n    if (_owned) {{\n{drops}}}\n    return _res;\n")
+        } else {
+            format!("    return {body};\n")
+        };
         self.bodies.push(format!(
-            "/* {}.{}{} */\n{sig} {{\n    return {body};\n}}\n\n",
+            "/* {}.{}{} */\n{sig} {{\n{code}}}\n\n",
             self_ty,
             rd.name,
             if req.rtargs.is_empty() { String::new() } else { format!("[{}]", req.rtargs.join(", ")) }
@@ -863,10 +959,48 @@ static bool {inst}__has(struct {inst}* xs, {ce} x) {{\n\
         Ok(())
     }
 
+    fn param_drops(&mut self, cx: &Ctx) -> Result<String, String> {
+        let mut drops = String::new();
+        for (cn, ty) in &cx.params {
+            drops.push_str(&self.drop_stmt(ty, cn)?);
+        }
+        Ok(drops)
+    }
+
+    /// A self call in tail position (spec §10): no stack frame. The new arguments become
+    /// owned first, since they may borrow from what is released next. Then the scopes the
+    /// call leaves are released, then the previous iteration's parameters.
+    fn tail_jump(&mut self, cx: &Ctx, args: Vec<V>, ret: &str) -> Result<String, String> {
+        if args.len() != cx.params.len() {
+            return Err("tail call does not match the routine's parameters".into());
+        }
+        let k = self.next();
+        let mut code = String::new();
+        let mut assign = String::new();
+        for (i, (v, (cn, ty))) in args.into_iter().zip(&cx.params).enumerate() {
+            let c = self.own(v)?;
+            code.push_str(&format!("{} _t{k}_{i} = {c};\n", self.ctype(ty)?));
+            assign.push_str(&format!("{cn} = _t{k}_{i};\n"));
+        }
+        for (cn, ty) in cx.tail_drops.iter().rev() {
+            code.push_str(&self.drop_stmt(ty, cn)?);
+        }
+        let drops = self.param_drops(cx)?;
+        let cret = self.ctype(ret)?;
+        self.tail_used = true;
+        Ok(format!(
+            "({{\n{code}if (_owned) {{\n{drops}}}\n{assign}_owned = true;\ngoto _tail;\n{cret} _u{k};\n_u{k};\n}})"
+        ))
+    }
+
     fn drain(&mut self) {
         while let Some(req) = self.queue.pop_front() {
             let what = format!("{}.{}", req.module, req.routine);
             if let Err(e) = self.emit_fn(req) {
+                if let Some((v, t)) = retype_request(&e) {
+                    self.errors.push(format!("{what}: `{v}` is used as `{t}` but cannot be typed so here"));
+                    continue;
+                }
                 let msg = e.strip_prefix(NEED_TYPE).unwrap_or(&e);
                 let msg = if msg.is_empty() { "cannot infer a type" } else { msg };
                 self.errors.push(format!("{what}: {msg}"));
@@ -877,6 +1011,8 @@ static bool {inst}__has(struct {inst}* xs, {ce} x) {{\n\
     // ------------------------------------------------------------ expressions
 
     /// A block: its `let`s are owned and released after the (owned) result is computed.
+    /// `let zero = 0` has no type of its own, so a use such as `x < zero` on an `I64` restarts
+    /// the block with `zero` at that type. Each `let` changes type at most once.
     fn lower_block(
         &mut self,
         cx: &mut Ctx,
@@ -886,30 +1022,62 @@ static bool {inst}__has(struct {inst}* xs, {ce} x) {{\n\
         has_cur: bool,
     ) -> Lowered {
         let mark = cx.locals.len();
+        let tail = cx.tail;
+        let depth = cx.tail_drops.len();
+        let mut retyped: HashMap<String, String> = HashMap::new();
+        loop {
+            cx.tail = tail;
+            let res = self.lower_block_once(cx, stmts, body, expect, has_cur, &retyped);
+            cx.tail_drops.truncate(depth);
+            let Err(e) = &res else { return res };
+            let Some((v, t)) = retype_request(e) else { return res };
+            let declared = stmts.iter().any(|s| matches!(s, Stmt::Let(n, _) if n == v));
+            if !declared || retyped.contains_key(v) {
+                return res;
+            }
+            retyped.insert(v.to_string(), t.to_string());
+            cx.locals.truncate(mark);
+        }
+    }
+
+    fn lower_block_once(
+        &mut self,
+        cx: &mut Ctx,
+        stmts: &[Stmt],
+        body: &Expr,
+        expect: Option<&str>,
+        has_cur: bool,
+        retyped: &HashMap<String, String>,
+    ) -> Lowered {
+        let tail = std::mem::take(&mut cx.tail);
+        let mark = cx.locals.len();
         let mut code = String::new();
         let mut owned_locals: Vec<(String, String)> = Vec::new();
         for group in analyze_parallel_lets(stmts) {
             if group.len() == 1 {
                 let (v, e) = &group[0];
-                let x = self.lower(cx, e, None, has_cur)?;
+                let soft = !retyped.contains_key(v) && cx.untyped_num(e);
+                let x = self.lower(cx, e, retyped.get(v).map(String::as_str), has_cur)?;
                 let t = x.ty.clone();
                 let c = self.own(x)?;
                 let ct = self.ctype(&t)?;
-                let cn = cx.bind(v, &t);
+                let cn = cx.bind_let(v, &t, soft);
                 code.push_str(&format!("{ct} {cn} = {c};\n"));
                 owned_locals.push((cn, t));
             } else {
                 let mut lowered = Vec::new();
+                let mut soft = Vec::new();
                 for (v, e) in &group {
-                    let x = self.lower(cx, e, None, has_cur)?;
+                    soft.push(!retyped.contains_key(v) && cx.untyped_num(e));
+                    let x = self.lower(cx, e, retyped.get(v).map(String::as_str), has_cur)?;
                     let t = x.ty.clone();
                     let c = self.own(x)?;
                     let ct = self.ctype(&t)?;
                     lowered.push((v.clone(), c, t, ct));
                 }
                 let mut names = Vec::new();
-                for (v, _, t, ct) in &lowered {
-                    let cn = cx.bind(v, t);
+                for ((v, _, t, ct), soft) in lowered.iter().zip(soft) {
+                    let cn = cx.bind_let(v, t, soft);
                     code.push_str(&format!("{ct} {cn};\n"));
                     owned_locals.push((cn.clone(), t.clone()));
                     names.push(cn);
@@ -950,6 +1118,10 @@ static bool {inst}__has(struct {inst}* xs, {ce} x) {{\n\
                 }
                 code.push_str("}\n");
             }
+        }
+        if tail {
+            cx.tail = true;
+            cx.tail_drops.extend(owned_locals.iter().cloned());
         }
         let b = self.lower(cx, body, expect, has_cur)?;
         cx.locals.truncate(mark);
@@ -994,8 +1166,13 @@ static bool {inst}__has(struct {inst}* xs, {ce} x) {{\n\
         }
         let comparison = matches!(op, "=" | "!=" | "<" | "<=" | ">" | ">=");
         let operand_expect = if comparison { None } else { expect };
-        // Type the non-literal side first so an integer literal adopts its type.
-        let (la, rb) = if matches!(l, Expr::Int(_)) && !matches!(r, Expr::Int(_)) {
+        // A shift count has its own type. Otherwise type the side that has a type first, so
+        // an untyped number adopts it.
+        let (la, rb) = if matches!(op, "<<" | ">>") {
+            let la = self.lower(cx, l, operand_expect, hc)?;
+            let rb = self.lower(cx, r, None, hc)?;
+            (la, rb)
+        } else if cx.untyped_num(l) && !cx.untyped_num(r) {
             let rb = self.lower(cx, r, operand_expect, hc)?;
             let la = self.lower(cx, l, Some(&rb.ty.clone()), hc)?;
             (la, rb)
@@ -1124,6 +1301,7 @@ static bool {inst}__has(struct {inst}* xs, {ce} x) {{\n\
         expect: Option<&str>,
         hc: bool,
     ) -> Lowered {
+        let tail_site = std::mem::take(&mut cx.tail_site);
         let (rd, kind) = Self::find_routine(md, r).ok_or_else(|| format!("`{}` has no routine `{r}`", md.name))?;
         if kind == "specify" {
             return Err(format!(
@@ -1143,8 +1321,8 @@ static bool {inst}__has(struct {inst}* xs, {ce} x) {{\n\
         let mut map: HashMap<String, String> = HashMap::new();
         if let Some(rv) = &recv {
             unify(&generic_self, &rv.ty, &tps, &mut map);
-        } else if md.name == cx.owner && !md.type_params.is_empty() {
-            // Unqualified or `M.r` call inside module M: same instance as the caller.
+        } else if md.name == cx.owner && hc && Self::has_current(md, kind) {
+            // The call uses the caller's `Current`, so it is the caller's instance.
             for tp in &md.type_params {
                 if let Some(c) = cx.tmap.get(tp) {
                     map.insert(tp.clone(), c.clone());
@@ -1161,6 +1339,11 @@ static bool {inst}__has(struct {inst}* xs, {ce} x) {{\n\
                 lowered[i] = Some(self.lower(cx, a, Some(&pt), hc)?);
                 continue;
             }
+            // An untyped number says nothing about a type parameter: it adopts one found
+            // from the other arguments or from the caller's instance below.
+            if cx.untyped_num(a) {
+                continue;
+            }
             match self.lower(cx, a, None, hc) {
                 Ok(v) => {
                     unify(&pt, &v.ty, &tps, &mut map);
@@ -1170,13 +1353,27 @@ static bool {inst}__has(struct {inst}* xs, {ce} x) {{\n\
                 Err(e) => return Err(e),
             }
         }
+        // `M.make(..)` inside module M: the expected type and the arguments come first (a
+        // `map[B]` on `BOX[A]` builds a `BOX[B]`). Only what they leave open is the caller's.
+        if md.name == cx.owner {
+            for tp in &md.type_params {
+                if let (false, Some(c)) = (map.contains_key(tp), cx.tmap.get(tp)) {
+                    map.insert(tp.clone(), c.clone());
+                }
+            }
+        }
         for (i, ((_, pt), a)) in rd.params.iter().zip(args).enumerate() {
             if lowered[i].is_none() {
                 let pt = subst(&fix_cur(pt), &map);
-                if mentions_any(&pt, &tps) {
+                if !mentions_any(&pt, &tps) {
+                    lowered[i] = Some(self.lower(cx, a, Some(&pt), hc)?);
+                } else if cx.untyped_num(a) {
+                    let v = self.lower(cx, a, None, hc)?;
+                    unify(&pt, &v.ty, &tps, &mut map);
+                    lowered[i] = Some(v);
+                } else {
                     return Err(NEED_TYPE.into());
                 }
-                lowered[i] = Some(self.lower(cx, a, Some(&pt), hc)?);
             }
         }
         if let Some(tp) = tps.iter().find(|t| !map.contains_key(*t)) {
@@ -1188,6 +1385,18 @@ static bool {inst}__has(struct {inst}* xs, {ce} x) {{\n\
         let mod_targs: Vec<String> = md.type_params.iter().map(|t| map[t].clone()).collect();
         let rtargs: Vec<String> = rd.type_params.iter().map(|t| map[t].clone()).collect();
         let cname = self.request_fn(&md.name, &mod_targs, r, &rtargs);
+        if tail_site && cname == cx.fn_cname {
+            let self_ty = Self::self_type(md, &mod_targs);
+            let mut vals = Vec::new();
+            if Self::has_current(md, kind) {
+                vals.push(recv.unwrap_or_else(|| borrowed("Current".to_string(), self_ty.clone())));
+            }
+            vals.extend(lowered.into_iter().flatten());
+            map.insert("Current".into(), self_ty);
+            let ret = subst(&rd.ret_type, &map);
+            let code = self.tail_jump(cx, vals, &ret)?;
+            return Ok(owned(code, ret));
+        }
         let mut t = Temps::default();
         let mut cargs = Vec::new();
         if Self::has_current(md, kind) {
@@ -1326,6 +1535,11 @@ static bool {inst}__has(struct {inst}* xs, {ce} x) {{\n\
             tmap: cx.tmap.clone(),
             locals: Vec::new(),
             used: HashSet::new(),
+            tail: false,
+            tail_site: false,
+            tail_drops: Vec::new(),
+            fn_cname: String::new(),
+            params: Vec::new(),
         };
         let mut prologue = String::new();
         let mut env_fields = String::new();
@@ -1422,6 +1636,8 @@ static bool {inst}__has(struct {inst}* xs, {ce} x) {{\n\
     }
 
     fn lower_match(&mut self, cx: &mut Ctx, scrut: &Expr, cases: &[MatchCase], expect: Option<&str>, hc: bool) -> Lowered {
+        let tail = std::mem::take(&mut cx.tail);
+        let depth = cx.tail_drops.len();
         let sv0 = self.lower(cx, scrut, None, hc)?;
         let st = sv0.ty.clone();
         let md = self
@@ -1437,6 +1653,10 @@ static bool {inst}__has(struct {inst}* xs, {ce} x) {{\n\
         let scrut_owned = sv0.owned;
         let sc = sv0.code;
         let mut result_ty: Option<String> = expect.map(|e| e.to_string());
+        let mut soft_result = false;
+        if tail && scrut_owned {
+            cx.tail_drops.push((sv.clone(), st.clone()));
+        }
         let mut arms = Vec::new();
         let mut has_default = false;
         for c in cases {
@@ -1475,14 +1695,29 @@ static bool {inst}__has(struct {inst}* xs, {ce} x) {{\n\
                 }
                 _ => return Err("this `match` pattern is not supported by the C backend".into()),
             };
-            let bv = self.lower_block(cx, &c.stmts, &c.body, result_ty.as_deref(), hc)?;
+            let untyped = cx.untyped_num(&c.body);
+            let arm_expect = if soft_result { None } else { result_ty.as_deref() };
+            cx.tail = tail;
+            let bv = self.lower_block(cx, &c.stmts, &c.body, arm_expect, hc)?;
+            if soft_result && result_ty.as_deref().is_some_and(|t| numeric_conflict(t, &bv.ty)) {
+                // Earlier arms were untyped numbers: this arm decides the type of the `match`.
+                cx.locals.truncate(mark);
+                let t = bv.ty.clone();
+                cx.tail = tail;
+                cx.tail_drops.truncate(depth);
+                return self.lower_match(cx, scrut, cases, Some(&t), hc);
+            }
             if result_ty.is_none() {
                 result_ty = Some(bv.ty.clone());
+                soft_result = untyped;
+            } else if !untyped {
+                soft_result = false;
             }
             let b = self.own(bv)?;
             cx.locals.truncate(mark);
             arms.push(format!("{label} {{ {pre}{rv} = {b}; break; }}\n"));
         }
+        cx.tail_drops.truncate(depth);
         let rt = result_ty.ok_or("empty `match`")?;
         let crt = self.ctype(&rt)?;
         let mut s = format!("({{\n{sct} {sv} = {sc};\n{crt} {rv};\nswitch ({sv}->tag) {{\n");
@@ -1500,7 +1735,34 @@ static bool {inst}__has(struct {inst}* xs, {ce} x) {{\n\
         Ok(owned(s, rt))
     }
 
+    /// Lowers `e`. A numeric value of another kind than the context expects is never left to
+    /// C's implicit conversion: the verifier reads both as mathematical numbers, so a signed
+    /// value compared as unsigned would make the binary disagree with its proof.
     fn lower(&mut self, cx: &mut Ctx, e: &Expr, expect: Option<&str>, hc: bool) -> Lowered {
+        let x = self.lower_expr(cx, e, expect, hc)?;
+        if let Some(want) = expect.map(norm_type) {
+            if numeric_conflict(&want, &x.ty) {
+                return Err(match cx.soft_var(e) {
+                    Some(v) => retype(&v, &want),
+                    None => format!("a `{}` value is used where `{want}` is required", x.ty),
+                });
+            }
+            // C only warns about a pointer to another instance, and the struct layout differs.
+            let wrong_instance = self.module(type_head(&want)).is_some()
+                && type_head(&want) == type_head(&x.ty)
+                && cnorm(&want) != cnorm(&x.ty);
+            if wrong_instance {
+                return Err(format!("a `{}` value is used where `{want}` is required", x.ty));
+            }
+        }
+        Ok(x)
+    }
+
+    fn lower_expr(&mut self, cx: &mut Ctx, e: &Expr, expect: Option<&str>, hc: bool) -> Lowered {
+        // Tail position passes through blocks, `if` and `match` only: every other
+        // subexpression starts with it cleared.
+        let tail = std::mem::take(&mut cx.tail);
+        cx.tail_site = false;
         let expect_n = expect.map(norm_type);
         let expect = expect_n.as_deref();
         match e {
@@ -1509,6 +1771,9 @@ static bool {inst}__has(struct {inst}* xs, {ce} x) {{\n\
                     Some(t) if is_scalar(t) && t != "BOOL" && t != "UNIT" => t.to_string(),
                     _ => "U64".to_string(),
                 };
+                if is_signed(&ty) && *n > i64::MAX as u128 {
+                    return Err(format!("the literal {n} does not fit in `{ty}`"));
+                }
                 Ok(owned(Self::int_lit(*n, &ty), ty))
             }
             Expr::Float(f) => Ok(owned(format!("{f:?}"), "F64")),
@@ -1566,7 +1831,28 @@ static bool {inst}__has(struct {inst}* xs, {ce} x) {{\n\
                 Ok(owned(format!("(!{c})"), "BOOL"))
             }
             Expr::UnaryNeg(x) => {
-                let v = self.lower(cx, x, expect, hc)?;
+                // A negated literal is signed unless the context says otherwise.
+                let inner_expect = match (&**x, expect) {
+                    (Expr::Int(_), Some(t)) if t == "F64" || is_signed(t) => Some(t),
+                    (Expr::Int(0), Some(t)) if is_unsigned(t) => Some(t),
+                    (Expr::Int(n), Some(t)) if is_unsigned(t) => {
+                        return Err(format!("the negative literal -{n} cannot have type `{t}`"));
+                    }
+                    (Expr::Int(_), _) => Some("I64"),
+                    _ => expect,
+                };
+                if matches!(**x, Expr::Int(n) if n == 1u128 << 63) && inner_expect.is_some_and(is_signed) {
+                    // `9223372036854775808LL` itself is not a valid C literal.
+                    let ty = inner_expect.unwrap_or("I64").to_string();
+                    return Ok(owned("(-9223372036854775807LL - 1)".into(), ty));
+                }
+                let v = self.lower(cx, x, inner_expect, hc)?;
+                if is_unsigned(&v.ty) && !matches!(**x, Expr::Int(0)) {
+                    return Err(match cx.soft_var(x) {
+                        Some(soft) => retype(&soft, "I64"),
+                        None => format!("unary `-` on the unsigned type `{}`", v.ty),
+                    });
+                }
                 Ok(owned(format!("(-{})", v.code), v.ty))
             }
             Expr::BinOp(op, l, r) => self.lower_binop(cx, op, l, r, expect, hc),
@@ -1579,6 +1865,7 @@ static bool {inst}__has(struct {inst}* xs, {ce} x) {{\n\
                 }
                 let owner = self.module(&cx.owner).ok_or("no owner module")?;
                 if Self::find_routine(owner, f).is_some() {
+                    cx.tail_site = tail;
                     return self.lower_call(cx, owner, f, None, args, expect, hc);
                 }
                 Err(format!("unknown function `{f}`"))
@@ -1593,6 +1880,7 @@ static bool {inst}__has(struct {inst}* xs, {ce} x) {{\n\
                             .and_then(|st| self.variant_fields(&st, None))
                             .is_some_and(|fs| fs.iter().any(|(f, _)| f == v)));
                     if !is_value {
+                        cx.tail_site = tail;
                         return self.lower_static(cx, v, m, args, expect, hc);
                     }
                 }
@@ -1646,15 +1934,32 @@ static bool {inst}__has(struct {inst}* xs, {ce} x) {{\n\
                         }
                     }
                 }
+                cx.tail_site = tail;
                 self.lower_call(cx, md, m, Some(rv), args, expect, hc)
+            }
+            // A block written as an expression by pattern compilation. Its dead branch is a
+            // copy, and lowering it would double the C at every nested level.
+            Expr::If(c, ts, te, _, _) if matches!(**c, Expr::Bool(true)) => {
+                cx.tail = tail;
+                self.lower_block(cx, ts, te, expect, hc)
             }
             Expr::If(c, ts, te, es, ee) => {
                 let cc = self.lower(cx, c, Some("BOOL"), hc)?.code;
-                let a = match self.lower_block(cx, ts, te, expect, hc) {
+                // An untyped number takes its type from the other branch.
+                let else_first = expect.is_none() && cx.untyped_num(te) && !cx.untyped_num(ee);
+                cx.tail = tail;
+                let first = if else_first {
+                    Err(NEED_TYPE.to_string())
+                } else {
+                    self.lower_block(cx, ts, te, expect, hc)
+                };
+                let a = match first {
                     Ok(x) => x,
                     Err(e) if need(&e) && expect.is_none() => {
+                        cx.tail = tail;
                         let b = self.lower_block(cx, es, ee, None, hc)?;
                         let tb = b.ty.clone();
+                        cx.tail = tail;
                         let a = self.lower_block(cx, ts, te, Some(&tb), hc)?;
                         let (ac, bc) = (self.own(a)?, self.own(b)?);
                         return Ok(owned(format!("({cc} ? ({ac}) : ({bc}))"), tb));
@@ -1662,11 +1967,15 @@ static bool {inst}__has(struct {inst}* xs, {ce} x) {{\n\
                     Err(e) => return Err(e),
                 };
                 let ta = a.ty.clone();
+                cx.tail = tail;
                 let b = self.lower_block(cx, es, ee, Some(expect.unwrap_or(&ta)), hc)?;
                 let (ac, bc) = (self.own(a)?, self.own(b)?);
                 Ok(owned(format!("({cc} ? ({ac}) : ({bc}))"), ta))
             }
-            Expr::Match(scrut, cases) => self.lower_match(cx, scrut, cases, expect, hc),
+            Expr::Match(scrut, cases) => {
+                cx.tail = tail;
+                self.lower_match(cx, scrut, cases, expect, hc)
+            }
             Expr::RecordLit(fields) => {
                 let ty = expect
                     .map(|s| s.to_string())

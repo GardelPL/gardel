@@ -1,0 +1,31 @@
+module BOX[A]
+
+representation {NONE}
+  value: A
+
+create {ANY}
+
+  make(x: A): BOX[A]
+    do
+      { value = x }
+    end
+
+feature {ANY}
+
+  get: A
+    do
+      Current.value
+    end
+
+  map[B](f: A -> B): BOX[B]
+    do
+      BOX.make(f(Current.value))
+    end
+
+  twin: BOX[A]
+    do
+      let b = BOX.make(Current.value)
+      b
+    end
+
+end

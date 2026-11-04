@@ -86,7 +86,16 @@ flowchart TD
         C1 --> C2 --> C3 --> C4
     end
 
-    PhaseA --> PhaseB --> PhaseC
+    subgraph PhaseD ["Phase D: Reactive Programs (draft)"]
+        D0["Task D.0: Fix `case _` in Boogie"]
+        D1["Task D.1: Spec v0.5"]
+        D2["Tasks D.2-D.4: Prelude, Checker, Host Loop Slice"]
+        D3["Tasks D.5-D.8: Timers, Input, Sockets, Replay"]
+        D0 --> D2
+        D1 --> D2 --> D3
+    end
+
+    PhaseA --> PhaseB --> PhaseC --> PhaseD
 ```
 
 ---
@@ -350,7 +359,7 @@ Source: [review/review.md](review/review.md). The verification notes for each fi
   - Tests: `test_c3_typed_backend_compiles_stdlib_seq_from_source`, `test_c3_seq_programs_run_natively_from_source` (includes a mutant that must fail check 2, and the depth-accounting check), `test_c3_typed_backend_runs_text_program` (the C.2 UTF-8 program with all 12 inputs through the new backend), `test_c3_typed_backend_refuses_what_it_cannot_lower`, `test_c3_lifted_lambdas_are_proven_not_assumed`. `cargo test` 85/85.
 - **Known limits:**
   - *(The C backend and verifier limits listed here at first were fixed by the second follow-up below.)*
-  - Proof stability is checked on one Z3 seed only; gardelc has no seed option yet.
+  - Proof stability is now checked on multiple Z3 seeds (added `--z3-seed <N>` and multi-seed run in `scripts/c3_regression.ps1`). `--z3-seed` overrides `GARDEL_Z3_SEED`, and a missing or invalid value in either is an error, so a sweep cannot silently run on the default seed.
   - The BendRT backend emits `.bend` files, but C.3 did not run them.
 - [x] **C.3 follow-up 2: memory, closures, patterns, argv; no hand-written C left.**
   - **Reference counting** (`c11_typed.rs`). Every heap value (module values, `LIST` cells, closure environments, string and byte buffers) has an atomic count. Gardel values are immutable and acyclic, so counting frees everything, deterministically. Calls borrow their arguments and return an owned result; constructors consume what they store; parameters, `match` binders and captures are borrowed; `let` and IO-bound locals are released at the end of their block; an owned temporary used as a borrow is bound and released after the use. Every lowered expression records whether it is owned, and `dup_*`/`drop_*` are inserted from that. Drops loop on the last same-type field, so long lists are freed in constant C stack. `STRING`/`BYTES` carry an `owner` (counted buffer, `NULL` for literals and argv). A test harness counts live allocations: 0 after 50 calls of every checked routine (SEQ ops, the parallel build and sum, closures, BIGNAT), and it does see a deliberately unreleased tree.
@@ -365,9 +374,28 @@ Source: [review/review.md](review/review.md). The verification notes for each fi
 - **Known limits (after follow-up 2):**
   - Freeing is sequential and each value costs atomic count updates; a large structure released just before exit is freed anyway. No ownership transfer ("last use moves") yet.
   - A non-decreasing recursion on a client ADT parameter is rejected by a solver timeout, not a clean `variant_decrease` failure.
-  - The untyped emitter (`emit_c11` / `emit_c11_general_module`) is no longer used by the CLI; only its old unit tests use it.
+  - The unused untyped emitter (`emit_c11` / `emit_c11_general_module`) was removed; all code generation and tests now use the typed backend (`c11_typed`).
   - A library build instantiates type parameters at `U64` only. Tuples are pairs only.
-  - Proof stability is checked on one Z3 seed only; the BendRT output is not run.
+  - Proof stability is now verified across multiple Z3 seeds (`0`, `1`, `42`); the BendRT output is not run.
+
+- [x] **C.3 follow-up 3: code review fixes (critical items).** Each fix was checked against the previous compiler build, which failed the same fixture.
+  - **Signed values compiled as unsigned.** A number with no annotation defaulted to `U64`, so `let zero = 0; x < zero` on an `I64` compared as unsigned in C, and the binary disagreed with its verified contract. Unannotated `let`s now take their type from their uses (the block is lowered again at that type), `if` and `match` take it from a typed branch, and a negated literal defaults to `I64`. Any remaining mix of signed, unsigned and `F64` is an error, never a C conversion. Negating an unsigned value and a literal that does not fit are errors too.
+  - **Wrong generic instance.** `BOX.make(..)` inside `BOX[A].map[B]` was pinned to the caller's `BOX[A]`. Only a call using the caller's `Current` is pinned now. Otherwise the expected type and the arguments decide, and the caller's instance fills what they leave open. A value of another instance of the expected module is an error (C only warned, and the layouts differ).
+  - **`match` scrutinee** (`patterns.rs`). It was copied into every column, which turned O(n) into O(2^n) for a recursive scrutinee (`fib_pair(90)` did not finish), and a binder such as `case (p, q)` on `p` captured the later columns. The scrutinee is now bound once to a fresh `_pmN`. A plain variable stays as it is unless a binder shadows it, so existing proofs keep their shape. The C backend lowers only the live branch of a pattern block, so nesting no longer doubles the C.
+  - **Self tail calls are loops (spec §10).** The typed backend had none: a verified `loop(3000000, ..)` overflowed the stack (`0xC00000FD`). A tail call in a block, `if` or `match` now takes owned arguments, releases the scopes it leaves and the previous parameters, and jumps. This also covers calls that are not C tail calls because a local must be released after them. The unused `is_tail_recursive_routine` and its test are removed.
+  - **Z3 seeds.** An invalid `--z3-seed` or `GARDEL_Z3_SEED` was ignored, and the run still reported 0/0 on the default seed. Both are errors now. The seed is resolved once at startup, so the `--run` Boogie call honours the variable too. The prover log shows both Z3 seed options set.
+  - Tests `test_d_untyped_numbers_take_their_type_from_use`, `test_d_mixed_signedness_is_refused_not_converted`, `test_d_generic_call_inside_its_module_uses_the_right_instance`, `test_d_match_evaluates_its_scrutinee_once`, `test_d_match_binder_does_not_capture_its_scrutinee`, `test_d_self_tail_calls_are_loops`, `test_z3_seed_invalid_values_are_errors`, `test_z3_seed_args_set_both_solver_seeds`. `cargo test` 99/99.
+- **Known limits (after follow-up 3):**
+  - A `let` or pattern binder cannot reuse a parameter's name in Boogie (`more than one declaration of variable name`). It fails loudly. The C backend handles such shadowing correctly.
+  - Only self tail calls are loops. Mutual recursion still uses the stack.
+  - From the same review, not yet fixed (all fail loudly): `map_boogie_type` splits nested type arguments on every comma (`BOX[TUPLE[A, B]]`), `desugar_patterns` skips laws, a by-value tuple parameter in a function type fails in gcc, and field names are not escaped in C (`r`, C keywords).
+  - `--run`'s second Boogie call finds Z3 through a relative path, which Boogie cannot start. The result of that call is not used.
+- [x] **C.3 follow-up 4: verdicts no longer depend on machine load or solver failure.**
+  - **Soundness: a solver that gave up could read as verified.** `Verification inconclusive (P)` did not match the parser, and Boogie's summary (`2 verified, 0 errors, 1 inconclusive`) was not read, so the module reported 0 errors. A crash with no summary passed the same way. Every "gave up" wording is now an error, and passing requires Boogie's clean summary line (`N verified, 0 errors` and nothing after it). Anything else fails closed with `Phase 3 Boogie (Verification Incomplete)`.
+  - **Load no longer changes a verdict.** `/timeLimit:10` was wall-clock time, and Boogie reports hitting it as an ordinary error. Under 60 parallel runs, the valid proof in `test_c3_lifted_lambdas_are_proven_not_assumed` failed 53 times, and that test failed in about 1 of 4 full `cargo test` runs. Verification now uses Z3's resource limit `/rlimit` (`DEFAULT_Z3_RLIMIT`, override with `--z3-rlimit <N>`), which counts solver work. A 600-second time limit stays only as a backstop for a hung solver. The same 60-run load test now passes 60 of 60.
+  - **Unproven is not refuted.** Boogie prints a refutation with a `*** MODEL`. A failed obligation with no model is one the solver gave up on, and it is now reported as `Phase 3 Boogie (Verification Resource Limit)`, with its tag kept for contract withdrawal (Task B.9), and not as a postcondition violation.
+  - **Calibration (2026-11-04).** All VCs of `--stdlib`, the six examples and `cargo test` were captured: 136 unique files, 65 of them clean. Each clean file was run on seeds 0–3 at rising limits. Every proof passed on every seed. Resources needed: 245 of 260 file/seed pairs at most 500K, heaviest 3M (`BYTES`, seed 1). One proof varies by up to 6x across seeds. The limit is 30M, 10x the heaviest proof. No clean file changes verdict between 3M and 100M. If a proof passes 10M, recalibrate rather than raising the limit in passing.
+  - Tests `test_boogie_inconclusive_is_never_a_pass`, `test_solver_giving_up_is_unproven_not_refuted`, `test_z3_rlimit_verdict_is_decided_by_the_limit`. `cargo test` 102/102.
 
 #### Task C.4: Memory Management Performance [📋 Planned]
 
@@ -389,6 +417,113 @@ Source: [review/review.md](review/review.md). The verification notes for each fi
 
 ---
 
+### Phase D: Reactive Programs
+
+**Status:** 📋 Draft, not started (2026-11-04).
+
+**Objective:** let Gardel express programs that run until told to stop (servers, TUIs, games) without weakening totality. Every routine stays total. Non-termination lives in one place, the runtime's host loop, and a `reactive program` declares it. The design is [reactive/reactive_programs.md](reactive/reactive_programs.md) (revision 2), corrected by the findings below.
+
+**Not in this phase:** partial functions (proposal §10), liveness and fairness, parallel event handling, and bounds on total state size.
+
+#### Findings from probing the design against `gardelc` (2026-11-04)
+
+Small multi-file programs shaped like the proposal were run through the compiler at commit `70dfef5`.
+
+| # | Finding | Effect on the plan |
+| :--- | :--- | :--- |
+| 1 | `representation {ECHO_SERVER}` in the state's own file (proposal §7.1) is rejected with `E0103`: the export list counts as a dependency, so state and program form a cycle. | The proposal's example does not compile as written. Fixed by decision 1. |
+| 2 | A client cannot use another file's record representation in Boogie, even with `representation {ANY}`. A literal or update gets the enclosing module's type, and a field read emits an undeclared `fn_<field>`. This fails loudly and is not a soundness hole. | "Invariant preservation comes for free" (proposal §4.2) is false for client-built records. Fixed by decision 1. |
+| 3 | The same design verifies when the state is opaque and changed through its own routines. A `step` over `CONN_STATE.add/remove`, with `add` guarded by `require room`, verified 0/0 under `--strict`, and it ran natively with the right result. Removing the guard was rejected (`room`). Returning `Go` on the shutdown event was rejected by a postcondition. The state's `filter` with a capturing lambda proved the invariant. | The verifier needs no new machinery for invariants, as the proposal hoped. |
+| 4 | `case _` on a sum type fails in Boogie with `use of undeclared function: is_`, both on a module's own ADT and on a linked one inside a `program`. | Blocks proposal §6, which tells programs to end `match` with `case _`. Task D.0 fixes it. |
+| 5 | `e = Shutdown` breaks the §9 equality rules, because `EVENT` holds `STRING`/`BYTES` and is not `CANONICAL_EQ`. `Result is Stop` has no syntax. | Fixed by decision 2. The postcondition form was tested in finding 3. |
+| 6 | `specify` is not permitted in `program` (`main.rs`, §4), but proposal §3 allows `specify` lemmas in a reactive program. | Lemmas go in the state module or a `functions` module (proposal §7.3). |
+| 7 | Proposal §9 assumes `poll`/`epoll`, and development is on Windows. `IO.read_line` blocks, while a command must never block the loop. | Decisions 4 and 5. |
+
+#### Decisions
+
+1. **State is an opaque module.** `S` is normally a `module` with `representation {NONE}` in its own file. It has an `invariant` and routines whose `require` clauses carry the guards. `step` builds no records. The invariant is proven once, in the state module. Client-built records, and export lists that do not create dependency edges, are a possible later extension, not a prerequisite.
+2. **`shutdown_must_stop` uses constructor tests.** The prelude provides `EVENT.is_shutdown` and `STEP.is_stop`. The compiler adds the implicit postcondition `e.is_shutdown implies Result.is_stop` to `step`. No new syntax and no `=` on `EVENT`.
+3. **Closed types grow with the runtime.** A variant of `COMMAND` or `EVENT` is added only in the task whose runtime can deliver it, so the type never promises something the host cannot do. The slice starts with `Print` and `Shutdown`.
+4. **Shared `poll`-style event loop first.** POSIX `poll` and Windows `WSAPoll` (sockets), with `SetConsoleCtrlHandler` / `sigaction` for shutdown. Move to IOCP or `epoll` only if a measurement requires it.
+5. **Blocking sources run on helper threads.** Console input runs on a reader thread that queues events. The Gardel step loop stays single-threaded and handles one event at a time.
+6. **Event sources are an internal interface from the start.** The first host loop reads from a scripted source as well as from the OS. Tests then stay deterministic and need no real signals. D.8 builds logging and replay on the same interface.
+7. **Open questions closed for the first version** (proposal §11): `Shutdown` stays mandatory (no never-stopping programs), `cmds` stays `LIST[COMMAND]`, and correlation ids are deferred until a program needs several `ReadLine`s in flight.
+
+#### Dependency graph
+
+```mermaid
+flowchart TD
+    D0["D.0: Fix `case _` in Boogie"]
+    D1["D.1: Spec v0.5 & proposal revision 3"]
+    D2["D.2: Prelude STEP, COMMAND, EVENT"]
+    D3["D.3: Parser & checker"]
+    D4["D.4: Host loop (Print + Shutdown slice)"]
+    D5["D.5: SetTimer / Tick"]
+    D6["D.6: ReadLine and Key"]
+    D7["D.7: Sockets & echo server"]
+    D8["D.8: Event log & replay"]
+    C44["C.4.4: Arena per step"]
+    D0 --> D2
+    D1 --> D2 --> D3 --> D4 --> D5 --> D6 --> D7
+    D4 --> D8
+    D5 --> C44
+```
+
+#### Task D.0: Fix `case _` on Sum Types in Boogie [📋 Planned]
+- [ ] Lower a wildcard arm to the negation of the earlier constructors, or to the final `else`, instead of emitting `is_`.
+- [ ] Check a wildcard on a module's own ADT, on a linked ADT, and on a prelude ADT, and a bind-all arm in each position.
+- Acceptance: a test where `case _` verifies in all three cases, and a mutant where a wrong wildcard arm is rejected. Exhaustiveness checks on non-wildcard matches are unchanged. `cargo test` and `--stdlib --strict` stay clean.
+
+#### Task D.1: Spec v0.5 and Proposal Revision 3 [📋 Planned]
+- [ ] Apply the table in proposal §12 to the spec, leaving out the `partial` rows.
+- [ ] Update `reactive_programs.md` with the findings and decisions above. Rewrite the echo example over an opaque `SERVER_STATE`, drop the `specify` claim in §3, and state rule 4 with `is_shutdown` / `is_stop`.
+- [ ] Add a new §16 section for Phase D.
+- Acceptance: every example in the proposal has been compiled by `gardelc` or is marked as depending on a named later task.
+
+#### Task D.2: Prelude Modules [📋 Planned]
+- [ ] Add `stdlib/core/step.gdl`, `command.gdl` and `event.gdl`: `STEP[S]` with `is_stop`, `COMMAND` with `Print`, and `EVENT` with `Shutdown` and `is_shutdown`.
+- [ ] Register them in `STDLIB_SOURCES` and `phase4_stdlib_source()` in dependency order, and in the §4.1 prelude inventory.
+- [ ] Note the user-visible change: `STEP`, `COMMAND` and `EVENT` become reserved through `E0101`.
+- Acceptance: `--stdlib --strict` 0/0, and existing examples unchanged.
+
+#### Task D.3: Parser and Checker [📋 Planned]
+- [ ] Add `ModuleKind::ReactiveProgram` and accept `reactive program`. Treat it like `Program` at the existing `ModuleKind` sites, including the ban on `specify`.
+- [ ] Require `init(args: SEQ[STRING]): STEP[S]` and `step(s: S, e: EVENT): STEP[S]`, and reject `main`.
+- [ ] Diagnostics in family `"Phase 4 (Reactive Violation)"`: `missing_init`, `missing_step`, `main_in_reactive`, `state_type_mismatch`, `io_in_reactive`, `shutdown_must_stop`.
+- [ ] Add the implicit `shutdown_must_stop` postcondition (decision 2). Keep it as an ordinary obligation so the fixpoint in Task B.9 handles it.
+- [ ] Label the unit in `--inspect`. A reactive program is an entry-point root, like `program`.
+- Acceptance: one test per diagnostic, including a `step` that continues on `Shutdown` and a `step` that breaks the state's `require`. The diagnostic for an invariant failure names the state's clause.
+
+#### Task D.4: Host Loop, `Print` + `Shutdown` Slice [📋 Planned]
+- [ ] Emit a C entry point for a reactive root in `c11_typed.rs`: call `init`, run its commands in order, wait for an event, call `step`, and repeat. Run `Stop`'s commands, then exit with its code.
+- [ ] Follow the reference-counting rules: the loop owns the current state, and releases the old state and the command list after each step.
+- [ ] Implement the OS and scripted event sources (decision 6), and shutdown through `SetConsoleCtrlHandler` / `sigaction`.
+- [ ] Add `examples/reactive_hello.gdl`: print a greeting, wait, print a goodbye on Ctrl-C, exit 0.
+- Acceptance: verifies 0/0, and runs natively on Windows with a real Ctrl-C and in tests with a scripted `Shutdown`. Exit codes come from `Stop`. `init` returning `Stop` exits without calling `step`.
+
+#### Task D.5: `SetTimer` / `Tick` [📋 Planned]
+- [ ] Add `COMMAND.SetTimer(id, millis)` and `EVENT.Tick(id)`, with the event loop's wait bounded by the next timer.
+- [ ] Add a timer example whose state module has a proven invariant.
+- Acceptance: live allocations do not grow over 100,000 scripted ticks (the first long-run leak test), and time per event is recorded as the baseline for C.4.4.
+
+#### Task D.6: `ReadLine` and `Key` [📋 Planned]
+- [ ] Add `ReadLine` / `Line(RESULT[IO_ERROR, STRING])`, reusing the RFC 3629 validation of `gardel_io_read_line_result`, on a reader thread (decision 5).
+- [ ] Add raw-mode `Key(code)` on the Windows console and POSIX terminals. Restore the terminal on every exit path.
+- [ ] Add an example: a small turn-based TUI game whose board invariant is proven.
+- Acceptance: malformed input arrives as an `Error` event and never crashes. The terminal is restored after `Stop` and after Ctrl-C. Scripted runs give identical output.
+
+#### Task D.7: Sockets and the Echo Server [📋 Planned]
+- [ ] Add opaque `CONN_ID` (`representation {NONE}`, `CANONICAL_EQ`, `ORD`), `Listen`, `Send`, `Close`, and `Accepted`, `ListenFailed`, `Received`, `SendFailed`, `Closed`.
+- [ ] Enforce the runtime's handle guarantees (proposal §6): one `Accepted` per id, and at most one `Closed` after `Close`.
+- [ ] Add `examples/echo_server.gdl` with a verified connection limit.
+- Acceptance: the limit holds under a client test that opens more connections than allowed. Removing the limit guard is rejected by the verifier. Live allocations do not grow across many connect/close cycles.
+
+#### Task D.8: Event Log and Replay [📋 Planned]
+- [ ] Add a runtime flag that records events, and one that replays a log through the scripted source.
+- Acceptance: replaying a recorded run of the D.6 example reproduces its commands exactly, which tests the determinism claim in proposal §5.
+
+---
+
 ## 5. Verification & Acceptance Criteria
 
 | Phase | Milestone | Acceptance Criteria |
@@ -398,6 +533,9 @@ Source: [review/review.md](review/review.md). The verification notes for each fi
 | **B** | **String Literal Lowering** | String literals in user programs type-check as prelude `STRING` and execute in C11 backend. |
 | **C** | **Modular Standard Library** | `stdlib/` organized into subdirectories (`concepts/`, `core/`, `collections/`, `numeric/`, `text/`, `functional/`). `phase4_stdlib_source()` bundles cleanly. |
 | **C** | **Zero Verification Errors** | `gardelc --stdlib --strict` verifies with **0 errors and 0 warnings**. All 4 example programs (`bounded_stack`, `greeter`, `peano_ord`, `tree`) verify with **0 errors and 0 warnings** under `--strict`. 100% of unit tests pass in `cargo test` (92/92). |
+| **D** | **Reactive Slice** | `examples/reactive_hello.gdl` verifies with **0 errors and 0 warnings**, runs natively, and exits through `Stop` on a real Ctrl-C and on a scripted `Shutdown`. Each reactive diagnostic has a test. |
+| **D** | **Unbounded Runs** | A timer program shows no growth in live allocations over 100,000 events. `examples/echo_server.gdl` holds its verified connection limit under test, and removing the guard is rejected by the verifier. |
+| **D** | **Determinism** | Replaying a recorded event log reproduces the run's commands exactly. |
 
 ---
 
@@ -405,7 +543,7 @@ Source: [review/review.md](review/review.md). The verification notes for each fi
 
 With **Phase A: Language Specification Harmonization**, **Phase B: Compiler Engine & Prelude Tooling**, **Task C.1: Physical Decomposition of `stdlib/`**, **Task C.2: High-Performance Smart String (`stdlib/text/string.gdl`)**, and **Task C.3: Regression Verification & Performance Benchmarking** completely executed and verified with 0 errors and 0 warnings under `--strict`, Phase C's planned work is done. The verification baseline is clean, and every module compiles from source to C with reference-counted memory (C.3 follow-ups).
 
-The next step is to define **Phase D** in this roadmap (tasks, dependency graph, acceptance criteria) before starting it. The C prerequisites of [reactive/reactive_programs.md](reactive/reactive_programs.md) are in place (C.3 follow-ups): every module compiles from source, closures work, and memory is reference counted, so a program that runs forever does not leak. Reactive programs (parser, checker, prelude, `shutdown_must_stop`, host loop) follow, starting with the `Print` + `Shutdown` slice.
+The next step is **Phase D: Reactive Programs**, now drafted above with its tasks, dependency graph and acceptance criteria. The C prerequisites of [reactive/reactive_programs.md](reactive/reactive_programs.md) are in place (C.3 follow-ups): every module compiles from source, closures work, and memory is reference counted, so a program that runs forever does not leak. Start with Task D.0 and Task D.1, then build the `Print` + `Shutdown` slice (D.2–D.4).
 
-**Task C.4 (memory management performance)** is planned. C.4.1–C.4.3 do not depend on Phase D and can be done before or alongside it; C.4.1 and C.4.2 are small and have the largest measured payoff. C.4.4 needs a reactive program to measure against, so it belongs with Phase D.
+**Task C.4 (memory management performance)** is planned. C.4.1–C.4.3 do not depend on Phase D and can be done before or alongside it. C.4.1 and C.4.2 are small and have the largest payoff measured on `seq_bench`, but a reactive program rarely exits, so C.4.1 does little for Phase D and C.4.2 matters more. C.4.4 needs a reactive program to measure against, and D.5 provides its baseline.
 

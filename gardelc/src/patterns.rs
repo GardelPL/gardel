@@ -8,8 +8,9 @@
 //!   * `if` chains comparing a scalar with literals, and
 //!   * arm-local `let`s for bound names.
 //! This is the classic clause-matrix algorithm: rows are tried in order, so the first
-//! matching row wins, as in the source. Gardel is pure, so a column expression such as
-//! `p.first` may be evaluated more than once without changing the meaning.
+//! matching row wins, as in the source. The scrutinee is bound once to a fresh `_pmN` (a
+//! plain variable stays as it is unless a binder shadows it), so a column such as
+//! `_pm1.first` is a cheap projection that may be repeated.
 //! Exhaustiveness is still decided by the flat matches produced (a missing constructor
 //! stays a missing constructor). A literal column without a default row is left alone
 //! unless it is a complete `BOOL` (`true` and `false`), so the original diagnostics apply.
@@ -254,8 +255,22 @@ fn rewrite_expr(e: &mut Expr, c: &mut Compiler) {
                 })
                 .collect();
             let saved = c.counter;
-            match c.compile(&[(**scrut).clone()], rows) {
-                Some((stmts, body)) => *e = block_expr(stmts, body),
+            // Columns are copied into every test and binder, so the scrutinee is bound once:
+            // copying a call would repeat it (exponentially when it is recursive), and a
+            // binder named like a scrutinee variable would capture the later columns.
+            let shadowed = match &**scrut {
+                Expr::Var(v) => cases.iter().any(|k| k.pattern.collect_bindings().contains(v)),
+                other => !expr_uses_io(other),
+            };
+            let root = if shadowed { Some(c.fresh()) } else { None };
+            let col = root.clone().map_or_else(|| (**scrut).clone(), Expr::Var);
+            match c.compile(&[col], rows) {
+                Some((mut stmts, body)) => {
+                    if let Some(v) = root {
+                        stmts.insert(0, Stmt::Let(v, (**scrut).clone()));
+                    }
+                    *e = block_expr(stmts, body)
+                }
                 None => c.counter = saved,
             }
         }

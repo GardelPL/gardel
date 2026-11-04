@@ -1,0 +1,88 @@
+program TAIL_PROG
+
+feature {ANY}
+
+  scalar(n: U64, acc: U64): U64
+    variant
+      n
+    do
+      if n = 0 then acc else scalar(n - 1, acc +% n) end
+    end
+
+  owned_local(n: U64, acc: SEQ[U64]): U64
+    variant
+      n
+    do
+      if n = 0 then
+        acc.length
+      else
+        let s = SEQ.singleton(n)
+        owned_local(n - 1, s)
+      end
+    end
+
+  growing(n: U64, acc: LIST[U64]): U64
+    variant
+      n
+    do
+      if n = 0 then
+        acc.length
+      else
+        growing(n - 1, acc.prepend(n))
+      end
+    end
+
+  wrap(n: U64): OPTION[U64]
+    do
+      if n % 2 = 0 then Some(n) else None end
+    end
+
+  owned_scrutinee(n: U64, acc: U64): U64
+    variant
+      n
+    do
+      if n = 0 then
+        acc
+      else
+        match wrap(n)
+          case Some(v) then owned_scrutinee(n - 1, acc +% 1)
+          case None then owned_scrutinee(n - 1, acc)
+        end
+      end
+    end
+
+  not_tail(n: U64): U64
+    variant
+      n
+    do
+      if n = 0 then 0 else not_tail(n - 1) +% 1 end
+    end
+
+  build(n: U64, acc: TAIL_NATS): TAIL_NATS
+    variant
+      n
+    do
+      if n = 0 then acc else build(n - 1, Succ(acc)) end
+    end
+
+  first_failure(depth: U64): U64
+    do
+      let nats = build(depth, Zero)
+      let doubled = nats.plus(nats)
+      if scalar(depth, 0) != (depth *% (depth +% 1)) / 2 then 1
+      else if owned_local(depth, SEQ.empty) != 1 then 2
+      else if growing(depth, LIST.empty) != depth then 3
+      else if owned_scrutinee(depth, 0) != depth / 2 then 4
+      else if not_tail(1000) != 1000 then 5
+      else if nats.count(0) != depth then 6
+      else if doubled.count(0) != depth *% 2 then 7
+      else 0
+      end end end end end end end
+    end
+
+  main(args: SEQ[STRING]): IO[EXIT_CODE]
+    do
+      IO.exit(first_failure(3000000))
+    end
+
+end
