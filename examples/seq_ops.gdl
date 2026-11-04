@@ -1,0 +1,72 @@
+program SEQ_OPS
+
+-- Runs every executable routine of the stdlib `SEQ` module, compiled from its Gardel
+-- source, and checks the results at run time. Exit code 0 means all checks passed;
+-- k > 0 names the first failing check. Used by the C backend regression tests.
+
+feature {ANY}
+
+  from_range(lo: U64, hi: U64): SEQ[U64]
+    require
+      valid_range: lo <= hi
+      bounded: hi <= 1000000
+    variant
+      hi - lo
+    do
+      if lo = hi then
+        SEQ.singleton(lo)
+      else
+        let mid = lo + (hi - lo) / 2
+        let left = from_range(lo, mid)
+        let right = from_range(mid + 1, hi)
+        left.concat(right)
+      end
+    ensure
+      exact_length: Result.length = hi - lo + 1
+    end
+
+  digits_left(s: SEQ[U64]): U64
+    do
+      s.fold_left(fn(acc: U64, x: U64): U64 do acc *% 10 +% x end, 0)
+    end
+
+  digits_right(s: SEQ[U64]): U64
+    do
+      s.fold_right(fn(x: U64, acc: U64): U64 do acc *% 10 +% x end, 0)
+    end
+
+  count_true(s: SEQ[BOOL]): U64
+    do
+      s.fold_left(fn(acc: U64, b: BOOL): U64 do if b then acc +% 1 else acc end end, 0)
+    end
+
+  first_failure(n: U64): U64
+    require
+      five: n = 5
+    do
+      let s = from_range(1, n)
+      let doubled = s.map(fn(x: U64): U64 do x *% 2 end)
+      let evens = s.filter(fn(x: U64): BOOL do x % 2 = 0 end)
+      let big = s.map(fn(x: U64): BOOL do x > 3 end)
+      if digits_left(s) != 12345 then 1
+      else if digits_right(s) != 54321 then 2
+      else if digits_left(doubled) != 24690 then 3
+      else if digits_left(evens) != 24 then 4
+      else if evens.length != 2 then 5
+      else if count_true(big) != 2 then 6
+      else if not s.equals(from_range(1, 5)) then 7
+      else if s.equals(doubled) then 8
+      else if not s.concat(SEQ.empty).equals(s) then 9
+      else if s.is_empty then 10
+      else if not s.filter(fn(x: U64): BOOL do x > 9 end).is_empty then 11
+      else if s.length != 5 then 12
+      else 0
+      end end end end end end end end end end end end
+    end
+
+  main(args: SEQ[STRING]): IO[EXIT_CODE]
+    do
+      IO.exit(first_failure(5))
+    end
+
+end

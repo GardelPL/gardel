@@ -10,6 +10,9 @@ use std::fs;
 use std::process::Command;
 use std::rc::Rc;
 
+mod c11_typed;
+pub use c11_typed::emit_c11_typed;
+
 // ============================================================================
 // 1. AST DEFINITIONS (Gardel v0.4 Phase 4: Concepts, Boogie, Fuel, Stdlib & IO)
 // ============================================================================
@@ -4839,6 +4842,205 @@ thread_local! {
         const { std::cell::RefCell::new(None) };
     static BOOGIE_TYPE_ENV: std::cell::RefCell<HashMap<String, String>> =
         std::cell::RefCell::new(HashMap::new());
+    /// Declarations of lambdas lifted to Boogie functions (`lift_boogie_lambda`), drained
+    /// into the module theory at the end of `emit_boogie_parts`.
+    static BOOGIE_LIFTED_LAMBDAS: std::cell::RefCell<String> =
+        const { std::cell::RefCell::new(String::new()) };
+    static BOOGIE_LAMBDA_COUNTER: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Variables of `e` (and of the statements of nested blocks) that are not bound inside it.
+fn expr_free_vars(e: &Expr, bound: &mut Vec<String>, out: &mut Vec<String>) {
+    fn block(stmts: &[Stmt], body: &Expr, bound: &mut Vec<String>, out: &mut Vec<String>) {
+        let mark = bound.len();
+        for st in stmts {
+            match st {
+                Stmt::Let(v, x) => {
+                    expr_free_vars(x, bound, out);
+                    bound.push(v.clone());
+                }
+                Stmt::Check(_, x) | Stmt::Assume(_, x) => expr_free_vars(x, bound, out),
+                Stmt::Reveal(_) => {}
+            }
+        }
+        expr_free_vars(body, bound, out);
+        bound.truncate(mark);
+    }
+    match e {
+        Expr::Var(v) => {
+            if !bound.contains(v) && !out.contains(v) {
+                out.push(v.clone());
+            }
+        }
+        Expr::Int(_) | Expr::Float(_) | Expr::Char(_) | Expr::Unit | Expr::Bool(_) | Expr::Str(_) => {}
+        Expr::UnaryNot(x) | Expr::UnaryNeg(x) => expr_free_vars(x, bound, out),
+        Expr::BinOp(_, l, r) => {
+            expr_free_vars(l, bound, out);
+            expr_free_vars(r, bound, out);
+        }
+        Expr::Call(f, args) => {
+            if !bound.contains(f) && !out.contains(f) {
+                out.push(f.clone());
+            }
+            for a in args {
+                expr_free_vars(a, bound, out);
+            }
+        }
+        Expr::MethodCall(recv, _, args) => {
+            expr_free_vars(recv, bound, out);
+            for a in args {
+                expr_free_vars(a, bound, out);
+            }
+        }
+        Expr::If(c, ts, te, es, ee) => {
+            expr_free_vars(c, bound, out);
+            block(ts, te, bound, out);
+            block(es, ee, bound, out);
+        }
+        Expr::Match(s, cases) => {
+            expr_free_vars(s, bound, out);
+            for c in cases {
+                let mark = bound.len();
+                bound.extend(c.bindings());
+                block(&c.stmts, &c.body, bound, out);
+                bound.truncate(mark);
+            }
+        }
+        Expr::RecordLit(fs) => {
+            for (_, x) in fs {
+                expr_free_vars(x, bound, out);
+            }
+        }
+        Expr::RecordUpdate(b, fs) => {
+            expr_free_vars(b, bound, out);
+            for (_, x) in fs {
+                expr_free_vars(x, bound, out);
+            }
+        }
+        Expr::TupleLit(xs) => {
+            for x in xs {
+                expr_free_vars(x, bound, out);
+            }
+        }
+        Expr::Forall(v, _, b) | Expr::Exists(v, _, b) => {
+            bound.push(v.clone());
+            expr_free_vars(b, bound, out);
+            bound.pop();
+        }
+        Expr::WithIo(io, fin) => {
+            let mark = bound.len();
+            for st in io {
+                match st {
+                    IoStmt::Bind(v, x) => {
+                        expr_free_vars(x, bound, out);
+                        bound.push(v.clone());
+                    }
+                    IoStmt::Action(x) => expr_free_vars(x, bound, out),
+                }
+            }
+            expr_free_vars(fin, bound, out);
+            bound.truncate(mark);
+        }
+        Expr::Lambda(ps, _, stmts, body) => {
+            let mark = bound.len();
+            bound.extend(ps.iter().map(|(p, _)| p.clone()));
+            block(stmts, body, bound, out);
+            bound.truncate(mark);
+        }
+    }
+}
+
+/// Lifts a lambda of one or two parameters to a fresh Boogie function `lam_M_k(captures)`
+/// returning an `Fn1`/`Fn2` value, defined by the axiom
+/// `FnN_app(lam_M_k(c..), x..) == body`. The function symbol is fresh and has exactly one
+/// defining equation, so the axiom is consistent. Captured locals (variables of the
+/// enclosing routine with a known type) become arguments. Returns `None` for lambdas whose
+/// types mention a type parameter of `m` (they keep the special-cased encodings).
+fn lift_boogie_lambda(
+    params: &[(String, String)],
+    ret_ty: &str,
+    stmts: &[Stmt],
+    body: &Expr,
+    m: &ModuleDecl,
+    implicit_fields: &HashSet<String>,
+    strings: &[String],
+) -> Option<String> {
+    if params.is_empty() || params.len() > 2 {
+        return None;
+    }
+    let mentions_tp = |t: &str| type_tokens(t).iter().any(|tok| m.type_params.iter().any(|p| p == tok));
+    if params.iter().any(|(_, t)| mentions_tp(t)) || mentions_tp(ret_ty) {
+        return None;
+    }
+    let param_names: Vec<String> = params.iter().map(|(p, _)| p.clone()).collect();
+    let mut free = Vec::new();
+    let mut bound = param_names.clone();
+    let blk = Expr::If(
+        Box::new(Expr::Bool(true)),
+        stmts.to_vec(),
+        Box::new(body.clone()),
+        Vec::new(),
+        Box::new(Expr::Unit),
+    );
+    expr_free_vars(&blk, &mut bound, &mut free);
+    let captures: Vec<(String, String)> = free
+        .into_iter()
+        .filter(|v| !implicit_fields.contains(v))
+        .filter_map(|v| boogie_env_type(&v).map(|t| (v, t)))
+        .collect();
+    if captures.iter().any(|(_, t)| mentions_tp(t)) {
+        return None;
+    }
+    // Emit the body with the parameters typed (restoring any shadowed entries afterwards).
+    let saved: Vec<(String, Option<String>)> =
+        params.iter().map(|(p, _)| (p.clone(), boogie_env_type(p))).collect();
+    for (p, t) in params {
+        bind_boogie_env_type(p, t);
+    }
+    let body_bpl = emit_boogie_block_expr(stmts, body, m, implicit_fields, "DefaultFuel", strings);
+    BOOGIE_TYPE_ENV.with(|env| {
+        let mut env = env.borrow_mut();
+        for (p, prev) in saved {
+            match prev {
+                Some(t) => {
+                    env.insert(p, t);
+                }
+                None => {
+                    env.remove(&p);
+                }
+            }
+        }
+    });
+    let k = BOOGIE_LAMBDA_COUNTER.with(|c| {
+        let v = c.get();
+        c.set(v + 1);
+        v
+    });
+    let name = format!("lam_{}_{k}", m.name);
+    let cap_decls: Vec<String> = captures
+        .iter()
+        .map(|(v, t)| format!("{v}: {}", map_boogie_type(t, m)))
+        .collect();
+    let cap_names: Vec<String> = captures.iter().map(|(v, _)| v.clone()).collect();
+    let fn_ty = map_boogie_type(
+        &format!(
+            "({}) -> {ret_ty}",
+            params.iter().map(|(p, t)| format!("{p}: {t}")).collect::<Vec<_>>().join(", ")
+        ),
+        m,
+    );
+    let app = if params.len() == 1 { "Fn1_app" } else { "Fn2_app" };
+    let call = format!("{name}({})", cap_names.join(", "));
+    let mut quant: Vec<String> = cap_decls.clone();
+    quant.extend(params.iter().map(|(p, t)| format!("{p}: {}", map_boogie_type(t, m))));
+    let applied = format!("{app}({call}, {})", param_names.join(", "));
+    let decl = format!(
+        "function {name}({}) returns ({fn_ty});\naxiom (forall {} :: {{ {applied} }} {applied} == {body_bpl});\n",
+        cap_decls.join(", "),
+        quant.join(", ")
+    );
+    BOOGIE_LIFTED_LAMBDAS.with(|l| l.borrow_mut().push_str(&decl));
+    Some(call)
 }
 
 /// Runs `f` with Standard Prelude injection enabled (or disabled) for Boogie emission
@@ -5506,6 +5708,20 @@ fn unify_type(pattern: &str, actual: &str, tps: &[String], map: &mut HashMap<Str
         map.entry(p.to_string()).or_insert_with(|| a.to_string());
         return;
     }
+    // Function types: `(acc: B, x: A) -> B` against `(U64, U64) -> U64`.
+    if split_top_level_arrow(p).is_some() || split_top_level_arrow(a).is_some() {
+        let pf = c11_typed::fn_parts(&c11_typed::norm_type(p));
+        let af = c11_typed::fn_parts(&c11_typed::norm_type(a));
+        if let (Some((pp, pr)), Some((ap, ar))) = (pf, af) {
+            if pp.len() == ap.len() {
+                for (x, y) in pp.iter().zip(ap.iter()) {
+                    unify_type(x, y, tps, map);
+                }
+                unify_type(&pr, &ar, tps, map);
+            }
+        }
+        return;
+    }
     let (ph, pargs) = split_type_app(p);
     let (ah, aargs) = split_type_app(a);
     if ph == ah && pargs.len() == aargs.len() {
@@ -5688,6 +5904,11 @@ fn infer_gardel_type(e: &Expr, m: &ModuleDecl, ctx: &BoogiePreludeCtx) -> Option
         Expr::If(_, _, t, _, f) => {
             infer_gardel_type(t, m, ctx).or_else(|| infer_gardel_type(f, m, ctx))
         }
+        // A lambda's parameter and result types are annotated.
+        Expr::Lambda(ps, ret, _, _) => Some(c11_typed::norm_type(&format!(
+            "({}) -> {ret}",
+            ps.iter().map(|(_, t)| t.as_str()).collect::<Vec<_>>().join(", ")
+        ))),
         _ => None,
     }
 }
@@ -5701,7 +5922,11 @@ fn resolve_prelude_receiver(
     ctx: &BoogiePreludeCtx,
 ) -> Option<String> {
     if let Expr::Var(v) = recv {
-        if v == "LIST" || v == "LIST_OPS" || v == "FUNCTION_OPS" || v == "SEQ" {
+        if v == "LIST"
+            || v == "LIST_OPS"
+            || v == "FUNCTION_OPS"
+            || (v == "SEQ" && ctx.module("SEQ").is_none())
+        {
             return None;
         }
         if v != "Current" && v != "Result" && boogie_env_type(v).is_none() {
@@ -5768,7 +5993,11 @@ fn prelude_call_target(
         return None;
     };
     if let Expr::Var(v) = &**recv {
-        if v == "LIST" || v == "LIST_OPS" || v == "FUNCTION_OPS" || v == "SEQ" {
+        if v == "LIST"
+            || v == "LIST_OPS"
+            || v == "FUNCTION_OPS"
+            || (v == "SEQ" && ctx.module("SEQ").is_none())
+        {
             return None;
         }
         if v != &m.name && v != "Current" && boogie_env_type(v).is_none() {
@@ -5822,7 +6051,11 @@ fn emit_boogie_prelude_ref(
         }
         Expr::MethodCall(recv, r, args) => {
             if let Expr::Var(v) = &**recv {
-                if v == "LIST" || v == "LIST_OPS" || v == "FUNCTION_OPS" || v == "SEQ" {
+                if v == "LIST"
+            || v == "LIST_OPS"
+            || v == "FUNCTION_OPS"
+            || (v == "SEQ" && ctx.module("SEQ").is_none())
+        {
                     return None;
                 }
                 if v != &m.name
@@ -6480,6 +6713,10 @@ fn emit_boogie_parts(m: &ModuleDecl, fuel_limit: usize) -> BoogieParts {
         "axiom (forall<T> xs: Seq T, ys: Seq T, zs: Seq T :: { Seq_append(Seq_append(xs, ys), zs) } Seq_append(Seq_append(xs, ys), zs) == Seq_append(xs, Seq_append(ys, zs)));\n",
     );
     out.push_str("axiom (forall<T> x: T :: { Seq_singleton(x) } Seq_singleton(x) == Seq_prepend(x, (Seq_empty() : Seq T)));\n");
+    // The empty list has no members. Without this base case, `has` on any list
+    // built from `empty` (e.g. `LIST.singleton(v).has(x)`) was unconstrained,
+    // which made `forall x. xs.has(x) implies ...` postconditions unprovable.
+    out.push_str("axiom (forall<T> x: T :: { Seq_has((Seq_empty() : Seq T), x) } !Seq_has((Seq_empty() : Seq T), x));\n");
     out.push_str("axiom (forall<T> x: T, xs: Seq T, ys: Seq T :: { Seq_append(Seq_prepend(x, xs), ys) } Seq_append(Seq_prepend(x, xs), ys) == Seq_prepend(x, Seq_append(xs, ys)));\n");
     out.push_str(
         "axiom (forall<T> x: T, y: T, xs: Seq T :: { Seq_has(Seq_prepend(y, xs), x) } Seq_has(Seq_prepend(y, xs), x) <==> (x == y || Seq_has(xs, x)));\n",
@@ -7313,6 +7550,11 @@ fn emit_boogie_parts(m: &ModuleDecl, fuel_limit: usize) -> BoogieParts {
             &collect_module_strings(m),
         ));
     }
+
+    // Lambdas lifted while emitting the theory and the procedures (Boogie declarations are
+    // order-independent, so they can follow their uses).
+    let mut theory = theory;
+    theory.push_str(&BOOGIE_LIFTED_LAMBDAS.with(|l| std::mem::take(&mut *l.borrow_mut())));
 
     BoogieParts {
         preamble,
@@ -10987,7 +11229,7 @@ fn emit_boogie_expr_with_strings(
         Expr::WithIo(_, final_e) => {
             emit_boogie_expr_with_strings(final_e, m, implicit_fields, revealed, fuel_var, strings)
         }
-        Expr::Lambda(params, _, stmts, body) => {
+        Expr::Lambda(params, ret_ty, stmts, body) => {
             if params.len() == 1 && stmts.is_empty() {
                 let p0 = &params[0].0;
                 if let Expr::Var(v) = &**body {
@@ -11087,6 +11329,11 @@ fn emit_boogie_expr_with_strings(
                         }
                     }
                 }
+            }
+            if let Some(lifted) =
+                lift_boogie_lambda(params, ret_ty, stmts, body, m, implicit_fields, strings)
+            {
+                return lifted;
             }
             emit_boogie_block_expr(stmts, body, m, implicit_fields, fuel_var, strings)
         }
@@ -13983,12 +14230,20 @@ pub fn is_tail_recursive_routine(r: &RoutineDecl) -> bool {
 // 10. BACKEND 2: C11 RUNTIME EMITTER (.c) (Phase 4 Stdlib: SEQ, BIGNAT, STRING, IO)
 // ============================================================================
 
+/// Module names for which `emit_c11` returns a hand-written reference runtime instead of
+/// lowering the module's Gardel source. That C is NOT covered by verification, and it is
+/// selected by exact name only: monomorphized names such as `SEQ_U64` (what the CLI emits
+/// for `SEQ`) go through the general emitter. Keep in sync with the arms of `emit_c11`.
+pub const C11_REFERENCE_RUNTIMES: &[&str] =
+    &["TREE", "BOUNDED_STACK", "PEANO", "SEQ", "BIGNAT", "STRING"];
+
 pub fn emit_c11(m: &ModuleDecl) -> String {
     let mut out = String::new();
     match m.name.as_str() {
         "TREE" => {
             out.push_str(
-                r#"// Automatically generated by gardelc (Phase 4 -> C11 + OpenMP Parallel Runtime)
+                r#"// HAND-WRITTEN REFERENCE RUNTIME embedded in gardelc for module TREE (C11 + OpenMP).
+// It is NOT compiled from the Gardel source of this module and is NOT covered by verification.
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -14060,7 +14315,7 @@ int main(void) {
         t = from_range(1, 100000);
         res = max_value(t);
     }
-    printf("Verified TREE.from_range(1, 100000).max_value = %llu\n", (unsigned long long)res);
+    printf("Reference runtime TREE.from_range(1, 100000).max_value = %llu\n", (unsigned long long)res);
     return 0;
 }
 "#,
@@ -14068,7 +14323,8 @@ int main(void) {
         }
         "BOUNDED_STACK" => {
             out.push_str(
-                r#"// Automatically generated by gardelc (Phase 4 -> C11 Product & Refinement Runtime)
+                r#"// HAND-WRITTEN REFERENCE RUNTIME embedded in gardelc for module BOUNDED_STACK (product and refinement).
+// It is NOT compiled from the Gardel source of this module and is NOT covered by verification.
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -14155,7 +14411,7 @@ int main(void) {
     printf("Popped element = %llu, remaining count = %llu\n", (unsigned long long)p2.first, (unsigned long long)count(p2.second));
     s = p2.second;
 
-    printf("Verified BOUNDED_STACK operations executed successfully.\n");
+    printf("Reference runtime BOUNDED_STACK operations executed successfully.\n");
     return 0;
 }
 "#,
@@ -14163,7 +14419,8 @@ int main(void) {
         }
         "PEANO" => {
             out.push_str(
-                r#"// Automatically generated by gardelc (Phase 4 -> Monomorphized Concept Conformance C11 Runtime)
+                r#"// HAND-WRITTEN REFERENCE RUNTIME embedded in gardelc for module PEANO (monomorphized concept conformance).
+// It is NOT compiled from the Gardel source of this module and is NOT covered by verification.
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -14223,99 +14480,13 @@ int main(void) {
             );
         }
         "SEQ" => {
-            out.push_str(
-                r#"// Automatically generated by gardelc (Phase 4 Stdlib -> Parallel Balanced Tree SEQ[U64] C11 Runtime)
-#include <stdint.h>
-#include <stdio.h>
-#include <stdlib.h>
-
-typedef uint64_t U64;
-
-typedef struct SEQ {
-    enum { SEQ_Empty, SEQ_Leaf, SEQ_Concat } tag;
-    U64 len;
-    union {
-        struct { U64 value; } Leaf;
-        struct { struct SEQ* left; struct SEQ* right; } Concat;
-    };
-} SEQ;
-
-static inline SEQ* seq_empty(void) {
-    SEQ* s = (SEQ*)malloc(sizeof(SEQ));
-    s->tag = SEQ_Empty;
-    s->len = 0;
-    return s;
-}
-
-static inline SEQ* seq_singleton(U64 x) {
-    SEQ* s = (SEQ*)malloc(sizeof(SEQ));
-    s->tag = SEQ_Leaf;
-    s->len = 1;
-    s->Leaf.value = x;
-    return s;
-}
-
-static inline SEQ* seq_concat(SEQ* l, SEQ* r) {
-    if (l->tag == SEQ_Empty) return r;
-    if (r->tag == SEQ_Empty) return l;
-    SEQ* s = (SEQ*)malloc(sizeof(SEQ));
-    s->tag = SEQ_Concat;
-    s->len = l->len + r->len;
-    s->Concat.left = l;
-    s->Concat.right = r;
-    return s;
-}
-
-SEQ* seq_from_range(U64 lo, U64 hi) {
-    if (lo > hi) return seq_empty();
-    if (lo == hi) return seq_singleton(lo);
-    U64 mid = lo + (hi - lo) / 2;
-    SEQ* left = NULL;
-    SEQ* right = NULL;
-    #pragma omp task shared(left) if(hi - lo > 512)
-    left = seq_from_range(lo, mid);
-    #pragma omp task shared(right) if(hi - lo > 512)
-    right = seq_from_range(mid + 1, hi);
-    #pragma omp taskwait
-    return seq_concat(left, right);
-}
-
-U64 seq_parallel_sum(SEQ* s) {
-    switch (s->tag) {
-        case SEQ_Empty: return 0;
-        case SEQ_Leaf:  return s->Leaf.value;
-        case SEQ_Concat: {
-            U64 sl = 0, sr = 0;
-            #pragma omp task shared(sl) if(s->len > 512)
-            sl = seq_parallel_sum(s->Concat.left);
-            #pragma omp task shared(sr) if(s->len > 512)
-            sr = seq_parallel_sum(s->Concat.right);
-            #pragma omp taskwait
-            return sl + sr;
-        }
-    }
-    return 0;
-}
-
-int main(void) {
-    SEQ* xs = NULL;
-    U64 total = 0;
-    #pragma omp parallel
-    #pragma omp single
-    {
-        xs = seq_from_range(1, 10000);
-        total = seq_parallel_sum(xs);
-    }
-    printf("Verified Phase 4 SEQ[U64]: len = %llu, parallel_sum(1..10000) = %llu\n",
-           (unsigned long long)xs->len, (unsigned long long)total);
-    return 0;
-}
-"#,
-            );
+            // Kept as a real file so the C.3 benchmark builds the same source.
+            out.push_str(include_str!("../runtime/reference/seq.c"));
         }
         "BIGNAT" => {
             out.push_str(
-                r#"// Automatically generated by gardelc (Phase 4 Stdlib -> BIGNAT 64-bit Limbs in SEQ[U64] C11 Runtime)
+                r#"// HAND-WRITTEN REFERENCE RUNTIME embedded in gardelc for module BIGNAT (64-bit limbs in SEQ[U64]).
+// It is NOT compiled from the Gardel source of this module and is NOT covered by verification.
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -14366,7 +14537,7 @@ int main(void) {
     BIGNAT a = bignat_from_u64(0xFFFFFFFFFFFFFFFFULL);
     BIGNAT b = bignat_from_u64(1ULL);
     BIGNAT sum = bignat_add(a, b);
-    printf("Verified Phase 4 BIGNAT (SEQ[U64] limbs, ghost MATH_INT): (2^64 - 1) + 1 => limb_count = %llu, high_limb = %llu, low_limb = %llu\n",
+    printf("Reference runtime BIGNAT (SEQ[U64] limbs, ghost MATH_INT): (2^64 - 1) + 1 => limb_count = %llu, high_limb = %llu, low_limb = %llu\n",
            (unsigned long long)sum.size,
            (unsigned long long)sum.limbs[1],
            (unsigned long long)sum.limbs[0]);
@@ -14377,7 +14548,8 @@ int main(void) {
         }
         "STRING" => {
             out.push_str(
-                r#"// Automatically generated by gardelc (Phase 4 Stdlib -> UTF-8 STRING backed by SEQ[U64] C11 Runtime)
+                r#"// HAND-WRITTEN REFERENCE RUNTIME embedded in gardelc for module STRING (ASCII words in SEQ[U64]; predates the packed UTF-8 runtime of Task C.2).
+// It is NOT compiled from the Gardel source of this module and is NOT covered by verification.
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -14416,7 +14588,7 @@ int main(void) {
     STRING hello = string_from_utf8("Hello, ");
     STRING world = string_from_utf8("Gardel v0.4 Phase 4!");
     STRING msg = string_concat(hello, world);
-    printf("Verified Phase 4 UTF-8 STRING (SEQ[U64] words = %llu, byte_len = %llu): %.*s\n",
+    printf("Reference runtime STRING (SEQ[U64] words = %llu, byte_len = %llu): %.*s\n",
            (unsigned long long)msg.word_len,
            (unsigned long long)msg.byte_len,
            (int)msg.byte_len,
@@ -16568,6 +16740,7 @@ fn main() {
     let mut primary_c = String::new();
     let mut primary_exe = String::new();
     let mut emitted_bpl: Vec<String> = Vec::new();
+    let mut c_backend_errors: Vec<String> = Vec::new();
 
     for m in &all_modules {
         let stem = m.name.to_lowercase();
@@ -16616,7 +16789,20 @@ fn main() {
             std::process::exit(1);
         }
 
-        let c_code = emit_c11(&converted_mono);
+        // Hand-written reference runtimes are kept for their exact module names only;
+        // everything else is lowered from its Gardel source by the typed backend, with
+        // the other project modules (and the prelude) available to it.
+        let c_code = if C11_REFERENCE_RUNTIMES.contains(&converted_mono.name.as_str()) {
+            emit_c11(&converted_mono)
+        } else {
+            let others: Vec<&ModuleDecl> =
+                all_modules.iter().filter(|o| o.name != m.name).map(|o| &**o).collect();
+            let (code, errs) = emit_c11_typed(m, &others);
+            if m.name == module.name {
+                c_backend_errors = errs;
+            }
+            code
+        };
         if let Err(e) = fs::write(&c_path, c_code) {
             eprintln!("[ERROR] Failed to write C11 output '{c_path}': {e}");
             std::process::exit(1);
@@ -16651,6 +16837,15 @@ fn main() {
         }
         println!("[4/5] Emitted monomorphized Bend v2 target    -> {primary_bend}");
         println!("[5/5] Emitted C11 runtime target              -> {primary_c}");
+        for e in &c_backend_errors {
+            println!("      [C backend] {e} (the C file starts with #error)");
+        }
+        if C11_REFERENCE_RUNTIMES.contains(&module.name.as_str()) {
+            println!(
+                "      note: {primary_c} is the hand-written reference runtime for `{}`, not compiled from its source; verification does not cover it",
+                module.name
+            );
+        }
         if gcc_compiled {
             println!("      Compiled native executable              -> {primary_exe}");
         }
@@ -16896,7 +17091,8 @@ end
             let bpl = emit_boogie(m, 2);
             assert!(bpl.contains(&format!("// Module: {}", m.name)));
             let c11 = emit_c11(m);
-            assert!(c11.contains("int main(void)"));
+            // `int main(void)`, or `int main(int argc, ...)` for the SEQ benchmark (Task C.3).
+            assert!(c11.contains("int main("));
         }
     }
 
@@ -18599,6 +18795,251 @@ end
                 .all(|d| d.rule == "Phase 3 Boogie (Non-Exhaustive Match)"),
             "got {diags:?}"
         );
+    }
+
+    // ---------------------------------------------------------------------------------
+    // Task C.3: every example verifies under --strict, and `LIST.has` has its base case.
+    // ---------------------------------------------------------------------------------
+
+    #[test]
+    fn test_c3_all_examples_verify_strict() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../examples");
+        let mut names: Vec<_> = fs::read_dir(&dir)
+            .expect("examples/ exists")
+            .filter_map(|e| e.ok().map(|e| e.path()))
+            .filter(|p| p.extension().is_some_and(|x| x == "gdl"))
+            .collect();
+        names.sort();
+        assert!(names.len() >= 4, "expected the example programs, got {names:?}");
+        for path in names {
+            let src = fs::read_to_string(&path).unwrap();
+            let m = parse_user_module_with_prelude(&src);
+            let shown = path.display().to_string();
+            let diags = with_prelude_injection(true, || {
+                verify_module_phase3(&m, &src, &shown, DEFAULT_FUEL, true, false, false)
+            });
+            assert!(diags.is_empty(), "{shown} must verify with 0/0, got {diags:?}");
+        }
+    }
+
+    #[test]
+    fn test_c3_reference_runtimes_are_labeled_and_matched_by_exact_name() {
+        // Every hand-written template says so, and none claims to be verified.
+        for name in C11_REFERENCE_RUNTIMES {
+            let src = format!("module {name}\n\nrepresentation {{ANY}}\n  v: U64\n\nend\n");
+            let c = emit_c11(&parse_single_module(&src));
+            assert!(
+                c.starts_with(&format!("// HAND-WRITTEN REFERENCE RUNTIME embedded in gardelc for module {name} ")),
+                "{name}: missing reference-runtime header"
+            );
+            assert!(c.contains("NOT covered by verification"), "{name}");
+            assert!(!c.contains("printf(\"Verified"), "{name}: output claims verification");
+        }
+        // Monomorphized or look-alike names are compiled from source, not swapped for a template.
+        for name in ["SEQ_U64", "TREE_U64", "MY_SEQ"] {
+            let src = format!("module {name}\n\nrepresentation {{ANY}}\n  v: U64\n\nend\n");
+            let c = emit_c11(&parse_single_module(&src));
+            assert!(c.contains("General C11 AST Lowering"), "{name} must use the general emitter");
+            assert!(!c.contains("HAND-WRITTEN REFERENCE RUNTIME"), "{name}");
+        }
+        // The benchmark source is the file the SEQ arm embeds.
+        let seq = include_str!("../runtime/reference/seq.c");
+        assert!(seq.contains("seq_parallel_sum") && seq.contains("int main(int argc"));
+    }
+
+    /// Compiles `c` with gcc (OpenMP on) and runs it once per input, returning exit code and
+    /// trimmed stdout. `None` when gcc is not available.
+    fn c3_native_runs(c: &str, tag: &str, inputs: &[&[u8]]) -> Option<Vec<(i32, String)>> {
+        use std::io::Write;
+        let dir = env::temp_dir().join(format!("gardel_{tag}_{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let c_path = dir.join(format!("{tag}.c"));
+        let exe = dir.join(format!("{tag}.exe"));
+        fs::write(&c_path, c).unwrap();
+        let out = Command::new("gcc")
+            .args(["-std=gnu11", "-O1", "-fopenmp", "-o"])
+            .arg(&exe)
+            .arg(&c_path)
+            .output()
+            .ok()?;
+        assert!(
+            out.status.success(),
+            "generated C must compile:\n{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let runs = inputs
+            .iter()
+            .map(|input| {
+                let mut child = Command::new(&exe)
+                    .stdin(std::process::Stdio::piped())
+                    .stdout(std::process::Stdio::piped())
+                    .spawn()
+                    .unwrap();
+                child.stdin.take().unwrap().write_all(input).unwrap();
+                let o = child.wait_with_output().unwrap();
+                (
+                    o.status.code().unwrap_or(-1),
+                    String::from_utf8_lossy(&o.stdout).trim_end().to_string(),
+                )
+            })
+            .collect();
+        let _ = fs::remove_dir_all(&dir);
+        Some(runs)
+    }
+
+    fn c3_verify_and_emit(src: &str, path: &str) -> String {
+        let m = parse_user_module_with_prelude(src);
+        let diags = with_prelude_injection(true, || {
+            verify_module_phase3(&m, src, path, DEFAULT_FUEL, true, false, false)
+        });
+        assert!(diags.is_empty(), "{path} must verify with 0/0, got {diags:?}");
+        let (c, errs) = emit_c11_typed(&m, &[]);
+        assert!(errs.is_empty(), "{path}: C backend errors {errs:?}");
+        assert!(!c.contains("#error"), "{path}");
+        c
+    }
+
+    #[test]
+    fn test_c3_typed_backend_compiles_stdlib_seq_from_source() {
+        // The whole stdlib SEQ module (generic, higher-order, using the LIST runtime for
+        // `to_list`/`equals`) is lowered from `stdlib/collections/seq.gdl`, not a template.
+        let seq = standard_prelude().module("SEQ").expect("prelude SEQ");
+        let (c, errs) = emit_c11_typed(seq, &[]);
+        assert!(errs.is_empty(), "{errs:?}");
+        assert!(!c.contains("HAND-WRITTEN REFERENCE RUNTIME"));
+        for f in [
+            "SEQ_U64__empty(void)",
+            "SEQ_U64__singleton(uint64_t x)",
+            "SEQ_U64__equals(struct SEQ_U64* Current, struct SEQ_U64* other)",
+            "SEQ_U64__to_list(struct SEQ_U64* Current)",
+            "SEQ_U64__concat(struct SEQ_U64* Current, struct SEQ_U64* other)",
+            "SEQ_U64__map__U64(struct SEQ_U64* Current, gfn_U64_to_U64 f)",
+            "SEQ_U64__filter(struct SEQ_U64* Current, gfn_U64_to_BOOL keep)",
+            "SEQ_U64__fold_left__U64(",
+            "SEQ_U64__fold_right__U64(",
+            "LIST_U64__append(",
+        ] {
+            assert!(c.contains(f), "missing {f}");
+        }
+        // `map`'s two recursive calls are independent `let`s: they become OpenMP tasks.
+        assert!(c.contains("#pragma omp task shared(ml)"), "map must fork its halves");
+        // Specification-only routines (`model`) are never emitted.
+        assert!(!c.contains("SEQ_U64__model"));
+        if let Some(runs) = c3_native_runs(&format!("{c}\nint main(void) {{ return 0; }}\n"), "seqlib", &[b""]) {
+            assert_eq!(runs[0].0, 0);
+        }
+    }
+
+    #[test]
+    fn test_c3_seq_programs_run_natively_from_source() {
+        // Every executable SEQ routine, compiled from source, against run-time checks.
+        let ops = include_str!("../../examples/seq_ops.gdl");
+        let c = c3_verify_and_emit(ops, "examples/seq_ops.gdl");
+        if let Some(runs) = c3_native_runs(&c, "seqops", &[b""]) {
+            assert_eq!(runs[0].0, 0, "seq_ops: first failing check");
+        }
+        // The checks are live: a wrong expectation for `fold_right` is caught at run time.
+        let wrong = ops.replace("digits_right(s) != 54321 then 2", "digits_right(s) != 12345 then 2");
+        assert_ne!(wrong, ops);
+        let c = c3_verify_and_emit(&wrong, "seq_ops_mutant.gdl");
+        if let Some(runs) = c3_native_runs(&c, "seqopsmut", &[b""]) {
+            assert_eq!(runs[0].0, 2, "fold_right order must be observable");
+        }
+        // The benchmark program: parallel build plus fold, input validated at the boundary.
+        let bench = include_str!("../../examples/seq_bench.gdl");
+        let c = c3_verify_and_emit(bench, "examples/seq_bench.gdl");
+        assert!(c.contains("#pragma omp task shared(left)"), "from_range must fork");
+        // The branch run inline is one level deeper too; otherwise the depth never grows
+        // along right spines and millions of tasks are created (a C.3 regression: the
+        // 20-thread build was 3.5x slower than the 1-thread build).
+        assert!(c.contains("gardel_task_depth = _pd; right = "), "inline branch must count depth");
+        assert!(c.contains("if (_pd <= GARDEL_TASK_DEPTH) {"), "past the cutoff, no OpenMP calls");
+        if let Some(runs) = c3_native_runs(
+            &c,
+            "seqbench",
+            &[b"1\n", b"2\n", b"100000\n", b"abc\n", b"0\n", b"\n", b"", b"1000000001\n"],
+        ) {
+            let codes: Vec<i32> = runs.iter().map(|r| r.0).collect();
+            assert_eq!(codes, [0, 0, 0, 2, 2, 2, 2, 2]);
+        }
+    }
+
+    #[test]
+    fn test_c3_typed_backend_runs_text_program() {
+        // The C.2 text program through the typed backend (what the CLI now uses), with the
+        // same inputs and expectations as the untyped emitter's test.
+        let c = c3_verify_and_emit(C2_TEXT_PROGRAM, "textdemo.gdl");
+        let inputs: [&[u8]; 12] = [
+            "Ana\n".as_bytes(),
+            "\u{65e5}\u{1F980}\n".as_bytes(),
+            b"\n",
+            b"",
+            b"\xED\xC0\n",
+            b"\xE0\x41\n",
+            b"\xE0\x80\n",
+            b"\xE0\x80\x80\n",
+            b"\xC0\xAF\n",
+            b"\xED\xA0\x80\n",
+            b"\xF4\x90\x80\x80\n",
+            b"ab\xFF\n",
+        ];
+        if let Some(runs) = c3_native_runs(&c, "texttyped", &inputs) {
+            assert_eq!(runs[0], (7, "H\u{e9}, Ana".to_string()));
+            let codes: Vec<i32> = runs.iter().skip(1).map(|r| r.0).collect();
+            assert_eq!(codes, [6, 4, 1, 11, 11, 20, 30, 30, 40, 11, 12]);
+        }
+    }
+
+    #[test]
+    fn test_c3_typed_backend_refuses_what_it_cannot_lower() {
+        // A capturing lambda has no C lowering yet: the C file must not compile.
+        let src = "program CAP\n\nfeature {ANY}\n\n  total(s: SEQ[U64], k: U64): U64\n    do\n      s.fold_left(fn(acc: U64, x: U64): U64 do acc +% (x +% k) end, 0)\n    end\n\n  main(args: SEQ[STRING]): IO[EXIT_CODE]\n    do\n      IO.exit(total(SEQ.singleton(1), 2))\n    end\n\nend\n";
+        let m = parse_user_module_with_prelude(src);
+        let (c, errs) = emit_c11_typed(&m, &[]);
+        assert!(errs.iter().any(|e| e.contains("captures `k`")), "{errs:?}");
+        assert!(c.lines().nth(1).is_some_and(|l| l.starts_with("#error")), "C must start with #error");
+        // Specification-only routines are refused too.
+        let src = "program GHOST\n\nfeature {ANY}\n\n  main(args: SEQ[STRING]): IO[EXIT_CODE]\n    do\n      IO.exit(if SEQ.singleton(1).model.length = 1 then 0 else 1 end)\n    end\n\nend\n";
+        let m = parse_user_module_with_prelude(src);
+        let (_, errs) = emit_c11_typed(&m, &[]);
+        assert!(errs.iter().any(|e| e.contains("specification (ghost) routine")), "{errs:?}");
+    }
+
+    #[test]
+    fn test_c3_lifted_lambdas_are_proven_not_assumed() {
+        // A capturing lambda passed to the prelude SEQ is lifted to a Boogie function with
+        // one defining axiom; facts about it are proven, and wrong ones are rejected.
+        let ok = "program LAM\n\nfeature {ANY}\n\n  total(s: SEQ[U64], k: U64): U64\n    do\n      s.fold_left(fn(acc: U64, x: U64): U64 do acc +% (x +% k) end, 0)\n    end\n\n  one(x: U64): U64\n    require\n      small: x < 100\n    do\n      total(SEQ.singleton(x), 5)\n    ensure\n      exact: Result = x + 5\n    end\n\n  main(args: SEQ[STRING]): IO[EXIT_CODE]\n    do\n      IO.exit(0)\n    end\n\nend\n";
+        let verify = |src: &str| {
+            let m = parse_user_module_with_prelude(src);
+            with_prelude_injection(true, || {
+                verify_module_phase3(&m, src, "lam.gdl", DEFAULT_FUEL, true, false, false)
+            })
+        };
+        let diags = verify(ok);
+        assert!(diags.is_empty(), "{diags:?}");
+        let diags = verify(&ok.replace("exact: Result = x + 5", "exact: Result = x + 6"));
+        assert!(diags.iter().any(|d| d.tag == "exact"), "{diags:?}");
+    }
+
+    #[test]
+    fn test_c3_list_has_empty_base_case_is_not_vacuous() {
+        // `examples/tree.gdl` needed `!Seq_has(Seq_empty(), x)`. A strengthened bound must
+        // still be rejected, so the new axiom does not make the postconditions vacuous.
+        let src = include_str!("../../examples/tree.gdl");
+        let mutants = [
+            ("(lo <= x and x <= hi)", "(lo <= x and x < hi)", "in_bounds"),
+            ("implies x <= Result", "implies x < Result", "upper_bound"),
+        ];
+        for (from, to, tag) in mutants {
+            assert!(src.contains(from), "tree.gdl changed: {from}");
+            let bad = src.replace(from, to);
+            let m = parse_user_module_with_prelude(&bad);
+            let diags = with_prelude_injection(true, || {
+                verify_module_phase3(&m, &bad, "tree_mutant.gdl", DEFAULT_FUEL, true, false, false)
+            });
+            assert!(diags.iter().any(|d| d.tag == tag), "{tag} must fail, got {diags:?}");
+        }
     }
 
     const C2_TEXT_PROGRAM: &str = "program TEXTDEMO\n\nfeature {ANY}\n\n  main(args: SEQ[STRING]): IO[EXIT_CODE]\n    do\n      with IO\n        line_res <- IO.read_line\n        match line_res\n          case Ok(name) then\n            let g = \"H\u{e9}, \".concat(name)\n            match STRING.from_utf8(g.to_utf8)\n              case Ok(h) then\n                with IO\n                  IO.print_line(h)\n                  IO.exit(if g.character_at(1).code = 233 and h.equals(g) then g.code_point_count else 99 end)\n                end\n              case Error(_) then\n                IO.exit(98)\n            end\n          case Error(e) then\n            match e\n              case Decode(se) then\n                match se\n                  case InvalidByte(o, b) then IO.exit(10 + o % 10)\n                  case TruncatedSequence(o, n) then IO.exit(20 + o % 10)\n                  case OverlongEncoding(o) then IO.exit(30 + o % 10)\n                  case UnpairedSurrogate(o) then IO.exit(40 + o % 10)\n                end\n              case EndOfInput then IO.exit(1)\n              case OsError(c) then IO.exit(2)\n            end\n        end\n      end\n    end\n\nend\n";

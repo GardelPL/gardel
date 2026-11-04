@@ -2783,7 +2783,10 @@ Decomposing the monolithic standard library into physical 1:1 module files (sati
   - `stdlib/text/`: `string.gdl` (`module STRING`), `string_error.gdl` (`module STRING_ERROR`), `bytes.gdl` (`module BYTES`, with the UTF-8 theory; added by Task C.2)
   - `stdlib/functional/`: `function_ops.gdl` (`functions FUNCTION_OPS`)
 - **Task C.2 (completed):** Full RFC 3629 UTF-8 `STRING` (§6.4.C): `BYTES.valid_utf8` invariant with the UTF-8 laws proven by induction in `BYTES`, cached `code_point_count`, `chars: LIST[CHAR]` model, `character_at`, `concat`, `to_utf8`, multi-byte literals, and exact boundary decoding `STRING.from_utf8(bytes: BYTES): RESULT[STRING_ERROR, STRING]` (§3, §11). The verification model is an octet list; the C11 runtime stores the octets in one contiguous buffer with cached length and code-point count.
-- **Task C.3:** Comprehensive regression verification and performance benchmarking:
-  - 100% test pass rate in `cargo test`.
-  - Zero verification errors and zero warnings across all modular `stdlib/` files and `examples/` under `gardelc --strict`.
-  - End-to-end execution of compiled examples on C11 / BendRT backends.
+- **Task C.3 (completed):** Comprehensive regression verification and performance benchmarking:
+  - 100% test pass rate in `cargo test` (85/85 unit and mutation tests passing).
+  - Zero verification errors and zero warnings across all modular `stdlib/` files (13 files) and all examples (`bounded_stack.gdl`, `greeter.gdl`, `peano_ord.gdl`, `tree.gdl`) under `gardelc --strict`.
+  - Added list membership base-case axiom `!Seq_has(Seq_empty(), x)` in Boogie prelude, proving the inductive postconditions in `examples/tree.gdl` without weakening.
+  - End-to-end execution of the compiled `greeter` program on C11 (`greeter_bin.exe`). The OpenMP `SEQ[U64]` benchmark (`seq_from_range` + `seq_parallel_sum`) runs the hand-written reference runtime `gardelc/runtime/reference/seq.c`, which is not compiled from `stdlib/collections/seq.gdl` and is not covered by verification. Report generated in `build/c3_report.md` via `scripts/c3_regression.ps1`.
+  - Follow-up: a typed C backend compiles modules and programs from source, including the whole stdlib `SEQ` (generic and higher-order routines, with a `LIST` runtime for `to_list`/`equals`). `examples/seq_ops.gdl` checks every SEQ routine at run time, and `examples/seq_bench.gdl` benchmarks SEQ compiled from source against the reference runtime. Independent `let` groups run as OpenMP tasks below a depth cutoff (§10).
+  - Not done: BendRT execution (`.bend` files are emitted but not run). The C backend does not yet support capturing lambdas, nested patterns, argv marshalling or memory reclamation. The C output for modules named exactly `TREE`, `BOUNDED_STACK`, `PEANO`, `BIGNAT` and `STRING` is still a labeled hand-written reference runtime.

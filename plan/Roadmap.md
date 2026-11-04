@@ -320,12 +320,39 @@ Source: [review/review.md](review/review.md). The verification notes for each fi
   - `LIST_OPS.at`, like the other `LIST_OPS` functions, is realized by the built-in `Seq_at` preamble axioms (B.1 known limit).
   - The C emitter still has no general type inference: text methods rely on `_Generic`, so a call on an unexpected type is a C compile error, not a wrong call.
 
-#### Task C.3: Regression Verification & Performance Benchmarking
-- Run complete test suite:
-  - `cd gardelc && cargo test` (all 77+ tests passing).
-  - Verify all modular stdlib files under `gardelc --strict` with 0 errors and 0 warnings.
-  - Verify all examples under `gardelc --strict` with 0 errors and 0 warnings.
-  - Execute native C11 builds of `greeter` and `SEQ` parallel tree benchmarks.
+#### Task C.3: Regression Verification & Performance Benchmarking [✅ Completed]
+- [x] Run complete test suite:
+  - `cd gardelc && cargo test` (all 85 tests passing).
+  - Verify all modular stdlib files under `gardelc --strict` with 0 errors and 0 warnings (13 files in ~11.0s).
+  - Verify all examples under `gardelc --strict` with 0 errors and 0 warnings:
+    - `bounded_stack.gdl`: 0 errors, 0 warnings (0.75s)
+    - `greeter.gdl`: 0 errors, 0 warnings (1.18s)
+    - `peano_ord.gdl`: 0 errors, 0 warnings (0.90s)
+    - `seq_bench.gdl`, `seq_ops.gdl`: 0 errors, 0 warnings (added by the typed C backend follow-up below)
+    - `tree.gdl`: 0 errors, 0 warnings (0.78s) — closed remaining 2 errors by supplying the `Seq_empty` base axiom for `Seq_has` (`!Seq_has(Seq_empty(), x)`), proving both `in_bounds` and `upper_bound`. The axiom is sound because it holds in the finite-list model and agrees with the existing `Seq_length`/`Seq_empty` axioms. Separately, mutation tests show that the proofs are not vacuous: stronger bounds are still rejected.
+  - Added `utf8_step_4` inductive single-step lemma in `stdlib/text/bytes.gdl` to stabilize Z3 SMT solver across random seeds for multi-byte `push_utf8_4` capacity invariants.
+  - Native C11 run of `greeter` (end-to-end stdin/stdout), compiled from its Gardel source.
+  - OpenMP benchmark of the **hand-written SEQ reference runtime** `gardelc/runtime/reference/seq.c` (`seq_from_range` + `seq_parallel_sum`, up to 4,000,000 nodes, 4.39x on 20 logical cores). This C is not compiled from `stdlib/collections/seq.gdl` and verification does not cover it, so the number says nothing about code gardelc generates. For the compiled-from-source benchmark, see the typed C backend follow-up below.
+  - Automated runner and reporter: `scripts/c3_regression.ps1` emitting `build/c3_report.md`.
+- [x] **C.3 review fix (critical): hand-written C presented as compiled output.**
+  - `emit_c11` returns a fixed, hand-written C program for modules named `TREE`, `BOUNDED_STACK`, `PEANO`, `SEQ`, `BIGNAT` and `STRING` (`C11_REFERENCE_RUNTIMES`). C.3 had added a `"SEQ_U64"` alias so that `--stdlib` (which monomorphizes `SEQ` to `SEQ_U64`) wrote that template as `build/seq.c`, and the benchmark printed "Verified Phase 4 SEQ[U64]". The alias is removed: templates are chosen by exact name only, and monomorphized names go through the general emitter.
+  - Every template now starts with `HAND-WRITTEN REFERENCE RUNTIME … NOT covered by verification`, and none prints "Verified". The CLI prints a note when the primary module's C output is a template (for example `build/tree.c`).
+  - The SEQ template lives in `gardelc/runtime/reference/seq.c` (embedded with `include_str!`), and the C.3 script benchmarks that file under a "reference runtime" label.
+  - Test `test_c3_reference_runtimes_are_labeled_and_matched_by_exact_name`. `cargo test` 80/80.
+- [x] **C.3 follow-up: typed C backend; stdlib `SEQ` compiled from source.**
+  - **`gardelc/src/c11_typed.rs`** lowers modules and programs to C from their Gardel source, using inferred types. Routine instances are named after their owner type (`SEQ_U64__concat`). Generic modules *and* routine-level type parameters are instantiated on demand from a worklist: `SEQ[A].fold_left[B]` at `A = B = U64` is `SEQ_U64__fold_left__U64`, with `B` inferred from the function argument. It lowers constructors, `match` with field binders and arm-local `let`s, record literals and updates, Leibniz `=` (generated structural equality), function values and non-capturing lambdas (C function pointers). It provides an iterative cons-list runtime for `LIST[T]` where executable code uses it (`SEQ.to_list`, `SEQ.equals`). Specification routines (`model`) are never emitted. `STRING`, `BYTES` and `IO` stay in the C runtime header. A program's translation unit contains every module instance it uses, and `main` runs inside an OpenMP region. The CLI uses this backend for every C output except the exact-name reference templates. Anything it cannot lower is reported, and the C file then starts with `#error`.
+  - **Fork-join (spec §10):** an independent `let` group becomes OpenMP tasks below a depth cutoff (`GARDEL_TASK_DEPTH`, default 12); past the cutoff it runs as plain sequential C. While measuring, a first version only deepened the *spawned* branch, so the depth never grew along right spines and millions of tasks were created: the 20-thread build was 3.5x *slower* than the 1-thread build. Every branch now runs one level deeper, a task restores its thread's depth, and a test pins this.
+  - **Verifier fixes needed by client programs of the prelude `SEQ`** (each failed loudly before; none was unsound). `SEQ.empty`/`SEQ.singleton` called from a client were emitted as the bootstrap constructors `Empty()`/`Leaf(x)` instead of `SEQ__fn_*` calls. General lambdas were emitted as their bare body with unbound parameters; they are now lifted to a fresh Boogie function `lam_M_k(captures)` with one defining axiom `FnN_app(lam_M_k(c), x..) == body` (consistent: a fresh symbol with one equation), captures included. Local type inference now types lambdas and unifies function types, so `let d = s.map(fn(x: U64): U64 do ... end)` gets `SEQ[U64]`.
+  - **Programs:** `examples/seq_ops.gdl` runs every executable SEQ routine compiled from source against 12 run-time checks, including the order of `fold_left` vs `fold_right`. `examples/seq_bench.gdl` reads `n` through the verified `read_line` boundary, builds `1..n` with a forking `from_range` and sums it with `SEQ.fold_left`. Both verify 0/0.
+  - **Benchmark** (`scripts/c3_regression.ps1`, i9-12900HK, 20 logical cores, wall clock including process start, best of 3, n = 4,000,000): compiled from Gardel, 455 ms on 1 thread and 328 ms on 20 (x1.38); the hand-written reference, 869 ms and 176 ms (x4.95). On 1 thread the compiled program is faster because past the cutoff it makes no OpenMP calls. On 20 threads the reference wins because its sum is parallel, while `SEQ.fold_left` is sequential and SEQ has no parallel reduction.
+  - The script now sets BOM-less UTF-8 for `[Console]::InputEncoding`. Windows PowerShell 5 had prefixed piped input with U+FEFF, which the Gardel programs (correctly) rejected. The greeter check now compares ordinally: PowerShell's `-eq`/`-ceq` ignore U+FEFF, which had hidden the problem.
+  - Tests: `test_c3_typed_backend_compiles_stdlib_seq_from_source`, `test_c3_seq_programs_run_natively_from_source` (includes a mutant that must fail check 2, and the depth-accounting check), `test_c3_typed_backend_runs_text_program` (the C.2 UTF-8 program with all 12 inputs through the new backend), `test_c3_typed_backend_refuses_what_it_cannot_lower`, `test_c3_lifted_lambdas_are_proven_not_assumed`. `cargo test` 85/85.
+- **Known limits:**
+  - **C backend:** no capturing lambdas (closures), so `FUNCTION_OPS.compose` and lambdas that use a local do not compile (`#error`). No nested patterns, tuples or literal patterns in `match`. `main(args)` gets an empty `SEQ[STRING]`: argv is not marshalled, and spec §11 does not say how `args` relates to argv. Nothing is freed (no reference counting or GC yet), so a long-running program leaks. A library build instantiates type parameters at `U64` only.
+  - **Verifier, client programs:** a client cannot `match` on the prelude `SEQ`'s constructors (it is modelled abstractly), a bare zero-parameter routine name is not treated as a call, and `SEQ.empty` as a *receiver* has no inferred element type. `examples/seq_ops.gdl` works around the last two.
+  - The reference templates for `TREE`, `BOUNDED_STACK`, `PEANO`, `BIGNAT` and `STRING` are still used for those exact names. The `STRING` template predates the packed UTF-8 runtime of C.2 (ASCII words in `SEQ[U64]`); user programs use the real `gardel_string_*` runtime.
+  - Proof stability is checked on one Z3 seed only; gardelc has no seed option yet.
+  - The BendRT backend emits `.bend` files, but C.3 did not run them.
 
 ---
 
@@ -337,11 +364,13 @@ Source: [review/review.md](review/review.md). The verification notes for each fi
 | **B** | **Compiler Prelude Injection** | `gardelc examples/greeter.gdl --strict` succeeds without `greeter.gdl` duplicating standard library definitions or faking `group` headers. |
 | **B** | **String Literal Lowering** | String literals in user programs type-check as prelude `STRING` and execute in C11 backend. |
 | **C** | **Modular Standard Library** | `stdlib/` organized into subdirectories (`concepts/`, `core/`, `collections/`, `numeric/`, `text/`, `functional/`). `phase4_stdlib_source()` bundles cleanly. |
-| **C** | **Zero Verification Errors** | `gardelc --stdlib --strict` verifies with **0 errors and 0 warnings**. 100% of unit tests pass in `cargo test`. |
+| **C** | **Zero Verification Errors** | `gardelc --stdlib --strict` verifies with **0 errors and 0 warnings**. All 4 example programs (`bounded_stack`, `greeter`, `peano_ord`, `tree`) verify with **0 errors and 0 warnings** under `--strict`. 100% of unit tests pass in `cargo test` (85/85). |
 
 ---
 
 ## 6. Immediate Next Step
 
-With **Phase A: Language Specification Harmonization**, **Phase B: Compiler Engine & Prelude Tooling**, **Task C.1: Physical Decomposition of `stdlib/`**, and **Task C.2: High-Performance Smart String (`stdlib/text/string.gdl`)** completely executed and verified with 0 errors and 0 warnings under `--strict`, the immediate execution task is **Task C.3: Regression Verification & Performance Benchmarking**.
+With **Phase A: Language Specification Harmonization**, **Phase B: Compiler Engine & Prelude Tooling**, **Task C.1: Physical Decomposition of `stdlib/`**, **Task C.2: High-Performance Smart String (`stdlib/text/string.gdl`)**, and **Task C.3: Regression Verification & Performance Benchmarking** completely executed and verified with 0 errors and 0 warnings under `--strict`, Phase C is concluded. The verification baseline is clean. The native baseline covers `program` modules only (see the C.3 known limits).
+
+The next step is to define **Phase D** in this roadmap (tasks, dependency graph, acceptance criteria) before starting it. The typed C backend (C.3 follow-up) already covers building prelude ADTs, `match` binders and compiling non-`program` modules from source. The remaining C prerequisites that [reactive/reactive_programs.md](reactive/reactive_programs.md) depends on come first: memory reclamation (a reactive program runs forever, and nothing is freed yet), capturing closures, and retiring the remaining reference templates. Reactive programs (parser, checker, prelude, `shutdown_must_stop`, host loop) follow, starting with the `Print` + `Shutdown` slice.
 
