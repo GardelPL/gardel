@@ -407,6 +407,42 @@ impl MatchCase {
     pub fn top_bindings(&self) -> Vec<Option<String>> {
         self.pattern.top_bindings()
     }
+
+    /// Whether the arm matches every value (`case _` or a bare binder `case x`).
+    pub fn is_catch_all(&self) -> bool {
+        matches!(self.pattern, Pattern::Wildcard | Pattern::Bind(_))
+    }
+
+    /// The arm's `let`s and body with a bare binder (`case x`) replaced by the scrutinee
+    /// `scrut`, so verifier back ends need no local for it. Other arms are unchanged.
+    pub fn with_binder_substituted(&self, scrut: &Expr) -> (Vec<Stmt>, Expr) {
+        let Pattern::Bind(b) = &self.pattern else {
+            return (self.stmts.clone(), self.body.clone());
+        };
+        let mut stmts = Vec::with_capacity(self.stmts.len());
+        let mut shadowed = false;
+        for st in &self.stmts {
+            if shadowed {
+                stmts.push(st.clone());
+                continue;
+            }
+            stmts.push(match st {
+                Stmt::Let(v, e) => Stmt::Let(v.clone(), subst_expr_var(e, b, scrut)),
+                Stmt::Check(v, e) => Stmt::Check(v.clone(), subst_expr_var(e, b, scrut)),
+                Stmt::Assume(v, e) => Stmt::Assume(v.clone(), subst_expr_var(e, b, scrut)),
+                Stmt::Reveal(v) => Stmt::Reveal(v.clone()),
+            });
+            if matches!(st, Stmt::Let(v, _) if v == b) {
+                shadowed = true;
+            }
+        }
+        let body = if shadowed {
+            self.body.clone()
+        } else {
+            subst_expr_var(&self.body, b, scrut)
+        };
+        (stmts, body)
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -1458,7 +1494,15 @@ impl Parser {
             invariants,
         };
         desugar_nullary_calls(&mut m);
-        patterns::desugar_patterns(&mut m);
+        if let Some(site) = patterns::desugar_patterns(&mut m).first() {
+            return Err(ParseError {
+                message: format!(
+                    "E0316: unreachable_match_arm: in `{}.{site}`, a `match` has an arm after `case _` or a bare binder, which can never run. Remove it, or move the catch-all last",
+                    m.name
+                ),
+                token_pos: self.pos,
+            });
+        }
         Ok(m)
     }
 
@@ -3646,7 +3690,8 @@ pub fn collect_monomorphized_instances(prog: &ProgramEnv) -> Vec<ModuleDecl> {
             if let Some(close) = ty.rfind(']') {
                 let base = &ty[..open];
                 let args_str = &ty[open + 1..close];
-                let args: Vec<String> = args_str.split(',').map(|s| s.trim().to_string()).collect();
+                let args: Vec<String> =
+                    split_top_level_commas(args_str).iter().map(|s| s.trim().to_string()).collect();
                 return Some((base.to_string(), args));
             }
         }
@@ -8200,22 +8245,20 @@ fn map_boogie_type(ty: &str, m: &ModuleDecl) -> String {
     if let Some(inner) = ty.strip_prefix("IO[").and_then(|s| s.strip_suffix(']')) {
         return format!("(IO {})", map_boogie_type(inner.trim(), m));
     }
+    // Type arguments are split at top-level commas only, so nested arguments such as
+    // `BOX[TUPLE[A, B]]` or `TUPLE[RESULT[A, E], B]` keep their own commas.
     if let Some(inner) = ty.strip_prefix("TUPLE[").and_then(|s| s.strip_suffix(']')) {
-        let parts: Vec<String> = inner
-            .split(',')
-            .map(|p| map_boogie_type(p.trim(), m))
+        let parts: Vec<String> = split_top_level_commas(inner)
+            .into_iter()
+            .map(|p| map_boogie_type(p, m))
             .collect();
         if parts.len() == 2 {
             return format!("(Tuple2 {} {})", parts[0], parts[1]);
         }
     }
-    if let Some(idx) = ty.find('[') {
-        let base = &ty[..idx];
-        let inner = &ty[idx + 1..ty.len() - 1];
-        let parts: Vec<String> = inner
-            .split(',')
-            .map(|p| map_boogie_type(p.trim(), m))
-            .collect();
+    let (base, args) = split_type_app(ty);
+    if !args.is_empty() {
+        let parts: Vec<String> = args.iter().map(|p| map_boogie_type(p, m)).collect();
         return format!("({base} {})", parts.join(" "));
     }
     ty.to_string()
@@ -9033,6 +9076,8 @@ impl LawProofCtx<'_> {
     /// to *other* laws contribute nothing (no cross-law assumption, which could be circular).
     fn stmts(&mut self, e: &Expr, pad: &str) -> String {
         match e {
+            // A block written as an expression by pattern compilation.
+            Expr::If(c, ts, te, _, _) if matches!(**c, Expr::Bool(true)) => self.block(ts, te, pad),
             Expr::Call(f, args) if f == &self.law.name => self.recursive_call(args, pad),
             Expr::Bool(true) => String::new(),
             Expr::Call(f, _) if self.m.specify_laws.iter().any(|(_, l)| &l.name == f) => {
@@ -9046,13 +9091,9 @@ impl LawProofCtx<'_> {
             Expr::If(c, ts, te, es, ee) => {
                 let mut s = format!("{pad}if ({}) {{\n", self.emit(c));
                 let inner = format!("{pad}  ");
-                if ts.is_empty() {
-                    s.push_str(&self.stmts(te, &inner));
-                }
+                s.push_str(&self.block(ts, te, &inner));
                 s.push_str(&format!("{pad}}} else {{\n"));
-                if es.is_empty() {
-                    s.push_str(&self.stmts(ee, &inner));
-                }
+                s.push_str(&self.block(es, ee, &inner));
                 s.push_str(&format!("{pad}}}\n"));
                 s
             }
@@ -9061,7 +9102,23 @@ impl LawProofCtx<'_> {
                 let mut s = String::new();
                 let mut first = true;
                 for c in cases {
+                    if c.is_catch_all() {
+                        // The final `else`. E0316 guarantees that it is the last arm.
+                        let (stmts, body) = c.with_binder_substituted(scrut);
+                        if first {
+                            return self.block(&stmts, &body, pad);
+                        }
+                        s.push_str(&format!("{pad}}} else {{\n"));
+                        s.push_str(&self.block(&stmts, &body, &format!("{pad}  ")));
+                        break;
+                    }
                     let Some((prefix, vdecl)) = boogie_match_variant(c.ctor(), self.m) else {
+                        // Skipping the arm would silently lose its proof steps.
+                        s.push_str(&format!(
+                            "{pad}assert {{:msg \"{}::check::unknown_constructor_{}\"}} false;\n",
+                            self.law_ctx,
+                            c.ctor()
+                        ));
                         continue;
                     };
                     let kw = if first { "if" } else { "} else if" };
@@ -9074,6 +9131,21 @@ impl LawProofCtx<'_> {
                     let depth = self.scope.len();
                     for (opt_b, (fname, fty)) in c.top_bindings().iter().zip(vdecl.fields.iter()) {
                         if let Some(b) = opt_b {
+                            // A field typed by a type parameter of another module has no
+                            // type this context can name (`Some(val: A)` in a client), so
+                            // the binder stands for the projection itself.
+                            let foreign_generic = !prefix.is_empty()
+                                && boogie_prelude_ctx().is_some_and(|ctx| {
+                                    ctx.module(prefix.trim_end_matches("__")).is_some_and(|o| {
+                                        fty.split(|ch: char| !ch.is_alphanumeric() && ch != '_')
+                                            .any(|tok| o.type_params.iter().any(|tp| tp == tok))
+                                    })
+                                });
+                            if foreign_generic {
+                                let proj = format!("{prefix}{}_{fname}({scrut_bpl})", c.ctor());
+                                self.scope.push((b.clone(), proj));
+                                continue;
+                            }
                             let local = format!("_lb{}_{b}", self.locals.len());
                             self.locals
                                 .push((local.clone(), map_boogie_type(fty, self.m)));
@@ -9084,9 +9156,7 @@ impl LawProofCtx<'_> {
                             self.scope.push((b.clone(), local));
                         }
                     }
-                    if c.stmts.is_empty() {
-                        s.push_str(&self.stmts(&c.body, &inner));
-                    }
+                    s.push_str(&self.block(&c.stmts, &c.body, &inner));
                     self.scope.truncate(depth);
                 }
                 if !first {
@@ -9100,6 +9170,33 @@ impl LawProofCtx<'_> {
                 self.emit(e)
             ),
         }
+    }
+}
+
+impl LawProofCtx<'_> {
+    /// The statements of a block in a law body, then its proof steps. `let`s are substituted
+    /// (a law body is pure, and its `let`s need no Boogie locals). Nothing is skipped: a block
+    /// holds the bindings of a compiled pattern, and the proof steps that depend on them.
+    fn block(&mut self, stmts: &[Stmt], body: &Expr, pad: &str) -> String {
+        let mut s = String::new();
+        let mut substs: Vec<(String, Expr)> = Vec::new();
+        for st in stmts {
+            match st {
+                Stmt::Let(v, e) => {
+                    let val = subst_expr_vars(e, &substs);
+                    substs.retain(|(target, _)| target != v);
+                    substs.push((v.clone(), val));
+                }
+                Stmt::Check(_, e) => s.push_str(&self.stmts(&subst_expr_vars(e, &substs), pad)),
+                Stmt::Assume(_, e) => {
+                    let e = self.emit(&subst_expr_vars(e, &substs));
+                    s.push_str(&format!("{pad}assume {e};\n"));
+                }
+                Stmt::Reveal(_) => {}
+            }
+        }
+        s.push_str(&self.stmts(&subst_expr_vars(body, &substs), pad));
+        s
     }
 }
 
@@ -9428,6 +9525,26 @@ fn emit_boogie_proc_stmts_and_ret(
                 ));
             }
             for (idx, c) in cases.iter().enumerate() {
+                if c.is_catch_all() {
+                    // `case _` / `case x` matches whatever the earlier arms left: it is the
+                    // final `else` (or the whole match when first), and later arms are
+                    // unreachable. A bare binder is replaced by the scrutinee.
+                    let head = if idx == 0 { "if (true)" } else { "else" };
+                    s.push_str(&format!("{pad}{head} {{\n"));
+                    let (c_stmts, c_body) = c.with_binder_substituted(scrut);
+                    let mut rev_case = revealed.clone();
+                    s.push_str(&emit_boogie_proc_stmts_and_ret(
+                        &c_stmts,
+                        &c_body,
+                        r,
+                        m,
+                        &mut rev_case,
+                        indent + 2,
+                        strings,
+                    ));
+                    s.push_str(&format!("{pad}}}\n"));
+                    break;
+                }
                 let kw = if idx == 0 { "if" } else { "else if" };
                 s.push_str(&format!(
                     "{pad}{kw} ({}({scrut_bpl})) {{\n",
@@ -11284,23 +11401,30 @@ fn emit_boogie_expr_with_strings(
             if cases.is_empty() {
                 return s_str;
             }
-            let mut acc = emit_boogie_match_case(
-                &s_str,
-                cases.last().expect("non-empty cases"),
-                m,
-                implicit_fields,
-                fuel_var,
-                strings,
-            );
-            for c in cases.iter().rev().skip(1) {
-                let branch_val =
-                    emit_boogie_match_case(&s_str, c, m, implicit_fields, fuel_var, strings);
-                acc = format!(
-                    "(if {}({s_str}) then {branch_val} else {acc})",
-                    boogie_ctor_tester(c.ctor(), m)
+            // Built from the last arm backwards. A catch-all arm (`_` or a bare binder) is
+            // unconditional, so it drops every later (unreachable) arm instead of testing a
+            // constructor; the last arm is the final `else` (exhaustiveness is checked
+            // separately).
+            let mut acc: Option<String> = None;
+            for c in cases.iter().rev() {
+                let branch_val = emit_boogie_match_case(
+                    scrut,
+                    &s_str,
+                    c,
+                    m,
+                    implicit_fields,
+                    fuel_var,
+                    strings,
                 );
+                acc = Some(match acc {
+                    Some(rest) if !c.is_catch_all() => format!(
+                        "(if {}({s_str}) then {branch_val} else {rest})",
+                        boogie_ctor_tester(c.ctor(), m)
+                    ),
+                    _ => branch_val,
+                });
             }
-            acc
+            acc.unwrap_or(s_str)
         }
         Expr::RecordLit(fields) => {
             if let ReprKind::Product(decl_fields) = &m.repr {
@@ -11534,6 +11658,7 @@ fn emit_boogie_expr_with_strings(
 }
 
 fn emit_boogie_match_case(
+    scrut: &Expr,
     scrut_bpl: &str,
     c: &MatchCase,
     m: &ModuleDecl,
@@ -11541,8 +11666,8 @@ fn emit_boogie_match_case(
     fuel_var: &str,
     strings: &[String],
 ) -> String {
-    let mut expr = c.body.clone();
-    for st in c.stmts.iter().rev() {
+    let (stmts, mut expr) = c.with_binder_substituted(scrut);
+    for st in stmts.iter().rev() {
         if let Stmt::Let(var, val) = st {
             expr = subst_expr_var(&expr, var, val);
         }
@@ -13330,8 +13455,10 @@ fn eval_expr_symbolic_with_branches(
             let s_val = eval_expr_symbolic(scrut, env, m, revealed, fuel_limit)
                 .map_err(|f| fault_to_diagnostic(f, r, m, src, input_path, env, pcs))?;
             if let GardelVal::Variant(ctor, args) = &s_val {
-                if let Some(matched) = cases.iter().find(|c| c.ctor() == ctor) {
-                    let pat = if matched.bindings().is_empty() {
+                if let Some(matched) = cases.iter().find(|c| c.is_catch_all() || c.ctor() == ctor) {
+                    let pat = if matched.is_catch_all() {
+                        "_".to_string()
+                    } else if matched.bindings().is_empty() {
                         matched.ctor().to_string()
                     } else {
                         format!("{}({})", matched.ctor(), matched.bindings().join(", "))
@@ -14070,7 +14197,7 @@ fn eval_expr_symbolic(
         Expr::Match(scrut, cases) => {
             let sv = eval_expr_symbolic(scrut, env, m, revealed, fuel)?;
             if let GardelVal::Variant(ctor, args) = sv {
-                if let Some(c) = cases.iter().find(|c| c.ctor() == ctor) {
+                if let Some(c) = cases.iter().find(|c| c.is_catch_all() || c.ctor() == ctor) {
                     let mut sub_env = env.clone();
                     let mut sub_rev = revealed.clone();
                     for (b, av) in c.bindings().iter().zip(args.into_iter()) {
@@ -18419,6 +18546,202 @@ end
         let r = &plain.feature_routines[0].1;
         let text = format!("{:?}", r.body);
         assert!(!text.contains("_pm"), "{text}");
+    }
+
+    #[test]
+    fn test_d0_wildcard_arms_verify_on_own_prelude_and_linked_adts() {
+        // Task D.0: `case _` and a bare binder `case x` lower to the final `else` (or to the
+        // whole match when first) instead of an undeclared `is_` tester, on the module's
+        // own ADT, on a prelude ADT and on a linked user ADT inside a `program`.
+        let own = include_str!("../tests/boogie/wild_own.gdl").replace("\r\n", "\n");
+        let own = own.as_str();
+        let prelude = include_str!("../tests/boogie/wild_prelude.gdl");
+        let diags = c3_verify(own, "wild_own.gdl");
+        assert!(diags.is_empty(), "wild_own: {diags:?}");
+        let diags = c3_verify(prelude, "wild_prelude.gdl");
+        assert!(diags.is_empty(), "wild_prelude: {diags:?}");
+        let light = include_str!("../tests/boogie/wild_linked/light.gdl");
+        let prog = include_str!("../tests/boogie/wild_linked/wild_prog.gdl");
+        let linked = |prog: &str| {
+            let mut units = b4_units(&[("light.gdl", light), ("wild_prog.gdl", prog)]);
+            let checked = check_and_verify_project(&mut units, b4_opts(true, true));
+            assert!(checked.fatal.is_empty());
+            checked.diags.into_iter().map(|(_, d)| d).collect::<Vec<Diagnostic>>()
+        };
+        let diags = linked(prog);
+        assert!(diags.is_empty(), "wild_linked: {diags:?}");
+
+        // Mutants: a wrong wildcard (or bind-all) arm is rejected in every position.
+        let own_mutants = [
+            // last arm, own ADT
+            ("case _ then False", "case _ then True", "exact"),
+            // a wildcard after a constructor arm
+            ("red_zero: Current = Red implies Result = 0", "red_zero: Current = Red implies Result = 1", "red_zero"),
+            // first arm takes every value
+            ("case _ then 1", "case _ then 3", "one"),
+            // a bind-all arm after a constructor arm
+            ("red_stays: Current = Red implies Result = Red", "red_stays: Current = Red implies Result = Amber", "red_stays"),
+            // bind-all binder is the scrutinee
+            ("case other then other", "case other then Red", "others_stay"),
+        ];
+        for (from, to, tag) in own_mutants {
+            assert!(own.contains(from), "wild_own.gdl changed: {from}");
+            let diags = c3_verify(&own.replace(from, to), "wild_own_mutant.gdl");
+            assert!(diags.iter().any(|d| d.tag == tag), "{tag} must fail, got {diags:?}");
+        }
+        let prelude_mutants = [
+            ("case _ then 7", "case _ then 8", "seven"),
+            ("case None then Some(0)", "case None then None", "some"),
+            ("case _ then False", "case _ then True", "none_false"),
+        ];
+        for (from, to, tag) in prelude_mutants {
+            assert!(prelude.contains(from), "wild_prelude.gdl changed: {from}");
+            let diags = c3_verify(&prelude.replace(from, to), "wild_prelude_mutant.gdl");
+            assert!(diags.iter().any(|d| d.tag == tag), "{tag} must fail, got {diags:?}");
+        }
+        let linked_mutants = [
+            ("case _ then False", "case _ then True", "exact"),
+            ("case other then other", "case other then Amber", "no_amber"),
+        ];
+        for (from, to, tag) in linked_mutants {
+            assert!(prog.contains(from), "wild_prog.gdl changed: {from}");
+            let diags = linked(&prog.replace(from, to));
+            assert!(diags.iter().any(|d| d.tag == tag), "{tag} must fail, got {diags:?}");
+        }
+
+        // Exhaustiveness of a match without a catch-all is unchanged.
+        let partial = own.replace("        case Red then Green(30)\n        case other then other\n", "        case Red then Green(30)\n        case Amber then Amber\n");
+        assert_ne!(partial, own);
+        let diags = c3_verify(&partial, "wild_own_partial.gdl");
+        assert!(!diags.is_empty(), "a non-exhaustive match must still be rejected");
+    }
+
+    #[test]
+    fn test_d0_arm_after_a_catch_all_is_rejected() {
+        // Boogie stopped at the catch-all while a C `switch` still honoured a later `case`,
+        // so the binary could disagree with the proof. Such an arm is now an error.
+        let parse = |src: &str| {
+            let tokens = tokenize(src).expect("lexing");
+            Parser::new(tokens).parse_file().map(|_| ()).map_err(|e| e.message)
+        };
+        let wrap = |m: &str| {
+            format!("module L\n\nrepresentation {{ANY}}\n  | A\n  | B\n  | C\n\nfeature {{ANY}}\n\n  r: U64\n    do\n      {m}\n    end\n\nend\n")
+        };
+        for bad in [
+            "match Current case A then 1 case _ then 2 case B then 3 end",
+            "match Current case _ then 2 case B then 3 end",
+            "match Current case x then 2 case B then 3 end",
+            "match Current case _ then 2 case _ then 3 end",
+            "if True then 1 else match Current case _ then 2 case B then 3 end end",
+        ] {
+            let err = parse(&wrap(bad)).expect_err(bad);
+            assert!(err.starts_with("E0316: unreachable_match_arm"), "{err}");
+            assert!(err.contains("`L.r`"), "{err}");
+        }
+        for good in [
+            "match Current case A then 1 case B then 2 case C then 3 end",
+            "match Current case A then 1 case _ then 2 end",
+            "match Current case _ then 2 end",
+            "match Current case x then 2 end",
+        ] {
+            assert!(parse(&wrap(good)).is_ok(), "{good}");
+        }
+        // In a law too.
+        let src = "functions F\n\nspecify {ANY}\n\n  law l(o: OPTION[U64])\n    do\n      match o\n        case _ then True\n        case None then True\n      end\n    ensure\n      t: True\n    end\n\nend\n";
+        let err = parse(src).expect_err("law");
+        assert!(err.contains("`F.l`"), "{err}");
+    }
+
+    #[test]
+    fn test_d0_no_law_proof_step_is_dropped() {
+        // Compiled patterns put `let`s in law blocks, and such blocks and `case _` arms used
+        // to lose their proof steps without a word. A step is asserted in every position:
+        // the false one is reported and the true one verifies.
+        let bodies = [
+            ("tuple", "p: TUPLE[U64, U64]", "match p case (a, b) then STEP end"),
+            ("literal", "n: U64", "match n case 0 then STEP case _ then True end"),
+            ("literal_else", "n: U64", "match n case 0 then True case _ then STEP end"),
+            ("binder_else", "n: U64", "match n case 0 then True case k then STEP end"),
+            ("call_scrutinee", "n: U64", "match id(n) case 0 then STEP case _ then True end"),
+            ("last_wildcard", "o: OPTION[U64]", "match o case None then True case _ then STEP end"),
+            ("only_wildcard", "o: OPTION[U64]", "match o case _ then STEP end"),
+            ("bind_all", "o: OPTION[U64]", "match o case None then True case other then STEP end"),
+            ("nested", "o: OPTION[OPTION[U64]]", "match o case Some(Some(x)) then STEP case _ then True end"),
+        ];
+        let module = |law: &str, params: &str, body: &str, step: &str| {
+            format!(
+                "functions STEPS\n\nfeature {{ANY}}\n\n  id(n: U64): U64\n    do\n      n\n    end\n\nspecify {{ANY}}\n\n  law {law}({params})\n    do\n      {}\n    ensure\n      holds: 1 = 1\n    end\n\nend\n",
+                body.replace("STEP", step)
+            )
+        };
+        for (name, params, body) in bodies {
+            let good = module(name, params, body, "1 = 1");
+            let diags = c3_verify(&good, "steps.gdl");
+            assert!(diags.is_empty(), "{name}: a true step must verify: {diags:?}");
+            let bad = module(name, params, body, "1 = 2");
+            let diags = c3_verify(&bad, "steps.gdl");
+            assert!(diags.iter().any(|d| d.tag == "proof_step"), "{name}: a false step must be reported: {diags:?}");
+        }
+    }
+
+    #[test]
+    fn test_d0_induction_hypothesis_survives_a_catch_all_arm() {
+        // `count_is_n` needs its recursive call, which sits in a bare-binder arm. Dropped, the
+        // law cannot be proven. So this verifying shows that the hypothesis was used.
+        let src = "functions IND\n\nfeature {ANY}\n\n  count(n: U64): U64\n    variant\n      n\n    do\n      if n = 0 then 0 else count(n - 1) end\n    end\n\nspecify {ANY}\n\n  law count_is_n(n: U64)\n    variant\n      n\n    do\n      match n\n        case 0 then True\n        case k then count_is_n(k - 1)\n      end\n    ensure\n      same: count(n) = 0\n    end\n\nend\n";
+        let diags = c3_verify(src, "ind.gdl");
+        assert!(diags.is_empty(), "{diags:?}");
+        let without = src.replace("case k then count_is_n(k - 1)", "case k then True");
+        let diags = c3_verify(&without, "ind.gdl");
+        assert!(diags.iter().any(|d| d.level == "error"), "the law must need its hypothesis: {diags:?}");
+    }
+
+    #[test]
+    fn test_d0_bounded_evaluator_takes_catch_all_arms() {
+        // The fallback evaluator agrees with Boogie on `case _`, so a verdict does not depend
+        // on whether the solvers are installed.
+        let src = include_str!("../tests/boogie/wild_own.gdl");
+        let m = parse_user_module_with_prelude(src);
+        let diags = with_prelude_injection(true, || {
+            verify_module_phase3(&m, src, "wild_own.gdl", DEFAULT_FUEL, true, false, true)
+        });
+        assert!(diags.iter().all(|d| d.level != "error"), "{diags:?}");
+    }
+
+    #[test]
+    fn test_d0_nested_type_arguments_map_to_boogie() {
+        // Type arguments split at top-level commas only.
+        let m = parse_single_module("functions T\n\nfeature {ANY}\n\n  f: U64\n    do\n      0\n    end\n\nend\n");
+        assert_eq!(map_boogie_type("BOX[TUPLE[U64, BOOL]]", &m), "(BOX (Tuple2 int bool))");
+        assert_eq!(
+            map_boogie_type("TUPLE[PAIR[U64, BOOL], U64]", &m),
+            "(Tuple2 (PAIR int bool) int)"
+        );
+        assert_eq!(
+            map_boogie_type("MAP[TUPLE[U64, U64], STEP[TUPLE[BOOL, U64]]]", &m),
+            "(MAP (Tuple2 int int) (STEP (Tuple2 bool int)))"
+        );
+    }
+
+    #[test]
+    fn test_d0_patterns_in_laws_are_compiled() {
+        // Literal and tuple patterns in law bodies and contracts are desugared like routine
+        // bodies, so they verify in Boogie; a wrong conclusion is still rejected.
+        let src = include_str!("../tests/boogie/law_patterns.gdl");
+        let diags = c3_verify(src, "law_patterns.gdl");
+        assert!(diags.is_empty(), "law_patterns: {diags:?}");
+        let mutants = [
+            ("small: n <= 1", "small: n <= 2", "ten_or_eleven"),
+            ("case 1 then False case _ then True", "case _ then True", "twelve"),
+        ];
+        for (from, to, tag) in mutants {
+            assert!(src.contains(from), "law_patterns.gdl changed: {from}");
+            let diags = c3_verify(&src.replace(from, to), "law_patterns_mutant.gdl");
+            assert!(diags.iter().any(|d| d.tag == tag), "{tag} must fail, got {diags:?}");
+        }
+        let m = parse_user_module_with_prelude(src);
+        let text = format!("{:?}", m.specify_laws);
+        assert!(!text.contains("Lit("), "literal patterns must be compiled away: {text}");
     }
 
     #[test]

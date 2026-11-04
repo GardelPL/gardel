@@ -1,0 +1,77 @@
+module LIGHT
+
+representation {ANY}
+  | Red
+  | Amber
+  | Green(secs: NAT)
+
+feature {ANY}
+
+  -- Wildcard last, after one constructor.
+  is_red: BOOL
+    do
+      match Current
+        case Red then True
+        case _ then False
+      end
+    ensure
+      exact: Result = (Current = Red)
+    end
+
+  -- Wildcard after a constructor arm with a binder pattern.
+  code: NAT
+    do
+      match Current
+        case Green(_) then 5
+        case _ then 0
+      end
+    ensure
+      red_zero: Current = Red implies Result = 0
+      green_big: Current != Red and Current != Amber implies Result = 5
+    end
+
+  -- A wildcard as the only arm: every value takes it.
+  always_one: NAT
+    do
+      match Current
+        case _ then 1
+      end
+    ensure
+      one: Result = 1
+    end
+
+  -- Bind-all arm last: the binder is the scrutinee.
+  next: LIGHT
+    do
+      match Current
+        case Red then Green(30)
+        case other then other
+      end
+    ensure
+      red_goes_green: Current = Red implies Result = Green(30)
+      others_stay: Current != Red implies Result = Current
+    end
+
+  -- Bind-all arm after a constructor arm.
+  keep: LIGHT
+    do
+      match Current
+        case Amber then Red
+        case x then x
+      end
+    ensure
+      red_stays: Current = Red implies Result = Red
+    end
+
+  -- Wildcard inside an expression (contract position).
+  wait_secs: NAT
+    do
+      match Current
+        case Green(s) then s
+        case _ then 0
+      end
+    ensure
+      non_green_zero: (match Current case Green(_) then True case _ then False end) or Result = 0
+    end
+
+end

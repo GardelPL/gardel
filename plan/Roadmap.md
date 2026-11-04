@@ -469,10 +469,19 @@ flowchart TD
     D5 --> C44
 ```
 
-#### Task D.0: Fix `case _` on Sum Types in Boogie [📋 Planned]
-- [ ] Lower a wildcard arm to the negation of the earlier constructors, or to the final `else`, instead of emitting `is_`.
-- [ ] Check a wildcard on a module's own ADT, on a linked ADT, and on a prelude ADT, and a bind-all arm in each position.
-- Acceptance: a test where `case _` verifies in all three cases, and a mutant where a wrong wildcard arm is rejected. Exhaustiveness checks on non-wildcard matches are unchanged. `cargo test` and `--stdlib --strict` stay clean.
+#### Task D.0: Fix `case _` on Sum Types in Boogie, Nested Type Arguments, and Patterns in Laws [✅ Completed]
+- [x] Lower a wildcard arm to the final `else` (or to the whole match when it comes first), instead of emitting `is_`. An arm after a catch-all is rejected (`E0316`, below). A bare binder `case x` is replaced by the scrutinee.
+- [x] Check a wildcard on a module's own ADT, on a linked ADT, and on a prelude ADT, and a bind-all arm in each position (`gardelc/tests/boogie/wild_own.gdl`, `wild_prelude.gdl`, `wild_linked/`).
+- [x] Widened from review findings, since reactive programs hit them directly: `map_boogie_type` splits type arguments at top-level commas only, so `BOX[TUPLE[A, B]]` and `OPTION[RESULT[TUPLE[..], ..]]` map correctly. A reactive state or `STEP[...]` holding a `TUPLE` or `RESULT` hits the same path.
+- [x] Widened: `desugar_patterns` also compiles law bodies and law `require`/`ensure` clauses, so literal and tuple patterns in laws verify in Boogie (`tests/boogie/law_patterns.gdl`). Multi-step lemmas about `step` need this.
+- [x] **D.0 review fixes.**
+  - **Verifier and binary disagreed after a catch-all.** Boogie stopped at the first `case _`, while a C `switch` still honoured a later `case`, so a verified routine could return another value at run time. An arm after a catch-all is now `E0316: unreachable_match_arm`, reported during pattern compilation, so it covers routines, contracts, invariants and laws, and no backend has to decide what such an arm means. Add `E0316` to the spec in Task D.1.
+  - **Law proof steps were silently dropped.** Blocks with `let`s (which compiled patterns produce) and `case _` arms lost their steps and induction hypotheses. The law's own `ensure` was still proven, so no false law passed, but a false step went unreported and a valid induction could not be proven. `LawProofCtx::block` now substitutes `let`s and keeps `check`/`assume`, a catch-all arm is the final `else`, and an unknown constructor is an error instead of a skipped arm. The stdlib laws verify with their steps enforced.
+  - **Binder of a foreign generic field in a law** (`Some(x)` on `OPTION` in a client): the Boogie local had the undeclared type `A`. The binder now stands for the projection. This was hidden while those arms were dropped.
+  - **Bounded evaluator:** arms are taken in order and catch-alls match, so `case _` gets the same verdict with and without the solvers.
+  - **Nested type arguments:** `collect_monomorphized_instances` splits at top-level commas too. The D.0 test no longer depends on the checkout's line endings.
+  - Tests `test_d0_arm_after_a_catch_all_is_rejected`, `test_d0_no_law_proof_step_is_dropped` (a false step in 9 positions is reported, a true one verifies), `test_d0_induction_hypothesis_survives_a_catch_all_arm`, `test_d0_bounded_evaluator_takes_catch_all_arms`. `cargo test` 109/109. `--stdlib --strict` 0/0 on seeds 0–3.
+- Acceptance: a test where `case _` verifies in all three cases, and a mutant where a wrong wildcard arm is rejected. Exhaustiveness checks on non-wildcard matches are unchanged. `cargo test` and `--stdlib --strict` stay clean. Tests: `test_d0_wildcard_arms_verify_on_own_prelude_and_linked_adts`, `test_d0_nested_type_arguments_map_to_boogie`, `test_d0_patterns_in_laws_are_compiled`.
 
 #### Task D.1: Spec v0.5 and Proposal Revision 3 [📋 Planned]
 - [ ] Apply the table in proposal §12 to the spec, leaving out the `partial` rows.
