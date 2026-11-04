@@ -1,5 +1,6 @@
-// HAND-WRITTEN REFERENCE RUNTIME embedded in gardelc for module SEQ (parallel balanced tree SEQ[U64], C11 + OpenMP).
-// It is NOT compiled from the Gardel source of this module and is NOT covered by verification.
+// HAND-WRITTEN REFERENCE RUNTIME for SEQ[U64] (parallel balanced tree, C11 + OpenMP).
+// Benchmark baseline only: gardelc never emits it. It is NOT compiled from Gardel source and
+// is NOT covered by verification; it frees nothing.
 // Benchmarked by scripts/c3_regression.ps1. Build: gcc -std=gnu11 -O3 -fopenmp seq.c
 // Usage: seq [n]  (sums 1..n; exit 1 if the sum is wrong)
 #include <stdint.h>

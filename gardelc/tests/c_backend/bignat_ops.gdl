@@ -1,0 +1,28 @@
+program BIGNAT_OPS
+
+feature {ANY}
+
+  first_failure(n: U64): U64
+    require
+      five: n = 5
+    do
+      let a = BIGNAT.from_u64(n)
+      let b = BIGNAT.from_u64(7)
+      let z = BIGNAT.zero
+      if not a.equals(BIGNAT.from_u64(5)) then 1
+      else if a.equals(b) then 2
+      else if not a.less_than(b) then 3
+      else if b.less_than(a) then 4
+      else if z.limb_count != 0 then 5
+      else if a.limb_count != 1 then 6
+      else if not z.less_than(a) then 7
+      else 0
+      end end end end end end end
+    end
+
+  main(args: SEQ[STRING]): IO[EXIT_CODE]
+    do
+      IO.exit(first_failure(5))
+    end
+
+end

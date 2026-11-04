@@ -1,0 +1,39 @@
+program CLOSURES
+
+feature {ANY}
+
+  scaled_sum(s: SEQ[U64], k: U64): U64
+    do
+      s.map(fn(x: U64): U64 do x *% k end).fold_left(fn(acc: U64, y: U64): U64 do acc +% y +% k end, 0)
+    end
+
+  nested(s: SEQ[U64], k: U64): U64
+    do
+      s.fold_left(fn(acc: U64, x: U64): U64 do acc +% SEQ.singleton(x).fold_left(fn(a: U64, y: U64): U64 do a +% y *% k end, 0) end, 0)
+    end
+
+  composed(x: U64): U64
+    do
+      let h = FUNCTION_OPS.compose(fn(y: U64): U64 do y +% 1 end, fn(y: U64): U64 do y *% 2 end)
+      h(x)
+    end
+
+  first_failure(k: U64): U64
+    require
+      three: k = 3
+    do
+      let s = SEQ.singleton(1).concat(SEQ.singleton(2))
+      if scaled_sum(s, k) != 15 then 1
+      else if nested(s, k) != 9 then 2
+      else if composed(5) != 11 then 3
+      else if s.filter(fn(x: U64): BOOL do x > k - 2 end).length != 1 then 4
+      else 0
+      end end end end
+    end
+
+  main(args: SEQ[STRING]): IO[EXIT_CODE]
+    do
+      IO.exit(first_failure(3))
+    end
+
+end

@@ -1,0 +1,24 @@
+program SEQMATCH
+
+feature {ANY}
+
+  psum(s: SEQ[U64]): U64
+    variant
+      s
+    do
+      match s
+        case Empty then 0
+        case Leaf(v) then v
+        case Concat(l, r, _) then
+          let a = psum(l)
+          let b = psum(r)
+          a +% b
+      end
+    end
+
+  main(args: SEQ[STRING]): IO[EXIT_CODE]
+    do
+      IO.exit(if psum(SEQ.singleton(3).concat(SEQ.singleton(4))) = 7 then 0 else 1 end)
+    end
+
+end

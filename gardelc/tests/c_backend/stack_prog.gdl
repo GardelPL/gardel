@@ -1,0 +1,26 @@
+program STACK_PROG
+
+feature {ANY}
+
+  check(k: U64): U64
+    require
+      three: k = 3
+    do
+      let s1 = BOUNDED_STACK.make(4).push(10)
+      let s2 = s1.push(20)
+      let s3 = s2.push(k)
+      let p = s3.pop
+      if p.first != 3 then 1
+      else if p.second.count != 2 then 2
+      else if s3.count != 3 then 3
+      else if s3.capacity != 4 then 4
+      else 0
+      end end end end
+    end
+
+  main(args: SEQ[STRING]): IO[EXIT_CODE]
+    do
+      IO.exit(check(3))
+    end
+
+end

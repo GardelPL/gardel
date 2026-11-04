@@ -1,0 +1,22 @@
+program NULLARY
+
+feature {ANY}
+
+  answer: U64
+    do
+      41 + 1
+    ensure
+      exact: Result = 42
+    end
+
+  check_empty(s: SEQ[U64]): BOOL
+    do
+      SEQ.empty.concat(s).equals(s)
+    end
+
+  main(args: SEQ[STRING]): IO[EXIT_CODE]
+    do
+      IO.exit(if answer = 42 and check_empty(SEQ.singleton(3)) then 0 else 1 end)
+    end
+
+end

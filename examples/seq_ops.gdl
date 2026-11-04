@@ -40,11 +40,9 @@ feature {ANY}
       s.fold_left(fn(acc: U64, b: BOOL): U64 do if b then acc +% 1 else acc end end, 0)
     end
 
-  first_failure(n: U64): U64
-    require
-      five: n = 5
+  first_failure: U64
     do
-      let s = from_range(1, n)
+      let s = from_range(1, 5)
       let doubled = s.map(fn(x: U64): U64 do x *% 2 end)
       let evens = s.filter(fn(x: U64): BOOL do x % 2 = 0 end)
       let big = s.map(fn(x: U64): BOOL do x > 3 end)
@@ -56,7 +54,7 @@ feature {ANY}
       else if count_true(big) != 2 then 6
       else if not s.equals(from_range(1, 5)) then 7
       else if s.equals(doubled) then 8
-      else if not s.concat(SEQ.empty).equals(s) then 9
+      else if not SEQ.empty.concat(s).equals(s) then 9
       else if s.is_empty then 10
       else if not s.filter(fn(x: U64): BOOL do x > 9 end).is_empty then 11
       else if s.length != 5 then 12
@@ -66,7 +64,7 @@ feature {ANY}
 
   main(args: SEQ[STRING]): IO[EXIT_CODE]
     do
-      IO.exit(first_failure(5))
+      IO.exit(first_failure)
     end
 
 end

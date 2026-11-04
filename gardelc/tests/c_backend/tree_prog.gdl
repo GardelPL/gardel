@@ -1,0 +1,17 @@
+program TREE_PROG
+
+feature {ANY}
+
+  check(n: NAT): U64
+    require
+      in_range: n >= 1 and n <= 1000
+    do
+      if TREE.from_range(1, n).max_value = n then 0 else 1 end
+    end
+
+  main(args: SEQ[STRING]): IO[EXIT_CODE]
+    do
+      IO.exit(check(1000))
+    end
+
+end

@@ -1,0 +1,43 @@
+program PATTERNS
+
+feature {ANY}
+
+  classify(n: U64): U64
+    do
+      match n
+        case 0 then 10
+        case 1 then 11
+        case _ then 12
+      end
+    end
+
+  swap(p: TUPLE[U64, BOOL]): TUPLE[BOOL, U64]
+    do
+      match p
+        case (a, b) then (b, a)
+      end
+    end
+
+  depth(o: OPTION[OPTION[U64]]): U64
+    do
+      match o
+        case Some(Some(x)) then x
+        case Some(None) then 1
+        case None then 0
+      end
+    end
+
+  first_or(r: RESULT[U64, TUPLE[U64, U64]]): U64
+    do
+      match r
+        case Ok((a, _)) then a
+        case Error(e) then e
+      end
+    end
+
+  main(args: SEQ[STRING]): IO[EXIT_CODE]
+    do
+      IO.exit(if classify(0) = 10 and classify(1) = 11 and classify(7) = 12 and swap((5, True)).second = 5 and swap((5, True)).first and depth(Some(Some(9))) = 9 and depth(Some(None)) = 1 and depth(None) = 0 and first_or(Ok((4, 5))) = 4 and first_or(Error(3)) = 3 then 0 else 1 end)
+    end
+
+end

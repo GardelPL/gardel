@@ -11,7 +11,131 @@ use std::process::Command;
 use std::rc::Rc;
 
 mod c11_typed;
+mod patterns;
 pub use c11_typed::emit_c11_typed;
+
+/// In a `program` or `functions` module (no `Current`), a free name that is a routine of
+/// the module with no parameters is a call of it: `IO.exit(first_failure)` means
+/// `first_failure()`. Rewriting it to `Call(name, [])` lets every later phase (checks,
+/// verification, code generation) treat it as the call it is. Locals, parameters, `match`
+/// binders, lambda parameters and quantified variables shadow routine names.
+fn desugar_nullary_calls(m: &mut ModuleDecl) {
+    if !matches!(m.kind, ModuleKind::Program | ModuleKind::Functions) {
+        return;
+    }
+    let nullary: HashSet<String> = m
+        .create_routines
+        .iter()
+        .chain(&m.feature_routines)
+        .chain(&m.specify_routines)
+        .filter(|(_, r)| r.params.is_empty() && r.type_params.is_empty())
+        .map(|(_, r)| r.name.clone())
+        .collect();
+    if nullary.is_empty() {
+        return;
+    }
+    fn block(stmts: &mut [Stmt], body: &mut Expr, n: &HashSet<String>, bound: &mut Vec<String>) {
+        let mark = bound.len();
+        for st in stmts.iter_mut() {
+            match st {
+                Stmt::Let(v, e) => {
+                    expr(e, n, bound);
+                    bound.push(v.clone());
+                }
+                Stmt::Check(_, e) | Stmt::Assume(_, e) => expr(e, n, bound),
+                Stmt::Reveal(_) => {}
+            }
+        }
+        expr(body, n, bound);
+        bound.truncate(mark);
+    }
+    fn expr(e: &mut Expr, n: &HashSet<String>, bound: &mut Vec<String>) {
+        match e {
+            Expr::Var(v) => {
+                if n.contains(v.as_str()) && !bound.iter().any(|b| b == v) {
+                    *e = Expr::Call(v.clone(), Vec::new());
+                }
+            }
+            Expr::Int(_) | Expr::Float(_) | Expr::Char(_) | Expr::Unit | Expr::Bool(_) | Expr::Str(_) => {}
+            Expr::UnaryNot(x) | Expr::UnaryNeg(x) => expr(x, n, bound),
+            Expr::BinOp(_, l, r) => {
+                expr(l, n, bound);
+                expr(r, n, bound);
+            }
+            Expr::Call(_, args) => args.iter_mut().for_each(|a| expr(a, n, bound)),
+            Expr::MethodCall(recv, _, args) => {
+                // `T.r` with `T` a type name stays as it is (a `Var` receiver that names a
+                // routine is still a value and is rewritten).
+                expr(recv, n, bound);
+                args.iter_mut().for_each(|a| expr(a, n, bound));
+            }
+            Expr::If(c, ts, te, es, ee) => {
+                expr(c, n, bound);
+                block(ts, te, n, bound);
+                block(es, ee, n, bound);
+            }
+            Expr::Match(sc, cases) => {
+                expr(sc, n, bound);
+                for c in cases.iter_mut() {
+                    let mark = bound.len();
+                    bound.extend(c.bindings());
+                    block(&mut c.stmts, &mut c.body, n, bound);
+                    bound.truncate(mark);
+                }
+            }
+            Expr::RecordLit(fs) => fs.iter_mut().for_each(|(_, x)| expr(x, n, bound)),
+            Expr::RecordUpdate(b, fs) => {
+                expr(b, n, bound);
+                fs.iter_mut().for_each(|(_, x)| expr(x, n, bound));
+            }
+            Expr::TupleLit(xs) => xs.iter_mut().for_each(|x| expr(x, n, bound)),
+            Expr::Forall(v, _, b) | Expr::Exists(v, _, b) => {
+                bound.push(v.clone());
+                expr(b, n, bound);
+                bound.pop();
+            }
+            Expr::WithIo(io, fin) => {
+                let mark = bound.len();
+                for st in io.iter_mut() {
+                    match st {
+                        IoStmt::Bind(v, x) => {
+                            expr(x, n, bound);
+                            bound.push(v.clone());
+                        }
+                        IoStmt::Action(x) => expr(x, n, bound),
+                    }
+                }
+                expr(fin, n, bound);
+                bound.truncate(mark);
+            }
+            Expr::Lambda(ps, _, stmts, body) => {
+                let mark = bound.len();
+                bound.extend(ps.iter().map(|(p, _)| p.clone()));
+                block(stmts, body, n, bound);
+                bound.truncate(mark);
+            }
+        }
+    }
+    let all = m
+        .create_routines
+        .iter_mut()
+        .chain(m.feature_routines.iter_mut())
+        .chain(m.specify_routines.iter_mut());
+    for (_, r) in all {
+        let mut bound: Vec<String> = r.params.iter().map(|(p, _)| p.clone()).collect();
+        for (_, e) in r.requires.iter_mut() {
+            expr(e, &nullary, &mut bound);
+        }
+        for e in r.variant.iter_mut() {
+            expr(e, &nullary, &mut bound);
+        }
+        block(&mut r.stmts, &mut r.body, &nullary, &mut bound);
+        bound.push("Result".into());
+        for (_, e) in r.ensures.iter_mut() {
+            expr(e, &nullary, &mut bound);
+        }
+    }
+}
 
 // ============================================================================
 // 1. AST DEFINITIONS (Gardel v0.4 Phase 4: Concepts, Boogie, Fuel, Stdlib & IO)
@@ -1319,7 +1443,7 @@ impl Parser {
         }
         self.expect_kw("end")?;
 
-        Ok(ModuleDecl {
+        let mut m = ModuleDecl {
             kind,
             name,
             type_params,
@@ -1332,7 +1456,10 @@ impl Parser {
             create_routines,
             feature_routines,
             invariants,
-        })
+        };
+        desugar_nullary_calls(&mut m);
+        patterns::desugar_patterns(&mut m);
+        Ok(m)
     }
 
     fn is_section_or_end(&self) -> bool {
@@ -5848,7 +5975,15 @@ fn infer_gardel_type(e: &Expr, m: &ModuleDecl, ctx: &BoogiePreludeCtx) -> Option
                         let (rd, _) = find_module_routine(m, r)?;
                         return instantiate_ret_type(m, rd, None, &arg_tys, &m.type_params);
                     }
-                    if let Some(p) = ctx.module(v) {
+                    // `FUNCTION_OPS`/`LIST_OPS` calls are translated to built-ins, so these
+                    // modules may be absent from the context; their declared signatures
+                    // still give the result type.
+                    let owner = ctx.module(v).or_else(|| {
+                        matches!(v.as_str(), "FUNCTION_OPS" | "LIST_OPS")
+                            .then(|| standard_prelude().module(v))
+                            .flatten()
+                    });
+                    if let Some(p) = owner {
                         let (rd, _) = find_module_routine(p, r)?;
                         return instantiate_ret_type(p, rd, None, &arg_tys, &[]);
                     }
@@ -5864,7 +5999,17 @@ fn infer_gardel_type(e: &Expr, m: &ModuleDecl, ctx: &BoogiePreludeCtx) -> Option
                     }
                 }
             }
-            let rt = infer_gardel_type(recv, m, ctx)?;
+            let rt = match infer_gardel_type(recv, m, ctx) {
+                Some(t) => t,
+                None => {
+                    // `M.make(4).push(10)`: the receiver's type arguments are fixed only
+                    // by this call's arguments; infer the result from the routine of the
+                    // receiver's module.
+                    let p = ctx.module(prelude_result_head(recv, ctx)?)?;
+                    let (rd, _) = find_module_routine(p, r)?;
+                    return instantiate_ret_type(p, rd, None, &arg_tys, &[]);
+                }
+            };
             let head = type_head(&rt).to_string();
             if head == "LIST" || (head == "SEQ" && ctx.module("SEQ").is_none()) {
                 let elem = split_type_app(&rt).1.first().map(|s| s.to_string());
@@ -5915,6 +6060,22 @@ fn infer_gardel_type(e: &Expr, m: &ModuleDecl, ctx: &BoogiePreludeCtx) -> Option
 
 /// Decides whether `recv.mname(..)` in user module `m` targets an injected prelude
 /// module's routine, returning that module's name.
+/// The prelude module whose values `e` produces, when only that is known: `SEQ.empty`
+/// (element type not yet inferable) and call chains on it such as `SEQ.empty.concat(s)`.
+/// Enough to route a method call to the right module.
+fn prelude_result_head<'c>(e: &Expr, ctx: &'c BoogiePreludeCtx) -> Option<&'c str> {
+    let Expr::MethodCall(recv, r, _) = e else {
+        return None;
+    };
+    let owner: &ModuleDecl = match &**recv {
+        Expr::Var(v) if boogie_env_type(v).is_none() && ctx.module(v).is_some() => ctx.module(v)?,
+        inner => ctx.module(prelude_result_head(inner, ctx)?)?,
+    };
+    let (rd, _) = find_module_routine(owner, r)?;
+    let ret = rd.ret_type.trim();
+    (ret == "Current" || type_head(ret) == owner.name).then_some(owner.name.as_str())
+}
+
 fn resolve_prelude_receiver(
     recv: &Expr,
     mname: &str,
@@ -5937,7 +6098,9 @@ fn resolve_prelude_receiver(
     }
     let has_instance_routine =
         |p: &ModuleDecl| find_module_routine(p, mname).is_some_and(|(_, has_cur)| has_cur);
-    if let Some(ty) = infer_gardel_type(recv, m, ctx) {
+    let inferred = infer_gardel_type(recv, m, ctx)
+        .or_else(|| prelude_result_head(recv, ctx).map(|h| h.to_string()));
+    if let Some(ty) = inferred {
         let head = type_head(&ty);
         if head != m.name {
             if let Some(p) = ctx.module(head) {
@@ -8689,15 +8852,11 @@ fn emit_group_call_termination(
     let emit = |e: &Expr| {
         emit_boogie_expr_with_strings(e, m, &HashSet::new(), revealed, "DefaultFuel", strings)
     };
-    let is_adt_ty =
-        |t: &str| t == m.name || t == "Current" || t.starts_with(&format!("{}[", m.name));
-    let structural = |v: &Expr, params: &[(String, String)]| -> bool {
-        match v {
-            Expr::Var(x) => {
-                x == "Current" || params.iter().any(|(pn, pt)| pn == x && is_adt_ty(pt))
-            }
-            _ => false,
+    let size_of = |v: &Expr, rd: &RoutineDecl| -> Option<String> {
+        if matches!(v, Expr::Var(x) if x == "Current") {
+            return Some(format!("{}_adt_size", m.name));
         }
+        structural_variant(v, rd, m)
     };
     let mut substs: Vec<(String, Expr)> = callee
         .params
@@ -8715,24 +8874,22 @@ fn emit_group_call_termination(
     let mut curr = Vec::new();
     let mut next = Vec::new();
     for i in 0..k {
-        let c_struct = structural(&r.variant[i], &r.params);
-        let n_struct = structural(&callee.variant[i], &callee.params);
-        let c = if c_struct {
-            format!("{}_adt_size({})", m.name, emit(&r.variant[i]))
-        } else {
-            emit(&r.variant[i])
+        let c_size = size_of(&r.variant[i], r);
+        let n_size = size_of(&callee.variant[i], callee);
+        let c = match &c_size {
+            Some(f) => format!("{f}({})", emit(&r.variant[i])),
+            None => emit(&r.variant[i]),
         };
-        if !c_struct {
+        if c_size.is_none() {
             s.push_str(&format!(
                 "{pad}assert {{:msg \"{}::variant::variant_non_negative\"}} 0 <= {c};\n",
                 r.name
             ));
         }
         let ne = subst_expr_vars(&callee.variant[i], &substs);
-        let n = if n_struct {
-            format!("{}_adt_size({})", m.name, emit(&ne))
-        } else {
-            emit(&ne)
+        let n = match &n_size {
+            Some(f) => format!("{f}({})", emit(&ne)),
+            None => emit(&ne),
         };
         curr.push(c);
         next.push(n);
@@ -9979,6 +10136,28 @@ fn emit_boogie_expr_obligations(
     s
 }
 
+/// Structural size function measuring a variant component of type `ty`: the module's
+/// own `<M>_adt_size`, or the namespaced `<P>__<P>_adt_size` of a sum type `P` from the
+/// prelude or a linked project module (e.g. a client recursing on `SEQ`'s constructors).
+/// The size axioms (a field is smaller than its value) come with that module's theory.
+fn adt_size_fn(ty: &str, m: &ModuleDecl) -> Option<String> {
+    let t = ty.trim();
+    if t == m.name || t == "Current" || t.starts_with(&format!("{}[", m.name)) {
+        return Some(format!("{}_adt_size", m.name));
+    }
+    let ctx = boogie_prelude_ctx()?;
+    let head = type_head(t);
+    let p = ctx.module(head)?;
+    matches!(p.repr, ReprKind::Sum(_)).then(|| format!("{head}__{head}_adt_size"))
+}
+
+/// The size function of variant component `v` when it is a parameter of `r` of an ADT type.
+fn structural_variant(v: &Expr, r: &RoutineDecl, m: &ModuleDecl) -> Option<String> {
+    let Expr::Var(x) = v else { return None };
+    let (_, t) = r.params.iter().find(|(pn, _)| pn == x)?;
+    adt_size_fn(t, m)
+}
+
 fn emit_boogie_variant_obligations(
     r: &RoutineDecl,
     m: &ModuleDecl,
@@ -10010,14 +10189,18 @@ fn emit_boogie_variant_obligations(
     let mut next_vals = Vec::new();
 
     for v_e in &r.variant {
-        let curr_v =
+        // A structural variant on an ADT parameter is measured by the value's size.
+        let size = structural_variant(v_e, r, m);
+        let mut curr_v =
             emit_boogie_expr_with_strings(v_e, m, &empty_fields, revealed, "DefaultFuel", strings);
-        s.push_str(&format!(
-            "{pad}assert {{:msg \"{}::variant::variant_non_negative\"}} 0 <= {curr_v};\n",
-            r.name
-        ));
+        if size.is_none() {
+            s.push_str(&format!(
+                "{pad}assert {{:msg \"{}::variant::variant_non_negative\"}} 0 <= {curr_v};\n",
+                r.name
+            ));
+        }
         let next_var_e = subst_expr_vars(v_e, substs);
-        let next_v = emit_boogie_expr_with_strings(
+        let mut next_v = emit_boogie_expr_with_strings(
             &next_var_e,
             m,
             &empty_fields,
@@ -10025,6 +10208,10 @@ fn emit_boogie_variant_obligations(
             "DefaultFuel",
             strings,
         );
+        if let Some(f) = size {
+            curr_v = format!("{f}({curr_v})");
+            next_v = format!("{f}({next_v})");
+        }
         curr_vals.push(curr_v);
         next_vals.push(next_v);
     }
@@ -10104,10 +10291,16 @@ pub fn subst_expr_vars(e: &Expr, substs: &[(String, Expr)]) -> Expr {
             Box::new(subst_expr_vars(l, substs)),
             Box::new(subst_expr_vars(r, substs)),
         ),
-        Expr::Call(f, args) => Expr::Call(
-            f.clone(),
-            args.iter().map(|a| subst_expr_vars(a, substs)).collect(),
-        ),
+        Expr::Call(f, args) => {
+            let args: Vec<Expr> = args.iter().map(|a| subst_expr_vars(a, substs)).collect();
+            // A call of a substituted function value `h(x)` (e.g. `let h = compose(..)`)
+            // becomes a call of the replacement: `repl.apply(x)`, or a renamed call.
+            match substs.iter().find(|(target, _)| target == f) {
+                Some((_, Expr::Var(r))) => Expr::Call(r.clone(), args),
+                Some((_, repl)) => Expr::MethodCall(Box::new(repl.clone()), "apply".into(), args),
+                None => Expr::Call(f.clone(), args),
+            }
+        }
         Expr::MethodCall(recv, mname, args) => Expr::MethodCall(
             Box::new(subst_expr_vars(recv, substs)),
             mname.clone(),
@@ -14230,379 +14423,10 @@ pub fn is_tail_recursive_routine(r: &RoutineDecl) -> bool {
 // 10. BACKEND 2: C11 RUNTIME EMITTER (.c) (Phase 4 Stdlib: SEQ, BIGNAT, STRING, IO)
 // ============================================================================
 
-/// Module names for which `emit_c11` returns a hand-written reference runtime instead of
-/// lowering the module's Gardel source. That C is NOT covered by verification, and it is
-/// selected by exact name only: monomorphized names such as `SEQ_U64` (what the CLI emits
-/// for `SEQ`) go through the general emitter. Keep in sync with the arms of `emit_c11`.
-pub const C11_REFERENCE_RUNTIMES: &[&str] =
-    &["TREE", "BOUNDED_STACK", "PEANO", "SEQ", "BIGNAT", "STRING"];
-
+/// The untyped C emitter (kept for its unit tests). The CLI uses the typed backend,
+/// `c11_typed::emit_c11_typed`, for every C output.
 pub fn emit_c11(m: &ModuleDecl) -> String {
-    let mut out = String::new();
-    match m.name.as_str() {
-        "TREE" => {
-            out.push_str(
-                r#"// HAND-WRITTEN REFERENCE RUNTIME embedded in gardelc for module TREE (C11 + OpenMP).
-// It is NOT compiled from the Gardel source of this module and is NOT covered by verification.
-#include <stdint.h>
-#include <stdio.h>
-#include <stdlib.h>
-
-typedef uint64_t U64;
-
-typedef struct TREE {
-    enum { TAG_Leaf, TAG_Node } tag;
-    union {
-        struct { U64 value; } Leaf;
-        struct { struct TREE* left; struct TREE* right; } Node;
-    };
-} TREE;
-
-static inline TREE* make_Leaf(U64 value) {
-    TREE* t = (TREE*)malloc(sizeof(TREE));
-    t->tag = TAG_Leaf;
-    t->Leaf.value = value;
-    return t;
-}
-
-static inline TREE* make_Node(TREE* left, TREE* right) {
-    TREE* t = (TREE*)malloc(sizeof(TREE));
-    t->tag = TAG_Node;
-    t->Node.left = left;
-    t->Node.right = right;
-    return t;
-}
-
-TREE* from_range(U64 lo, U64 hi) {
-    if (lo == hi) {
-        return make_Leaf(lo);
-    } else {
-        U64 mid = lo + (hi - lo) / 2;
-        TREE* left_tree = NULL;
-        TREE* right_tree = NULL;
-        #pragma omp task shared(left_tree) if(hi - lo > 1024)
-        left_tree = from_range(lo, mid);
-        #pragma omp task shared(right_tree) if(hi - lo > 1024)
-        right_tree = from_range(mid + 1, hi);
-        #pragma omp taskwait
-        return make_Node(left_tree, right_tree);
-    }
-}
-
-U64 max_value(TREE* Current) {
-    switch (Current->tag) {
-        case TAG_Leaf:
-            return Current->Leaf.value;
-        case TAG_Node: {
-            U64 ml = 0, mr = 0;
-            #pragma omp task shared(ml)
-            ml = max_value(Current->Node.left);
-            #pragma omp task shared(mr)
-            mr = max_value(Current->Node.right);
-            #pragma omp taskwait
-            return (ml >= mr) ? ml : mr;
-        }
-    }
-    return 0;
-}
-
-int main(void) {
-    TREE* t = NULL;
-    U64 res = 0;
-    #pragma omp parallel
-    #pragma omp single
-    {
-        t = from_range(1, 100000);
-        res = max_value(t);
-    }
-    printf("Reference runtime TREE.from_range(1, 100000).max_value = %llu\n", (unsigned long long)res);
-    return 0;
-}
-"#,
-            );
-        }
-        "BOUNDED_STACK" => {
-            out.push_str(
-                r#"// HAND-WRITTEN REFERENCE RUNTIME embedded in gardelc for module BOUNDED_STACK (product and refinement).
-// It is NOT compiled from the Gardel source of this module and is NOT covered by verification.
-#include <stdint.h>
-#include <stdio.h>
-#include <stdlib.h>
-#include <stdbool.h>
-
-typedef uint64_t U64;
-
-typedef struct LIST_Node {
-    U64 head;
-    struct LIST_Node* tail;
-} LIST_Node;
-
-typedef struct BOUNDED_STACK {
-    LIST_Node* items;
-    U64 size;
-    U64 limit;
-} BOUNDED_STACK;
-
-typedef struct TUPLE_U64_BOUNDED_STACK {
-    U64 first;
-    BOUNDED_STACK second;
-} TUPLE_U64_BOUNDED_STACK;
-
-static inline BOUNDED_STACK make(U64 cap) {
-    BOUNDED_STACK s;
-    s.items = NULL;
-    s.size = 0;
-    s.limit = cap;
-    return s;
-}
-
-static inline U64 count(BOUNDED_STACK current) {
-    return current.size;
-}
-
-static inline U64 capacity(BOUNDED_STACK current) {
-    return current.limit;
-}
-
-static inline BOUNDED_STACK push(BOUNDED_STACK current, U64 x) {
-    if (current.size >= current.limit) {
-        fprintf(stderr, "Precondition violation: not_full\n");
-        exit(1);
-    }
-    LIST_Node* node = (LIST_Node*)malloc(sizeof(LIST_Node));
-    node->head = x;
-    node->tail = current.items;
-    BOUNDED_STACK next;
-    next.items = node;
-    next.size = current.size + 1;
-    next.limit = current.limit;
-    return next;
-}
-
-static inline TUPLE_U64_BOUNDED_STACK pop(BOUNDED_STACK current) {
-    if (current.size == 0 || current.items == NULL) {
-        fprintf(stderr, "Precondition violation: not_empty\n");
-        exit(1);
-    }
-    TUPLE_U64_BOUNDED_STACK res;
-    res.first = current.items->head;
-    res.second.items = current.items->tail;
-    res.second.size = current.size - 1;
-    res.second.limit = current.limit;
-    return res;
-}
-
-int main(void) {
-    printf("Initializing BOUNDED_STACK with capacity 5...\n");
-    BOUNDED_STACK s = make(5);
-    printf("Initial count = %llu, capacity = %llu\n", (unsigned long long)count(s), (unsigned long long)capacity(s));
-
-    printf("Pushing 10, 20, 30...\n");
-    s = push(s, 10);
-    s = push(s, 20);
-    s = push(s, 30);
-    printf("Current count = %llu\n", (unsigned long long)count(s));
-
-    TUPLE_U64_BOUNDED_STACK p1 = pop(s);
-    printf("Popped element = %llu, remaining count = %llu\n", (unsigned long long)p1.first, (unsigned long long)count(p1.second));
-    s = p1.second;
-
-    TUPLE_U64_BOUNDED_STACK p2 = pop(s);
-    printf("Popped element = %llu, remaining count = %llu\n", (unsigned long long)p2.first, (unsigned long long)count(p2.second));
-    s = p2.second;
-
-    printf("Reference runtime BOUNDED_STACK operations executed successfully.\n");
-    return 0;
-}
-"#,
-            );
-        }
-        "PEANO" => {
-            out.push_str(
-                r#"// HAND-WRITTEN REFERENCE RUNTIME embedded in gardelc for module PEANO (monomorphized concept conformance).
-// It is NOT compiled from the Gardel source of this module and is NOT covered by verification.
-#include <stdint.h>
-#include <stdio.h>
-#include <stdlib.h>
-#include <stdbool.h>
-
-typedef struct PEANO {
-    enum { TAG_Zero, TAG_Succ } tag;
-    struct PEANO* pred;
-} PEANO;
-
-static inline PEANO* make_Zero(void) {
-    PEANO* p = (PEANO*)malloc(sizeof(PEANO));
-    p->tag = TAG_Zero;
-    p->pred = NULL;
-    return p;
-}
-
-static inline PEANO* make_Succ(PEANO* pred) {
-    PEANO* p = (PEANO*)malloc(sizeof(PEANO));
-    p->tag = TAG_Succ;
-    p->pred = pred;
-    return p;
-}
-
-bool equals(PEANO* current, PEANO* other) {
-    while (current->tag == TAG_Succ && other->tag == TAG_Succ) {
-        current = current->pred;
-        other = other->pred;
-    }
-    return current->tag == TAG_Zero && other->tag == TAG_Zero;
-}
-
-bool less_than(PEANO* current, PEANO* other) {
-    while (current->tag == TAG_Succ && other->tag == TAG_Succ) {
-        current = current->pred;
-        other = other->pred;
-    }
-    return current->tag == TAG_Zero && other->tag == TAG_Succ;
-}
-
-bool less_or_equal(PEANO* current, PEANO* other) {
-    return less_than(current, other) || equals(current, other);
-}
-
-int main(void) {
-    PEANO* zero = make_Zero();
-    PEANO* one = make_Succ(zero);
-    PEANO* two = make_Succ(one);
-
-    printf("Testing monomorphized PEANO (satisfies ORD refines EQ):\n");
-    printf("  one.equals(one)        = %s\n", equals(one, one) ? "True" : "False");
-    printf("  one.less_than(two)     = %s\n", less_than(one, two) ? "True" : "False");
-    printf("  two.less_or_equal(two) = %s (inherited from concept ORD)\n", less_or_equal(two, two) ? "True" : "False");
-    return 0;
-}
-"#,
-            );
-        }
-        "SEQ" => {
-            // Kept as a real file so the C.3 benchmark builds the same source.
-            out.push_str(include_str!("../runtime/reference/seq.c"));
-        }
-        "BIGNAT" => {
-            out.push_str(
-                r#"// HAND-WRITTEN REFERENCE RUNTIME embedded in gardelc for module BIGNAT (64-bit limbs in SEQ[U64]).
-// It is NOT compiled from the Gardel source of this module and is NOT covered by verification.
-#include <stdint.h>
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
-
-typedef uint64_t U64;
-
-typedef struct BIGNAT {
-    U64* limbs;
-    U64 size;
-} BIGNAT;
-
-static inline BIGNAT bignat_zero(void) {
-    BIGNAT b = { NULL, 0 };
-    return b;
-}
-
-static inline BIGNAT bignat_from_u64(U64 x) {
-    if (x == 0) return bignat_zero();
-    BIGNAT b;
-    b.limbs = (U64*)malloc(sizeof(U64));
-    b.limbs[0] = x;
-    b.size = 1;
-    return b;
-}
-
-BIGNAT bignat_add(BIGNAT a, BIGNAT b) {
-    U64 max_len = (a.size > b.size) ? a.size : b.size;
-    U64* out = (U64*)calloc(max_len + 1, sizeof(U64));
-    unsigned __int128 carry = 0;
-    for (U64 i = 0; i < max_len; i++) {
-        unsigned __int128 la = (i < a.size) ? a.limbs[i] : 0;
-        unsigned __int128 lb = (i < b.size) ? b.limbs[i] : 0;
-        unsigned __int128 sum = la + lb + carry;
-        out[i] = (U64)sum;
-        carry = sum >> 64;
-    }
-    U64 final_size = max_len;
-    if (carry > 0) {
-        out[max_len] = (U64)carry;
-        final_size = max_len + 1;
-    }
-    BIGNAT res = { out, final_size };
-    return res;
-}
-
-int main(void) {
-    BIGNAT a = bignat_from_u64(0xFFFFFFFFFFFFFFFFULL);
-    BIGNAT b = bignat_from_u64(1ULL);
-    BIGNAT sum = bignat_add(a, b);
-    printf("Reference runtime BIGNAT (SEQ[U64] limbs, ghost MATH_INT): (2^64 - 1) + 1 => limb_count = %llu, high_limb = %llu, low_limb = %llu\n",
-           (unsigned long long)sum.size,
-           (unsigned long long)sum.limbs[1],
-           (unsigned long long)sum.limbs[0]);
-    return 0;
-}
-"#,
-            );
-        }
-        "STRING" => {
-            out.push_str(
-                r#"// HAND-WRITTEN REFERENCE RUNTIME embedded in gardelc for module STRING (ASCII words in SEQ[U64]; predates the packed UTF-8 runtime of Task C.2).
-// It is NOT compiled from the Gardel source of this module and is NOT covered by verification.
-#include <stdint.h>
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
-#include <stdbool.h>
-
-typedef uint64_t U64;
-typedef uint32_t CHAR;
-
-typedef struct STRING {
-    U64* words;
-    U64 word_len;
-    U64 byte_len;
-} STRING;
-
-STRING string_from_utf8(const char* utf8) {
-    size_t blen = strlen(utf8);
-    size_t wlen = (blen + 7) / 8;
-    U64* words = (U64*)calloc(wlen ? wlen : 1, sizeof(U64));
-    memcpy(words, utf8, blen);
-    STRING s = { words, (U64)wlen, (U64)blen };
-    return s;
-}
-
-STRING string_concat(STRING a, STRING b) {
-    U64 total_bytes = a.byte_len + b.byte_len;
-    U64 wlen = (total_bytes + 7) / 8;
-    U64* words = (U64*)calloc(wlen ? wlen : 1, sizeof(U64));
-    memcpy((char*)words, (const char*)a.words, (size_t)a.byte_len);
-    memcpy((char*)words + a.byte_len, (const char*)b.words, (size_t)b.byte_len);
-    STRING s = { words, wlen, total_bytes };
-    return s;
-}
-
-int main(void) {
-    STRING hello = string_from_utf8("Hello, ");
-    STRING world = string_from_utf8("Gardel v0.4 Phase 4!");
-    STRING msg = string_concat(hello, world);
-    printf("Reference runtime STRING (SEQ[U64] words = %llu, byte_len = %llu): %.*s\n",
-           (unsigned long long)msg.word_len,
-           (unsigned long long)msg.byte_len,
-           (int)msg.byte_len,
-           (const char*)msg.words);
-    return 0;
-}
-"#,
-            );
-        }
-        _ => {
-            out.push_str(&emit_c11_general_module(m));
-        }
-    }
-    out
+    emit_c11_general_module(m)
 }
 
 pub fn map_c_type(ty: &str) -> String {
@@ -14687,13 +14511,34 @@ typedef struct {
     const char* data;
     uint64_t len;
     uint64_t chars;
+    void* owner; /* counted buffer holding `data`; NULL for static text (literals, argv) */
 } GardelString;
 
 /* Runtime BYTES (spec 11): a read-only view of raw octets. */
 typedef struct {
     const uint8_t* data;
     uint64_t len;
+    void* owner; /* as for GardelString */
 } GardelBytes;
+
+/* Counted text buffers: the reference count precedes the octets. */
+typedef struct gardel_buf { _Atomic uint64_t rc; } gardel_buf;
+static inline char* gardel_buf_alloc(size_t n, void** owner) {
+    gardel_buf* b = (gardel_buf*)gardel_alloc(sizeof(gardel_buf) + n);
+    atomic_init(&b->rc, 1);
+    *owner = b;
+    return (char*)(b + 1);
+}
+static inline void gardel_owner_dup(void* o) {
+    if (o) atomic_fetch_add_explicit(&((gardel_buf*)o)->rc, 1, memory_order_relaxed);
+}
+static inline void gardel_owner_drop(void* o) {
+    if (o && atomic_fetch_sub_explicit(&((gardel_buf*)o)->rc, 1, memory_order_acq_rel) == 1) gardel_free(o);
+}
+static inline GardelString gardel_string_dup(GardelString s) { gardel_owner_dup(s.owner); return s; }
+static inline void gardel_string_drop(GardelString s) { gardel_owner_drop(s.owner); }
+static inline GardelBytes gardel_bytes_dup(GardelBytes b) { gardel_owner_dup(b.owner); return b; }
+static inline void gardel_bytes_drop(GardelBytes b) { gardel_owner_drop(b.owner); }
 
 /* Number of scalars in well-formed UTF-8: every byte that is not a continuation byte. */
 static inline uint64_t gardel_utf8_count(const uint8_t* bytes, uint64_t len) {
@@ -14708,7 +14553,7 @@ static inline uint64_t gardel_utf8_count(const uint8_t* bytes, uint64_t len) {
    read-only, NUL-terminated UTF-8 byte buffer emitted by the compiler. No copy and no
    decoding: the literal was validated at compile time. */
 static inline GardelString string_from_utf8(const uint8_t* bytes, uint64_t len) {
-    GardelString s = { (const char*)bytes, len, gardel_utf8_count(bytes, len) };
+    GardelString s = { (const char*)bytes, len, gardel_utf8_count(bytes, len), NULL };
     return s;
 }
 
@@ -14736,16 +14581,20 @@ static inline uint32_t gardel_string_character_at(GardelString s, uint64_t index
         i += n;
     }
 }
+/* Borrows `a` and `b`; returns a new counted string. */
 static inline GardelString gardel_string_concat(GardelString a, GardelString b) {
-    char* buf = (char*)gardel_alloc((size_t)(a.len + b.len + 1));
+    void* owner = NULL;
+    char* buf = gardel_buf_alloc((size_t)(a.len + b.len + 1), &owner);
     memcpy(buf, a.data, (size_t)a.len);
     memcpy(buf + a.len, b.data, (size_t)b.len);
     buf[a.len + b.len] = '\0';
-    GardelString s = { buf, a.len + b.len, a.chars + b.chars };
+    GardelString s = { buf, a.len + b.len, a.chars + b.chars, owner };
     return s;
 }
+/* Borrows `s`; the result shares its buffer (a new reference). */
 static inline GardelBytes gardel_string_to_utf8(GardelString s) {
-    GardelBytes b = { (const uint8_t*)s.data, s.len };
+    gardel_owner_dup(s.owner);
+    GardelBytes b = { (const uint8_t*)s.data, s.len, s.owner };
     return b;
 }
 
@@ -14994,8 +14843,12 @@ static struct {r}* gardel_io_read_line_result(void) {{
     uint64_t chars = 0;
     struct STRING_ERROR* derr = gardel_utf8_validate((const uint8_t*)buf, (uint64_t)len, &chars);
     if (derr) {{ free(buf); return make_{r}_Error(make_IO_ERROR_Decode(derr)); }}
-    buf[len] = '\0';
-    GardelString s = {{ buf, (uint64_t)len, chars }};
+    void* owner = NULL;
+    char* data = gardel_buf_alloc(len + 1, &owner);
+    memcpy(data, buf, len);
+    data[len] = '\0';
+    free(buf);
+    GardelString s = {{ data, (uint64_t)len, chars, owner }};
     return make_{r}_Ok(s);
 }}
 
@@ -15059,7 +14912,9 @@ fn emit_c11_from_utf8_runtime() -> String {
     uint64_t chars = 0;
     struct STRING_ERROR* err = gardel_utf8_validate(b.data, b.len, &chars);
     if (err) return make_{r}_Error(err);
-    GardelString s = {{ (const char*)b.data, b.len, chars }};
+    /* The string shares the bytes' buffer: a new reference. */
+    gardel_owner_dup(b.owner);
+    GardelString s = {{ (const char*)b.data, b.len, chars, b.owner }};
     return make_{r}_Ok(s);
 }}
 
@@ -16789,20 +16644,14 @@ fn main() {
             std::process::exit(1);
         }
 
-        // Hand-written reference runtimes are kept for their exact module names only;
-        // everything else is lowered from its Gardel source by the typed backend, with
-        // the other project modules (and the prelude) available to it.
-        let c_code = if C11_REFERENCE_RUNTIMES.contains(&converted_mono.name.as_str()) {
-            emit_c11(&converted_mono)
-        } else {
-            let others: Vec<&ModuleDecl> =
-                all_modules.iter().filter(|o| o.name != m.name).map(|o| &**o).collect();
-            let (code, errs) = emit_c11_typed(m, &others);
-            if m.name == module.name {
-                c_backend_errors = errs;
-            }
-            code
-        };
+        // Every C output is lowered from Gardel source by the typed backend, with the
+        // other project modules (and the prelude) available to it.
+        let others: Vec<&ModuleDecl> =
+            all_modules.iter().filter(|o| o.name != m.name).map(|o| &**o).collect();
+        let (c_code, errs) = emit_c11_typed(m, &others);
+        if m.name == module.name {
+            c_backend_errors = errs;
+        }
         if let Err(e) = fs::write(&c_path, c_code) {
             eprintln!("[ERROR] Failed to write C11 output '{c_path}': {e}");
             std::process::exit(1);
@@ -16839,12 +16688,6 @@ fn main() {
         println!("[5/5] Emitted C11 runtime target              -> {primary_c}");
         for e in &c_backend_errors {
             println!("      [C backend] {e} (the C file starts with #error)");
-        }
-        if C11_REFERENCE_RUNTIMES.contains(&module.name.as_str()) {
-            println!(
-                "      note: {primary_c} is the hand-written reference runtime for `{}`, not compiled from its source; verification does not cover it",
-                module.name
-            );
         }
         if gcc_compiled {
             println!("      Compiled native executable              -> {primary_exe}");
@@ -18822,51 +18665,11 @@ end
         }
     }
 
-    #[test]
-    fn test_c3_reference_runtimes_are_labeled_and_matched_by_exact_name() {
-        // Every hand-written template says so, and none claims to be verified.
-        for name in C11_REFERENCE_RUNTIMES {
-            let src = format!("module {name}\n\nrepresentation {{ANY}}\n  v: U64\n\nend\n");
-            let c = emit_c11(&parse_single_module(&src));
-            assert!(
-                c.starts_with(&format!("// HAND-WRITTEN REFERENCE RUNTIME embedded in gardelc for module {name} ")),
-                "{name}: missing reference-runtime header"
-            );
-            assert!(c.contains("NOT covered by verification"), "{name}");
-            assert!(!c.contains("printf(\"Verified"), "{name}: output claims verification");
-        }
-        // Monomorphized or look-alike names are compiled from source, not swapped for a template.
-        for name in ["SEQ_U64", "TREE_U64", "MY_SEQ"] {
-            let src = format!("module {name}\n\nrepresentation {{ANY}}\n  v: U64\n\nend\n");
-            let c = emit_c11(&parse_single_module(&src));
-            assert!(c.contains("General C11 AST Lowering"), "{name} must use the general emitter");
-            assert!(!c.contains("HAND-WRITTEN REFERENCE RUNTIME"), "{name}");
-        }
-        // The benchmark source is the file the SEQ arm embeds.
-        let seq = include_str!("../runtime/reference/seq.c");
-        assert!(seq.contains("seq_parallel_sum") && seq.contains("int main(int argc"));
-    }
-
     /// Compiles `c` with gcc (OpenMP on) and runs it once per input, returning exit code and
     /// trimmed stdout. `None` when gcc is not available.
     fn c3_native_runs(c: &str, tag: &str, inputs: &[&[u8]]) -> Option<Vec<(i32, String)>> {
         use std::io::Write;
-        let dir = env::temp_dir().join(format!("gardel_{tag}_{}", std::process::id()));
-        fs::create_dir_all(&dir).unwrap();
-        let c_path = dir.join(format!("{tag}.c"));
-        let exe = dir.join(format!("{tag}.exe"));
-        fs::write(&c_path, c).unwrap();
-        let out = Command::new("gcc")
-            .args(["-std=gnu11", "-O1", "-fopenmp", "-o"])
-            .arg(&exe)
-            .arg(&c_path)
-            .output()
-            .ok()?;
-        assert!(
-            out.status.success(),
-            "generated C must compile:\n{}",
-            String::from_utf8_lossy(&out.stderr)
-        );
+        let (dir, exe) = c3_compile(c, tag)?;
         let runs = inputs
             .iter()
             .map(|input| {
@@ -18885,6 +18688,53 @@ end
             .collect();
         let _ = fs::remove_dir_all(&dir);
         Some(runs)
+    }
+
+    /// Compiles `c` with gcc (OpenMP on). `None` when gcc is not available.
+    fn c3_compile(c: &str, tag: &str) -> Option<(std::path::PathBuf, std::path::PathBuf)> {
+        let dir = env::temp_dir().join(format!("gardel_{tag}_{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let c_path = dir.join(format!("{tag}.c"));
+        let exe = dir.join(format!("{tag}.exe"));
+        fs::write(&c_path, c).unwrap();
+        let out = Command::new("gcc")
+            .args(["-std=gnu11", "-O1", "-fopenmp", "-o"])
+            .arg(&exe)
+            .arg(&c_path)
+            .output()
+            .ok()?;
+        assert!(
+            out.status.success(),
+            "generated C must compile:\n{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        Some((dir, exe))
+    }
+
+    /// Live heap objects after evaluating `call` once (warm-up) and after 50 more times,
+    /// in the program's C with its `main` replaced. Both must be 0 for a leak-free routine
+    /// whose result is a plain value. `None` when gcc is not available.
+    fn c3_live_after(c: &str, tag: &str, call: &str) -> Option<(u64, u64)> {
+        let c = c.replace(
+            "int main(int argc, char** argv) {",
+            "int gardel_program_main(int argc, char** argv) {",
+        );
+        let harness = format!(
+            "{c}\nint main(void) {{\n    uint64_t r = (uint64_t)({call});\n    uint64_t first = gardel_live_allocations();\n    for (int i = 0; i < 50; i++) r += (uint64_t)({call});\n    printf(\"%llu %llu %llu\\n\", (unsigned long long)first, (unsigned long long)gardel_live_allocations(), (unsigned long long)r);\n    return 0;\n}}\n"
+        );
+        let (dir, exe) = c3_compile(&harness, tag)?;
+        let out = Command::new(&exe).output().unwrap();
+        let _ = fs::remove_dir_all(&dir);
+        let text = String::from_utf8_lossy(&out.stdout).to_string();
+        let nums: Vec<u64> = text.split_whitespace().map(|x| x.parse().unwrap()).collect();
+        Some((nums[0], nums[1]))
+    }
+
+    fn c3_verify(src: &str, path: &str) -> Vec<Diagnostic> {
+        let m = parse_user_module_with_prelude(src);
+        with_prelude_injection(true, || {
+            verify_module_phase3(&m, src, path, DEFAULT_FUEL, true, false, false)
+        })
     }
 
     fn c3_verify_and_emit(src: &str, path: &str) -> String {
@@ -18991,18 +18841,181 @@ end
     }
 
     #[test]
-    fn test_c3_typed_backend_refuses_what_it_cannot_lower() {
-        // A capturing lambda has no C lowering yet: the C file must not compile.
-        let src = "program CAP\n\nfeature {ANY}\n\n  total(s: SEQ[U64], k: U64): U64\n    do\n      s.fold_left(fn(acc: U64, x: U64): U64 do acc +% (x +% k) end, 0)\n    end\n\n  main(args: SEQ[STRING]): IO[EXIT_CODE]\n    do\n      IO.exit(total(SEQ.singleton(1), 2))\n    end\n\nend\n";
-        let m = parse_user_module_with_prelude(src);
-        let (c, errs) = emit_c11_typed(&m, &[]);
-        assert!(errs.iter().any(|e| e.contains("captures `k`")), "{errs:?}");
-        assert!(c.lines().nth(1).is_some_and(|l| l.starts_with("#error")), "C must start with #error");
-        // Specification-only routines are refused too.
+    fn test_d_no_hand_written_templates_remain() {
+        // The modules that used to get a hand-written C program are lowered from source.
+        for name in ["TREE", "BOUNDED_STACK", "PEANO", "SEQ", "BIGNAT", "STRING"] {
+            let src = format!("module {name}\n\nrepresentation {{ANY}}\n  v: U64\n\nend\n");
+            let c = emit_c11(&parse_single_module(&src));
+            assert!(!c.contains("HAND-WRITTEN"), "{name}");
+        }
+        for (path, src) in [
+            ("examples/tree.gdl", include_str!("../../examples/tree.gdl")),
+            ("examples/bounded_stack.gdl", include_str!("../../examples/bounded_stack.gdl")),
+            ("examples/peano_ord.gdl", include_str!("../../examples/peano_ord.gdl")),
+        ] {
+            let m = parse_user_module_with_prelude(src);
+            let (c, errs) = emit_c11_typed(&m, &[]);
+            assert!(errs.is_empty(), "{path}: {errs:?}");
+            assert!(c.contains(&format!("struct {} {{", c_instance_name(&if m.type_params.is_empty() { m.name.clone() } else { format!("{}[U64]", m.name) }))), "{path}");
+            if let Some((dir, _)) = c3_compile(&format!("{c}\nint main(void) {{ return 0; }}\n"), "tmpl") {
+                let _ = fs::remove_dir_all(dir);
+            }
+        }
+        let bignat = standard_prelude().module("BIGNAT").unwrap();
+        let (_, errs) = emit_c11_typed(bignat, &[]);
+        assert!(errs.is_empty(), "{errs:?}");
+    }
+
+    #[test]
+    fn test_d_former_template_modules_run_from_source() {
+        // Programs using TREE, BOUNDED_STACK and PEANO (multi-file projects) and BIGNAT
+        // (prelude), verified, compiled from source and run.
+        for (lib_path, lib, prog_path, prog) in [
+            ("tree.gdl", include_str!("../../examples/tree.gdl"), "tree_prog.gdl", include_str!("../tests/c_backend/tree_prog.gdl")),
+            ("bounded_stack.gdl", include_str!("../../examples/bounded_stack.gdl"), "stack_prog.gdl", include_str!("../tests/c_backend/stack_prog.gdl")),
+            ("peano.gdl", include_str!("../../examples/peano_ord.gdl"), "peano_prog.gdl", include_str!("../tests/c_backend/peano_prog.gdl")),
+        ] {
+            let mut units = b4_units(&[(lib_path, lib), (prog_path, prog)]);
+            let checked = check_and_verify_project(&mut units, b4_opts(true, true));
+            assert!(checked.fatal.is_empty());
+            let diags: Vec<&Diagnostic> = checked.diags.iter().map(|(_, d)| d).collect();
+            assert!(diags.is_empty(), "{prog_path}: {diags:?}");
+            let lib_m = units[0].ast.modules[0].clone();
+            let prog_m = units[1].ast.modules[0].clone();
+            let (c, errs) = emit_c11_typed(&prog_m, &[&lib_m]);
+            assert!(errs.is_empty(), "{prog_path}: {errs:?}");
+            if let Some(runs) = c3_native_runs(&c, prog_path.trim_end_matches(".gdl"), &[b""]) {
+                assert_eq!(runs[0].0, 0, "{prog_path}: first failing check");
+            }
+        }
+        let c = c3_verify_and_emit(include_str!("../tests/c_backend/bignat_ops.gdl"), "bignat_ops.gdl");
+        if let Some(runs) = c3_native_runs(&c, "bignatops", &[b""]) {
+            assert_eq!(runs[0].0, 0, "bignat_ops: first failing check");
+        }
+    }
+
+    #[test]
+    fn test_d_closures_capture_and_are_freed() {
+        // Captured locals (in map/filter/fold), a lambda nested in a lambda, and
+        // FUNCTION_OPS.compose (a stdlib closure) compiled from source.
+        let src = include_str!("../tests/c_backend/closures.gdl");
+        let c = c3_verify_and_emit(src, "closures.gdl");
+        assert!(c.contains("_env_drop(struct gardel_env* h)"), "closures carry counted environments");
+        if let Some(runs) = c3_native_runs(&c, "closures", &[b""]) {
+            assert_eq!(runs[0].0, 0, "closures: first failing check");
+        }
+        if let Some((first, after)) = c3_live_after(&c, "closuresleak", "CLOSURES__first_failure(3)") {
+            assert_eq!((first, after), (0, 0), "closures and their environments must be freed");
+        }
+        // The library build of FUNCTION_OPS (compose returns a capturing closure).
+        let fops = standard_prelude().module("FUNCTION_OPS").unwrap();
+        let (_, errs) = emit_c11_typed(fops, &[]);
+        assert!(errs.is_empty(), "{errs:?}");
+    }
+
+    #[test]
+    fn test_d_reference_counting_frees_everything() {
+        // Every routine below returns a plain value, so after it returns no heap object may
+        // remain: SEQ trees and lists (seq_ops), the parallel build and sum (seq_bench, tasks
+        // on), BIGNAT limbs.
+        let ops = c3_verify_and_emit(include_str!("../../examples/seq_ops.gdl"), "seq_ops.gdl");
+        let bench = c3_verify_and_emit(include_str!("../../examples/seq_bench.gdl"), "seq_bench.gdl");
+        let big = c3_verify_and_emit(include_str!("../tests/c_backend/bignat_ops.gdl"), "bignat_ops.gdl");
+        for (c, tag, call) in [
+            (&ops, "opsleak", "SEQ_OPS__first_failure()"),
+            (&bench, "benchleak", "({ struct SEQ_U64* t = SEQ_BENCH__from_range(1, 5000); uint64_t s = SEQ_BENCH__sum(t); drop_SEQ_U64(t); s; })"),
+            (&big, "bigleak", "BIGNAT_OPS__first_failure(5)"),
+        ] {
+            if let Some(live) = c3_live_after(c, tag, call) {
+                assert_eq!(live, (0, 0), "{tag}: live heap objects after the call");
+            }
+        }
+        // A leak is detected: a value that is never released stays live.
+        if let Some((first, after)) = c3_live_after(&bench, "benchleak2", "SEQ_BENCH__from_range(1, 10) != NULL") {
+            assert_eq!((first, after), (19, 19 * 51), "the harness must see unreleased trees");
+        }
+    }
+
+    #[test]
+    fn test_d_pattern_compilation() {
+        // Literal, tuple and nested patterns are compiled to flat matches and `if`s; the
+        // result verifies and runs.
+        let src = include_str!("../tests/c_backend/patterns.gdl");
+        let c = c3_verify_and_emit(src, "patterns.gdl");
+        if let Some(runs) = c3_native_runs(&c, "patterns", &[b""]) {
+            assert_eq!(runs[0].0, 0);
+        }
+        // First matching row wins: a wrong expectation for the nested `Some(None)` row fails.
+        let wrong = src.replace("case Some(None) then 1", "case Some(None) then 2");
+        let c = c3_verify_and_emit(&wrong, "patterns_mutant.gdl");
+        if let Some(runs) = c3_native_runs(&c, "patternsmut", &[b""]) {
+            assert_eq!(runs[0].0, 1);
+        }
+        // Exhaustiveness is still checked after compilation: dropping `case None` is reported.
+        let partial = src.replace("        case None then 0\n", "");
+        assert_ne!(partial, src);
+        let diags = c3_verify(&partial, "patterns_partial.gdl");
+        assert!(!diags.is_empty(), "a non-exhaustive nested match must be rejected");
+    }
+
+    #[test]
+    fn test_d_nullary_calls_and_receiver_inference() {
+        // `answer` (a bare zero-parameter routine) and `SEQ.empty` as a receiver.
+        let src = include_str!("../tests/c_backend/nullary.gdl");
+        let c = c3_verify_and_emit(src, "nullary.gdl");
+        if let Some(runs) = c3_native_runs(&c, "nullary", &[b""]) {
+            assert_eq!(runs[0].0, 0);
+        }
+        let diags = c3_verify(&src.replace("exact: Result = 42", "exact: Result = 43"), "nullary_mutant.gdl");
+        assert!(diags.iter().any(|d| d.tag == "exact"), "{diags:?}");
+    }
+
+    #[test]
+    fn test_d_client_match_on_prelude_seq() {
+        // A client recursing structurally on SEQ's constructors (`variant s`) verifies
+        // (termination via SEQ's size measure) and runs.
+        let c = c3_verify_and_emit(include_str!("../tests/c_backend/seqmatch.gdl"), "seqmatch.gdl");
+        if let Some(runs) = c3_native_runs(&c, "seqmatch", &[b""]) {
+            assert_eq!(runs[0].0, 0);
+        }
+    }
+
+    #[test]
+    fn test_d_main_args_are_validated_utf8() {
+        let c = c3_verify_and_emit(include_str!("../tests/c_backend/args.gdl"), "args.gdl");
+        let Some((dir, exe)) = c3_compile(&c, "args") else { return };
+        let run = |args: &[std::ffi::OsString]| -> (i32, String) {
+            let o = Command::new(&exe).args(args).output().unwrap();
+            (o.status.code().unwrap_or(-1), String::from_utf8_lossy(&o.stderr).to_string())
+        };
+        // exit = 10 * count + total code points
+        assert_eq!(run(&[]).0, 0);
+        assert_eq!(run(&["ab".into(), "\u{e9}\u{65e5}".into()]).0, 24);
+        // An argument that is not valid Unicode text is refused before `main` runs.
+        #[cfg(windows)]
+        let bad: std::ffi::OsString = {
+            use std::os::windows::ffi::OsStringExt;
+            std::ffi::OsString::from_wide(&[0x61, 0xD800])
+        };
+        #[cfg(unix)]
+        let bad: std::ffi::OsString = {
+            use std::os::unix::ffi::OsStringExt;
+            std::ffi::OsString::from_vec(vec![0x61, 0xFF])
+        };
+        let (code, err) = run(&["ok".into(), bad]);
+        assert_eq!(code, 2);
+        assert!(err.contains("argument 2 is not valid UTF-8"), "{err}");
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn test_d_typed_backend_refuses_specification_code() {
+        // Specification-only routines have no executable form: the C file starts with #error.
         let src = "program GHOST\n\nfeature {ANY}\n\n  main(args: SEQ[STRING]): IO[EXIT_CODE]\n    do\n      IO.exit(if SEQ.singleton(1).model.length = 1 then 0 else 1 end)\n    end\n\nend\n";
         let m = parse_user_module_with_prelude(src);
-        let (_, errs) = emit_c11_typed(&m, &[]);
+        let (c, errs) = emit_c11_typed(&m, &[]);
         assert!(errs.iter().any(|e| e.contains("specification (ghost) routine")), "{errs:?}");
+        assert!(c.lines().nth(1).is_some_and(|l| l.starts_with("#error")), "C must start with #error");
     }
 
     #[test]

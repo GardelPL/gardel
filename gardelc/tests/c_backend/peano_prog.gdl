@@ -1,0 +1,24 @@
+program PEANO_PROG
+
+feature {ANY}
+
+  check(u: U64): U64
+    require
+      zero: u = 0
+    do
+      let one = Succ(Zero)
+      let two = Succ(one)
+      if not one.less_than(two) then 1
+      else if two.less_than(one) then 2
+      else if not two.equals(Succ(Succ(Zero))) then 3
+      else if one.equals(two) then 4
+      else u
+      end end end end
+    end
+
+  main(args: SEQ[STRING]): IO[EXIT_CODE]
+    do
+      IO.exit(check(0))
+    end
+
+end

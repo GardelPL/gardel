@@ -82,7 +82,8 @@ flowchart TD
         C1["Task C.1: Physical File Decomposition of stdlib/"]
         C2["Task C.2: High-Performance Smart String (Packed/UTF-8)"]
         C3["Task C.3: Full Regression Verification & SMT Benchmark"]
-        C1 --> C2 --> C3
+        C4["Task C.4: Memory Management Performance"]
+        C1 --> C2 --> C3 --> C4
     end
 
     PhaseA --> PhaseB --> PhaseC
@@ -348,11 +349,43 @@ Source: [review/review.md](review/review.md). The verification notes for each fi
   - The script now sets BOM-less UTF-8 for `[Console]::InputEncoding`. Windows PowerShell 5 had prefixed piped input with U+FEFF, which the Gardel programs (correctly) rejected. The greeter check now compares ordinally: PowerShell's `-eq`/`-ceq` ignore U+FEFF, which had hidden the problem.
   - Tests: `test_c3_typed_backend_compiles_stdlib_seq_from_source`, `test_c3_seq_programs_run_natively_from_source` (includes a mutant that must fail check 2, and the depth-accounting check), `test_c3_typed_backend_runs_text_program` (the C.2 UTF-8 program with all 12 inputs through the new backend), `test_c3_typed_backend_refuses_what_it_cannot_lower`, `test_c3_lifted_lambdas_are_proven_not_assumed`. `cargo test` 85/85.
 - **Known limits:**
-  - **C backend:** no capturing lambdas (closures), so `FUNCTION_OPS.compose` and lambdas that use a local do not compile (`#error`). No nested patterns, tuples or literal patterns in `match`. `main(args)` gets an empty `SEQ[STRING]`: argv is not marshalled, and spec §11 does not say how `args` relates to argv. Nothing is freed (no reference counting or GC yet), so a long-running program leaks. A library build instantiates type parameters at `U64` only.
-  - **Verifier, client programs:** a client cannot `match` on the prelude `SEQ`'s constructors (it is modelled abstractly), a bare zero-parameter routine name is not treated as a call, and `SEQ.empty` as a *receiver* has no inferred element type. `examples/seq_ops.gdl` works around the last two.
-  - The reference templates for `TREE`, `BOUNDED_STACK`, `PEANO`, `BIGNAT` and `STRING` are still used for those exact names. The `STRING` template predates the packed UTF-8 runtime of C.2 (ASCII words in `SEQ[U64]`); user programs use the real `gardel_string_*` runtime.
+  - *(The C backend and verifier limits listed here at first were fixed by the second follow-up below.)*
   - Proof stability is checked on one Z3 seed only; gardelc has no seed option yet.
   - The BendRT backend emits `.bend` files, but C.3 did not run them.
+- [x] **C.3 follow-up 2: memory, closures, patterns, argv; no hand-written C left.**
+  - **Reference counting** (`c11_typed.rs`). Every heap value (module values, `LIST` cells, closure environments, string and byte buffers) has an atomic count. Gardel values are immutable and acyclic, so counting frees everything, deterministically. Calls borrow their arguments and return an owned result; constructors consume what they store; parameters, `match` binders and captures are borrowed; `let` and IO-bound locals are released at the end of their block; an owned temporary used as a borrow is bound and released after the use. Every lowered expression records whether it is owned, and `dup_*`/`drop_*` are inserted from that. Drops loop on the last same-type field, so long lists are freed in constant C stack. `STRING`/`BYTES` carry an `owner` (counted buffer, `NULL` for literals and argv). A test harness counts live allocations: 0 after 50 calls of every checked routine (SEQ ops, the parallel build and sum, closures, BIGNAT), and it does see a deliberately unreleased tree.
+  - **Closures:** a function value is `{fn, env}` with a counted environment of captured values (dup'd at creation, released with the environment). Lambdas capturing locals or `Current`, nested lambdas, routine names as values and `FUNCTION_OPS.compose` (a stdlib closure) compile and run.
+  - **Patterns** (`patterns.rs`, a pass after parsing): literal, tuple and nested patterns and top-level binders are compiled (clause matrix, first row wins) into flat matches, `if` chains and arm-local `let`s, for the verifier and the C backend alike. Exhaustiveness is still checked on the flat matches produced (a test removes `case None` from a nested match and expects a diagnostic). Tuples are C value structs.
+  - **argv** (spec §11): `main(args: SEQ[STRING])` gets argv[1..] as a balanced `SEQ[STRING]`; each argument is checked with the RFC 3629 validator of `read_line`, and an invalid one stops the program with exit code 2 and a message before `main` runs. On Windows the arguments come from the UTF-16 command line (the C `argv` is in the ANSI code page); unpaired surrogates are invalid.
+  - **No hand-written C:** `emit_c11`'s templates for `TREE`, `BOUNDED_STACK`, `PEANO`, `SEQ`, `BIGNAT`, `STRING` are deleted and the CLI lowers every module from source. `STRING`/`BYTES` library builds say that the runtime header provides them. Programs using `TREE`, `BOUNDED_STACK` and `PEANO` (verified as multi-file projects) and `BIGNAT` run from source. `gardelc/runtime/reference/seq.c` stays only as the benchmark baseline.
+  - **Verifier fixes for client programs:** a bare zero-parameter routine name in a `program`/`functions` module is a call (a scope-aware rewrite after parsing). Receiver types of static call chains are inferred from the method's arguments (`SEQ.empty.concat(s)`, `BOUNDED_STACK.make(4).push(10)`). A call of a `let`-bound function value (`let h = FUNCTION_OPS.compose(..)`, then `h(x)`) is substituted as `.apply`. A structural `variant` on a parameter of a prelude or linked ADT is measured by that module's size function, so a client can recurse on `SEQ`'s constructors (`examples/seq_bench.gdl` now sums in parallel this way).
+  - **C type aliases:** `NAT`/`EXIT_CODE` (`U64`) and `INT` (`I64`) are one spelling inside the C backend; otherwise `(U64) -> U64` and `(NAT) -> NAT` were different C function types.
+  - **Benchmark** (n = 4,000,000, best of 3, wall clock): compiled from Gardel 832 ms on 1 thread and 591 ms on 20; the reference 881 ms and 177 ms. The compiled program now frees its 8M-node tree before exiting (about 300 ms, sequential); the reference frees nothing. Reference counting itself added about 70 ms to the 1-thread build.
+  - Tests (`gardelc/tests/c_backend/*.gdl` fixtures): `test_d_no_hand_written_templates_remain`, `test_d_former_template_modules_run_from_source`, `test_d_closures_capture_and_are_freed`, `test_d_reference_counting_frees_everything`, `test_d_pattern_compilation`, `test_d_nullary_calls_and_receiver_inference`, `test_d_client_match_on_prelude_seq`, `test_d_main_args_are_validated_utf8`, `test_d_typed_backend_refuses_specification_code`. `cargo test` 92/92.
+- **Known limits (after follow-up 2):**
+  - Freeing is sequential and each value costs atomic count updates; a large structure released just before exit is freed anyway. No ownership transfer ("last use moves") yet.
+  - A non-decreasing recursion on a client ADT parameter is rejected by a solver timeout, not a clean `variant_decrease` failure.
+  - The untyped emitter (`emit_c11` / `emit_c11_general_module`) is no longer used by the CLI; only its old unit tests use it.
+  - A library build instantiates type parameters at `U64` only. Tuples are pairs only.
+  - Proof stability is checked on one Z3 seed only; the BendRT output is not run.
+
+#### Task C.4: Memory Management Performance [📋 Planned]
+
+**Objective:** make memory management cheaper while keeping reference counting, which suits Gardel's immutable, acyclic values and frees deterministically (tracing GC was considered and rejected: pauses and non-deterministic timing conflict with the bounded-work-per-event goal of reactive programs, and it complicates the OpenMP tasks).
+
+**Baseline** (`examples/seq_bench.gdl`, n = 4,000,000, i9-12900HK, after C.3 follow-up 2): 832 ms on 1 thread, 591 ms on 20. Of this, counting costs about 70 ms on the 1-thread build (atomic updates, mostly the copy/release pair around each `concat`), and freeing the 8M-node tree costs 260–325 ms, one `free()` per node on one thread. Most of the cost is the allocator, not the counting. Subtasks are ordered by payoff for effort; each is measured with `scripts/c3_regression.ps1` and must keep the leak tests (`test_d_reference_counting_frees_everything`) at 0.
+
+- [ ] **C.4.1 Skip freeing at program exit.** When `main` returns, or `IO.exit` ends the process, the operating system reclaims all memory, so the final drops are wasted work. Leave values alive at those points (e.g. `IO.exit` does not unwind, and `main`'s result path skips its pending drops).
+  - Acceptance: `seq_bench` no longer frees its tree before exiting (about 300 ms less at n = 4M); the leak tests still report 0 for routines that return normally (they measure inside the program, not at exit).
+- [ ] **C.4.2 Faster allocator.** Replace `malloc`/`free` in `gardel_alloc`/`gardel_free` with per-thread free lists by size class (most Gardel nodes are a few fixed sizes), or link an existing allocator such as mimalloc. Keep the live-allocation counter for tests, but make it per thread or debug-only so it is not a contended atomic.
+  - Acceptance: lower allocation and free time on 1 thread, and the 20-thread build no longer limited by heap contention; measured against the baseline above.
+- [ ] **C.4.3 Optimized reference counting (Perceus / Lean 4 style).**
+  - **Ownership transfer on last use:** pass a variable's reference instead of copying it when this is its last use, so `left.concat(right)` does not pay a copy then a release. Needs an owned-parameter calling convention where profitable, or borrow inference.
+  - **Reuse:** when a value's count is 1, a `match` arm that builds a value of the same shape updates it in place instead of freeing and allocating ("functional but in place").
+  - **Non-atomic counts for unshared values:** use atomics only for values another task can see; mark values as shared when they are passed into a task (as Lean does).
+  - Acceptance: most of the ~70 ms counting overhead removed; leak tests at 0; the native runs and the C.2 text program unchanged.
+- [ ] **C.4.4 Arena per step for reactive programs (evaluate with Phase D).** A reactive `step` is pure and returns the next state, so after each event everything not reachable from the new state (and the commands) is garbage. Allocate during a step in a bump arena, copy out only the surviving state, then release the whole arena at once. Cost scales with the live state rather than with allocation volume. Risk: a large state copied on every step; mitigate with an older generation (reference counted) for long-lived state.
+  - Acceptance: a prototype on a reactive example compared with plain reference counting (time per event and peak memory), and a decision recorded here.
 
 ---
 
@@ -364,13 +397,15 @@ Source: [review/review.md](review/review.md). The verification notes for each fi
 | **B** | **Compiler Prelude Injection** | `gardelc examples/greeter.gdl --strict` succeeds without `greeter.gdl` duplicating standard library definitions or faking `group` headers. |
 | **B** | **String Literal Lowering** | String literals in user programs type-check as prelude `STRING` and execute in C11 backend. |
 | **C** | **Modular Standard Library** | `stdlib/` organized into subdirectories (`concepts/`, `core/`, `collections/`, `numeric/`, `text/`, `functional/`). `phase4_stdlib_source()` bundles cleanly. |
-| **C** | **Zero Verification Errors** | `gardelc --stdlib --strict` verifies with **0 errors and 0 warnings**. All 4 example programs (`bounded_stack`, `greeter`, `peano_ord`, `tree`) verify with **0 errors and 0 warnings** under `--strict`. 100% of unit tests pass in `cargo test` (85/85). |
+| **C** | **Zero Verification Errors** | `gardelc --stdlib --strict` verifies with **0 errors and 0 warnings**. All 4 example programs (`bounded_stack`, `greeter`, `peano_ord`, `tree`) verify with **0 errors and 0 warnings** under `--strict`. 100% of unit tests pass in `cargo test` (92/92). |
 
 ---
 
 ## 6. Immediate Next Step
 
-With **Phase A: Language Specification Harmonization**, **Phase B: Compiler Engine & Prelude Tooling**, **Task C.1: Physical Decomposition of `stdlib/`**, **Task C.2: High-Performance Smart String (`stdlib/text/string.gdl`)**, and **Task C.3: Regression Verification & Performance Benchmarking** completely executed and verified with 0 errors and 0 warnings under `--strict`, Phase C is concluded. The verification baseline is clean. The native baseline covers `program` modules only (see the C.3 known limits).
+With **Phase A: Language Specification Harmonization**, **Phase B: Compiler Engine & Prelude Tooling**, **Task C.1: Physical Decomposition of `stdlib/`**, **Task C.2: High-Performance Smart String (`stdlib/text/string.gdl`)**, and **Task C.3: Regression Verification & Performance Benchmarking** completely executed and verified with 0 errors and 0 warnings under `--strict`, Phase C's planned work is done. The verification baseline is clean, and every module compiles from source to C with reference-counted memory (C.3 follow-ups).
 
-The next step is to define **Phase D** in this roadmap (tasks, dependency graph, acceptance criteria) before starting it. The typed C backend (C.3 follow-up) already covers building prelude ADTs, `match` binders and compiling non-`program` modules from source. The remaining C prerequisites that [reactive/reactive_programs.md](reactive/reactive_programs.md) depends on come first: memory reclamation (a reactive program runs forever, and nothing is freed yet), capturing closures, and retiring the remaining reference templates. Reactive programs (parser, checker, prelude, `shutdown_must_stop`, host loop) follow, starting with the `Print` + `Shutdown` slice.
+The next step is to define **Phase D** in this roadmap (tasks, dependency graph, acceptance criteria) before starting it. The C prerequisites of [reactive/reactive_programs.md](reactive/reactive_programs.md) are in place (C.3 follow-ups): every module compiles from source, closures work, and memory is reference counted, so a program that runs forever does not leak. Reactive programs (parser, checker, prelude, `shutdown_must_stop`, host loop) follow, starting with the `Print` + `Shutdown` slice.
+
+**Task C.4 (memory management performance)** is planned. C.4.1–C.4.3 do not depend on Phase D and can be done before or alongside it; C.4.1 and C.4.2 are small and have the largest measured payoff. C.4.4 needs a reactive program to measure against, so it belongs with Phase D.
 
