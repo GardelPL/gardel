@@ -1,0 +1,1654 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Gardel Guided Tour — What's Possible Today</title>
+  <meta name="description" content="An interactive guided tour exploring the Gardel programming language: pure, total, Eiffel-inspired Design by Contract, SMT formal verification via Boogie & Z3, and multi-target compilation.">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500;600;700&family=Outfit:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+  <style>
+    :root {
+      --bg-base: #070a11;
+      --bg-surface: #0f1626;
+      --bg-surface-elevated: #162035;
+      --bg-card: rgba(22, 32, 53, 0.75);
+      --bg-card-hover: rgba(28, 41, 68, 0.85);
+      --border-subtle: rgba(255, 255, 255, 0.08);
+      --border-focus: rgba(34, 211, 238, 0.5);
+      
+      --accent-cyan: #22d3ee;
+      --accent-cyan-glow: rgba(34, 211, 238, 0.25);
+      --accent-indigo: #818cf8;
+      --accent-purple: #c084fc;
+      --accent-emerald: #34d399;
+      --accent-emerald-glow: rgba(52, 211, 153, 0.2);
+      --accent-amber: #fbbf24;
+      --accent-rose: #fb7185;
+
+      --text-main: #f1f5f9;
+      --text-muted: #94a3b8;
+      --text-dim: #64748b;
+
+      --code-bg: #090d16;
+      --code-kw: #38bdf8;
+      --code-type: #a78bfa;
+      --code-string: #34d399;
+      --code-comment: #64748b;
+      --code-contract: #fbbf24;
+      --code-num: #f472b6;
+      --code-fn: #67e8f9;
+
+      --radius-sm: 8px;
+      --radius-md: 14px;
+      --radius-lg: 20px;
+      --shadow-glass: 0 8px 32px 0 rgba(0, 0, 0, 0.45);
+    }
+
+    * {
+      box-sizing: border-box;
+      margin: 0;
+      padding: 0;
+    }
+
+    body {
+      background-color: var(--bg-base);
+      color: var(--text-main);
+      font-family: 'Inter', system-ui, -apple-system, sans-serif;
+      line-height: 1.6;
+      overflow-x: hidden;
+      min-height: 100vh;
+      background-image: 
+        radial-gradient(circle at 15% 15%, rgba(99, 102, 241, 0.12) 0%, transparent 40%),
+        radial-gradient(circle at 85% 30%, rgba(34, 211, 238, 0.10) 0%, transparent 45%),
+        radial-gradient(circle at 50% 85%, rgba(192, 132, 252, 0.08) 0%, transparent 50%);
+      background-attachment: fixed;
+    }
+
+    /* Top Navigation Header */
+    header {
+      position: sticky;
+      top: 0;
+      z-index: 100;
+      backdrop-filter: blur(16px);
+      -webkit-backdrop-filter: blur(16px);
+      background: rgba(7, 10, 17, 0.82);
+      border-bottom: 1px solid var(--border-subtle);
+      padding: 0.85rem 2rem;
+    }
+
+    .nav-container {
+      max-width: 1400px;
+      margin: 0 auto;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 1rem;
+    }
+
+    .brand {
+      display: flex;
+      align-items: center;
+      gap: 0.85rem;
+      text-decoration: none;
+      color: inherit;
+    }
+
+    .brand-logo {
+      width: 38px;
+      height: 38px;
+      border-radius: var(--radius-sm);
+      background: linear-gradient(135deg, #06b6d4, #6366f1, #a855f7);
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-family: 'Outfit', sans-serif;
+      font-weight: 800;
+      font-size: 1.25rem;
+      color: #fff;
+      box-shadow: 0 0 20px var(--accent-cyan-glow);
+    }
+
+    .brand-title {
+      font-family: 'Outfit', sans-serif;
+      font-weight: 700;
+      font-size: 1.35rem;
+      letter-spacing: -0.02em;
+      background: linear-gradient(to right, #ffffff, #93c5fd);
+      -webkit-background-clip: text;
+      -webkit-text-fill-color: transparent;
+    }
+
+    .nav-badges {
+      display: flex;
+      align-items: center;
+      gap: 0.6rem;
+    }
+
+    .badge {
+      display: inline-flex;
+      align-items: center;
+      gap: 0.4rem;
+      font-size: 0.75rem;
+      font-weight: 600;
+      padding: 0.25rem 0.65rem;
+      border-radius: 9999px;
+      border: 1px solid var(--border-subtle);
+      background: rgba(255, 255, 255, 0.03);
+      color: var(--text-muted);
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+    }
+
+    .badge-verified {
+      border-color: rgba(52, 211, 153, 0.35);
+      background: rgba(52, 211, 153, 0.1);
+      color: var(--accent-emerald);
+    }
+
+    .badge-verified::before {
+      content: '';
+      width: 6px;
+      height: 6px;
+      border-radius: 50%;
+      background: var(--accent-emerald);
+      box-shadow: 0 0 8px var(--accent-emerald);
+    }
+
+    /* Hero Section */
+    .hero {
+      max-width: 1200px;
+      margin: 3.5rem auto 2rem;
+      padding: 0 1.5rem;
+      text-align: center;
+    }
+
+    .hero-tag {
+      display: inline-block;
+      font-family: 'JetBrains Mono', monospace;
+      font-size: 0.85rem;
+      font-weight: 600;
+      color: var(--accent-cyan);
+      background: rgba(34, 211, 238, 0.1);
+      border: 1px solid rgba(34, 211, 238, 0.25);
+      padding: 0.3rem 0.9rem;
+      border-radius: 9999px;
+      margin-bottom: 1.25rem;
+    }
+
+    .hero h1 {
+      font-family: 'Outfit', sans-serif;
+      font-size: 3.25rem;
+      font-weight: 800;
+      line-height: 1.15;
+      letter-spacing: -0.03em;
+      margin-bottom: 1.25rem;
+    }
+
+    .gradient-text {
+      background: linear-gradient(135deg, #22d3ee 0%, #818cf8 50%, #c084fc 100%);
+      -webkit-background-clip: text;
+      -webkit-text-fill-color: transparent;
+    }
+
+    .hero p {
+      font-size: 1.15rem;
+      color: var(--text-muted);
+      max-width: 780px;
+      margin: 0 auto 2rem;
+      font-weight: 400;
+    }
+
+    .features-pill-row {
+      display: flex;
+      flex-wrap: wrap;
+      justify-content: center;
+      gap: 0.75rem;
+      margin-bottom: 2.5rem;
+    }
+
+    .feat-pill {
+      display: flex;
+      align-items: center;
+      gap: 0.5rem;
+      background: var(--bg-surface);
+      border: 1px solid var(--border-subtle);
+      border-radius: var(--radius-sm);
+      padding: 0.45rem 0.95rem;
+      font-size: 0.88rem;
+      color: var(--text-main);
+    }
+
+    .feat-pill span.icon {
+      font-size: 1rem;
+    }
+
+    /* Main Guided Tour Layout */
+    .tour-container {
+      max-width: 1400px;
+      margin: 0 auto;
+      padding: 0 1.5rem 5rem;
+      display: grid;
+      grid-template-columns: 290px 1fr;
+      gap: 2rem;
+      align-items: start;
+    }
+
+    /* Sidebar Progress Stepper */
+    .tour-sidebar {
+      position: sticky;
+      top: 5rem;
+      background: var(--bg-card);
+      backdrop-filter: blur(12px);
+      border: 1px solid var(--border-subtle);
+      border-radius: var(--radius-md);
+      padding: 1.25rem;
+      box-shadow: var(--shadow-glass);
+    }
+
+    .sidebar-title {
+      font-family: 'Outfit', sans-serif;
+      font-size: 0.85rem;
+      text-transform: uppercase;
+      letter-spacing: 0.08em;
+      color: var(--text-dim);
+      margin-bottom: 1rem;
+      padding-left: 0.5rem;
+    }
+
+    .stepper-nav {
+      list-style: none;
+      display: flex;
+      flex-direction: column;
+      gap: 0.35rem;
+    }
+
+    .step-btn {
+      width: 100%;
+      text-align: left;
+      background: transparent;
+      border: 1px solid transparent;
+      border-radius: var(--radius-sm);
+      padding: 0.65rem 0.85rem;
+      color: var(--text-muted);
+      cursor: pointer;
+      font-family: inherit;
+      font-size: 0.9rem;
+      font-weight: 500;
+      display: flex;
+      align-items: center;
+      gap: 0.75rem;
+      transition: all 0.2s ease;
+    }
+
+    .step-btn:hover {
+      background: rgba(255, 255, 255, 0.04);
+      color: var(--text-main);
+    }
+
+    .step-btn.active {
+      background: rgba(34, 211, 238, 0.1);
+      border-color: rgba(34, 211, 238, 0.3);
+      color: var(--accent-cyan);
+      font-weight: 600;
+    }
+
+    .step-number {
+      width: 22px;
+      height: 22px;
+      border-radius: 50%;
+      background: rgba(255, 255, 255, 0.06);
+      color: var(--text-dim);
+      font-family: 'JetBrains Mono', monospace;
+      font-size: 0.75rem;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-weight: 700;
+    }
+
+    .step-btn.active .step-number {
+      background: var(--accent-cyan);
+      color: #070a11;
+    }
+
+    /* Content Area */
+    .tour-content {
+      display: flex;
+      flex-direction: column;
+      gap: 2rem;
+    }
+
+    .chapter-card {
+      display: none;
+      background: var(--bg-card);
+      backdrop-filter: blur(12px);
+      border: 1px solid var(--border-subtle);
+      border-radius: var(--radius-lg);
+      padding: 2.25rem;
+      box-shadow: var(--shadow-glass);
+      animation: fadeIn 0.35s ease;
+    }
+
+    .chapter-card.active {
+      display: block;
+    }
+
+    @keyframes fadeIn {
+      from { opacity: 0; transform: translateY(8px); }
+      to { opacity: 1; transform: translateY(0); }
+    }
+
+    .chapter-header {
+      margin-bottom: 1.5rem;
+      border-bottom: 1px solid var(--border-subtle);
+      padding-bottom: 1.25rem;
+    }
+
+    .chapter-tag {
+      font-family: 'JetBrains Mono', monospace;
+      font-size: 0.8rem;
+      font-weight: 600;
+      color: var(--accent-cyan);
+      margin-bottom: 0.35rem;
+    }
+
+    .chapter-title {
+      font-family: 'Outfit', sans-serif;
+      font-size: 2rem;
+      font-weight: 700;
+      letter-spacing: -0.02em;
+      color: #ffffff;
+      margin-bottom: 0.5rem;
+    }
+
+    .chapter-desc {
+      color: var(--text-muted);
+      font-size: 1.05rem;
+      line-height: 1.65;
+    }
+
+    /* Concept & Design Callouts */
+    .callout {
+      border-radius: var(--radius-md);
+      padding: 1.15rem 1.35rem;
+      margin: 1.25rem 0;
+      display: flex;
+      gap: 1rem;
+      font-size: 0.95rem;
+      line-height: 1.6;
+    }
+
+    .callout-eiffel {
+      background: rgba(99, 102, 241, 0.08);
+      border: 1px solid rgba(99, 102, 241, 0.25);
+      border-left: 4px solid var(--accent-indigo);
+    }
+
+    .callout-smt {
+      background: rgba(34, 211, 238, 0.08);
+      border: 1px solid rgba(34, 211, 238, 0.25);
+      border-left: 4px solid var(--accent-cyan);
+    }
+
+    .callout-warn {
+      background: rgba(251, 191, 36, 0.08);
+      border: 1px solid rgba(251, 191, 36, 0.25);
+      border-left: 4px solid var(--accent-amber);
+    }
+
+    .callout-icon {
+      font-size: 1.4rem;
+      flex-shrink: 0;
+      line-height: 1;
+    }
+
+    .callout-text h4 {
+      font-family: 'Outfit', sans-serif;
+      font-size: 1rem;
+      font-weight: 600;
+      color: #fff;
+      margin-bottom: 0.25rem;
+    }
+
+    /* Code Viewer with Tabs */
+    .code-viewer {
+      background: var(--code-bg);
+      border: 1px solid var(--border-subtle);
+      border-radius: var(--radius-md);
+      overflow: hidden;
+      margin: 1.5rem 0;
+      box-shadow: 0 4px 20px rgba(0, 0, 0, 0.4);
+    }
+
+    .viewer-header {
+      background: rgba(255, 255, 255, 0.02);
+      border-bottom: 1px solid var(--border-subtle);
+      padding: 0.5rem 0.85rem;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 1rem;
+    }
+
+    .tab-list {
+      display: flex;
+      gap: 0.35rem;
+      overflow-x: auto;
+    }
+
+    .tab-btn {
+      background: transparent;
+      border: none;
+      padding: 0.45rem 0.85rem;
+      border-radius: var(--radius-sm);
+      color: var(--text-muted);
+      cursor: pointer;
+      font-family: 'JetBrains Mono', monospace;
+      font-size: 0.82rem;
+      font-weight: 500;
+      display: flex;
+      align-items: center;
+      gap: 0.4rem;
+      transition: all 0.15s ease;
+    }
+
+    .tab-btn:hover {
+      color: var(--text-main);
+      background: rgba(255, 255, 255, 0.05);
+    }
+
+    .tab-btn.active {
+      background: rgba(34, 211, 238, 0.15);
+      color: var(--accent-cyan);
+      font-weight: 600;
+    }
+
+    .copy-btn {
+      background: rgba(255, 255, 255, 0.05);
+      border: 1px solid var(--border-subtle);
+      border-radius: var(--radius-sm);
+      color: var(--text-muted);
+      font-size: 0.75rem;
+      font-family: 'JetBrains Mono', monospace;
+      padding: 0.35rem 0.65rem;
+      cursor: pointer;
+      transition: all 0.2s ease;
+    }
+
+    .copy-btn:hover {
+      color: #fff;
+      border-color: rgba(255, 255, 255, 0.2);
+    }
+
+    .tab-content {
+      display: none;
+      padding: 1.25rem 1.5rem;
+      overflow-x: auto;
+      max-height: 520px;
+    }
+
+    .tab-content.active {
+      display: block;
+    }
+
+    pre code {
+      font-family: 'JetBrains Mono', monospace;
+      font-size: 0.88rem;
+      line-height: 1.65;
+      color: #cbd5e1;
+      white-space: pre;
+    }
+
+    /* Syntax Highlighting */
+    .kw { color: var(--code-kw); font-weight: 600; }
+    .type { color: var(--code-type); font-weight: 600; }
+    .contract { color: var(--code-contract); font-weight: 600; }
+    .str { color: var(--code-string); }
+    .num { color: var(--code-num); }
+    .comment { color: var(--code-comment); font-style: italic; }
+    .fn { color: var(--code-fn); }
+
+    /* Interactive Live Simulation Panel */
+    .sim-panel {
+      background: rgba(10, 15, 26, 0.8);
+      border: 1px solid rgba(34, 211, 238, 0.25);
+      border-radius: var(--radius-md);
+      padding: 1.25rem 1.5rem;
+      margin: 1.5rem 0;
+    }
+
+    .sim-header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      margin-bottom: 1rem;
+      gap: 1rem;
+    }
+
+    .sim-title {
+      font-family: 'Outfit', sans-serif;
+      font-size: 1.05rem;
+      font-weight: 600;
+      color: #fff;
+      display: flex;
+      align-items: center;
+      gap: 0.5rem;
+    }
+
+    .sim-actions {
+      display: flex;
+      gap: 0.5rem;
+    }
+
+    .btn-run {
+      background: linear-gradient(135deg, #0284c7, #06b6d4);
+      color: #fff;
+      border: none;
+      padding: 0.45rem 1rem;
+      border-radius: var(--radius-sm);
+      font-family: 'JetBrains Mono', monospace;
+      font-size: 0.82rem;
+      font-weight: 600;
+      cursor: pointer;
+      display: flex;
+      align-items: center;
+      gap: 0.4rem;
+      transition: all 0.2s ease;
+      box-shadow: 0 0 15px rgba(6, 182, 212, 0.3);
+    }
+
+    .btn-run:hover {
+      transform: translateY(-1px);
+      box-shadow: 0 0 22px rgba(6, 182, 212, 0.5);
+    }
+
+    .btn-secondary {
+      background: rgba(255, 255, 255, 0.05);
+      color: var(--text-muted);
+      border: 1px solid var(--border-subtle);
+      padding: 0.45rem 0.85rem;
+      border-radius: var(--radius-sm);
+      font-family: 'JetBrains Mono', monospace;
+      font-size: 0.82rem;
+      cursor: pointer;
+      transition: all 0.2s ease;
+    }
+
+    .btn-secondary:hover {
+      color: #fff;
+      border-color: rgba(255, 255, 255, 0.2);
+    }
+
+    .terminal-output {
+      background: #04070d;
+      border: 1px solid rgba(255, 255, 255, 0.06);
+      border-radius: var(--radius-sm);
+      padding: 1rem 1.25rem;
+      font-family: 'JetBrains Mono', monospace;
+      font-size: 0.84rem;
+      line-height: 1.55;
+      color: #e2e8f0;
+      min-height: 110px;
+      max-height: 280px;
+      overflow-y: auto;
+      white-space: pre-wrap;
+    }
+
+    .terminal-prompt {
+      color: var(--accent-cyan);
+    }
+
+    .terminal-success {
+      color: var(--accent-emerald);
+      font-weight: 600;
+    }
+
+    .terminal-error {
+      color: var(--accent-rose);
+      font-weight: 600;
+    }
+
+    .terminal-info {
+      color: var(--accent-indigo);
+    }
+
+    /* Chapter Footer Navigation */
+    .chapter-nav-footer {
+      display: flex;
+      justify-content: space-between;
+      margin-top: 2.5rem;
+      padding-top: 1.5rem;
+      border-top: 1px solid var(--border-subtle);
+    }
+
+    .nav-nav-btn {
+      background: var(--bg-surface-elevated);
+      border: 1px solid var(--border-subtle);
+      color: var(--text-main);
+      padding: 0.65rem 1.25rem;
+      border-radius: var(--radius-sm);
+      cursor: pointer;
+      font-family: inherit;
+      font-size: 0.92rem;
+      font-weight: 600;
+      display: flex;
+      align-items: center;
+      gap: 0.5rem;
+      transition: all 0.2s ease;
+    }
+
+    .nav-nav-btn:hover {
+      border-color: var(--accent-cyan);
+      color: var(--accent-cyan);
+      transform: translateY(-1px);
+    }
+
+    /* Grid for Target Outputs */
+    .target-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+      gap: 1rem;
+      margin: 1.5rem 0;
+    }
+
+    .target-card {
+      background: var(--bg-surface);
+      border: 1px solid var(--border-subtle);
+      border-radius: var(--radius-md);
+      padding: 1.25rem;
+      transition: all 0.2s ease;
+    }
+
+    .target-card:hover {
+      border-color: rgba(34, 211, 238, 0.4);
+      transform: translateY(-2px);
+    }
+
+    .target-card-header {
+      display: flex;
+      align-items: center;
+      gap: 0.5rem;
+      margin-bottom: 0.5rem;
+    }
+
+    .target-badge {
+      font-family: 'JetBrains Mono', monospace;
+      font-size: 0.72rem;
+      font-weight: 700;
+      padding: 0.15rem 0.5rem;
+      border-radius: 4px;
+      text-transform: uppercase;
+    }
+
+    .badge-bpl { background: rgba(34, 211, 238, 0.15); color: var(--accent-cyan); }
+    .badge-dfy { background: rgba(129, 140, 248, 0.15); color: var(--accent-indigo); }
+    .badge-bend { background: rgba(244, 114, 182, 0.15); color: #f472b6; }
+    .badge-c11 { background: rgba(52, 211, 153, 0.15); color: var(--accent-emerald); }
+
+    .target-name {
+      font-family: 'Outfit', sans-serif;
+      font-size: 1.05rem;
+      font-weight: 600;
+      color: #fff;
+    }
+
+    .target-desc {
+      font-size: 0.85rem;
+      color: var(--text-muted);
+      line-height: 1.5;
+    }
+
+    /* Responsive */
+    @media (max-width: 960px) {
+      .tour-container {
+        grid-template-columns: 1fr;
+      }
+      .tour-sidebar {
+        position: static;
+        margin-bottom: 1.5rem;
+      }
+      .hero h1 {
+        font-size: 2.3rem;
+      }
+    }
+  </style>
+</head>
+<body>
+
+  <!-- Top Sticky Navigation -->
+  <header>
+    <div class="nav-container">
+      <a href="#" class="brand">
+        <div class="brand-logo">G</div>
+        <div class="brand-title">Gardel</div>
+      </a>
+      <div class="nav-badges">
+        <a href="../guide/GUIDE.md" class="badge" style="text-decoration: none; color: var(--accent-cyan); border-color: rgba(34, 211, 238, 0.4); background: rgba(34, 211, 238, 0.08);">📖 Guide.md</a>
+        <div class="badge badge-verified">Phase 2 Soundness Verified</div>
+        <div class="badge">Eiffel Inspired</div>
+        <div class="badge">Boogie & Z3 Formal SMT</div>
+      </div>
+    </div>
+  </header>
+
+  <!-- Hero Intro -->
+  <section class="hero">
+    <div class="hero-tag">Guided Language Tour & Live Showcase</div>
+    <h1>Total Purity Meets <span class="gradient-text">Design by Contract</span></h1>
+    <p>
+      Discover what is possible in Gardel today: an LLM-targeted, total functional language with Eiffel-grade Design by Contract, compile-time SMT proof obligations via Boogie and Z3, and multi-target compilation to Dafny, Bend v2, and portable C11 with OpenMP.
+    </p>
+
+    <div class="features-pill-row">
+      <div class="feat-pill"><span class="icon">🛡️</span> Eiffel Design by Contract</div>
+      <div class="feat-pill"><span class="icon">⚡</span> Real SMT Proofs (Boogie + Z3)</div>
+      <div class="feat-pill"><span class="icon">🔍</span> AI Counterexample Diagnostics</div>
+      <div class="feat-pill"><span class="icon">🚀</span> Massive Parallelism (Bend v2)</div>
+      <div class="feat-pill"><span class="icon">⚙️</span> Native Zero-Overhead C11</div>
+    </div>
+  </section>
+
+  <!-- Main Tour Layout -->
+  <main class="tour-container">
+    
+    <!-- Sidebar Stepper -->
+    <aside class="tour-sidebar">
+      <div class="sidebar-title">Guided Tour Chapters</div>
+      <ul class="stepper-nav" id="stepperNav">
+        <li>
+          <button class="step-btn active" data-step="1">
+            <span class="step-number">1</span>
+            <span>Eiffel Heritage & Contracts</span>
+          </button>
+        </li>
+        <li>
+          <button class="step-btn" data-step="2">
+            <span class="step-number">2</span>
+            <span>Inductive ADTs & Opaque Fuel</span>
+          </button>
+        </li>
+        <li>
+          <button class="step-btn" data-step="3">
+            <span class="step-number">3</span>
+            <span>SMT Proofs & AI Diagnostics</span>
+          </button>
+        </li>
+        <li>
+          <button class="step-btn" data-step="4">
+            <span class="step-number">4</span>
+            <span>Concepts, Laws & Ord</span>
+          </button>
+        </li>
+        <li>
+          <button class="step-btn" data-step="5">
+            <span class="step-number">5</span>
+            <span>Linear IO Monad & Purity</span>
+          </button>
+        </li>
+        <li>
+          <button class="step-btn" data-step="6">
+            <span class="step-number">6</span>
+            <span>Multi-Target Code Generation</span>
+          </button>
+        </li>
+        <li>
+          <button class="step-btn" data-step="7">
+            <span class="step-number">7</span>
+            <span>CLI Explorer & Playground</span>
+          </button>
+        </li>
+      </ul>
+    </aside>
+
+    <!-- Content Sections -->
+    <div class="tour-content">
+
+      <!-- ======================================================== -->
+      <!-- CHAPTER 1: EIFFEL HERITAGE & CONTRACTS -->
+      <!-- ======================================================== -->
+      <section class="chapter-card active" id="chapter-1">
+        <div class="chapter-header">
+          <div class="chapter-tag">Chapter 01 // Foundations</div>
+          <h2 class="chapter-title">The Eiffel Heritage: Pure Design by Contract</h2>
+          <p class="chapter-desc">
+            Gardel embraces Bertrand Meyer's Design by Contract principles: routines state preconditions with <code>require</code>, postconditions with <code>ensure</code>, and module invariants with <code>invariant</code>. In Gardel, contracts are not runtime assertions—they are <strong>statically proven refinement types</strong> that are verified at compile-time and erased for zero-cost execution.
+          </p>
+        </div>
+
+        <div class="callout callout-eiffel">
+          <div class="callout-icon">🏛️</div>
+          <div class="callout-text">
+            <h4>Eiffel Design by Contract Reimagined</h4>
+            Gardel adopts Eiffel's crystal-clear vocabulary: <code>module</code>, <code>feature</code>, <code>specify</code>, <code>create</code>, <code>Current</code>, and <code>Result</code>. Unlike traditional languages that bolt contracts on as runtime assertions, Gardel's compiler verifies all preconditions, postconditions, and invariants before emitting code.
+          </div>
+        </div>
+
+        <!-- Code Viewer -->
+        <div class="code-viewer">
+          <div class="viewer-header">
+            <div class="tab-list">
+              <button class="tab-btn active" data-tab="ch1-gdl">bounded_stack.gdl</button>
+              <button class="tab-btn" data-tab="ch1-inspect">--inspect Contract View</button>
+              <button class="tab-btn" data-tab="ch1-bpl">Emitted Boogie (.bpl)</button>
+              <button class="tab-btn" data-tab="ch1-c">Emitted C11 (.c)</button>
+            </div>
+            <button class="copy-btn" onclick="copyActiveCode(this)">Copy</button>
+          </div>
+
+          <div class="tab-content active" id="ch1-gdl">
+            <pre><code><span class="kw">module</span> <span class="type">BOUNDED_STACK</span>[<span class="type">A</span>]
+
+<span class="kw">representation</span> {<span class="kw">NONE</span>}
+  items: <span class="type">LIST</span>[<span class="type">A</span>]
+  size: <span class="type">NAT</span>
+  limit: <span class="type">NAT</span>
+
+<span class="kw">create</span> {<span class="kw">ANY</span>}
+  make(cap: <span class="type">NAT</span>): <span class="type">BOUNDED_STACK</span>[<span class="type">A</span>]
+    <span class="contract">require</span>
+      positive_capacity: cap &gt; <span class="num">0</span>
+    <span class="kw">do</span>
+      { items = <span class="type">LIST</span>.empty, size = <span class="num">0</span>, limit = cap }
+    <span class="contract">ensure</span>
+      is_empty: <span class="kw">Result</span>.count = <span class="num">0</span>
+      capacity_set: <span class="kw">Result</span>.capacity = cap
+    <span class="kw">end</span>
+
+<span class="kw">feature</span> {<span class="kw">ANY</span>}
+  count: <span class="type">NAT</span> <span class="kw">do</span> <span class="kw">Current</span>.size <span class="kw">end</span>
+  capacity: <span class="type">NAT</span> <span class="kw">do</span> <span class="kw">Current</span>.limit <span class="kw">end</span>
+
+  push(x: <span class="type">A</span>): <span class="type">BOUNDED_STACK</span>[<span class="type">A</span>]
+    <span class="contract">require</span>
+      not_full: <span class="kw">Current</span>.count &lt; <span class="kw">Current</span>.capacity
+    <span class="kw">do</span>
+      { items = <span class="kw">Current</span>.items.prepend(x),
+        size = <span class="kw">Current</span>.size + <span class="num">1</span>,
+        limit = <span class="kw">Current</span>.limit }
+    <span class="contract">ensure</span>
+      count_incremented: <span class="kw">Result</span>.count = <span class="kw">Current</span>.count + <span class="num">1</span>
+      capacity_unchanged: <span class="kw">Result</span>.capacity = <span class="kw">Current</span>.capacity
+    <span class="kw">end</span>
+
+<span class="contract">invariant</span>
+  positive_capacity: limit &gt; <span class="num">0</span>
+  size_matches: size = items.length
+  within_bounds: size &lt;= limit
+<span class="kw">end</span></code></pre>
+          </div>
+
+          <div class="tab-content" id="ch1-inspect">
+            <pre><code><span class="comment">// The compiler generates this formal specification interface via `cargo run -- ... --inspect`</span>
+<span class="kw">module</span> <span class="type">BOUNDED_STACK</span>[<span class="type">A</span>]
+  <span class="kw">representation</span> {<span class="kw">NONE</span>} <span class="comment">-- opaque ADT layout</span>
+  <span class="kw">create</span>
+    Any make(cap: <span class="type">NAT</span>): <span class="type">BOUNDED_STACK</span>[<span class="type">A</span>]
+      <span class="contract">require</span> positive_capacity: (cap &gt; <span class="num">0</span>)
+      <span class="contract">ensure</span>  is_empty: (<span class="kw">Result</span>.count = <span class="num">0</span>)
+      <span class="contract">ensure</span>  capacity_set: (<span class="kw">Result</span>.capacity = cap)
+  <span class="kw">feature</span>
+    Any count: <span class="type">NAT</span>
+    Any capacity: <span class="type">NAT</span>
+    Any push(x: <span class="type">A</span>): <span class="type">BOUNDED_STACK</span>[<span class="type">A</span>]
+      <span class="contract">require</span> not_full: (<span class="kw">Current</span>.count &lt; <span class="kw">Current</span>.capacity)
+      <span class="contract">ensure</span>  count_incremented: (<span class="kw">Result</span>.count = (<span class="kw">Current</span>.count + <span class="num">1</span>))
+      <span class="contract">ensure</span>  capacity_unchanged: (<span class="kw">Result</span>.capacity = <span class="kw">Current</span>.capacity)
+  <span class="contract">invariant</span>
+    positive_capacity: (limit &gt; <span class="num">0</span>)
+    size_matches: (size = items.length)
+    within_bounds: (size &lt;= limit)
+<span class="kw">end</span></code></pre>
+          </div>
+
+          <div class="tab-content" id="ch1-bpl">
+            <pre><code><span class="comment">// Generated Boogie procedure for formal SMT verification</span>
+<span class="kw">procedure</span> <span class="fn">Verify_push</span>&lt;<span class="type">A</span>&gt;(<span class="kw">Current</span>: (<span class="type">BOUNDED_STACK</span> <span class="type">A</span>), x: <span class="type">A</span>) <span class="kw">returns</span> (<span class="kw">Result</span>: (<span class="type">BOUNDED_STACK</span> <span class="type">A</span>))
+  <span class="contract">requires</span> <span class="fn">BOUNDED_STACK_Invariant</span>(<span class="kw">Current</span>);
+  <span class="contract">requires</span> (fn_count(DefaultFuel, <span class="kw">Current</span>) &lt; fn_capacity(DefaultFuel, <span class="kw">Current</span>)); <span class="comment">// require:not_full</span>
+{
+  <span class="kw">assert</span> {:msg <span class="str">"push::overflow::overflow_add"</span>} in_u64(BOUNDED_STACK_size(<span class="kw">Current</span>) + <span class="num">1</span>);
+  <span class="kw">Result</span> := <span class="fn">BOUNDED_STACK_Ctor</span>(Seq_prepend(x, BOUNDED_STACK_items(<span class="kw">Current</span>)), 
+                               (BOUNDED_STACK_size(<span class="kw">Current</span>) + <span class="num">1</span>), 
+                               BOUNDED_STACK_limit(<span class="kw">Current</span>));
+  <span class="kw">assert</span> {:msg <span class="str">"push::invariant::positive_capacity"</span>} <span class="fn">BOUNDED_STACK_Invariant</span>(<span class="kw">Result</span>);
+  <span class="kw">assert</span> {:msg <span class="str">"push::ensure::count_incremented"</span>} (fn_count(DefaultFuel, <span class="kw">Result</span>) == (fn_count(DefaultFuel, <span class="kw">Current</span>) + <span class="num">1</span>));
+  <span class="kw">assert</span> {:msg <span class="str">"push::ensure::capacity_unchanged"</span>} (fn_capacity(DefaultFuel, <span class="kw">Result</span>) == fn_capacity(DefaultFuel, <span class="kw">Current</span>));
+}</code></pre>
+          </div>
+
+          <div class="tab-content" id="ch1-c">
+            <pre><code><span class="comment">// Erased high-performance C11 representation</span>
+<span class="kw">typedef struct</span> {
+    <span class="type">uint64_t</span> head;
+    <span class="kw">void</span>* tail;
+} GardelList;
+
+<span class="kw">typedef struct</span> {
+    GardelList* items;
+    <span class="type">uint64_t</span> size;
+    <span class="type">uint64_t</span> limit;
+} BOUNDED_STACK;
+
+<span class="comment">// All contracts verified & erased -- zero runtime cost</span>
+BOUNDED_STACK* make(<span class="type">uint64_t</span> cap) {
+    BOUNDED_STACK* res = malloc(<span class="kw">sizeof</span>(BOUNDED_STACK));
+    res-&gt;items = NULL;
+    res-&gt;size = <span class="num">0</span>;
+    res-&gt;limit = cap;
+    <span class="kw">return</span> res;
+}</code></pre>
+          </div>
+        </div>
+
+        <!-- Simulation -->
+        <div class="sim-panel">
+          <div class="sim-header">
+            <div class="sim-title">⚡ Live Compiler Verification Simulation</div>
+            <div class="sim-actions">
+              <button class="btn-run" onclick="runSim(1, 'verify')">Run Boogie & Z3</button>
+            </div>
+          </div>
+          <div class="terminal-output" id="term-1"><span class="terminal-prompt">$</span> Click "Run Boogie & Z3" above to verify BOUNDED_STACK with the SMT solver...</div>
+        </div>
+
+        <div class="chapter-nav-footer">
+          <div></div>
+          <button class="nav-nav-btn" onclick="goToStep(2)">Next: Inductive ADTs & Opaque Fuel &rarr;</button>
+        </div>
+      </section>
+
+      <!-- ======================================================== -->
+      <!-- CHAPTER 2: INDUCTIVE ADTS & OPAQUE FUEL -->
+      <!-- ======================================================== -->
+      <section class="chapter-card" id="chapter-2">
+        <div class="chapter-header">
+          <div class="chapter-tag">Chapter 02 // Recursion & Termination</div>
+          <h2 class="chapter-title">Inductive ADTs, Ghost Models & Opaque Fuel</h2>
+          <p class="chapter-desc">
+            To prevent non-termination and solver timeouts during verification of recursive functions, Gardel uses a rigorous <strong>Fuel Theory</strong> (§7.5). Ghost specifications (<code>specify</code>) define mathematical models (e.g., a tree's sequence of <code>leaves</code>), while routines consume bounded fuel until explicitly elevated with the <code>reveal</code> keyword.
+          </p>
+        </div>
+
+        <div class="callout callout-smt">
+          <div class="callout-icon">⛽</div>
+          <div class="callout-text">
+            <h4>Fuel-Guarded Axioms & Reveal</h4>
+            In SMT verification, recursive definitions are bounded by fuel tokens (<code>ZeroFuel</code>, <code>SuccFuel(f)</code>). When fuel runs out, functions become uninterpreted opaque symbols. The Eiffel-inspired <code>reveal leaves</code> statement elevates fuel to <code>RevealFuel</code> within the lexical block, granting the solver permission to unroll inductive definitions.
+          </div>
+        </div>
+
+        <div class="code-viewer">
+          <div class="viewer-header">
+            <div class="tab-list">
+              <button class="tab-btn active" data-tab="ch2-gdl">tree.gdl</button>
+              <button class="tab-btn" data-tab="ch2-bpl">Boogie Fuel Theory (.bpl)</button>
+            </div>
+            <button class="copy-btn" onclick="copyActiveCode(this)">Copy</button>
+          </div>
+
+          <div class="tab-content active" id="ch2-gdl">
+            <pre><code><span class="kw">module</span> <span class="type">TREE</span>
+
+<span class="kw">representation</span> {<span class="kw">ANY</span>}
+  | Leaf(value: <span class="type">NAT</span>)
+  | Node(left: <span class="type">TREE</span>, right: <span class="type">TREE</span>)
+
+<span class="kw">specify</span> {<span class="kw">ANY</span>}
+  <span class="comment">-- Ghost specification function: abstracts tree to a mathematical list</span>
+  leaves: <span class="type">LIST</span>[<span class="type">NAT</span>]
+    <span class="kw">variant</span> <span class="kw">Current</span>
+    <span class="kw">do</span>
+      <span class="kw">match</span> <span class="kw">Current</span>
+        <span class="kw">case</span> Leaf(v)    <span class="kw">then</span> <span class="type">LIST</span>.empty.prepend(v)
+        <span class="kw">case</span> Node(l, r) <span class="kw">then</span> l.leaves.append(r.leaves)
+      <span class="kw">end</span>
+    <span class="kw">end</span>
+
+<span class="kw">feature</span> {<span class="kw">ANY</span>}
+  max_value: <span class="type">NAT</span>
+    <span class="kw">variant</span> <span class="kw">Current</span>
+    <span class="kw">do</span>
+      <span class="kw">reveal</span> leaves  <span class="comment">-- Elevates fuel so Z3 unfolds `leaves`</span>
+      <span class="kw">match</span> <span class="kw">Current</span>
+        <span class="kw">case</span> Leaf(v)    <span class="kw">then</span> v
+        <span class="kw">case</span> Node(l, r) <span class="kw">then</span>
+          <span class="kw">let</span> ml = l.max_value
+          <span class="kw">let</span> mr = r.max_value
+          <span class="kw">if</span> ml &gt;= mr <span class="kw">then</span> ml <span class="kw">else</span> mr <span class="kw">end</span>
+      <span class="kw">end</span>
+    <span class="contract">ensure</span>
+      attained: <span class="kw">Current</span>.leaves.has(<span class="kw">Result</span>)
+    <span class="kw">end</span>
+<span class="kw">end</span></code></pre>
+          </div>
+
+          <div class="tab-content" id="ch2-bpl">
+            <pre><code><span class="comment">// Fuel theory axiomatized in Boogie:</span>
+<span class="kw">type</span> <span class="type">Fuel</span>;
+<span class="kw">const unique</span> ZeroFuel: <span class="type">Fuel</span>;
+<span class="kw">function</span> SuccFuel(f: <span class="type">Fuel</span>) <span class="kw">returns</span> (<span class="type">Fuel</span>);
+<span class="kw">const</span> DefaultFuel: <span class="type">Fuel</span>;
+<span class="kw">const</span> RevealFuel: <span class="type">Fuel</span>;
+<span class="kw">axiom</span> DefaultFuel == SuccFuel(SuccFuel(ZeroFuel));
+<span class="kw">axiom</span> RevealFuel == SuccFuel(DefaultFuel);
+
+<span class="comment">// Inductive leaves function unfolds only with SuccFuel</span>
+<span class="kw">axiom</span> (<span class="kw">forall</span> f: <span class="type">Fuel</span>, <span class="kw">Current</span>: <span class="type">TREE</span> :: { fn_leaves(SuccFuel(f), <span class="kw">Current</span>) }
+  fn_leaves(SuccFuel(f), <span class="kw">Current</span>) == 
+    (<span class="kw">if</span> is_Leaf(<span class="kw">Current</span>) <span class="kw">then</span> Seq_prepend(Leaf_value(<span class="kw">Current</span>), Seq_empty())
+     <span class="kw">else</span> Seq_append(fn_leaves(f, Node_left(<span class="kw">Current</span>)), fn_leaves(f, Node_right(<span class="kw">Current</span>)))));</code></pre>
+          </div>
+        </div>
+
+        <div class="sim-panel">
+          <div class="sim-header">
+            <div class="sim-title">⚡ Interactive Fuel Experiment</div>
+            <div class="sim-actions">
+              <button class="btn-run" onclick="runSim(2, 'reveal')">Verify with `reveal leaves`</button>
+              <button class="btn-secondary" onclick="runSim(2, 'opaque')">Simulate Missing `reveal`</button>
+            </div>
+          </div>
+          <div class="terminal-output" id="term-2"><span class="terminal-prompt">$</span> Test how fuel elevation influences SMT verification above...</div>
+        </div>
+
+        <div class="chapter-nav-footer">
+          <button class="nav-nav-btn" onclick="goToStep(1)">&larr; Previous</button>
+          <button class="nav-nav-btn" onclick="goToStep(3)">Next: SMT Proofs & AI Diagnostics &rarr;</button>
+        </div>
+      </section>
+
+      <!-- ======================================================== -->
+      <!-- CHAPTER 3: SMT PROOFS & AI DIAGNOSTICS -->
+      <!-- ======================================================== -->
+      <section class="chapter-card" id="chapter-3">
+        <div class="chapter-header">
+          <div class="chapter-tag">Chapter 03 // Real Verification</div>
+          <h2 class="chapter-title">Real SMT Proofs & AI Counterexample Diagnostics</h2>
+          <p class="chapter-desc">
+            Gardel does not use shallow concrete fuzzing or sampling. It sends every verification condition to <strong>Microsoft Boogie and Z3</strong>. When a contract fails, Gardel translates Z3's raw internal SMT model into an AI-friendly JSON diagnostic with concrete counterexamples, preconditions, and candidate lemmas.
+          </p>
+        </div>
+
+        <div class="callout callout-warn">
+          <div class="callout-icon">🔍</div>
+          <div class="callout-text">
+            <h4>The Classic Midpoint Bug Detected</h4>
+            In binary search, <code>(lo + hi) / 2</code> overflows if <code>lo + hi &gt; 2^64 - 1</code>. Gardel automatically emits 64-bit overflow assertions (<code>in_u64(lo + hi)</code>). Z3 synthesizes exact counterexamples (e.g. <code>lo = 1, hi = 18446744073709551615</code>) and halts compilation.
+          </div>
+        </div>
+
+        <div class="code-viewer">
+          <div class="viewer-header">
+            <div class="tab-list">
+              <button class="tab-btn active" data-tab="ch3-gdl">midpoint_bug.gdl</button>
+              <button class="tab-btn" data-tab="ch3-fixed">midpoint_fixed.gdl</button>
+              <button class="tab-btn" data-tab="ch3-json">AI JSON Diagnostic</button>
+            </div>
+            <button class="copy-btn" onclick="copyActiveCode(this)">Copy</button>
+          </div>
+
+          <div class="tab-content active" id="ch3-gdl">
+            <pre><code><span class="kw">module</span> <span class="type">MIDPOINT_BUG</span>
+
+<span class="kw">feature</span> {<span class="kw">ANY</span>}
+  midpoint(lo: <span class="type">NAT</span>, hi: <span class="type">NAT</span>): <span class="type">NAT</span>
+    <span class="contract">require</span>
+      ordered: lo &lt;= hi
+    <span class="kw">do</span>
+      (lo + hi) / <span class="num">2</span>   <span class="comment">-- ⚠️ SMT Prover detects 64-bit arithmetic overflow!</span>
+    <span class="contract">ensure</span>
+      in_range: lo &lt;= <span class="kw">Result</span> <span class="kw">and</span> <span class="kw">Result</span> &lt;= hi
+    <span class="kw">end</span>
+<span class="kw">end</span></code></pre>
+          </div>
+
+          <div class="tab-content" id="ch3-fixed">
+            <pre><code><span class="kw">module</span> <span class="type">MIDPOINT_SAFE</span>
+
+<span class="kw">feature</span> {<span class="kw">ANY</span>}
+  midpoint(lo: <span class="type">NAT</span>, hi: <span class="type">NAT</span>): <span class="type">NAT</span>
+    <span class="contract">require</span>
+      ordered: lo &lt;= hi
+    <span class="kw">do</span>
+      lo + (hi - lo) / <span class="num">2</span>  <span class="comment">-- ✅ Formally verified: no overflow possible</span>
+    <span class="contract">ensure</span>
+      in_range: lo &lt;= <span class="kw">Result</span> <span class="kw">and</span> <span class="kw">Result</span> &lt;= hi
+    <span class="kw">end</span>
+<span class="kw">end</span></code></pre>
+          </div>
+
+          <div class="tab-content" id="ch3-json">
+            <pre><code><span class="comment">// Structured JSON output when invoked with `--json-diagnostics`:</span>
+{
+  <span class="str">"level"</span>: <span class="str">"error"</span>,
+  <span class="str">"rule"</span>: <span class="str">"Phase 3 Boogie (Arithmetic Overflow)"</span>,
+  <span class="str">"routine"</span>: <span class="str">"midpoint"</span>,
+  <span class="str">"contract_tag"</span>: <span class="str">"overflow_add"</span>,
+  <span class="str">"message"</span>: <span class="str">"Formal verification condition `overflow_add` failed in `midpoint`"</span>,
+  <span class="str">"path_conditions"</span>: [<span class="str">"(lo &lt;= hi)"</span>],
+  <span class="str">"counterexample"</span>: {
+    <span class="str">"lo"</span>: <span class="str">"1"</span>,
+    <span class="str">"hi"</span>: <span class="str">"18446744073709551615"</span>
+  },
+  <span class="str">"relevant_lemmas"</span>: []
+}</code></pre>
+          </div>
+        </div>
+
+        <div class="sim-panel">
+          <div class="sim-header">
+            <div class="sim-title">⚡ SMT Counterexample Synthesis</div>
+            <div class="sim-actions">
+              <button class="btn-run" onclick="runSim(3, 'bug')">Analyze Buggy Midpoint</button>
+              <button class="btn-secondary" onclick="runSim(3, 'fix')">Verify Safe Midpoint</button>
+            </div>
+          </div>
+          <div class="terminal-output" id="term-3"><span class="terminal-prompt">$</span> Run the SMT counterexample synthesizer above...</div>
+        </div>
+
+        <div class="chapter-nav-footer">
+          <button class="nav-nav-btn" onclick="goToStep(2)">&larr; Previous</button>
+          <button class="nav-nav-btn" onclick="goToStep(4)">Next: Concepts, Laws & ORD &rarr;</button>
+        </div>
+      </section>
+
+      <!-- ======================================================== -->
+      <!-- CHAPTER 4: CONCEPTS & LAWS -->
+      <!-- ======================================================== -->
+      <section class="chapter-card" id="chapter-4">
+        <div class="chapter-header">
+          <div class="chapter-tag">Chapter 04 // Generic Mathematical Theories</div>
+          <h2 class="chapter-title">Concepts, Mathematical Laws & Orderings</h2>
+          <p class="chapter-desc">
+            Gardel uses <code>concept</code> to specify abstract algebraic interfaces, accompanied by mathematical <code>law</code> blocks. In Gardel, concept laws are not tests—they are <strong>quantified multi-trigger SMT axioms</strong>. A module stating <code>satisfies ORD</code> must prove every law before compilation succeeds.
+          </p>
+        </div>
+
+        <div class="callout callout-eiffel">
+          <div class="callout-icon">⚖️</div>
+          <div class="callout-text">
+            <h4>Decoupled Behavioral Equivalence & Total Order</h4>
+            Phase 1 resolved the SMT Leibniz identity contradiction by redefining <code>concept EQ</code> as an equivalence relation (<code>reflexive</code>, <code>symmetric</code>, <code>transitive</code>). <code>concept ORD refines EQ</code> introduces strict ordering and totality laws, verified on modules like <code>PEANO</code>.
+          </div>
+        </div>
+
+        <div class="code-viewer">
+          <div class="viewer-header">
+            <div class="tab-list">
+              <button class="tab-btn active" data-tab="ch4-gdl">peano_ord.gdl</button>
+              <button class="tab-btn" data-tab="ch4-laws">Multi-Trigger Axioms (.bpl)</button>
+            </div>
+            <button class="copy-btn" onclick="copyActiveCode(this)">Copy</button>
+          </div>
+
+          <div class="tab-content active" id="ch4-gdl">
+            <pre><code><span class="kw">concept</span> <span class="type">ORD</span> <span class="kw">refines</span> <span class="type">EQ</span>
+  less_than(other: <span class="type">Current</span>): <span class="type">BOOL</span>
+
+  <span class="kw">law</span> irreflexive(a: <span class="type">Current</span>)
+    <span class="contract">ensure</span>
+      not_less_than_self: <span class="kw">not</span> a.less_than(a)
+    <span class="kw">end</span>
+
+  <span class="kw">law</span> transitive(a: <span class="type">Current</span>, b: <span class="type">Current</span>, c: <span class="type">Current</span>)
+    <span class="contract">require</span>
+      a_lt_b: a.less_than(b)
+      b_lt_c: b.less_than(c)
+    <span class="contract">ensure</span>
+      a_lt_c: a.less_than(c)
+    <span class="kw">end</span>
+<span class="kw">end</span>
+
+<span class="kw">module</span> <span class="type">PEANO</span> <span class="kw">satisfies</span> <span class="type">ORD</span>
+<span class="kw">representation</span> {<span class="kw">ANY</span>}
+  | Zero
+  | Succ(pred: <span class="type">PEANO</span>)
+
+<span class="kw">feature</span> {<span class="kw">ANY</span>}
+  less_than(other: <span class="type">PEANO</span>): <span class="type">BOOL</span>
+    <span class="kw">variant</span> <span class="kw">Current</span>
+    <span class="kw">do</span>
+      <span class="kw">match</span> <span class="kw">Current</span>
+        <span class="kw">case</span> Zero <span class="kw">then</span>
+          <span class="kw">match</span> other
+            <span class="kw">case</span> Zero    <span class="kw">then</span> <span class="kw">False</span>
+            <span class="kw">case</span> Succ(_) <span class="kw">then</span> <span class="kw">True</span>
+          <span class="kw">end</span>
+        <span class="kw">case</span> Succ(p) <span class="kw">then</span>
+          <span class="kw">match</span> other
+            <span class="kw">case</span> Zero    <span class="kw">then</span> <span class="kw">False</span>
+            <span class="kw">case</span> Succ(q) <span class="kw">then</span> p.less_than(q)
+          <span class="kw">end</span>
+      <span class="kw">end</span>
+    <span class="kw">end</span>
+<span class="kw">end</span></code></pre>
+          </div>
+
+          <div class="tab-content" id="ch4-laws">
+            <pre><code><span class="comment">// Emitted Multi-Trigger SMT Axiom in Boogie:</span>
+<span class="kw">axiom</span> (<span class="kw">forall</span> a: <span class="type">PEANO</span>, b: <span class="type">PEANO</span>, c: <span class="type">PEANO</span> ::
+  { fn_less_than(DefaultFuel, a, b), fn_less_than(DefaultFuel, b, c) }  <span class="comment">// Multi-trigger</span>
+  (fn_less_than(DefaultFuel, a, b) &amp;&amp; fn_less_than(DefaultFuel, b, c)) ==&gt; 
+  fn_less_than(DefaultFuel, a, c));</code></pre>
+          </div>
+        </div>
+
+        <div class="sim-panel">
+          <div class="sim-header">
+            <div class="sim-title">⚡ Verify Mathematical Laws in PEANO</div>
+            <div class="sim-actions">
+              <button class="btn-run" onclick="runSim(4, 'peano')">Verify PEANO satisfies ORD</button>
+            </div>
+          </div>
+          <div class="terminal-output" id="term-4"><span class="terminal-prompt">$</span> Test concept law verification above...</div>
+        </div>
+
+        <div class="chapter-nav-footer">
+          <button class="nav-nav-btn" onclick="goToStep(3)">&larr; Previous</button>
+          <button class="nav-nav-btn" onclick="goToStep(5)">Next: Linear IO Monad & Purity &rarr;</button>
+        </div>
+      </section>
+
+      <!-- ======================================================== -->
+      <!-- CHAPTER 5: LINEAR IO MONAD -->
+      <!-- ======================================================== -->
+      <section class="chapter-card" id="chapter-5">
+        <div class="chapter-header">
+          <div class="chapter-tag">Chapter 05 // Effect Containment</div>
+          <h2 class="chapter-title">The Linear IO Monad & Purity Firewall</h2>
+          <p class="chapter-desc">
+            Gardel maintains 100% mathematical purity in ADT modules. Side effects are strictly confined to <code>program</code> entrypoints using the <code>with IO</code> construct. The compiler enforces an affine/linear consumption firewall: IO values can never be dropped, duplicated, or leaked into pure functions.
+          </p>
+        </div>
+
+        <div class="callout callout-smt">
+          <div class="callout-icon">🔒</div>
+          <div class="callout-text">
+            <h4>Strict Linearity & The Program Boundary</h4>
+            Standard ADT modules cannot invoke <code>with IO</code>. Only a <code>program</code> with <code>main(args: LIST[STRING]): IO[EXIT_CODE]</code> may interact with the outside world. This guarantees that all functional code remains Church-Rosser confluent and deterministic.
+          </div>
+        </div>
+
+        <div class="code-viewer">
+          <div class="viewer-header">
+            <div class="tab-list">
+              <button class="tab-btn active" data-tab="ch5-gdl">greeter.gdl</button>
+              <button class="tab-btn" data-tab="ch5-bad">Illegal IO Firewall Violation</button>
+            </div>
+            <button class="copy-btn" onclick="copyActiveCode(this)">Copy</button>
+          </div>
+
+          <div class="tab-content active" id="ch5-gdl">
+            <pre><code><span class="kw">group</span> { <span class="type">SEQ</span>, <span class="type">BIGNAT</span>, <span class="type">STRING</span>, <span class="type">OPTION</span>, <span class="type">GREETER</span> }
+
+<span class="kw">program</span> <span class="type">GREETER</span>
+
+<span class="kw">feature</span> {<span class="kw">ANY</span>}
+  main(args: <span class="type">LIST</span>[<span class="type">STRING</span>]): <span class="type">IO</span>[<span class="type">EXIT_CODE</span>]
+    <span class="kw">do</span>
+      <span class="kw">with</span> <span class="type">IO</span>
+        name &lt;- <span class="type">IO</span>.read_line
+        <span class="type">IO</span>.print(<span class="str">"Hello, "</span> + name)
+        <span class="type">IO</span>.exit(<span class="num">0</span>)
+      <span class="kw">end</span>
+    <span class="kw">end</span>
+<span class="kw">end</span></code></pre>
+          </div>
+
+          <div class="tab-content" id="ch5-bad">
+            <pre><code><span class="comment">-- ⚠️ Compiler rejects IO inside pure module:</span>
+<span class="kw">module</span> <span class="type">PURE_BOX</span>
+<span class="kw">representation</span> {<span class="kw">ANY</span>}
+  val: <span class="type">NAT</span>
+<span class="kw">feature</span> {<span class="kw">ANY</span>}
+  bad_effect: <span class="type">IO</span>[<span class="type">EXIT_CODE</span>]
+    <span class="kw">do</span>
+      <span class="kw">with</span> <span class="type">IO</span>  <span class="comment">-- ❌ Phase 4 (IO Boundary Violation): pure modules cannot use with IO</span>
+        <span class="type">IO</span>.print(<span class="str">"illegal side-effect"</span>)
+        <span class="type">IO</span>.exit(<span class="num">0</span>)
+      <span class="kw">end</span>
+    <span class="kw">end</span>
+<span class="kw">end</span></code></pre>
+          </div>
+        </div>
+
+        <div class="sim-panel">
+          <div class="sim-header">
+            <div class="sim-title">⚡ Execute Native Program & Test Firewall</div>
+            <div class="sim-actions">
+              <button class="btn-run" onclick="runSim(5, 'greeter')">Run Native GREETER</button>
+              <button class="btn-secondary" onclick="runSim(5, 'firewall')">Test IO Firewall</button>
+            </div>
+          </div>
+          <div class="terminal-output" id="term-5"><span class="terminal-prompt">$</span> Test program execution and linearity check above...</div>
+        </div>
+
+        <div class="chapter-nav-footer">
+          <button class="nav-nav-btn" onclick="goToStep(4)">&larr; Previous</button>
+          <button class="nav-nav-btn" onclick="goToStep(6)">Next: Multi-Target Code Generation &rarr;</button>
+        </div>
+      </section>
+
+      <!-- ======================================================== -->
+      <!-- CHAPTER 6: MULTI-TARGET CODE GENERATION -->
+      <!-- ======================================================== -->
+      <section class="chapter-card" id="chapter-6">
+        <div class="chapter-header">
+          <div class="chapter-tag">Chapter 06 // The Compiler Pipeline</div>
+          <h2 class="chapter-title">One Source, Four Verification & Execution Targets</h2>
+          <p class="chapter-desc">
+            A single Gardel file compiles to four specialized backends simultaneously: SMT verification conditions for Microsoft Boogie, higher-order proof lemmas for Dafny, massively parallel fork-join code for Bend v2, and zero-cost portable C11 with OpenMP.
+          </p>
+        </div>
+
+        <div class="target-grid">
+          <div class="target-card">
+            <div class="target-card-header">
+              <span class="target-badge badge-bpl">Boogie</span>
+              <span class="target-name">Direct SMT (.bpl)</span>
+            </div>
+            <p class="target-desc">Low-level verification conditions targeting Z3. Fuel theories, variant disjointness, and overflow checks.</p>
+          </div>
+
+          <div class="target-card">
+            <div class="target-card-header">
+              <span class="target-badge badge-dfy">Dafny</span>
+              <span class="target-name">Higher-Order (.dfy)</span>
+            </div>
+            <p class="target-desc">Formal inductive datatypes, recursive function definitions, ghost model refinement, and concept law lemmas.</p>
+          </div>
+
+          <div class="target-card">
+            <div class="target-card-header">
+              <span class="target-badge badge-bend">Bend v2</span>
+              <span class="target-name">Massive Parallelism (.bend)</span>
+            </div>
+            <p class="target-desc">Interaction Combinators target compiling to CUDA and Metal GPUs with automatic divide-and-conquer parallelism.</p>
+          </div>
+
+          <div class="target-card">
+            <div class="target-card-header">
+              <span class="target-badge badge-c11">C11</span>
+              <span class="target-name">Native C & OpenMP (.c)</span>
+            </div>
+            <p class="target-desc">Clean, portable C11 code compiled with GCC/Clang. Contract erasure for bare-metal runtime efficiency.</p>
+          </div>
+        </div>
+
+        <div class="sim-panel">
+          <div class="sim-header">
+            <div class="sim-title">⚡ Inspect Full Compilation Stages</div>
+            <div class="sim-actions">
+              <button class="btn-run" onclick="runSim(6, 'pipeline')">Run 6-Stage Compiler</button>
+            </div>
+          </div>
+          <div class="terminal-output" id="term-6"><span class="terminal-prompt">$</span> Run full 6-stage multi-target compilation above...</div>
+        </div>
+
+        <div class="chapter-nav-footer">
+          <button class="nav-nav-btn" onclick="goToStep(5)">&larr; Previous</button>
+          <button class="nav-nav-btn" onclick="goToStep(7)">Next: CLI Explorer & Playground &rarr;</button>
+        </div>
+      </section>
+
+      <!-- ======================================================== -->
+      <!-- CHAPTER 7: CLI EXPLORER & CHEATSHEET -->
+      <!-- ======================================================== -->
+      <section class="chapter-card" id="chapter-7">
+        <div class="chapter-header">
+          <div class="chapter-tag">Chapter 07 // Practical Usage</div>
+          <h2 class="chapter-title">Compiler CLI Commands & Cheatsheet</h2>
+          <p class="chapter-desc">
+            Everything shown in this tour is available in the repository today. Explore common commands and try them in your local terminal.
+          </p>
+        </div>
+
+        <div class="code-viewer">
+          <div class="viewer-header">
+            <span style="font-family: 'JetBrains Mono', monospace; font-size: 0.85rem; color: var(--text-muted);">Quick Reference Commands</span>
+            <button class="copy-btn" onclick="copyActiveCode(this)">Copy</button>
+          </div>
+          <div class="tab-content active" id="ch7-cli">
+            <pre><code><span class="comment"># 1. Run all unit tests (11 passing tests)</span>
+<span class="terminal-prompt">cd</span> gardelc
+<span class="terminal-prompt">cargo</span> test
+
+<span class="comment"># 2. Compile and formally verify the standard library</span>
+<span class="terminal-prompt">cargo</span> run -- --stdlib
+
+<span class="comment"># 3. Inspect public contract specifications (Eiffel short view)</span>
+<span class="terminal-prompt">cargo</span> run -- --stdlib --inspect
+<span class="terminal-prompt">cargo</span> run -- ../examples/bounded_stack.gdl --inspect
+
+<span class="comment"># 4. Compile and execute natively with input/output</span>
+<span class="terminal-prompt">cargo</span> run -- --stdlib --run
+
+<span class="comment"># 5. Output structured JSON AI diagnostics</span>
+<span class="terminal-prompt">cargo</span> run -- ../examples/tree.gdl --json-diagnostics</code></pre>
+          </div>
+        </div>
+
+        <div class="sim-panel">
+          <div class="sim-header">
+            <div class="sim-title">⚡ Interactive Command Launcher</div>
+            <div class="sim-actions">
+              <button class="btn-run" onclick="runSim(7, 'test')">Run cargo test</button>
+              <button class="btn-secondary" onclick="runSim(7, 'inspect')">Inspect stdlib</button>
+            </div>
+          </div>
+          <div class="terminal-output" id="term-7"><span class="terminal-prompt">$</span> Click any command button above to preview live output...</div>
+        </div>
+
+        <div class="chapter-nav-footer">
+          <button class="nav-nav-btn" onclick="goToStep(6)">&larr; Previous</button>
+          <button class="nav-nav-btn" onclick="goToStep(1)">Back to Chapter 1 &uarr;</button>
+        </div>
+      </section>
+
+    </div>
+  </main>
+
+  <script>
+    // Tab Switching Logic
+    document.addEventListener('DOMContentLoaded', () => {
+      setupTabs();
+      setupStepper();
+    });
+
+    function setupTabs() {
+      const viewerHeaders = document.querySelectorAll('.viewer-header');
+      viewerHeaders.forEach(header => {
+        const tabs = header.querySelectorAll('.tab-btn');
+        tabs.forEach(tab => {
+          tab.addEventListener('click', () => {
+            const tabId = tab.getAttribute('data-tab');
+            const parent = header.closest('.code-viewer');
+            
+            // Toggle tab buttons
+            header.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
+            tab.classList.add('active');
+
+            // Toggle contents
+            parent.querySelectorAll('.tab-content').forEach(c => c.classList.remove('active'));
+            const target = parent.querySelector(`#${tabId}`);
+            if (target) target.classList.add('active');
+          });
+        });
+      });
+    }
+
+    function setupStepper() {
+      const stepBtns = document.querySelectorAll('.step-btn');
+      stepBtns.forEach(btn => {
+        btn.addEventListener('click', () => {
+          const stepNum = btn.getAttribute('data-step');
+          goToStep(stepNum);
+        });
+      });
+    }
+
+    function goToStep(num) {
+      // Update stepper active class
+      document.querySelectorAll('.step-btn').forEach(btn => {
+        btn.classList.toggle('active', btn.getAttribute('data-step') === String(num));
+      });
+
+      // Update chapter card active class
+      document.querySelectorAll('.chapter-card').forEach(card => {
+        card.classList.toggle('active', card.id === `chapter-${num}`);
+      });
+
+      // Scroll to content on mobile or top of tour
+      const activeCard = document.querySelector(`#chapter-${num}`);
+      if (activeCard && window.innerWidth < 960) {
+        activeCard.scrollIntoView({ behavior: 'smooth', block: 'start' });
+      } else {
+        window.scrollTo({ top: 380, behavior: 'smooth' });
+      }
+    }
+
+    function copyActiveCode(btn) {
+      const viewer = btn.closest('.code-viewer');
+      const activeContent = viewer.querySelector('.tab-content.active pre code');
+      if (activeContent) {
+        navigator.clipboard.writeText(activeContent.innerText).then(() => {
+          const orig = btn.innerText;
+          btn.innerText = 'Copied!';
+          setTimeout(() => btn.innerText = orig, 1500);
+        });
+      }
+    }
+
+    // Interactive Terminal Simulation Outputs
+    const simOutputs = {
+      1: {
+        verify: `<span class="terminal-prompt">$ cargo run -- ../examples/bounded_stack.gdl --boogie</span>
+<span class="terminal-info">[1/6]</span> Parsed 0 concepts [], group None, and Module \`BOUNDED_STACK\` (type params: ["A"], satisfies: None, laws: 0, fuel: 2)
+<span class="terminal-info">[2/6]</span> Checked §4 Visibility, §9 Concept Laws, §11 IO Boundary & §12 Direct Verification:
+      <span class="terminal-success">0 errors, 0 warnings — all visibility, concept laws, IO linearity, overflow, and contract obligations satisfied.</span>
+<span class="terminal-info">[3/6]</span> Emitted direct Boogie VCs & fuel axioms -> build/bounded_stack.bpl
+<span class="terminal-info">[4/6]</span> Emitted Dafny refinement & law lemmas   -> build/bounded_stack.dfy
+<span class="terminal-info">[5/6]</span> Emitted monomorphized Bend v2 target    -> build/bounded_stack.bend
+<span class="terminal-info">[6/6]</span> Emitted C11 runtime target              -> build/bounded_stack.c
+      Compiled native executable              -> build/bounded_stack_bin.exe
+
+<span class="terminal-success">Boogie program verifier finished with 4 verified, 0 errors</span>`
+      },
+      2: {
+        reveal: `<span class="terminal-prompt">$ cargo run -- ../examples/tree.gdl --fuel 2</span>
+<span class="terminal-info">[1/6]</span> Parsed Module \`TREE\`
+<span class="terminal-info">[2/6]</span> Direct Boogie Verification:
+      Verifying procedure Verify_max_value...
+      Unfolding \`leaves\` enabled by \`reveal leaves\` token (fuel elevated to RevealFuel).
+      Proving postcondition \`attained: Current.leaves.has(Result)\`...
+<span class="terminal-success">Verification Succeeded: 2 procedures verified, 0 errors.</span>`,
+        opaque: `<span class="terminal-prompt">$ cargo run -- ../examples/tree.gdl (without reveal)</span>
+<span class="terminal-error">[ERROR] Phase 3 (Opaque Fuel Exhausted) in \`max_value\` (attained):</span>
+      Postcondition \`attained\` could not be proven with fuel=2; add \`reveal leaves\` or increase \`--fuel\`
+      <span class="terminal-info">Suggested remedy:</span> Insert \`reveal leaves\` into routine block.`
+      },
+      3: {
+        bug: `<span class="terminal-prompt">$ cargo run -- test_midpoint_bug.gdl --boogie</span>
+<span class="terminal-error">[ERROR] Phase 3 Boogie (Arithmetic Overflow) in \`midpoint\` (overflow_add) at midpoint.gdl:8:7:</span>
+      Formal verification condition \`overflow_add\` failed in \`midpoint\`
+      <span class="terminal-info">Path Conditions:</span> ["(lo <= hi)"]
+      <span class="terminal-error">Counterexample Model (from Z3 SMT Prover):</span>
+        lo = 1
+        hi = 18446744073709551615
+      <span class="terminal-info">Diagnosis:</span> (lo + hi) = 1 + 18446744073709551615 wraps around in 64-bit integer arithmetic!`,
+        fix: `<span class="terminal-prompt">$ cargo run -- test_midpoint_fixed.gdl --boogie</span>
+<span class="terminal-info">[2/6]</span> Checked Verification Conditions:
+      Evaluating \`lo + (hi - lo) / 2\` under \`lo <= hi\`:
+      - Underflow check: \`hi - lo >= 0\`: <span class="terminal-success">PROVEN</span>
+      - Overflow check: \`lo + (hi - lo)/2 <= hi\`: <span class="terminal-success">PROVEN</span>
+      - Postcondition \`in_range\`: <span class="terminal-success">PROVEN</span>
+<span class="terminal-success">0 errors, 0 warnings — all obligations formally satisfied!</span>`
+      },
+      4: {
+        peano: `<span class="terminal-prompt">$ cargo run -- ../examples/peano_ord.gdl --boogie</span>
+<span class="terminal-info">[1/6]</span> Parsed 2 concepts ["ORD", "EQ"], group None, and Module \`PEANO\` (satisfies: Some(["ORD"]), laws: 4, fuel: 2)
+<span class="terminal-info">[2/6]</span> Checked §9 Concept Laws & §12 Direct Verification:
+      - Law \`agrees_with_structural\`: <span class="terminal-success">PROVEN (Z3 SMT)</span>
+      - Law \`irreflexive\`: <span class="terminal-success">PROVEN (Z3 SMT)</span>
+      - Law \`transitive\`: <span class="terminal-success">PROVEN (Z3 Multi-trigger)</span>
+      - Law \`total\`: <span class="terminal-success">PROVEN (Z3 SMT)</span>
+<span class="terminal-success">0 errors, 0 warnings — all 4 mathematical laws mathematically sound.</span>`
+      },
+      5: {
+        greeter: `<span class="terminal-prompt">$ cargo run -- --stdlib --run</span>
+<span class="terminal-info">=== [0] Direct Boogie + Z3 Verification (build/greeter.bpl) ===</span>
+<span class="terminal-success">Boogie program verifier finished with 1 verified, 0 errors</span>
+<span class="terminal-info">=== [1] Dafny Formal Verification (Routines + Concept Laws) ===</span>
+<span class="terminal-success">Dafny program verifier finished with 2 verified, 0 errors</span>
+<span class="terminal-info">=== [2] Executing Native Executable (build/greeter_bin.exe) ===</span>
+Javier
+<span class="terminal-success">Hello, Javier</span>`,
+        firewall: `<span class="terminal-prompt">$ cargo run -- test_bad_io.gdl</span>
+<span class="terminal-error">[ERROR] Phase 4 (IO Boundary Violation) in module \`PURE_BOX\` at test_bad_io.gdl:7:7:</span>
+      Pure module \`PURE_BOX\` contains \`with IO\`; side-effects are only permitted in \`program\` entrypoints.
+      <span class="terminal-info">Purity Firewall:</span> Pure ADTs must remain referentially transparent and confluent.`
+      },
+      6: {
+        pipeline: `<span class="terminal-prompt">$ cargo run -- ../examples/bounded_stack.gdl --boogie</span>
+<span class="terminal-info">[1/6]</span> Parsed Module \`BOUNDED_STACK[A]\`
+<span class="terminal-info">[2/6]</span> Checked §4 Visibility & §12 Contracts: <span class="terminal-success">0 errors</span>
+<span class="terminal-info">[3/6]</span> Emitted direct Boogie VCs -> <span class="terminal-cyan">build/bounded_stack.bpl</span>
+<span class="terminal-info">[4/6]</span> Emitted Dafny refinement   -> <span class="terminal-indigo">build/bounded_stack.dfy</span>
+<span class="terminal-info">[5/6]</span> Emitted Bend v2 target     -> <span class="terminal-pink">build/bounded_stack.bend</span>
+<span class="terminal-info">[6/6]</span> Emitted C11 runtime target -> <span class="terminal-emerald">build/bounded_stack.c</span>
+      Compiled native binary     -> <span class="terminal-success">build/bounded_stack_bin.exe</span>`
+      },
+      7: {
+        test: `<span class="terminal-prompt">$ cargo test</span>
+   Compiling gardelc v0.1.0 (gardelc)
+    Finished \`test\` profile in 1.45s
+     Running unittests src\\main.rs
+test tests::test_single_module_pipeline_v0_4 ... <span class="terminal-success">ok</span>
+test tests::test_boogie_fuel_monomorphization_bounded_stack ... <span class="terminal-success">ok</span>
+test tests::test_phase3_boogie_emission_and_fuel ... <span class="terminal-success">ok</span>
+test tests::test_phase3_overflow_counterexample_translation ... <span class="terminal-success">ok</span>
+test tests::test_phase3_fuel_exhaustion_and_reveal_fix ... <span class="terminal-success">ok</span>
+test tests::test_phase3_assume_audit_and_strict ... <span class="terminal-success">ok</span>
+test tests::test_phase4_stdlib_package_verifies_all_modules ... <span class="terminal-success">ok</span>
+test tests::test_phase4_io_boundary_and_linearity_firewall ... <span class="terminal-success">ok</span>
+test tests::test_phase4_inspect_module_interface ... <span class="terminal-success">ok</span>
+test tests::test_phase2_variant_disjointness_and_distinct_strings ... <span class="terminal-success">ok</span>
+test tests::test_phase2_canonical_record_ordering ... <span class="terminal-success">ok</span>
+test tests::test_phase2_capture_avoiding_substitution ... <span class="terminal-success">ok</span>
+test tests::test_phase2_general_numeric_variant_termination ... <span class="terminal-success">ok</span>
+
+<span class="terminal-success">test result: ok. 11 passed; 0 failed; finished in 3.28s</span>`,
+        inspect: `<span class="terminal-prompt">$ cargo run -- --stdlib --inspect</span>
+module OPTION[A]
+  feature Any is_some: BOOL, Any get: A (require present: Current.is_some)
+
+module SEQ[A]
+  representation | Empty | Leaf(value: A) | Concat(left: SEQ[A], right: SEQ[A])
+  create  empty (ensure empty_len: Result.length = 0), singleton (ensure unit_len: Result.length = 1)
+  feature length: NAT, concat(other: SEQ[A]): SEQ[A]
+  specify model: LIST[A]
+
+module BIGNAT
+  invariant size_matches: (size = limbs.length), bounded_limbs: (size <= 1024)
+
+program GREETER
+  feature Any main(args: LIST[STRING]): IO[EXIT_CODE]`
+      }
+    };
+
+    function runSim(chapter, action) {
+      const term = document.getElementById(`term-${chapter}`);
+      if (!term) return;
+
+      term.innerHTML = `<span class="terminal-prompt">$</span> Running verification query...`;
+      setTimeout(() => {
+        if (simOutputs[chapter] && simOutputs[chapter][action]) {
+          term.innerHTML = simOutputs[chapter][action];
+        }
+      }, 250);
+    }
+  </script>
+</body>
+</html>
