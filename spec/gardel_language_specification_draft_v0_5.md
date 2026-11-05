@@ -32,7 +32,7 @@ Gardel is a pure, total, deterministic, statically verified language designed fo
 | Entry points | Nothing may refer to a `program` or `reactive program` (`E0104`, §4). |
 | `EXIT_CODE` | Defined in §3. |
 
-**Implementation status:** the `match` rule, the solver limit and the entry-point rule are implemented. Reactive programs run, with timers and console input; sockets are being built in Phase D (§16.5).
+**Implementation status:** the `match` rule, the solver limit and the entry-point rule are implemented. Reactive programs run, with timers, console input, sockets and replay (§16.5).
 
 ---
 
@@ -2241,9 +2241,19 @@ A connection ends in one way, with `Closed`. It comes after `Close`, once the qu
 
 Every ready socket gets one event per pass, and sockets and timers take turns, so no client, and no zero timer, starves the rest. A pending `Shutdown` comes first.
 
-For tests and replay, `GARDEL_EVENTS` replaces the outside world with a script: event names separated by spaces, such as `Tick:1 Key:Up Key:113 Line:hello%20there LineEnd Accepted:1 Received:1:hi%20there SendFailed:1:32 ListenFailed:8888:98 Closed:1 Shutdown`. `Key:<n>` is a `Char` by scalar value, and `%XX` in a line or in received data is a byte, so a script can hold a space or malformed input. `LineEnd` is the end of input. Timers, reads and sockets do not run in a script, so it does not depend on the clock, the terminal or the network; `Listen`, `Send` and `Close` are written to standard error as lines such as `net: Send 1 hi%20there`. An unknown name stops the program with exit status 2. The end of a script is a `Shutdown`, so a scripted run always ends.
+For tests and replay, `GARDEL_EVENTS` replaces the outside world with a script: event names separated by spaces, such as `Tick:1 Key:Up Key:113 Line:hello%20there LineEnd LineFailed:5 Accepted:1 Received:1:hi%20there SendFailed:1:32 ListenFailed:8888:98 Closed:1 Shutdown`. `Key:<n>` is a `Char` by scalar value, and `%XX` in a line or in received data is a byte, so a script can hold a space or malformed input. `LineEnd` is the end of input, and `LineFailed:<code>` a read that failed. Timers, reads and sockets do not run in a script, so it does not depend on the clock, the terminal or the network; `Listen`, `Send` and `Close` are written to standard error as lines such as `net: Send 1 hi%20there`. An unknown name stops the program with exit status 2. The end of a script is a `Shutdown`, so a scripted run always ends.
 
-Guaranteed, given the proof obligations hold: no crash, out-of-bounds access or overflow in any step; the state invariant after every step; finite handling of each event by Gardel code; every run that receives `Shutdown` ends with the code chosen by `step`; and determinism: the states and commands are a function of `args` and the observed event sequence.
+**Event log and replay.** With `GARDEL_RECORD=<file>` a run writes a log, and with `GARDEL_REPLAY=<file>` the program runs from one. These are environment variables, as `GARDEL_EVENTS` is, because the command line belongs to the program: a flag taken from it would change `args`, and `args` is an input to the run.
+
+A log is text, with one line for each thing that happened, in order: a `gardel-log 1 <PROGRAM>` header, an `arg <text>` line per argument, an `event <token>` line per delivered event, in the script syntax above, a `command <token>` line per command, as `Print:<text>`, `SetTimer:<id>:<millis>`, `ReadLine`, `ReadKey`, `Listen:<port>`, `Send:<id>:<text>` or `Close:<id>`, and finally `exit <code>`. Texts use `%XX`. Each event reaches the file before `step` runs, so a run that dies leaves the event that killed it, and a command is logged before it is performed.
+
+A replay is a scripted run: arguments and events come from the log, and timers, reads and sockets do not run. Each command, and the exit code, is compared with the log before it takes effect. The first difference stops the program with exit status 3 and a message giving the log line, what the log says and what the program did. A log that is not for this program, malformed text, arguments on the command line, or `GARDEL_REPLAY` with `GARDEL_RECORD` or `GARDEL_EVENTS` stop it with exit status 2.
+
+A log with no `exit` line is a run that was cut short, by a kill or a full disk. A last line with no line break is dropped, and the replay checks what is there, gets the `Shutdown` of a script's end, says on standard error that the rest was not checked, and exits with the program's own code. If the log cannot be written, the run continues without one and warns once: a recording does not end a server.
+
+A log holds everything the program received and typed-in text, in the clear, and it grows for as long as the run does. On POSIX a new log is readable by its owner only.
+
+Guaranteed, given the proof obligations hold: no crash, out-of-bounds access or overflow in any step; the state invariant after every step; finite handling of each event by Gardel code; every run that receives `Shutdown` ends with the code chosen by `step`; and determinism: the states and commands are a function of `args` and the observed event sequence, which a replay checks for a recorded run.
 
 Not guaranteed, because the verifier does not model the outside world (§11, item 5): that events arrive, that commands succeed or how long they take, the arrival order of concurrent events, liveness, or delivery of `Shutdown` on `SIGKILL` or power loss. `Shutdown` is delivered for SIGINT, SIGTERM and the Windows console control events.
 
@@ -2823,7 +2833,7 @@ The table below records the architectural decisions locked in v0.4 alongside the
 | Closure semantics | Unrestricted via compile-time closure conversion | **Locked in v0.4** (lambda lifting to first-order ADTs replaces affine restriction) |
 | Verifier backend | Boogie and Z3 (with native SMT diagnostic indexing) | **Locked in v0.4** (Direct Boogie/Z3 pipeline replaces Phase 0 Dafny prototype; verified under `gardelc --strict`. The Dafny emitter was removed in Roadmap Task B.12: Boogie is the only verifier) |
 | Memory management in C | Atomic reference counting of immutable, acyclic values | **Implemented** (Task C.3 follow-ups). Optimizations: Task C.4; an arena per reactive step is evaluated with Phase D |
-| Non-termination | `reactive program`: total `init` and `step`, runtime-owned event loop (§11.6) | **Specified in v0.5**; implementation in Phase D (§16.5) |
+| Non-termination | `reactive program`: total `init` and `step`, runtime-owned event loop (§11.6) | **Implemented** (Phase D, §16.5) |
 | Catch-all `match` arms | Must be last (`E0316`, §5.1) | **Locked in v0.5** |
 | Verification budget | Z3 resource limit, with no pass unless Boogie reports a clean result (§7.3) | **Locked in v0.5** |
 | Gradual verification | None; `assume` audited by `--audit` / `--strict` | **Locked in v0.4** (failure-as-value `RESULT[E, A]` standardized with full combinators) |
@@ -2850,7 +2860,7 @@ The `gardelc` compiler pipeline (§13) and its `--json-diagnostics` `"rule"` tax
    - `concept` declarations, `refines` hierarchies, conditional module conformance (`satisfies ... where ...`), concept law proof obligations, SMT quantifier `trigger` attributes, and zero-overhead monomorphization (§9, §13). Static and verification diagnostics emit `"Phase 2 (...)"` rules (§12).
 4. **Phase 3: Direct Boogie Verifier & AI Diagnostic Tooling — [✅ Locked in v0.4]**
    - Direct Boogie (`.bpl`) verification condition generation, Z3 discharge, fuel-bounded recursive unfolding, `reveal` directives for opaque `specify` queries (§7.5), counterexample translation, and deterministic `--json-diagnostics` with `relevant_lemmas` law indexing (§12). Verification diagnostics emit `"Phase 3 (...)"` and `"Phase 3 Boogie (...)"` rules.
-5. **Phase 4: Standard Library & Linear IO Architecture — [🔄 Steps 1–4 and Evolution Plan Phases A–C Completed (Task C.4 planned); Phase D Active]**
+5. **Phase 4: Standard Library & Linear IO Architecture — [🔄 Steps 1–4 and Evolution Plan Phases A–D Completed (Task C.4 planned)]**
    - Standard Prelude package (`phase4_stdlib_source()`), linear `IO[A]` boundary and branch enforcement emitting `"Phase 4 (IO Boundary Violation)"` and `"Phase 4 (Linear IO Violation)"` diagnostics (§11), foundational library remediation (**Steps 1–4**, §16.3), and modular packaging & tooling (**Phases A–C**, §16.4).
 
 ---
@@ -2938,7 +2948,7 @@ Decomposing the monolithic standard library into physical 1:1 module files (sati
   - Not done: BendRT execution (`.bend` files are emitted but not run).
 - **Task C.4 (planned):** Memory management performance: skip freeing at program exit, faster allocator (size-classed free lists or mimalloc), optimized reference counting (ownership transfer, reuse, non-atomic counts for unshared values), and bump-pointer per-step arena for reactive programs.
 
-### 16.5 Phase D: Reactive Programs — [🔄 Active]
+### 16.5 Phase D: Reactive Programs — [✅ Completed]
 
 Phase D builds the `reactive program` of §11.6. `plan/Roadmap.md` holds its tasks and acceptance criteria.
 
@@ -2953,6 +2963,6 @@ Phase D builds the `reactive program` of §11.6. `plan/Roadmap.md` holds its tas
 | D.6 | `ReadLine`, `ReadKey`, `Line`, `Key`, `KEY` | ✅ Completed |
 | D.6b | `=` enforced for every type (§9) | ✅ Completed |
 | D.7 | `CONN_ID`, sockets, the echo server | ✅ Completed |
-| D.8 | Event log and replay | 📋 Planned |
+| D.8 | Event log and replay | ✅ Completed |
 
 Partial functions (a routine with no `variant`) are a separate proposal and are not part of Phase D.

@@ -1,6 +1,8 @@
 # Proposal: Reactive Programs (explicit non-termination)
 
-Status: **being implemented in Phase D** ([Roadmap](../Roadmap.md)). The normative text is spec v0.5 §11.6. This document keeps the rationale. Section 13 says what has been compiled and what depends on a later task.
+Status: **implemented in Phase D** ([Roadmap](../Roadmap.md)). The normative text is spec v0.5 §11.6. This document keeps the rationale. Section 13 says what has been compiled and what depends on a later task.
+
+Revision 5 (2026-11-05) records what D.8 decided, now normative in spec §11.6. Section 5's "logging the events is enough to replay a run exactly" needs the arguments too, so the log has them. It also holds the commands and the exit code, because a replay that compares nothing could not fail.
 
 Revision 4 (2026-11-05) records what D.7 decided, now normative in spec §11.6: `Close` sends what is queued first, a failed `Send` ends the connection, queues are bounded, and `Listen` is on loopback unless `GARDEL_LISTEN_ADDR` says otherwise.
 
@@ -104,7 +106,7 @@ Guaranteed (given the verifier proves the obligations):
 - No crash, null dereference, out-of-bounds access, or overflow in any step.
 - The state invariant holds after `init` and after every step, for an unbounded run.
 - Each event is handled in finite time by Gardel code.
-- **Determinism:** the sequence of states and commands is a function of `args` and the observed event sequence. Logging the events is enough to replay a run exactly, because command outcomes come back as events.
+- **Determinism:** the sequence of states and commands is a function of `args` and the observed event sequence. Logging `args` and the events is enough to replay a run exactly, because command outcomes come back as events. The log also holds the commands and the exit code, so a replay can check the claim (spec §11.6).
 - Every run that receives `Shutdown` ends with the code chosen by `step`.
 
 Not guaranteed (the verifier does not model the outside world, §11.5):
@@ -353,5 +355,6 @@ Applied in spec v0.5, except the rows and clauses about `partial`, which wait fo
 | §7.1 `SERVER_STATE` | Compiled as written, with the prelude `CONN_ID` (`examples/echo_server/`) | |
 | §7.1 `init` and `step` | Compiled as written, and run over real TCP against more clients than allowed. Three mutants are rejected as section 7.1 states | |
 | §7.2 game loop | Compiled and run (`examples/reactive_game/`) | |
+| §5 determinism | Checked by replay for recorded runs of the game, the clock and a network program (Task D.8) | |
 | §7.3 test program | Compiled and run, as above. `let t = LIST.empty.prepend(..)` in a `program` fails in Boogie, so the event list came from a routine with a declared return type | Roadmap, Phase D finding 8 |
 | §10 partial functions | Not compiled | Not in Phase D |

@@ -15209,27 +15209,45 @@ static struct {r}* gardel_line_from_bytes(char* buf, size_t len) {{
     GardelString s = {{ data, (uint64_t)len, chars, owner }};
     return make_{r}_Ok(s);
 }}
-static struct {r}* gardel_io_read_line_result(void) {{
+static struct {r}* gardel_line_failed(int64_t code) {{
+    return make_{r}_Error(make_IO_ERROR_OsError(code));
+}}
+/* The bytes of one line, apart from what they mean, which an event log needs. */
+enum {{ GARDEL_LINE_READ, GARDEL_LINE_ENDED, GARDEL_LINE_FAILED }};
+static int gardel_line_read(char** out, size_t* out_len, int64_t* code) {{
     size_t cap = 128, len = 0;
     char* buf = (char*)malloc(cap);
     int c, saw_any = 0;
-    if (!buf) return make_{r}_Error(make_IO_ERROR_OsError((int64_t)ENOMEM));
+    if (!buf) {{ *code = ENOMEM; return GARDEL_LINE_FAILED; }}
     while ((c = fgetc(stdin)) != EOF) {{
         saw_any = 1;
         if (c == '\n') break;
-        if ((uint64_t)len + 1 >= {max_line}ULL) {{ free(buf); return make_{r}_Error(make_IO_ERROR_OsError((int64_t)EOVERFLOW)); }}
+        if ((uint64_t)len + 1 >= {max_line}ULL) {{ free(buf); *code = EOVERFLOW; return GARDEL_LINE_FAILED; }}
         if (len + 1 >= cap) {{
             char* nb = (char*)realloc(buf, cap * 2);
-            if (!nb) {{ free(buf); return make_{r}_Error(make_IO_ERROR_OsError((int64_t)ENOMEM)); }}
+            if (!nb) {{ free(buf); *code = ENOMEM; return GARDEL_LINE_FAILED; }}
             buf = nb;
             cap *= 2;
         }}
         buf[len++] = (char)c;
     }}
-    if (ferror(stdin)) {{ free(buf); return make_{r}_Error(make_IO_ERROR_OsError((int64_t)errno)); }}
-    if (!saw_any) {{ free(buf); return gardel_line_at_end(); }}
+    if (ferror(stdin)) {{ free(buf); *code = errno; return GARDEL_LINE_FAILED; }}
+    if (!saw_any) {{ free(buf); return GARDEL_LINE_ENDED; }}
     if (len > 0 && buf[len - 1] == '\r') len--;
-    return gardel_line_from_bytes(buf, len);
+    *out = buf;
+    *out_len = len;
+    return GARDEL_LINE_READ;
+}}
+static struct {r}* gardel_line_value(int state, char* buf, size_t len, int64_t code) {{
+    if (state == GARDEL_LINE_READ) return gardel_line_from_bytes(buf, len);
+    return state == GARDEL_LINE_ENDED ? gardel_line_at_end() : gardel_line_failed(code);
+}}
+static struct {r}* gardel_io_read_line_result(void) {{
+    char* buf = NULL;
+    size_t len = 0;
+    int64_t code = 0;
+    int state = gardel_line_read(&buf, &len, &code);
+    return gardel_line_value(state, buf, len, code);
 }}
 
 "#
@@ -19840,6 +19858,289 @@ end
         };
         assert!(run(&client("if a != b then 1 else 0 end")) > 0);
         assert_eq!(run(&client("if a.same(b) then 1 else 0 end")), 0);
+    }
+
+    /// A run with no outside setting of its own: (exit code, stdout, stderr).
+    fn d8_run(exe: &std::path::Path, envs: &[(&str, &std::ffi::OsStr)], input: &[u8], args: &[&str]) -> (i32, String, String) {
+        use std::io::Write;
+        let mut cmd = Command::new(exe);
+        for name in ["GARDEL_EVENTS", "GARDEL_RECORD", "GARDEL_REPLAY", "GARDEL_LISTEN_ADDR"] {
+            cmd.env_remove(name);
+        }
+        let mut child = cmd
+            .envs(envs.iter().copied())
+            .args(args)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        // A program that stops early may not read it all.
+        let _ = child.stdin.take().unwrap().write_all(input);
+        let o = child.wait_with_output().unwrap();
+        let text = |b: &[u8]| String::from_utf8_lossy(b).replace("\r\n", "\n");
+        (o.status.code().unwrap_or(-1), text(&o.stdout), text(&o.stderr))
+    }
+
+    fn d8_replay(exe: &std::path::Path, log: &std::path::Path) -> (i32, String, String) {
+        d8_run(exe, &[("GARDEL_REPLAY", log.as_os_str())], b"", &[])
+    }
+
+    /// The events of a log, as a script.
+    fn d8_script(log: &str) -> String {
+        log.lines().filter_map(|l| l.strip_prefix("event ")).collect::<Vec<_>>().join(" ")
+    }
+
+    /// The acceptance check on a recorded run, and it does not rest on the runtime's own
+    /// comparison: its events, given to a fresh run as a plain script, write the same log.
+    fn d8_check_replay(exe: &std::path::Path, log: &std::path::Path, live: &(i32, String, String)) {
+        let text = fs::read_to_string(log).unwrap();
+        let replay = d8_replay(exe, log);
+        assert_eq!((replay.0, &replay.1), (live.0, &live.1), "{text}\n{}", replay.2);
+        let again = log.with_extension("again");
+        let scripted = d8_run(exe, &[("GARDEL_EVENTS", d8_script(&text).as_ref()), ("GARDEL_RECORD", again.as_os_str())], b"", &[]);
+        assert_eq!(scripted.0, live.0);
+        assert_eq!(fs::read_to_string(&again).unwrap(), text);
+    }
+
+    #[test]
+    fn test_d8_replay_of_the_game_reproduces_its_commands() {
+        let c = d4_c(&[("track_board.gdl", D6_BOARD), ("reactive_game.gdl", D6_GAME)]);
+        let Some((dir, exe)) = c3_compile(&c, "d8game") else { return };
+        let log = dir.join("run.log");
+        // A win, a quit after malformed bytes, and input that ends, from real stdin.
+        for input in [&b"llll"[..], b"lhx\xFF\xC0\x80q", b"l", b""] {
+            let live = d8_run(&exe, &[("GARDEL_RECORD", log.as_os_str())], input, &[]);
+            let text = fs::read_to_string(&log).unwrap();
+            assert!(text.starts_with("gardel-log 1 REACTIVE_GAME\ncommand Print:"), "{text}");
+            assert!(text.contains("command ReadKey\nevent Key:"), "{text}");
+            assert!(text.ends_with(&format!("exit {}\n", live.0)), "{text}");
+            d8_check_replay(&exe, &log, &live);
+            assert_eq!(d8_replay(&exe, &log).2, "", "a whole log replays with nothing to report");
+        }
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_d8_replay_does_not_wait_for_timers() {
+        let state = include_str!("../../examples/reactive_clock/clock_state.gdl");
+        let clock = include_str!("../../examples/reactive_clock/reactive_clock.gdl");
+        let c = d4_c(&[("clock_state.gdl", state), ("reactive_clock.gdl", clock)]);
+        let Some((dir, exe)) = c3_compile(&c, "d8clock") else { return };
+        let log = dir.join("run.log");
+        let live = d8_run(&exe, &[("GARDEL_RECORD", log.as_os_str())], b"", &[]);
+        assert_eq!(live.0, 0, "{}", live.2);
+        assert_eq!(d8_script(&fs::read_to_string(&log).unwrap()), "Tick:1 Tick:1 Tick:1");
+        let start = std::time::Instant::now();
+        d8_check_replay(&exe, &log, &live);
+        // The run took two seconds of timers, and this is two runs with none.
+        assert!(start.elapsed() < std::time::Duration::from_millis(1800), "{:?}", start.elapsed());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_d8_every_event_survives_the_log() {
+        let src = "reactive program ANY_EVENT\n\nfeature {ANY}\n\n  init(args: SEQ[STRING]): STEP[NAT]\n    do\n      Continue(0, LIST.empty)\n    end\n\n  step(s: NAT, e: EVENT): STEP[NAT]\n    do\n      match e\n        case Shutdown then Stop(0, LIST.empty)\n        case _ then Continue(s, LIST.empty)\n      end\n    end\n\nend\n";
+        let c = d4_c(&[("any_event.gdl", src)]);
+        let Some((dir, exe)) = c3_compile(&c, "d8any") else { return };
+        let log = dir.join("run.log");
+        let script = "Tick:18446744073709551615 Line: Line:a%20b Line:%FF%FE%00%0A LineEnd LineFailed:5 Key:Up Key:Down Key:Left Key:Right Key:Enter Key:Escape Key:Backspace Key:Tab Key:Other Key:KeysEnded Key:0 Key:1114111 Accepted:7 Received:7: Received:7:%00%25%0A%20%FFz ListenFailed:70000:98 SendFailed:7:18446744073709551615 Closed:7 Shutdown";
+        let run = d8_run(&exe, &[("GARDEL_EVENTS", script.as_ref()), ("GARDEL_RECORD", log.as_os_str())], b"", &[]);
+        assert_eq!(run.0, 0, "{}", run.2);
+        assert_eq!(d8_script(&fs::read_to_string(&log).unwrap()), script);
+        d8_check_replay(&exe, &log, &run);
+        let _ = fs::remove_dir_all(&dir);
+
+        // A line's meaning comes back from its bytes, and a read error from its code.
+        let c = d4_c(&[("echo_lines.gdl", D6_LINES)]);
+        let Some((dir, exe)) = c3_compile(&c, "d8lines") else { return };
+        let log = dir.join("run.log");
+        let live = d8_run(&exe, &[("GARDEL_RECORD", log.as_os_str())], b"caf\xC3\xA9 au lait\r\n\xFF\n%41\n", &[]);
+        assert_eq!((live.0, live.1.as_str()), (0, "caf\u{e9} au lait\nbad input\n%41\nend\n"), "{}", live.2);
+        assert_eq!(d8_script(&fs::read_to_string(&log).unwrap()), "Line:caf%C3%A9%20au%20lait Line:%FF Line:%2541 LineEnd");
+        d8_check_replay(&exe, &log, &live);
+        let failed = d8_run(&exe, &[("GARDEL_EVENTS", "Line:a LineFailed:5".as_ref()), ("GARDEL_RECORD", log.as_os_str())], b"", &[]);
+        assert_eq!((failed.0, failed.1.as_str()), (1, "a\nread failed\n"));
+        d8_check_replay(&exe, &log, &failed);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_d8_a_replay_gets_the_arguments_of_its_run() {
+        let src = "reactive program COUNT_ARGS\n\nfeature {ANY}\n\n  init(args: SEQ[STRING]): STEP[NAT]\n    do\n      Stop(args.length, LIST.empty)\n    end\n\n  step(s: NAT, e: EVENT): STEP[NAT]\n    do\n      Stop(s, LIST.empty)\n    end\n\nend\n";
+        let c = d4_c(&[("count_args.gdl", src)]);
+        let Some((dir, exe)) = c3_compile(&c, "d8args") else { return };
+        let log = dir.join("run.log");
+        let live = d8_run(&exe, &[("GARDEL_RECORD", log.as_os_str())], b"", &["a b", "", "\u{e9}"]);
+        assert_eq!(live.0, 3, "{}", live.2);
+        assert_eq!(fs::read_to_string(&log).unwrap(), "gardel-log 1 COUNT_ARGS\narg a%20b\narg \narg %C3%A9\nexit 3\n");
+        assert_eq!(d8_replay(&exe, &log).0, 3);
+        // Silently using these instead would be a replay of a run that never happened.
+        let other = d8_run(&exe, &[("GARDEL_REPLAY", log.as_os_str())], b"", &["x"]);
+        assert_eq!(other.0, 2, "{}", other.2);
+        assert!(other.2.contains("takes its arguments from the log"), "{}", other.2);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_d8_a_network_run_replays_with_no_network() {
+        use std::io::{Read, Write};
+        let port = d7_free_port();
+        let src = D7_RULES.replace("8888", &port.to_string());
+        let c = d4_c(&[("net_rules.gdl", &src)]);
+        let Some((dir, exe)) = c3_compile(&c, "d8rules") else { return };
+        let log = dir.join("run.log");
+        let spawn = |exe: &std::path::Path, log: &std::path::Path| {
+            Command::new(exe)
+                .env_remove("GARDEL_EVENTS")
+                .env_remove("GARDEL_LISTEN_ADDR")
+                .env("GARDEL_RECORD", log)
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .spawn()
+                .unwrap()
+        };
+        let server = spawn(&exe, &log);
+        for payload in [&b"\x00 %\n\xFF"[..], b"plain"] {
+            let mut s = d7_connect(port);
+            s.write_all(payload).unwrap();
+            let mut got = Vec::new();
+            s.read_to_end(&mut got).unwrap();
+            assert_eq!(got, b"bye");
+        }
+        let o = d7_finish(server);
+        let text = |b: &[u8]| String::from_utf8_lossy(b).replace("\r\n", "\n");
+        let live = (o.status.code().unwrap_or(-1), text(&o.stdout), String::new());
+        let recorded = fs::read_to_string(&log).unwrap();
+        assert_eq!(live.0, 0, "{}", text(&o.stderr));
+        assert!(recorded.contains(&format!("command Listen:{port}\n")), "{recorded}");
+        assert!(recorded.contains("event Received:1:%00%20%25%0A%FF\n"), "{recorded}");
+        assert!(recorded.contains("command Send:1:bye\n"), "{recorded}");
+        assert!(recorded.contains("command Close:1\n"), "{recorded}");
+
+        // Someone else holds the port, so this passes only if the replay leaves it alone.
+        let held = std::net::TcpListener::bind(("127.0.0.1", port)).unwrap();
+        d8_check_replay(&exe, &log, &live);
+        let replay = d8_replay(&exe, &log);
+        assert!(replay.2.contains("net: Send 1 bye\n"), "{}", replay.2);
+        drop(held);
+
+        // A server is usually stopped from outside. One that is killed leaves a log with no
+        // `exit`, which is still a run: it replays up to there, and says that it stopped.
+        let port = d7_free_port();
+        let Some((dir2, exe)) = c3_compile(&d7_echo_c(port), "d8killed") else { return };
+        let log = dir2.join("run.log");
+        let mut server = spawn(&exe, &log);
+        let mut s = d7_connect(port);
+        d7_round_trip(&mut s, b"one");
+        d7_round_trip(&mut s, b"two");
+        server.kill().unwrap();
+        server.wait().unwrap();
+        let recorded = fs::read_to_string(&log).unwrap();
+        assert!(recorded.contains("event Received:1:one\ncommand Send:1:one\n"), "{recorded}");
+        assert!(!recorded.contains("exit"), "{recorded}");
+        let replay = d8_replay(&exe, &log);
+        assert_eq!(replay.0, 0, "{}", replay.2);
+        assert!(replay.2.contains("net: Send 1 one\n"), "{}", replay.2);
+        assert!(replay.2.contains("the log ends before the run does"), "{}", replay.2);
+        let _ = fs::remove_dir_all(&dir);
+        let _ = fs::remove_dir_all(&dir2);
+    }
+
+    #[test]
+    fn test_d8_a_replay_that_differs_is_an_error() {
+        let c = d4_c(&[("track_board.gdl", D6_BOARD), ("reactive_game.gdl", D6_GAME)]);
+        let Some((dir, exe)) = c3_compile(&c, "d8differs") else { return };
+        let log = dir.join("run.log");
+        let live = d8_run(&exe, &[("GARDEL_RECORD", log.as_os_str())], b"llll", &[]);
+        assert_eq!(live.0, 0);
+        let good = fs::read_to_string(&log).unwrap();
+        let edited = dir.join("edited.log");
+
+        // The log says one thing and the program does another. The check runs before the
+        // command does, so nothing wrong is printed.
+        let win = "command Print:You%20win%2E\n";
+        let cases = [
+            (good.replace(win, "command Print:You%20lose%2E\n"), "log: command Print:You%20lose"),
+            (good.replace(win, ""), "log: exit 0"),
+            (good.replacen("command ReadKey\nevent", "event", 1), "run: command ReadKey"),
+            (good.replacen("command ReadKey\n", "command ReadKey\ncommand ReadKey\n", 1), "run: waiting for an event"),
+            (good.replace("exit 0\n", "exit 7\n"), "log: exit 7"),
+            (good.replace("exit 0\n", "event Shutdown\nexit 0\n"), "log: event Shutdown"),
+        ];
+        for (text, shown) in &cases {
+            assert_ne!(text, &good);
+            fs::write(&edited, text).unwrap();
+            let r = d8_replay(&exe, &edited);
+            assert_eq!(r.0, 3, "{text}\n{}", r.2);
+            assert!(r.2.contains("the run differs from the log at line"), "{}", r.2);
+            assert!(r.2.contains(shown), "wanted `{shown}` in {}", r.2);
+            assert!(!r.1.contains("You lose"), "{}", r.1);
+        }
+
+        // A program that changed since the run: the use replay has for finding a regression.
+        let changed = D6_GAME.replace("You win.", "You won.");
+        assert_ne!(changed, D6_GAME);
+        let c = d4_c(&[("track_board.gdl", D6_BOARD), ("reactive_game.gdl", &changed)]);
+        let Some((dir2, changed_exe)) = c3_compile(&c, "d8changed") else { return };
+        let r = d8_replay(&changed_exe, &log);
+        assert_eq!(r.0, 3, "{}", r.2);
+        assert!(r.2.contains("log: command Print:You%20win") && r.2.contains("run: command Print:You%20won"), "{}", r.2);
+
+        // Not a replay at all.
+        fs::write(&edited, good.replace("REACTIVE_GAME", "OTHER_GAME")).unwrap();
+        let other = d8_replay(&exe, &edited);
+        assert_eq!(other.0, 2);
+        assert!(other.2.contains("not a log of this program"), "{}", other.2);
+        fs::write(&edited, good.replacen("event Key:108", "event Nonsense", 1)).unwrap();
+        let bad = d8_replay(&exe, &edited);
+        assert_eq!(bad.0, 2);
+        assert!(bad.2.contains("GARDEL_REPLAY: unknown event `Nonsense`"), "{}", bad.2);
+        assert_eq!(d8_replay(&exe, &dir.join("missing.log")).0, 2);
+        let path = log.as_os_str();
+        for envs in [
+            vec![("GARDEL_REPLAY", path), ("GARDEL_EVENTS", "Key:Left".as_ref())],
+            vec![("GARDEL_REPLAY", path), ("GARDEL_RECORD", edited.as_os_str())],
+            vec![("GARDEL_RECORD", dir.as_os_str())],
+        ] {
+            let r = d8_run(&exe, &envs, b"", &[]);
+            assert_eq!(r.0, 2, "{}", r.2);
+            assert_eq!(r.1, "", "nothing runs");
+        }
+        let _ = fs::remove_dir_all(&dir);
+        let _ = fs::remove_dir_all(&dir2);
+    }
+
+    #[test]
+    fn test_d8_any_log_replays_or_is_refused_without_a_crash() {
+        let c = d4_c(&[("track_board.gdl", D6_BOARD), ("reactive_game.gdl", D6_GAME)]);
+        let Some((dir, exe)) = c3_compile(&c, "d8cut") else { return };
+        let log = dir.join("run.log");
+        // Exit 1: the input ended. That code tells a whole log from one replayed to its end.
+        let live = d8_run(&exe, &[("GARDEL_RECORD", log.as_os_str())], b"l", &[]);
+        assert_eq!(live.0, 1);
+        let good = fs::read(&log).unwrap();
+        let header = good.iter().position(|b| *b == b'\n').unwrap() + 1;
+        let cut = dir.join("cut.log");
+        // Cut anywhere, as a kill during a write would. What is left is an honest prefix.
+        for end in header..good.len() {
+            fs::write(&cut, &good[..end]).unwrap();
+            let r = d8_replay(&exe, &cut);
+            assert!([0, 1].contains(&r.0), "cut at {end}: {r:?}");
+            assert!(r.2.contains("the log ends before the run does"), "cut at {end}: {r:?}");
+        }
+        // Any byte wrong: refused, or a different run, and never a crash.
+        for at in 0..good.len() {
+            for byte in [b'%', b'\n', 0xFF] {
+                let mut bad = good.clone();
+                bad[at] = byte;
+                fs::write(&cut, &bad).unwrap();
+                let r = d8_replay(&exe, &cut);
+                assert!([0, 1, 2, 3].contains(&r.0), "byte {at} as {byte}: {r:?}");
+            }
+        }
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]

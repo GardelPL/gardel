@@ -86,7 +86,7 @@ flowchart TD
         C1 --> C2 --> C3 --> C4
     end
 
-    subgraph PhaseD ["Phase D: Reactive Programs (draft)"]
+    subgraph PhaseD ["Phase D: Reactive Programs"]
         D0["Task D.0: Fix `case _` in Boogie"]
         D1["Task D.1: Spec v0.5"]
         D2["Tasks D.2-D.4: Prelude, Checker, Host Loop Slice"]
@@ -419,7 +419,7 @@ Source: [review/review.md](review/review.md). The verification notes for each fi
 
 ### Phase D: Reactive Programs
 
-**Status:** 🔄 In progress: D.0 to D.7 completed, D.8 next (2026-11-05).
+**Status:** ✅ Completed: D.0 to D.8 (2026-11-05).
 
 **Objective:** let Gardel express programs that run until told to stop (servers, TUIs, games) without weakening totality. Every routine stays total. Non-termination lives in one place, the runtime's host loop, and a `reactive program` declares it. The design is [reactive/reactive_programs.md](reactive/reactive_programs.md) (revision 2), corrected by the findings below.
 
@@ -577,9 +577,18 @@ flowchart TD
 - **Known limits.** `SendFailed` is tested only for a full queue, not for an OS error from `send`. IPv4 only, with one address for all `Listen`s, and no outgoing connections. Hiding a representation across modules is enforced, but only as a Boogie type error, so a client reading `c.id` gets an internal message and not a `gardelc` rule. A connection that stalls while open stays open: a program that wants a timeout sets a timer and `Close`s. A module named `C` fails in Boogie ("reserved for type constructor"). On Windows a bind to `127.0.0.1:8080` succeeds beside a wildcard listener on the same port, and such a listener can take the connections: Docker Desktop publishing `8080` did this during testing, so the example then seems to hang. The tests use free ports.
 - Acceptance: the limit holds under a client test that opens more connections than allowed (70 against 64, and exactly in a script). Removing the limit guard is rejected by the verifier (`room`, and `within_limit` without the `require`). Live allocations do not grow across 2,000 connect/close cycles.
 
-#### Task D.8: Event Log and Replay [📋 Planned]
-- [ ] Add a runtime flag that records events, and one that replays a log through the scripted source.
-- Acceptance: replaying a recorded run of the D.6 example reproduces its commands exactly, which tests the determinism claim in proposal §5.
+#### Task D.8: Event Log and Replay [✅ Completed]
+- [x] `GARDEL_RECORD=<file>` writes a log and `GARDEL_REPLAY=<file>` replays one through the scripted source, as spec §11.6 defines. The "flags" of the original task are environment variables, because the command line is the program's own: taking a flag from it would change `args`, which is an input to the run.
+- [x] **The log holds the commands and the exit code as well as the events, which the task did not ask for.** The events alone would make a replay that nothing could fail. With the commands in the log, the replay compares each one before it takes effect and stops with exit status 3 and the line that differs, so a log from a working build finds a regression in a changed program.
+- [x] **Arguments are logged too**, since determinism is stated over `args` and the events. A replay uses the logged ones, and refuses any given on its command line. `gardel_main_args` was split in two for this.
+- [x] **A line's raw bytes are kept for the log**, since a `RESULT` has lost them and a malformed line has no text. `gardel_io_read_line_result` was split into reading and interpreting, and `LineFailed:<code>` was added to scripts, because a failed read had no token.
+- [x] **Every command needs a log form.** `host_command_log` has one case per variant, and a variant with none stops the build, as `host_command_code` does.
+- [x] A log may end anywhere: a kill leaves no `exit` line and perhaps half a line. That half is dropped, the rest replays, a note says the remainder was not checked, and the exit code is the program's. A log that cannot be written ends the recording with one warning, not the run.
+- Tests `test_d8_replay_of_the_game_reproduces_its_commands`, `test_d8_replay_does_not_wait_for_timers`, `test_d8_every_event_survives_the_log`, `test_d8_a_replay_gets_the_arguments_of_its_run`, `test_d8_a_network_run_replays_with_no_network`, `test_d8_a_replay_that_differs_is_an_error`, `test_d8_any_log_replays_or_is_refused_without_a_crash`. The acceptance check does not rest on the runtime's own comparison: the events of a log, given to a fresh run as a plain `GARDEL_EVENTS` script, write a byte-identical log. The network replay runs while another listener holds the port. The last test cuts a game log at every byte, and replaces every byte with each of three values. Two mutants were rejected: a replay that never compares, and a raw line break in logged text.
+- Checked by hand, not in `cargo test`. Windows: a real Ctrl-Break during a recorded echo session ended with code 0, the log held `event Shutdown` and `exit 0`, and it replayed with code 0. Ubuntu 24.04 under AddressSanitizer and UBSan: the game with malformed input, a 51 KB echo over real TCP stopped by `SIGTERM`, both replayed, and a log created as `-rw-------`. Recording to `/dev/full` warned once and the game played to the end with its own exit code. Leak checking was off.
+- `cargo test` 150/150. `--stdlib --strict` 0/0 on seeds 0–3, and the ten examples 0/0.
+- **Known limits.** A log has no size limit, holds what clients sent in the clear, and is protected by file mode only on POSIX. The header names the program, not its build, so a changed program is noticed only when a command differs, not when only its state does. A cut log checks nothing past its end. Replay shows that commands repeat, and nothing about the real effects of those commands, such as bytes reaching a client. The cost of recording, two flushes per event, was not measured. `GARDEL_RECORD` and `GARDEL_REPLAY` go through `getenv` and `fopen`, so on Windows a path outside the ANSI code page may fail, and it does so with exit status 2.
+- Acceptance: replaying a recorded run of the D.6 example reproduces its commands exactly, which tests the determinism claim in proposal §5. The run came from real stdin, with malformed bytes in it, and it also holds for the D.5 clock on real timers and for a network run.
 
 ---
 
@@ -602,7 +611,7 @@ flowchart TD
 
 With **Phase A: Language Specification Harmonization**, **Phase B: Compiler Engine & Prelude Tooling**, **Task C.1: Physical Decomposition of `stdlib/`**, **Task C.2: High-Performance Smart String (`stdlib/text/string.gdl`)**, and **Task C.3: Regression Verification & Performance Benchmarking** completely executed and verified with 0 errors and 0 warnings under `--strict`, Phase C's planned work is done. The verification baseline is clean, and every module compiles from source to C with reference-counted memory (C.3 follow-ups).
 
-The next step is **Phase D: Reactive Programs**, defined above with its tasks, dependency graph and acceptance criteria. The C prerequisites of [reactive/reactive_programs.md](reactive/reactive_programs.md) are in place (C.3 follow-ups): every module compiles from source, closures work, and memory is reference counted, so a program that runs forever does not leak. Tasks D.0 to D.6 are completed, so `examples/reactive_hello.gdl`, `examples/reactive_clock/` and `examples/reactive_game/` run. Tasks D.6b and D.7 are completed too, so `examples/echo_server/` runs over real sockets with a proven connection limit. Next, the event log and replay (D.8). C.4.4 has its baseline (Task D.5).
+**Phase D: Reactive Programs** is defined above with its tasks, dependency graph and acceptance criteria. The C prerequisites of [reactive/reactive_programs.md](reactive/reactive_programs.md) are in place (C.3 follow-ups): every module compiles from source, closures work, and memory is reference counted, so a program that runs forever does not leak. Tasks D.0 to D.6 are completed, so `examples/reactive_hello.gdl`, `examples/reactive_clock/` and `examples/reactive_game/` run. Tasks D.6b and D.7 are completed too, so `examples/echo_server/` runs over real sockets with a proven connection limit, and D.8 records and replays any of them, so Phase D is complete. C.4.4 has its baseline (Task D.5).
 
 **Task C.4 (memory management performance)** is planned. C.4.1–C.4.3 do not depend on Phase D and can be done before or alongside it. C.4.1 and C.4.2 are small and have the largest payoff measured on `seq_bench`, but a reactive program rarely exits, so C.4.1 does little for Phase D and C.4.2 matters more. C.4.4 needs a reactive program to measure against, and D.5 provides its baseline.
 

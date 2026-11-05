@@ -2230,7 +2230,8 @@ static struct SEQ_STRING* gardel_args_range(GardelString* xs, uint64_t lo, uint6
     struct SEQ_STRING* r = gardel_args_range(xs, mid, hi);
     return make_SEQ_STRING_Concat(l, r, hi - lo);
 }
-static struct SEQ_STRING* gardel_main_args(int argc, char** argv) {
+/* The arguments as UTF-8, with the program's name first. An entry that cannot be converted is NULL. */
+static int gardel_args_utf8(int argc, char** argv, char*** out) {
     int n = argc;
     char** u = argv;
 #ifdef _WIN32
@@ -2250,6 +2251,10 @@ static struct SEQ_STRING* gardel_main_args(int argc, char** argv) {
         n = argc;
     }
 #endif
+    *out = u;
+    return n;
+}
+static struct SEQ_STRING* gardel_args_value(int n, char** u) {
     if (n <= 1) return make_SEQ_STRING_Empty();
     GardelString* xs = (GardelString*)malloc(sizeof(GardelString) * (size_t)(n - 1));
     for (int i = 1; i < n; i++) {
@@ -2266,6 +2271,11 @@ static struct SEQ_STRING* gardel_main_args(int argc, char** argv) {
     struct SEQ_STRING* s = gardel_args_range(xs, 0, (uint64_t)(n - 1));
     free(xs);
     return s;
+}
+static struct SEQ_STRING* gardel_main_args(int argc, char** argv) {
+    char** u;
+    int n = gardel_args_utf8(argc, argv, &u);
+    return gardel_args_value(n, u);
 }
 
 "#
@@ -2309,7 +2319,10 @@ static struct SEQ_STRING* gardel_main_args(int argc, char** argv) {
         let mut run = String::new();
         for v in self.variants_of("COMMAND")? {
             let body = host_command_code(&v).ok_or_else(|| format!("`COMMAND.{v}` has no host implementation"))?;
-            run.push_str(&format!("        case TAG_COMMAND_{v}: {body} break;\n"));
+            let log = host_command_log(&v).ok_or_else(|| format!("`COMMAND.{v}` has no log form"))?;
+            run.push_str(&format!(
+                "        case TAG_COMMAND_{v}:\n            if (gardel_log_active()) {{ gardel_log_word(\"command \"); {log} gardel_log_finish(false); }}\n            {body} break;\n"
+            ));
         }
         let mut make = String::new();
         for v in self.variants_of("EVENT")? {
@@ -2330,7 +2343,7 @@ static struct SEQ_STRING* gardel_main_args(int argc, char** argv) {
         Ok((
             format!(
                 "{REACTIVE_RUNTIME}\n\
-                 static void gardel_run_commands({cmds} p) {{\n    for (; p; p = p->tail) {{\n        {cmd} c = p->head;\n        switch (c->tag) {{\n{run}        default: abort();\n        }}\n    }}\n    /* The program may now wait for days: what it printed must already be out. */\n    fflush(stdout);\n}}\n\n\
+                 static void gardel_run_commands({cmds} p) {{\n    for (; p; p = p->tail) {{\n        {cmd} c = p->head;\n        switch (c->tag) {{\n{run}        default: abort();\n        }}\n    }}\n    gardel_log_flush();\n    /* The program may now wait for days: what it printed must already be out. */\n    fflush(stdout);\n}}\n\n\
                  static {keyt} gardel_key_value(struct gardel_host_event ev) {{\n    switch (ev.key) {{\n{make_key}        default: abort();\n    }}\n}}\n\n\
                  static {evt} gardel_event_value(struct gardel_host_event ev) {{\n    switch (ev.kind) {{\n{make}        default: abort();\n    }}\n}}\n\n\
                  int gardel_reactive_main(int argc, char** argv) {{\n\
@@ -2338,7 +2351,11 @@ static struct SEQ_STRING* gardel_main_args(int argc, char** argv) {
                  \x20   gardel_timer_count = 0;\n\
                  \x20   const char* script = getenv(\"GARDEL_EVENTS\");\n\
                  \x20   if (script) gardel_host_script = script;\n\
-                 \x20   struct SEQ_STRING* args = gardel_main_args(argc, argv);\n\
+                 \x20   char** argu;\n\
+                 \x20   int argn = gardel_args_utf8(argc, argv, &argu);\n\
+                 \x20   gardel_log_start(\"{name}\", &argn, &argu);\n\
+                 \x20   struct SEQ_STRING* args = gardel_args_value(argn, argu);\n\
+                 \x20   gardel_log_args(argn, argu);\n\
                  \x20   int code = 0;\n\
                  \x20   #pragma omp parallel\n\
                  \x20   #pragma omp single\n\
@@ -2349,7 +2366,9 @@ static struct SEQ_STRING* gardel_main_args(int argc, char** argv) {
                  \x20           gardel_run_commands(r->Continue.cmds);\n\
                  \x20           {sct} state = {keep};\n\
                  \x20           {drop_step}\
-                 \x20           {evt} e = gardel_event_value(gardel_next_event());\n\
+                 \x20           struct gardel_host_event got = gardel_next_event();\n\
+                 \x20           gardel_log_event(&got);\n\
+                 \x20           {evt} e = gardel_event_value(got);\n\
                  \x20           r = {step}(state, e);\n\
                  \x20           {drop_event}\
                  \x20           {drop_state}\
@@ -2359,6 +2378,7 @@ static struct SEQ_STRING* gardel_main_args(int argc, char** argv) {
                  \x20       }}\n\
                  \x20       gardel_run_commands(r->Stop.cmds);\n\
                  \x20       code = (int)r->Stop.code;\n\
+                 \x20       gardel_log_exit(code);\n\
                  \x20       {drop_step}\
                  \x20   }}\n\
                  \x20   gardel_net_finish();\n\
@@ -2467,11 +2487,18 @@ struct gardel_host_event {
     enum gardel_host_key key;   /* Key */
     uint32_t ch;                /* Key: a Unicode scalar, for GARDEL_KEY_CHAR */
     GardelBytes data;           /* Received: owned */
-    int64_t err;                /* ListenFailed, SendFailed: the OS error code */
+    int64_t err;                /* ListenFailed, SendFailed, Line: the OS error code */
+    int line_state;             /* Line: a GARDEL_LINE_* */
+    char* raw;                  /* Line: the bytes read, kept only when recording */
+    size_t raw_len;
 };
 
 /* Scripted events, from GARDEL_EVENTS: names separated by spaces. NULL reads the OS. */
 static const char* gardel_host_script = NULL;
+static const char* gardel_event_source = "GARDEL_EVENTS";
+/* Set before any thread starts. A line's bytes are gone once it is a RESULT, and a bad line has
+   no text to log, so the reader keeps them for a recording. */
+static bool gardel_log_capture = false;
 
 #ifdef _WIN32
 __declspec(dllimport) int __stdcall SetConsoleCtrlHandler(int (__stdcall*)(unsigned long), int);
@@ -2890,6 +2917,14 @@ static struct gardel_answer** gardel_answers_end = &gardel_answers;
 static bool gardel_reader_started = false;
 static int gardel_pending_answers = 0;
 
+static void gardel_keep_line(struct gardel_host_event* ev, const char* buf, size_t len) {
+    if (!gardel_log_capture) return;
+    ev->raw = (char*)malloc(len + 1);
+    if (!ev->raw) abort();
+    memcpy(ev->raw, buf, len);
+    ev->raw_len = len;
+}
+
 /* Every exit path: after Stop, after a shutdown, and through exit(). */
 static void gardel_term_restore(void) { gardel_term_set_raw(false); }
 
@@ -2979,8 +3014,12 @@ static void gardel_reader_main(void) {
             a->ev.kind = GARDEL_HOST_KEY;
             gardel_read_key(&a->ev);
         } else {
+            char* buf = NULL;
+            size_t len = 0;
             a->ev.kind = GARDEL_HOST_LINE;
-            a->ev.line = gardel_io_read_line_result();
+            a->ev.line_state = gardel_line_read(&buf, &len, &a->ev.err);
+            if (a->ev.line_state == GARDEL_LINE_READ) gardel_keep_line(&a->ev, buf, len);
+            a->ev.line = gardel_line_value(a->ev.line_state, buf, len, a->ev.err);
         }
         free(r);
         gardel_lock();
@@ -3441,6 +3480,289 @@ static char* gardel_script_text(const char* name, size_t n, size_t i, size_t* le
     return buf;
 }
 
+static const struct { const char* name; enum gardel_host_key key; } gardel_key_names[] = {
+    {"Up", GARDEL_KEY_UP}, {"Down", GARDEL_KEY_DOWN}, {"Left", GARDEL_KEY_LEFT},
+    {"Right", GARDEL_KEY_RIGHT}, {"Enter", GARDEL_KEY_ENTER}, {"Escape", GARDEL_KEY_ESCAPE},
+    {"Backspace", GARDEL_KEY_BACKSPACE}, {"Tab", GARDEL_KEY_TAB}, {"Other", GARDEL_KEY_OTHER},
+    {"KeysEnded", GARDEL_KEY_END_OF_INPUT},
+};
+
+/* The event log (spec 11.6). GARDEL_RECORD writes one, and GARDEL_REPLAY runs one through the
+   scripted source. Lines in order of occurrence, each text %XX-escaped so that a line is a line:
+
+       gardel-log 1 ECHO_SERVER
+       arg some%20argument
+       command Listen:8888
+       event Accepted:1
+       event Received:1:hi
+       command Send:1:hi
+       exit 0
+
+   Events are what makes a run repeatable, and the commands and the exit code are what a replay
+   checks. A log ends wherever its program was killed, so a last line with no line break is
+   dropped, and a replay that runs out of log gets the `Shutdown` of a script's end. */
+#define GARDEL_LOG_VERSION "1"
+#define GARDEL_REPLAY_DIVERGED 3
+static FILE* gardel_log_file = NULL;
+static char* gardel_log_line = NULL;
+static size_t gardel_log_len = 0, gardel_log_cap = 0;
+static bool gardel_replaying = false, gardel_replay_cut = false;
+static const char* gardel_replay_pos = NULL;
+static const char* gardel_replay_end = NULL;
+static uint64_t gardel_replay_line_no = 0;
+
+static bool gardel_log_active(void) { return gardel_log_file || gardel_replaying; }
+
+static void gardel_log_put(const char* s, size_t n) {
+    gardel_log_line = (char*)gardel_grow(gardel_log_line, &gardel_log_cap, gardel_log_len + n + 1, 1);
+    memcpy(gardel_log_line + gardel_log_len, s, n);
+    gardel_log_len += n;
+}
+static void gardel_log_word(const char* s) { gardel_log_put(s, strlen(s)); }
+static void gardel_log_number(uint64_t v) {
+    char t[24];
+    gardel_log_put(t, (size_t)snprintf(t, sizeof t, "%llu", (unsigned long long)v));
+}
+static void gardel_log_text(const void* data, uint64_t n) {
+    static const char hex[] = "0123456789ABCDEF";
+    const unsigned char* p = (const unsigned char*)data;
+    gardel_log_line = (char*)gardel_grow(gardel_log_line, &gardel_log_cap, gardel_log_len + 3 * (size_t)n + 1, 1);
+    char* w = gardel_log_line + gardel_log_len;
+    for (uint64_t i = 0; i < n; i++) {
+        unsigned char c = p[i];
+        if ((c >= '0' && c <= '9') || (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z')) {
+            *w++ = (char)c;
+        } else {
+            *w++ = '%';
+            *w++ = hex[c >> 4];
+            *w++ = hex[c & 15];
+        }
+    }
+    gardel_log_len = (size_t)(w - gardel_log_line);
+}
+
+/* A full disk is no reason to end a server. What was written is a good log of a run cut short. */
+static void gardel_log_lost(void) {
+    fprintf(stderr, "warning: GARDEL_RECORD: cannot write the log, so recording stops here\n");
+    fclose(gardel_log_file);
+    gardel_log_file = NULL;
+}
+
+/* The next line of the log. False once it has run out, which a replay says once. */
+static bool gardel_replay_next(const char** line, size_t* n) {
+    size_t left = (size_t)(gardel_replay_end - gardel_replay_pos);
+    const char* eol = left ? (const char*)memchr(gardel_replay_pos, '\n', left) : NULL;
+    if (!eol) {
+        if (!gardel_replay_cut) fprintf(stderr, "replay: the log ends before the run does, so the rest is not checked\n");
+        gardel_replay_cut = true;
+        return false;
+    }
+    *line = gardel_replay_pos;
+    *n = (size_t)(eol - gardel_replay_pos);
+    gardel_replay_pos = eol + 1;
+    gardel_replay_line_no++;
+    return true;
+}
+
+static void gardel_replay_show(const char* label, const char* s, size_t n) {
+    fprintf(stderr, "  %s %.*s%s\n", label, (int)(n > 120 ? 120 : n), s, n > 120 ? "..." : "");
+}
+static void gardel_replay_diverged(const char* line, size_t n, const char* run, size_t run_n) {
+    fflush(stdout);
+    fprintf(stderr, "error: replay: the run differs from the log at line %llu\n", (unsigned long long)gardel_replay_line_no);
+    gardel_replay_show("log:", line, n);
+    gardel_replay_show("run:", run, run_n);
+    exit(GARDEL_REPLAY_DIVERGED);
+}
+
+/* The line just built: written when recording, and compared with the log when replaying. */
+static void gardel_log_finish(bool flush) {
+    if (gardel_log_file) {
+        gardel_log_put("\n", 1);
+        if (fwrite(gardel_log_line, 1, gardel_log_len, gardel_log_file) != gardel_log_len
+            || (flush && fflush(gardel_log_file) != 0)) gardel_log_lost();
+    } else if (gardel_replaying) {
+        const char* line;
+        size_t n;
+        if (gardel_replay_next(&line, &n) && (n != gardel_log_len || memcmp(line, gardel_log_line, n) != 0)) {
+            gardel_replay_diverged(line, n, gardel_log_line, gardel_log_len);
+        }
+    }
+    gardel_log_len = 0;
+}
+
+/* After a batch of commands, before the wait. */
+static void gardel_log_flush(void) {
+    if (gardel_log_file && fflush(gardel_log_file) != 0) gardel_log_lost();
+}
+
+static void gardel_log_refused(const char* source, const char* what) {
+    fprintf(stderr, "error: %s: %s\n", source, what);
+    exit(2);
+}
+
+static FILE* gardel_log_create(const char* path) {
+#ifdef _WIN32
+    return fopen(path, "wb");
+#else
+    /* A log holds what clients sent and what was typed, so it is the owner's alone. */
+    int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+    return fd < 0 ? NULL : fdopen(fd, "wb");
+#endif
+}
+
+static char* gardel_log_load(const char* path, size_t* len) {
+    FILE* f = fopen(path, "rb");
+    if (!f) return NULL;
+    size_t cap = 65536, n = 0, got;
+    char* buf = (char*)malloc(cap);
+    if (!buf) abort();
+    while ((got = fread(buf + n, 1, cap - n, f)) > 0) {
+        n += got;
+        if (n == cap) {
+            cap *= 2;
+            buf = (char*)realloc(buf, cap);
+            if (!buf) abort();
+        }
+    }
+    bool failed = ferror(f) != 0;
+    fclose(f);
+    if (failed) {
+        free(buf);
+        return NULL;
+    }
+    *len = n;
+    return buf;
+}
+
+/* A replay runs with the arguments of its run: they are an input like the events. */
+static void gardel_replay_args(int* argn, char*** argu) {
+    if (*argn > 1) gardel_log_refused("GARDEL_REPLAY", "a replay takes its arguments from the log");
+    int n = 1;
+    char** u = (char**)malloc(sizeof(char*));
+    if (!u) abort();
+    u[0] = NULL;
+    while (gardel_replay_end - gardel_replay_pos >= 4 && memcmp(gardel_replay_pos, "arg ", 4) == 0) {
+        const char* line;
+        size_t len, got;
+        if (!gardel_replay_next(&line, &len)) break;
+        char* text = gardel_script_text(line, len, 4, &got);
+        if (!text) gardel_log_refused("GARDEL_REPLAY", "an argument in the log is malformed");
+        text[got] = '\0';
+        u = (char**)realloc(u, sizeof(char*) * (size_t)(n + 1));
+        if (!u) abort();
+        u[n++] = text;
+    }
+    *argn = n;
+    *argu = u;
+}
+
+/* Before anything else that can be observed: `init` may already print. */
+static void gardel_log_start(const char* program, int* argn, char*** argu) {
+    const char* record = getenv("GARDEL_RECORD");
+    const char* replay = getenv("GARDEL_REPLAY");
+    if (replay && (record || gardel_host_script)) {
+        gardel_log_refused("GARDEL_REPLAY", "it cannot be used with GARDEL_RECORD or GARDEL_EVENTS");
+    }
+    gardel_log_word("gardel-log " GARDEL_LOG_VERSION " ");
+    gardel_log_word(program);
+    if (record) {
+        gardel_log_capture = true;
+        gardel_log_file = gardel_log_create(record);
+        if (!gardel_log_file) gardel_log_refused("GARDEL_RECORD", "cannot create the log");
+        gardel_log_finish(true);
+    } else if (replay) {
+        size_t len = 0;
+        char* text = gardel_log_load(replay, &len);
+        if (!text) gardel_log_refused("GARDEL_REPLAY", "cannot read the log");
+        const char* line;
+        size_t n;
+        gardel_replay_pos = text;
+        gardel_replay_end = text + len;
+        if (!gardel_replay_next(&line, &n) || n != gardel_log_len || memcmp(line, gardel_log_line, n) != 0) {
+            gardel_log_refused("GARDEL_REPLAY", "this is not a log of this program");
+        }
+        /* Scripted: timers, reads and sockets do not run. */
+        gardel_host_script = "";
+        gardel_event_source = "GARDEL_REPLAY";
+        gardel_replaying = true;
+        gardel_replay_args(argn, argu);
+    }
+    gardel_log_len = 0;
+}
+
+static void gardel_log_args(int argn, char** argu) {
+    if (!gardel_log_file) return;
+    for (int i = 1; i < argn; i++) {
+        gardel_log_word("arg ");
+        gardel_log_text(argu[i], strlen(argu[i]));
+        gardel_log_finish(false);
+    }
+}
+
+/* Called as an event is delivered, so the order in the log is the order `step` saw. The line
+   reaches the disk before `step` runs: the event that breaks a run is the one to keep. */
+static void gardel_log_event(struct gardel_host_event* ev) {
+    if (gardel_log_file) {
+        gardel_log_word("event ");
+        switch (ev->kind) {
+        case GARDEL_HOST_SHUTDOWN: gardel_log_word("Shutdown"); break;
+        case GARDEL_HOST_TICK: gardel_log_word("Tick:"); gardel_log_number(ev->id); break;
+        case GARDEL_HOST_LINE:
+            if (ev->line_state == GARDEL_LINE_ENDED) {
+                gardel_log_word("LineEnd");
+            } else if (ev->line_state == GARDEL_LINE_FAILED) {
+                gardel_log_word("LineFailed:");
+                gardel_log_number((uint64_t)ev->err);
+            } else {
+                gardel_log_word("Line:");
+                gardel_log_text(ev->raw, ev->raw_len);
+            }
+            break;
+        case GARDEL_HOST_KEY:
+            gardel_log_word("Key:");
+            if (ev->key == GARDEL_KEY_CHAR) {
+                gardel_log_number(ev->ch);
+            } else {
+                size_t k = 0;
+                while (gardel_key_names[k].key != ev->key) k++;
+                gardel_log_word(gardel_key_names[k].name);
+            }
+            break;
+        case GARDEL_HOST_ACCEPTED: gardel_log_word("Accepted:"); gardel_log_number(ev->id); break;
+        case GARDEL_HOST_CLOSED: gardel_log_word("Closed:"); gardel_log_number(ev->id); break;
+        case GARDEL_HOST_RECEIVED:
+            gardel_log_word("Received:");
+            gardel_log_number(ev->id);
+            gardel_log_word(":");
+            gardel_log_text(ev->data.data, ev->data.len);
+            break;
+        case GARDEL_HOST_LISTEN_FAILED:
+        case GARDEL_HOST_SEND_FAILED:
+            gardel_log_word(ev->kind == GARDEL_HOST_SEND_FAILED ? "SendFailed:" : "ListenFailed:");
+            gardel_log_number(ev->id);
+            gardel_log_word(":");
+            gardel_log_number((uint64_t)ev->err);
+            break;
+        default: abort();
+        }
+        gardel_log_finish(true);
+    }
+    free(ev->raw);
+    ev->raw = NULL;
+}
+
+static void gardel_log_exit(int code) {
+    if (!gardel_log_active()) return;
+    gardel_log_word("exit ");
+    gardel_log_number((uint32_t)code);
+    gardel_log_finish(true);
+    if (gardel_log_file && fclose(gardel_log_file) != 0) {
+        fprintf(stderr, "warning: GARDEL_RECORD: cannot finish the log\n");
+    }
+    gardel_log_file = NULL;
+}
+
 /* Socket tokens of a script: `Accepted:<id>`, `Closed:<id>`, `Received:<id>:<text>`,
    `ListenFailed:<port>:<code>`, `SendFailed:<id>:<code>`. */
 static bool gardel_script_net(const char* name, size_t n, struct gardel_host_event* ev) {
@@ -3479,12 +3801,25 @@ static bool gardel_script_net(const char* name, size_t n, struct gardel_host_eve
 
 static struct gardel_host_event gardel_next_scripted_event(void) {
     struct gardel_host_event ev = { GARDEL_HOST_SHUTDOWN, 0, NULL, GARDEL_KEY_OTHER, 0, {NULL, 0, NULL}, 0 };
-    while (*gardel_host_script == ' ') gardel_host_script++;
-    /* The end of a script is a shutdown: `step` is proven to stop on it, so a script ends. */
-    if (!*gardel_host_script) return ev;
-    size_t n = strcspn(gardel_host_script, " ");
-    const char* name = gardel_host_script;
-    gardel_host_script += n;
+    const char* name;
+    size_t n;
+    /* The end of a script or of a log is a shutdown: `step` is proven to stop on it, so a
+       scripted run ends. */
+    if (gardel_replaying) {
+        if (!gardel_replay_next(&name, &n)) return ev;
+        if (n < 6 || memcmp(name, "event ", 6) != 0) {
+            static const char waiting[] = "waiting for an event";
+            gardel_replay_diverged(name, n, waiting, sizeof waiting - 1);
+        }
+        name += 6;
+        n -= 6;
+    } else {
+        while (*gardel_host_script == ' ') gardel_host_script++;
+        if (!*gardel_host_script) return ev;
+        n = strcspn(gardel_host_script, " ");
+        name = gardel_host_script;
+        gardel_host_script += n;
+    }
     if (n == 8 && memcmp(name, "Shutdown", 8) == 0) return ev;
     if (gardel_script_net(name, n, &ev)) return ev;
     if (n > 5 && memcmp(name, "Tick:", 5) == 0) {
@@ -3499,27 +3834,34 @@ static struct gardel_host_event gardel_next_scripted_event(void) {
         char* buf = gardel_script_text(name, n, 5, &len);
         if (buf) {
             ev.kind = GARDEL_HOST_LINE;
+            gardel_keep_line(&ev, buf, len);
             ev.line = gardel_line_from_bytes(buf, len);
             return ev;
         }
     }
     if (n == 7 && memcmp(name, "LineEnd", 7) == 0) {
         ev.kind = GARDEL_HOST_LINE;
+        ev.line_state = GARDEL_LINE_ENDED;
         ev.line = gardel_line_at_end();
         return ev;
     }
+    if (n > 11 && memcmp(name, "LineFailed:", 11) == 0) {
+        size_t i = 11;
+        uint64_t code;
+        if (gardel_script_number(name, n, &i, &code) && i == n) {
+            ev.kind = GARDEL_HOST_LINE;
+            ev.line_state = GARDEL_LINE_FAILED;
+            ev.err = (int64_t)code;
+            ev.line = gardel_line_failed(ev.err);
+            return ev;
+        }
+    }
     /* Key:<name>, or Key:<scalar> for a character. */
     if (n > 4 && memcmp(name, "Key:", 4) == 0) {
-        static const struct { const char* name; enum gardel_host_key key; } keys[] = {
-            {"Up", GARDEL_KEY_UP}, {"Down", GARDEL_KEY_DOWN}, {"Left", GARDEL_KEY_LEFT},
-            {"Right", GARDEL_KEY_RIGHT}, {"Enter", GARDEL_KEY_ENTER}, {"Escape", GARDEL_KEY_ESCAPE},
-            {"Backspace", GARDEL_KEY_BACKSPACE}, {"Tab", GARDEL_KEY_TAB}, {"Other", GARDEL_KEY_OTHER},
-            {"KeysEnded", GARDEL_KEY_END_OF_INPUT},
-        };
         ev.kind = GARDEL_HOST_KEY;
-        for (size_t k = 0; k < sizeof keys / sizeof keys[0]; k++) {
-            if (strlen(keys[k].name) == n - 4 && memcmp(name + 4, keys[k].name, n - 4) == 0) {
-                ev.key = keys[k].key;
+        for (size_t k = 0; k < sizeof gardel_key_names / sizeof gardel_key_names[0]; k++) {
+            if (strlen(gardel_key_names[k].name) == n - 4 && memcmp(name + 4, gardel_key_names[k].name, n - 4) == 0) {
+                ev.key = gardel_key_names[k].key;
                 return ev;
             }
         }
@@ -3532,7 +3874,7 @@ static struct gardel_host_event gardel_next_scripted_event(void) {
             return ev;
         }
     }
-    fprintf(stderr, "error: GARDEL_EVENTS: unknown event `%.*s`\n", (int)n, name);
+    fprintf(stderr, "error: %s: unknown event `%.*s`\n", gardel_event_source, (int)n, name);
     exit(2);
 }
 
@@ -3580,6 +3922,22 @@ pub(crate) fn host_command_code(variant: &str) -> Option<&'static str> {
         "Listen" => Some("gardel_host_listen(c->Listen.port);"),
         "Send" => Some("gardel_host_send(c->Send.conn->id, c->Send.data);"),
         "Close" => Some("gardel_host_close(c->Close.conn->id);"),
+        _ => None,
+    }
+}
+
+/// How a `COMMAND` variant, bound as `c`, is written in the event log, so a replay can compare
+/// it. `None` stops the build, as for `host_command_code`: a command left out of the log would
+/// be one that replay does not check.
+pub(crate) fn host_command_log(variant: &str) -> Option<&'static str> {
+    match variant {
+        "Print" => Some("gardel_log_word(\"Print:\"); gardel_log_text(c->Print.text.data, c->Print.text.len);"),
+        "SetTimer" => Some("gardel_log_word(\"SetTimer:\"); gardel_log_number(c->SetTimer.id); gardel_log_word(\":\"); gardel_log_number(c->SetTimer.millis);"),
+        "ReadLine" => Some("gardel_log_word(\"ReadLine\");"),
+        "ReadKey" => Some("gardel_log_word(\"ReadKey\");"),
+        "Listen" => Some("gardel_log_word(\"Listen:\"); gardel_log_number(c->Listen.port);"),
+        "Send" => Some("gardel_log_word(\"Send:\"); gardel_log_number(c->Send.conn->id); gardel_log_word(\":\"); gardel_log_text(c->Send.data.data, c->Send.data.len);"),
+        "Close" => Some("gardel_log_word(\"Close:\"); gardel_log_number(c->Close.conn->id);"),
         _ => None,
     }
 }
