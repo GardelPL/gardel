@@ -1,0 +1,35 @@
+-- Sends far more than a client that never reads can take, so a Send must fail and not block.
+reactive program NET_FLOOD
+
+feature {ANY}
+
+  -- n more copies of the Send in front of `rest`.
+  repeat(c: CONN_ID, data: BYTES, n: NAT, rest: LIST[COMMAND]): LIST[COMMAND]
+    variant
+      n
+    do
+      if n = 0 then rest else repeat(c, data, n - 1, rest.prepend(Send(c, data))) end
+    end
+
+  init(args: SEQ[STRING]): STEP[NAT]
+    do
+      Continue(0, LIST.empty.prepend(Listen(8888)))
+    end
+
+  step(s: NAT, e: EVENT): STEP[NAT]
+    do
+      match e
+        case Received(c, data) then
+          Continue(s, repeat(c, data, 1000, LIST.empty))
+        case SendFailed(c, err) then
+          Continue(s, LIST.empty.prepend(Print("send failed")))
+        case Closed(c) then
+          Stop(0, LIST.empty.prepend(Print("closed")))
+        case Shutdown then
+          Stop(9, LIST.empty)
+        case _ then
+          Continue(s, LIST.empty)
+      end
+    end
+
+end

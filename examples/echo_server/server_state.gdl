@@ -1,0 +1,38 @@
+-- The live connections of the echo server. It is opaque, so only these routines can build one,
+-- and `within_limit` holds after `init` and after every step of an unbounded run.
+module SERVER_STATE
+
+representation {NONE}
+  live: LIST[CONN_ID]
+  limit: NAT
+
+invariant
+  within_limit: live.length <= limit
+
+create {ANY}
+
+  make(cap: NAT): SERVER_STATE
+    do
+      { live = LIST.empty, limit = cap }
+    end
+
+feature {ANY}
+
+  has_room: BOOL
+    do
+      Current.live.length < Current.limit
+    end
+
+  admit(c: CONN_ID): SERVER_STATE
+    require
+      room: Current.has_room
+    do
+      { Current with live = Current.live.prepend(c) }
+    end
+
+  release(c: CONN_ID): SERVER_STATE
+    do
+      { Current with live = LIST_OPS.filter(Current.live, fn(x: CONN_ID): BOOL do x != c end) }
+    end
+
+end

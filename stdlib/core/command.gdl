@@ -5,5 +5,8 @@ representation {ANY}
   | SetTimer(id: NAT, millis: U64)
   | ReadLine
   | ReadKey
+  | Listen(port: NAT)
+  | Send(conn: CONN_ID, data: BYTES)
+  | Close(conn: CONN_ID)
 
 end

@@ -117,6 +117,7 @@ end
 │   └── install_tools.sh   # Linux/macOS Bash installer
 ├── examples/              # Standalone Gardel (.gdl) example programs
 │   ├── bounded_stack.gdl
+│   ├── echo_server/           # TCP echo server with a proven connection limit
 │   ├── greeter.gdl
 │   ├── reactive_clock/        # Countdown: a reactive program with timers and a proven state
 │   ├── reactive_game/         # A small terminal game with a proven board

@@ -2226,14 +2226,22 @@ Rules:
 4. **Shutdown must stop.** `step` has the implicit postcondition `e.is_shutdown implies Result.is_stop`, tagged `shutdown_must_stop`. It is always added, so a clause the programmer writes cannot replace it. Constructor queries are used because `EVENT` is not `CANONICAL_EQ` (§9).
 5. **Commands never block.** Commands in one `cmds` list run in order. A command that can fail reports the failure as a later event, never as a crash (§7.2). Output is flushed after each list, before the program waits. The commands of a `Stop` run before the process exits, and its `code` is the exit status. If `init` returns `Stop`, `step` is never called.
 6. **Events are untrusted.** The verifier assumes nothing about a payload beyond its type. Payloads become invariant-carrying values only through `RESULT`-returning boundary routines (§7.2, §11.4).
-7. **Handles.** Each `CONN_ID` comes from exactly one `Accepted` event. After `Close(c)` runs, at most one more event mentions `c`, and it is `Closed(c)`.
+7. **Handles.** Each `CONN_ID` comes from exactly one `Accepted` event, and an id is never used again. After `Close(c)` runs, at most one more event mentions `c`, and it is `Closed(c)`. No event mentions `c` after `Closed(c)`, and a command naming a closed connection does nothing.
 8. **Closed types.** `COMMAND` and `EVENT` are closed, and adding a variant is a prelude change. A program should end a `match` on `EVENT` with `case _` (§5.1).
 
 **Timers.** A timer fires once: `SetTimer(id, millis)` is answered by one `Tick(id)` after at least `millis` milliseconds, on a monotonic clock. A repeating timer sets the next one in `step`. Setting an id that is pending replaces it. Timers fire in deadline order, and in the order they were set on a tie. A pending `Shutdown` comes before any timer that is due, so a program that keeps setting a zero timer can still be stopped. Timers end with the program.
 
 **Console input.** `ReadLine` and `ReadKey` ask for one line or one key, and are answered by one `Line` or `Key` event. A program asks again for the next. Requests are served in order, on a thread of their own, so a blocked read never holds up timers or a `Shutdown`. `Line` carries the result of `IO.read_line` (§11, item 4): an `Error` for malformed UTF-8 or the end of input. `KEY` has no error case: malformed input is `Other`, so `Char` always holds a valid `CHAR`, and the end of input is `KeysEnded`, so a program cannot hang on a closed input. `ReadKey` puts a terminal in raw mode, with no line editing or echo, and `ReadLine` takes it back. Ctrl-C stays a `Shutdown` in raw mode. The terminal is restored when the program ends through `Stop`, a `Shutdown` or a host error. It cannot be restored after a crash or `SIGKILL`.
 
-For tests and replay, `GARDEL_EVENTS` replaces the outside world with a script: event names separated by spaces, such as `Tick:1 Key:Up Key:113 Line:hello%20there LineEnd Shutdown`. `Key:<n>` is a `Char` by scalar value, and `%XX` in a line is a byte, so a script can hold a space or malformed input. `LineEnd` is the end of input. Timers and reads do not run in a script, so it does not depend on the clock or the terminal. An unknown name stops the program with exit status 2. The end of a script is a `Shutdown`, so a scripted run always ends.
+**Sockets.** `Listen(port)` opens a TCP listening socket on IPv4, on the loopback address unless the variable `GARDEL_LISTEN_ADDR` names another one (`0.0.0.0` is every interface), so a program is on the network only when its operator says so. Success has no event: `Accepted` follows when a client connects. `ListenFailed` reports a port that is taken, an address that is not valid, a port above 65535, and port 0, since the program could not learn which port it got.
+
+`Received` carries what one read returned. TCP is a stream, so one `Send` may arrive as several `Received`, and several as one. `Send` never blocks. What the system will not take at once waits in the connection's queue, and the runtime stops reading a connection while 64 KiB wait in its queue, so a client that sends and never reads fills its own TCP window and not this process. A `Send` made while 1 MiB waits fails.
+
+A connection ends in one way, with `Closed`. It comes after `Close`, once the queue has gone out, after the peer closes, once the queue has gone out, or after an error. A peer that closes only its sending side therefore still gets what was queued for it, but a program cannot answer it afterwards: it has seen `Closed`. A failed `Send` ends the connection, since the stream would have a hole, so `SendFailed` is always followed by `Closed`, and the handle guarantee means nothing is reported after a `Close`. A queue that takes no data for 5 seconds is dropped while its connection is ending. The commands of a `Stop` run first, and the program then waits at most 1 second for queues to empty.
+
+Every ready socket gets one event per pass, and sockets and timers take turns, so no client, and no zero timer, starves the rest. A pending `Shutdown` comes first.
+
+For tests and replay, `GARDEL_EVENTS` replaces the outside world with a script: event names separated by spaces, such as `Tick:1 Key:Up Key:113 Line:hello%20there LineEnd Accepted:1 Received:1:hi%20there SendFailed:1:32 ListenFailed:8888:98 Closed:1 Shutdown`. `Key:<n>` is a `Char` by scalar value, and `%XX` in a line or in received data is a byte, so a script can hold a space or malformed input. `LineEnd` is the end of input. Timers, reads and sockets do not run in a script, so it does not depend on the clock, the terminal or the network; `Listen`, `Send` and `Close` are written to standard error as lines such as `net: Send 1 hi%20there`. An unknown name stops the program with exit status 2. The end of a script is a `Shutdown`, so a scripted run always ends.
 
 Guaranteed, given the proof obligations hold: no crash, out-of-bounds access or overflow in any step; the state invariant after every step; finite handling of each event by Gardel code; every run that receives `Shutdown` ends with the code chosen by `step`; and determinism: the states and commands are a function of `args` and the observed event sequence.
 
@@ -2944,7 +2952,7 @@ Phase D builds the `reactive program` of §11.6. `plan/Roadmap.md` holds its tas
 | D.5 | `SetTimer`, `Tick` | ✅ Completed |
 | D.6 | `ReadLine`, `ReadKey`, `Line`, `Key`, `KEY` | ✅ Completed |
 | D.6b | `=` enforced for every type (§9) | ✅ Completed |
-| D.7 | `CONN_ID`, sockets, the echo server | 📋 Planned |
+| D.7 | `CONN_ID`, sockets, the echo server | ✅ Completed |
 | D.8 | Event log and replay | 📋 Planned |
 
 Partial functions (a routine with no `variant`) are a separate proposal and are not part of Phase D.

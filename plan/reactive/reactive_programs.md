@@ -2,6 +2,8 @@
 
 Status: **being implemented in Phase D** ([Roadmap](../Roadmap.md)). The normative text is spec v0.5 §11.6. This document keeps the rationale. Section 13 says what has been compiled and what depends on a later task.
 
+Revision 4 (2026-11-05) records what D.7 decided, now normative in spec §11.6: `Close` sends what is queued first, a failed `Send` ends the connection, queues are bounded, and `Listen` is on loopback unless `GARDEL_LISTEN_ADDR` says otherwise.
+
 Revision 3 (2026-11-04) corrects revision 2 against `gardelc`:
 - The state is an **opaque** module, and `step` changes it through the module's routines (sections 3, 4, 7.1). Revision 2's echo example did not compile: `representation {ECHO_SERVER}` in the state's own file is a dependency cycle (`E0103`), and a client cannot build or read another file's record in Boogie.
 - `shutdown_must_stop` is stated with the constructor queries `EVENT.is_shutdown` and `STEP.is_stop`. `e = Shutdown` broke the §9 equality rules, and `Result is Stop` had no syntax (section 4).
@@ -59,7 +61,7 @@ end
 
 - `S` is any ordinary user type, normally an opaque `module` (`representation {NONE}`) in its own file, whose `invariant` states the safety properties and whose routines carry the guards in `require`. It is inferred from the return type of `init`, and `step` must use the same `S`.
 - A `reactive program` has exactly `init` and `step` and no `main`. It may contain helper routines. It has no `specify` section, like a `program`: lemmas go in the state module or a `functions` module (section 7.3).
-- `init` is pure as well. It cannot touch the world directly, but it can return commands (for example `Listen(8080)`) and it can refuse to start with `Stop(code, ...)`, for example when `args` are invalid.
+- `init` is pure as well. It cannot touch the world directly, but it can return commands (for example `Listen(8888)`) and it can refuse to start with `Stop(code, ...)`, for example when `args` are invalid.
 
 New prelude types (one module per file under `stdlib/core/`, see section 12):
 
@@ -190,7 +192,7 @@ feature {ANY}
 
   init(args: SEQ[STRING]): STEP[SERVER_STATE]
     do
-      Continue(SERVER_STATE.make(64), LIST.empty.prepend(Listen(8080)))
+      Continue(SERVER_STATE.make(64), LIST.empty.prepend(Listen(8888)))
     end
 
   step(s: SERVER_STATE, e: EVENT): STEP[SERVER_STATE]
@@ -207,7 +209,7 @@ feature {ANY}
         case Closed(c) then
           Continue(s.release(c), LIST.empty)
         case ListenFailed(_, _) then
-          Stop(1, LIST.empty.prepend(Print("cannot listen on port 8080")))
+          Stop(1, LIST.empty.prepend(Print("cannot listen on port 8888")))
         case Shutdown then
           Stop(0, LIST.empty)
         case _ then
@@ -340,16 +342,16 @@ Applied in spec v0.5, except the rows and clauses about `partial`, which wait fo
 
 ## 13. Status of the examples
 
-"Compiled" means `gardelc --strict` reported 0 errors and 0 warnings, on 2026-11-04. Types not yet in the prelude were compiled as ordinary user modules.
+"Compiled" means `gardelc --strict` reported 0 errors and 0 warnings, on 2026-11-05.
 
 | Example | Status | Depends on |
 | --- | --- | --- |
 | §3 `reactive program` form | Compiled and run (`examples/reactive_hello.gdl`) | |
 | §3 `STEP`, with `is_stop` | In the prelude (`stdlib/core/step.gdl`) | |
-| §3 `COMMAND`: `Print`, `SetTimer`, `ReadLine`, `ReadKey` | In the prelude | `Listen`, `Send`, `Close`: compiled as user modules, D.7 for the prelude |
-| §6 `EVENT`: `Accepted`, `ListenFailed`, `Received`, `Line`, `Closed`, `Shutdown`, with `is_shutdown` | Compiled | `Tick`, `Line` and `Key` are in the prelude. The rest: D.7 |
-| §7.1 `SERVER_STATE` | Compiled, with `CONN_ID` as a plain opaque module (no `satisfies`) | D.7 for the prelude `CONN_ID` |
-| §7.1 `init` and `step` logic | Compiled as `functions ECHO_LOGIC`, with the `shutdown_must_stop` postcondition written by hand. A test program fed it four events and the native run gave the expected connection count. Three mutants were rejected as section 7.1 states | D.7 for real sockets and the full `EVENT` |
+| §3 `COMMAND` | In the prelude, every variant | |
+| §6 `EVENT`, with `is_shutdown` | In the prelude, every variant | |
+| §7.1 `SERVER_STATE` | Compiled as written, with the prelude `CONN_ID` (`examples/echo_server/`) | |
+| §7.1 `init` and `step` | Compiled as written, and run over real TCP against more clients than allowed. Three mutants are rejected as section 7.1 states | |
 | §7.2 game loop | Compiled and run (`examples/reactive_game/`) | |
 | §7.3 test program | Compiled and run, as above. `let t = LIST.empty.prepend(..)` in a `program` fails in Boogie, so the event list came from a routine with a declared return type | Roadmap, Phase D finding 8 |
 | §10 partial functions | Not compiled | Not in Phase D |

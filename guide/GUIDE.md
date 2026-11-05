@@ -266,7 +266,7 @@ gardelc hello.gdl --json-diagnostics
 gardelc --inspect hello.gdl
 
 # Run the emitted C11 binary (in build/):
-gcc -O3 -fopenmp build/hello.c -o hello
+gcc -O3 -fopenmp build/hello.c -o hello    # a reactive program on Windows also needs -lws2_32
 ./hello
 
 # Run the emitted Bend v2 file (in build/):

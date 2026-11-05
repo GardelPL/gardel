@@ -3662,6 +3662,10 @@ pub const STDLIB_SOURCES: &[(&str, &str)] = &[
         include_str!("../../stdlib/functional/function_ops.gdl"),
     ),
     (
+        "stdlib/core/conn_id.gdl",
+        include_str!("../../stdlib/core/conn_id.gdl"),
+    ),
+    (
         "stdlib/core/command.gdl",
         include_str!("../../stdlib/core/command.gdl"),
     ),
@@ -3707,6 +3711,8 @@ pub fn phase4_stdlib_source() -> &'static str {
         include_str!("../../stdlib/collections/list_ops.gdl"),
         "\n",
         include_str!("../../stdlib/functional/function_ops.gdl"),
+        "\n",
+        include_str!("../../stdlib/core/conn_id.gdl"),
         "\n",
         include_str!("../../stdlib/core/command.gdl"),
         "\n",
@@ -4752,11 +4758,15 @@ pub fn check_module_dependency_cycles(units: &[SourceUnit], table: &LinkTable) -
     )]
 }
 
+/// What the reactive host links with for sockets (spec 11.6). A library no code calls adds
+/// nothing to the program.
+pub const GCC_NET_LIBS: &[&str] = if cfg!(windows) { &["-lws2_32"] } else { &[] };
+
 /// Prelude modules whose background theory is injected into user Boogie contexts.
 /// `STRING` is injected for modules that mention it, contain string literals or use `IO`
 /// (Task B.3: literals denote prelude `STRING` values); `LIST_OPS` / `FUNCTION_OPS` are realized by the built-in
 /// `Seq_*` / `Fn1_*` preamble theories already present in every Boogie file.
-const BOOGIE_INJECTED_PRELUDE: [&str; 12] = [
+const BOOGIE_INJECTED_PRELUDE: [&str; 13] = [
     "OPTION",
     "RESULT",
     "SEQ",
@@ -4765,6 +4775,7 @@ const BOOGIE_INJECTED_PRELUDE: [&str; 12] = [
     "STRING_ERROR",
     "STRING",
     "IO_ERROR",
+    "CONN_ID",
     "COMMAND",
     "KEY",
     "EVENT",
@@ -16541,6 +16552,7 @@ fn main() {
     let gcc_compiled = if module.kind.is_entry_point() {
         Command::new("gcc")
             .args(["-O3", "-fopenmp", &primary_c, "-o", &primary_exe])
+                .args(GCC_NET_LIBS)
             .status()
             .is_ok_and(|s| s.success())
     } else {
@@ -16790,7 +16802,7 @@ end
         let stdlib = parse_phase4_stdlib().expect("Phase 4 stdlib should parse");
         assert_eq!(stdlib.group, None);
         assert_eq!(stdlib.concepts.len(), 3);
-        assert_eq!(stdlib.modules.len(), 14);
+        assert_eq!(stdlib.modules.len(), 15);
         for m in &stdlib.modules {
             let mut diags = check_visibility_and_semantics(m);
             diags.extend(verify_module_phase3(
@@ -17280,7 +17292,7 @@ end
     #[test]
     fn test_plan3_multi_module_stdlib_pipeline() {
         let ast = parse_phase4_stdlib().expect("stdlib parses cleanly");
-        assert_eq!(ast.modules.len(), 14);
+        assert_eq!(ast.modules.len(), 15);
         let mut prog_env = ProgramEnv {
             modules: HashMap::new(),
             concepts: HashMap::new(),
@@ -18541,6 +18553,7 @@ end
             .args(["-std=gnu11", "-O1", "-fopenmp", "-o"])
             .arg(&exe)
             .arg(&c_path)
+            .args(GCC_NET_LIBS)
             .output()
             .ok()?;
         assert!(
@@ -19361,6 +19374,367 @@ end
         assert_ne!(bad, D6_BOARD);
         let (diags, _) = d2_project(&[("track_board.gdl", &bad), ("reactive_game.gdl", D6_GAME)]);
         assert!(diags.iter().any(|d| d.tag == "on_board"), "{diags:?}");
+    }
+
+    const D7_STATE: &str = include_str!("../../examples/echo_server/server_state.gdl");
+    const D7_ECHO: &str = include_str!("../../examples/echo_server/echo_server.gdl");
+    const D7_RULES: &str = include_str!("../tests/reactive/net_rules.gdl");
+    const D7_FLOOD: &str = include_str!("../tests/reactive/net_flood.gdl");
+
+    /// A port nothing listens on: the system's choice, given back at once.
+    fn d7_free_port() -> u16 {
+        std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port()
+    }
+
+    fn d7_echo_c(port: u16) -> String {
+        d4_c(&[("server_state.gdl", D7_STATE), ("echo_server.gdl", &D7_ECHO.replace("8888", &port.to_string()))])
+    }
+
+    fn d7_spawn(exe: &std::path::Path) -> std::process::Child {
+        Command::new(exe)
+            .env_remove("GARDEL_EVENTS")
+            .env_remove("GARDEL_LISTEN_ADDR")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap()
+    }
+
+    /// Waits for a server to end by itself. One that hangs fails the test.
+    fn d7_finish(mut server: std::process::Child) -> std::process::Output {
+        for _ in 0..3000 {
+            if server.try_wait().unwrap().is_some() {
+                return server.wait_with_output().unwrap();
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let _ = server.kill();
+        panic!("the server did not stop: {:?}", server.wait_with_output().unwrap());
+    }
+
+    /// A client of a server that may still be starting, with a read timeout, so that a server
+    /// that hangs fails the test and does not stop it.
+    fn d7_connect(port: u16) -> std::net::TcpStream {
+        for _ in 0..500 {
+            if let Ok(s) = std::net::TcpStream::connect(("127.0.0.1", port)) {
+                s.set_read_timeout(Some(std::time::Duration::from_secs(10))).unwrap();
+                s.set_nodelay(true).unwrap();
+                return s;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        panic!("no server on port {port}");
+    }
+
+    fn d7_round_trip(s: &mut std::net::TcpStream, text: &[u8]) {
+        use std::io::{Read, Write};
+        s.write_all(text).unwrap();
+        let mut got = vec![0u8; text.len()];
+        s.read_exact(&mut got).unwrap();
+        assert_eq!(got, text);
+    }
+
+    /// True when the server let this client in: it echoes, where a refused one sees the end.
+    fn d7_admitted(s: &mut std::net::TcpStream) -> bool {
+        use std::io::{Read, Write};
+        let _ = s.write_all(b"?");
+        let mut b = [0u8; 1];
+        matches!(s.read(&mut b), Ok(1))
+    }
+
+    #[test]
+    fn test_d7_conn_id_laws_are_proven_and_a_handle_cannot_be_forged() {
+        let stdlib = parse_phase4_stdlib().unwrap();
+        let conn = stdlib.modules.iter().find(|m| m.name == "CONN_ID").expect("CONN_ID");
+        assert!(matches!(conn.repr_vis, Visibility::None));
+        assert!(conn.create_routines.is_empty(), "a creator would forge handles");
+        let laws: Vec<&str> = conn.specify_laws.iter().map(|(_, l)| l.name.as_str()).collect();
+        for law in ["reflexive", "symmetric", "transitive", "agrees_with_structural", "irreflexive", "total"] {
+            assert!(laws.contains(&law), "{law}: {laws:?}");
+        }
+        // Handles compare with `=` (it is CANONICAL_EQ), and that is all a client can do.
+        let client = |body: &str, ret: &str| {
+            format!("reactive program CLIENT\n\nfeature {{ANY}}\n\n  probe(a: CONN_ID, b: CONN_ID): {ret}\n    do\n      {body}\n    end\n\n  init(args: SEQ[STRING]): STEP[NAT]\n    do\n      Stop(0, LIST.empty)\n    end\n\n  step(s: NAT, e: EVENT): STEP[NAT]\n    do\n      Stop(s, LIST.empty)\n    end\n\nend\n")
+        };
+        for (body, ret) in [("a = b", "BOOL"), ("a != b", "BOOL"), ("a.equals(b)", "BOOL"), ("a.less_than(b)", "BOOL")] {
+            let (diags, _) = d2_project(&[("client.gdl", &client(body, ret))]);
+            assert!(diags.is_empty(), "`{body}` must stay legal: {diags:?}");
+        }
+        // Hiding is enforced by types: a record literal is always the current module's record,
+        // and a field is a function of its own module's sort.
+        for (body, ret) in [("a.id", "U64"), ("{ id = 1 }", "CONN_ID"), ("{ a with id = 5 }", "CONN_ID"), ("CONN_ID.make(1)", "CONN_ID")] {
+            let (diags, _) = d2_project(&[("client.gdl", &client(body, ret))]);
+            assert!(diags.iter().any(|d| d.level == "error"), "`{body}` forges or opens a handle");
+        }
+    }
+
+    #[test]
+    fn test_d7_the_limit_is_proven() {
+        let c = d7_echo_c(8888);
+        assert!(c.contains("case TAG_COMMAND_Listen:"), "one case per variant");
+        // `within_limit` needs `room`, and `step` must prove `room`.
+        let no_require = D7_STATE.replace("    require\n      room: Current.has_room\n", "").replace("    require\r\n      room: Current.has_room\r\n", "");
+        assert_ne!(no_require, D7_STATE);
+        let (diags, _) = d2_project(&[("server_state.gdl", &no_require), ("echo_server.gdl", D7_ECHO)]);
+        assert!(diags.iter().any(|d| d.tag == "within_limit"), "{diags:?}");
+        let no_guard = D7_ECHO.replace("if s.has_room then", "if True then");
+        assert_ne!(no_guard, D7_ECHO);
+        let (diags, _) = d2_project(&[("server_state.gdl", D7_STATE), ("echo_server.gdl", &no_guard)]);
+        assert!(diags.iter().any(|d| d.tag == "room"), "{diags:?}");
+        // A shutdown must stop, here as everywhere.
+        let no_stop = D7_ECHO.replace("case Shutdown then\n          Stop(0, LIST.empty)", "case Shutdown then\n          Continue(s, LIST.empty)")
+            .replace("case Shutdown then\r\n          Stop(0, LIST.empty)", "case Shutdown then\r\n          Continue(s, LIST.empty)");
+        assert_ne!(no_stop, D7_ECHO);
+        let (diags, _) = d2_project(&[("server_state.gdl", D7_STATE), ("echo_server.gdl", &no_stop)]);
+        assert!(diags.iter().any(|d| d.tag == "shutdown_must_stop"), "{diags:?}");
+    }
+
+    #[test]
+    fn test_d7_scripted_sockets() {
+        // No socket is opened: the script is the world, and the commands are written out.
+        let c = d7_echo_c(8888);
+        let script = "Accepted:1 Accepted:2 Received:1:hi%20there SendFailed:1:32 Closed:1 Received:2:%FF%00 Closed:2 Shutdown";
+        if let Some((code, out, err)) = d4_run(&c, "rnet", script, &[]) {
+            assert_eq!((code, out.as_str()), (0, ""), "{err}");
+            assert_eq!(err.replace("\r\n", "\n"), "net: Listen 8888\nnet: Send 1 hi%20there\nnet: Send 2 %FF%00\n");
+        }
+        // The limit, exactly: the 64 first are in, the next is refused, and a free slot is
+        // used again.
+        let mut script: String = (1..=65).map(|i| format!("Accepted:{i} ")).collect();
+        script.push_str("Closed:1 Accepted:66 Accepted:67");
+        if let Some((code, _, err)) = d4_run(&c, "rnetlimit", &script, &[]) {
+            assert_eq!(code, 0, "{err}");
+            let closes: Vec<&str> = err.lines().filter(|l| l.starts_with("net: Close")).collect();
+            assert_eq!(closes, ["net: Close 65", "net: Close 67"], "{err}");
+        }
+        if let Some((code, out, _)) = d4_run(&c, "rnetfail", "ListenFailed:8888:98", &[]) {
+            assert_eq!((code, out.trim_end()), (1, "cannot listen on port 8888"));
+        }
+        for bad in ["Accepted:x", "Accepted:", "Closed:1:2", "Received:1", "Received:1:%ZZ", "SendFailed:1:", "ListenFailed:80"] {
+            if let Some((code, _, err)) = d4_run(&c, "rnetbad", bad, &[]) {
+                assert_eq!(code, 2, "`{bad}`: {err}");
+                assert!(err.contains("unknown event"), "`{bad}`: {err}");
+            }
+        }
+    }
+
+    #[test]
+    fn test_d7_echo_server_over_real_sockets() {
+        use std::io::{Read, Write};
+        let port = d7_free_port();
+        let Some((dir, exe)) = c3_compile(&d7_echo_c(port), "recho") else { return };
+        let mut server = d7_spawn(&exe);
+
+        // The limit under more clients than allowed: the 64 first are in and keep working.
+        let mut live: Vec<std::net::TcpStream> = Vec::new();
+        for i in 0..64u32 {
+            let mut c = d7_connect(port);
+            d7_round_trip(&mut c, format!("hello {i}").as_bytes());
+            live.push(c);
+        }
+        for _ in 0..6 {
+            assert!(!d7_admitted(&mut d7_connect(port)), "the 65th client got in");
+        }
+        for (i, c) in live.iter_mut().enumerate() {
+            d7_round_trip(c, format!("still here {i}").as_bytes());
+        }
+        // A slot is free again once its client has gone.
+        live.pop();
+        let mut replaced = false;
+        for _ in 0..200 {
+            if d7_admitted(&mut d7_connect(port)) {
+                replaced = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(replaced, "a closed connection must free its slot");
+        live.clear();
+
+        let mut admitted = None;
+        for _ in 0..200 {
+            let mut c = d7_connect(port);
+            if d7_admitted(&mut c) {
+                admitted = Some(c);
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let mut sink = admitted.expect("the slots come back");
+
+        // A client that sends and never reads stops only itself. The server stops reading it,
+        // so its send blocks, and everyone else is served.
+        let mut stalled = d7_connect(port);
+        stalled.set_write_timeout(Some(std::time::Duration::from_millis(300))).unwrap();
+        let chunk = vec![7u8; 65536];
+        let mut sent = 0usize;
+        let mut blocked = false;
+        while sent < 400 * 1024 * 1024 {
+            match stalled.write(&chunk) {
+                Ok(n) => sent += n,
+                Err(_) => {
+                    blocked = true;
+                    break;
+                }
+            }
+        }
+        assert!(blocked, "the server read {sent} bytes that it cannot send back");
+        d7_round_trip(&mut sink, b"not blocked");
+        drop(stalled);
+
+        // A long stream with both directions busy, ended by half a close: all of the echo
+        // arrives after the client has finished sending.
+        let mut big = d7_connect(port);
+        let data: Vec<u8> = (0..4 * 1024 * 1024u32).map(|i| (i % 251) as u8).collect();
+        let mut writer = big.try_clone().unwrap();
+        let to_send = data.clone();
+        let t = std::thread::spawn(move || {
+            writer.write_all(&to_send).unwrap();
+            writer.shutdown(std::net::Shutdown::Write).unwrap();
+        });
+        let mut got = Vec::new();
+        big.read_to_end(&mut got).unwrap();
+        t.join().unwrap();
+        assert_eq!(got.len(), data.len());
+        assert!(got == data, "the stream came back different");
+
+        assert!(server.try_wait().unwrap().is_none(), "the server must still run");
+        #[cfg(unix)]
+        {
+            let sent = Command::new("kill").arg("-TERM").arg(server.id().to_string()).status().unwrap();
+            assert!(sent.success());
+            assert_eq!(server.wait().unwrap().code(), Some(0), "`Shutdown` stops with code 0");
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = server.kill();
+            let _ = server.wait();
+        }
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_d7_listen_failures_are_events() {
+        // The port is taken.
+        let taken = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = taken.local_addr().unwrap().port();
+        let Some((dir, exe)) = c3_compile(&d7_echo_c(port), "rlisten") else { return };
+        let o = Command::new(&exe).env_remove("GARDEL_EVENTS").env_remove("GARDEL_LISTEN_ADDR").output().unwrap();
+        assert_eq!(o.status.code(), Some(1), "{}", String::from_utf8_lossy(&o.stderr));
+        assert!(String::from_utf8_lossy(&o.stdout).contains("cannot listen"));
+        // An address that is not one.
+        let o = Command::new(&exe).env_remove("GARDEL_EVENTS").env("GARDEL_LISTEN_ADDR", "not.an.address").output().unwrap();
+        assert_eq!(o.status.code(), Some(1));
+        drop(taken);
+        let _ = fs::remove_dir_all(&dir);
+        // Ports that cannot be listened on: too large, and 0, which the program could not learn.
+        for port in ["70000", "0"] {
+            let src = D7_ECHO.replace("Listen(8888)", &format!("Listen({port})"));
+            let c = d4_c(&[("server_state.gdl", D7_STATE), ("echo_server.gdl", &src)]);
+            let Some((dir, exe)) = c3_compile(&c, "rlistenbad") else { return };
+            let o = Command::new(&exe).env_remove("GARDEL_EVENTS").output().unwrap();
+            assert_eq!(o.status.code(), Some(1), "port {port}");
+            let _ = fs::remove_dir_all(&dir);
+        }
+    }
+
+    #[test]
+    fn test_d7_a_closed_handle_stays_quiet() {
+        use std::io::{Read, Write};
+        // After Close(c) a program may still name c, by mistake: the bytes of the earlier Send
+        // arrive, the later Send does nothing, and exactly one event mentions c: its Closed.
+        let port = d7_free_port();
+        let src = D7_RULES.replace("8888", &port.to_string());
+        let c = d4_c(&[("net_rules.gdl", &src)]);
+        let Some((dir, exe)) = c3_compile(&c, "rrules") else { return };
+        let server = d7_spawn(&exe);
+        for _ in 0..2 {
+            let mut s = d7_connect(port);
+            s.write_all(b"x").unwrap();
+            let mut got = Vec::new();
+            s.read_to_end(&mut got).unwrap();
+            assert_eq!(got, b"bye", "the Send before Close arrives, and the one after it does not");
+        }
+        let o = d7_finish(server);
+        let _ = fs::remove_dir_all(&dir);
+        assert_eq!(o.status.code(), Some(0));
+        assert_eq!(String::from_utf8_lossy(&o.stdout).replace("\r\n", "\n"), "received\nclosed\nreceived\nclosed\n");
+    }
+
+    #[test]
+    fn test_d7_a_failed_send_ends_the_connection() {
+        use std::io::Write;
+        // A client that reads nothing: the queue fills, and a Send fails in place of blocking.
+        // Its SendFailed comes first, and Closed follows, so a program has one ending to handle.
+        let port = d7_free_port();
+        let src = D7_FLOOD.replace("8888", &port.to_string());
+        let c = d4_c(&[("net_flood.gdl", &src)]);
+        let Some((dir, exe)) = c3_compile(&c, "rflood") else { return };
+        let server = d7_spawn(&exe);
+        let mut client = d7_connect(port);
+        client.write_all(&[7u8; 65536]).unwrap();
+        let o = d7_finish(server);
+        drop(client);
+        assert_eq!(o.status.code(), Some(0));
+        assert_eq!(String::from_utf8_lossy(&o.stdout).replace("\r\n", "\n"), "send failed\nclosed\n");
+        // After Close, not even that failure is reported.
+        let port = d7_free_port();
+        let src = D7_FLOOD.replace("8888", &port.to_string()).replace("1000, LIST.empty)", "1000, LIST.empty.prepend(Close(c)))");
+        assert!(src.contains("prepend(Close(c))"));
+        let c = d4_c(&[("net_flood.gdl", &src)]);
+        let (dir2, exe) = c3_compile(&c, "rfloodclose").unwrap();
+        let server = d7_spawn(&exe);
+        let mut client = d7_connect(port);
+        client.write_all(&[7u8; 65536]).unwrap();
+        let o = d7_finish(server);
+        drop(client);
+        let _ = fs::remove_dir_all(&dir);
+        let _ = fs::remove_dir_all(&dir2);
+        assert_eq!(o.status.code(), Some(0));
+        assert_eq!(String::from_utf8_lossy(&o.stdout).replace("\r\n", "\n"), "closed\n");
+    }
+
+    #[test]
+    fn test_d7_live_allocations_do_not_grow_across_connections() {
+        use std::io::{Read, Write};
+        // Three events per client: Accepted, Received, Closed. The live count is sampled during
+        // the run, so a leak per connection shows even if the program frees it all at exit.
+        let port = d7_free_port();
+        let c = d7_echo_c(port);
+        let harness = format!(
+            "#define GARDEL_HOST_PROBE gardel_probe\nstatic void gardel_probe(void);\n{c}\n\
+             static uint64_t gardel_seen = 0, gardel_early = 0, gardel_peak = 0;\n\
+             static void gardel_probe(void) {{\n    uint64_t live = gardel_live_allocations();\n    gardel_seen++;\n    if (gardel_seen == 300) gardel_early = live;\n    if (gardel_seen >= 300 && live > gardel_peak) gardel_peak = live;\n    if (gardel_seen == 5900) {{\n        fprintf(stderr, \"early=%llu peak=%llu\\n\", (unsigned long long)gardel_early, (unsigned long long)gardel_peak);\n        fflush(stderr);\n        _Exit(0);\n    }}\n}}\n"
+        );
+        let Some((dir, exe)) = c3_compile(&harness, "rcycles") else { return };
+        let server = d7_spawn(&exe);
+        for i in 0..2000u32 {
+            let Ok(mut s) = std::net::TcpStream::connect(("127.0.0.1", port)).or_else(|_| {
+                std::thread::sleep(std::time::Duration::from_millis(50));
+                std::net::TcpStream::connect(("127.0.0.1", port))
+            }) else {
+                break; // the probe saw enough, and the server has gone
+            };
+            s.set_read_timeout(Some(std::time::Duration::from_secs(10))).unwrap();
+            if s.write_all(b"cycle").is_err() {
+                break;
+            }
+            let mut got = [0u8; 5];
+            if s.read_exact(&mut got).is_err() {
+                assert!(i > 1900, "the server stopped early, at client {i}");
+                break;
+            }
+        }
+        let o = d7_finish(server);
+        let _ = fs::remove_dir_all(&dir);
+        let err = String::from_utf8_lossy(&o.stderr).to_string();
+        let field = |k: &str| -> u64 {
+            let at = err.find(&format!("{k}=")).unwrap_or_else(|| panic!("{err}"));
+            err[at + k.len() + 1..].split_whitespace().next().unwrap().parse().unwrap()
+        };
+        // At most one client at a time: a list cell, a handle and the bytes in flight.
+        assert!(field("peak") <= field("early") + 8, "live allocations grew: {err}");
     }
 
     #[test]
