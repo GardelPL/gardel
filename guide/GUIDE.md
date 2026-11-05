@@ -90,6 +90,7 @@ This guide is written for two audiences:
 - [17. Projects and the Standard Prelude](#17-projects-and-the-standard-prelude)
   - [The Prelude Is Always There](#the-prelude-is-always-there)
   - [Multi-File Projects](#multi-file-projects)
+  - [Project Manifests (`Gardel.toml`)](#project-manifests-gardeltoml)
   - [Name Resolution](#name-resolution)
   - [The Standard Library Sources (`stdlib/`)](#the-standard-library-sources-stdlib)
 - [18. Compiler CLI Cheatsheet & Grammar Reference](#18-compiler-cli-cheatsheet--grammar-reference)
@@ -1641,10 +1642,37 @@ gardelc src/*.gdl --strict    # a wildcard pattern
 gardelc a.gdl b.gdl           # explicit files
 ```
 
+Existing examples and projects work directly without any configuration file.
+
 Rules:
 - **One module per file**, named after it: `module BANK_ACCOUNT` lives in `bank_account.gdl`. Otherwise you get `W0201: file_module_name_mismatch`, which `--strict` turns into a failure.
 - **No duplicates:** two files declaring the same module is `E0102`.
 - **No cycles between files:** each file's proofs trust the contracts of the files it uses, so a cycle would let two modules prove each other. Cross-file cycles are rejected with `E0103: cyclic_module_dependency`; genuinely mutually dependent modules belong in one file.
+
+### Project Manifests (`Gardel.toml`)
+
+Projects may also declare their identity and boundaries with a `Gardel.toml` file in their root directory (Task E.1):
+
+```toml
+[project]
+name = "echo-server"
+version = "0.1.0"
+```
+
+When a manifest is used:
+- Sources are placed under `src/` (e.g. `examples/echo_server/src/*.gdl`).
+- Compile the project by passing `--project <DIR>`:
+  ```bash
+  gardelc --project examples/echo_server --strict
+  ```
+- Or run `gardelc` with no input operands from within the project directory:
+  ```bash
+  cd examples/echo_server
+  gardelc --strict
+  ```
+- **Package naming rules:** Lowercase ASCII letters, digits, `-`, and `.`. Each segment must start with `a`–`z` and cannot end with `-`. The name cannot start with `gardel.` and cannot produce the default alias `GARDEL` (which is reserved for the Standard Prelude).
+- **Strict TOML 1.0:** The parser enforces a clean, dependency-free subset with 1-based line numbers on syntax or schema errors.
+- **Zero semantic difference:** A manifest changes nothing about how source code behaves or verifies; it establishes project identity and boundaries for tooling and future dependency resolution. Projects without a `Gardel.toml` continue to compile using files and directory paths as usual.
 
 ### Name Resolution
 
@@ -1719,6 +1747,10 @@ gardelc <file.gdl>
 gardelc <file.gdl> <other.gdl> ...
 gardelc <DIR>
 gardelc 'src/*.gdl'
+
+# Compile and verify a manifest project (defined by Gardel.toml)
+gardelc --project <DIR>
+gardelc                        # when ./Gardel.toml is present
 
 # Verify the Standard Prelude sources (stdlib/) as one linked project
 gardelc --stdlib --strict

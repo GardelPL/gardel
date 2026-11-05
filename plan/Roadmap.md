@@ -636,7 +636,7 @@ flowchart TD
 
 ### Phase E: Projects and Packages (the "Verified Universe")
 
-**Status:** Task E.0 ✅ Completed (2026-11-05). All design questions are decided (decisions 1 to 11). E.1 is ready to start. E.2 and E.3 can follow, using the stdlib to measure. E.4 onwards waits until a real second package exists.
+**Status:** Tasks E.0 & E.1 ✅ Completed (2026-11-05). All design questions are decided (decisions 1 to 11). E.1 completed. E.2 and E.3 can follow, using the stdlib to measure. E.4 onwards waits until a real second package exists.
 
 **Objective:** let a Gardel project depend on other Gardel packages without import statements, and without trusting anything that was not proven on this machine. Source stays declaration-only. A manifest, `Gardel.toml`, states what is in the universe. Modular reasoning stays Hoare's rule for a call: prove the callee's precondition, then use its postcondition.
 
@@ -709,11 +709,11 @@ flowchart TD
 - Tests `test_e0_every_undefined_name_has_a_rule_and_a_location` (rule and line), `test_e0_all_repository_sources_resolve` (every example and the stdlib, so a false rejection fails here), `test_e0_private_members_stay_private`, `test_e0_constructors_of_one_name`, `test_e0_what_boogie_refuses_is_not_shown_as_boogie_text`, `test_e0_flags_are_known_or_refused`. `cargo test` 164/164. `--stdlib --strict` 0/0 and the eleven examples 0/0.
 - **Known limits.** A member on a receiver of unknown type is not resolved here, and reaches `E0199` or the verifier. `feature {OTHER}` across files is not usable, as the export list forms a cycle (`E0103`), so `E0113` is tested only for `{NONE}` and for a module outside the list.
 
-#### Task E.1: `Gardel.toml` Without Dependencies [ ]
-- [ ] `[project]` with `name` and `version`, read by the TOML subset parser of decision 10. `gardelc` with no input, or `--project DIR`, reads it and uses `src/`.
-- [ ] Check package names against decision 11. TOML outside the subset, a duplicate key or a bad escape is an error with its line number.
-- [ ] Spec §4.2 and §13: the manifest. A manifest without dependencies changes nothing about what a source file means, and dependencies change it only through the names and aliases they add.
-- Acceptance: `examples/echo_server` with a manifest gives the same `.bpl` and `.c` as `gardelc examples/echo_server`.
+#### Task E.1: `Gardel.toml` Without Dependencies [✅ Completed]
+- [x] `[project]` with `name` and `version`, read by the strict TOML 1.0 subset parser of decision 10 (`gardelc/src/manifest.rs`). `gardelc` with no input, or `--project DIR`, reads it and uses `src/`.
+- [x] Check package names against decision 11 (lowercase, digits, `-`, `.`, segments starting with a lowercase letter and not ending with `-`, no reserved `gardel` prefix or `GARDEL` alias). TOML outside the subset, unknown table/keys, a duplicate key/table, or a bad escape is an error with its 1-based line number.
+- [x] Spec §4.2 and §13: documented the manifest model, naming rules, and CLI resolution. A manifest without dependencies changes nothing about what a source file means, and dependencies change it only through the names and aliases they add.
+- [x] Acceptance: `examples/echo_server/Gardel.toml` added and sources placed in `examples/echo_server/src/`; `gardelc --project examples/echo_server` and `gardelc examples/echo_server` give the exact same `.bpl` and `.c` files. Unit tests: `test_e1_manifest_parser_and_package_name_validation`, `test_e1_echo_server_with_manifest_gives_same_bpl_and_c`, `test_e1_cli_project_argument_handling`, plus strictness unit tests in `manifest.rs`.
 
 #### Task E.2: Contract-Only Interfaces [ ]
 - [ ] Define the `.gds` content from `--inspect`: signatures, `require`, `ensure`, public ghost signatures and laws. A ghost query over a hidden representation stays uninterpreted for a client.
@@ -774,7 +774,7 @@ flowchart TD
 
 ## 6. Immediate Next Step
 
-**Phase E: Projects and Packages:** Task E.0 is completed and all design questions are decided. The next step is Task E.1. Then run the measurement in Task E.2, and build a real second package before Task E.4.
+**Phase E: Projects and Packages:** Tasks E.0 and E.1 are completed and all design questions are decided. The next step is Task E.2 (Contract-Only Interfaces), followed by Task E.3 (Local Verification Cache).
 
 With **Phase A: Language Specification Harmonization**, **Phase B: Compiler Engine & Prelude Tooling**, **Task C.1: Physical Decomposition of `stdlib/`**, **Task C.2: High-Performance Smart String (`stdlib/text/string.gdl`)**, and **Task C.3: Regression Verification & Performance Benchmarking** completely executed and verified with 0 errors and 0 warnings under `--strict`, Phase C's planned work is done. The verification baseline is clean, and every module compiles from source to C with reference-counted memory (C.3 follow-ups).
 

@@ -11,6 +11,7 @@ use std::process::Command;
 use std::rc::Rc;
 
 mod c11_typed;
+pub mod manifest;
 mod names;
 mod patterns;
 pub use c11_typed::emit_c11_typed;
@@ -16610,6 +16611,63 @@ pub fn resolve_input_operands(operands: &[String]) -> Result<(Vec<String>, bool)
     Ok((files, project || operands.len() > 1))
 }
 
+/// Resolves a project directory `dir` containing `Gardel.toml` and `src/` (Task E.1).
+/// Returns `(Manifest, sorted_gdl_files)` or `ProjectResolutionError`.
+pub fn resolve_project_inputs(
+    dir: &std::path::Path,
+) -> Result<(manifest::Manifest, Vec<String>), manifest::ProjectResolutionError> {
+    let (manifest, src_dir) = manifest::resolve_manifest_project_dir(dir)?;
+    let src_dir_str = src_dir.to_string_lossy().to_string();
+    let files = gdl_files_in_dir(&src_dir_str, None).map_err(|e| {
+        manifest::ProjectResolutionError {
+            rule: "IO",
+            tag: "io_error",
+            path: src_dir_str.clone(),
+            line: 1,
+            message: e,
+        }
+    })?;
+    if files.is_empty() {
+        return Err(manifest::ProjectResolutionError {
+            rule: "IO",
+            tag: "io_error",
+            path: src_dir_str.clone(),
+            line: 1,
+            message: format!(
+                "No .gdl source files found in project '{}' ('{}')",
+                manifest.project.name, src_dir_str
+            ),
+        });
+    }
+    Ok((manifest, files))
+}
+
+/// Parses `--project <DIR>` from command-line arguments.
+/// Rejects `--project` without a directory argument or repeated `--project` flags.
+fn parse_project_arg(args: &[String]) -> Result<Option<String>, String> {
+    let mut project_dir = None;
+    let mut i = 1;
+    while i < args.len() {
+        let arg = &args[i];
+        if arg == "--project" {
+            let val = args
+                .get(i + 1)
+                .filter(|v| !v.starts_with("--") && !v.is_empty())
+                .ok_or_else(|| {
+                    "--project: expected a directory path after `--project`".to_string()
+                })?;
+            if project_dir.is_some() {
+                return Err("--project: option specified more than once".to_string());
+            }
+            project_dir = Some(val.clone());
+            i += 2;
+            continue;
+        }
+        i += 1;
+    }
+    Ok(project_dir)
+}
+
 /// Splits the command line into input operands (files, directories, wildcard patterns).
 /// The values of `--fuel <N>` and `--inspect [MODULE]` are not operands.
 /// Whether a command-line word names an input (file, directory or wildcard) rather than a
@@ -16621,7 +16679,7 @@ fn looks_like_input(s: &str) -> bool {
 }
 
 /// Flags followed by a value.
-const VALUE_FLAGS: &[&str] = &["--fuel", "--z3-seed", "--z3-rlimit"];
+const VALUE_FLAGS: &[&str] = &["--fuel", "--z3-seed", "--z3-rlimit", "--project"];
 /// Flags with no value, or with an optional one (`--inspect`, `--emit-stdlib`).
 const PLAIN_FLAGS: &[&str] = &[
     "--stdlib",
@@ -16872,8 +16930,30 @@ fn exit_with_frontend_error(
     message: String,
     path: &str,
 ) -> ! {
+    exit_with_frontend_error_at_line(json_mode, rule, routine, tag, message, path, 1)
+}
+
+/// Reports a fatal front-end error at a 1-based line number `line` in `path`.
+fn exit_with_frontend_error_at_line(
+    json_mode: bool,
+    rule: &'static str,
+    routine: &str,
+    tag: &str,
+    message: String,
+    path: &str,
+    line: usize,
+) -> ! {
     if json_mode {
-        let diag = Diagnostic::basic("error", rule, routine.to_string(), tag.to_string(), message);
+        let mut diag =
+            Diagnostic::basic("error", rule, routine.to_string(), tag.to_string(), message);
+        let line = line.max(1);
+        diag.span = Some(Span {
+            file: path.to_string(),
+            line,
+            column: 1,
+            end_line: line,
+            end_column: 1,
+        });
         println!("[\n{}\n]", diag.to_json("UNKNOWN", path));
     } else {
         eprintln!("[ERROR] {message}");
@@ -16883,9 +16963,9 @@ fn exit_with_frontend_error(
 
 fn main() {
     let args: Vec<String> = env::args().collect();
-    if args.len() < 2 {
+    if args.len() < 2 && !std::path::Path::new("Gardel.toml").is_file() {
         eprintln!(
-            "Usage: gardelc <input.gdl ... | DIR | --stdlib> [--no-prelude] [--inspect [MODULE]] [--emit-stdlib [DIR]] [--json-diagnostics] [--fuel <N>] [--z3-seed <N>] [--z3-rlimit <N>] [--audit] [--strict] [--bounded-check] [--run]"
+            "Usage: gardelc <input.gdl ... | DIR | --project <DIR> | --stdlib> [--no-prelude] [--inspect [MODULE]] [--emit-stdlib [DIR]] [--json-diagnostics] [--fuel <N>] [--z3-seed <N>] [--z3-rlimit <N>] [--audit] [--strict] [--bounded-check] [--run]"
         );
         eprintln!(
             "  --no-prelude  bootstrap mode: do not inject the Standard Prelude (implied by --stdlib and when compiling the prelude source itself, §4.1)"
@@ -16893,12 +16973,17 @@ fn main() {
         eprintln!(
             "  several files, a directory (its *.gdl files, searched recursively, skipping build/ and target/) or a wildcard pattern such as src/*.gdl form one project with a flat module namespace (§4.2)"
         );
+        eprintln!(
+            "  --project <DIR>  compile project defined by Gardel.toml in DIR using src/ (or run `gardelc` with no input when ./Gardel.toml is present, §4.2)"
+        );
         std::process::exit(1);
     }
 
+    let json_mode = args.iter().any(|a| a == "--json-diagnostics");
+
     if let Some(flag) = first_unknown_flag(&args) {
         exit_with_frontend_error(
-            args.iter().any(|a| a == "--json-diagnostics"),
+            json_mode,
             "Command Line",
             "gardelc",
             "unknown_flag",
@@ -16907,7 +16992,29 @@ fn main() {
         );
     }
 
+    let project_arg = match parse_project_arg(&args) {
+        Ok(dir) => dir,
+        Err(e) => exit_with_frontend_error(
+            json_mode,
+            "Command Line",
+            "gardelc",
+            "invalid_arguments",
+            e,
+            "",
+        ),
+    };
+
     if let Some(i) = args.iter().position(|a| a == "--emit-stdlib") {
+        if project_arg.is_some() {
+            exit_with_frontend_error(
+                json_mode,
+                "Command Line",
+                "gardelc",
+                "invalid_arguments",
+                "cannot combine --project with --emit-stdlib".to_string(),
+                "",
+            );
+        }
         let out_dir = args
             .get(i + 1)
             .filter(|a| !a.starts_with("--"))
@@ -16925,14 +17032,30 @@ fn main() {
         }
     }
 
+    if project_arg.is_some() && args.iter().any(|a| a == "--stdlib") {
+        exit_with_frontend_error(
+            json_mode,
+            "Command Line",
+            "gardelc",
+            "invalid_arguments",
+            "cannot combine --project with --stdlib".to_string(),
+            "",
+        );
+    }
+
+    let ops = input_operands(&args);
+    let has_implicit_project = ops.is_empty()
+        && project_arg.is_none()
+        && !args.iter().any(|a| a == "--stdlib")
+        && std::path::Path::new("Gardel.toml").is_file();
+
     let inspect_mode = args.iter().any(|a| a == "--inspect");
     let mut stdlib_only = args.iter().any(|a| a == "--stdlib")
-        || (inspect_mode && input_operands(&args).is_empty());
+        || (inspect_mode && ops.is_empty() && project_arg.is_none() && !has_implicit_project);
     // Stdlib files named explicitly (e.g. `gardelc --inspect option.gdl`): the whole tree is
     // verified, but `--inspect` shows only these files' modules.
     let mut requested_stdlib_files: Vec<std::path::PathBuf> = Vec::new();
 
-    let json_mode = args.iter().any(|a| a == "--json-diagnostics");
     let audit_mode = args.iter().any(|a| a == "--audit");
     let strict_mode = args.iter().any(|a| a == "--strict");
     let bounded_check = args.iter().any(|a| a == "--bounded-check");
@@ -16969,48 +17092,81 @@ fn main() {
     // mixing them with user files is an error (a user program gets the stdlib as its prelude).
     let mut user_inputs: Option<(Vec<String>, bool)> = None;
     if !stdlib_only {
-        let ops = input_operands(&args);
-        if ops.is_empty() {
-            exit_with_frontend_error(
-                json_mode,
-                "IO",
-                "file",
-                "io_error",
-                "No input file given (expected <input.gdl ...>, a directory, or --stdlib)"
-                    .to_string(),
-                "<none>",
-            );
-        }
-        let (paths, project) = match resolve_input_operands(&ops) {
-            Ok(r) => r,
-            Err(e) => exit_with_frontend_error(json_mode, "IO", "file", "io_error", e, &ops[0]),
-        };
-        let inside: Vec<&String> = paths.iter().filter(|p| path_in_stdlib_tree(p)).collect();
-        if inside.is_empty() {
-            user_inputs = Some((paths, project));
-        } else if inside.len() < paths.len() {
-            exit_with_frontend_error(
-                json_mode,
-                "IO",
-                "file",
-                "io_error",
-                format!(
-                    "Standard Prelude files ({}) cannot be compiled together with user files: user programs receive the stdlib as their prelude. Verify the stdlib with `gardelc --stdlib`",
-                    inside.iter().map(|p| format!("`{p}`")).collect::<Vec<_>>().join(", ")
-                ),
-                inside[0],
-            );
+        let project_manifest_dir = if let Some(dir) = project_arg {
+            if !ops.is_empty() {
+                exit_with_frontend_error(
+                    json_mode,
+                    "Command Line",
+                    "gardelc",
+                    "invalid_arguments",
+                    "cannot combine --project with explicit input file operands".to_string(),
+                    &ops[0],
+                );
+            }
+            Some(dir)
+        } else if has_implicit_project {
+            Some(".".to_string())
         } else {
-            let which = if inside.len() <= 3 {
-                inside.iter().map(|p| format!("`{p}`")).collect::<Vec<_>>().join(", ")
-            } else {
-                format!("{} files", inside.len())
+            None
+        };
+
+        if let Some(pdir) = project_manifest_dir {
+            let (_manifest, files) = match resolve_project_inputs(std::path::Path::new(&pdir)) {
+                Ok(res) => res,
+                Err(err) => exit_with_frontend_error_at_line(
+                    json_mode,
+                    err.rule,
+                    "Gardel.toml",
+                    err.tag,
+                    err.message,
+                    &err.path,
+                    err.line,
+                ),
             };
-            say(&format!(
-                "[stdlib] {which} belong(s) to the Standard Prelude, whose modules depend on each other: verifying the whole stdlib tree (as `--stdlib`)."
-            ));
-            requested_stdlib_files = inside.iter().filter_map(|p| fs::canonicalize(p).ok()).collect();
-            stdlib_only = true;
+            user_inputs = Some((files, true));
+        } else {
+            if ops.is_empty() {
+                exit_with_frontend_error(
+                    json_mode,
+                    "IO",
+                    "file",
+                    "io_error",
+                    "No input file given (expected <input.gdl ...>, a directory, --project <DIR>, or --stdlib)"
+                        .to_string(),
+                    "<none>",
+                );
+            }
+            let (paths, project) = match resolve_input_operands(&ops) {
+                Ok(r) => r,
+                Err(e) => exit_with_frontend_error(json_mode, "IO", "file", "io_error", e, &ops[0]),
+            };
+            let inside: Vec<&String> = paths.iter().filter(|p| path_in_stdlib_tree(p)).collect();
+            if inside.is_empty() {
+                user_inputs = Some((paths, project));
+            } else if inside.len() < paths.len() {
+                exit_with_frontend_error(
+                    json_mode,
+                    "IO",
+                    "file",
+                    "io_error",
+                    format!(
+                        "Standard Prelude files ({}) cannot be compiled together with user files: user programs receive the stdlib as their prelude. Verify the stdlib with `gardelc --stdlib`",
+                        inside.iter().map(|p| format!("`{p}`")).collect::<Vec<_>>().join(", ")
+                    ),
+                    inside[0],
+                );
+            } else {
+                let which = if inside.len() <= 3 {
+                    inside.iter().map(|p| format!("`{p}`")).collect::<Vec<_>>().join(", ")
+                } else {
+                    format!("{} files", inside.len())
+                };
+                say(&format!(
+                    "[stdlib] {which} belong(s) to the Standard Prelude, whose modules depend on each other: verifying the whole stdlib tree (as `--stdlib`)."
+                ));
+                requested_stdlib_files = inside.iter().filter_map(|p| fs::canonicalize(p).ok()).collect();
+                stdlib_only = true;
+            }
         }
     }
 
@@ -20371,8 +20527,8 @@ int main(void) {
         assert!(diags.iter().any(|d| d.tag == "on_board"), "{diags:?}");
     }
 
-    const D7_STATE: &str = include_str!("../../examples/echo_server/server_state.gdl");
-    const D7_ECHO: &str = include_str!("../../examples/echo_server/echo_server.gdl");
+    const D7_STATE: &str = include_str!("../../examples/echo_server/src/server_state.gdl");
+    const D7_ECHO: &str = include_str!("../../examples/echo_server/src/echo_server.gdl");
     const D7_RULES: &str = include_str!("../tests/reactive/net_rules.gdl");
     const D7_FLOOD: &str = include_str!("../tests/reactive/net_flood.gdl");
 
@@ -21743,8 +21899,16 @@ int main(void) {
         for entry in fs::read_dir(&root).unwrap() {
             let p = entry.unwrap().path();
             if p.is_dir() {
-                projects.push(fs::read_dir(&p).unwrap().map(|e| e.unwrap().path()).collect());
-            } else {
+                let gdl_files: Vec<std::path::PathBuf> =
+                    gdl_files_in_dir(&p.to_string_lossy(), None)
+                        .unwrap()
+                        .into_iter()
+                        .map(std::path::PathBuf::from)
+                        .collect();
+                if !gdl_files.is_empty() {
+                    projects.push(gdl_files);
+                }
+            } else if p.extension().and_then(|ext| ext.to_str()) == Some("gdl") {
                 projects.push(vec![p]);
             }
         }
@@ -21838,16 +22002,224 @@ int main(void) {
         };
         let unknown = |list: &[&str]| first_unknown_flag(&args(list)).cloned();
         assert_eq!(unknown(&["a.gdl", "--stric"]), Some("--stric".to_string()));
-        assert_eq!(unknown(&["--project", "."]), Some("--project".to_string()));
+        assert_eq!(unknown(&["--projct", "."]), Some("--projct".to_string()));
         assert_eq!(unknown(&["--boogie", "a.gdl"]), Some("--boogie".to_string()));
         for good in [
             &["a.gdl", "--strict", "--audit", "--run"][..],
             &["--stdlib", "--inspect", "SEQ", "--json-diagnostics"],
             &["a.gdl", "--fuel", "3", "--z3-seed", "1", "--z3-rlimit", "9"],
             &["--emit-stdlib", "out", "--no-prelude", "--bounded-check"],
+            &["--project", "examples/echo_server", "--strict"],
         ] {
             assert_eq!(unknown(good), None, "{good:?}");
         }
+    }
+
+    #[test]
+    fn test_e1_manifest_parser_and_package_name_validation() {
+        use crate::manifest::*;
+
+        // Valid manifest
+        let valid_src = r#"
+            # Project manifest
+            [project]
+            name = "echo-server"
+            version = "0.1.0"
+        "#;
+        let m = parse_manifest(valid_src).expect("valid manifest must parse");
+        assert_eq!(m.project.name, "echo-server");
+        assert_eq!(m.project.version, "0.1.0");
+        assert_eq!(default_alias_for_package(&m.project.name), "ECHO_SERVER");
+
+        // Package names (Decision 11)
+        assert!(validate_package_name("my-pkg").is_ok());
+        assert!(validate_package_name("acme.json").is_ok());
+        assert_eq!(default_alias_for_package("acme.json"), "JSON");
+        assert!(validate_package_name("acme.http-client").is_ok());
+        assert_eq!(default_alias_for_package("acme.http-client"), "HTTP_CLIENT");
+
+        // Rejected package names
+        assert!(validate_package_name("").is_err());
+        assert!(validate_package_name("EchoServer").is_err());
+        assert!(validate_package_name("echo_server").is_err());
+        assert!(validate_package_name("foo..bar").is_err());
+        assert!(validate_package_name("-foo").is_err());
+        assert!(validate_package_name("foo-").is_err());
+        assert!(validate_package_name("foo.-bar").is_err());
+        assert!(validate_package_name("123pkg").is_err());
+        assert!(validate_package_name("acme.2json").is_err());
+        assert!(validate_package_name("gardel").is_err());
+        assert!(validate_package_name("gardel.core").is_err());
+        assert!(validate_package_name("core.gardel").is_err());
+
+        // Line-numbered syntax and structure errors
+        let bad_escape = "[project]\nname = \"echo-server\"\nversion = \"0.1.\\k\"\n";
+        let err = parse_manifest(bad_escape).expect_err("bad escape should fail");
+        assert_eq!(err.line, 3);
+        assert!(err.message.contains("bad escape '\\k'"));
+
+        let bad_null_escape = "[project]\nname = \"echo-server\"\nversion = \"0.1.\\0\"\n";
+        let err = parse_manifest(bad_null_escape).expect_err("\\0 escape should fail in TOML 1.0");
+        assert_eq!(err.line, 3);
+        assert!(err.message.contains("bad escape '\\0'"));
+
+        let dup_key = "[project]\nname = \"echo-server\"\nname = \"other\"\nversion = \"0.1.0\"\n";
+        let err = parse_manifest(dup_key).expect_err("dup key should fail");
+        assert_eq!(err.line, 3);
+        assert!(err.message.contains("duplicate key 'name'"));
+
+        let dup_table = "[project]\nname = \"echo-server\"\nversion = \"0.1.0\"\n[project]\nname = \"other\"\n";
+        let err = parse_manifest(dup_table).expect_err("dup table should fail");
+        assert_eq!(err.line, 4);
+        assert!(err.message.contains("duplicate table '[project]'"));
+
+        let unknown_table = "[package]\nname = \"foo\"\nversion = \"1.0\"\n";
+        let err = parse_manifest(unknown_table).expect_err("unknown table should fail");
+        assert_eq!(err.line, 1);
+        assert!(err.message.contains("unknown table '[package]'"));
+
+        let unknown_key = "[project]\nname = \"echo-server\"\nversion = \"0.1.0\"\nauthor = \"me\"\n";
+        let err = parse_manifest(unknown_key).expect_err("unknown key should fail");
+        assert_eq!(err.line, 4);
+        assert!(err.message.contains("unknown key 'author'"));
+
+        let non_string = "[project]\nname = \"echo-server\"\nversion = 1\n";
+        let err = parse_manifest(non_string).expect_err("non-string should fail");
+        assert_eq!(err.line, 3);
+        assert!(err.message.contains("unsupported value"));
+
+        let missing_version = "\n\n[project]\nname = \"echo-server\"\n";
+        let err = parse_manifest(missing_version).expect_err("missing version should fail");
+        assert_eq!(err.line, 3);
+        assert!(err.message.contains("missing required key 'version'"));
+    }
+
+    #[test]
+    fn test_e1_echo_server_with_manifest_gives_same_bpl_and_c() {
+        let echo_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../examples/echo_server");
+        let manifest_path = echo_dir.join("Gardel.toml");
+        assert!(manifest_path.is_file(), "examples/echo_server/Gardel.toml must exist");
+        assert!(echo_dir.join("src").is_dir(), "examples/echo_server/src must exist");
+
+        // 1. Resolve as direct directory operand (as in `gardelc examples/echo_server`)
+        let (dir_files, dir_project) = resolve_input_operands(&[echo_dir.to_string_lossy().to_string()]).unwrap();
+        assert!(dir_project);
+
+        // 2. Resolve via manifest logic (as in `gardelc --project examples/echo_server`)
+        let (manifest, manifest_files) = resolve_project_inputs(&echo_dir).expect("echo_server manifest project should resolve");
+        assert_eq!(manifest.project.name, "echo-server");
+        assert_eq!(manifest.project.version, "0.1.0");
+
+        assert_eq!(dir_files, manifest_files, "both modes must resolve the exact same source files");
+
+        // Now compile and verify both, comparing emitted .bpl and .c
+        BOOGIE_LAMBDA_COUNTER.with(|c| c.set(0));
+        let dir_file_tuples: Vec<(String, String)> = dir_files
+            .iter()
+            .map(|p| (p.clone(), fs::read_to_string(p).unwrap()))
+            .collect();
+        let dir_tuples_ref: Vec<(&str, &str)> = dir_file_tuples
+            .iter()
+            .map(|(p, s)| (p.as_str(), s.as_str()))
+            .collect();
+        let mut dir_units = b4_units(&dir_tuples_ref);
+
+        let opts = VerifyOptions {
+            prelude_mode: true,
+            project_mode: true,
+            fuel_limit: 1,
+            strict: true,
+            audit: false,
+            bounded_check: false,
+            z3_seed: Some(1),
+            z3_rlimit: Some(DEFAULT_Z3_RLIMIT),
+        };
+
+        let dir_res = check_and_verify_project(&mut dir_units, opts);
+        assert!(dir_res.fatal.is_empty(), "dir fatal: {:?}", dir_res.fatal);
+        assert!(dir_res.diags.is_empty(), "dir diags: {:?}", dir_res.diags);
+
+        BOOGIE_LAMBDA_COUNTER.with(|c| c.set(0));
+        let manifest_file_tuples: Vec<(String, String)> = manifest_files
+            .iter()
+            .map(|p| (p.clone(), fs::read_to_string(p).unwrap()))
+            .collect();
+        let manifest_tuples_ref: Vec<(&str, &str)> = manifest_file_tuples
+            .iter()
+            .map(|(p, s)| (p.as_str(), s.as_str()))
+            .collect();
+        let mut manifest_units = b4_units(&manifest_tuples_ref);
+
+        let manifest_res = check_and_verify_project(&mut manifest_units, opts);
+        assert!(manifest_res.fatal.is_empty(), "manifest fatal: {:?}", manifest_res.fatal);
+        assert!(manifest_res.diags.is_empty(), "manifest diags: {:?}", manifest_res.diags);
+
+        // Compare emitted Boogie for each module
+        for (u_dir, u_man) in dir_units.iter().zip(manifest_units.iter()) {
+            for (m_dir, m_man) in u_dir.ast.modules.iter().zip(u_man.ast.modules.iter()) {
+                BOOGIE_LAMBDA_COUNTER.with(|c| c.set(0));
+                let bpl_dir = with_prelude_injection(true, || {
+                    with_link_table(dir_res.link.clone(), || emit_boogie(m_dir, 1))
+                });
+                BOOGIE_LAMBDA_COUNTER.with(|c| c.set(0));
+                let bpl_man = with_prelude_injection(true, || {
+                    with_link_table(manifest_res.link.clone(), || emit_boogie(m_man, 1))
+                });
+                assert_eq!(bpl_dir, bpl_man, "emitted .bpl for module {} must be identical", m_dir.name);
+            }
+        }
+
+        // Compare emitted C for the program
+        let dir_mods: Vec<ModuleDecl> = dir_units.iter().map(|u| u.ast.modules[0].clone()).collect();
+        let (dir_root, dir_libs) = dir_mods.split_last().expect("a program");
+        let dir_libs: Vec<&ModuleDecl> = dir_libs.iter().collect();
+        let (c_dir, _) = emit_c11_typed(dir_root, &dir_libs);
+
+        let man_mods: Vec<ModuleDecl> = manifest_units.iter().map(|u| u.ast.modules[0].clone()).collect();
+        let (man_root, man_libs) = man_mods.split_last().expect("a program");
+        let man_libs: Vec<&ModuleDecl> = man_libs.iter().collect();
+        let (c_man, _) = emit_c11_typed(man_root, &man_libs);
+        assert_eq!(c_dir, c_man, "emitted .c for echo_server project must be identical between directory and manifest mode");
+    }
+
+    #[test]
+    fn test_e1_cli_project_argument_handling() {
+        let args = |list: &[&str]| -> Vec<String> {
+            std::iter::once("gardelc").chain(list.iter().copied()).map(String::from).collect()
+        };
+
+        // Valid `--project <DIR>`
+        assert_eq!(
+            parse_project_arg(&args(&["--project", "examples/echo_server", "--strict"])).unwrap(),
+            Some("examples/echo_server".to_string())
+        );
+        let ops = input_operands(&args(&["--project", "examples/echo_server", "--strict"]));
+        assert!(ops.is_empty(), "operands should be empty when --project consumes DIR: {ops:?}");
+
+        // Missing DIR after `--project` is rejected
+        assert!(parse_project_arg(&args(&["--project"])).is_err());
+        assert!(parse_project_arg(&args(&["--project", "--strict"])).is_err());
+
+        // Duplicate `--project` is rejected
+        assert!(parse_project_arg(&args(&["--project", "a", "--project", "b"])).is_err());
+
+        // If extra operands are passed alongside `--project DIR`, input_operands gathers them
+        // so `main()` can reject mixing `--project` with explicit operands.
+        let ops_mixed = input_operands(&args(&["foo.gdl", "--project", "examples/echo_server"]));
+        assert_eq!(ops_mixed, vec!["foo.gdl"]);
+
+        // Missing `src/` directory in a manifest project is rejected (no silent fallback)
+        let tmp = std::env::temp_dir().join(format!("gardel_e1_test_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&tmp);
+        fs::create_dir_all(&tmp).unwrap();
+        fs::write(
+            tmp.join("Gardel.toml"),
+            "[project]\nname = \"my-app\"\nversion = \"0.1.0\"\n",
+        )
+        .unwrap();
+        let err = resolve_project_inputs(&tmp).expect_err("missing src/ must be an error");
+        assert!(err.message.contains("src"), "expected error mentioning src/: {err:?}");
+        let _ = fs::remove_dir_all(&tmp);
     }
 
     #[test]

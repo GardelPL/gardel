@@ -341,6 +341,25 @@ The multi-file compilation pipeline proceeds through five deterministic stages:
 - A single-file run is unchanged and does not apply `W0201`.
 - **Acyclic cross-file dependencies:** user modules in different files that reference each other in a cycle are rejected with fatal error `E0103: cyclic_module_dependency`, because each module's proof would trust the other's contracts. Mutually dependent modules must be co-declared in one file under `group` (§4.3). Modules in the same file are not linked to each other by `gardelc` yet; simultaneous `group` verification is not yet implemented.
 
+#### 4. Project Manifest (`Gardel.toml`, Task E.1)
+A project may declare its identity and boundaries via a `Gardel.toml` file in its root directory.
+- **`[project]` table:** Declares project metadata:
+  ```toml
+  [project]
+  name = "echo-server"
+  version = "0.1.0"
+  ```
+- **Package naming rules:**
+  - Package names contain only ASCII lowercase letters, digits, `-`, and `.`.
+  - Segments separated by `.` cannot be empty, must start with an ASCII lowercase letter (`a`–`z`), and cannot end with `-`.
+  - The package name cannot start with `gardel.` or derive the default alias `GARDEL`, which is reserved for the Standard Prelude.
+  - The default alias of a package is the uppercase form of its last segment with `-` replaced by `_` (e.g. `acme.http-client` $\longrightarrow$ `HTTP_CLIENT`, `echo-server` $\longrightarrow$ `ECHO_SERVER`).
+- **TOML subset:** Manifest parsing enforces a strict, dependency-free TOML 1.0 subset (tables, quoted and bare keys, basic strings, inline tables of strings, and comments). Constructs outside this subset, duplicate keys, duplicate tables, or bad escape sequences fail statically with 1-based line numbers.
+- **Project layout & CLI invocation:**
+  - Standard source code resides in `src/`.
+  - Invoking `gardelc --project <DIR>` or running `gardelc` without input operands in a directory containing `Gardel.toml` reads the manifest, resolves sources under `src/`, and compiles in project mode.
+  - A manifest without dependencies changes nothing about what a source file means: constituent modules share the flat project namespace with the prelude in scope.
+
 ---
 
 **Name resolution.** Before verification, every name in a run must resolve against the project and the prelude. Each failure is fatal and reported at its source location:
@@ -2594,6 +2613,7 @@ Because each transformation step corresponds directly to a verified catalogue la
 
 The compiler `gardelc` verifies first and erases second, so everything that reaches the backend is total, memory-safe, pure code.
 
+0. **Project manifest & workspace resolution.** When invoked with `--project <DIR>` or with no input operands in a directory containing `Gardel.toml`, `gardelc` parses the manifest via its strict TOML 1.0 subset parser, validates package identity, and collects source files from `src/` into the multi-file project pipeline (§4.2.4).
 1. **Parse and resolve names.** Enforce selective export and all five visibility rules (§4).
 2. **Check types and concepts.** Resolve `Current`, uniform-access dot calls, and `satisfies` obligations.
 3. **Generate verification conditions.** Translate representations, ghost code, `let` blocks, contracts, variants, and 64-bit numerics to Boogie, then query Z3.
