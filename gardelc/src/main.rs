@@ -4333,6 +4333,10 @@ thread_local! {
         std::cell::RefCell::new(HashMap::new());
 }
 
+fn elem_env_type(v: &str) -> Option<String> {
+    ELEM_TYPE_ENV.with(|env| env.borrow().get(v).cloned())
+}
+
 fn elem_env_bind(v: &str, ty: &str) {
     ELEM_TYPE_ENV.with(|env| {
         env.borrow_mut().insert(v.to_string(), ty.to_string());
@@ -6293,12 +6297,13 @@ fn infer_gardel_type(e: &Expr, m: &ModuleDecl, ctx: &BoogiePreludeCtx) -> Option
             )
         }
         Expr::Bool(_) | Expr::UnaryNot(_) => Some("BOOL".to_string()),
-        Expr::BinOp(op, l, _) => {
+        Expr::BinOp(op, l, rhs) => {
             if matches!(
                 op.as_str(),
                 "+" | "-" | "*" | "/" | "%" | "+%" | "-%" | "*%" | "&" | "|" | "^" | "<<" | ">>"
             ) {
-                infer_gardel_type(l, m, ctx).or_else(|| Some("NAT".to_string()))
+                let typed = if matches!(&**l, Expr::Int(_)) { rhs } else { l };
+                infer_gardel_type(typed, m, ctx).or_else(|| Some("NAT".to_string()))
             } else {
                 Some("BOOL".to_string())
             }
@@ -7042,6 +7047,18 @@ fn emit_boogie_parts(m: &ModuleDecl, fuel_limit: usize) -> BoogieParts {
     out.push_str(
         "function {:inline} in_i64(x: int) returns (bool) { I64_MIN <= x && x <= I64_MAX }\n\n",
     );
+    // `/` and `%` truncate toward zero, as C does. Boogie's `div` and `mod` are Euclidean,
+    // which agrees only for a non-negative dividend, so that is the only case they serve.
+    out.push_str(
+        "function {:inline} gdl_div(x: int, y: int) returns (int) { if x >= 0 then x div y else -((-x) div y) }\n",
+    );
+    out.push_str(
+        "function {:inline} gdl_mod(x: int, y: int) returns (int) { if x >= 0 then x mod y else -((-x) mod y) }\n",
+    );
+    // The `I64` value of 64 bits read as a `U64`.
+    out.push_str(
+        "function {:inline} i64_of_bits(x: int) returns (int) { if x > I64_MAX then x - 18446744073709551616 else x }\n\n",
+    );
 
     out.push_str("type Unit;\n");
     out.push_str("const unique Unit_val: Unit;\n");
@@ -7623,6 +7640,8 @@ fn emit_boogie_parts(m: &ModuleDecl, fuel_limit: usize) -> BoogieParts {
             for (fnm, fty) in fields {
                 if fty == "NAT" || fty == "U64" {
                     clauses.push(format!("  in_u64({}_{}(Current))", m.name, fnm));
+                } else if fty == "INT" || fty == "I64" {
+                    clauses.push(format!("  in_i64({}_{}(Current))", m.name, fnm));
                 } else if fty == "CHAR" {
                     clauses.push(format!("  in_char({}_{}(Current))", m.name, fnm));
                 }
@@ -7723,6 +7742,8 @@ fn emit_boogie_parts(m: &ModuleDecl, fuel_limit: usize) -> BoogieParts {
             call_args_f.push(pn.clone());
             if pt == "NAT" || pt == "U64" {
                 pre_guards.push(format!("in_u64({pn})"));
+            } else if pt == "INT" || pt == "I64" {
+                pre_guards.push(format!("in_i64({pn})"));
             } else if pt == "CHAR" {
                 pre_guards.push(format!("in_char({pn})"));
             } else if !m.invariants.is_empty()
@@ -7825,6 +7846,8 @@ fn emit_boogie_parts(m: &ModuleDecl, fuel_limit: usize) -> BoogieParts {
         let mut post_clauses = Vec::new();
         if r.ret_type == "NAT" || r.ret_type == "U64" {
             post_clauses.push(format!("in_u64({fn_f_app})"));
+        } else if r.ret_type == "INT" || r.ret_type == "I64" {
+            post_clauses.push(format!("in_i64({fn_f_app})"));
         } else if r.ret_type == "CHAR" {
             post_clauses.push(format!("in_char({fn_f_app})"));
         } else if r.ret_type == m.name
@@ -8632,6 +8655,8 @@ fn emit_boogie_verify_routine(
     for (pn, pt) in &r.params {
         if pt == "NAT" || pt == "U64" {
             s.push_str(&format!("  requires in_u64({pn});\n"));
+        } else if pt == "INT" || pt == "I64" {
+            s.push_str(&format!("  requires in_i64({pn});\n"));
         } else if pt == "CHAR" {
             s.push_str(&format!("  requires in_char({pn});\n"));
         } else if !m.invariants.is_empty()
@@ -8764,6 +8789,8 @@ fn emit_boogie_verify_law(
             s.push_str(&format!("  requires {}_Invariant({pn});\n", m.name));
         } else if pt == "NAT" || pt == "U64" {
             s.push_str(&format!("  requires in_u64({pn});\n"));
+        } else if pt == "INT" || pt == "I64" {
+            s.push_str(&format!("  requires in_i64({pn});\n"));
         } else if pt == "CHAR" {
             s.push_str(&format!("  requires in_char({pn});\n"));
         }
@@ -9576,6 +9603,9 @@ fn collect_proc_locals(
                 }
                 None => infer_boogie_expr_type(e, r, m),
             };
+            if numeric_kind(e, m) == NumKind::Signed {
+                bind_signed_local(v);
+            }
             out.push((v.clone(), bty));
             collect_proc_locals(&[], e, r, m, out);
         }
@@ -10357,6 +10387,116 @@ fn is_module_typed_receiver(recv: &Expr, m: &ModuleDecl) -> bool {
     elem_receiver_type(recv, m).is_some_and(|t| t == module_self_type(m) || t == m.name)
 }
 
+/// Which range a number's arithmetic is checked against.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum NumKind {
+    Signed,
+    Unsigned,
+    /// An untyped number, which adopts the type of what it meets (spec §3).
+    Literal,
+    /// Not determined. The checks then require both ranges, so a wrong guess cannot let
+    /// a value through.
+    Unknown,
+}
+
+fn num_kind_of_type(ty: &str) -> NumKind {
+    match ty.trim() {
+        "I64" | "INT" => NumKind::Signed,
+        "U64" | "NAT" | "EXIT_CODE" | "F64" => NumKind::Unsigned,
+        _ => NumKind::Unknown,
+    }
+}
+
+/// Both sides of an operator have one type (mixing `U64` and `I64` is refused, spec §3).
+fn join_num_kinds(a: NumKind, b: NumKind) -> NumKind {
+    match (a, b) {
+        (NumKind::Literal, x) | (x, NumKind::Literal) => x,
+        (NumKind::Unknown, x) | (x, NumKind::Unknown) => x,
+        (x, y) if x == y => x,
+        _ => NumKind::Unknown,
+    }
+}
+
+fn numeric_kind(e: &Expr, m: &ModuleDecl) -> NumKind {
+    match e {
+        Expr::Int(_) => NumKind::Literal,
+        Expr::UnaryNeg(inner) => match numeric_kind(inner, m) {
+            NumKind::Literal => NumKind::Signed,
+            kind => kind,
+        },
+        Expr::BinOp(op, l, r) => match op.as_str() {
+            "<<" | ">>" => numeric_kind(l, m),
+            "+" | "-" | "*" | "/" | "%" | "+%" | "-%" | "*%" | "&" | "|" | "^" => {
+                operands_kind(l, r, m)
+            }
+            _ => NumKind::Unknown,
+        },
+        Expr::If(_, _, then_e, _, else_e) => {
+            join_num_kinds(numeric_kind(then_e, m), numeric_kind(else_e, m))
+        }
+        Expr::Match(_, cases) => cases
+            .iter()
+            .map(|c| numeric_kind(&c.body, m))
+            .fold(NumKind::Literal, join_num_kinds),
+        Expr::Var(v) if v == "Result" => {
+            boogie_result_type().map_or(NumKind::Unknown, |t| num_kind_of_type(&t))
+        }
+        Expr::Var(v) => {
+            if let Some(t) = boogie_env_type(v).or_else(|| elem_env_type(v)) {
+                return num_kind_of_type(&t);
+            }
+            match &m.repr {
+                ReprKind::Product(fields) => fields
+                    .iter()
+                    .find(|(f, _)| f == v)
+                    .map_or(NumKind::Unknown, |(_, t)| num_kind_of_type(t)),
+                _ => NumKind::Unknown,
+            }
+        }
+        Expr::Call(_, _) | Expr::MethodCall(_, _, _) => {
+            if let Some(ctx) = boogie_prelude_ctx() {
+                if let Some(t) = infer_gardel_type(e, m, &ctx) {
+                    return num_kind_of_type(&t);
+                }
+            }
+            let name = match e {
+                Expr::Call(f, _) => f,
+                Expr::MethodCall(_, f, _) => f,
+                _ => unreachable!("the arm matches only calls"),
+            };
+            if let Some((r, _)) = find_module_routine(m, name) {
+                return num_kind_of_type(&r.ret_type);
+            }
+            match &m.repr {
+                ReprKind::Product(fields) => fields
+                    .iter()
+                    .find(|(f, _)| f == name)
+                    .map_or(NumKind::Unknown, |(_, t)| num_kind_of_type(t)),
+                _ => NumKind::Unknown,
+            }
+        }
+        _ => NumKind::Unknown,
+    }
+}
+
+fn operands_kind(l: &Expr, r: &Expr, m: &ModuleDecl) -> NumKind {
+    join_num_kinds(numeric_kind(l, m), numeric_kind(r, m))
+}
+
+/// Boogie proposition that `v` fits the range of `kind`.
+fn in_range(kind: NumKind, v: &str) -> String {
+    match kind {
+        NumKind::Signed => format!("in_i64({v})"),
+        NumKind::Unsigned | NumKind::Literal => format!("in_u64({v})"),
+        NumKind::Unknown => format!("in_u64({v}) && in_i64({v})"),
+    }
+}
+
+fn bind_signed_local(v: &str) {
+    bind_boogie_env_type(v, "I64");
+    elem_env_bind(v, "I64");
+}
+
 /// A fresh local standing for a nested binder or lambda parameter `name` of Gardel type
 /// `gty`. Returns its name and Boogie type; the caller declares it with
 /// `declare_obligation_locals` only if the obligations mention it.
@@ -10368,6 +10508,7 @@ fn fresh_obligation_local(name: &str, gty: &str, m: &ModuleDecl) -> (String, Str
     });
     let fresh = format!("_ob{k}_{name}");
     bind_boogie_env_type(&fresh, gty);
+    elem_env_bind(&fresh, gty);
     (fresh, map_boogie_type(gty, m))
 }
 
@@ -10525,23 +10666,32 @@ fn emit_boogie_expr_obligations(
                 "DefaultFuel",
                 strings,
             );
+            let kind = operands_kind(l, rhs, m);
             match op.as_str() {
                 "+" if r.ret_type != "MATH_INT" => {
                     s.push_str(&format!(
-                        "{pad}assert {{:msg \"{}::overflow::overflow_add\"}} in_u64({l_bpl} + {r_bpl});\n",
-                        r.name
+                        "{pad}assert {{:msg \"{}::overflow::overflow_add\"}} {};\n",
+                        r.name,
+                        in_range(kind, &format!("{l_bpl} + {r_bpl}"))
                     ));
                 }
                 "-" if r.ret_type != "MATH_INT" => {
+                    let value = format!("{l_bpl} - {r_bpl}");
+                    let fits = match kind {
+                        // Both operands are in range, so only the lower bound can fail.
+                        NumKind::Unsigned | NumKind::Literal => format!("0 <= ({value})"),
+                        _ => in_range(kind, &value),
+                    };
                     s.push_str(&format!(
-                        "{pad}assert {{:msg \"{}::overflow::overflow_sub\"}} 0 <= ({l_bpl} - {r_bpl});\n",
+                        "{pad}assert {{:msg \"{}::overflow::overflow_sub\"}} {fits};\n",
                         r.name
                     ));
                 }
                 "*" if r.ret_type != "MATH_INT" => {
                     s.push_str(&format!(
-                        "{pad}assert {{:msg \"{}::overflow::overflow_mul\"}} in_u64({l_bpl} * {r_bpl});\n",
-                        r.name
+                        "{pad}assert {{:msg \"{}::overflow::overflow_mul\"}} {};\n",
+                        r.name,
+                        in_range(kind, &format!("{l_bpl} * {r_bpl}"))
                     ));
                 }
                 "/" | "%" => {
@@ -10549,6 +10699,13 @@ fn emit_boogie_expr_obligations(
                         "{pad}assert {{:msg \"{}::div_by_zero::div_by_zero\"}} {r_bpl} != 0;\n",
                         r.name
                     ));
+                    // `I64.min / -1` does not fit, and the hardware traps on both forms.
+                    if matches!(kind, NumKind::Signed | NumKind::Unknown) {
+                        s.push_str(&format!(
+                            "{pad}assert {{:msg \"{}::overflow::overflow_div\"}} !({l_bpl} == I64_MIN && {r_bpl} == -1);\n",
+                            r.name
+                        ));
+                    }
                 }
                 "<<" | ">>" => {
                     s.push_str(&format!(
@@ -10558,11 +10715,42 @@ fn emit_boogie_expr_obligations(
                 }
                 _ => {}
             }
+            // Bitwise operators are defined on `U64` (spec §3). The verifier's model reads
+            // the bits as unsigned, which is not the value an `I64` has.
+            if matches!(op.as_str(), "&" | "|" | "^" | "<<" | ">>") && kind == NumKind::Signed {
+                s.push_str(&format!(
+                    "{pad}assert {{:msg \"{}::overflow::bitwise_on_signed\"}} false;\n",
+                    r.name
+                ));
+            }
         }
-        Expr::UnaryNeg(inner) | Expr::UnaryNot(inner) => {
+        Expr::UnaryNot(inner) => {
             s.push_str(&emit_boogie_expr_obligations(
                 inner, r, m, revealed, indent, strings,
             ));
+        }
+        Expr::UnaryNeg(inner) => {
+            s.push_str(&emit_boogie_expr_obligations(
+                inner, r, m, revealed, indent, strings,
+            ));
+            if r.ret_type != "MATH_INT" {
+                let v = format!(
+                    "-({})",
+                    emit_boogie_expr_with_strings(
+                        inner,
+                        m,
+                        &empty_fields,
+                        revealed,
+                        "DefaultFuel",
+                        strings
+                    )
+                );
+                s.push_str(&format!(
+                    "{pad}assert {{:msg \"{}::overflow::overflow_neg\"}} {};\n",
+                    r.name,
+                    in_range(numeric_kind(e, m), &v)
+                ));
+            }
         }
         Expr::TupleLit(items) => {
             for item in items {
@@ -11670,7 +11858,7 @@ fn emit_boogie_expr_with_strings(
                 _ => None,
             };
             if let Some(fn_name) = b_fn {
-                return format!(
+                let bits = format!(
                     "{fn_name}({}, {})",
                     emit_boogie_expr_with_strings(
                         l,
@@ -11689,14 +11877,34 @@ fn emit_boogie_expr_with_strings(
                         strings
                     )
                 );
+                // Wrapping on `I64` is two's complement (the C cast through `uint64_t`).
+                if matches!(op.as_str(), "+%" | "-%" | "*%")
+                    && operands_kind(l, r, m) == NumKind::Signed
+                {
+                    return format!("i64_of_bits({bits})");
+                }
+                return bits;
+            }
+            if matches!(op.as_str(), "/" | "%") {
+                // Only a dividend known to be non-negative may use Boogie's own operators.
+                // They are easier on the solver, and truncation is right for any other.
+                let l_bpl =
+                    emit_boogie_expr_with_strings(l, m, implicit_fields, revealed, fuel_var, strings);
+                let r_bpl =
+                    emit_boogie_expr_with_strings(r, m, implicit_fields, revealed, fuel_var, strings);
+                let natural = matches!(numeric_kind(l, m), NumKind::Unsigned | NumKind::Literal);
+                return match (op.as_str(), natural) {
+                    ("/", true) => format!("({l_bpl} div {r_bpl})"),
+                    ("%", true) => format!("({l_bpl} mod {r_bpl})"),
+                    ("/", false) => format!("gdl_div({l_bpl}, {r_bpl})"),
+                    _ => format!("gdl_mod({l_bpl}, {r_bpl})"),
+                };
             }
             let b_op = match op.as_str() {
                 "=" => "==",
                 "and" => "&&",
                 "or" => "||",
                 "implies" => "==>",
-                "/" => "div",
-                "%" => "mod",
                 other => other,
             };
             format!(
@@ -21327,6 +21535,60 @@ int main(void) {
             let routine = format!("  t(x: U64): U64\n    do\n      {inner}\n    end\n");
             let tags = failed_tags_of_routine(&routine);
             assert!(tags.iter().any(|t| t == "overflow_mul"), "{inner}: {tags:?}");
+        }
+    }
+
+    #[test]
+    fn test_i64_arithmetic_is_checked_against_its_own_range() {
+        const SMALL: &str = "    require\n      lo: x > -100\n      hi: x < 100\n";
+        let rejected = [
+            ("  t(x: I64): I64\n    do\n      -x\n    end\n", "overflow_neg"),
+            ("  t(x: I64, y: I64): I64\n    do\n      x + y\n    end\n", "overflow_add"),
+            // The result fits `U64`, the range these used to be checked against.
+            ("  t(x: I64, y: I64): I64\n    require\n      a: x >= 0\n      b: y >= 0\n    do\n      x + y\n    end\n", "overflow_add"),
+            ("  t(x: I64): I64\n    require\n      n: x < 0\n    do\n      x * 2\n    end\n", "overflow_mul"),
+            ("  t(x: I64, y: I64): I64\n    require\n      nz: y != 0\n    do\n      x / y\n    end\n", "overflow_div"),
+            ("  t(x: I64, y: I64): I64\n    require\n      nz: y != 0\n    do\n      x % y\n    end\n", "overflow_div"),
+            ("  t(x: I64): I64\n    do\n      x & 3\n    end\n", "bitwise_on_signed"),
+            ("  t(x: I64): I64\n    do\n      x >> 1\n    end\n", "bitwise_on_signed"),
+            ("  t(x: U64): U64\n    do\n      -x\n    end\n", "overflow_neg"),
+            ("  t(x: U64): U64\n    do\n      3 - x\n    end\n", "overflow_sub"),
+            ("  t: I64\n    do\n      (-7) / 2\n    ensure\n      floor: Result = -4\n    end\n", "floor"),
+            ("  t: I64\n    do\n      (-7) % 2\n    ensure\n      euclid: Result = 1\n    end\n", "euclid"),
+            ("  half(x: I64): I64\n    do\n      x / 2\n    end\n\n  t: I64\n    do\n      half(-7)\n    ensure\n      floor: Result = -4\n    end\n", "floor"),
+            ("  t(p: TUPLE[I64, I64]): I64\n    do\n      p.first + p.second\n    end\n", "overflow_add"),
+            ("  t(o: OPTION[I64]): I64\n    do\n      match o\n        case Some(n) then -n\n        case None then 0\n      end\n    end\n", "overflow_neg"),
+        ];
+        for (routine, tag) in rejected {
+            let tags = failed_tags_of_routine(routine);
+            assert!(tags.iter().any(|t| t == tag), "{routine}: wanted {tag}, got {tags:?}");
+        }
+        let verified = [
+            format!("  t(x: I64): I64\n{SMALL}    do\n      x - 200\n    end\n"),
+            format!("  t(x: I64): I64\n{SMALL}    do\n      5 - x\n    end\n"),
+            format!("  t(x: I64): I64\n{SMALL}    do\n      x * 3\n    end\n"),
+            format!("  t(x: I64): I64\n{SMALL}    do\n      -x\n    end\n"),
+            format!("  t(x: I64): I64\n{SMALL}    do\n      let y = 5 - x\n      y - 200\n    end\n"),
+            format!("  t(c: BOOL, x: I64): I64\n{SMALL}    do\n      let v = if c then 0 else x end\n      v - 500\n    end\n"),
+            "  t(x: I64): I64\n    require\n      n: x > -9223372036854775808\n    do\n      if x < 0 then -x else x end\n    ensure\n      non_negative: Result >= 0\n    end\n".to_string(),
+            "  t(x: I64): BOOL\n    do\n      x <= 9223372036854775807\n    ensure\n      in_range: Result\n    end\n".to_string(),
+            "  t(x: I64): I64\n    do\n      x / 2 + x % 7\n    end\n".to_string(),
+            "  t: I64\n    do\n      -5 + 3\n    ensure\n      exact: Result = -2\n    end\n".to_string(),
+            "  t(x: U64): U64\n    require\n      s: x < 9223372036854775808\n    do\n      x + 9223372036854775807\n    end\n".to_string(),
+        ];
+        for routine in &verified {
+            assert_eq!(failed_tags_of_routine(routine), Vec::<String>::new(), "{routine}");
+        }
+    }
+
+    #[test]
+    fn test_i64_results_proven_by_the_verifier_are_what_the_binary_computes() {
+        // `/`, `%` and wrapping on negative numbers: each routine proves its exact result,
+        // and the program checks the same value at run time.
+        let src = include_str!("../tests/c_backend/signed_ops.gdl");
+        let c = c3_verify_and_emit(src, "signed_ops.gdl");
+        if let Some(runs) = c3_native_runs(&c, "signed_ops", &[b""]) {
+            assert_eq!(runs[0].0, 0, "signed_ops: first failing check");
         }
     }
 

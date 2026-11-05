@@ -285,7 +285,7 @@
 
   <section class="facts" aria-label="Project status">
     <dl>
-      <div><dt>156</dt><dd>compiler tests passing</dd></div>
+      <div><dt>158</dt><dd>compiler tests passing</dd></div>
       <div><dt>18 files</dt><dd>of standard library verified under <code>--strict</code></dd></div>
       <div><dt>Reactive</dt><dd>servers and games, with record and replay</dd></div>
       <div><dt>C11</dt><dd>runs natively, with automatic fork-join parallelism</dd></div>
@@ -462,7 +462,7 @@ static struct BOUNDED_STACK_U64* BOUNDED_STACK_U64__push(struct BOUNDED_STACK_U6
   </div>
   <div class="panel active" id="panel-5" role="tabpanel"><pre tabindex="0"><code data-lang="term">$ gardelc examples/bounded_stack.gdl --strict
 [0/5] Standard Prelude injected (§4.1): 15 modules […], 3 concepts (trusted, verified in --stdlib bootstrap mode)
-[1/5] Parsed 3 concepts ["ORD", "EQ", "CANONICAL_EQ"], group None, and Module `BOUNDED_STACK` (type params: ["A"], satisfies: None, laws: 0, fuel: 2)
+[1/5] Parsed 3 concepts ["EQ", "ORD", "CANONICAL_EQ"], group None, and Module `BOUNDED_STACK` (type params: ["A"], satisfies: None, laws: 0, fuel: 2)
 [2/5] Checked §4 Visibility, §9 Concept Laws, §11 IO Boundary &amp; §12 Direct Verification:
       0 errors, 0 warnings — all visibility, concept laws, IO linearity, overflow, and contract obligations satisfied.
 [3/5] Emitted direct Boogie VCs &amp; fuel axioms -&gt; build/bounded_stack.bpl
@@ -498,9 +498,10 @@ $ echo $?
   <thead><tr><th>Operators</th><th>Meaning</th><th>What you must prove</th></tr></thead>
   <tbody>
     <tr><td><code>+ - *</code></td><td>Checked</td><td>The true result fits the type</td></tr>
-    <tr><td><code>/ %</code></td><td>Checked</td><td>The divisor is not zero</td></tr>
-    <tr><td><code>+% -% *%</code></td><td>Wrapping, modulo 2<sup>64</sup></td><td>Nothing</td></tr>
-    <tr><td><code>&amp; | ^ &lt;&lt; &gt;&gt;</code></td><td>Bitwise on <code>U64</code></td><td>Shift amounts are below 64</td></tr>
+    <tr><td><code>/ %</code></td><td>Checked, truncating as in C</td><td>The divisor is not zero, and for <code>I64</code>, not <code>I64.min / -1</code></td></tr>
+    <tr><td>Unary <code>-</code></td><td>Checked</td><td>The result fits, so an <code>I64</code> is not <code>I64.min</code></td></tr>
+    <tr><td><code>+% -% *%</code></td><td>Wrapping, modulo 2<sup>64</sup>, two's complement on <code>I64</code></td><td>Nothing</td></tr>
+    <tr><td><code>&amp; | ^ &lt;&lt; &gt;&gt;</code></td><td>Bitwise, on <code>U64</code> only</td><td>Shift amounts are below 64</td></tr>
   </tbody>
 </table></div>
 <h3>The midpoint bug</h3>
@@ -713,9 +714,6 @@ type Fuel;
 const unique ZeroFuel: Fuel;
 function SuccFuel(f: Fuel) returns (Fuel);
 const DefaultFuel: Fuel;
-const RevealFuel: Fuel;
-axiom DefaultFuel == SuccFuel(SuccFuel(ZeroFuel));
-axiom RevealFuel == SuccFuel(DefaultFuel);
 
 // `leaves` unfolds one level for each SuccFuel
 axiom (forall _fuel: Fuel, Current: TREE :: { fn_leaves(SuccFuel(_fuel), Current) } TREE_Invariant(Current) ==&gt; fn_leaves(SuccFuel(_fuel), Current) == (if is_Leaf(Current) then Seq_singleton(Leaf_value(Current)) else Seq_append(fn_leaves(_fuel, Node_left(Current)), fn_leaves(_fuel, Node_right(Current)))));</code></pre></div>
@@ -1794,7 +1792,7 @@ gardelc examples/reactive_game --strict
   </main>
 
   <footer class="site-footer">
-    <p>Code tabs that name a repository file hold that file verbatim. Terminal tabs are recorded output from <code>gardelc</code> at commit <code>6c07b80</code> on 2026-11-05, with steps 0 and 1 left out after chapter 1.</p>
+    <p>Code tabs that name a repository file hold that file verbatim. Terminal tabs are recorded output from <code>gardelc</code> at commit <code>58fcc88</code> on 2026-11-05, with steps 0 and 1 left out after chapter 1.</p>
   </footer>
 
   <script>
