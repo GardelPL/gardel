@@ -11,6 +11,7 @@ use std::process::Command;
 use std::rc::Rc;
 
 mod c11_typed;
+mod names;
 mod patterns;
 pub use c11_typed::emit_c11_typed;
 
@@ -13185,6 +13186,29 @@ pub fn parse_boogie_output(
                     "require" => "Phase 3 Boogie (Precondition Violation)",
                     _ => "Phase 3 Boogie (Verification Condition Failed)",
                 };
+                // A line with no tag is not a proof failure. Boogie refused the generated
+                // text, so nothing was verified.
+                if routine == "Unknown" {
+                    let detail = line.rsplit("Error:").next().unwrap_or(line).trim();
+                    let message = format!(
+                        "E0199: verifier_translation_failed: `{}` could not be translated for the verifier, so it is not verified. This is a limit of `gardelc`, not a fault shown in the program ({detail}). `GARDEL_KEEP_BPL=1` keeps the generated file",
+                        m.name
+                    );
+                    if !diags.iter().any(|d| d.message == message) {
+                        diags.push(
+                            Diagnostic::basic(
+                                "error",
+                                "E0199: verifier_translation_failed",
+                                m.name.clone(),
+                                "verifier_translation_failed".to_string(),
+                                message,
+                            )
+                            .with_module(&m.name),
+                        );
+                    }
+                    i += 1;
+                    continue;
+                }
                 diags.push(
                     Diagnostic::basic("error", static_rule, routine, tag, line.to_string())
                         .with_module(&m.name)
@@ -16596,12 +16620,45 @@ fn looks_like_input(s: &str) -> bool {
         || std::path::Path::new(s).exists()
 }
 
+/// Flags followed by a value.
+const VALUE_FLAGS: &[&str] = &["--fuel", "--z3-seed", "--z3-rlimit"];
+/// Flags with no value, or with an optional one (`--inspect`, `--emit-stdlib`).
+const PLAIN_FLAGS: &[&str] = &[
+    "--stdlib",
+    "--no-prelude",
+    "--inspect",
+    "--emit-stdlib",
+    "--json-diagnostics",
+    "--audit",
+    "--strict",
+    "--bounded-check",
+    "--run",
+];
+
+/// The first command-line word that looks like a flag and is not one. A mistyped `--strict`
+/// that was ignored would report a weaker check as passing.
+fn first_unknown_flag(args: &[String]) -> Option<&String> {
+    let mut i = 1;
+    while i < args.len() {
+        let a = &args[i];
+        if VALUE_FLAGS.contains(&a.as_str()) {
+            i += 2;
+            continue;
+        }
+        if a.starts_with("--") && !PLAIN_FLAGS.contains(&a.as_str()) {
+            return Some(a);
+        }
+        i += 1;
+    }
+    None
+}
+
 fn input_operands(args: &[String]) -> Vec<String> {
     let mut ops = Vec::new();
     let mut i = 1;
     while i < args.len() {
         let a = &args[i];
-        if a == "--fuel" || a == "--z3-seed" || a == "--z3-rlimit" {
+        if VALUE_FLAGS.contains(&a.as_str()) {
             i += 2;
             continue;
         }
@@ -16718,6 +16775,24 @@ pub fn check_and_verify_project(units: &mut [SourceUnit], opts: VerifyOptions) -
             };
         }
     }
+    let name_errors = names::check_names(units, opts.prelude_mode, &concept_map);
+    if !name_errors.is_empty() {
+        // Nothing can be verified, but what the static checks found still stands.
+        let mut fatal: Vec<Diagnostic> = pre
+            .iter()
+            .flatten()
+            .flatten()
+            .filter(|d| d.level == "error")
+            .cloned()
+            .collect();
+        fatal.extend(name_errors);
+        return CheckedProject {
+            diags: Vec::new(),
+            fatal,
+            concept_map,
+            link,
+        };
+    }
 
     let mut diags: Vec<(usize, Diagnostic)> = Vec::new();
     for (ui, u) in units.iter().enumerate() {
@@ -16819,6 +16894,17 @@ fn main() {
             "  several files, a directory (its *.gdl files, searched recursively, skipping build/ and target/) or a wildcard pattern such as src/*.gdl form one project with a flat module namespace (§4.2)"
         );
         std::process::exit(1);
+    }
+
+    if let Some(flag) = first_unknown_flag(&args) {
+        exit_with_frontend_error(
+            args.iter().any(|a| a == "--json-diagnostics"),
+            "Command Line",
+            "gardelc",
+            "unknown_flag",
+            format!("unknown flag `{flag}`. Run `gardelc` with no arguments to list the flags"),
+            "",
+        );
     }
 
     if let Some(i) = args.iter().position(|a| a == "--emit-stdlib") {
@@ -19904,8 +19990,9 @@ int main(void) {
     fn d3_diags(src: &str) -> Vec<Diagnostic> {
         let mut units = b4_units(&[("tick_state.gdl", D2_STATE), ("tick_reactive.gdl", src)]);
         let checked = check_and_verify_project(&mut units, b4_opts(true, true));
-        assert!(checked.fatal.is_empty(), "{:?}", checked.fatal);
-        checked.diags.into_iter().map(|(_, d)| d).collect()
+        let mut diags = checked.fatal;
+        diags.extend(checked.diags.into_iter().map(|(_, d)| d));
+        diags
     }
 
     /// `d3_diags` must report `tag` under the reactive rule.
@@ -21140,7 +21227,9 @@ int main(void) {
     fn d2_project(files: &[(&str, &str)]) -> (Vec<Diagnostic>, String) {
         let mut units = b4_units(files);
         let checked = check_and_verify_project(&mut units, b4_opts(true, true));
-        assert!(checked.fatal.is_empty(), "{:?}", checked.fatal);
+        if !checked.fatal.is_empty() {
+            return (checked.fatal, String::new());
+        }
         let diags: Vec<Diagnostic> = checked.diags.into_iter().map(|(_, d)| d).collect();
         let mods: Vec<ModuleDecl> = units.iter().map(|u| u.ast.modules[0].clone()).collect();
         let (root, libs) = mods.split_last().expect("a program");
@@ -21589,6 +21678,175 @@ int main(void) {
         let c = c3_verify_and_emit(src, "signed_ops.gdl");
         if let Some(runs) = c3_native_runs(&c, "signed_ops", &[b""]) {
             assert_eq!(runs[0].0, 0, "signed_ops: first failing check");
+        }
+    }
+
+    /// Runs the project through the checks and returns (rule, file:line) of what is fatal.
+    fn e0_fatal(files: &[(&str, &str)]) -> Vec<(String, String)> {
+        let mut units = b4_units(files);
+        let project = files.len() > 1;
+        let checked = check_and_verify_project(&mut units, b4_opts(project, false));
+        checked
+            .fatal
+            .iter()
+            .map(|d| {
+                let at = d.span.as_ref().map_or(String::new(), |s| format!("{}:{}", s.file, s.line));
+                (d.rule.to_string(), at)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn test_e0_every_undefined_name_has_a_rule_and_a_location() {
+        let routine = |body: &str| format!("functions T\n\nfeature {{ANY}}\n\n  id(x: U64): U64\n    do\n      x\n    end\n\n{body}\nend\n");
+        let cases = [
+            ("  t: U64\n    do\n      NO_MOD.two\n    end\n", "E0106: unknown_module", 12),
+            ("  t: U64\n    do\n      1\n    ensure\n      c: Result = NO_MOD.two\n    end\n", "E0106: unknown_module", 14),
+            ("  t: NO_TYPE\n    do\n      1\n    end\n", "E0107: unknown_type", 10),
+            ("  t(x: SEQ[NO_TYPE]): U64\n    do\n      1\n    end\n", "E0107: unknown_type", 10),
+            ("  t: U64\n    do\n      let f = fn(y: NO_TYPE): U64 do 1 end\n      1\n    end\n", "E0107: unknown_type", 12),
+            ("  t: U64\n    do\n      nothing(1)\n    end\n", "E0108: unknown_routine", 12),
+            ("  t: U64\n    do\n      T.nothing(1)\n    end\n", "E0108: unknown_routine", 12),
+            ("  t: SEQ[U64]\n    do\n      SEQ.nothing\n    end\n", "E0108: unknown_routine", 12),
+            ("  t(s: SEQ[U64]): U64\n    do\n      s.nothing\n    end\n", "E0108: unknown_routine", 12),
+            ("  t: U64\n    do\n      reveal nothing\n      1\n    end\n", "E0108: unknown_routine", 12),
+            ("  t: U64\n    do\n      id(NoCtor(1))\n    end\n", "E0109: unknown_constructor", 12),
+            ("  t(o: OPTION[U64]): U64\n    do\n      match o\n        case NoCtor(v) then v\n        case _ then 0\n      end\n    end\n", "E0109: unknown_constructor", 13),
+            ("  t: U64\n    do\n      nope + 1\n    end\n", "E0110: unknown_variable", 12),
+            ("  t: U64\n    do\n      id(1, 2)\n    end\n", "E0111: wrong_argument_count", 12),
+        ];
+        for (body, rule, line) in cases {
+            let src = routine(body);
+            let fatal = e0_fatal(&[("t.gdl", &src)]);
+            assert!(
+                fatal.iter().any(|(r, at)| r == rule && at == &format!("t.gdl:{line}")),
+                "{body}: wanted {rule} at line {line}, got {fatal:?}"
+            );
+        }
+        // Scopes: a local may hide a routine, and each of these is fine.
+        for body in [
+            "  t(f: U64 -> U64): U64\n    do\n      f(1)\n    end\n",
+            "  t: U64\n    do\n      let f = fn(y: U64): U64 do y end\n      f(1)\n    end\n",
+            "  t(o: OPTION[U64]): U64\n    do\n      match o\n        case Some(v) then v\n        case None then 0\n      end\n    end\n",
+            "  t(s: SEQ[U64]): BOOL\n    do\n      forall i: NAT. s.length >= i or i > 0\n    end\n",
+        ] {
+            let src = routine(body);
+            assert_eq!(e0_fatal(&[("t.gdl", &src)]), Vec::new(), "{body}");
+        }
+    }
+
+    #[test]
+    fn test_e0_all_repository_sources_resolve() {
+        // A false rejection here would stop a valid program from compiling at all.
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../examples");
+        let mut projects: Vec<Vec<std::path::PathBuf>> = Vec::new();
+        for entry in fs::read_dir(&root).unwrap() {
+            let p = entry.unwrap().path();
+            if p.is_dir() {
+                projects.push(fs::read_dir(&p).unwrap().map(|e| e.unwrap().path()).collect());
+            } else {
+                projects.push(vec![p]);
+            }
+        }
+        assert!(projects.len() >= 11, "{projects:?}");
+        let mut concepts = HashMap::new();
+        for c in &standard_prelude().concepts {
+            concepts.insert(c.name.clone(), c.clone());
+        }
+        for project in projects {
+            let sources: Vec<(String, String)> = project
+                .iter()
+                .map(|p| (p.display().to_string(), fs::read_to_string(p).unwrap()))
+                .collect();
+            let files: Vec<(&str, &str)> = sources.iter().map(|(p, s)| (p.as_str(), s.as_str())).collect();
+            let units = b4_units(&files);
+            let diags = names::check_names(&units, true, &concepts);
+            assert!(diags.is_empty(), "{project:?}: {diags:?}");
+        }
+        let stdlib = parse_phase4_stdlib().expect("stdlib parses");
+        let unit = SourceUnit { path: "stdlib".to_string(), src: String::new(), ast: stdlib };
+        let concepts: HashMap<String, ConceptDecl> =
+            unit.ast.concepts.iter().map(|c| (c.name.clone(), c.clone())).collect();
+        let diags = names::check_names(std::slice::from_ref(&unit), false, &concepts);
+        assert!(diags.is_empty(), "{diags:?}");
+    }
+
+    #[test]
+    fn test_e0_private_members_stay_private() {
+        let secret = "module SECRET\n\nrepresentation {NONE}\n  v: U64\n\ncreate {ANY}\n\n  make: SECRET\n    do\n      { v = 1 }\n    end\n\nfeature {ANY}\n\n  open_one: U64\n    do\n      Current.v\n    end\n\nfeature {NONE}\n\n  hidden: U64\n    do\n      Current.v\n    end\n\nfeature {FRIEND}\n\n  shared: U64\n    do\n      Current.v\n    end\n\nend\n";
+        let client = |name: &str, body: &str| {
+            format!("functions {name}\n\nfeature {{ANY}}\n\n  t(s: SECRET): U64\n    do\n      {body}\n    end\n\nend\n")
+        };
+        for body in ["s.v", "s.hidden", "SECRET.make.v", "SECRET.make.hidden", "s.shared"] {
+            let src = client("PEEK", body);
+            let fatal = e0_fatal(&[("secret.gdl", secret), ("peek.gdl", &src)]);
+            assert!(fatal.iter().any(|(r, _)| r == "E0113: hidden_member"), "{body}: {fatal:?}");
+        }
+        let exported = client("PEEK", "s.open_one");
+        assert_eq!(e0_fatal(&[("secret.gdl", secret), ("peek.gdl", &exported)]), Vec::new());
+
+        // A hidden sum type: its constructors are its representation.
+        let shade = "module SHADE\n\nrepresentation {NONE}\n  | Light(v: U64)\n  | Dark\n\ncreate {ANY}\n\n  make: SHADE\n    do\n      Dark\n    end\n\nend\n";
+        for (ret, body) in [
+            ("U64", "match s\n        case Light(v) then v\n        case _ then 0\n      end"),
+            ("SHADE", "Light(1)"),
+            ("SHADE", "Dark"),
+        ] {
+            let spy = format!("functions SPY\n\nfeature {{ANY}}\n\n  t(s: SHADE): {ret}\n    do\n      {body}\n    end\n\nend\n");
+            let fatal = e0_fatal(&[("shade.gdl", shade), ("spy.gdl", &spy)]);
+            assert!(fatal.iter().any(|(r, _)| r == "E0113: hidden_member"), "{body}: {fatal:?}");
+        }
+    }
+
+    #[test]
+    fn test_e0_constructors_of_one_name() {
+        let a = "module TOK_A\n\nrepresentation {ANY}\n  | Leaf(v: U64)\n  | End_a\n\nend\n";
+        let b = "module TOK_B\n\nrepresentation {ANY}\n  | Leaf(v: BOOL)\n  | End_b\n\nend\n";
+        // Used from a third module, they cannot be told apart, and both uses are reported.
+        let user = "functions USE_C\n\nfeature {ANY}\n\n  one: TOK_A\n    do\n      Leaf(1)\n    end\n\n  two: TOK_B\n    do\n      Leaf(True)\n    end\n\nend\n";
+        let fatal = e0_fatal(&[("tok_a.gdl", a), ("tok_b.gdl", b), ("use_c.gdl", user)]);
+        let at: Vec<&str> = fatal.iter().map(|(_, at)| at.as_str()).collect();
+        assert_eq!(fatal.len(), 2, "{fatal:?}");
+        assert!(fatal.iter().all(|(r, _)| r == "E0112: ambiguous_constructor"), "{fatal:?}");
+        assert_eq!(at, ["use_c.gdl:7", "use_c.gdl:12"]);
+        // Two modules that never meet are fine, as is a name used with no rival in reach.
+        let lone = "functions USE_D\n\nfeature {ANY}\n\n  one: TOK_A\n    do\n      End_a\n    end\n\nend\n";
+        assert_eq!(e0_fatal(&[("tok_a.gdl", a), ("tok_b.gdl", b), ("use_d.gdl", lone)]), Vec::new());
+        // A module's own constructor wins, as over the prelude's (§4.1).
+        let own = "module OWN\n\nrepresentation {ANY}\n  | Leaf(v: BOOL)\n  | Nope\n\nfeature {ANY}\n\n  flag: BOOL\n    do\n      match Current\n        case Leaf(b) then b\n        case Nope then False\n      end\n    end\n\nend\n";
+        assert_eq!(e0_fatal(&[("tok_a.gdl", a), ("own.gdl", own)]), Vec::new());
+    }
+
+    #[test]
+    fn test_e0_what_boogie_refuses_is_not_shown_as_boogie_text() {
+        let src = "functions T\n\nfeature {ANY}\n\n  t(x: U64): U64\n    do\n      x.nothing\n    end\n\nend\n";
+        let mut units = b4_units(&[("t.gdl", src)]);
+        let checked = check_and_verify_project(&mut units, b4_opts(false, false));
+        let diags: Vec<Diagnostic> = checked.diags.into_iter().map(|(_, d)| d).collect();
+        assert!(!diags.is_empty(), "it must not read as verified");
+        for d in &diags {
+            assert_eq!(d.rule, "E0199: verifier_translation_failed", "{d:?}");
+            assert!(!d.message.contains(".bpl"), "{}", d.message);
+        }
+        assert_eq!(diags.len(), 1, "one report per module: {diags:?}");
+    }
+
+    #[test]
+    fn test_e0_flags_are_known_or_refused() {
+        let args = |list: &[&str]| -> Vec<String> {
+            std::iter::once("gardelc").chain(list.iter().copied()).map(String::from).collect()
+        };
+        let unknown = |list: &[&str]| first_unknown_flag(&args(list)).cloned();
+        assert_eq!(unknown(&["a.gdl", "--stric"]), Some("--stric".to_string()));
+        assert_eq!(unknown(&["--project", "."]), Some("--project".to_string()));
+        assert_eq!(unknown(&["--boogie", "a.gdl"]), Some("--boogie".to_string()));
+        for good in [
+            &["a.gdl", "--strict", "--audit", "--run"][..],
+            &["--stdlib", "--inspect", "SEQ", "--json-diagnostics"],
+            &["a.gdl", "--fuel", "3", "--z3-seed", "1", "--z3-rlimit", "9"],
+            &["--emit-stdlib", "out", "--no-prelude", "--bounded-check"],
+        ] {
+            assert_eq!(unknown(good), None, "{good:?}");
         }
     }
 

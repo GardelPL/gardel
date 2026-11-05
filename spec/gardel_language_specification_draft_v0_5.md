@@ -336,10 +336,27 @@ The multi-file compilation pipeline proceeds through five deterministic stages:
 5. **Modular Verification Condition Generation (VCG):** For each module (or mutual `group`), the verifier constructs Boogie proof obligations using the public contracts, ghost models, and visible invariants of referenced dependencies, verifying units independently or in parallel.
 
 **CLI input rules (`gardelc`, Task B.4):**
-- Input operands may be any number of `.gdl` files, directories, and wildcard patterns. A directory stands for its top-level `*.gdl` files (not recursive, sorted by name). A wildcard in the file-name part of an operand (`src/*.gdl`) is expanded by `gardelc` itself when the shell has not expanded it (e.g. PowerShell, `cmd`). Files named twice are compiled once.
+- Input operands may be any number of `.gdl` files, directories, and wildcard patterns. A directory stands for its `*.gdl` files, searched recursively, skipping `build/` and `target/`. A wildcard in the file-name part of an operand (`src/*.gdl`) is expanded by `gardelc` itself when the shell has not expanded it (e.g. PowerShell, `cmd`). Files named twice are compiled once.
 - A run with more than one file, a directory, or a wildcard operand is a *project run*: the files share one flat namespace (`E0102`), each file is checked for `W0201`, and each module is verified once, in a context that holds the background theories (contracts, invariants, laws) of the other-file modules it references, transitively. Those contracts are trusted only because the referenced modules are verified in the same run; calls assert the callee's `require` clauses.
 - A single-file run is unchanged and does not apply `W0201`.
 - **Acyclic cross-file dependencies:** user modules in different files that reference each other in a cycle are rejected with fatal error `E0103: cyclic_module_dependency`, because each module's proof would trust the other's contracts. Mutually dependent modules must be co-declared in one file under `group` (§4.3). Modules in the same file are not linked to each other by `gardelc` yet; simultaneous `group` verification is not yet implemented.
+
+---
+
+**Name resolution.** Before verification, every name in a run must resolve against the project and the prelude. Each failure is fatal and reported at its source location:
+
+| Rule | Meaning |
+| --- | --- |
+| `E0106: unknown_module` | A module that is not in the run or the prelude |
+| `E0107: unknown_type` | A type that is not declared |
+| `E0108: unknown_routine` | A routine or field the module does not have, or a `reveal` of no routine |
+| `E0109: unknown_constructor` | A constructor no module declares |
+| `E0110: unknown_variable` | A name that is not a parameter, local, field or routine |
+| `E0111: wrong_argument_count` | A call to a known routine with the wrong number of arguments |
+| `E0112: ambiguous_constructor` | A constructor declared by two other user modules. A module's own constructor always wins, as it does over the prelude's (§4.1) |
+| `E0113: hidden_member` | A private routine or hidden field of another module, or a constructor of a representation not exported to the module. A hidden representation can be neither built nor matched |
+
+`E0105` is reserved for `ambiguous_module_reference` (Roadmap, Phase E). A receiver's type is followed through parameters, `let`s and routine results. Beyond that, what the verifier cannot translate is `E0199: verifier_translation_failed`: the module is not verified, and the fault is reported as a limit of `gardelc`, not of the program. An unknown command-line flag is an error.
 
 ---
 

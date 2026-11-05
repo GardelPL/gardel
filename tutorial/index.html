@@ -285,7 +285,7 @@
 
   <section class="facts" aria-label="Project status">
     <dl>
-      <div><dt>158</dt><dd>compiler tests passing</dd></div>
+      <div><dt>164</dt><dd>compiler tests passing</dd></div>
       <div><dt>18 files</dt><dd>of standard library verified under <code>--strict</code></dd></div>
       <div><dt>Reactive</dt><dd>servers and games, with record and replay</dd></div>
       <div><dt>C11</dt><dd>runs natively, with automatic fork-join parallelism</dd></div>
@@ -462,7 +462,7 @@ static struct BOUNDED_STACK_U64* BOUNDED_STACK_U64__push(struct BOUNDED_STACK_U6
   </div>
   <div class="panel active" id="panel-5" role="tabpanel"><pre tabindex="0"><code data-lang="term">$ gardelc examples/bounded_stack.gdl --strict
 [0/5] Standard Prelude injected (§4.1): 15 modules […], 3 concepts (trusted, verified in --stdlib bootstrap mode)
-[1/5] Parsed 3 concepts ["EQ", "ORD", "CANONICAL_EQ"], group None, and Module `BOUNDED_STACK` (type params: ["A"], satisfies: None, laws: 0, fuel: 2)
+[1/5] Parsed 3 concepts ["CANONICAL_EQ", "EQ", "ORD"], group None, and Module `BOUNDED_STACK` (type params: ["A"], satisfies: None, laws: 0, fuel: 2)
 [2/5] Checked §4 Visibility, §9 Concept Laws, §11 IO Boundary &amp; §12 Direct Verification:
       0 errors, 0 warnings — all visibility, concept laws, IO linearity, overflow, and contract obligations satisfied.
 [3/5] Emitted direct Boogie VCs &amp; fuel axioms -&gt; build/bounded_stack.bpl
@@ -1709,6 +1709,8 @@ if (_pd &lt;= GARDEL_TASK_DEPTH) {
   <li>Each file holds one unit: <code>module</code>, <code>concept</code>, <code>functions</code>, <code>program</code> or <code>reactive program</code>. A file whose name does not match gives warning <code>W0201</code>.</li>
   <li>Two units with one name are <code>E0102</code>. A dependency cycle across files is <code>E0103</code>, because each proof would trust the other.</li>
   <li>Nothing may refer to a <code>program</code>: <code>E0104</code>. Entry points are the roots of a run.</li>
+  <li>Every name resolves before anything is verified. An undefined module, type, routine, constructor or variable is <code>E0106</code> to <code>E0110</code>, at its source line.</li>
+  <li>A private routine, a hidden field or a constructor of a hidden representation cannot be reached from another module: <code>E0113</code>. Opaque state stays opaque.</li>
   <li><code>group { A, B }</code> no longer pulls in a library. It is only for modules whose proofs depend on each other in a cycle.</li>
 </ul>
 <h3>What is always available</h3>
@@ -1733,7 +1735,7 @@ if (_pd &lt;= GARDEL_TASK_DEPTH) {
 <section class="chapter" id="chapter-11">
 <div class="chapter-tag">Chapter 11 / Reference</div>
 <h2>Using gardelc</h2>
-<p class="lede">Build the compiler, then point it at a file or a folder. Verification needs Boogie and Z3, and native output needs gcc or clang. <code>scripts/install_tools</code> sets up the two provers.</p>
+<p class="lede">Build the compiler, then point it at a file or a folder. An unknown flag is an error, so a mistyped <code>--strict</code> cannot pass quietly. Verification needs Boogie and Z3, and native output needs gcc or clang. <code>scripts/install_tools</code> sets up the two provers.</p>
 <div class="viewer">
   <div class="viewer-bar">
     <div class="tabs" role="tablist"><button class="tab active" role="tab" aria-selected="true" data-panel="panel-55">Common commands</button></div>
@@ -1792,7 +1794,7 @@ gardelc examples/reactive_game --strict
   </main>
 
   <footer class="site-footer">
-    <p>Code tabs that name a repository file hold that file verbatim. Terminal tabs are recorded output from <code>gardelc</code> at commit <code>58fcc88</code> on 2026-11-05, with steps 0 and 1 left out after chapter 1.</p>
+    <p>Code tabs that name a repository file hold that file verbatim. Terminal tabs are recorded output from <code>gardelc</code> at commit <code>a3ab266</code> on 2026-11-05, with steps 0 and 1 left out after chapter 1.</p>
   </footer>
 
   <script>

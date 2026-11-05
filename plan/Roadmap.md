@@ -634,6 +634,115 @@ flowchart TD
 - Tests `test_i64_arithmetic_is_checked_against_its_own_range`, `test_i64_results_proven_by_the_verifier_are_what_the_binary_computes`. A probe of 61 cases had 17 of the first 35 wrong, and all are right now.
 - **Known limit.** Z3 gives up on a wrapping operator applied to a routine's result (`v(1) +% 1`) in an exact postcondition. It reports unproven, not verified, and a parameter pinned by `require` proves. `F64` operators are unchanged.
 
+### Phase E: Projects and Packages (the "Verified Universe")
+
+**Status:** Task E.0 ✅ Completed (2026-11-05). E.1 onwards 📋 proposed, and waits until a real second package exists, or until the decisions below are taken.
+
+**Objective:** let a Gardel project depend on other Gardel packages without import statements, and without trusting anything that was not proven on this machine. Source stays declaration-only. A manifest, `Gardel.toml`, states what is in the universe. Modular reasoning stays Hoare's rule for a call: prove the callee's precondition, then use its postcondition.
+
+**Review verdict:** the direction is right and fits what exists. No imports is already the language (§4.2): a project run links every file into one flat namespace with the prelude in scope. A manifest was anticipated in [stdlib_file_organization.md](stdlib_file_organization.md). Accepted with four corrections: a certificate cannot be the trust root, an interface file cannot replace source, collisions go beyond module names, and "bare by default" needs a rule for names that appear later.
+
+**Not in this phase:** a public registry, binary-only packages, signed certificates, two versions of one package in a build, and any change to `group`.
+
+#### Findings from probing the proposal against `gardelc` (2026-11-05)
+
+Small projects shaped like the proposal were run through the compiler at `58fcc88` plus Task D.10.
+
+| # | Finding | Effect on the plan |
+| :--- | :--- | :--- |
+| 1 | **A false dependency contract proves anything in the client.** A `LIB.f` with `assume c: False` and `ensure lie: Result = 2`, whose body returns 1: a client verified `absurd: Result = 3`, and `x * 1000` in the client reported no overflow, at exit 0. `--strict` catches it only because the source is in the run. | "Assume the library's postconditions as axioms" is safe only for what this machine proved. A downloaded `.gds` must never be trusted: it could state `False`. Decision 1. |
+| 2 | **Clients see public bodies today.** A client proved `Result = 5` for `DEP.five`, a routine with no `ensure`. | "Opaque bodies" is a semantic change: such proofs stop verifying, and today a dependency's body change can break or fix a client's proof silently. Decision 2. |
+| 3 | **Bodies are needed for code.** The C backend monomorphizes from source (Task C.3), so a generic module cannot be built from contracts. | A `.gds` cannot be the distributed form. A package ships source, and the interface is a derived cache for the verifier. Decision 3. |
+| 4 | **Constructors collide too.** `Leaf` in two modules of one project fails with a raw Boogie type error. Constructors resolve by name alone and have no qualified syntax (§4.1). | `JSON::PARSER` alone does not solve collisions: two libraries both defining `Leaf` or `Error` is more likely than two defining `PARSER`. Task E.0. |
+| 5 | **A unique name is assumed throughout.** Modules are found by bare name (`ctx.module` at 35 sites, 231 uses of `m.name` in `main.rs`, 15 in `c11_typed.rs`), and bare names form Boogie and C symbols (`PARSER__fn_x`, `struct PARSER`). | Most of the work. Two packages with one module name need identity by (package, name) and mangled symbols in Boogie and C. The `::` token is the small part. Task E.4. |
+| 6 | **"Bare by default" is fragile.** Under the proposal, a dependency adding a module `PARSER` in a minor release breaks every client using another `PARSER` bare. The prelude already has this shape: Phase D added `EVENT`, `KEY` and `COMMAND`, so a user module with one of those names now fails with `E0101`. | Decision 4 for local names, and a lockfile so nothing changes without an action. The prelude case is an open question. |
+| 7 | **Undefined and unknown things are reported badly.** An undefined module gives raw Boogie errors with a temp-file path (`Unknown`, `invalid type`). An unknown flag is ignored: `--project` and `--no-such-flag` both exit 0. | Must be real errors before a manifest adds paths and flags that can be mistyped. Task E.0. |
+| 8 | Directories are already recursive: `gardelc nested` linked `nested/sub/b_mod.gdl`. Spec §4.2 says they are not. | `src/**/*.gdl` already works. Fix the spec in Task E.0. |
+| 9 | The prelude is the proposal's interface model in a special case: its contracts are injected as trusted theory, proven by `--stdlib`. Cost today: 0.8 s for `bounded_stack.gdl`, 14.6 s for all 18 stdlib files under `--strict`. | The mechanism exists, so E.2 generalizes it. No claim about "hours" or "instant" can be made yet, and the "80% of trivial build errors" figure has no source. Measure in E.3. |
+| 10 | `[dependencies]` in `gardelc/Cargo.toml` is empty. `E0105` is unused. | Parsing `Gardel.toml` needs a dependency or a small TOML subset. Open question. |
+
+#### Decisions
+
+1. **Proofs are checked locally. A certificate is a cache, not evidence.** A dependency is verified from source on first use, and the result is cached under a hash of its source, the interfaces it depends on, the verifier version, the Boogie and Z3 versions, the solver limit and the flags. Nothing downloaded can mark a package as proven. The hash includes the verifier because soundness fixes change what is proven: Tasks D.9 and D.10 invalidated proofs from earlier compilers.
+2. **Contracts only across a package boundary.** A client of another package sees signatures, contracts, public ghost models and laws, never a `do` body. Within a project, linking stays as it is. Changing a body inside its contract then cannot change a client's proof.
+3. **Packages ship source.** The interface file is derived, for the verifier, and code generation reads source. Private routines stay hidden from clients by visibility.
+4. **Names resolve nearest first.** A project's own module wins over a dependency's, so a new module in a dependency never changes what local code means, the rule §4.1 already uses for constructors. Two direct dependencies with one name, used bare, are `E0105: ambiguous_module_reference`, fixed by qualifying.
+5. **Only direct dependencies are in the universe.** A package resolves its own names against its own manifest, so a transitive dependency adds no names. One version of a package per build, and a conflict is an error.
+6. **`--strict` is transitive.** A package's `assume`s are recorded in its cached result and reported to clients. `--strict` refuses them in any dependency, and `--bounded-check` results never count as proven.
+7. **Export lists stop at the package.** `{FRIENDS}` and `{M}` name modules of the same package. A `group` cannot cross packages, and an entry point is never exported (`E0104`).
+
+#### Open questions
+
+- **Prelude growth (finding 6):** let user modules shadow a prelude name added after a stated language edition, or keep `E0101` and accept that a new prelude name can break projects.
+- **Qualified constructors:** `TOK_A.Leaf(1)` or resolution from the expected type, or both. The C backend already uses the expected type.
+- **Manifest parser:** a TOML subset in `gardelc`, keeping it dependency-free, or the `toml` crate.
+- **Package aliases:** the proposal writes `package = "json"` and `JSON::PARSER`. The rule proposed here is the uppercased package name, unless `as` overrides it.
+
+#### Dependency graph
+
+```mermaid
+flowchart TD
+    E0["E.0: Names, errors & flags"]
+    E1["E.1: Gardel.toml, no dependencies"]
+    E2["E.2: Contract-only interfaces"]
+    E3["E.3: Local verification cache"]
+    E4["E.4: Path dependencies & package identity"]
+    E5["E.5: PKG::MODULE & E0105"]
+    E6["E.6: Git dependencies & lockfile"]
+    E7["E.7: Contract compatibility check"]
+    E0 --> E1 --> E4
+    E0 --> E2 --> E3 --> E4 --> E5 --> E6
+    E2 --> E7
+```
+
+#### Task E.0: Names, Errors and Flags [✅ Completed]
+- [x] **Name resolution before Boogie** (`gardelc/src/names.rs`). Undefined names reached Boogie and came back as `Phase 3 Boogie (Verification Condition Failed) in Unknown` with a temp-file path. Sixteen kinds were probed and all did this. Now `E0106` module, `E0107` type, `E0108` routine, `E0109` constructor, `E0110` variable and `E0111` argument count, each at its source location. They are fatal, and are reported together with what the static checks found, not in place of it.
+- [x] **Soundness: private members were not private across modules.** `SECRET.make.hidden`, a `feature {NONE}` routine, was callable from another module. A client could also match or build a constructor of a `representation {NONE}` sum type, so `Light(1)` forged a value the invariant never saw, which breaks the guarantee reactive state rests on. Reading a hidden field failed only by accident, as a Boogie error (the known limit of Task D.7). All three are `E0113: hidden_member`.
+- [x] Constructors of one name: a module's own wins. Declared by two other modules, a use is `E0112: ambiguous_constructor`, at each use. Qualified constructors stay an open question.
+- [x] **Backstop.** What Boogie refuses is `E0199: verifier_translation_failed`, once per module, with no Boogie file path: the module is not verified, and this is reported as a limit of `gardelc`. `x.nothing` on a `U64` lands here, because a receiver's type is followed only through parameters, `let`s and routine results.
+- [x] An unknown flag is an error. A mistyped `--stric` used to run the weaker check and report success. `--boogie`, used by the old tutorial, was one such flag.
+- [x] Spec §4.2 corrected: directories are recursive. The guide's table of contents linked to a section that did not exist.
+- Tests `test_e0_every_undefined_name_has_a_rule_and_a_location` (rule and line), `test_e0_all_repository_sources_resolve` (every example and the stdlib, so a false rejection fails here), `test_e0_private_members_stay_private`, `test_e0_constructors_of_one_name`, `test_e0_what_boogie_refuses_is_not_shown_as_boogie_text`, `test_e0_flags_are_known_or_refused`. `cargo test` 164/164. `--stdlib --strict` 0/0 and the eleven examples 0/0.
+- **Known limits.** A member on a receiver of unknown type is not resolved here, and reaches `E0199` or the verifier. `feature {OTHER}` across files is not usable, as the export list forms a cycle (`E0103`), so `E0113` is tested only for `{NONE}` and for a module outside the list.
+
+#### Task E.1: `Gardel.toml` Without Dependencies [ ]
+- [ ] `[project]` with `name` and `version`. `gardelc` with no input, or `--project DIR`, reads it and uses `src/`.
+- [ ] Spec §4.2 and §13: the manifest, and that it never changes what a source file means.
+- Acceptance: `examples/echo_server` with a manifest gives the same `.bpl` and `.c` as `gardelc examples/echo_server`.
+
+#### Task E.2: Contract-Only Interfaces [ ]
+- [ ] Define the `.gds` content from `--inspect`: signatures, `require`, `ensure`, public ghost signatures and laws. A ghost query over a hidden representation stays uninterpreted for a client.
+- [ ] Add a boundary to linking that withholds bodies, generalizing `prelude_contract_interface`.
+- [ ] **Measure first:** run `examples/` with bodies withheld, and record which proofs need new `ensure` clauses.
+- Acceptance: a client relying on a dependency's body fails with the missing fact named, and a body change inside the contract leaves the client's proof and result unchanged.
+
+#### Task E.3: Local Verification Cache [ ]
+- [ ] Cache key and contents as in decision 1. Any change to a key input re-verifies.
+- [ ] Record `assume`s, and make `--strict` transitive (decision 6).
+- [ ] Add `--verify-deps`, which ignores the cache, for CI.
+- [ ] Measure the time saved on the stdlib before and after.
+- Acceptance: a mutated cache entry or a false `.gds` cannot make a client verify (finding 1 is the test). Changing the verifier version re-verifies everything.
+
+#### Task E.4: Path Dependencies and Package Identity [ ]
+- [ ] `[dependencies]` with `path`. The universe is the prelude, the project and its direct dependencies (decision 5).
+- [ ] Identify modules by (package, name). Mangle Boogie and C symbols by package.
+- [ ] Apply decisions 4 and 7.
+- Acceptance: two packages that both define `PARSER` and `Leaf`, each used inside its own package, verify, link and run, and each keeps its own proofs.
+
+#### Task E.5: `PKG::MODULE` and `E0105` [ ]
+- [ ] Add the `::` token, and qualified names in expressions and types, including nested type arguments.
+- [ ] Add `E0105: ambiguous_module_reference`, listing the candidates and the qualified spellings. Allow qualification when it is not needed.
+- Acceptance: with two dependencies defining `PARSER`, bare use is `E0105` and both qualified uses verify and run.
+
+#### Task E.6: Git Dependencies and Lockfile [ ]
+- [ ] `git` dependencies pinned to a commit, with `Gardel.lock` holding source hashes and the Boogie and Z3 versions.
+- [ ] A build uses the locked sources and never fetches without being asked.
+- Acceptance: a fresh clone with the lockfile gives the same proofs, and a changed upstream commit is refused until the lock is updated.
+
+#### Task E.7: Contract Compatibility Check [ ]
+- [ ] Compare the interfaces of two versions: a stronger `require`, a weaker `ensure` or a removed routine is a breaking change.
+- Acceptance: a stronger `require` is reported as breaking and a body-only change is not. Implication between contracts is checked with the solver, and an unproven comparison counts as breaking.
+
 ---
 
 ## 5. Verification & Acceptance Criteria
@@ -648,10 +757,14 @@ flowchart TD
 | **D** | **Reactive Slice** | `examples/reactive_hello.gdl` verifies with **0 errors and 0 warnings**, runs natively, and exits through `Stop` on a real Ctrl-C and on a scripted `Shutdown`. Each reactive diagnostic has a test. |
 | **D** | **Unbounded Runs** | A timer program shows no growth in live allocations over 100,000 events. `examples/echo_server.gdl` holds its verified connection limit under test, and removing the guard is rejected by the verifier. |
 | **D** | **Determinism** | Replaying a recorded event log reproduces the run's commands exactly. |
+| **E** | **Nothing Unproven Is Trusted** | A false `.gds` or cache entry cannot make a client verify, `--strict` covers dependencies, and a changed verifier re-verifies them. |
+| **E** | **Two Libraries, One Name** | Two packages defining the same module and constructor names build and run together, with `E0105` on bare use across them. |
 
 ---
 
 ## 6. Immediate Next Step
+
+**Phase E: Projects and Packages:** Task E.0 is completed. E.1 onwards is proposed above, and waits for its decisions and for a real second package.
 
 With **Phase A: Language Specification Harmonization**, **Phase B: Compiler Engine & Prelude Tooling**, **Task C.1: Physical Decomposition of `stdlib/`**, **Task C.2: High-Performance Smart String (`stdlib/text/string.gdl`)**, and **Task C.3: Regression Verification & Performance Benchmarking** completely executed and verified with 0 errors and 0 warnings under `--strict`, Phase C's planned work is done. The verification baseline is clean, and every module compiles from source to C with reference-counted memory (C.3 follow-ups).
 
