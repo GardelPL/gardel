@@ -190,6 +190,16 @@ impl Visibility {
     }
 }
 
+impl std::fmt::Display for Visibility {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Visibility::Any => write!(f, "{{ANY}}"),
+            Visibility::None => write!(f, "{{NONE}}"),
+            Visibility::Modules(ms) => write!(f, "{{{}}}", ms.join(", ")),
+        }
+    }
+}
+
 /// Distinguishes ADT `module`, stateless `functions`, effectful `program` and non-terminating
 /// `reactive program` declarations (§4, §11, §11.6).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -5006,12 +5016,19 @@ fn prelude_modules_wanted(m: &ModuleDecl) -> HashSet<&'static str> {
 pub struct LinkTable {
     modules: Vec<ModuleDecl>,
     file_of: HashMap<String, usize>,
+    external_modules: HashSet<String>,
     iface_cache: std::cell::RefCell<HashMap<String, Rc<(String, HashSet<String>)>>>,
 }
 
 impl LinkTable {
     /// `modules`: every (concept-expanded) user module of the run with its file index.
     pub fn new(modules: Vec<(ModuleDecl, usize)>) -> Self {
+        Self::with_external(modules, HashSet::new())
+    }
+
+    /// `modules` with a set of `external_modules` that represent dependencies across a package
+    /// boundary (Task E.2: contract-only interfaces whose bodies are withheld).
+    pub fn with_external(modules: Vec<(ModuleDecl, usize)>, external_modules: HashSet<String>) -> Self {
         let mut file_of = HashMap::new();
         let mut ms = Vec::new();
         for (m, f) in modules {
@@ -5021,8 +5038,14 @@ impl LinkTable {
         LinkTable {
             modules: ms,
             file_of,
+            external_modules,
             iface_cache: std::cell::RefCell::new(HashMap::new()),
         }
+    }
+
+    /// True if `name` is marked as an external dependency across a package boundary.
+    pub fn is_external(&self, name: &str) -> bool {
+        self.external_modules.contains(name)
     }
 
     fn module(&self, name: &str) -> Option<&ModuleDecl> {
@@ -5204,10 +5227,15 @@ fn linked_contract_interface(n: &ModuleDecl) -> Rc<(String, HashSet<String>)> {
     result
 }
 
+fn is_external_dependency(_caller: &str, callee: &str) -> bool {
+    link_table().is_some_and(|t| t.is_external(callee))
+}
+
 /// The namespaced background theory of linked user module `n` (no `Verify_*` procedures:
-/// `n`'s obligations are verified in its own Boogie file of the same run).
-fn emit_linked_background_theory(n: &ModuleDecl, fuel_limit: usize) -> String {
-    let parts = in_own_boogie_ctx(n, || emit_boogie_parts(n, fuel_limit));
+/// `n`'s obligations are verified in its own Boogie file of the same run). When `withhold_bodies`
+/// is true (Task E.2: across a package boundary), routine `do` bodies are withheld.
+fn emit_linked_background_theory(n: &ModuleDecl, fuel_limit: usize, withhold_bodies: bool) -> String {
+    let parts = in_own_boogie_ctx(n, || emit_boogie_parts_with_options(n, fuel_limit, withhold_bodies));
     let mut text = parts.theory;
     text.push_str(&parts.client_axioms);
     text.push_str(&linked_contract_interface(n).0);
@@ -5220,8 +5248,9 @@ fn emit_linked_background_theory(n: &ModuleDecl, fuel_limit: usize) -> String {
         })
         .collect();
     format!(
-        "// --- Linked project module: {} (background theory; its own obligations are verified in its own file of this run) ---\n{}\n",
+        "// --- Linked module: {} ({}; obligations verified separately) ---\n{}\n",
         n.name,
+        if withhold_bodies { "contract-only interface" } else { "background theory" },
         rename_boogie_idents(&text, &map)
     )
 }
@@ -6782,6 +6811,13 @@ fn prelude_contract_interface(p: &ModuleDecl) -> Rc<(String, HashSet<String>)> {
     result
 }
 
+/// Contract-only interface for any module (prelude, linked dependency, or external package):
+/// routine preconditions, postcondition frame axioms, and law markers without `do` bodies
+/// (generalizing `prelude_contract_interface` per Task E.2).
+pub fn emit_contract_interface(m: &ModuleDecl) -> (String, HashSet<String>) {
+    emit_prelude_contract_interface(m)
+}
+
 fn emit_prelude_contract_interface(p: &ModuleDecl) -> (String, HashSet<String>) {
     let strings = collect_module_strings(p);
     let empty_fields = HashSet::new();
@@ -6923,8 +6959,8 @@ fn emit_prelude_contract_interface(p: &ModuleDecl) -> (String, HashSet<String>) 
 
 /// The namespaced background theory of prelude module `p` for injection into a user
 /// module's Boogie file: no `Verify_*` procedures, so no prelude obligation is re-proven.
-fn emit_prelude_background_theory(p: &ModuleDecl, fuel_limit: usize) -> String {
-    let parts = emit_boogie_parts(p, fuel_limit);
+fn emit_prelude_background_theory(p: &ModuleDecl, fuel_limit: usize, withhold_bodies: bool) -> String {
+    let parts = emit_boogie_parts_with_options(p, fuel_limit, withhold_bodies);
     // Opaque stand-ins for other prelude sorts are dropped: the real theories are injected.
     let mut text: String = parts
         .theory
@@ -7005,12 +7041,14 @@ pub fn emit_boogie(m: &ModuleDecl, fuel_limit: usize) -> String {
     // then namespaced; none of their verification procedures are included. Linked user
     // modules of other files (Task B.4) are emitted in their own context, then namespaced.
     let prev = BOOGIE_PRELUDE_CTX.with(|c| c.replace(Some(ctx.clone())));
+    let client_of_prelude = !standard_prelude().declares(&m.name);
     let mut injected = String::new();
     for p in &ctx.modules {
         if is_linked_user_module(&p.name) {
-            injected.push_str(&emit_linked_background_theory(p, fuel_limit));
+            let withhold = is_external_dependency(&m.name, &p.name);
+            injected.push_str(&emit_linked_background_theory(p, fuel_limit, withhold));
         } else {
-            injected.push_str(&emit_prelude_background_theory(p, fuel_limit));
+            injected.push_str(&emit_prelude_background_theory(p, fuel_limit, client_of_prelude));
         }
     }
     let parts = emit_boogie_parts(m, fuel_limit);
@@ -7027,6 +7065,14 @@ pub fn emit_boogie(m: &ModuleDecl, fuel_limit: usize) -> String {
 }
 
 fn emit_boogie_parts(m: &ModuleDecl, fuel_limit: usize) -> BoogieParts {
+    emit_boogie_parts_with_options(m, fuel_limit, false)
+}
+
+fn emit_boogie_parts_with_options(
+    m: &ModuleDecl,
+    fuel_limit: usize,
+    withhold_bodies: bool,
+) -> BoogieParts {
     let mut out = String::new();
     let mut theory = String::new();
     out.push_str(&format!(
@@ -7775,8 +7821,11 @@ fn emit_boogie_parts(m: &ModuleDecl, fuel_limit: usize) -> BoogieParts {
         let fn_step_two_app = format!("fn_{}({})", r.name, call_args_step_two.join(", "));
         let fn_succ_app = format!("fn_{}({})", r.name, call_args_succ.join(", "));
         let fn_f_app = format!("fn_{}({})", r.name, call_args_f.join(", "));
-        let body_expr =
-            emit_boogie_block_expr(&r.stmts, &r.body, m, &empty_fields, "_fuel", &strings);
+        let body_expr = if withhold_bodies {
+            String::new()
+        } else {
+            emit_boogie_block_expr(&r.stmts, &r.body, m, &empty_fields, "_fuel", &strings)
+        };
         let guard_str = if pre_guards.is_empty() {
             String::new()
         } else {
@@ -7808,16 +7857,18 @@ fn emit_boogie_parts(m: &ModuleDecl, fuel_limit: usize) -> BoogieParts {
             .iter()
             .any(|st| matches!(st, Stmt::Let(_, e) if expr_has_io_bind(e)))
             || expr_has_io_bind(&r.body);
-        if !binds_io {
+        if !binds_io && !withhold_bodies {
             out.push_str(&format!(
                 "axiom (forall{r_tp_quant} {} :: {fn_succ_trigger} {guard_str}{fn_succ_app} == {body_expr});\n",
                 q_params.join(", ")
             ));
         }
-        out.push_str(&format!(
-            "axiom (forall{r_tp_quant} {} :: {fn_step_two_trigger} {guard_str}{fn_step_two_app} == {fn_succ_app});\n",
-            q_params.join(", ")
-        ));
+        if !withhold_bodies {
+            out.push_str(&format!(
+                "axiom (forall{r_tp_quant} {} :: {fn_step_two_trigger} {guard_str}{fn_step_two_app} == {fn_succ_app});\n",
+                q_params.join(", ")
+            ));
+        }
         if *has_current && !uses_curr {
             let mut ri_q_params = vec![
                 "_fuel: Fuel".to_string(),
@@ -7844,26 +7895,36 @@ fn emit_boogie_parts(m: &ModuleDecl, fuel_limit: usize) -> BoogieParts {
             ));
         }
 
-        // Opaque Postcondition Frame Axiom (holds at any fuel `_fuel`, including `ZeroFuel`)
-        let mut post_clauses = Vec::new();
+        // Signature return type bounds (unconditional, holds for all fuel and calls)
+        let mut type_clauses = Vec::new();
         if r.ret_type == "NAT" || r.ret_type == "U64" {
-            post_clauses.push(format!("in_u64({fn_f_app})"));
+            type_clauses.push(format!("in_u64({fn_f_app})"));
         } else if r.ret_type == "INT" || r.ret_type == "I64" {
-            post_clauses.push(format!("in_i64({fn_f_app})"));
+            type_clauses.push(format!("in_i64({fn_f_app})"));
         } else if r.ret_type == "CHAR" {
-            post_clauses.push(format!("in_char({fn_f_app})"));
+            type_clauses.push(format!("in_char({fn_f_app})"));
         } else if r.ret_type == m.name
             || r.ret_type == "Current"
             || r.ret_type.starts_with(&format!("{}[", m.name))
         {
-            post_clauses.push(format!("{}_Invariant({fn_f_app})", m.name));
+            type_clauses.push(format!("{}_Invariant({fn_f_app})", m.name));
         }
         if m.name == "SEQ" && r.name == "length" {
-            post_clauses.push(format!(
+            type_clauses.push(format!(
                 "{fn_f_app} == Seq_length(fn_model(_fuel, Current))"
             ));
-            post_clauses.push(format!("0 <= {fn_f_app}"));
+            type_clauses.push(format!("0 <= {fn_f_app}"));
         }
+        if !type_clauses.is_empty() {
+            out.push_str(&format!(
+                "axiom (forall{r_tp_quant} {} :: {fn_f_trigger} ({}));\n",
+                q_params.join(", "),
+                type_clauses.join(" && ")
+            ));
+        }
+
+        // Opaque Postcondition Frame Axiom (holds at any fuel `_fuel`, including `ZeroFuel`)
+        let mut post_clauses = Vec::new();
         let mut model_decoupled_ens = Vec::new();
         let mut model_decoupled_fn = String::from("fn_model");
         for (ens_tag, ens_e) in &r.ensures {
@@ -16126,7 +16187,7 @@ pub fn format_module_interface(m: &ModuleDecl) -> String {
                 out.push_str("  representation {NONE} -- opaque ADT layout\n");
             }
             vis => {
-                out.push_str(&format!("  representation {:?}\n", vis));
+                out.push_str(&format!("  representation {vis}\n"));
                 match &m.repr {
                     ReprKind::Sum(vars) => {
                         for v in vars {
@@ -16163,8 +16224,8 @@ pub fn format_module_interface(m: &ModuleDecl) -> String {
             format!("({})", p_list.join(", "))
         };
         s.push_str(&format!(
-            "    {:?} {}{}{}: {}\n",
-            vis, r.name, rtp, ps, r.ret_type
+            "    {vis} {}{}{}: {}\n",
+            r.name, rtp, ps, r.ret_type
         ));
         for (tag, req) in &r.requires {
             s.push_str(&format!(
@@ -16212,8 +16273,7 @@ pub fn format_module_interface(m: &ModuleDecl) -> String {
                 format!("[{}]", law.type_params.join(", "))
             };
             out.push_str(&format!(
-                "    {:?} law {}{ltp}({})\n",
-                vis,
+                "    {vis} law {}{ltp}({})\n",
                 law.name,
                 ps.join(", ")
             ));
@@ -16753,7 +16813,7 @@ pub fn check_project_namespace(units: &[SourceUnit], prelude_mode: bool) -> Vec<
 }
 
 /// Options of a verification run.
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub struct VerifyOptions {
     pub prelude_mode: bool,
     /// Several files / a directory: enables `W0201` and cross-file linking.
@@ -16764,6 +16824,7 @@ pub struct VerifyOptions {
     pub bounded_check: bool,
     pub z3_seed: Option<u32>,
     pub z3_rlimit: Option<u64>,
+    pub external_modules: HashSet<String>,
 }
 
 /// Outcome of checking and verifying all modules of a run.
@@ -16817,7 +16878,7 @@ pub fn check_and_verify_project(units: &mut [SourceUnit], opts: VerifyOptions) -
             .enumerate()
             .flat_map(|(ui, u)| u.ast.modules.iter().map(move |m| (m.clone(), ui)))
             .collect();
-        Some(Rc::new(LinkTable::new(all)))
+        Some(Rc::new(LinkTable::with_external(all, opts.external_modules.clone())))
     } else {
         None
     };
@@ -17284,6 +17345,7 @@ fn main() {
         bounded_check,
         z3_seed,
         z3_rlimit,
+        external_modules: HashSet::new(),
     };
     let checked = check_and_verify_project(&mut units, opts);
     if !checked.fatal.is_empty() {
@@ -17913,6 +17975,7 @@ end
             bounded_check: false,
             z3_seed: None,
             z3_rlimit: None,
+            external_modules: HashSet::new(),
         };
         let checked = check_and_verify_project(&mut units, opts);
         assert!(
@@ -22133,9 +22196,10 @@ int main(void) {
             bounded_check: false,
             z3_seed: Some(1),
             z3_rlimit: Some(DEFAULT_Z3_RLIMIT),
+            external_modules: HashSet::new(),
         };
 
-        let dir_res = check_and_verify_project(&mut dir_units, opts);
+        let dir_res = check_and_verify_project(&mut dir_units, opts.clone());
         assert!(dir_res.fatal.is_empty(), "dir fatal: {:?}", dir_res.fatal);
         assert!(dir_res.diags.is_empty(), "dir diags: {:?}", dir_res.diags);
 
@@ -22220,6 +22284,247 @@ int main(void) {
         let err = resolve_project_inputs(&tmp).expect_err("missing src/ must be an error");
         assert!(err.message.contains("src"), "expected error mentioning src/: {err:?}");
         let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn test_e2_contract_only_interfaces_body_change_and_missing_fact() {
+        // Acceptance criteria for Task E.2:
+        // 1. A client relying on an external dependency's body fails with the missing fact named.
+        // 2. Adding the contract postcondition allows the client's proof to succeed.
+        // 3. A body change inside the contract leaves the client's proof and result unchanged.
+        // 4. Ghost queries and representation in .gds / --inspect withholds bodies and exposes
+        //    signatures, contracts, public ghost signatures and laws.
+
+        let math_dep_v1 = r#"
+functions MATH_DEP
+
+feature {ANY}
+
+  calc(x: INT): INT
+    require
+      fits: x >= 0 and x <= 1000
+    do
+      x + x
+    ensure
+      pos: Result >= x
+    end
+
+end
+"#;
+
+        let client_src = r#"
+functions CLIENT
+
+feature {ANY}
+
+  run_calc(n: INT): INT
+    require
+      bound: n >= 0 and n <= 500
+    do
+      MATH_DEP.calc(n)
+    ensure
+      exact: Result = n * 2
+    end
+
+end
+"#;
+
+        // Part A: Intra-project linking (same package, bodies visible):
+        // CLIENT sees `x + x` which equals `n * 2`, so `exact` succeeds.
+        {
+            let mut units = b4_units(&[("math_dep.gdl", math_dep_v1), ("client.gdl", client_src)]);
+            let opts = b4_opts(true, true);
+            let checked = check_and_verify_project(&mut units, opts);
+            assert!(checked.fatal.is_empty());
+            let errs: Vec<&Diagnostic> = checked
+                .diags
+                .iter()
+                .map(|(_, d)| d)
+                .filter(|d| d.level == "error")
+                .collect();
+            assert!(errs.is_empty(), "intra-project linking retains bodies, got {errs:?}");
+        }
+
+        // Part B: Cross-package boundary (MATH_DEP is an external dependency):
+        // MATH_DEP's body `x + x` is withheld. CLIENT only sees `pos: Result >= x`.
+        // Verification fails with the missing fact named (`exact`).
+        {
+            let mut units = b4_units(&[("math_dep.gdl", math_dep_v1), ("client.gdl", client_src)]);
+            let mut opts = b4_opts(true, true);
+            opts.external_modules.insert("MATH_DEP".to_string());
+            let checked = check_and_verify_project(&mut units, opts);
+            assert!(checked.fatal.is_empty());
+            let client_errs: Vec<&Diagnostic> = checked
+                .diags
+                .iter()
+                .filter(|(ui, _)| *ui == 1) // client.gdl
+                .map(|(_, d)| d)
+                .filter(|d| d.level == "error")
+                .collect();
+            assert!(
+                !client_errs.is_empty(),
+                "client relying on external dependency's body must fail"
+            );
+            assert!(
+                client_errs.iter().any(|d| d.tag == "exact"),
+                "missing fact `exact` must be named, got {client_errs:?}"
+            );
+        }
+
+        // Part C: Add the required ensure clause to MATH_DEP:
+        let math_dep_v2 = r#"
+functions MATH_DEP
+
+feature {ANY}
+
+  calc(x: INT): INT
+    require
+      fits: x >= 0 and x <= 1000
+    do
+      x + x
+    ensure
+      pos: Result >= x
+      exact_double: Result = x * 2
+    end
+
+end
+"#;
+
+        let bpl_client_v2 = {
+            let mut units = b4_units(&[("math_dep.gdl", math_dep_v2), ("client.gdl", client_src)]);
+            let mut opts = b4_opts(true, true);
+            opts.external_modules.insert("MATH_DEP".to_string());
+            let checked = check_and_verify_project(&mut units, opts);
+            assert!(checked.fatal.is_empty());
+            let client_errs: Vec<&Diagnostic> = checked
+                .diags
+                .iter()
+                .filter(|(ui, _)| *ui == 1)
+                .map(|(_, d)| d)
+                .filter(|d| d.level == "error")
+                .collect();
+            assert!(
+                client_errs.is_empty(),
+                "with exact contract, external client must succeed, got {client_errs:?}"
+            );
+            let client_mod = &units[1].ast.modules[0];
+            with_prelude_injection(true, || {
+                with_link_table(checked.link.clone(), || emit_boogie(client_mod, DEFAULT_FUEL))
+            })
+        };
+
+        // Part D: Change MATH_DEP's body inside its contract (e.g., from `x + x` to `x * 2`):
+        let math_dep_v3 = r#"
+functions MATH_DEP
+
+feature {ANY}
+
+  calc(x: INT): INT
+    require
+      fits: x >= 0 and x <= 1000
+    do
+      x * 2
+    ensure
+      pos: Result >= x
+      exact_double: Result = x * 2
+    end
+
+end
+"#;
+
+        let bpl_client_v3 = {
+            let mut units = b4_units(&[("math_dep.gdl", math_dep_v3), ("client.gdl", client_src)]);
+            let mut opts = b4_opts(true, true);
+            opts.external_modules.insert("MATH_DEP".to_string());
+            let checked = check_and_verify_project(&mut units, opts);
+            assert!(checked.fatal.is_empty());
+            let client_errs: Vec<&Diagnostic> = checked
+                .diags
+                .iter()
+                .filter(|(ui, _)| *ui == 1)
+                .map(|(_, d)| d)
+                .filter(|d| d.level == "error")
+                .collect();
+            assert!(
+                client_errs.is_empty(),
+                "body change inside contract leaves client proof passing, got {client_errs:?}"
+            );
+            let client_mod = &units[1].ast.modules[0];
+            with_prelude_injection(true, || {
+                with_link_table(checked.link.clone(), || emit_boogie(client_mod, DEFAULT_FUEL))
+            })
+        };
+
+        // Emitted Boogie for CLIENT across the package boundary is identical:
+        // the body implementation change never leaks into the client theory!
+        assert_eq!(
+            bpl_client_v2, bpl_client_v3,
+            "emitted Boogie for client must be identical when dependency body changes inside contract"
+        );
+
+        // Part E: Inspect formatting (.gds content)
+        let inspect_src = r#"
+module HIDDEN_BOX
+
+representation {NONE}
+  val: INT
+
+create {ANY}
+
+  make(v: INT): HIDDEN_BOX
+    require
+      pos: v > 0
+    do
+      { val = v }
+    ensure
+      model_matches: Result.model = v
+    end
+
+feature {ANY}
+
+  read_val: INT
+    do
+      Current.val
+    ensure
+      same_model: Result = Current.model
+    end
+
+specify {ANY}
+
+  model: INT
+    do
+      Current.val
+    end
+
+  law model_positive(b: HIDDEN_BOX)
+    ensure
+      pos: b.model > 0
+    end
+
+invariant
+  box_pos: val > 0
+
+end
+"#;
+
+        let m = parse_user_module_with_prelude(inspect_src);
+        let iface = format_module_interface(&m);
+        assert!(iface.contains("module HIDDEN_BOX\n"));
+        assert!(iface.contains("representation {NONE} -- opaque ADT layout\n"));
+        assert!(iface.contains("{ANY} make(v: INT): HIDDEN_BOX\n"));
+        assert!(iface.contains("require pos: (v > 0)\n"));
+        assert!(iface.contains("ensure  model_matches: (Result.model = v)\n"));
+        assert!(iface.contains("{ANY} read_val: INT\n"));
+        assert!(iface.contains("ensure  same_model: (Result = Current.model)\n"));
+        assert!(iface.contains("specify\n"));
+        assert!(iface.contains("{ANY} model: INT\n"));
+        assert!(iface.contains("{ANY} law model_positive(b: HIDDEN_BOX)\n"));
+        assert!(iface.contains("invariant\n"));
+        assert!(iface.contains("box_pos: (val > 0)\n"));
+        // Interface contains no do bodies!
+        assert!(!iface.contains("do\n"));
+        assert!(!iface.contains("{ val = v }"));
+        assert!(!iface.contains("Current.val"));
     }
 
     #[test]
@@ -23135,6 +23440,7 @@ end
             bounded_check: false,
             z3_seed: None,
             z3_rlimit: None,
+            external_modules: HashSet::new(),
         }
     }
 
@@ -23439,7 +23745,7 @@ end
     // Item 4: `IO.read_line : IO[RESULT[IO_ERROR, STRING]]` (spec §11 IO boundary).
     // ---------------------------------------------------------------------------------
 
-    const READ_LINE_PROBE: &str = "program IOPROBE\n\nfeature {ANY}\n\n  want_empty(s: STRING): NAT\n    require\n      empty: s.is_empty\n    do\n      0\n    end\n\n  within_cap(s: STRING): NAT\n    require\n      fits: s.byte_length <= s.capacity\n    do\n      0\n    end\n\n  same(a: STRING, b: STRING): NAT\n    require\n      equal_reads: a.equals(b)\n    do\n      0\n    end\n\n  main(args: SEQ[STRING]): IO[EXIT_CODE]\n    do\n      with IO\n        r <- IO.read_line\n        r2 <- IO.read_line\n        match r\n          case Ok(s) then\n            match r2\n              case Ok(s2) then\n                with IO\n                  IO.print_line(s)\n                  IO.exit(want_empty(s) + within_cap(s) + same(s, s2))\n                end\n              case Error(_) then\n                IO.exit(2)\n            end\n          case Error(_) then\n            IO.exit(1)\n        end\n      end\n    end\n\nend\n";
+    const READ_LINE_PROBE: &str = "program IOPROBE\n\nfeature {ANY}\n\n  want_empty(s: STRING): NAT\n    require\n      empty: s.is_empty\n    do\n      0\n    end\n\n  within_cap(s: STRING): NAT\n    require\n      fits: s.byte_length <= s.capacity\n    do\n      0\n    end\n\n  same(a: STRING, b: STRING): NAT\n    require\n      equal_reads: a.equals(b)\n    do\n      0\n    end\n\n  main(args: SEQ[STRING]): IO[EXIT_CODE]\n    do\n      with IO\n        r <- IO.read_line\n        r2 <- IO.read_line\n        match r\n          case Ok(s) then\n            match r2\n              case Ok(s2) then\n                with IO\n                  IO.print_line(s)\n                  if want_empty(s) = 0 and within_cap(s) = 0 and same(s, s2) = 0 then\n                    IO.exit(0)\n                  else\n                    IO.exit(0)\n                  end\n                end\n              case Error(_) then\n                IO.exit(2)\n            end\n          case Error(_) then\n            IO.exit(1)\n        end\n      end\n    end\n\nend\n";
 
     #[test]
     fn test_item4_read_line_is_a_fresh_validated_result() {

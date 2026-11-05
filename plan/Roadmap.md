@@ -715,11 +715,22 @@ flowchart TD
 - [x] Spec §4.2 and §13: documented the manifest model, naming rules, and CLI resolution. A manifest without dependencies changes nothing about what a source file means, and dependencies change it only through the names and aliases they add.
 - [x] Acceptance: `examples/echo_server/Gardel.toml` added and sources placed in `examples/echo_server/src/`; `gardelc --project examples/echo_server` and `gardelc examples/echo_server` give the exact same `.bpl` and `.c` files. Unit tests: `test_e1_manifest_parser_and_package_name_validation`, `test_e1_echo_server_with_manifest_gives_same_bpl_and_c`, `test_e1_cli_project_argument_handling`, plus strictness unit tests in `manifest.rs`.
 
-#### Task E.2: Contract-Only Interfaces [ ]
-- [ ] Define the `.gds` content from `--inspect`: signatures, `require`, `ensure`, public ghost signatures and laws. A ghost query over a hidden representation stays uninterpreted for a client.
-- [ ] Add a boundary to linking that withholds bodies, generalizing `prelude_contract_interface`.
-- [ ] **Measure first:** run `examples/` with bodies withheld, and record which proofs need new `ensure` clauses.
-- Acceptance: a client relying on a dependency's body fails with the missing fact named, and a body change inside the contract leaves the client's proof and result unchanged.
+#### Task E.2: Contract-Only Interfaces [✅ Completed]
+- [x] Define the `.gds` content from `--inspect`: signatures, `require`, `ensure`, public ghost signatures and laws. A ghost query over a hidden representation stays uninterpreted for a client. Visibility is canonical Eiffel style (`{ANY}`, `{NONE}`, `{M1, M2}`), and routine `do` bodies are withheld.
+- [x] Add a boundary to linking that withholds bodies, generalizing `prelude_contract_interface` across package boundaries (`LinkTable::with_external`, `LinkTable::is_external`, `emit_contract_interface`). Intra-project linking retains definitional axioms; cross-package linking withholds `do` bodies.
+- [x] **Measure first:** run `examples/` with bodies withheld, and record which proofs need new `ensure` clauses:
+  - Measured all 11 repository examples (`bounded_stack.gdl`, `greeter.gdl`, `peano_ord.gdl`, `seq_bench.gdl`, `seq_churn.gdl`, `seq_ops.gdl`, `tree.gdl`, `reactive_hello.gdl`, `reactive_clock`, `reactive_game`, `echo_server`).
+  - Added necessary contract postconditions / laws:
+    - `stdlib/core/step.gdl`: `is_stop` postcondition `ensure def: Result = (match Current case Stop(_, _) then True case _ then False end)`.
+    - `stdlib/core/event.gdl`: `is_shutdown` postcondition `ensure def: Result = (match Current case Shutdown then True case _ then False end)`.
+    - `stdlib/text/bytes.gdl`: `valid_utf8` postcondition `ensure empty_valid: (bs.length = 0) implies Result`, `to_list` postcondition `ensure len: Result.length = Current.length`, and `law utf8_step_1`.
+    - `stdlib/text/string.gdl`: `capacity` postcondition `ensure at_least_byte_length: Result >= Current.byte_length`.
+  - With these contract postconditions, all 11 examples verify with 0 errors and 0 warnings under `--strict`.
+- [x] Acceptance: verified by unit test `test_e2_contract_only_interfaces_body_change_and_missing_fact`:
+  - A client relying on an external dependency's body fails with the missing fact named (`exact`).
+  - Adding the contract postcondition to the dependency allows the client's proof to succeed.
+  - A body change inside the contract leaves the client's proof and result unchanged (and emits byte-identical Boogie background theories for the client).
+  - Ghost queries and hidden representation in `.gds` / `--inspect` are canonically formatted and withhold `do` bodies.
 
 #### Task E.3: Local Verification Cache [ ]
 - [ ] Cache key and contents as in decision 1. Any change to a key input re-verifies.
@@ -774,7 +785,7 @@ flowchart TD
 
 ## 6. Immediate Next Step
 
-**Phase E: Projects and Packages:** Tasks E.0 and E.1 are completed and all design questions are decided. The next step is Task E.2 (Contract-Only Interfaces), followed by Task E.3 (Local Verification Cache).
+**Phase E: Projects and Packages:** Tasks E.0, E.1, and E.2 are completed and all design questions are decided. The next step is Task E.3 (Local Verification Cache).
 
 With **Phase A: Language Specification Harmonization**, **Phase B: Compiler Engine & Prelude Tooling**, **Task C.1: Physical Decomposition of `stdlib/`**, **Task C.2: High-Performance Smart String (`stdlib/text/string.gdl`)**, and **Task C.3: Regression Verification & Performance Benchmarking** completely executed and verified with 0 errors and 0 warnings under `--strict`, Phase C's planned work is done. The verification baseline is clean, and every module compiles from source to C with reference-counted memory (C.3 follow-ups).
 
