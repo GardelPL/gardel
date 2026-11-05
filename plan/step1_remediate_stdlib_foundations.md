@@ -8,7 +8,7 @@
 - `../stdlib/stdlib.gdl`
 - `../gardelc/stdlib/stdlib.gdl`
 - `../gardelc/src/main.rs` (`phase4_stdlib_source()` and associated stdlib verification tests)
-- `../spec/gardel_language_specification_draft_v0_4.md` (§3, §10.5, §16)
+- `../spec/gardel_language_specification_draft_v0_5.md` (§3, §10.5, §16)
 
 ---
 

@@ -11,7 +11,7 @@
 **Target Files:**
 - `../stdlib/stdlib.gdl`
 - `../gardelc/src/main.rs` (`phase4_stdlib_source()`, Boogie/Dafny/C11 emitters, and stdlib verification unit tests)
-- `../spec/gardel_language_specification_draft_v0_4.md` (§8, §10.5, §16)
+- `../spec/gardel_language_specification_draft_v0_5.md` (§8, §10.5, §16)
 
 ---
 

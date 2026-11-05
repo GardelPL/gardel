@@ -111,7 +111,7 @@ end
 ```text
 ├── README.md              # Project overview and introduction
 ├── spec/                  # Gardel language specifications
-│   └── gardel_language_specification_draft_v0_4.md
+│   └── gardel_language_specification_draft_v0_5.md
 ├── scripts/               # Setup and verification tool installers
 │   ├── install_tools.ps1  # Windows PowerShell installer (Dafny, Z3, Boogie)
 │   └── install_tools.sh   # Linux/macOS Bash installer

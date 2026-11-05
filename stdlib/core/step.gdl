@@ -1,0 +1,17 @@
+module STEP[S]
+
+representation {ANY}
+  | Continue(next: S, cmds: LIST[COMMAND])
+  | Stop(code: EXIT_CODE, cmds: LIST[COMMAND])
+
+feature {ANY}
+
+  is_stop: BOOL
+    do
+      match Current
+        case Stop(_, _) then True
+        case _ then False
+      end
+    end
+
+end

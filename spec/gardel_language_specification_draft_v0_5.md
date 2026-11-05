@@ -1,6 +1,6 @@
-# Gardel Language Specification (Draft v0.4)
+# Gardel Language Specification (Draft v0.5)
 
-Oct 27, 2026 · @Javier
+Nov 4, 2026 · @Javier
 
 ## 1. Overview and changes since v0.2 / v0.3
 
@@ -21,6 +21,18 @@ Gardel is a pure, total, deterministic, statically verified language designed fo
 | Equality & Algebraic Laws | Inconsistent Leibniz `=` on non-canonical types; missing law catalogue | Strict equality hierarchy (`=`, `.equals()`, `.model = .model`) and normative Bird & Wadler algebraic law catalogue with AI diagnostic surfacing (§9, §12) |
 | AI Diagnostics | Solver failures only described human-oriented error text | Specified `gardelc --json-diagnostics` with structured counterexamples, contract tags, and cross-module law recommendations for automated LLM repair loops (§12, §13) |
 
+### Changes in v0.5
+
+| Area | Change |
+| --- | --- |
+| Non-termination | New unit kind `reactive program`. Every routine stays total. A program runs without end only through the runtime's event loop (§2, §4, §11.6). |
+| Prelude | `STEP`, `COMMAND`, `EVENT` and `CONN_ID` join the prelude inventory (§4.1, §11.6). A user constructor wins over a prelude constructor of the same name (§4.1). |
+| `match` | A catch-all arm must be the last arm (`E0316`, §5.1). |
+| Solver limit | Verification is bounded by solver work, not by time, so a verdict does not depend on machine load. A solver that gives up is reported as unproven, never as verified or refuted (§7.3, §12). |
+| `EXIT_CODE` | Defined in §3. |
+
+**Implementation status:** the `match` rule and the solver limit are implemented. Reactive programs are specified here and are being built in Phase D (§16.5).
+
 ---
 
 ## 2. Core design principles
@@ -28,7 +40,7 @@ Gardel is a pure, total, deterministic, statically verified language designed fo
 Gardel trades mutation, inheritance, and ad-hoc loops for mathematical proofs, strict determinism, and implicit parallelism:
 
 1. **One module, one ADT.** A `module` defines one data type, its operations, and its invariant. `functions` and `program` modules hold free functions and entry points.
-2. **Pure, total, deterministic.** Every routine terminates and nothing mutates. Evaluation order never changes a result for exact discrete types (`U64`, `I64`, `MATH_INT`, `BOOL`, `CHAR`, and algebraic data types, satisfying strict Church-Rosser bit-for-bit confluence). `F64` operations follow strict IEEE-754 expression-tree semantics without compiler re-association. Command-query separation becomes queries versus transformers that return a new value. `old` and `modifies` are unnecessary.
+2. **Pure, total, deterministic.** Every routine terminates and nothing mutates. A whole program can run without end only as a `reactive program`, through the runtime's event loop (§11.6); its routines are total too. Evaluation order never changes a result for exact discrete types (`U64`, `I64`, `MATH_INT`, `BOOL`, `CHAR`, and algebraic data types, satisfying strict Church-Rosser bit-for-bit confluence). `F64` operations follow strict IEEE-754 expression-tree semantics without compiler re-association. Command-query separation becomes queries versus transformers that return a new value. `old` and `modifies` are unnecessary.
 3. **Contracts are proofs, not checks.** `require`, `ensure`, `invariant`, `variant`, and `check` are discharged by the verifier and erased. Nothing is evaluated at runtime.
 4. **Invariants are types.** A module's invariant is part of what its type means, so it holds for every value wherever that value travels.
 5. **Selective export is a verification firewall.** Visibility lists control both name access and which facts the solver sees.
@@ -99,6 +111,8 @@ Runtime numbers are standard 64-bit machine values, and every checked arithmetic
 | `BOOL` | `uint8_t` | boolean truth values (`True`, `False`) |
 | `CHAR` | `uint32_t` | Unicode scalar value in $[0, 0\text{xD7FF}] \cup [0\text{xE000}, 0\text{x10FFFF}]$ |
 | `MATH_INT` | none (ghost) | unbounded integer; legal only in `specify` and contracts |
+
+`EXIT_CODE` is an alias of `U64`: the process exit status returned by `main` and carried by `Stop` (§11.6).
 
 Rules:
 
@@ -218,7 +232,7 @@ String literals (`"..."`) in Gardel source code are syntactic sugar for verified
 
 ## 4. Module architecture and compilation units
 
-A `module` is one abstract data type organized into four visibility-controlled sections. Two further kinds cover what a pure ADT cannot: a `functions` module holds free functions and a `program` holds the entry point.
+A `module` is one abstract data type organized into four visibility-controlled sections. Three further kinds cover what a pure ADT cannot: a `functions` module holds free functions, a `program` holds the entry point of a run that terminates, and a `reactive program` holds the entry points of a run that continues until it stops (§11.6).
 
 Inside a module, `Current` is the immutable receiver, `Result` is the return value in `ensure` clauses, and field projection and zero-argument queries share the same dot syntax (uniform access).
 
@@ -239,7 +253,7 @@ Sections may appear in any order, and `feature` and `specify` may repeat with di
 4. **Runtime-checkable preconditions.** A precondition of an exported routine should be written with exported runtime queries so callers can branch on it. Otherwise the compiler warns `ghost_precondition` (§7).
 5. **Invariant visibility.** Every symbol referenced in a module's `invariant` must be exported to at least the visibility list of its `representation` section, ensuring friend modules that construct values directly can see and prove the invariant (§6).
 
-A `functions` module has `feature` and `specify` sections only. A `program` has a `main` routine and is the only module that may use `IO` (§11).
+A `functions` module has `feature` and `specify` sections only. A `program` has a `main` routine and is the only module that may use `IO` (§11). A `reactive program` has `feature` sections only, with the routines `init` and `step` and no `main`, and uses commands instead of `IO` (§11.6).
 
 ### 4.1 The Standard Prelude
 
@@ -267,6 +281,7 @@ The Standard Prelude provides an irreducible core of verified concepts, algebrai
   - `module BYTES`: The standard opaque boundary byte buffer ADT (`representation {NONE}`) with ghost model `specify model: LIST[U64]` (§3.1, §11).
   - `module STRING_ERROR` & `module IO_ERROR`: Standard boundary error sum types for text decoding (`STRING.from_utf8`) and external I/O operations (§11).
   - `module BIGNAT`: Arbitrary-precision natural numbers represented as little-endian limbs in `LIST[U64]` with ghost model `specify model: MATH_INT` (§3, §6.4.B).
+  - `module STEP[S]`, `module COMMAND`, `module EVENT`: The result of a reactive step, the effects a step requests, and the outside events it receives (§11.6). `module CONN_ID`: An opaque connection handle (§11.6). Their variants are added with the runtime that can deliver them (§16.5).
 
 - **Mathematical Ghost Types & Specification Modules (§2, §6, §8):**
   - `LIST[A]`: The canonical inductive sequence ADT (`Nil | Cons(head: A, tail: LIST[A])`). `LIST` has **dual status**: it is the canonical ghost model of Dual-Layer Model Refinement (§2) *and* an ordinary sequential runtime structure that may appear in `representation` sections (e.g., `BOUNDED_STACK.items`, `BIGNAT.limbs`, `STRING.bytes`) and in runtime `do` bodies. Only its use as a model (inside `specify` queries and contracts) is erased.
@@ -276,6 +291,7 @@ The Standard Prelude provides an irreducible core of verified concepts, algebrai
 
 #### 3. Namespace Collision, Shadowing & Bootstrap Rules
 - **No Prelude Shadowing:** Prelude types and concepts reside in the root namespace. In standard compilation mode, user modules, functions, or concepts CANNOT redeclare or shadow any prelude identifier. Attempting to declare a top-level `module OPTION` or `concept EQ` is rejected by the compiler with fatal error `E0101: duplicate_prelude_symbol`.
+- **Constructors may be reused:** A user module may declare a constructor named like a prelude constructor (`Stop`, `Print`). In a module that sees both, the user's constructor wins, so a new prelude variant never changes what existing user code means. There is no qualified constructor syntax, so such a module cannot build the prelude's constructor: rename the user's.
 - **Standard Library Bootstrap (`--no-prelude`):** When compiling or verifying the Standard Prelude source files themselves, the compiler operates in `--no-prelude` bootstrap mode, suppressing automatic prelude injection so prelude modules can be defined and verified from source without self-collision. The prelude sources are the one-module-per-file tree `stdlib/` (`concepts/`, `core/`, `collections/`, `numeric/`, `text/`, `functional/`), embedded into `gardelc` at build time. A file is recognized as a prelude source by its location in that tree, not by its text. Because the prelude modules depend on each other, `gardelc --stdlib`, `gardelc stdlib/` and `gardelc stdlib/<dir>/<file>.gdl` all verify the whole tree as one linked project (§4.2); prelude files cannot be compiled together with user files. A copy of a prelude file elsewhere is an ordinary user file and collides with the prelude (`E0101`).
 - **Lexical Scoping of Type Parameters:** Type parameters (such as `[A]`, `[E]`, `[T]`) are lexically scoped to their declaring module or routine. A generic parameter `[A]` in `module STACK[A]` shadows any ambient type `A` strictly within the syntactic bounds of that module.
 
@@ -378,6 +394,8 @@ A `representation` block declares either a product (named fields) or a sum (vari
    The body of any `do`, `then`, `else`, or `case` branch is a `Block` consisting of zero or more statements (`let name = expr`, `check`, `assume`, `reveal`) followed by a final result expression. `let` bindings are immutable and enter the proof context (`name = expr`) for all subsequent statements and the final expression.
 5. **Refinement-Aware Matching & Dead Branch Elimination:**
    Exhaustiveness is checked against the active proof context. A branch that the context rules out (for example, `case None` under `require Current.is_some`, or `case Error` under `require Current.is_ok`) MAY be safely omitted. A reachable branch that is missing is rejected by the compiler. Omitted dead branches generate no runtime code and require no fallback handling, because the verifier has proven they cannot be executed.
+
+   Arms are tried in order. A catch-all arm (`case _`, or a bare binder `case x`) matches every value and must be the last arm: an arm after it can never run and is rejected with `E0316: unreachable_match_arm`. This holds in routines, contracts, invariants and laws.
 6. **Mutual Recursion Barriers:**
    Types whose representations or invariants refer to each other cyclically are declared within a `group { A, B }` block (§4.3), enabling simultaneous structural induction. Independent sum types reside in standard compilation units.
 
@@ -1437,7 +1455,7 @@ Monadic composition in Gardel is fully transparent to the SMT solver:
 ### 7.3 Solver Guidance, Fuel & Proof Failure Handling
 
 When Boogie/Z3 returns `unknown` or fails to prove an obligation:
-1. **Compilation Fails:** The build terminates immediately; unverified code cannot be transpiled or executed.
+1. **Compilation Fails:** The build terminates immediately; unverified code cannot be transpiled or executed. A module passes only when Boogie reports a clean result. A crash, a missing summary or an unknown outcome is an error, never a pass.
 2. **Diagnostic Feedback:** `gardelc --json-diagnostics` emits counterexamples, the violated contract clause tag, and relevant concept laws (§12).
 3. **Programmer Guidance:**
    - Add intermediate assertion steps: `check tag: predicate end`.
@@ -1445,6 +1463,7 @@ When Boogie/Z3 returns `unknown` or fails to prove an obligation:
    - Adjust function unfolding with `reveal f` or increase routine `fuel`.
    - Formulate ghost lemmas in `specify` blocks proving inductive sub-goals.
    - In rare exploratory phases, mark an unproven assumption with `assume tag: predicate end`. `gardelc --audit` lists all ambient assumptions, and production compilation (`--strict`) strictly rejects any remaining `assume` blocks.
+4. **Solver Limit.** Each Boogie procedure has a budget of Z3 resources (`--z3-rlimit <N>` overrides the default). The budget counts solver work, not time, so a verdict does not depend on machine load. An obligation that exhausts it is *unproven*, not refuted: it is reported as `Phase 3 Boogie (Verification Resource Limit)`, without a counterexample. Prefer a lemma to a higher limit. `--z3-seed <N>` (or `GARDEL_Z3_SEED`) fixes Z3's random seed for proof stability checks; an invalid value in either option is an error.
 
 ---
 
@@ -2033,7 +2052,7 @@ Gardel removes the special-purpose `fold` and `unfold` syntax of v0.2. Instead, 
 
 Gardel keeps a pure core and moves all input and output to the program boundary through a linear action type `IO[A]`.
 
-1. **Where IO lives.** Only a `program` module and routines typed `IO[A]` may perform effects. Core modules stay pure and verified.
+1. **Where IO lives.** Only a `program` module and routines typed `IO[A]` may perform effects. Core modules stay pure and verified. A `reactive program` uses no `IO`: it requests effects as commands (§11.6).
 2. **Linear actions and affine consumption.** An `IO[A]` value represents an unexecuted linear action token that must be consumed exactly once along every execution path in a `with IO` sequence. An `IO[...]` value cannot be duplicated, dropped silently in a branch, or captured by a multi-use closure (`fn`). Every branch of a conditional (`if` or `match`) within an IO routine must uniformly consume or return an `IO` action.
 3. **Typing rules for `with IO`.** Sequences within a `with IO` block obey explicit monadic sequencing rules:
    - Binding statement `x <- e`: requires $e : \text{IO}[A]$, and binds $x : A$ in all subsequent statements of the block.
@@ -2114,6 +2133,82 @@ feature {ANY}
 end
 ```
 
+### 11.6 Reactive programs
+
+A `reactive program` is correct when it runs until told to stop, as a server, a terminal interface or a game does. It keeps principle 2 (§2): every routine is total, and non-termination lives in one visible place, the runtime's event loop, which is host code and not Gardel code. The design rationale is in `plan/reactive/reactive_programs.md`. Implementation status: §16.5.
+
+```eiffel
+reactive program NAME
+
+feature {ANY}
+
+  init(args: SEQ[STRING]): STEP[S]
+    do
+      ...
+    end
+
+  step(s: S, e: EVENT): STEP[S]
+    do
+      ...
+    ensure
+      ...
+    end
+
+end
+```
+
+The runtime calls `init`, performs the commands it returns, waits for an event, calls `step`, and repeats until a step returns `Stop`. `S` is the state type. It is normally an opaque `module` in its own file (`representation {NONE}`) whose `invariant` states the safety properties and whose routines carry the guards in `require`.
+
+```eiffel
+module STEP[S]
+representation {ANY}
+  | Continue(next: S, cmds: LIST[COMMAND])
+  | Stop(code: EXIT_CODE, cmds: LIST[COMMAND])
+end
+```
+
+`STEP.is_stop` and `EVENT.is_shutdown` are prelude queries. The complete variant sets are below. `CONN_ID` is opaque (`representation {NONE}`, `satisfies CANONICAL_EQ, ORD`): a program can compare and store a handle but never forge one.
+
+```eiffel
+module COMMAND
+representation {ANY}
+  | Print(text: STRING)
+  | SetTimer(id: NAT, millis: U64)    -- answered by Tick(id)
+  | ReadLine                          -- answered by Line
+  | Listen(port: NAT)                 -- answered by Accepted / ListenFailed
+  | Send(conn: CONN_ID, data: BYTES)  -- a failure is answered by SendFailed
+  | Close(conn: CONN_ID)
+end
+
+module EVENT
+representation {ANY}
+  | Tick(id: NAT)
+  | Key(code: NAT)
+  | Line(res: RESULT[IO_ERROR, STRING])
+  | Accepted(conn: CONN_ID)
+  | ListenFailed(port: NAT, err: IO_ERROR)
+  | Received(conn: CONN_ID, data: BYTES)
+  | SendFailed(conn: CONN_ID, err: IO_ERROR)
+  | Closed(conn: CONN_ID)
+  | Shutdown
+end
+```
+
+Rules:
+
+1. **Form.** A `reactive program` has exactly the entry points `init` and `step` and no `main`; `step` and `init` must agree on `S`. It may have helper routines. It has no `specify` section: lemmas go in the state module or a `functions` module.
+2. **Totality.** `init` and `step` are ordinary total routines, with the termination obligation of §12. They are pure: they have no `IO` types and no `with IO`, so `IO.exit` cannot appear and `Stop` is the only way out.
+3. **Invariants.** Because `S` is a module type, its invariant holds for every value of `S` (§6). The obligations of the state module's routines therefore give "the invariant holds after `init` and after every step", for an unbounded run, with no new kind of verification condition.
+4. **Shutdown must stop.** `step` has the implicit postcondition `e.is_shutdown implies Result.is_stop`, tagged `shutdown_must_stop`. Constructor queries are used because `EVENT` is not `CANONICAL_EQ` (§9).
+5. **Commands never block.** Commands in one `cmds` list run in order. A command that can fail reports the failure as a later event, never as a crash (§7.2). The commands of a `Stop` run before the process exits. If `init` returns `Stop`, `step` is never called.
+6. **Events are untrusted.** The verifier assumes nothing about a payload beyond its type. Payloads become invariant-carrying values only through `RESULT`-returning boundary routines (§7.2, §11.4).
+7. **Handles.** Each `CONN_ID` comes from exactly one `Accepted` event. After `Close(c)` runs, at most one more event mentions `c`, and it is `Closed(c)`.
+8. **Closed types.** `COMMAND` and `EVENT` are closed, and adding a variant is a prelude change. A program should end a `match` on `EVENT` with `case _` (§5.1).
+
+Guaranteed, given the proof obligations hold: no crash, out-of-bounds access or overflow in any step; the state invariant after every step; finite handling of each event by Gardel code; every run that receives `Shutdown` ends with the code chosen by `step`; and determinism: the states and commands are a function of `args` and the observed event sequence.
+
+Not guaranteed, because the verifier does not model the outside world (§11, item 5): that events arrive, that commands succeed or how long they take, the arrival order of concurrent events, liveness, or delivery of `Shutdown` on `SIGKILL` or power loss. `Shutdown` is delivered for SIGINT, SIGTERM and the Windows console control events.
+
 ---
 
 ## 12. Verification semantics and AI diagnostics
@@ -2136,9 +2231,14 @@ Both `create` and `feature` routines returning an instance of `Current` (or any 
 | Overflow & Shift | each checked `+`, `-`, `*`, `/`, `%`, `<<`, `>>` | mathematical result in `U64`/`I64` range; divisor $\neq 0$; shift $< 64$ |
 | Termination | each recursive routine and law proof | `variant` strictly decreases in a well-founded order |
 | Exhaustiveness | each `match` | every omitted case is unreachable in the branch proof context |
+| Reactive shutdown | `step` of each `reactive program` | `e.is_shutdown implies Result.is_stop` (tag `shutdown_must_stop`, §11.6) |
 | Law | each `satisfies` | every law of the concept holds |
 | `check` | each `check` block | the predicate holds, then joins the active proof context |
 | `assume` | each `assume` block | none; joins the proof context and is listed by `gardelc --audit` |
+
+Static rules introduced in v0.5: `E0316: unreachable_match_arm` (§5.1), and the family `"Phase 4 (Reactive Violation)"` with the tags `missing_init`, `missing_step`, `main_in_reactive`, `state_type_mismatch`, `io_in_reactive` and `shutdown_must_stop` (§11.6).
+
+A solver result that is neither proof nor refutation is an error with its own rule, and its message says that the obligation is unproven: `"Phase 3 Boogie (Verification Resource Limit)"` for an obligation that exhausted the solver limit (§7.3), `"Phase 3 Boogie (Verification Timeout)"` for a procedure that did not finish, and `"Phase 3 Boogie (Verification Incomplete)"` when Boogie gives no clean result. A refutation always carries a counterexample.
 
 ### Structured Diagnostics for AI Agents (`--json-diagnostics`)
 
@@ -2447,6 +2547,7 @@ The compiler `gardelc` verifies first and erases second, so everything that reac
 | Concept use | Monomorphized; zero runtime dictionary overhead |
 | Contracts and ghost code | Erased completely |
 | `IO[A]` | Host C / Bend v2 IO primitives at `program` boundary |
+| `reactive program` | Host C event loop around `init` and `step` (§11.6) |
 
 ---
 
@@ -2537,7 +2638,8 @@ Block syntax is locked to `end`-delimited blocks to maximize structural accuracy
 CompilationUnit ::= GroupDecl? ModuleUnit+
 
 GroupDecl       ::= "group" "{" UpperIdent ( "," UpperIdent )+ "}"
-ModuleUnit      ::= ModuleDecl | FunctionsDecl | ProgramDecl | ConceptDecl
+ModuleUnit      ::= ModuleDecl | FunctionsDecl | ProgramDecl
+                  | ReactiveProgramDecl | ConceptDecl
 
 ModuleDecl    ::= "module" UpperIdent TypeParams? Satisfies?
                     ( RepresentationSection | CreateSection
@@ -2546,6 +2648,7 @@ ModuleDecl    ::= "module" UpperIdent TypeParams? Satisfies?
                   "end"
 FunctionsDecl ::= "functions" UpperIdent ( FeatureSection | SpecifySection )* "end"
 ProgramDecl   ::= "program" UpperIdent FeatureSection* "end"
+ReactiveProgramDecl ::= "reactive" "program" UpperIdent FeatureSection* "end"
 ConceptDecl   ::= "concept" UpperIdent TypeParams? Refines?
                     ( Signature | RoutineDecl | LawDecl )*
                   "end"
@@ -2609,7 +2712,7 @@ Expr          ::= Literal | LowerIdent | UpperIdent Args? | Expr "." LowerIdent 
                 | MatchExpr | LambdaExpr | WithIoExpr
                 | RecordLit | RecordUpdate | QuantExpr
 Args          ::= "(" ( Expr ( "," Expr )* )? ")"
-MatchExpr     ::= "match" Expr ( "case" Pattern "then" Block )+ "end"
+MatchExpr     ::= "match" Expr ( "case" Pattern "then" Block )+ "end"   (* a catch-all arm must be last, §5.1 *)
 Pattern       ::= "_" | LowerIdent | Literal
                 | UpperIdent ( "(" Pattern ( "," Pattern )* ")" )?
                 | "(" Pattern ( "," Pattern )* ")"
@@ -2681,7 +2784,10 @@ The table below records the architectural decisions locked in v0.4 alongside the
 | Recursion primitives | Standard `match` + `variant` + parallel `let` | **Locked in v0.4** (`fold`/`unfold`/`fork`/`Subject` removed; clean induction) |
 | Closure semantics | Unrestricted via compile-time closure conversion | **Locked in v0.4** (lambda lifting to first-order ADTs replaces affine restriction) |
 | Verifier backend | Boogie and Z3 (with native SMT diagnostic indexing) | **Locked in v0.4** (Direct Boogie/Z3 pipeline replaces Phase 0 Dafny prototype; verified under `gardelc --strict`. The Dafny emitter was removed in Roadmap Task B.12: Boogie is the only verifier) |
-| Memory management in C | Perceus reference counting with in-place reuse vs. BendRT arena | Active (to benchmark in Phase C runtime integration) |
+| Memory management in C | Atomic reference counting of immutable, acyclic values | **Implemented** (Task C.3 follow-ups). Optimizations: Task C.4; an arena per reactive step is evaluated with Phase D |
+| Non-termination | `reactive program`: total `init` and `step`, runtime-owned event loop (§11.6) | **Specified in v0.5**; implementation in Phase D (§16.5) |
+| Catch-all `match` arms | Must be last (`E0316`, §5.1) | **Locked in v0.5** |
+| Verification budget | Z3 resource limit, with no pass unless Boogie reports a clean result (§7.3) | **Locked in v0.5** |
 | Gradual verification | None; `assume` audited by `--audit` / `--strict` | **Locked in v0.4** (failure-as-value `RESULT[E, A]` standardized with full combinators) |
 | Standard Prelude & Module System | Automatic prelude injection (`OPTION`, `RESULT`, `SEQ`, `STRING`, `BYTES`, `STRING_ERROR`, `IO_ERROR`, `BIGNAT`, `LIST`, `MATH_INT`, `EQ`, `CANONICAL_EQ`, `ORD`, `LIST_OPS`, `FUNCTION_OPS`) with `--no-prelude` bootstrap flag; `group` scoped strictly to mutual recursion | **Locked in v0.4** (Formalized in Spec §4, §15) |
 | Dual-Layer Model Refinement | Principle 9: Pairing high-performance parallel structures with canonical inductive ghost models | **Locked in v0.4** (Formalized in Spec §2, §6) |
@@ -2706,7 +2812,7 @@ The `gardelc` compiler pipeline (§13) and its `--json-diagnostics` `"rule"` tax
    - `concept` declarations, `refines` hierarchies, conditional module conformance (`satisfies ... where ...`), concept law proof obligations, SMT quantifier `trigger` attributes, and zero-overhead monomorphization (§9, §13). Static and verification diagnostics emit `"Phase 2 (...)"` rules (§12).
 4. **Phase 3: Direct Boogie Verifier & AI Diagnostic Tooling — [✅ Locked in v0.4]**
    - Direct Boogie (`.bpl`) verification condition generation, Z3 discharge, fuel-bounded recursive unfolding, `reveal` directives for opaque `specify` queries (§7.5), counterexample translation, and deterministic `--json-diagnostics` with `relevant_lemmas` law indexing (§12). Verification diagnostics emit `"Phase 3 (...)"` and `"Phase 3 Boogie (...)"` rules.
-5. **Phase 4: Standard Library & Linear IO Architecture — [🔄 Steps 1–4 Completed; Consolidated Evolution Plan Phases A–C Active]**
+5. **Phase 4: Standard Library & Linear IO Architecture — [🔄 Steps 1–4 and Evolution Plan Phases A–C Completed (Task C.4 planned); Phase D Active]**
    - Standard Prelude package (`phase4_stdlib_source()`), linear `IO[A]` boundary and branch enforcement emitting `"Phase 4 (IO Boundary Violation)"` and `"Phase 4 (Linear IO Violation)"` diagnostics (§11), foundational library remediation (**Steps 1–4**, §16.3), and modular packaging & tooling (**Phases A–C**, §16.4).
 
 ---
@@ -2793,3 +2899,21 @@ Decomposing the monolithic standard library into physical 1:1 module files (sati
   - Follow-up 2: reference-counted memory (every heap value is freed when its last reference goes), closures, compiled literal/tuple/nested patterns (for the verifier and the C backend), validated command-line arguments (§11), and no hand-written C: every module compiles from source.
   - Not done: BendRT execution (`.bend` files are emitted but not run).
 - **Task C.4 (planned):** Memory management performance: skip freeing at program exit, faster allocator (size-classed free lists or mimalloc), optimized reference counting (ownership transfer, reuse, non-atomic counts for unshared values), and bump-pointer per-step arena for reactive programs.
+
+### 16.5 Phase D: Reactive Programs — [🔄 Active]
+
+Phase D builds the `reactive program` of §11.6. `plan/Roadmap.md` holds its tasks and acceptance criteria.
+
+| Task | Delivers | Status |
+| --- | --- | --- |
+| D.0 | `case _` in Boogie, nested type arguments, patterns in laws, `E0316` | ✅ Completed |
+| D.1 | Spec v0.5 and proposal revision 3 | ✅ Completed |
+| D.2 | Prelude `STEP`, `COMMAND` (`Print`), `EVENT` (`Shutdown`) | ✅ Completed |
+| D.3 | Parser and checker, including `shutdown_must_stop` | 📋 Planned |
+| D.4 | Host loop: the `Print` + `Shutdown` slice | 📋 Planned |
+| D.5 | `SetTimer`, `Tick` | 📋 Planned |
+| D.6 | `ReadLine`, `Line`, `Key` | 📋 Planned |
+| D.7 | `CONN_ID`, sockets, the echo server | 📋 Planned |
+| D.8 | Event log and replay | 📋 Planned |
+
+Partial functions (a routine with no `variant`) are a separate proposal and are not part of Phase D.

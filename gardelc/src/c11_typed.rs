@@ -1878,7 +1878,9 @@ static bool {inst}__has(struct {inst}* xs, {ce} x) {{\n\
                             .self_ty
                             .clone()
                             .and_then(|st| self.variant_fields(&st, None))
-                            .is_some_and(|fs| fs.iter().any(|(f, _)| f == v)));
+                            .is_some_and(|fs| fs.iter().any(|(f, _)| f == v)))
+                        // A nullary constructor as a receiver: `Shutdown.is_shutdown`.
+                        || (self.module(v).is_none() && self.ctor_owner(v, None, cx).is_some());
                     if !is_value {
                         cx.tail_site = tail;
                         return self.lower_static(cx, v, m, args, expect, hc);

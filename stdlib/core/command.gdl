@@ -1,0 +1,6 @@
+module COMMAND
+
+representation {ANY}
+  | Print(text: STRING)
+
+end

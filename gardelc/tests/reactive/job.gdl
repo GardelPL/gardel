@@ -1,0 +1,19 @@
+module JOB
+
+representation {ANY}
+  | Stop(reason: NAT)
+  | Print(pages: NAT)
+  | Idle
+
+feature {ANY}
+
+  weight: NAT
+    do
+      match Current
+        case Stop(r) then r
+        case Print(p) then p
+        case Idle then 0
+      end
+    end
+
+end

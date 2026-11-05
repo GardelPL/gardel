@@ -1,0 +1,17 @@
+module EVENT
+
+representation {ANY}
+  | Shutdown
+
+feature {ANY}
+
+  -- `=` is not available on EVENT, which will hold STRING and BYTES payloads (spec §9, §11.6).
+  is_shutdown: BOOL
+    do
+      match Current
+        case Shutdown then True
+        case _ then False
+      end
+    end
+
+end

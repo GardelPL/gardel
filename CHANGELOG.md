@@ -13,7 +13,7 @@ The remediation and implementation proceeded across four distinct phases:
 ---
 
 ### Phase 1: Specification Soundness & Theoretical Semantics Patch
-*Target: `spec/gardel_language_specification_draft_v0_4.md`*
+*Target: `spec/gardel_language_specification_draft_v0_5.md`*
 
 - **Decoupled `EQ` from SMT Leibniz Identity (§9)**:
   - Replaced the contradictory law `agrees_with_structural` (`a.equals(b) = (a = b)`) in concept `EQ` with standard equivalence relation laws: `reflexive`, `symmetric`, and `transitive`.

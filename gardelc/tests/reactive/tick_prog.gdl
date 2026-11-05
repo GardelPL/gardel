@@ -1,0 +1,37 @@
+program TICK_PROG
+
+feature {ANY}
+
+  commands(cmds: LIST[COMMAND]): U64
+    do
+      cmds.length
+    end
+
+  stop_code(r: STEP[TICK_STATE]): U64
+    do
+      match r
+        case Stop(code, cmds) then code
+        case Continue(next, cmds) then 100
+      end
+    end
+
+  first_failure: U64
+    do
+      match TICK_LOGIC.init(2)
+        case Continue(s, cmds) then
+          if commands(cmds) != 1 then 1
+          else if not TICK_LOGIC.step(s, Shutdown).is_stop then 2
+          else if stop_code(TICK_LOGIC.step(s, Shutdown)) != 0 then 3
+          else if not Shutdown.is_shutdown then 4
+          else 0
+          end end end end
+        case Stop(code, cmds) then 5
+      end
+    end
+
+  main(args: SEQ[STRING]): IO[EXIT_CODE]
+    do
+      IO.exit(first_failure)
+    end
+
+end

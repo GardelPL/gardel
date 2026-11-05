@@ -3540,6 +3540,18 @@ pub const STDLIB_SOURCES: &[(&str, &str)] = &[
         "stdlib/functional/function_ops.gdl",
         include_str!("../../stdlib/functional/function_ops.gdl"),
     ),
+    (
+        "stdlib/core/command.gdl",
+        include_str!("../../stdlib/core/command.gdl"),
+    ),
+    (
+        "stdlib/core/event.gdl",
+        include_str!("../../stdlib/core/event.gdl"),
+    ),
+    (
+        "stdlib/core/step.gdl",
+        include_str!("../../stdlib/core/step.gdl"),
+    ),
 ];
 
 /// Returns the canonical Gardel v0.4 Phase 4 Standard Library source package (§3, §5, §10.5, §11, §16).
@@ -3570,6 +3582,12 @@ pub fn phase4_stdlib_source() -> &'static str {
         include_str!("../../stdlib/collections/list_ops.gdl"),
         "\n",
         include_str!("../../stdlib/functional/function_ops.gdl"),
+        "\n",
+        include_str!("../../stdlib/core/command.gdl"),
+        "\n",
+        include_str!("../../stdlib/core/event.gdl"),
+        "\n",
+        include_str!("../../stdlib/core/step.gdl"),
     )
 }
 
@@ -4575,7 +4593,7 @@ pub fn check_module_dependency_cycles(units: &[SourceUnit], table: &LinkTable) -
 /// `STRING` is injected for modules that mention it, contain string literals or use `IO`
 /// (Task B.3: literals denote prelude `STRING` values); `LIST_OPS` / `FUNCTION_OPS` are realized by the built-in
 /// `Seq_*` / `Fn1_*` preamble theories already present in every Boogie file.
-const BOOGIE_INJECTED_PRELUDE: [&str; 8] = [
+const BOOGIE_INJECTED_PRELUDE: [&str; 11] = [
     "OPTION",
     "RESULT",
     "SEQ",
@@ -4584,6 +4602,9 @@ const BOOGIE_INJECTED_PRELUDE: [&str; 8] = [
     "STRING_ERROR",
     "STRING",
     "IO_ERROR",
+    "COMMAND",
+    "EVENT",
+    "STEP",
 ];
 
 /// Marker on the opaque declaration of another prelude module's sort that a module's
@@ -4688,12 +4709,15 @@ impl BoogiePreludeCtx {
                 }
             }
         }
+        // A user constructor wins over a prelude one (spec §4.1): the prelude grows with
+        // new variants, and that must not change what existing user code means.
+        let mut user_ctors = HashSet::new();
         for n in &linked {
             if let ReprKind::Sum(vs) = &n.repr {
                 for v in vs {
-                    ctor_owner
-                        .entry(v.name.clone())
-                        .or_insert_with(|| n.name.clone());
+                    if user_ctors.insert(v.name.clone()) {
+                        ctor_owner.insert(v.name.clone(), n.name.clone());
+                    }
                 }
             }
         }
@@ -16429,7 +16453,7 @@ end
         let stdlib = parse_phase4_stdlib().expect("Phase 4 stdlib should parse");
         assert_eq!(stdlib.group, None);
         assert_eq!(stdlib.concepts.len(), 3);
-        assert_eq!(stdlib.modules.len(), 10);
+        assert_eq!(stdlib.modules.len(), 13);
         for m in &stdlib.modules {
             let mut diags = check_visibility_and_semantics(m);
             diags.extend(verify_module_phase3(
@@ -16919,7 +16943,7 @@ end
     #[test]
     fn test_plan3_multi_module_stdlib_pipeline() {
         let ast = parse_phase4_stdlib().expect("stdlib parses cleanly");
-        assert_eq!(ast.modules.len(), 10);
+        assert_eq!(ast.modules.len(), 13);
         let mut prog_env = ProgramEnv {
             modules: HashMap::new(),
             concepts: HashMap::new(),
@@ -18614,6 +18638,70 @@ end
         assert_ne!(partial, own);
         let diags = c3_verify(&partial, "wild_own_partial.gdl");
         assert!(!diags.is_empty(), "a non-exhaustive match must still be rejected");
+    }
+
+    /// Verifies a multi-file project (the program last) and returns its diagnostics and C.
+    fn d2_project(files: &[(&str, &str)]) -> (Vec<Diagnostic>, String) {
+        let mut units = b4_units(files);
+        let checked = check_and_verify_project(&mut units, b4_opts(true, true));
+        assert!(checked.fatal.is_empty(), "{:?}", checked.fatal);
+        let diags: Vec<Diagnostic> = checked.diags.into_iter().map(|(_, d)| d).collect();
+        let mods: Vec<ModuleDecl> = units.iter().map(|u| u.ast.modules[0].clone()).collect();
+        let (root, libs) = mods.split_last().expect("a program");
+        let libs: Vec<&ModuleDecl> = libs.iter().collect();
+        (diags, emit_c11_typed(root, &libs).0)
+    }
+
+    const D2_STATE: &str = include_str!("../tests/reactive/tick_state.gdl");
+    const D2_LOGIC: &str = include_str!("../tests/reactive/tick_logic.gdl");
+    const D2_PROG: &str = include_str!("../tests/reactive/tick_prog.gdl");
+
+    #[test]
+    fn test_d2_prelude_step_types_work_from_user_code() {
+        // A step function over the prelude STEP, COMMAND and EVENT with an opaque state.
+        let files = [("tick_state.gdl", D2_STATE), ("tick_logic.gdl", D2_LOGIC), ("tick_prog.gdl", D2_PROG)];
+        let (diags, c) = d2_project(&files);
+        assert!(diags.is_empty(), "{diags:?}");
+        assert!(!c.contains("#error"), "{}", c.lines().nth(1).unwrap_or(""));
+        if let Some(runs) = c3_native_runs(&c, "tickprog", &[b""]) {
+            assert_eq!(runs[0].0, 0, "tick_prog: first failing check");
+        }
+        if let Some((first, after)) = c3_live_after(&c, "tickleak", "TICK_PROG__first_failure()") {
+            assert_eq!((first, after), (0, 0), "states, commands and strings must be freed");
+        }
+        // The guarantees are not vacuous.
+        let no_guard = D2_LOGIC.replace("if s.has_room then Continue", "if True then Continue");
+        assert_ne!(no_guard, D2_LOGIC);
+        let (diags, _) = d2_project(&[("tick_state.gdl", D2_STATE), ("tick_logic.gdl", &no_guard), ("tick_prog.gdl", D2_PROG)]);
+        assert!(diags.iter().any(|d| d.tag == "room"), "{diags:?}");
+        let no_stop = D2_LOGIC.replace(r#"Stop(s.value, LIST.empty.prepend(Print("bye")))"#, "Continue(s, LIST.empty)");
+        assert_ne!(no_stop, D2_LOGIC);
+        let (diags, _) = d2_project(&[("tick_state.gdl", D2_STATE), ("tick_logic.gdl", &no_stop), ("tick_prog.gdl", D2_PROG)]);
+        assert!(diags.iter().any(|d| d.tag == "shutdown_must_stop"), "{diags:?}");
+    }
+
+    #[test]
+    fn test_d2_user_constructors_win_over_prelude_constructors() {
+        // JOB has its own `Stop` and `Print`. Adding them to the prelude must not change what
+        // a client of JOB means, even one that also uses the prelude STEP.
+        let job = include_str!("../tests/reactive/job.gdl");
+        let prog = include_str!("../tests/reactive/job_prog.gdl");
+        let (diags, c) = d2_project(&[("job.gdl", job), ("job_prog.gdl", prog)]);
+        assert!(diags.is_empty(), "{diags:?}");
+        if let Some(runs) = c3_native_runs(&c, "jobprog", &[b""]) {
+            assert_eq!(runs[0].0, 7, "JOB's own constructors must run");
+        }
+    }
+
+    #[test]
+    fn test_d2_prelude_step_names_are_reserved() {
+        for name in ["STEP", "COMMAND", "EVENT"] {
+            let src = format!("module {name}\n\nrepresentation {{ANY}}\n  | A\n\nend\n");
+            let m = parse_user_module_with_prelude(&src);
+            let ast = FileAst { group: None, concepts: Vec::new(), modules: vec![m] };
+            let diags = check_prelude_collisions(&ast, &src, "x.gdl");
+            assert!(diags.iter().any(|d| d.rule.starts_with("E0101")), "{name}: {diags:?}");
+        }
     }
 
     #[test]

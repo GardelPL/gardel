@@ -4,7 +4,7 @@
 **Target Documents:**
 - [core_library.md](core_library.md)
 - [functional_ideas.md](functional_ideas.md)
-- [gardel_language_specification_draft_v0_4.md](../spec/gardel_language_specification_draft_v0_4.md)
+- [gardel_language_specification_draft_v0_5.md](../spec/gardel_language_specification_draft_v0_5.md)
 - [stdlib.gdl](../stdlib/stdlib.gdl)
 
 ---
@@ -25,7 +25,7 @@
 
 ## 2. Alignment Audit with Specification v0.4
 
-Both planning documents align philosophically with [gardel_language_specification_draft_v0_4.md](../spec/gardel_language_specification_draft_v0_4.md), particularly in rejecting `fold`/`unfold` syntax in favor of standard library combinators and pure structural recursion. However, our audit uncovered **seven specific misalignments** across [stdlib.gdl](../stdlib/stdlib.gdl), the two plan documents, and the v0.4 specification.
+Both planning documents align philosophically with [gardel_language_specification_draft_v0_5.md](../spec/gardel_language_specification_draft_v0_5.md), particularly in rejecting `fold`/`unfold` syntax in favor of standard library combinators and pure structural recursion. However, our audit uncovered **seven specific misalignments** across [stdlib.gdl](../stdlib/stdlib.gdl), the two plan documents, and the v0.4 specification.
 
 ### 2.1 Critical Misalignments Between `stdlib.gdl` and Spec v0.4 (Remediated in Step 1)
 
@@ -129,7 +129,7 @@ To maximize velocity and keep every commit 100% verified by `gardelc` (Boogie + 
 4. **Verification & Testing:**
    - `gardelc stdlib/stdlib.gdl --strict`: **0 errors, 0 warnings** across all 5 modules (`SEQ`, `BIGNAT`, `STRING`, `OPTION`, `RESULT`).
    - `cargo test`: **28 passed; 0 failed**, including unit tests proving precondition violations on invalid `get`/`get_error` calls.
-   - Updated `spec/gardel_language_specification_draft_v0_4.md` §7.4 (`try_make_result`) and §16 roadmap table. Ready to proceed to Step 3.
+   - Updated `spec/gardel_language_specification_draft_v0_5.md` §7.4 (`try_make_result`) and §16 roadmap table. Ready to proceed to Step 3.
 
 ### Step 3: Build the Verified Functional Core on `LIST` and `SEQ` — ✅ COMPLETED (October 30, 2026) — [Dedicated Plan: step3_verified_functional_core.md](step3_verified_functional_core.md)
 1. **Added `functions LIST_OPS` to standard library ([`stdlib.gdl`](../stdlib/stdlib.gdl#L476-L633)):**
@@ -152,7 +152,7 @@ To maximize velocity and keep every commit 100% verified by `gardelc` (Boogie + 
 5. **Verification & Testing:**
    - `gardelc stdlib/stdlib.gdl --strict`: **0 errors, 0 warnings** across all 7 stdlib modules (`SEQ`, `BIGNAT`, `STRING`, `OPTION`, `RESULT`, `LIST_OPS`, `FUNCTION_OPS`).
    - `cargo test`: **31 passed; 0 failed** (100% pass rate).
-   - Updated `spec/gardel_language_specification_draft_v0_4.md` §8, §10.5, and §16 roadmap table. Ready to proceed to Step 4.
+   - Updated `spec/gardel_language_specification_draft_v0_5.md` §8, §10.5, and §16 roadmap table. Ready to proceed to Step 4.
 
 ### Step 4: Codify the Algebraic Law Catalogue & Concept Conformance — [Dedicated Plan: step4_algebraic_law_catalogue_and_concept_conformance.md](step4_algebraic_law_catalogue_and_concept_conformance.md)
 1. Move `concept EQ`, `concept CANONICAL_EQ`, and `concept ORD` into [stdlib.gdl](../stdlib/stdlib.gdl) (and update [peano_ord.gdl](../examples/peano_ord.gdl) to match v0.4 §9).

@@ -1,6 +1,12 @@
 # Proposal: Reactive Programs (explicit non-termination)
 
-Status: **design proposal, not implemented.** Syntax is illustrative and has not been run through `gardelc`. It is written against spec v0.4 and slots into §11 (Effects and IO) next to the existing `program` form. Section 12 lists the exact spec changes it needs.
+Status: **being implemented in Phase D** ([Roadmap](../Roadmap.md)). The normative text is spec v0.5 §11.6. This document keeps the rationale. Section 13 says what has been compiled and what depends on a later task.
+
+Revision 3 (2026-11-04) corrects revision 2 against `gardelc`:
+- The state is an **opaque** module, and `step` changes it through the module's routines (sections 3, 4, 7.1). Revision 2's echo example did not compile: `representation {ECHO_SERVER}` in the state's own file is a dependency cycle (`E0103`), and a client cannot build or read another file's record in Boogie.
+- `shutdown_must_stop` is stated with the constructor queries `EVENT.is_shutdown` and `STEP.is_stop`. `e = Shutdown` broke the §9 equality rules, and `Result is Stop` had no syntax (section 4).
+- `specify` is not permitted in a reactive program, as in a `program`. Lemmas go in the state module or a `functions` module (section 3).
+- Open questions are closed for the first version (section 11), and the implementation plan moved to the Roadmap (section 9).
 
 Revision 2 (2026-11-03) fixes the problems found in review against spec v0.4:
 - `step` is now **pure** and returns commands, and the runtime performs them. It no longer runs `IO` itself. This is what makes "each event is handled in finite time" and "deterministic given the event sequence" true (sections 2, 4, 5).
@@ -55,8 +61,8 @@ feature {ANY}
 end
 ```
 
-- `S` is any ordinary user type, normally a `module` in its own file whose `invariant` states the safety properties. It is inferred from the return type of `init`, and `step` must use the same `S`.
-- A `reactive program` has exactly `init` and `step` and no `main`. It may contain other routines (helpers, `specify` lemmas) like any `program`.
+- `S` is any ordinary user type, normally an opaque `module` (`representation {NONE}`) in its own file, whose `invariant` states the safety properties and whose routines carry the guards in `require`. It is inferred from the return type of `init`, and `step` must use the same `S`.
+- A `reactive program` has exactly `init` and `step` and no `main`. It may contain helper routines. It has no `specify` section, like a `program`: lemmas go in the state module or a `functions` module (section 7.3).
 - `init` is pure as well. It cannot touch the world directly, but it can return commands (for example `Listen(8080)`) and it can refuse to start with `Stop(code, ...)`, for example when `args` are invalid.
 
 New prelude types (one module per file under `stdlib/core/`, see section 12):
@@ -79,16 +85,16 @@ representation {ANY}
 end
 ```
 
-`EVENT` is defined in section 6. `CONN_ID` is an opaque prelude handle (`representation {NONE}`, `satisfies CANONICAL_EQ, ORD`), so programs can compare and store handles but never forge one.
+`EVENT` is defined in section 6. `CONN_ID` is an opaque prelude handle (`representation {NONE}`, `satisfies CANONICAL_EQ, ORD`), so programs can compare and store handles but never forge one. `satisfies` here is a real proof burden: Task D.7 must prove the `EQ`, `CANONICAL_EQ` and `ORD` laws for it. `STEP` also has the query `is_stop`, and `EVENT` the query `is_shutdown` (section 4).
 
 Commands in one `cmds` list run in list order. A command never blocks the loop. A command that can fail reports its failure as an event, never as a crash, in line with the Error Handling Doctrine (§7.2).
 
 ## 4. Typing and verification rules
 
 1. **Step totality.** `init` and `step` are ordinary total routines. Any recursion inside them needs a `variant`. The runtime loop is host code and is not subject to this check.
-2. **Invariant establishment and preservation come for free.** Because `S` is a module type, its invariant is part of the type (§6). Every `Continue(next, ...)` that `init` or `step` builds must hold a valid `S`, and every record literal or update that builds that `S` is a construction site with the usual obligation (§12). Inside `step`, the parameter `s: S` is assumed to satisfy the invariant. Together these give "the invariant holds after `init` and after every step" with no new kind of verification condition.
+2. **Invariants need no new kind of verification condition.** Because `S` is a module type, its invariant is part of the type (§6). With an opaque `S`, the only code that builds an `S` is the state module's own routines, which prove the invariant in their own obligations (§12), given their `require` clauses. `step` then has to prove those `require` clauses at each call. Together these give "the invariant holds after `init` and after every step" for an unbounded run.
 3. **Purity.** `init` and `step` must not have `IO[...]` types and must not contain `with IO`. A reactive program uses no `IO` at all, so the existing IO checks (`io_in_pure_module`, linearity) need no change for it. `IO.exit` therefore cannot appear, and the only way out is `Stop`.
-4. **Shutdown must stop.** The verifier adds the obligation `e = Shutdown implies Result is Stop` to `step` (diagnostic `"Phase 4 (Reactive Violation)"`, tag `shutdown_must_stop`). This guarantees a clean exit path that the runtime does not have to force.
+4. **Shutdown must stop.** The compiler adds the implicit postcondition `e.is_shutdown implies Result.is_stop` to `step` (tag `shutdown_must_stop`). `EVENT.is_shutdown` and `STEP.is_stop` are prelude queries: `=` is not available, because `EVENT` holds `STRING` and `BYTES` and is not `CANONICAL_EQ` (§9). This guarantees a clean exit path that the runtime does not have to force.
 5. **Bounded work per step.** Because `step` is pure and total and commands do not block, each event is handled in finite time. The program can only run forever by receiving infinitely many events.
 6. **Events are untrusted input.** Payloads arrive as `BYTES`, or as `RESULT[IO_ERROR, STRING]` for lines that were already decoded. They become verified ADTs only through `RESULT`-returning boundary routines (§7.2.2, §11.4). The verifier assumes nothing about event payloads beyond their types.
 7. **Entry-point firewall.** A `reactive program`, like a `program`, is a root and cannot be referenced from other modules. Its `step` can still be exercised from test programs if it is factored into a `functions` module (section 7.3).
@@ -139,17 +145,43 @@ Which variants a runtime can deliver depends on which command families it suppor
 
 ### 7.1 Echo server with a connection limit
 
-The state lives in its own file, `server_state.gdl`. Only the server may build it directly:
+The state lives in its own file, `server_state.gdl`. It is opaque, so only its own routines can build one, and `admit` states the guard the server must prove:
 
 ```eiffel
 module SERVER_STATE
 
-representation {ECHO_SERVER}
+representation {NONE}
   live: LIST[CONN_ID]
   limit: NAT
 
 invariant
   within_limit: live.length <= limit
+
+create {ANY}
+
+  make(cap: NAT): SERVER_STATE
+    do
+      { live = LIST.empty, limit = cap }
+    end
+
+feature {ANY}
+
+  has_room: BOOL
+    do
+      Current.live.length < Current.limit
+    end
+
+  admit(c: CONN_ID): SERVER_STATE
+    require
+      room: Current.has_room
+    do
+      { Current with live = Current.live.prepend(c) }
+    end
+
+  release(c: CONN_ID): SERVER_STATE
+    do
+      { Current with live = LIST_OPS.filter(Current.live, fn(x: CONN_ID): BOOL do x != c end) }
+    end
 
 end
 ```
@@ -161,24 +193,22 @@ feature {ANY}
 
   init(args: SEQ[STRING]): STEP[SERVER_STATE]
     do
-      Continue({ live = LIST.empty, limit = 64 },
-               LIST.empty.prepend(Listen(8080)))
+      Continue(SERVER_STATE.make(64), LIST.empty.prepend(Listen(8080)))
     end
 
   step(s: SERVER_STATE, e: EVENT): STEP[SERVER_STATE]
     do
       match e
         case Accepted(c) then
-          if s.live.length < s.limit then
-            Continue({ s with live = s.live.prepend(c) }, LIST.empty)
+          if s.has_room then
+            Continue(s.admit(c), LIST.empty)
           else
             Continue(s, LIST.empty.prepend(Close(c)))
           end
         case Received(c, data) then
           Continue(s, LIST.empty.prepend(Send(c, data)))
         case Closed(c) then
-          let rest = LIST_OPS.filter(s.live, fn(x: CONN_ID): BOOL do x != c end)
-          Continue({ s with live = rest }, LIST.empty)
+          Continue(s.release(c), LIST.empty)
         case ListenFailed(_, _) then
           Stop(1, LIST.empty.prepend(Print("cannot listen on port 8080")))
         case Shutdown then
@@ -192,10 +222,10 @@ end
 ```
 
 What the verifier checks:
-- `init`: the literal `{ live = LIST.empty, limit = 64 }` is a construction site, and `0 <= 64` holds.
-- `Accepted`: the path condition `s.live.length < s.limit` gives `s.live.length + 1 <= s.limit` at the update.
-- `Closed`: `LIST_OPS.filter` ensures `not_longer: Result.length <= xs.length`, and the invariant on `s` gives `rest.length <= s.limit`.
-- `Shutdown` returns `Stop`, which discharges rule 4.
+- `admit`: `room` gives `live.length + 1 <= limit` for the updated record, so the invariant holds. Removing `room` fails `within_limit`.
+- `release`: `LIST_OPS.filter` ensures `not_longer: Result.length <= xs.length`, and the invariant on `Current` gives the rest.
+- `step`, `Accepted`: the path condition `s.has_room` discharges `room`. Replacing the `if` condition with `True` fails `room`.
+- `step`, `Shutdown`: it returns `Stop`, which discharges `shutdown_must_stop`. Returning `Continue` there fails it.
 
 Two bugs from the first draft are now impossible. The old `Closed` branch computed `conns - 1` without knowing `conns > 0`, which is a `NAT` underflow. It also counted a `Closed` event for a connection that had been rejected over the limit, so the count could drift below the true number of live connections. Tracking the live set removes both, and connections that were rejected never enter `live`.
 
@@ -207,7 +237,7 @@ The state is the board, a module whose invariant states that the position is leg
 
 ### 7.3 Testing a step function
 
-Put the transition logic in a `functions` module (for example `functions ECHO_LOGIC` with `step_logic(s, e)`) and have the reactive `step` delegate to it. A terminating `program` can then feed it a fixed list of events and print the results, and `specify` lemmas can state multi-step properties as ordinary recursion over a `LIST[EVENT]` with `variant events.length`.
+Put the transition logic in a `functions` module (for example `functions ECHO_LOGIC` with `step_logic(s, e)`) and have the reactive `step` delegate to it. A terminating `program` can then feed it a fixed list of events and check the results, and `specify` lemmas in that `functions` module can state multi-step properties as ordinary recursion over a `LIST[EVENT]` with `variant events.length`.
 
 ## 8. Marking and tooling
 
@@ -217,16 +247,11 @@ Put the transition logic in a `functions` module (for example `functions ECHO_LO
 
 ## 9. Implementation plan
 
-1. **Parser and checker:** add `ModuleKind::ReactiveProgram`. Accept `reactive program`, require `init` and `step`, reject `main`, unify their state type, reject `IO` inside it, and add the `shutdown_must_stop` obligation.
-2. **Prelude:** add `STEP`, `COMMAND`, `EVENT`, and `CONN_ID` under `stdlib/core/`, verified in `--stdlib` mode like the other prelude files.
-3. **Verifier:** no new obligation kinds beyond `shutdown_must_stop`. Construction sites and termination already cover the rest.
-4. **Codegen/runtime:** a host-side C loop: call `init`, then repeatedly run the returned commands, wait for the next event, and call `step`. Commands run with non-blocking OS calls (poll/epoll or the platform equivalent). The loop is not Gardel code, and no loop construct is added to the language.
-5. **Command families, smallest first:** `Print` and `Shutdown`, then `SetTimer`/`Tick`, then `ReadLine`/`Line` and raw `Key` (TUI, games), then `Listen`/`Send`/`Close` (sockets, HTTP).
-6. **Event log:** an optional runtime flag that records events and replays a log, for the determinism guarantee in section 5.
+Tasks D.2 to D.8 in the [Roadmap](../Roadmap.md) hold the plan, smallest first: `Print` and `Shutdown`, then timers, then console input, then sockets, then replay.
 
 ## 10. Partial functions (second, narrower feature)
 
-Status: **design proposal, to be built after reactive programs.** Syntax is illustrative and untested.
+Status: **design proposal, not part of Phase D.** Syntax is illustrative and has not been run through `gardelc`.
 
 `reactive` covers programs that run forever by design. It does not help when a single computation has no `variant`, as in interpreters, unbounded search, or fixpoint iteration. For those, add an explicitly marked **partial** routine. This follows Idris (`partial`), F\* (`Div` effect), and Dafny (`decreases *`), and matches Gardel's Hoare-logic base. A partial routine has **partial correctness** (`{P} C {Q}`: if it terminates, `Q` holds), while ordinary routines keep **total correctness**.
 
@@ -290,16 +315,21 @@ The result type has an explicit `OutOfFuel` error, so termination is proven, the
 
 ## 11. Open questions
 
-- Should a reactive program be allowed to declare that it never stops (embedded use), which would drop rule 4 and the `Shutdown` event?
-- Command results: is "outcomes come back as events" enough, or do some commands need a correlation id (for example, several `ReadLine` requests in flight)?
-- Concurrency: the first version handles one event at a time. Parallel handling of independent connections would need a proof that their state updates commute, or per-connection state.
+Closed for the first version (Roadmap, Phase D decisions):
+- A reactive program cannot declare that it never stops. Rule 4 and `Shutdown` stay mandatory.
+- Command results are events. Correlation ids wait until a program needs several `ReadLine` requests in flight.
+- One event is handled at a time. Parallel handling is out of scope.
+- Command batches are `LIST[COMMAND]`, which matches execution order.
+
+Still open:
 - Resource bounds: the echo invariant already bounds connection bookkeeping. Should contracts be able to bound total state size in general, so "runs forever without unbounded memory growth" becomes a checked property?
 - Liveness and fairness: deferred, and documented as intentionally not claimed.
-- `LIST[COMMAND]` versus `SEQ[COMMAND]` for command batches: `LIST` is simpler and sequential, which matches execution order.
 - Partial functions: can the backend guarantee demand-driven evaluation of partial calls without losing automatic parallelism elsewhere?
 - Partial functions: should a dedicated partial module kind come later, and what may import it?
 
-## 12. Required spec changes (v0.4 to v0.5)
+## 12. Spec changes (v0.4 to v0.5)
+
+Applied in spec v0.5, except the rows and clauses about `partial`, which wait for that feature.
 
 | Spec section | Change |
 | --- | --- |
@@ -310,3 +340,19 @@ The result type has an explicit `OutOfFuel` error, so termination is proven, the
 | §11.1 | "Only a `program` module may use IO" stays true. Add that a `reactive program` uses commands, not `IO`. |
 | §12 obligations table | Add the `shutdown_must_stop` row. For partial routines, the termination row does not apply and the routine row becomes partial correctness. |
 | §15 grammar | `ModuleUnit` gains `ReactiveProgramDecl ::= "reactive" "program" UpperIdent FeatureSection* "end"`. `RoutineDecl` gains an optional leading `"partial"`. |
+
+## 13. Status of the examples
+
+"Compiled" means `gardelc --strict` reported 0 errors and 0 warnings, on 2026-11-04. The `reactive program` form has no parser yet, so its logic was compiled as a `functions` module and the prelude types as ordinary user modules.
+
+| Example | Status | Depends on |
+| --- | --- | --- |
+| §3 `reactive program` form | Not compiled | D.3 |
+| §3 `STEP`, with `is_stop` | In the prelude (`stdlib/core/step.gdl`) | |
+| §3 `COMMAND`: `Print`, `Listen`, `Send`, `Close` | Compiled | `SetTimer`: D.5. `ReadLine`: D.6 |
+| §6 `EVENT`: `Accepted`, `ListenFailed`, `Received`, `Line`, `Closed`, `Shutdown`, with `is_shutdown` | Compiled | `Tick`: D.5. `Key`: D.6. `SendFailed`: D.7 |
+| §7.1 `SERVER_STATE` | Compiled, with `CONN_ID` as a plain opaque module (no `satisfies`) | D.7 for the prelude `CONN_ID` |
+| §7.1 `init` and `step` logic | Compiled as `functions ECHO_LOGIC`, with the `shutdown_must_stop` postcondition written by hand. A test program fed it four events and the native run gave the expected connection count. Three mutants were rejected as section 7.1 states | D.3 for the `reactive program` wrapper, D.7 for real sockets |
+| §7.2 game loop | Prose only | D.6 |
+| §7.3 test program | Compiled and run, as above. `let t = LIST.empty.prepend(..)` in a `program` fails in Boogie, so the event list came from a routine with a declared return type | Roadmap, Phase D finding 8 |
+| §10 partial functions | Not compiled | Not in Phase D |

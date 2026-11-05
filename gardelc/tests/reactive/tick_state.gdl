@@ -1,0 +1,36 @@
+module TICK_STATE
+
+representation {NONE}
+  count: NAT
+  limit: NAT
+
+invariant
+  within_limit: count <= limit
+
+create {ANY}
+
+  make(cap: NAT): TICK_STATE
+    do
+      { count = 0, limit = cap }
+    end
+
+feature {ANY}
+
+  value: NAT
+    do
+      Current.count
+    end
+
+  has_room: BOOL
+    do
+      Current.count < Current.limit
+    end
+
+  bump: TICK_STATE
+    require
+      room: Current.has_room
+    do
+      { Current with count = Current.count + 1 }
+    end
+
+end

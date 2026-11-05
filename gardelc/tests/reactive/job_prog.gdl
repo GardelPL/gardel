@@ -1,0 +1,28 @@
+program JOB_PROG
+
+feature {ANY}
+
+  halt(n: NAT): JOB
+    do
+      Stop(n)
+    end
+
+  pages(j: JOB): NAT
+    do
+      match j
+        case Print(p) then p
+        case _ then 0
+      end
+    end
+
+  keep_going(c: BOOL): STEP[NAT]
+    do
+      Continue(1, LIST.empty)
+    end
+
+  main(args: SEQ[STRING]): IO[EXIT_CODE]
+    do
+      IO.exit(halt(3).weight +% pages(Print(4)))
+    end
+
+end
