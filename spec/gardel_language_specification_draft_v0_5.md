@@ -29,9 +29,10 @@ Gardel is a pure, total, deterministic, statically verified language designed fo
 | Prelude | `STEP`, `COMMAND`, `EVENT` and `CONN_ID` join the prelude inventory (§4.1, §11.6). A user constructor wins over a prelude constructor of the same name (§4.1). |
 | `match` | A catch-all arm must be the last arm (`E0316`, §5.1). |
 | Solver limit | Verification is bounded by solver work, not by time, so a verdict does not depend on machine load. A solver that gives up is reported as unproven, never as verified or refuted (§7.3, §12). |
+| Entry points | Nothing may refer to a `program` or `reactive program` (`E0104`, §4). |
 | `EXIT_CODE` | Defined in §3. |
 
-**Implementation status:** the `match` rule and the solver limit are implemented. Reactive programs are specified here and are being built in Phase D (§16.5).
+**Implementation status:** the `match` rule, the solver limit and the entry-point rule are implemented. Reactive programs verify and compile; the runtime that runs them is being built in Phase D (§16.5).
 
 ---
 
@@ -254,6 +255,8 @@ Sections may appear in any order, and `feature` and `specify` may repeat with di
 5. **Invariant visibility.** Every symbol referenced in a module's `invariant` must be exported to at least the visibility list of its `representation` section, ensuring friend modules that construct values directly can see and prove the invariant (§6).
 
 A `functions` module has `feature` and `specify` sections only. A `program` has a `main` routine and is the only module that may use `IO` (§11). A `reactive program` has `feature` sections only, with the routines `init` and `step` and no `main`, and uses commands instead of `IO` (§11.6).
+
+A `program` and a `reactive program` are entry points, the roots of a run. Nothing may refer to one: `E0104: entry_point_reference`. Code that two units share goes in a `functions` module.
 
 ### 4.1 The Standard Prelude
 
@@ -2196,10 +2199,10 @@ end
 
 Rules:
 
-1. **Form.** A `reactive program` has exactly the entry points `init` and `step` and no `main`; `step` and `init` must agree on `S`. It may have helper routines. It has no `specify` section: lemmas go in the state module or a `functions` module.
-2. **Totality.** `init` and `step` are ordinary total routines, with the termination obligation of §12. They are pure: they have no `IO` types and no `with IO`, so `IO.exit` cannot appear and `Stop` is the only way out.
+1. **Form.** A `reactive program` has exactly the entry points `init` and `step` and no `main`; `step` and `init` must agree on `S`. It may have helper routines. It has no `specify` section (lemmas go in the state module or a `functions` module) and no type parameters. `reactive` is a keyword only directly before `program`.
+2. **Totality.** `init` and `step` are ordinary total routines, with the termination obligation of §12. They are pure: no routine of a reactive program has an `IO` type or a `with IO`, so `IO.exit` cannot appear and `Stop` is the only way out. `init` and `step` have no `require`: the runtime calls them with every input and proves nothing, so a precondition would be an unchecked assumption. A case to refuse is handled in the body, for example with `Stop`.
 3. **Invariants.** Because `S` is a module type, its invariant holds for every value of `S` (§6). The obligations of the state module's routines therefore give "the invariant holds after `init` and after every step", for an unbounded run, with no new kind of verification condition.
-4. **Shutdown must stop.** `step` has the implicit postcondition `e.is_shutdown implies Result.is_stop`, tagged `shutdown_must_stop`. Constructor queries are used because `EVENT` is not `CANONICAL_EQ` (§9).
+4. **Shutdown must stop.** `step` has the implicit postcondition `e.is_shutdown implies Result.is_stop`, tagged `shutdown_must_stop`. It is always added, so a clause the programmer writes cannot replace it. Constructor queries are used because `EVENT` is not `CANONICAL_EQ` (§9).
 5. **Commands never block.** Commands in one `cmds` list run in order. A command that can fail reports the failure as a later event, never as a crash (§7.2). The commands of a `Stop` run before the process exits. If `init` returns `Stop`, `step` is never called.
 6. **Events are untrusted.** The verifier assumes nothing about a payload beyond its type. Payloads become invariant-carrying values only through `RESULT`-returning boundary routines (§7.2, §11.4).
 7. **Handles.** Each `CONN_ID` comes from exactly one `Accepted` event. After `Close(c)` runs, at most one more event mentions `c`, and it is `Closed(c)`.
@@ -2236,7 +2239,7 @@ Both `create` and `feature` routines returning an instance of `Current` (or any 
 | `check` | each `check` block | the predicate holds, then joins the active proof context |
 | `assume` | each `assume` block | none; joins the proof context and is listed by `gardelc --audit` |
 
-Static rules introduced in v0.5: `E0316: unreachable_match_arm` (§5.1), and the family `"Phase 4 (Reactive Violation)"` with the tags `missing_init`, `missing_step`, `main_in_reactive`, `state_type_mismatch`, `io_in_reactive` and `shutdown_must_stop` (§11.6).
+Static rules introduced in v0.5: `E0104: entry_point_reference` (§4), `E0316: unreachable_match_arm` (§5.1), and the family `"Phase 4 (Reactive Violation)"` with the tags `missing_init`, `missing_step`, `main_in_reactive`, `bad_init_signature`, `bad_step_signature`, `state_type_mismatch`, `entry_point_require`, `io_in_reactive` and `shutdown_must_stop` (§11.6).
 
 A solver result that is neither proof nor refutation is an error with its own rule, and its message says that the obligation is unproven: `"Phase 3 Boogie (Verification Resource Limit)"` for an obligation that exhausted the solver limit (§7.3), `"Phase 3 Boogie (Verification Timeout)"` for a procedure that did not finish, and `"Phase 3 Boogie (Verification Incomplete)"` when Boogie gives no clean result. A refutation always carries a counterexample.
 
@@ -2909,7 +2912,7 @@ Phase D builds the `reactive program` of §11.6. `plan/Roadmap.md` holds its tas
 | D.0 | `case _` in Boogie, nested type arguments, patterns in laws, `E0316` | ✅ Completed |
 | D.1 | Spec v0.5 and proposal revision 3 | ✅ Completed |
 | D.2 | Prelude `STEP`, `COMMAND` (`Print`), `EVENT` (`Shutdown`) | ✅ Completed |
-| D.3 | Parser and checker, including `shutdown_must_stop` | 📋 Planned |
+| D.3 | Parser and checker, including `shutdown_must_stop` | ✅ Completed |
 | D.4 | Host loop: the `Print` + `Shutdown` slice | 📋 Planned |
 | D.5 | `SetTimer`, `Tick` | 📋 Planned |
 | D.6 | `ReadLine`, `Line`, `Key` | 📋 Planned |

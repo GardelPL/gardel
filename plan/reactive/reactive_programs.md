@@ -41,8 +41,6 @@ reactive program NAME
 feature {ANY}
 
   init(args: SEQ[STRING]): STEP[S]
-    require
-      ...
     do
       ...
     ensure
@@ -50,8 +48,6 @@ feature {ANY}
     end
 
   step(s: S, e: EVENT): STEP[S]
-    require
-      ...
     do
       ...
     ensure
@@ -91,13 +87,13 @@ Commands in one `cmds` list run in list order. A command never blocks the loop. 
 
 ## 4. Typing and verification rules
 
-1. **Step totality.** `init` and `step` are ordinary total routines. Any recursion inside them needs a `variant`. The runtime loop is host code and is not subject to this check.
+1. **Step totality.** `init` and `step` are ordinary total routines. Any recursion inside them needs a `variant`. The runtime loop is host code and is not subject to this check. They have no `require` (`entry_point_require`): the runtime calls them with every input and proves nothing, so `require False` on `step` would make its whole contract vacuous, `shutdown_must_stop` included.
 2. **Invariants need no new kind of verification condition.** Because `S` is a module type, its invariant is part of the type (§6). With an opaque `S`, the only code that builds an `S` is the state module's own routines, which prove the invariant in their own obligations (§12), given their `require` clauses. `step` then has to prove those `require` clauses at each call. Together these give "the invariant holds after `init` and after every step" for an unbounded run.
 3. **Purity.** `init` and `step` must not have `IO[...]` types and must not contain `with IO`. A reactive program uses no `IO` at all, so the existing IO checks (`io_in_pure_module`, linearity) need no change for it. `IO.exit` therefore cannot appear, and the only way out is `Stop`.
 4. **Shutdown must stop.** The compiler adds the implicit postcondition `e.is_shutdown implies Result.is_stop` to `step` (tag `shutdown_must_stop`). `EVENT.is_shutdown` and `STEP.is_stop` are prelude queries: `=` is not available, because `EVENT` holds `STRING` and `BYTES` and is not `CANONICAL_EQ` (§9). This guarantees a clean exit path that the runtime does not have to force.
 5. **Bounded work per step.** Because `step` is pure and total and commands do not block, each event is handled in finite time. The program can only run forever by receiving infinitely many events.
 6. **Events are untrusted input.** Payloads arrive as `BYTES`, or as `RESULT[IO_ERROR, STRING]` for lines that were already decoded. They become verified ADTs only through `RESULT`-returning boundary routines (§7.2.2, §11.4). The verifier assumes nothing about event payloads beyond their types.
-7. **Entry-point firewall.** A `reactive program`, like a `program`, is a root and cannot be referenced from other modules. Its `step` can still be exercised from test programs if it is factored into a `functions` module (section 7.3).
+7. **Entry-point firewall.** A `reactive program`, like a `program`, is a root and cannot be referenced from other modules (`E0104`). Its `step` can still be exercised from test programs if it is factored into a `functions` module (section 7.3).
 
 ## 5. What is and is not guaranteed
 
@@ -242,7 +238,7 @@ Put the transition logic in a `functions` module (for example `functions ECHO_LO
 ## 8. Marking and tooling
 
 - `gardelc --inspect` labels the module `reactive program` and shows the contracts of `init` and `step`, so a reviewer or AI agent can see at a glance which programs do not terminate.
-- New diagnostics in the existing Phase 4 family: `"Phase 4 (Reactive Violation)"` with tags `missing_init`, `missing_step`, `main_in_reactive`, `state_type_mismatch` (`init` and `step` disagree on `S`), `io_in_reactive`, and `shutdown_must_stop`. Invariant failures stay ordinary construction-site diagnostics, with the invariant clause tag (for example `within_limit`).
+- New diagnostics in the existing Phase 4 family: `"Phase 4 (Reactive Violation)"` with tags `missing_init`, `missing_step`, `main_in_reactive`, `bad_init_signature`, `bad_step_signature`, `state_type_mismatch` (`init` and `step` disagree on `S`), `entry_point_require`, `io_in_reactive`, and `shutdown_must_stop`. Invariant failures stay ordinary diagnostics, with the invariant clause tag (for example `within_limit`).
 - `--json-diagnostics` counterexamples for `step` include the failing `EVENT` value.
 
 ## 9. Implementation plan
@@ -343,16 +339,16 @@ Applied in spec v0.5, except the rows and clauses about `partial`, which wait fo
 
 ## 13. Status of the examples
 
-"Compiled" means `gardelc --strict` reported 0 errors and 0 warnings, on 2026-11-04. The `reactive program` form has no parser yet, so its logic was compiled as a `functions` module and the prelude types as ordinary user modules.
+"Compiled" means `gardelc --strict` reported 0 errors and 0 warnings, on 2026-11-04. Types not yet in the prelude were compiled as ordinary user modules.
 
 | Example | Status | Depends on |
 | --- | --- | --- |
-| §3 `reactive program` form | Not compiled | D.3 |
+| §3 `reactive program` form | Compiled (`gardelc/tests/reactive/tick_reactive.gdl`) | D.4 to run it |
 | §3 `STEP`, with `is_stop` | In the prelude (`stdlib/core/step.gdl`) | |
 | §3 `COMMAND`: `Print`, `Listen`, `Send`, `Close` | Compiled | `SetTimer`: D.5. `ReadLine`: D.6 |
 | §6 `EVENT`: `Accepted`, `ListenFailed`, `Received`, `Line`, `Closed`, `Shutdown`, with `is_shutdown` | Compiled | `Tick`: D.5. `Key`: D.6. `SendFailed`: D.7 |
 | §7.1 `SERVER_STATE` | Compiled, with `CONN_ID` as a plain opaque module (no `satisfies`) | D.7 for the prelude `CONN_ID` |
-| §7.1 `init` and `step` logic | Compiled as `functions ECHO_LOGIC`, with the `shutdown_must_stop` postcondition written by hand. A test program fed it four events and the native run gave the expected connection count. Three mutants were rejected as section 7.1 states | D.3 for the `reactive program` wrapper, D.7 for real sockets |
+| §7.1 `init` and `step` logic | Compiled as `functions ECHO_LOGIC`, with the `shutdown_must_stop` postcondition written by hand. A test program fed it four events and the native run gave the expected connection count. Three mutants were rejected as section 7.1 states | D.7 for real sockets and the full `EVENT` |
 | §7.2 game loop | Prose only | D.6 |
 | §7.3 test program | Compiled and run, as above. `let t = LIST.empty.prepend(..)` in a `program` fails in Boogie, so the event list came from a routine with a declared return type | Roadmap, Phase D finding 8 |
 | §10 partial functions | Not compiled | Not in Phase D |

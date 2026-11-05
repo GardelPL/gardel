@@ -419,7 +419,7 @@ Source: [review/review.md](review/review.md). The verification notes for each fi
 
 ### Phase D: Reactive Programs
 
-**Status:** 🔄 In progress: D.0 to D.2 completed, D.3 next (2026-11-04).
+**Status:** 🔄 In progress: D.0 to D.3 completed, D.4 next (2026-11-04).
 
 **Objective:** let Gardel express programs that run until told to stop (servers, TUIs, games) without weakening totality. Every routine stays total. Non-termination lives in one place, the runtime's host loop, and a `reactive program` declares it. The design is [reactive/reactive_programs.md](reactive/reactive_programs.md) (revision 2), corrected by the findings below.
 
@@ -505,12 +505,17 @@ flowchart TD
 - **Known limits:** a module that sees a user `Stop` cannot build the prelude `Stop`, since there is no qualified constructor syntax. It fails loudly. Until `EVENT` has a second variant, a `case _` arm on `EVENT` is unreachable, so a false call there verifies, correctly: `tests/reactive/tick_logic.gdl` keeps its logic in a separate routine for that reason.
 - Acceptance: `--stdlib --strict` 0/0, and existing examples unchanged.
 
-#### Task D.3: Parser and Checker [📋 Planned]
-- [ ] Add `ModuleKind::ReactiveProgram` and accept `reactive program`. Treat it like `Program` at the existing `ModuleKind` sites, including the ban on `specify`.
-- [ ] Require `init(args: SEQ[STRING]): STEP[S]` and `step(s: S, e: EVENT): STEP[S]`, and reject `main`.
-- [ ] Diagnostics in family `"Phase 4 (Reactive Violation)"`: `missing_init`, `missing_step`, `main_in_reactive`, `state_type_mismatch`, `io_in_reactive`, `shutdown_must_stop`.
-- [ ] Add the implicit `shutdown_must_stop` postcondition (decision 2). Keep it as an ordinary obligation so the fixpoint in Task B.9 handles it.
-- [ ] Label the unit in `--inspect`. A reactive program is an entry-point root, like `program`.
+#### Task D.3: Parser and Checker [✅ Completed]
+- [x] Added `ModuleKind::ReactiveProgram` and `reactive program`. `reactive` is a keyword only directly before `program`. As for `program`, there is no `specify`, `representation`, `create` or `invariant` section. Type parameters are rejected.
+- [x] Required `init(args: SEQ[STRING]): STEP[S]` and `step(s: S, e: EVENT): STEP[S]`, and rejected `main`. Type aliases are the same type (`STEP[NAT]` with `s: U64`).
+- [x] Diagnostics in family `"Phase 4 (Reactive Violation)"`: `missing_init`, `missing_step`, `main_in_reactive`, `state_type_mismatch`, `io_in_reactive`, `shutdown_must_stop`, plus `bad_init_signature` and `bad_step_signature`.
+- [x] Added the implicit `shutdown_must_stop` postcondition (decision 2). It stays an ordinary postcondition, so the fixpoint in Task B.9 handles it, and only the report names the reactive rule. It is always added, so a weak clause under the same tag cannot replace it.
+- [x] Labelled the unit in `--inspect`.
+- [x] **Not in the original task: `entry_point_require`.** The proposal allowed `require` on `init` and `step`, but the runtime calls them with every input and proves nothing. `require False` on `step` would have made its contract vacuous, `shutdown_must_stop` included.
+- [x] **Not in the original task: `E0104: entry_point_reference`.** The proposal said an entry point cannot be referenced, but nothing enforced it, for `program` either: a `functions` module could call into a `program`. It now applies to both, using the cross-file reference scan of `E0103`.
+- [x] Until D.4 adds the host loop, a reactive program builds as a library: `init` and `step` compile to C and no executable is linked.
+- Tests `test_d3_reactive_program_verifies`, `test_d3_form_of_a_reactive_program`, `test_d3_entry_points_cannot_assume_anything`, `test_d3_step_obligations`, `test_d3_nothing_may_refer_to_an_entry_point`, `test_d3_logic_compiles_to_c_without_a_host_loop_yet`. `cargo test` 118/118. `--stdlib --strict` 0/0 on seeds 0–3, and the six examples 0/0.
+- **Known limit:** `E0104` uses the cross-file reference scan, so a reference inside one file is not caught. Same-file modules are not linked to each other anyway (Task B.4), so such a reference does not verify.
 - Acceptance: one test per diagnostic, including a `step` that continues on `Shutdown` and a `step` that breaks the state's `require`. The diagnostic for an invariant failure names the state's clause.
 
 #### Task D.4: Host Loop, `Print` + `Shutdown` Slice [📋 Planned]
@@ -567,7 +572,7 @@ flowchart TD
 
 With **Phase A: Language Specification Harmonization**, **Phase B: Compiler Engine & Prelude Tooling**, **Task C.1: Physical Decomposition of `stdlib/`**, **Task C.2: High-Performance Smart String (`stdlib/text/string.gdl`)**, and **Task C.3: Regression Verification & Performance Benchmarking** completely executed and verified with 0 errors and 0 warnings under `--strict`, Phase C's planned work is done. The verification baseline is clean, and every module compiles from source to C with reference-counted memory (C.3 follow-ups).
 
-The next step is **Phase D: Reactive Programs**, defined above with its tasks, dependency graph and acceptance criteria. The C prerequisites of [reactive/reactive_programs.md](reactive/reactive_programs.md) are in place (C.3 follow-ups): every module compiles from source, closures work, and memory is reference counted, so a program that runs forever does not leak. Tasks D.0 to D.2 are completed. Next, finish the `Print` + `Shutdown` slice (D.3, D.4).
+The next step is **Phase D: Reactive Programs**, defined above with its tasks, dependency graph and acceptance criteria. The C prerequisites of [reactive/reactive_programs.md](reactive/reactive_programs.md) are in place (C.3 follow-ups): every module compiles from source, closures work, and memory is reference counted, so a program that runs forever does not leak. Tasks D.0 to D.3 are completed. Next, finish the `Print` + `Shutdown` slice with the host loop (D.4).
 
 **Task C.4 (memory management performance)** is planned. C.4.1–C.4.3 do not depend on Phase D and can be done before or alongside it. C.4.1 and C.4.2 are small and have the largest payoff measured on `seq_bench`, but a reactive program rarely exits, so C.4.1 does little for Phase D and C.4.2 matters more. C.4.4 needs a reactive program to measure against, and D.5 provides its baseline.
 

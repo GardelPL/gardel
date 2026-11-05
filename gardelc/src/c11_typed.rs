@@ -115,7 +115,7 @@ pub(crate) fn norm_type(t: &str) -> String {
 /// `EXIT_CODE` are `U64`, `INT` is `I64`), since they are the same C type. Without this a
 /// function value `(U64) -> U64` and a parameter `(NAT) -> NAT` would get two different
 /// C function types.
-fn cnorm(t: &str) -> String {
+pub(crate) fn cnorm(t: &str) -> String {
     norm_type_with(t, true)
 }
 

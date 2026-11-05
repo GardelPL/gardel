@@ -20,7 +20,7 @@ pub use c11_typed::emit_c11_typed;
 /// verification, code generation) treat it as the call it is. Locals, parameters, `match`
 /// binders, lambda parameters and quantified variables shadow routine names.
 fn desugar_nullary_calls(m: &mut ModuleDecl) {
-    if !matches!(m.kind, ModuleKind::Program | ModuleKind::Functions) {
+    if m.kind == ModuleKind::Module {
         return;
     }
     let nullary: HashSet<String> = m
@@ -188,12 +188,21 @@ impl Visibility {
     }
 }
 
-/// Distinguishes ADT `module`, stateless `functions`, and effectful `program` declarations (§4, §11).
+/// Distinguishes ADT `module`, stateless `functions`, effectful `program` and non-terminating
+/// `reactive program` declarations (§4, §11, §11.6).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ModuleKind {
     Module,
     Functions,
     Program,
+    ReactiveProgram,
+}
+
+impl ModuleKind {
+    /// A root of the run: nothing may refer to it (`E0104`).
+    pub fn is_entry_point(self) -> bool {
+        matches!(self, ModuleKind::Program | ModuleKind::ReactiveProgram)
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -1177,10 +1186,12 @@ impl Parser {
                 modules.push(self.parse_module_with_kind(ModuleKind::Functions)?);
             } else if self.is_kw("program") {
                 modules.push(self.parse_module_with_kind(ModuleKind::Program)?);
+            } else if self.is_kw("reactive") {
+                modules.push(self.parse_module_with_kind(ModuleKind::ReactiveProgram)?);
             } else {
                 return Err(ParseError {
                     message: format!(
-                        "Expected `concept`, `module`, `functions`, or `program`, got {:?}",
+                        "Expected `concept`, `module`, `functions`, `program`, or `reactive program`, got {:?}",
                         self.peek()
                     ),
                     token_pos: self.pos,
@@ -1312,6 +1323,10 @@ impl Parser {
             ModuleKind::Module => self.expect_kw("module")?,
             ModuleKind::Functions => self.expect_kw("functions")?,
             ModuleKind::Program => self.expect_kw("program")?,
+            ModuleKind::ReactiveProgram => {
+                self.expect_kw("reactive")?;
+                self.expect_kw("program")?;
+            }
         }
         let name = self.expect_upper_ident()?;
         let mut type_params = Vec::new();
@@ -1372,7 +1387,7 @@ impl Parser {
 
         while !self.is_kw("end") {
             if self.is_kw("representation") {
-                if kind == ModuleKind::Functions || kind == ModuleKind::Program {
+                if kind != ModuleKind::Module {
                     return Err(ParseError {
                         message: format!(
                             "Section `representation` is not permitted in `{kind:?}` declaration (§4)"
@@ -1418,9 +1433,9 @@ impl Parser {
                     repr = ReprKind::Product(fields);
                 }
             } else if self.is_kw("specify") {
-                if kind == ModuleKind::Program {
+                if kind.is_entry_point() {
                     return Err(ParseError {
-                        message: "Section `specify` is not permitted in `program` declaration (§4)"
+                        message: "Section `specify` is not permitted in `program` declaration (§4); put lemmas in a `module` or `functions` module"
                             .to_string(),
                         token_pos: self.pos,
                     });
@@ -1435,7 +1450,7 @@ impl Parser {
                     }
                 }
             } else if self.is_kw("create") {
-                if kind == ModuleKind::Functions || kind == ModuleKind::Program {
+                if kind != ModuleKind::Module {
                     return Err(ParseError {
                         message: format!(
                             "Section `create` is not permitted in `{kind:?}` declaration (§4)"
@@ -1455,7 +1470,7 @@ impl Parser {
                     feature_routines.push((vis.clone(), self.parse_routine()?));
                 }
             } else if self.is_kw("invariant") {
-                if kind == ModuleKind::Functions || kind == ModuleKind::Program {
+                if kind != ModuleKind::Module {
                     return Err(ParseError {
                         message: format!(
                             "Section `invariant` is not permitted in `{kind:?}` declaration (§4)"
@@ -1478,6 +1493,16 @@ impl Parser {
             }
         }
         self.expect_kw("end")?;
+
+        if kind == ModuleKind::ReactiveProgram {
+            if !type_params.is_empty() {
+                return Err(ParseError {
+                    message: format!("`reactive program {name}` cannot have type parameters (§15)"),
+                    token_pos: self.pos,
+                });
+            }
+            add_shutdown_obligation(&mut feature_routines);
+        }
 
         let mut m = ModuleDecl {
             kind,
@@ -2534,8 +2559,93 @@ pub fn check_and_expand_concepts(
     diags
 }
 
+const REACTIVE_VIOLATION: &str = "Phase 4 (Reactive Violation)";
+
+/// The obligation every reactive `step` carries (§11.6, rule 4). It is added whatever the
+/// programmer wrote, so a weaker clause with the same tag cannot stand in for it.
+fn add_shutdown_obligation(feature_routines: &mut [(Visibility, RoutineDecl)]) {
+    let Some((_, step)) = feature_routines.iter_mut().find(|(_, r)| r.name == "step") else {
+        return;
+    };
+    let [_, (event, _)] = step.params.as_slice() else {
+        return; // `bad_step_signature`
+    };
+    let query = |recv: &str, q: &str| {
+        Expr::MethodCall(Box::new(Expr::Var(recv.to_string())), q.to_string(), Vec::new())
+    };
+    let obligation = Expr::BinOp(
+        "implies".to_string(),
+        Box::new(query(event, "is_shutdown")),
+        Box::new(query("Result", "is_stop")),
+    );
+    step.ensures.push(("shutdown_must_stop".to_string(), obligation));
+}
+
+/// The argument of `STEP[..]`, in the C backend's normal form (aliases resolved).
+fn step_state_type(ret: &str) -> Option<String> {
+    let t = c11_typed::cnorm(ret);
+    Some(t.strip_prefix("STEP[")?.strip_suffix(']')?.to_string())
+}
+
+/// The form of a `reactive program` (§11.6, rules 1 and 2).
+fn check_reactive_program(m: &ModuleDecl) -> Vec<Diagnostic> {
+    let mut diags = Vec::new();
+    let mut report = |routine: &str, tag: &str, msg: String| {
+        diags.push(Diagnostic::basic("error", REACTIVE_VIOLATION, routine.to_string(), tag.to_string(), msg));
+    };
+    let find = |n: &str| m.feature_routines.iter().map(|(_, r)| r).find(|r| r.name == n);
+    let (init, step) = (find("init"), find("step"));
+    if init.is_none() {
+        report(&m.name, "missing_init", format!("`{}` needs `init(args: SEQ[STRING]): STEP[S]` (§11.6)", m.name));
+    }
+    if step.is_none() {
+        report(&m.name, "missing_step", format!("`{}` needs `step(s: S, e: EVENT): STEP[S]` (§11.6)", m.name));
+    }
+    if find("main").is_some() {
+        report("main", "main_in_reactive", format!("`{}` has no `main`: the runtime calls `init` and `step` (§11.6)", m.name));
+    }
+    // The runtime calls these with whatever arrives and can prove nothing, so a `require`
+    // would be an unchecked assumption: `require False` would make `step` vacuous.
+    for r in [init, step].into_iter().flatten() {
+        if !r.requires.is_empty() {
+            report(&r.name, "entry_point_require", format!("`{}` cannot have `require`: the runtime calls it with every input, so nothing would prove it (§11.6). Handle the case in the body", r.name));
+        }
+    }
+    let init_state = init.and_then(|r| {
+        let ok = r.type_params.is_empty()
+            && matches!(r.params.as_slice(), [(_, t)] if c11_typed::cnorm(t) == "SEQ[STRING]");
+        let state = step_state_type(&r.ret_type).filter(|_| ok);
+        if state.is_none() {
+            report("init", "bad_init_signature", "`init` must be `init(args: SEQ[STRING]): STEP[S]` (§11.6)".to_string());
+        }
+        state
+    });
+    let step_state = step.and_then(|r| {
+        let param = match r.params.as_slice() {
+            [(_, s), (_, e)] if r.type_params.is_empty() && c11_typed::cnorm(e) == "EVENT" => Some(c11_typed::cnorm(s)),
+            _ => None,
+        };
+        let state = param.zip(step_state_type(&r.ret_type));
+        if state.is_none() {
+            report("step", "bad_step_signature", "`step` must be `step(s: S, e: EVENT): STEP[S]` (§11.6)".to_string());
+        }
+        state
+    });
+    if let Some((param, ret)) = &step_state {
+        if param != ret {
+            report("step", "state_type_mismatch", format!("`step` takes state `{param}` but returns `STEP[{ret}]` (§11.6)"));
+        } else if let Some(s) = init_state.as_ref().filter(|s| *s != param) {
+            report("init", "state_type_mismatch", format!("`init` returns `STEP[{s}]` but `step` takes state `{param}` (§11.6)"));
+        }
+    }
+    diags
+}
+
 pub fn check_visibility_and_semantics(m: &ModuleDecl) -> Vec<Diagnostic> {
     let mut diags = Vec::new();
+    if m.kind == ModuleKind::ReactiveProgram {
+        diags.extend(check_reactive_program(m));
+    }
     let mut symbol_vis: HashMap<String, Visibility> = HashMap::new();
     let mut ghost_symbols: HashSet<String> = HashSet::new();
     let mut known_routines: HashSet<String> = HashSet::new();
@@ -2687,7 +2797,18 @@ pub fn check_visibility_and_semantics(m: &ModuleDecl) -> Vec<Diagnostic> {
                 Stmt::Let(_, e) | Stmt::Check(_, e) | Stmt::Assume(_, e) => expr_uses_io(e),
                 Stmt::Reveal(_) => false,
             });
-        if (is_io_ret || uses_io) && m.kind != ModuleKind::Program {
+        if (is_io_ret || uses_io) && m.kind == ModuleKind::ReactiveProgram {
+            diags.push(Diagnostic::basic(
+                "error",
+                REACTIVE_VIOLATION,
+                r.name.clone(),
+                "io_in_reactive".into(),
+                format!(
+                    "Routine `{}` in `{}` uses `IO`. A reactive program requests effects by returning commands (§11.6)",
+                    r.name, m.name
+                ),
+            ));
+        } else if (is_io_ret || uses_io) && m.kind != ModuleKind::Program {
             diags.push(Diagnostic::basic(
                 "error",
                 "Phase 4 (IO Boundary Violation)",
@@ -4409,6 +4530,7 @@ fn top_level_decls(ast: &FileAst) -> Vec<(&str, &'static str)> {
                 ModuleKind::Module => "module",
                 ModuleKind::Functions => "functions",
                 ModuleKind::Program => "program",
+                ModuleKind::ReactiveProgram => "reactive program",
             };
             (m.name.as_str(), kw)
         }))
@@ -4537,6 +4659,36 @@ pub fn check_file_module_name(unit: &SourceUnit, strict: bool) -> Vec<Diagnostic
     )
     .with_module(primary)
     .with_ai_context(sp, Vec::new(), BTreeMap::new(), Vec::new())]
+}
+
+/// `E0104: entry_point_reference` (§4): a `program` or `reactive program` is a root of the
+/// run, so no other module may refer to it. Shared logic goes in a `functions` module.
+pub fn check_entry_point_references(units: &[SourceUnit], table: &LinkTable) -> Vec<Diagnostic> {
+    let mut diags = Vec::new();
+    for (m, entry) in table.entry_point_references() {
+        let found = units.iter().find_map(|u| {
+            top_level_decls(&u.ast)
+                .into_iter()
+                .find(|(n, _)| *n == m.name)
+                .map(|(_, kw)| locate_decl_header(&u.src, &u.path, kw, &m.name))
+        });
+        let mut d = Diagnostic::basic(
+            "error",
+            "E0104: entry_point_reference",
+            m.name.clone(),
+            "entry_point_reference".to_string(),
+            format!(
+                "E0104: entry_point_reference: `{}` refers to the entry point `{}`. Nothing may refer to a `program` or `reactive program`: move the shared code to a `functions` module (§4)",
+                m.name, entry.name
+            ),
+        )
+        .with_module(&m.name);
+        if let Some(sp) = found {
+            d = d.with_ai_context(sp, Vec::new(), BTreeMap::new(), Vec::new());
+        }
+        diags.push(d);
+    }
+    diags
 }
 
 /// `E0103: cyclic_module_dependency` (§4.2.3, §4.3): user modules of different files that
@@ -4870,6 +5022,19 @@ impl LinkTable {
 
     /// A cycle of cross-file module references, if any (as a list of module names, the
     /// first repeated at the end).
+    /// Every (module, entry point it refers to) pair of the run.
+    fn entry_point_references(&self) -> Vec<(&ModuleDecl, &ModuleDecl)> {
+        let mut refs = Vec::new();
+        for m in &self.modules {
+            for n in self.direct_links(m) {
+                if n.kind.is_entry_point() {
+                    refs.push((m, n));
+                }
+            }
+        }
+        refs
+    }
+
     pub fn find_cycle(&self) -> Option<Vec<String>> {
         let edges: HashMap<&str, Vec<&str>> = self
             .modules
@@ -12896,6 +13061,44 @@ pub fn verify_module_phase3(
     audit_mode: bool,
     bounded_check: bool,
 ) -> Vec<Diagnostic> {
+    let mut diags =
+        verify_module_obligations(m, src, input_path, fuel_limit, strict_mode, audit_mode, bounded_check);
+    // `shutdown_must_stop` is an ordinary postcondition, so the fixpoint of Task B.9 handles
+    // it like any other. Only the report names it as the rule it is.
+    if m.kind == ModuleKind::ReactiveProgram {
+        for d in &mut diags {
+            if d.tag == "shutdown_must_stop" && d.rule == "Phase 3 Boogie (Postcondition Violation)" {
+                d.rule = REACTIVE_VIOLATION.into();
+                // The clause is implicit, so it has no text to find: point at `step`.
+                d.span = source_line_of(src, input_path, "step(");
+            }
+        }
+    }
+    diags
+}
+
+/// The span of the first line of `src` that starts with `prefix`, ignoring indentation.
+fn source_line_of(src: &str, input_path: &str, prefix: &str) -> Option<Span> {
+    let (idx, line) = src.lines().enumerate().find(|(_, l)| l.trim_start().starts_with(prefix))?;
+    let column = line.len() - line.trim_start().len() + 1;
+    Some(Span {
+        file: input_path.to_string(),
+        line: idx + 1,
+        column,
+        end_line: idx + 1,
+        end_column: line.len() + 1,
+    })
+}
+
+fn verify_module_obligations(
+    m: &ModuleDecl,
+    src: &str,
+    input_path: &str,
+    fuel_limit: usize,
+    strict_mode: bool,
+    audit_mode: bool,
+    bounded_check: bool,
+) -> Vec<Diagnostic> {
     let mut diags = Vec::new();
     let is_adt = m.kind == ModuleKind::Module;
 
@@ -14975,6 +15178,7 @@ pub fn format_module_interface(m: &ModuleDecl) -> String {
         ModuleKind::Module => "module",
         ModuleKind::Functions => "functions",
         ModuleKind::Program => "program",
+        ModuleKind::ReactiveProgram => "reactive program",
     };
     let tp = if m.type_params.is_empty() {
         String::new()
@@ -15599,7 +15803,8 @@ pub fn check_and_verify_project(units: &mut [SourceUnit], opts: VerifyOptions) -
         None
     };
     if let Some(table) = &link {
-        let fatal = check_module_dependency_cycles(units, table);
+        let mut fatal = check_module_dependency_cycles(units, table);
+        fatal.extend(check_entry_point_references(units, table));
         if !fatal.is_empty() {
             return CheckedProject {
                 diags: Vec::new(),
@@ -15976,7 +16181,7 @@ fn main() {
     let all_modules: Vec<&ModuleDecl> = units.iter().flat_map(|u| u.ast.modules.iter()).collect();
     let programs: Vec<&&ModuleDecl> = all_modules
         .iter()
-        .filter(|m| m.kind == ModuleKind::Program)
+        .filter(|m| m.kind.is_entry_point())
         .collect();
     let module = if project_mode && programs.len() == 1 {
         (*programs[0]).clone()
@@ -18638,6 +18843,147 @@ end
         assert_ne!(partial, own);
         let diags = c3_verify(&partial, "wild_own_partial.gdl");
         assert!(!diags.is_empty(), "a non-exhaustive match must still be rejected");
+    }
+
+    const D3_REACTIVE: &str = include_str!("../tests/reactive/tick_reactive.gdl");
+
+    /// Diagnostics of `tick_reactive.gdl` as `src`, checked and verified in its project.
+    fn d3_diags(src: &str) -> Vec<Diagnostic> {
+        let mut units = b4_units(&[("tick_state.gdl", D2_STATE), ("tick_reactive.gdl", src)]);
+        let checked = check_and_verify_project(&mut units, b4_opts(true, true));
+        assert!(checked.fatal.is_empty(), "{:?}", checked.fatal);
+        checked.diags.into_iter().map(|(_, d)| d).collect()
+    }
+
+    /// `d3_diags` must report `tag` under the reactive rule.
+    fn d3_rejects(src: &str, tag: &str) {
+        let diags = d3_diags(src);
+        assert!(
+            diags.iter().any(|d| d.tag == tag && d.rule == "Phase 4 (Reactive Violation)"),
+            "{tag} must be reported, got {diags:?}"
+        );
+    }
+
+    #[test]
+    fn test_d3_reactive_program_verifies() {
+        let diags = d3_diags(D3_REACTIVE);
+        assert!(diags.is_empty(), "{diags:?}");
+        let m = parse_user_module_with_prelude(D3_REACTIVE);
+        assert_eq!(m.kind, ModuleKind::ReactiveProgram);
+        let (_, step) = m.feature_routines.iter().find(|(_, r)| r.name == "step").unwrap();
+        assert!(step.ensures.iter().any(|(t, _)| t == "shutdown_must_stop"));
+        // `--inspect` shows what kind of unit it is, and the obligation.
+        let text = format_module_interface(&m);
+        assert!(text.starts_with("reactive program TICK_REACTIVE"), "{text}");
+        assert!(text.contains("shutdown_must_stop"), "{text}");
+        // `reactive` is a keyword only directly before `program`.
+        let src = "functions REACT\n\nfeature {ANY}\n\n  reactive(n: U64): U64\n    do\n      let program = n\n      program\n    end\n\nend\n";
+        assert!(c3_verify(src, "react.gdl").is_empty());
+    }
+
+    #[test]
+    fn test_d3_form_of_a_reactive_program() {
+        let cut = |from: &str, to: &str| {
+            let s = D3_REACTIVE.replace(from, to);
+            assert_ne!(s, D3_REACTIVE, "tick_reactive.gdl changed: {from}");
+            s
+        };
+        d3_rejects(&cut("  init(args: SEQ[STRING])", "  start(args: SEQ[STRING])"), "missing_init");
+        d3_rejects(&cut("  step(s: TICK_STATE, e: EVENT)", "  stepper(s: TICK_STATE, e: EVENT)"), "missing_step");
+        let main = "  main(args: SEQ[STRING]): U64\n    do\n      0\n    end\n\n  grow(s: TICK_STATE)";
+        d3_rejects(&cut("  grow(s: TICK_STATE)", main), "main_in_reactive");
+        let io = "  helper: IO[EXIT_CODE]\n    do\n      IO.exit(0)\n    end\n\n  grow(s: TICK_STATE)";
+        d3_rejects(&cut("  grow(s: TICK_STATE)", io), "io_in_reactive");
+        d3_rejects(&cut("init(args: SEQ[STRING]): STEP[TICK_STATE]", "init(args: SEQ[STRING]): STEP[NAT]"), "state_type_mismatch");
+        d3_rejects(&cut("step(s: TICK_STATE, e: EVENT): STEP[TICK_STATE]", "step(s: TICK_STATE, e: EVENT): STEP[NAT]"), "state_type_mismatch");
+        d3_rejects(&cut("init(args: SEQ[STRING])", "init(n: NAT)"), "bad_init_signature");
+        d3_rejects(&cut("step(s: TICK_STATE, e: EVENT)", "step(s: TICK_STATE, e: NAT)"), "bad_step_signature");
+        d3_rejects(&cut("step(s: TICK_STATE, e: EVENT)", "step(s: TICK_STATE)"), "bad_step_signature");
+        // Aliases are the same type.
+        let aliased = "reactive program ALIAS\n\nfeature {ANY}\n\n  init(args: SEQ[STRING]): STEP[NAT]\n    do\n      Continue(0, LIST.empty)\n    end\n\n  step(s: U64, e: EVENT): STEP[U64]\n    do\n      Stop(s, LIST.empty)\n    end\n\nend\n";
+        assert!(check_visibility_and_semantics(&parse_user_module_with_prelude(aliased)).iter().all(|d| d.level != "error"));
+        // Parse errors, as for `program`.
+        for (from, to) in [
+            ("reactive program TICK_REACTIVE", "reactive program TICK_REACTIVE[A]"),
+            ("feature {ANY}", "specify {ANY}\n\n  law l\n    ensure\n      t: True\n    end\n\nfeature {ANY}"),
+            ("feature {ANY}", "invariant\n  t: True\n\nfeature {ANY}"),
+        ] {
+            let tokens = tokenize(&cut(from, to)).expect("lexing");
+            assert!(Parser::new(tokens).parse_file().is_err(), "`{to}` must not parse");
+        }
+    }
+
+    #[test]
+    fn test_d3_entry_points_cannot_assume_anything() {
+        // The runtime calls `step` with every event, so a `require` would be an assumption
+        // nobody proves. `require False` would otherwise discharge `shutdown_must_stop`.
+        let vacuous = D3_REACTIVE
+            .replace("step(s: TICK_STATE, e: EVENT): STEP[TICK_STATE]\n    do", "step(s: TICK_STATE, e: EVENT): STEP[TICK_STATE]\n    require\n      never: False\n    do")
+            .replace(r#"Stop(s.value, LIST.empty.prepend(Print("bye")))"#, "Continue(s, LIST.empty)");
+        assert!(vacuous.contains("never: False"), "tick_reactive.gdl changed");
+        d3_rejects(&vacuous, "entry_point_require");
+        let init = D3_REACTIVE.replace("init(args: SEQ[STRING]): STEP[TICK_STATE]\n    do", "init(args: SEQ[STRING]): STEP[TICK_STATE]\n    require\n      t: True\n    do");
+        assert_ne!(init, D3_REACTIVE);
+        d3_rejects(&init, "entry_point_require");
+        // A weaker clause under the same tag does not replace the obligation.
+        let weak = D3_REACTIVE
+            .replace("          grow(s)\n      end\n    end", "          grow(s)\n      end\n    ensure\n      shutdown_must_stop: True\n    end")
+            .replace(r#"Stop(s.value, LIST.empty.prepend(Print("bye")))"#, "Continue(s, LIST.empty)");
+        assert!(weak.contains("shutdown_must_stop: True"), "tick_reactive.gdl changed");
+        d3_rejects(&weak, "shutdown_must_stop");
+    }
+
+    #[test]
+    fn test_d3_step_obligations() {
+        // A step that continues on `Shutdown`.
+        let no_stop = D3_REACTIVE.replace(r#"Stop(s.value, LIST.empty.prepend(Print("bye")))"#, "Continue(s, LIST.empty)");
+        assert_ne!(no_stop, D3_REACTIVE);
+        d3_rejects(&no_stop, "shutdown_must_stop");
+        // The clause is implicit, and the diagnostic still points at `step`.
+        let want = no_stop.lines().position(|l| l.starts_with("  step(")).unwrap() + 1;
+        let diags = d3_diags(&no_stop);
+        let d = diags.iter().find(|d| d.tag == "shutdown_must_stop").unwrap();
+        assert_eq!(d.span.as_ref().map(|s| s.line), Some(want), "{d:?}");
+        // A step that breaks the state's `require`.
+        let no_guard = D3_REACTIVE.replace("if s.has_room then Continue", "if True then Continue");
+        assert_ne!(no_guard, D3_REACTIVE);
+        let diags = d3_diags(&no_guard);
+        assert!(diags.iter().any(|d| d.tag == "room"), "{diags:?}");
+        // An invariant failure names the state's clause.
+        let state = D2_STATE.replace("room: Current.has_room", "room: True");
+        assert_ne!(state, D2_STATE);
+        let mut units = b4_units(&[("tick_state.gdl", &state), ("tick_reactive.gdl", D3_REACTIVE)]);
+        let checked = check_and_verify_project(&mut units, b4_opts(true, true));
+        assert!(checked.diags.iter().any(|(_, d)| d.tag == "within_limit"), "{:?}", checked.diags);
+    }
+
+    #[test]
+    fn test_d3_nothing_may_refer_to_an_entry_point() {
+        let client = "functions USER\n\nfeature {ANY}\n\n  f(n: U64): U64\n    do\n      TARGET.helper(n)\n    end\n\nend\n";
+        let helper = "  helper(n: U64): U64\n    do\n      n\n    end\n\n";
+        for target in [
+            format!("program TARGET\n\nfeature {{ANY}}\n\n{helper}  main(args: SEQ[STRING]): IO[EXIT_CODE]\n    do\n      IO.exit(0)\n    end\n\nend\n"),
+            format!("reactive program TARGET\n\nfeature {{ANY}}\n\n{helper}  init(args: SEQ[STRING]): STEP[NAT]\n    do\n      Stop(0, LIST.empty)\n    end\n\n  step(s: NAT, e: EVENT): STEP[NAT]\n    do\n      Stop(s, LIST.empty)\n    end\n\nend\n"),
+        ] {
+            let mut units = b4_units(&[("target.gdl", &target), ("user.gdl", client)]);
+            let checked = check_and_verify_project(&mut units, b4_opts(true, true));
+            assert!(
+                checked.fatal.iter().any(|d| d.rule == "E0104: entry_point_reference" && d.routine == "USER"),
+                "{:?}",
+                checked.fatal
+            );
+        }
+    }
+
+    #[test]
+    fn test_d3_logic_compiles_to_c_without_a_host_loop_yet() {
+        let mut units = b4_units(&[("tick_state.gdl", D2_STATE), ("tick_reactive.gdl", D3_REACTIVE)]);
+        let checked = check_and_verify_project(&mut units, b4_opts(true, true));
+        assert!(checked.fatal.is_empty());
+        let (root, lib) = (units[1].ast.modules[0].clone(), units[0].ast.modules[0].clone());
+        let (c, errs) = emit_c11_typed(&root, &[&lib]);
+        assert!(errs.is_empty(), "{errs:?}");
+        assert!(c.contains("TICK_REACTIVE__step("), "the step function must be emitted");
     }
 
     /// Verifies a multi-file project (the program last) and returns its diagnostics and C.
