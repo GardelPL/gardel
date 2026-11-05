@@ -1,0 +1,45 @@
+-- The board of the game. It is opaque, so only these routines can build one, and `on_board`
+-- holds for every position the game can ever reach, whatever keys it receives.
+module TRACK_BOARD
+
+representation {NONE}
+  pos: NAT
+
+invariant
+  on_board: pos < 5
+
+create {ANY}
+
+  start: TRACK_BOARD
+    do
+      { pos = 0 }
+    end
+
+feature {ANY}
+
+  at_goal: BOOL
+    do
+      Current.pos = 4
+    end
+
+  left: TRACK_BOARD
+    do
+      if Current.pos > 0 then { pos = Current.pos - 1 } else Current end
+    end
+
+  right: TRACK_BOARD
+    do
+      if Current.pos + 1 < 5 then { pos = Current.pos + 1 } else Current end
+    end
+
+  view: STRING
+    do
+      if Current.pos = 0 then "@...G"
+      else if Current.pos = 1 then ".@..G"
+      else if Current.pos = 2 then "..@.G"
+      else if Current.pos = 3 then "...@G"
+      else "....@"
+      end end end end
+    end
+
+end

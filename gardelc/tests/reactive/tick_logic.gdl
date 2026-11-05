@@ -1,0 +1,27 @@
+functions TICK_LOGIC
+
+feature {ANY}
+
+  init(cap: NAT): STEP[TICK_STATE]
+    do
+      Continue(TICK_STATE.make(cap), LIST.empty.prepend(Print("ready")))
+    end
+
+  grow(s: TICK_STATE): STEP[TICK_STATE]
+    do
+      if s.has_room then Continue(s.bump, LIST.empty) else Continue(s, LIST.empty) end
+    end
+
+  step(s: TICK_STATE, e: EVENT): STEP[TICK_STATE]
+    do
+      match e
+        case Shutdown then
+          Stop(s.value, LIST.empty.prepend(Print("bye")))
+        case _ then
+          grow(s)
+      end
+    ensure
+      shutdown_must_stop: e.is_shutdown implies Result.is_stop
+    end
+
+end

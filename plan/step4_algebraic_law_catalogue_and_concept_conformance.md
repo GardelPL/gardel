@@ -6,7 +6,7 @@
 - [core_library_vs_functional_ideas_review.md](core_library_vs_functional_ideas_review.md) (§2.1, §2.2 Friction Point 2, §3 Workstream 4, §4 Step 4)
 - [core_library.md](core_library.md) (§8 The real differentiator: a library of algebraic laws, §10 Official Core Library)
 - [functional_ideas.md](functional_ideas.md) (§2 Priority 1: Equational reasoning and algebraic laws, §5 Recursion and induction, §7 ADT refinement proofs)
-- [gardel_language_specification_draft_v0_4.md](../spec/gardel_language_specification_draft_v0_4.md) (§9 Concepts, laws and conformance, §10.5 SEQ, §12 Verification, §16 Standard Library)
+- [gardel_language_specification_draft_v0_5.md](../spec/gardel_language_specification_draft_v0_5.md) (§9 Concepts, laws and conformance, §10.5 SEQ, §12 Verification, §16 Standard Library)
 - [peano_ord.gdl](../examples/peano_ord.gdl)
 - [step1_remediate_stdlib_foundations.md](step1_remediate_stdlib_foundations.md)
 - [step2_result_and_composable_option.md](step2_result_and_composable_option.md)
@@ -15,7 +15,7 @@
 - `../stdlib/stdlib.gdl`
 - `../gardelc/stdlib/stdlib.gdl` (if present) / `../gardelc/src/main.rs` (`phase4_stdlib_source()`, concept checker, Boogie emitter for concept laws/triggers, and `--json-diagnostics`)
 - `../examples/peano_ord.gdl`
-- `../spec/gardel_language_specification_draft_v0_4.md` (§9, §16)
+- `../spec/gardel_language_specification_draft_v0_5.md` (§9, §16)
 
 ---
 

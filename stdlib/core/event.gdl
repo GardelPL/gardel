@@ -1,0 +1,25 @@
+module EVENT
+
+representation {ANY}
+  | Tick(id: NAT)
+  | Line(res: RESULT[IO_ERROR, STRING])
+  | Key(key: KEY)
+  | Accepted(conn: CONN_ID)
+  | ListenFailed(port: NAT, err: IO_ERROR)
+  | Received(conn: CONN_ID, data: BYTES)
+  | SendFailed(conn: CONN_ID, err: IO_ERROR)
+  | Closed(conn: CONN_ID)
+  | Shutdown
+
+feature {ANY}
+
+  -- `=` is not available on EVENT, which holds STRING and BYTES payloads (spec §9, §11.6).
+  is_shutdown: BOOL
+    do
+      match Current
+        case Shutdown then True
+        case _ then False
+      end
+    end
+
+end

@@ -1,0 +1,8 @@
+module LIGHT
+
+representation {ANY}
+  | Red
+  | Amber
+  | Green(secs: NAT)
+
+end

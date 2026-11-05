@@ -11,6 +11,7 @@ use std::process::Command;
 use std::rc::Rc;
 
 mod c11_typed;
+mod names;
 mod patterns;
 pub use c11_typed::emit_c11_typed;
 
@@ -20,7 +21,7 @@ pub use c11_typed::emit_c11_typed;
 /// verification, code generation) treat it as the call it is. Locals, parameters, `match`
 /// binders, lambda parameters and quantified variables shadow routine names.
 fn desugar_nullary_calls(m: &mut ModuleDecl) {
-    if !matches!(m.kind, ModuleKind::Program | ModuleKind::Functions) {
+    if m.kind == ModuleKind::Module {
         return;
     }
     let nullary: HashSet<String> = m
@@ -188,12 +189,21 @@ impl Visibility {
     }
 }
 
-/// Distinguishes ADT `module`, stateless `functions`, and effectful `program` declarations (§4, §11).
+/// Distinguishes ADT `module`, stateless `functions`, effectful `program` and non-terminating
+/// `reactive program` declarations (§4, §11, §11.6).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ModuleKind {
     Module,
     Functions,
     Program,
+    ReactiveProgram,
+}
+
+impl ModuleKind {
+    /// A root of the run: nothing may refer to it (`E0104`).
+    pub fn is_entry_point(self) -> bool {
+        matches!(self, ModuleKind::Program | ModuleKind::ReactiveProgram)
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -406,6 +416,42 @@ impl MatchCase {
 
     pub fn top_bindings(&self) -> Vec<Option<String>> {
         self.pattern.top_bindings()
+    }
+
+    /// Whether the arm matches every value (`case _` or a bare binder `case x`).
+    pub fn is_catch_all(&self) -> bool {
+        matches!(self.pattern, Pattern::Wildcard | Pattern::Bind(_))
+    }
+
+    /// The arm's `let`s and body with a bare binder (`case x`) replaced by the scrutinee
+    /// `scrut`, so verifier back ends need no local for it. Other arms are unchanged.
+    pub fn with_binder_substituted(&self, scrut: &Expr) -> (Vec<Stmt>, Expr) {
+        let Pattern::Bind(b) = &self.pattern else {
+            return (self.stmts.clone(), self.body.clone());
+        };
+        let mut stmts = Vec::with_capacity(self.stmts.len());
+        let mut shadowed = false;
+        for st in &self.stmts {
+            if shadowed {
+                stmts.push(st.clone());
+                continue;
+            }
+            stmts.push(match st {
+                Stmt::Let(v, e) => Stmt::Let(v.clone(), subst_expr_var(e, b, scrut)),
+                Stmt::Check(v, e) => Stmt::Check(v.clone(), subst_expr_var(e, b, scrut)),
+                Stmt::Assume(v, e) => Stmt::Assume(v.clone(), subst_expr_var(e, b, scrut)),
+                Stmt::Reveal(v) => Stmt::Reveal(v.clone()),
+            });
+            if matches!(st, Stmt::Let(v, _) if v == b) {
+                shadowed = true;
+            }
+        }
+        let body = if shadowed {
+            self.body.clone()
+        } else {
+            subst_expr_var(&self.body, b, scrut)
+        };
+        (stmts, body)
     }
 }
 
@@ -1141,10 +1187,12 @@ impl Parser {
                 modules.push(self.parse_module_with_kind(ModuleKind::Functions)?);
             } else if self.is_kw("program") {
                 modules.push(self.parse_module_with_kind(ModuleKind::Program)?);
+            } else if self.is_kw("reactive") {
+                modules.push(self.parse_module_with_kind(ModuleKind::ReactiveProgram)?);
             } else {
                 return Err(ParseError {
                     message: format!(
-                        "Expected `concept`, `module`, `functions`, or `program`, got {:?}",
+                        "Expected `concept`, `module`, `functions`, `program`, or `reactive program`, got {:?}",
                         self.peek()
                     ),
                     token_pos: self.pos,
@@ -1276,6 +1324,10 @@ impl Parser {
             ModuleKind::Module => self.expect_kw("module")?,
             ModuleKind::Functions => self.expect_kw("functions")?,
             ModuleKind::Program => self.expect_kw("program")?,
+            ModuleKind::ReactiveProgram => {
+                self.expect_kw("reactive")?;
+                self.expect_kw("program")?;
+            }
         }
         let name = self.expect_upper_ident()?;
         let mut type_params = Vec::new();
@@ -1336,7 +1388,7 @@ impl Parser {
 
         while !self.is_kw("end") {
             if self.is_kw("representation") {
-                if kind == ModuleKind::Functions || kind == ModuleKind::Program {
+                if kind != ModuleKind::Module {
                     return Err(ParseError {
                         message: format!(
                             "Section `representation` is not permitted in `{kind:?}` declaration (§4)"
@@ -1382,9 +1434,9 @@ impl Parser {
                     repr = ReprKind::Product(fields);
                 }
             } else if self.is_kw("specify") {
-                if kind == ModuleKind::Program {
+                if kind.is_entry_point() {
                     return Err(ParseError {
-                        message: "Section `specify` is not permitted in `program` declaration (§4)"
+                        message: "Section `specify` is not permitted in `program` declaration (§4); put lemmas in a `module` or `functions` module"
                             .to_string(),
                         token_pos: self.pos,
                     });
@@ -1399,7 +1451,7 @@ impl Parser {
                     }
                 }
             } else if self.is_kw("create") {
-                if kind == ModuleKind::Functions || kind == ModuleKind::Program {
+                if kind != ModuleKind::Module {
                     return Err(ParseError {
                         message: format!(
                             "Section `create` is not permitted in `{kind:?}` declaration (§4)"
@@ -1419,7 +1471,7 @@ impl Parser {
                     feature_routines.push((vis.clone(), self.parse_routine()?));
                 }
             } else if self.is_kw("invariant") {
-                if kind == ModuleKind::Functions || kind == ModuleKind::Program {
+                if kind != ModuleKind::Module {
                     return Err(ParseError {
                         message: format!(
                             "Section `invariant` is not permitted in `{kind:?}` declaration (§4)"
@@ -1443,6 +1495,16 @@ impl Parser {
         }
         self.expect_kw("end")?;
 
+        if kind == ModuleKind::ReactiveProgram {
+            if !type_params.is_empty() {
+                return Err(ParseError {
+                    message: format!("`reactive program {name}` cannot have type parameters (§15)"),
+                    token_pos: self.pos,
+                });
+            }
+            add_shutdown_obligation(&mut feature_routines);
+        }
+
         let mut m = ModuleDecl {
             kind,
             name,
@@ -1458,7 +1520,15 @@ impl Parser {
             invariants,
         };
         desugar_nullary_calls(&mut m);
-        patterns::desugar_patterns(&mut m);
+        if let Some(site) = patterns::desugar_patterns(&mut m).first() {
+            return Err(ParseError {
+                message: format!(
+                    "E0316: unreachable_match_arm: in `{}.{site}`, a `match` has an arm after `case _` or a bare binder, which can never run. Remove it, or move the catch-all last",
+                    m.name
+                ),
+                token_pos: self.pos,
+            });
+        }
         Ok(m)
     }
 
@@ -2490,8 +2560,93 @@ pub fn check_and_expand_concepts(
     diags
 }
 
+const REACTIVE_VIOLATION: &str = "Phase 4 (Reactive Violation)";
+
+/// The obligation every reactive `step` carries (§11.6, rule 4). It is added whatever the
+/// programmer wrote, so a weaker clause with the same tag cannot stand in for it.
+fn add_shutdown_obligation(feature_routines: &mut [(Visibility, RoutineDecl)]) {
+    let Some((_, step)) = feature_routines.iter_mut().find(|(_, r)| r.name == "step") else {
+        return;
+    };
+    let [_, (event, _)] = step.params.as_slice() else {
+        return; // `bad_step_signature`
+    };
+    let query = |recv: &str, q: &str| {
+        Expr::MethodCall(Box::new(Expr::Var(recv.to_string())), q.to_string(), Vec::new())
+    };
+    let obligation = Expr::BinOp(
+        "implies".to_string(),
+        Box::new(query(event, "is_shutdown")),
+        Box::new(query("Result", "is_stop")),
+    );
+    step.ensures.push(("shutdown_must_stop".to_string(), obligation));
+}
+
+/// The argument of `STEP[..]`, in the C backend's normal form (aliases resolved).
+fn step_state_type(ret: &str) -> Option<String> {
+    let t = c11_typed::cnorm(ret);
+    Some(t.strip_prefix("STEP[")?.strip_suffix(']')?.to_string())
+}
+
+/// The form of a `reactive program` (§11.6, rules 1 and 2).
+fn check_reactive_program(m: &ModuleDecl) -> Vec<Diagnostic> {
+    let mut diags = Vec::new();
+    let mut report = |routine: &str, tag: &str, msg: String| {
+        diags.push(Diagnostic::basic("error", REACTIVE_VIOLATION, routine.to_string(), tag.to_string(), msg));
+    };
+    let find = |n: &str| m.feature_routines.iter().map(|(_, r)| r).find(|r| r.name == n);
+    let (init, step) = (find("init"), find("step"));
+    if init.is_none() {
+        report(&m.name, "missing_init", format!("`{}` needs `init(args: SEQ[STRING]): STEP[S]` (§11.6)", m.name));
+    }
+    if step.is_none() {
+        report(&m.name, "missing_step", format!("`{}` needs `step(s: S, e: EVENT): STEP[S]` (§11.6)", m.name));
+    }
+    if find("main").is_some() {
+        report("main", "main_in_reactive", format!("`{}` has no `main`: the runtime calls `init` and `step` (§11.6)", m.name));
+    }
+    // The runtime calls these with whatever arrives and can prove nothing, so a `require`
+    // would be an unchecked assumption: `require False` would make `step` vacuous.
+    for r in [init, step].into_iter().flatten() {
+        if !r.requires.is_empty() {
+            report(&r.name, "entry_point_require", format!("`{}` cannot have `require`: the runtime calls it with every input, so nothing would prove it (§11.6). Handle the case in the body", r.name));
+        }
+    }
+    let init_state = init.and_then(|r| {
+        let ok = r.type_params.is_empty()
+            && matches!(r.params.as_slice(), [(_, t)] if c11_typed::cnorm(t) == "SEQ[STRING]");
+        let state = step_state_type(&r.ret_type).filter(|_| ok);
+        if state.is_none() {
+            report("init", "bad_init_signature", "`init` must be `init(args: SEQ[STRING]): STEP[S]` (§11.6)".to_string());
+        }
+        state
+    });
+    let step_state = step.and_then(|r| {
+        let param = match r.params.as_slice() {
+            [(_, s), (_, e)] if r.type_params.is_empty() && c11_typed::cnorm(e) == "EVENT" => Some(c11_typed::cnorm(s)),
+            _ => None,
+        };
+        let state = param.zip(step_state_type(&r.ret_type));
+        if state.is_none() {
+            report("step", "bad_step_signature", "`step` must be `step(s: S, e: EVENT): STEP[S]` (§11.6)".to_string());
+        }
+        state
+    });
+    if let Some((param, ret)) = &step_state {
+        if param != ret {
+            report("step", "state_type_mismatch", format!("`step` takes state `{param}` but returns `STEP[{ret}]` (§11.6)"));
+        } else if let Some(s) = init_state.as_ref().filter(|s| *s != param) {
+            report("init", "state_type_mismatch", format!("`init` returns `STEP[{s}]` but `step` takes state `{param}` (§11.6)"));
+        }
+    }
+    diags
+}
+
 pub fn check_visibility_and_semantics(m: &ModuleDecl) -> Vec<Diagnostic> {
     let mut diags = Vec::new();
+    if m.kind == ModuleKind::ReactiveProgram {
+        diags.extend(check_reactive_program(m));
+    }
     let mut symbol_vis: HashMap<String, Visibility> = HashMap::new();
     let mut ghost_symbols: HashSet<String> = HashSet::new();
     let mut known_routines: HashSet<String> = HashSet::new();
@@ -2643,7 +2798,18 @@ pub fn check_visibility_and_semantics(m: &ModuleDecl) -> Vec<Diagnostic> {
                 Stmt::Let(_, e) | Stmt::Check(_, e) | Stmt::Assume(_, e) => expr_uses_io(e),
                 Stmt::Reveal(_) => false,
             });
-        if (is_io_ret || uses_io) && m.kind != ModuleKind::Program {
+        if (is_io_ret || uses_io) && m.kind == ModuleKind::ReactiveProgram {
+            diags.push(Diagnostic::basic(
+                "error",
+                REACTIVE_VIOLATION,
+                r.name.clone(),
+                "io_in_reactive".into(),
+                format!(
+                    "Routine `{}` in `{}` uses `IO`. A reactive program requests effects by returning commands (§11.6)",
+                    r.name, m.name
+                ),
+            ));
+        } else if (is_io_ret || uses_io) && m.kind != ModuleKind::Program {
             diags.push(Diagnostic::basic(
                 "error",
                 "Phase 4 (IO Boundary Violation)",
@@ -3496,6 +3662,26 @@ pub const STDLIB_SOURCES: &[(&str, &str)] = &[
         "stdlib/functional/function_ops.gdl",
         include_str!("../../stdlib/functional/function_ops.gdl"),
     ),
+    (
+        "stdlib/core/conn_id.gdl",
+        include_str!("../../stdlib/core/conn_id.gdl"),
+    ),
+    (
+        "stdlib/core/command.gdl",
+        include_str!("../../stdlib/core/command.gdl"),
+    ),
+    (
+        "stdlib/core/key.gdl",
+        include_str!("../../stdlib/core/key.gdl"),
+    ),
+    (
+        "stdlib/core/event.gdl",
+        include_str!("../../stdlib/core/event.gdl"),
+    ),
+    (
+        "stdlib/core/step.gdl",
+        include_str!("../../stdlib/core/step.gdl"),
+    ),
 ];
 
 /// Returns the canonical Gardel v0.4 Phase 4 Standard Library source package (§3, §5, §10.5, §11, §16).
@@ -3526,6 +3712,16 @@ pub fn phase4_stdlib_source() -> &'static str {
         include_str!("../../stdlib/collections/list_ops.gdl"),
         "\n",
         include_str!("../../stdlib/functional/function_ops.gdl"),
+        "\n",
+        include_str!("../../stdlib/core/conn_id.gdl"),
+        "\n",
+        include_str!("../../stdlib/core/command.gdl"),
+        "\n",
+        include_str!("../../stdlib/core/key.gdl"),
+        "\n",
+        include_str!("../../stdlib/core/event.gdl"),
+        "\n",
+        include_str!("../../stdlib/core/step.gdl"),
     )
 }
 
@@ -3646,7 +3842,8 @@ pub fn collect_monomorphized_instances(prog: &ProgramEnv) -> Vec<ModuleDecl> {
             if let Some(close) = ty.rfind(']') {
                 let base = &ty[..open];
                 let args_str = &ty[open + 1..close];
-                let args: Vec<String> = args_str.split(',').map(|s| s.trim().to_string()).collect();
+                let args: Vec<String> =
+                    split_top_level_commas(args_str).iter().map(|s| s.trim().to_string()).collect();
                 return Some((base.to_string(), args));
             }
         }
@@ -4137,6 +4334,10 @@ thread_local! {
         std::cell::RefCell::new(HashMap::new());
 }
 
+fn elem_env_type(v: &str) -> Option<String> {
+    ELEM_TYPE_ENV.with(|env| env.borrow().get(v).cloned())
+}
+
 fn elem_env_bind(v: &str, ty: &str) {
     ELEM_TYPE_ENV.with(|env| {
         env.borrow_mut().insert(v.to_string(), ty.to_string());
@@ -4172,6 +4373,11 @@ fn elem_receiver_type(e: &Expr, m: &ModuleDecl) -> Option<String> {
             let rt = elem_receiver_type(recv, m)?;
             if rt != module_self_type(m) && rt != m.name {
                 return None;
+            }
+            if let ReprKind::Product(fields) = &m.repr {
+                if let Some((_, ty)) = fields.iter().find(|(f, _)| f == r) {
+                    return Some(ty.clone());
+                }
             }
             let (rd, _) = find_module_routine(m, r)?;
             Some(if rd.ret_type == "Current" {
@@ -4346,6 +4552,7 @@ fn top_level_decls(ast: &FileAst) -> Vec<(&str, &'static str)> {
                 ModuleKind::Module => "module",
                 ModuleKind::Functions => "functions",
                 ModuleKind::Program => "program",
+                ModuleKind::ReactiveProgram => "reactive program",
             };
             (m.name.as_str(), kw)
         }))
@@ -4476,6 +4683,36 @@ pub fn check_file_module_name(unit: &SourceUnit, strict: bool) -> Vec<Diagnostic
     .with_ai_context(sp, Vec::new(), BTreeMap::new(), Vec::new())]
 }
 
+/// `E0104: entry_point_reference` (§4): a `program` or `reactive program` is a root of the
+/// run, so no other module may refer to it. Shared logic goes in a `functions` module.
+pub fn check_entry_point_references(units: &[SourceUnit], table: &LinkTable) -> Vec<Diagnostic> {
+    let mut diags = Vec::new();
+    for (m, entry) in table.entry_point_references() {
+        let found = units.iter().find_map(|u| {
+            top_level_decls(&u.ast)
+                .into_iter()
+                .find(|(n, _)| *n == m.name)
+                .map(|(_, kw)| locate_decl_header(&u.src, &u.path, kw, &m.name))
+        });
+        let mut d = Diagnostic::basic(
+            "error",
+            "E0104: entry_point_reference",
+            m.name.clone(),
+            "entry_point_reference".to_string(),
+            format!(
+                "E0104: entry_point_reference: `{}` refers to the entry point `{}`. Nothing may refer to a `program` or `reactive program`: move the shared code to a `functions` module (§4)",
+                m.name, entry.name
+            ),
+        )
+        .with_module(&m.name);
+        if let Some(sp) = found {
+            d = d.with_ai_context(sp, Vec::new(), BTreeMap::new(), Vec::new());
+        }
+        diags.push(d);
+    }
+    diags
+}
+
 /// `E0103: cyclic_module_dependency` (§4.2.3, §4.3): user modules of different files that
 /// reference each other in a cycle. Each module's verification uses the contracts of the
 /// modules it references as axioms, so a cross-file cycle would make the proofs circular;
@@ -4526,11 +4763,15 @@ pub fn check_module_dependency_cycles(units: &[SourceUnit], table: &LinkTable) -
     )]
 }
 
+/// What the reactive host links with for sockets (spec 11.6). A library no code calls adds
+/// nothing to the program.
+pub const GCC_NET_LIBS: &[&str] = if cfg!(windows) { &["-lws2_32"] } else { &[] };
+
 /// Prelude modules whose background theory is injected into user Boogie contexts.
 /// `STRING` is injected for modules that mention it, contain string literals or use `IO`
 /// (Task B.3: literals denote prelude `STRING` values); `LIST_OPS` / `FUNCTION_OPS` are realized by the built-in
 /// `Seq_*` / `Fn1_*` preamble theories already present in every Boogie file.
-const BOOGIE_INJECTED_PRELUDE: [&str; 8] = [
+const BOOGIE_INJECTED_PRELUDE: [&str; 13] = [
     "OPTION",
     "RESULT",
     "SEQ",
@@ -4539,6 +4780,11 @@ const BOOGIE_INJECTED_PRELUDE: [&str; 8] = [
     "STRING_ERROR",
     "STRING",
     "IO_ERROR",
+    "CONN_ID",
+    "COMMAND",
+    "KEY",
+    "EVENT",
+    "STEP",
 ];
 
 /// Marker on the opaque declaration of another prelude module's sort that a module's
@@ -4643,12 +4889,15 @@ impl BoogiePreludeCtx {
                 }
             }
         }
+        // A user constructor wins over a prelude one (spec §4.1): the prelude grows with
+        // new variants, and that must not change what existing user code means.
+        let mut user_ctors = HashSet::new();
         for n in &linked {
             if let ReprKind::Sum(vs) = &n.repr {
                 for v in vs {
-                    ctor_owner
-                        .entry(v.name.clone())
-                        .or_insert_with(|| n.name.clone());
+                    if user_ctors.insert(v.name.clone()) {
+                        ctor_owner.insert(v.name.clone(), n.name.clone());
+                    }
                 }
             }
         }
@@ -4801,6 +5050,19 @@ impl LinkTable {
 
     /// A cycle of cross-file module references, if any (as a list of module names, the
     /// first repeated at the end).
+    /// Every (module, entry point it refers to) pair of the run.
+    fn entry_point_references(&self) -> Vec<(&ModuleDecl, &ModuleDecl)> {
+        let mut refs = Vec::new();
+        for m in &self.modules {
+            for n in self.direct_links(m) {
+                if n.kind.is_entry_point() {
+                    refs.push((m, n));
+                }
+            }
+        }
+        refs
+    }
+
     pub fn find_cycle(&self) -> Option<Vec<String>> {
         let edges: HashMap<&str, Vec<&str>> = self
             .modules
@@ -4974,6 +5236,11 @@ thread_local! {
     static BOOGIE_LIFTED_LAMBDAS: std::cell::RefCell<String> =
         const { std::cell::RefCell::new(String::new()) };
     static BOOGIE_LAMBDA_COUNTER: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// Procedure locals for the binders and lambda parameters of nested expressions (see
+    /// `emit_boogie_expr_obligations`), drained by `emit_boogie_verify_routine`.
+    static BOOGIE_OBLIGATION_LOCALS: std::cell::RefCell<Vec<(String, String)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+    static BOOGIE_OBLIGATION_COUNTER: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 /// Variables of `e` (and of the statements of nested blocks) that are not bound inside it.
@@ -5271,7 +5538,7 @@ fn bind_boogie_env_type(v: &str, ty: &str) {
 
 /// Task B.3 / §9: static checks on prelude `STRING` values in a user module (prelude mode).
 ///
-/// * `E0311 non_canonical_string_equality`: `a = b` with a `STRING` operand. `STRING` is
+/// * `E0311 non_canonical_equality`: `a = b` with a `STRING` operand. `STRING` is
 ///   `EQ` but not `CANONICAL_EQ` (two values with equal `chars` may differ in hidden
 ///   capacity), so structural Leibniz `=` is forbidden (§9); use `a.equals(b)` or
 ///   `a.chars = b.chars`.
@@ -5307,7 +5574,7 @@ fn type_satisfies(ty: &str, concept: &str, m: &ModuleDecl, ctx: &BoogiePreludeCt
     let ty = ty.trim();
     if matches!(
         ty,
-        "U64" | "NAT" | "I64" | "INT" | "BOOL" | "CHAR" | "UNIT" | "()" | "EXIT_CODE"
+        "U64" | "NAT" | "I64" | "INT" | "BOOL" | "CHAR" | "UNIT" | "()" | "EXIT_CODE" | "MATH_INT"
     ) {
         return matches!(concept, "EQ" | "CANONICAL_EQ" | "ORD");
     }
@@ -5605,14 +5872,128 @@ pub fn check_where_constraints(m: &ModuleDecl, src: &str, input_path: &str) -> V
         .collect()
 }
 
+/// Where an expression sits, for the equality rule (§9).
+struct EqSite<'a> {
+    routine: &'a str,
+    /// Type parameters of the routine.
+    type_params: &'a [String],
+    /// In code that runs. A contract is proven and erased, so it is held to less.
+    runtime: bool,
+}
+
+impl EqSite<'_> {
+    fn contract(&self) -> EqSite<'_> {
+        EqSite { routine: self.routine, type_params: self.type_params, runtime: false }
+    }
+}
+
+/// Whether a contract may not use `=` on `ty` (§9): the type says equality is not structural,
+/// by declaring `EQ` without `CANONICAL_EQ`, or holds such a type. `F64` is not reflexive, and
+/// the layout of a type opaque to `m` is not `m`'s to compare. A type parameter can be: a
+/// contract on one says that a generic routine returns this very value.
+fn leibniz_forbidden(ty: &str, m: &ModuleDecl, ctx: &BoogiePreludeCtx, seen: &mut Vec<String>) -> bool {
+    let ty = ty.trim();
+    if ty == "F64" {
+        return true;
+    }
+    if seen.iter().any(|s| s == ty) {
+        return false;
+    }
+    seen.push(ty.to_string());
+    let (head, args) = split_type_app(ty);
+    if head == "LIST" {
+        return false;
+    }
+    if head == "TUPLE" {
+        return args.iter().any(|a| leibniz_forbidden(a, m, ctx, seen));
+    }
+    let Some(owner) = (if head == m.name { Some(m) } else { ctx.module(head) }) else {
+        return false;
+    };
+    if let Some(sat) = &owner.satisfies {
+        let closure: Vec<String> = sat.concepts.iter().flat_map(|c| concept_closure(c)).collect();
+        if closure.iter().any(|c| c == "EQ") && !closure.iter().any(|c| c == "CANONICAL_EQ") {
+            return true;
+        }
+    }
+    let visible = owner.name == m.name
+        || match &owner.repr_vis {
+            Visibility::Any => true,
+            Visibility::None => false,
+            Visibility::Modules(ms) => ms.iter().any(|n| n == &m.name),
+        };
+    let canonical = owner.satisfies.as_ref().is_some_and(|sat| {
+        sat.concepts.iter().flat_map(|c| concept_closure(c)).any(|c| c == "CANONICAL_EQ")
+    });
+    if !visible && !canonical {
+        return true;
+    }
+    if args.iter().any(|a| leibniz_forbidden(a, m, ctx, seen)) {
+        return true;
+    }
+    if canonical {
+        return false;
+    }
+    // A plain ADT is compared field by field.
+    let fields: Vec<&String> = match &owner.repr {
+        ReprKind::Product(fs) => fs.iter().map(|(_, t)| t).collect(),
+        ReprKind::Sum(vs) => vs.iter().flat_map(|v| v.fields.iter().map(|(_, t)| t)).collect(),
+    };
+    fields.into_iter().any(|t| leibniz_forbidden(t, m, ctx, seen))
+}
+
+/// Whether running code may compare `ty` with `=` (§9): the comparison is a real structural
+/// one in C, so the type must be primitive, a `LIST` or a `TUPLE` of such, or `CANONICAL_EQ`.
+fn leibniz_runtime_allowed(ty: &str, m: &ModuleDecl, ctx: &BoogiePreludeCtx, site: &EqSite<'_>) -> bool {
+    let ty = ty.trim();
+    let (head, args) = split_type_app(ty);
+    if matches!(head, "LIST" | "TUPLE") {
+        return args.iter().all(|a| leibniz_runtime_allowed(a, m, ctx, site));
+    }
+    if site.type_params.iter().any(|t| t == ty) {
+        return false; // a routine's type parameter has no bound
+    }
+    type_satisfies(ty, "CANONICAL_EQ", m, ctx)
+}
+
+/// True for the name of a constructor with no fields.
+fn is_nullary_ctor(e: &Expr, m: &ModuleDecl, ctx: &BoogiePreludeCtx) -> bool {
+    let name = match e {
+        Expr::Var(v) => v,
+        Expr::Call(f, args) if args.is_empty() => f,
+        _ => return false,
+    };
+    let nullary = |o: &ModuleDecl| matches!(&o.repr, ReprKind::Sum(vs) if vs.iter().any(|v| &v.name == name && v.fields.is_empty()));
+    nullary(m) || ctx.modules.iter().any(nullary)
+}
+
+/// `E0311: non_canonical_equality` for the expression `l = r`, or `None` (§9).
+fn equality_violation(e: &Expr, l: &Expr, r: &Expr, m: &ModuleDecl, ctx: &BoogiePreludeCtx, site: &EqSite<'_>) -> Option<String> {
+    let (tl, tr) = (infer_gardel_type(l, m, ctx), infer_gardel_type(r, m, ctx));
+    let text = format_gardel_expr(e);
+    let advice = "use `a.equals(b)` or compare models (`a.model = b.model`)";
+    for t in tl.iter().chain(tr.iter()) {
+        if leibniz_forbidden(t, m, ctx, &mut Vec::new()) {
+            return Some(format!("E0311: non_canonical_equality: `{text}` compares `{t}` with structural `=`, which is not its equality (§9): {advice}"));
+        }
+    }
+    if !site.runtime {
+        return None;
+    }
+    let Some(t) = tl.as_ref().or(tr.as_ref()) else {
+        return Some(format!("E0311: non_canonical_equality: `{text}` runs, and the type of its operands cannot be inferred, so `=` cannot be checked (§9)"));
+    };
+    if leibniz_runtime_allowed(t, m, ctx, site) || is_nullary_ctor(l, m, ctx) || is_nullary_ctor(r, m, ctx) {
+        return None;
+    }
+    Some(format!("E0311: non_canonical_equality: `{text}` runs, and `{t}` is not `CANONICAL_EQ`, so `=` would compare structure (§9): {advice}, or declare `satisfies CANONICAL_EQ`"))
+}
+
 pub fn check_string_semantics(m: &ModuleDecl, src: &str, input_path: &str) -> Vec<Diagnostic> {
     if !prelude_injection_enabled() || standard_prelude().declares(&m.name) {
         return Vec::new();
     }
     let ctx = Rc::new(BoogiePreludeCtx::for_module(m));
-    if ctx.module("STRING").is_none() {
-        return Vec::new();
-    }
     let prev = BOOGIE_PRELUDE_CTX.with(|c| c.replace(Some(ctx.clone())));
     let mut found: Vec<(String, &'static str, String)> = Vec::new();
 
@@ -5628,7 +6009,7 @@ pub fn check_string_semantics(m: &ModuleDecl, src: &str, input_path: &str) -> Ve
     }
     fn walk_stmts(
         stmts: &[Stmt],
-        rn: &str,
+        rn: &EqSite<'_>,
         m: &ModuleDecl,
         ctx: &BoogiePreludeCtx,
         out: &mut Vec<(String, &'static str, String)>,
@@ -5641,14 +6022,14 @@ pub fn check_string_semantics(m: &ModuleDecl, src: &str, input_path: &str) -> Ve
                         bind_boogie_env_type(v, &t);
                     }
                 }
-                Stmt::Check(_, e) | Stmt::Assume(_, e) => walk(e, rn, m, ctx, out),
+                Stmt::Check(_, e) | Stmt::Assume(_, e) => walk(e, &rn.contract(), m, ctx, out),
                 Stmt::Reveal(_) => {}
             }
         }
     }
     fn walk(
         e: &Expr,
-        rn: &str,
+        rn: &EqSite<'_>,
         m: &ModuleDecl,
         ctx: &BoogiePreludeCtx,
         out: &mut Vec<(String, &'static str, String)>,
@@ -5658,18 +6039,13 @@ pub fn check_string_semantics(m: &ModuleDecl, src: &str, input_path: &str) -> Ve
                 walk(l, rn, m, ctx, out);
                 walk(r, rn, m, ctx, out);
                 let s_operand = is_string(l, m, ctx) || is_string(r, m, ctx);
-                if op == "=" && s_operand {
-                    out.push((
-                        rn.to_string(),
-                        "E0311: non_canonical_string_equality",
-                        format!(
-                            "E0311: non_canonical_string_equality: `{}` compares STRING values with structural `=`; STRING satisfies EQ but not CANONICAL_EQ (§9), so use `a.equals(b)` or `a.chars = b.chars`",
-                            format_gardel_expr(e)
-                        ),
-                    ));
+                if op == "=" {
+                    if let Some(msg) = equality_violation(e, l, r, m, ctx, rn) {
+                        out.push((rn.routine.to_string(), "E0311: non_canonical_equality", msg));
+                    }
                 } else if op == "+" && s_operand {
                     out.push((
-                        rn.to_string(),
+                        rn.routine.to_string(),
                         "E0312: string_plus_operator",
                         format!(
                             "E0312: string_plus_operator: `{}` applies `+` to STRING; `+` is not part of the prelude STRING API (§3.1); use `a.concat(b)`",
@@ -5696,7 +6072,7 @@ pub fn check_string_semantics(m: &ModuleDecl, src: &str, input_path: &str) -> Ve
                 for c in cases {
                     if pat_has_str(&c.pattern) {
                         out.push((
-                            rn.to_string(),
+                            rn.routine.to_string(),
                             "E0313: string_literal_pattern",
                             format!(
                                 "E0313: string_literal_pattern: `case {}` matches a STRING structurally; STRING is not CANONICAL_EQ (§9), use `if s.equals(...)`",
@@ -5745,23 +6121,27 @@ pub fn check_string_semantics(m: &ModuleDecl, src: &str, input_path: &str) -> Ve
         .map(|(_, r)| r);
     for r in routines {
         set_boogie_type_env(m, &r.params, Some(&r.ret_type));
+        let ghost = m.specify_routines.iter().any(|(_, g)| std::ptr::eq(g, r));
+        let body = EqSite { routine: &r.name, type_params: &r.type_params, runtime: !ghost };
+        let contract = body.contract();
         for (_, e) in &r.requires {
-            walk(e, &r.name, m, &ctx, &mut found);
+            walk(e, &contract, m, &ctx, &mut found);
         }
-        walk_stmts(&r.stmts, &r.name, m, &ctx, &mut found);
-        walk(&r.body, &r.name, m, &ctx, &mut found);
+        walk_stmts(&r.stmts, &body, m, &ctx, &mut found);
+        walk(&r.body, &body, m, &ctx, &mut found);
         for (_, e) in &r.ensures {
-            walk(e, &r.name, m, &ctx, &mut found);
+            walk(e, &contract, m, &ctx, &mut found);
         }
     }
     for (_, law) in &m.specify_laws {
         set_boogie_type_env(m, &law.params, None);
+        let site = EqSite { routine: &law.name, type_params: &[], runtime: false };
         for (_, e) in law.requires.iter().chain(law.ensures.iter()) {
-            walk(e, &law.name, m, &ctx, &mut found);
+            walk(e, &site, m, &ctx, &mut found);
         }
-        walk_stmts(&law.stmts, &law.name, m, &ctx, &mut found);
+        walk_stmts(&law.stmts, &site, m, &ctx, &mut found);
         if let Some(b) = &law.body {
-            walk(b, &law.name, m, &ctx, &mut found);
+            walk(b, &site, m, &ctx, &mut found);
         }
     }
     clear_boogie_type_env();
@@ -5918,12 +6298,13 @@ fn infer_gardel_type(e: &Expr, m: &ModuleDecl, ctx: &BoogiePreludeCtx) -> Option
             )
         }
         Expr::Bool(_) | Expr::UnaryNot(_) => Some("BOOL".to_string()),
-        Expr::BinOp(op, l, _) => {
+        Expr::BinOp(op, l, rhs) => {
             if matches!(
                 op.as_str(),
                 "+" | "-" | "*" | "/" | "%" | "+%" | "-%" | "*%" | "&" | "|" | "^" | "<<" | ">>"
             ) {
-                infer_gardel_type(l, m, ctx).or_else(|| Some("NAT".to_string()))
+                let typed = if matches!(&**l, Expr::Int(_)) { rhs } else { l };
+                infer_gardel_type(typed, m, ctx).or_else(|| Some("NAT".to_string()))
             } else {
                 Some("BOOL".to_string())
             }
@@ -6667,6 +7048,18 @@ fn emit_boogie_parts(m: &ModuleDecl, fuel_limit: usize) -> BoogieParts {
     out.push_str(
         "function {:inline} in_i64(x: int) returns (bool) { I64_MIN <= x && x <= I64_MAX }\n\n",
     );
+    // `/` and `%` truncate toward zero, as C does. Boogie's `div` and `mod` are Euclidean,
+    // which agrees only for a non-negative dividend, so that is the only case they serve.
+    out.push_str(
+        "function {:inline} gdl_div(x: int, y: int) returns (int) { if x >= 0 then x div y else -((-x) div y) }\n",
+    );
+    out.push_str(
+        "function {:inline} gdl_mod(x: int, y: int) returns (int) { if x >= 0 then x mod y else -((-x) mod y) }\n",
+    );
+    // The `I64` value of 64 bits read as a `U64`.
+    out.push_str(
+        "function {:inline} i64_of_bits(x: int) returns (int) { if x > I64_MAX then x - 18446744073709551616 else x }\n\n",
+    );
 
     out.push_str("type Unit;\n");
     out.push_str("const unique Unit_val: Unit;\n");
@@ -7248,6 +7641,8 @@ fn emit_boogie_parts(m: &ModuleDecl, fuel_limit: usize) -> BoogieParts {
             for (fnm, fty) in fields {
                 if fty == "NAT" || fty == "U64" {
                     clauses.push(format!("  in_u64({}_{}(Current))", m.name, fnm));
+                } else if fty == "INT" || fty == "I64" {
+                    clauses.push(format!("  in_i64({}_{}(Current))", m.name, fnm));
                 } else if fty == "CHAR" {
                     clauses.push(format!("  in_char({}_{}(Current))", m.name, fnm));
                 }
@@ -7348,6 +7743,8 @@ fn emit_boogie_parts(m: &ModuleDecl, fuel_limit: usize) -> BoogieParts {
             call_args_f.push(pn.clone());
             if pt == "NAT" || pt == "U64" {
                 pre_guards.push(format!("in_u64({pn})"));
+            } else if pt == "INT" || pt == "I64" {
+                pre_guards.push(format!("in_i64({pn})"));
             } else if pt == "CHAR" {
                 pre_guards.push(format!("in_char({pn})"));
             } else if !m.invariants.is_empty()
@@ -7450,6 +7847,8 @@ fn emit_boogie_parts(m: &ModuleDecl, fuel_limit: usize) -> BoogieParts {
         let mut post_clauses = Vec::new();
         if r.ret_type == "NAT" || r.ret_type == "U64" {
             post_clauses.push(format!("in_u64({fn_f_app})"));
+        } else if r.ret_type == "INT" || r.ret_type == "I64" {
+            post_clauses.push(format!("in_i64({fn_f_app})"));
         } else if r.ret_type == "CHAR" {
             post_clauses.push(format!("in_char({fn_f_app})"));
         } else if r.ret_type == m.name
@@ -8200,22 +8599,20 @@ fn map_boogie_type(ty: &str, m: &ModuleDecl) -> String {
     if let Some(inner) = ty.strip_prefix("IO[").and_then(|s| s.strip_suffix(']')) {
         return format!("(IO {})", map_boogie_type(inner.trim(), m));
     }
+    // Type arguments are split at top-level commas only, so nested arguments such as
+    // `BOX[TUPLE[A, B]]` or `TUPLE[RESULT[A, E], B]` keep their own commas.
     if let Some(inner) = ty.strip_prefix("TUPLE[").and_then(|s| s.strip_suffix(']')) {
-        let parts: Vec<String> = inner
-            .split(',')
-            .map(|p| map_boogie_type(p.trim(), m))
+        let parts: Vec<String> = split_top_level_commas(inner)
+            .into_iter()
+            .map(|p| map_boogie_type(p, m))
             .collect();
         if parts.len() == 2 {
             return format!("(Tuple2 {} {})", parts[0], parts[1]);
         }
     }
-    if let Some(idx) = ty.find('[') {
-        let base = &ty[..idx];
-        let inner = &ty[idx + 1..ty.len() - 1];
-        let parts: Vec<String> = inner
-            .split(',')
-            .map(|p| map_boogie_type(p.trim(), m))
-            .collect();
+    let (base, args) = split_type_app(ty);
+    if !args.is_empty() {
+        let parts: Vec<String> = args.iter().map(|p| map_boogie_type(p, m)).collect();
         return format!("({base} {})", parts.join(" "));
     }
     ty.to_string()
@@ -8259,6 +8656,8 @@ fn emit_boogie_verify_routine(
     for (pn, pt) in &r.params {
         if pt == "NAT" || pt == "U64" {
             s.push_str(&format!("  requires in_u64({pn});\n"));
+        } else if pt == "INT" || pt == "I64" {
+            s.push_str(&format!("  requires in_i64({pn});\n"));
         } else if pt == "CHAR" {
             s.push_str(&format!("  requires in_char({pn});\n"));
         } else if !m.invariants.is_empty()
@@ -8293,20 +8692,13 @@ fn emit_boogie_verify_routine(
 
     let mut locals = Vec::new();
     collect_proc_locals(&r.stmts, &r.body, r, m, &mut locals);
-    let mut seen_locals = HashSet::new();
-    for (vname, bty) in &locals {
-        if seen_locals.insert(vname.clone()) {
-            s.push_str(&format!("  var {vname}: {bty};\n"));
-        }
-    }
-    s.push_str(&emit_string_literal_lemma_calls(strings));
+    let mut code = emit_string_literal_lemma_calls(strings);
     for (_, req_e) in &r.requires {
-        s.push_str(&emit_from_scalar_obligation(
+        code.push_str(&emit_from_scalar_obligation(
             req_e, &r.name, m, &revealed, "  ", strings,
         ));
     }
-
-    s.push_str(&emit_boogie_proc_stmts_and_ret(
+    code.push_str(&emit_boogie_proc_stmts_and_ret(
         &r.stmts,
         &r.body,
         r,
@@ -8315,6 +8707,15 @@ fn emit_boogie_verify_routine(
         2,
         strings,
     ));
+    // Emitting the body may have added locals for nested binders and lambda parameters.
+    locals.extend(BOOGIE_OBLIGATION_LOCALS.with(|l| std::mem::take(&mut *l.borrow_mut())));
+    let mut seen_locals = HashSet::new();
+    for (vname, bty) in &locals {
+        if seen_locals.insert(vname.clone()) {
+            s.push_str(&format!("  var {vname}: {bty};\n"));
+        }
+    }
+    s.push_str(&code);
 
     let returns_mod = r.ret_type == "Current"
         || r.ret_type == m.name
@@ -8389,6 +8790,8 @@ fn emit_boogie_verify_law(
             s.push_str(&format!("  requires {}_Invariant({pn});\n", m.name));
         } else if pt == "NAT" || pt == "U64" {
             s.push_str(&format!("  requires in_u64({pn});\n"));
+        } else if pt == "INT" || pt == "I64" {
+            s.push_str(&format!("  requires in_i64({pn});\n"));
         } else if pt == "CHAR" {
             s.push_str(&format!("  requires in_char({pn});\n"));
         }
@@ -9033,6 +9436,8 @@ impl LawProofCtx<'_> {
     /// to *other* laws contribute nothing (no cross-law assumption, which could be circular).
     fn stmts(&mut self, e: &Expr, pad: &str) -> String {
         match e {
+            // A block written as an expression by pattern compilation.
+            Expr::If(c, ts, te, _, _) if matches!(**c, Expr::Bool(true)) => self.block(ts, te, pad),
             Expr::Call(f, args) if f == &self.law.name => self.recursive_call(args, pad),
             Expr::Bool(true) => String::new(),
             Expr::Call(f, _) if self.m.specify_laws.iter().any(|(_, l)| &l.name == f) => {
@@ -9046,13 +9451,9 @@ impl LawProofCtx<'_> {
             Expr::If(c, ts, te, es, ee) => {
                 let mut s = format!("{pad}if ({}) {{\n", self.emit(c));
                 let inner = format!("{pad}  ");
-                if ts.is_empty() {
-                    s.push_str(&self.stmts(te, &inner));
-                }
+                s.push_str(&self.block(ts, te, &inner));
                 s.push_str(&format!("{pad}}} else {{\n"));
-                if es.is_empty() {
-                    s.push_str(&self.stmts(ee, &inner));
-                }
+                s.push_str(&self.block(es, ee, &inner));
                 s.push_str(&format!("{pad}}}\n"));
                 s
             }
@@ -9061,7 +9462,23 @@ impl LawProofCtx<'_> {
                 let mut s = String::new();
                 let mut first = true;
                 for c in cases {
+                    if c.is_catch_all() {
+                        // The final `else`. E0316 guarantees that it is the last arm.
+                        let (stmts, body) = c.with_binder_substituted(scrut);
+                        if first {
+                            return self.block(&stmts, &body, pad);
+                        }
+                        s.push_str(&format!("{pad}}} else {{\n"));
+                        s.push_str(&self.block(&stmts, &body, &format!("{pad}  ")));
+                        break;
+                    }
                     let Some((prefix, vdecl)) = boogie_match_variant(c.ctor(), self.m) else {
+                        // Skipping the arm would silently lose its proof steps.
+                        s.push_str(&format!(
+                            "{pad}assert {{:msg \"{}::check::unknown_constructor_{}\"}} false;\n",
+                            self.law_ctx,
+                            c.ctor()
+                        ));
                         continue;
                     };
                     let kw = if first { "if" } else { "} else if" };
@@ -9074,6 +9491,21 @@ impl LawProofCtx<'_> {
                     let depth = self.scope.len();
                     for (opt_b, (fname, fty)) in c.top_bindings().iter().zip(vdecl.fields.iter()) {
                         if let Some(b) = opt_b {
+                            // A field typed by a type parameter of another module has no
+                            // type this context can name (`Some(val: A)` in a client), so
+                            // the binder stands for the projection itself.
+                            let foreign_generic = !prefix.is_empty()
+                                && boogie_prelude_ctx().is_some_and(|ctx| {
+                                    ctx.module(prefix.trim_end_matches("__")).is_some_and(|o| {
+                                        fty.split(|ch: char| !ch.is_alphanumeric() && ch != '_')
+                                            .any(|tok| o.type_params.iter().any(|tp| tp == tok))
+                                    })
+                                });
+                            if foreign_generic {
+                                let proj = format!("{prefix}{}_{fname}({scrut_bpl})", c.ctor());
+                                self.scope.push((b.clone(), proj));
+                                continue;
+                            }
                             let local = format!("_lb{}_{b}", self.locals.len());
                             self.locals
                                 .push((local.clone(), map_boogie_type(fty, self.m)));
@@ -9084,9 +9516,7 @@ impl LawProofCtx<'_> {
                             self.scope.push((b.clone(), local));
                         }
                     }
-                    if c.stmts.is_empty() {
-                        s.push_str(&self.stmts(&c.body, &inner));
-                    }
+                    s.push_str(&self.block(&c.stmts, &c.body, &inner));
                     self.scope.truncate(depth);
                 }
                 if !first {
@@ -9100,6 +9530,33 @@ impl LawProofCtx<'_> {
                 self.emit(e)
             ),
         }
+    }
+}
+
+impl LawProofCtx<'_> {
+    /// The statements of a block in a law body, then its proof steps. `let`s are substituted
+    /// (a law body is pure, and its `let`s need no Boogie locals). Nothing is skipped: a block
+    /// holds the bindings of a compiled pattern, and the proof steps that depend on them.
+    fn block(&mut self, stmts: &[Stmt], body: &Expr, pad: &str) -> String {
+        let mut s = String::new();
+        let mut substs: Vec<(String, Expr)> = Vec::new();
+        for st in stmts {
+            match st {
+                Stmt::Let(v, e) => {
+                    let val = subst_expr_vars(e, &substs);
+                    substs.retain(|(target, _)| target != v);
+                    substs.push((v.clone(), val));
+                }
+                Stmt::Check(_, e) => s.push_str(&self.stmts(&subst_expr_vars(e, &substs), pad)),
+                Stmt::Assume(_, e) => {
+                    let e = self.emit(&subst_expr_vars(e, &substs));
+                    s.push_str(&format!("{pad}assume {e};\n"));
+                }
+                Stmt::Reveal(_) => {}
+            }
+        }
+        s.push_str(&self.stmts(&subst_expr_vars(body, &substs), pad));
+        s
     }
 }
 
@@ -9147,6 +9604,9 @@ fn collect_proc_locals(
                 }
                 None => infer_boogie_expr_type(e, r, m),
             };
+            if numeric_kind(e, m) == NumKind::Signed {
+                bind_signed_local(v);
+            }
             out.push((v.clone(), bty));
             collect_proc_locals(&[], e, r, m, out);
         }
@@ -9157,23 +9617,9 @@ fn collect_proc_locals(
             collect_proc_locals(es, ee, r, m, out);
         }
         Expr::Match(scrut, cases) => {
-            let ctx = boogie_prelude_ctx();
             for c in cases {
                 if let Some((proj_prefix, vdecl)) = boogie_match_variant(c.ctor(), m) {
-                    // Prelude variant fields are instantiated from the scrutinee's type.
-                    let mut inst = HashMap::new();
-                    if let (false, Some(ctx)) = (proj_prefix.is_empty(), ctx.as_ref()) {
-                        if let Some(owner) = ctx.module(proj_prefix.trim_end_matches('_')) {
-                            if let Some(st) = infer_gardel_type(scrut, m, ctx) {
-                                unify_type(
-                                    &module_self_type(owner),
-                                    &st,
-                                    &owner.type_params,
-                                    &mut inst,
-                                );
-                            }
-                        }
-                    }
+                    let inst = match_field_instantiation(scrut, &proj_prefix, m);
                     for (opt_b, (_, fty)) in c.top_bindings().iter().zip(vdecl.fields.iter()) {
                         if let Some(b) = opt_b {
                             if proj_prefix.is_empty() {
@@ -9205,6 +9651,27 @@ fn collect_proc_locals(
         }
         _ => {}
     }
+}
+
+/// Type arguments of a prelude constructor's fields, from the type of `scrut`. A module's
+/// own constructors (`proj_prefix` empty) use the field types as declared.
+fn match_field_instantiation(
+    scrut: &Expr,
+    proj_prefix: &str,
+    m: &ModuleDecl,
+) -> HashMap<String, String> {
+    let mut inst = HashMap::new();
+    if proj_prefix.is_empty() {
+        return inst;
+    }
+    if let Some(ctx) = boogie_prelude_ctx() {
+        if let Some(owner) = ctx.module(proj_prefix.trim_end_matches('_')) {
+            if let Some(st) = infer_gardel_type(scrut, m, &ctx) {
+                unify_type(&module_self_type(owner), &st, &owner.type_params, &mut inst);
+            }
+        }
+    }
+    inst
 }
 
 fn infer_boogie_expr_type(e: &Expr, r: &RoutineDecl, m: &ModuleDecl) -> String {
@@ -9410,6 +9877,9 @@ fn emit_boogie_proc_stmts_and_ret(
             ));
         }
         Expr::Match(scrut, cases) => {
+            s.push_str(&emit_boogie_expr_obligations(
+                scrut, r, m, revealed, indent, strings,
+            ));
             let scrut_bpl = emit_boogie_expr_with_strings(
                 scrut,
                 m,
@@ -9428,6 +9898,26 @@ fn emit_boogie_proc_stmts_and_ret(
                 ));
             }
             for (idx, c) in cases.iter().enumerate() {
+                if c.is_catch_all() {
+                    // `case _` / `case x` matches whatever the earlier arms left: it is the
+                    // final `else` (or the whole match when first), and later arms are
+                    // unreachable. A bare binder is replaced by the scrutinee.
+                    let head = if idx == 0 { "if (true)" } else { "else" };
+                    s.push_str(&format!("{pad}{head} {{\n"));
+                    let (c_stmts, c_body) = c.with_binder_substituted(scrut);
+                    let mut rev_case = revealed.clone();
+                    s.push_str(&emit_boogie_proc_stmts_and_ret(
+                        &c_stmts,
+                        &c_body,
+                        r,
+                        m,
+                        &mut rev_case,
+                        indent + 2,
+                        strings,
+                    ));
+                    s.push_str(&format!("{pad}}}\n"));
+                    break;
+                }
                 let kw = if idx == 0 { "if" } else { "else if" };
                 s.push_str(&format!(
                     "{pad}{kw} ({}({scrut_bpl})) {{\n",
@@ -9898,6 +10388,231 @@ fn is_module_typed_receiver(recv: &Expr, m: &ModuleDecl) -> bool {
     elem_receiver_type(recv, m).is_some_and(|t| t == module_self_type(m) || t == m.name)
 }
 
+/// Which range a number's arithmetic is checked against.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum NumKind {
+    Signed,
+    Unsigned,
+    /// An untyped number, which adopts the type of what it meets (spec §3).
+    Literal,
+    /// Not determined. The checks then require both ranges, so a wrong guess cannot let
+    /// a value through.
+    Unknown,
+}
+
+fn num_kind_of_type(ty: &str) -> NumKind {
+    match ty.trim() {
+        "I64" | "INT" => NumKind::Signed,
+        "U64" | "NAT" | "EXIT_CODE" | "F64" => NumKind::Unsigned,
+        _ => NumKind::Unknown,
+    }
+}
+
+/// Both sides of an operator have one type (mixing `U64` and `I64` is refused, spec §3).
+fn join_num_kinds(a: NumKind, b: NumKind) -> NumKind {
+    match (a, b) {
+        (NumKind::Literal, x) | (x, NumKind::Literal) => x,
+        (NumKind::Unknown, x) | (x, NumKind::Unknown) => x,
+        (x, y) if x == y => x,
+        _ => NumKind::Unknown,
+    }
+}
+
+fn numeric_kind(e: &Expr, m: &ModuleDecl) -> NumKind {
+    match e {
+        Expr::Int(_) => NumKind::Literal,
+        Expr::UnaryNeg(inner) => match numeric_kind(inner, m) {
+            NumKind::Literal => NumKind::Signed,
+            kind => kind,
+        },
+        Expr::BinOp(op, l, r) => match op.as_str() {
+            "<<" | ">>" => numeric_kind(l, m),
+            "+" | "-" | "*" | "/" | "%" | "+%" | "-%" | "*%" | "&" | "|" | "^" => {
+                operands_kind(l, r, m)
+            }
+            _ => NumKind::Unknown,
+        },
+        Expr::If(_, _, then_e, _, else_e) => {
+            join_num_kinds(numeric_kind(then_e, m), numeric_kind(else_e, m))
+        }
+        Expr::Match(_, cases) => cases
+            .iter()
+            .map(|c| numeric_kind(&c.body, m))
+            .fold(NumKind::Literal, join_num_kinds),
+        Expr::Var(v) if v == "Result" => {
+            boogie_result_type().map_or(NumKind::Unknown, |t| num_kind_of_type(&t))
+        }
+        Expr::Var(v) => {
+            if let Some(t) = boogie_env_type(v).or_else(|| elem_env_type(v)) {
+                return num_kind_of_type(&t);
+            }
+            match &m.repr {
+                ReprKind::Product(fields) => fields
+                    .iter()
+                    .find(|(f, _)| f == v)
+                    .map_or(NumKind::Unknown, |(_, t)| num_kind_of_type(t)),
+                _ => NumKind::Unknown,
+            }
+        }
+        Expr::Call(_, _) | Expr::MethodCall(_, _, _) => {
+            if let Some(ctx) = boogie_prelude_ctx() {
+                if let Some(t) = infer_gardel_type(e, m, &ctx) {
+                    return num_kind_of_type(&t);
+                }
+            }
+            let name = match e {
+                Expr::Call(f, _) => f,
+                Expr::MethodCall(_, f, _) => f,
+                _ => unreachable!("the arm matches only calls"),
+            };
+            if let Some((r, _)) = find_module_routine(m, name) {
+                return num_kind_of_type(&r.ret_type);
+            }
+            match &m.repr {
+                ReprKind::Product(fields) => fields
+                    .iter()
+                    .find(|(f, _)| f == name)
+                    .map_or(NumKind::Unknown, |(_, t)| num_kind_of_type(t)),
+                _ => NumKind::Unknown,
+            }
+        }
+        _ => NumKind::Unknown,
+    }
+}
+
+fn operands_kind(l: &Expr, r: &Expr, m: &ModuleDecl) -> NumKind {
+    join_num_kinds(numeric_kind(l, m), numeric_kind(r, m))
+}
+
+/// Boogie proposition that `v` fits the range of `kind`.
+fn in_range(kind: NumKind, v: &str) -> String {
+    match kind {
+        NumKind::Signed => format!("in_i64({v})"),
+        NumKind::Unsigned | NumKind::Literal => format!("in_u64({v})"),
+        NumKind::Unknown => format!("in_u64({v}) && in_i64({v})"),
+    }
+}
+
+fn bind_signed_local(v: &str) {
+    bind_boogie_env_type(v, "I64");
+    elem_env_bind(v, "I64");
+}
+
+/// A fresh local standing for a nested binder or lambda parameter `name` of Gardel type
+/// `gty`. Returns its name and Boogie type; the caller declares it with
+/// `declare_obligation_locals` only if the obligations mention it.
+fn fresh_obligation_local(name: &str, gty: &str, m: &ModuleDecl) -> (String, String) {
+    let k = BOOGIE_OBLIGATION_COUNTER.with(|c| {
+        let v = c.get();
+        c.set(v + 1);
+        v
+    });
+    let fresh = format!("_ob{k}_{name}");
+    bind_boogie_env_type(&fresh, gty);
+    elem_env_bind(&fresh, gty);
+    (fresh, map_boogie_type(gty, m))
+}
+
+fn declare_obligation_locals(locals: Vec<(String, String)>) {
+    BOOGIE_OBLIGATION_LOCALS.with(|l| l.borrow_mut().extend(locals));
+}
+
+/// What every value of type `gty` satisfies, assumed of the fresh local `v`. It is the same
+/// list a routine parameter gets as `requires` (`emit_boogie_verify_routine`).
+fn emit_value_assumptions(v: &str, gty: &str, m: &ModuleDecl, pad: &str) -> String {
+    let own = gty == m.name || gty == "Current" || gty.starts_with(&format!("{}[", m.name));
+    if matches!(gty, "NAT" | "U64" | "EXIT_CODE") {
+        format!("{pad}assume in_u64({v});\n")
+    } else if matches!(gty, "INT" | "I64") {
+        format!("{pad}assume in_i64({v});\n")
+    } else if gty == "CHAR" {
+        format!("{pad}assume in_char({v});\n")
+    } else if own {
+        if m.invariants.is_empty() {
+            String::new()
+        } else {
+            format!("{pad}assume {}_Invariant({v});\n", m.name)
+        }
+    } else if let Some(p) = boogie_prelude_ctx().and_then(|ctx| {
+        ctx.module(type_head(gty))
+            .filter(|p| !p.invariants.is_empty())
+            .cloned()
+    }) {
+        format!("{pad}assume {0}__{0}_Invariant({v});\n", p.name)
+    } else {
+        String::new()
+    }
+}
+
+/// Obligations of a nested block, which has no Boogie locals of its own: as in
+/// `emit_boogie_block_expr`, each `let` is substituted into what follows it. A `check` is
+/// asserted and an `assume` taken, in the Boogie branch the caller opened for the block.
+#[allow(clippy::too_many_arguments)]
+fn emit_block_obligations(
+    stmts: &[Stmt],
+    body: &Expr,
+    r: &RoutineDecl,
+    m: &ModuleDecl,
+    revealed: &HashSet<String>,
+    indent: usize,
+    strings: &[String],
+) -> String {
+    let pad = " ".repeat(indent);
+    let mut revealed = revealed.clone();
+    let mut substs: Vec<(String, Expr)> = Vec::new();
+    let mut s = String::new();
+    for st in stmts {
+        match st {
+            Stmt::Let(v, e) => {
+                let e_sub = subst_expr_vars(e, &substs);
+                s.push_str(&emit_boogie_expr_obligations(
+                    &e_sub, r, m, &revealed, indent, strings,
+                ));
+                substs.push((v.clone(), e_sub));
+            }
+            Stmt::Check(tag, e) | Stmt::Assume(tag, e) => {
+                let e_bpl = emit_boogie_expr_with_strings(
+                    &subst_expr_vars(e, &substs),
+                    m,
+                    &HashSet::new(),
+                    &revealed,
+                    "DefaultFuel",
+                    strings,
+                );
+                if matches!(st, Stmt::Check(_, _)) {
+                    s.push_str(&format!(
+                        "{pad}assert {{:msg \"{}::check::{tag}\"}} {e_bpl};\n",
+                        r.name
+                    ));
+                } else {
+                    s.push_str(&format!("{pad}assume {e_bpl}; // assume:{tag}\n"));
+                }
+            }
+            Stmt::Reveal(target) => {
+                revealed.insert(target.clone());
+            }
+        }
+    }
+    s.push_str(&emit_boogie_expr_obligations(
+        &subst_expr_vars(body, &substs),
+        r,
+        m,
+        &revealed,
+        indent,
+        strings,
+    ));
+    s
+}
+
+/// Obligations of every operation in the expression `e`, each on the path where it runs.
+/// `emit_boogie_proc_stmts_and_ret` splits the `if` and `match` that shape a routine body
+/// into Boogie branches; anything nested inside an expression arrives here, so this match
+/// is exhaustive: a new `Expr` variant must say what it obliges.
+///
+/// Nested `if`, `match`, `and`, `or` and `implies` become Boogie branches, so a guard
+/// protects what it guards. A lambda body is checked at the point of creation, under what
+/// holds there (its captures are immutable), for every argument of its parameter types,
+/// since it can be applied to any of them: see the `Expr::Lambda` arm.
 fn emit_boogie_expr_obligations(
     e: &Expr,
     r: &RoutineDecl,
@@ -9918,9 +10633,6 @@ fn emit_boogie_expr_obligations(
             s.push_str(&emit_boogie_expr_obligations(
                 l, r, m, revealed, indent, strings,
             ));
-            s.push_str(&emit_boogie_expr_obligations(
-                rhs, r, m, revealed, indent, strings,
-            ));
             let l_bpl = emit_boogie_expr_with_strings(
                 l,
                 m,
@@ -9929,6 +10641,24 @@ fn emit_boogie_expr_obligations(
                 "DefaultFuel",
                 strings,
             );
+            // These evaluate their right side only when the left allows it (C `&&`, `||`).
+            let short_circuit = match op.as_str() {
+                "and" | "implies" => Some(l_bpl.clone()),
+                "or" => Some(format!("!({l_bpl})")),
+                _ => None,
+            };
+            if let Some(guard) = short_circuit {
+                let right = emit_boogie_expr_obligations(
+                    rhs, r, m, revealed, indent + 2, strings,
+                );
+                if !right.is_empty() {
+                    s.push_str(&format!("{pad}if ({guard}) {{\n{right}{pad}}}\n"));
+                }
+                return s;
+            }
+            s.push_str(&emit_boogie_expr_obligations(
+                rhs, r, m, revealed, indent, strings,
+            ));
             let r_bpl = emit_boogie_expr_with_strings(
                 rhs,
                 m,
@@ -9937,23 +10667,32 @@ fn emit_boogie_expr_obligations(
                 "DefaultFuel",
                 strings,
             );
+            let kind = operands_kind(l, rhs, m);
             match op.as_str() {
                 "+" if r.ret_type != "MATH_INT" => {
                     s.push_str(&format!(
-                        "{pad}assert {{:msg \"{}::overflow::overflow_add\"}} in_u64({l_bpl} + {r_bpl});\n",
-                        r.name
+                        "{pad}assert {{:msg \"{}::overflow::overflow_add\"}} {};\n",
+                        r.name,
+                        in_range(kind, &format!("{l_bpl} + {r_bpl}"))
                     ));
                 }
                 "-" if r.ret_type != "MATH_INT" => {
+                    let value = format!("{l_bpl} - {r_bpl}");
+                    let fits = match kind {
+                        // Both operands are in range, so only the lower bound can fail.
+                        NumKind::Unsigned | NumKind::Literal => format!("0 <= ({value})"),
+                        _ => in_range(kind, &value),
+                    };
                     s.push_str(&format!(
-                        "{pad}assert {{:msg \"{}::overflow::overflow_sub\"}} 0 <= ({l_bpl} - {r_bpl});\n",
+                        "{pad}assert {{:msg \"{}::overflow::overflow_sub\"}} {fits};\n",
                         r.name
                     ));
                 }
                 "*" if r.ret_type != "MATH_INT" => {
                     s.push_str(&format!(
-                        "{pad}assert {{:msg \"{}::overflow::overflow_mul\"}} in_u64({l_bpl} * {r_bpl});\n",
-                        r.name
+                        "{pad}assert {{:msg \"{}::overflow::overflow_mul\"}} {};\n",
+                        r.name,
+                        in_range(kind, &format!("{l_bpl} * {r_bpl}"))
                     ));
                 }
                 "/" | "%" => {
@@ -9961,6 +10700,13 @@ fn emit_boogie_expr_obligations(
                         "{pad}assert {{:msg \"{}::div_by_zero::div_by_zero\"}} {r_bpl} != 0;\n",
                         r.name
                     ));
+                    // `I64.min / -1` does not fit, and the hardware traps on both forms.
+                    if matches!(kind, NumKind::Signed | NumKind::Unknown) {
+                        s.push_str(&format!(
+                            "{pad}assert {{:msg \"{}::overflow::overflow_div\"}} !({l_bpl} == I64_MIN && {r_bpl} == -1);\n",
+                            r.name
+                        ));
+                    }
                 }
                 "<<" | ">>" => {
                     s.push_str(&format!(
@@ -9970,13 +10716,66 @@ fn emit_boogie_expr_obligations(
                 }
                 _ => {}
             }
+            // Bitwise operators are defined on `U64` (spec §3). The verifier's model reads
+            // the bits as unsigned, which is not the value an `I64` has.
+            if matches!(op.as_str(), "&" | "|" | "^" | "<<" | ">>") && kind == NumKind::Signed {
+                s.push_str(&format!(
+                    "{pad}assert {{:msg \"{}::overflow::bitwise_on_signed\"}} false;\n",
+                    r.name
+                ));
+            }
+        }
+        Expr::UnaryNot(inner) => {
+            s.push_str(&emit_boogie_expr_obligations(
+                inner, r, m, revealed, indent, strings,
+            ));
         }
         Expr::UnaryNeg(inner) => {
             s.push_str(&emit_boogie_expr_obligations(
                 inner, r, m, revealed, indent, strings,
             ));
+            if r.ret_type != "MATH_INT" {
+                let v = format!(
+                    "-({})",
+                    emit_boogie_expr_with_strings(
+                        inner,
+                        m,
+                        &empty_fields,
+                        revealed,
+                        "DefaultFuel",
+                        strings
+                    )
+                );
+                s.push_str(&format!(
+                    "{pad}assert {{:msg \"{}::overflow::overflow_neg\"}} {};\n",
+                    r.name,
+                    in_range(numeric_kind(e, m), &v)
+                ));
+            }
+        }
+        Expr::TupleLit(items) => {
+            for item in items {
+                s.push_str(&emit_boogie_expr_obligations(
+                    item, r, m, revealed, indent, strings,
+                ));
+            }
         }
         Expr::RecordLit(_) | Expr::RecordUpdate(_, _) => {
+            let (base, fields) = match e {
+                Expr::RecordLit(fields) => (None, fields),
+                Expr::RecordUpdate(base, fields) => (Some(&**base), fields),
+                _ => unreachable!("the arm matches only record expressions"),
+            };
+            if let Some(base) = base {
+                s.push_str(&emit_boogie_expr_obligations(
+                    base, r, m, revealed, indent, strings,
+                ));
+            }
+            for (_, value) in fields {
+                s.push_str(&emit_boogie_expr_obligations(
+                    value, r, m, revealed, indent, strings,
+                ));
+            }
             let val_bpl = emit_boogie_expr_with_strings(
                 e,
                 m,
@@ -10130,7 +10929,185 @@ fn emit_boogie_expr_obligations(
                 ));
             }
         }
-        _ => {}
+        Expr::If(c, then_stmts, then_e, else_stmts, else_e) => {
+            s.push_str(&emit_boogie_expr_obligations(
+                c, r, m, revealed, indent, strings,
+            ));
+            let then_part =
+                emit_block_obligations(then_stmts, then_e, r, m, revealed, indent + 2, strings);
+            let else_part =
+                emit_block_obligations(else_stmts, else_e, r, m, revealed, indent + 2, strings);
+            if !then_part.is_empty() || !else_part.is_empty() {
+                let c_bpl = emit_boogie_expr_with_strings(
+                    c,
+                    m,
+                    &empty_fields,
+                    revealed,
+                    "DefaultFuel",
+                    strings,
+                );
+                s.push_str(&format!(
+                    "{pad}if ({c_bpl}) {{\n{then_part}{pad}}} else {{\n{else_part}{pad}}}\n"
+                ));
+            }
+        }
+        Expr::Match(scrut, cases) => {
+            s.push_str(&emit_boogie_expr_obligations(
+                scrut, r, m, revealed, indent, strings,
+            ));
+            let scrut_bpl = emit_boogie_expr_with_strings(
+                scrut,
+                m,
+                &empty_fields,
+                revealed,
+                "DefaultFuel",
+                strings,
+            );
+            // (tester, code) per arm; a catch-all has no tester and ends the chain.
+            let mut arms: Vec<(Option<String>, String)> = Vec::new();
+            for c in cases {
+                if c.is_catch_all() {
+                    let (c_stmts, c_body) = c.with_binder_substituted(scrut);
+                    arms.push((
+                        None,
+                        emit_block_obligations(
+                            &c_stmts, &c_body, r, m, revealed, indent + 2, strings,
+                        ),
+                    ));
+                    break;
+                }
+                let mut head = String::new();
+                let mut renames: Vec<(String, Expr)> = Vec::new();
+                let mut fresh_locals = Vec::new();
+                if let Some((proj_prefix, vdecl)) = boogie_match_variant(c.ctor(), m) {
+                    let inst = match_field_instantiation(scrut, &proj_prefix, m);
+                    for (opt_b, (fname, fty)) in c.top_bindings().iter().zip(vdecl.fields.iter()) {
+                        if let Some(b) = opt_b {
+                            let gty = subst_type_idents(fty, &inst);
+                            let (fresh, bty) = fresh_obligation_local(b, &gty, m);
+                            if proj_prefix.is_empty() {
+                                elem_env_bind(&fresh, fty);
+                            }
+                            head.push_str(&format!(
+                                "{pad}  {fresh} := {proj_prefix}{}_{fname}({scrut_bpl});\n",
+                                c.ctor()
+                            ));
+                            head.push_str(&emit_value_assumptions(
+                                &fresh,
+                                &gty,
+                                m,
+                                &format!("{pad}  "),
+                            ));
+                            renames.push((b.clone(), Expr::Var(fresh.clone())));
+                            fresh_locals.push((fresh, bty));
+                        }
+                    }
+                }
+                let (c_stmts, c_body) = subst_block(&c.stmts, &c.body, &renames);
+                let code = emit_block_obligations(
+                    &c_stmts, &c_body, r, m, revealed, indent + 2, strings,
+                );
+                let tester = format!("{}({scrut_bpl})", boogie_ctor_tester(c.ctor(), m));
+                if code.is_empty() {
+                    arms.push((Some(tester), String::new()));
+                } else {
+                    declare_obligation_locals(fresh_locals);
+                    arms.push((Some(tester), format!("{head}{code}")));
+                }
+            }
+            if arms.iter().any(|(_, code)| !code.is_empty()) {
+                for (idx, (tester, code)) in arms.iter().enumerate() {
+                    let open = match (idx, tester) {
+                        (0, Some(t)) => format!("if ({t})"),
+                        (_, Some(t)) => format!("else if ({t})"),
+                        (0, None) => "if (true)".to_string(),
+                        (_, None) => "else".to_string(),
+                    };
+                    s.push_str(&format!("{pad}{open} {{\n{code}{pad}}}\n"));
+                }
+            }
+        }
+        Expr::Lambda(params, _, stmts, body) => {
+            // A path of its own that stops at the end, so nothing assumed here leaks out.
+            let inner_pad = format!("{pad}  ");
+            let mut head = String::new();
+            let mut renames: Vec<(String, Expr)> = Vec::new();
+            let mut fresh_locals = Vec::new();
+            for (pname, pty) in params {
+                let (fresh, bty) = fresh_obligation_local(pname, pty, m);
+                head.push_str(&format!("{inner_pad}havoc {fresh};\n"));
+                head.push_str(&emit_value_assumptions(&fresh, pty, m, &inner_pad));
+                renames.push((pname.clone(), Expr::Var(fresh.clone())));
+                fresh_locals.push((fresh, bty));
+            }
+            let (l_stmts, l_body) = subst_block(stmts, body, &renames);
+            let code = emit_block_obligations(
+                &l_stmts, &l_body, r, m, revealed, indent + 2, strings,
+            );
+            if !code.is_empty() {
+                declare_obligation_locals(fresh_locals);
+                s.push_str(&format!(
+                    "{pad}if (*) {{\n{head}{code}{inner_pad}assume false;\n{pad}}}\n"
+                ));
+            }
+        }
+        Expr::WithIo(io_stmts, final_e) => {
+            let mut renames: Vec<(String, Expr)> = Vec::new();
+            for io_st in io_stmts {
+                match io_st {
+                    IoStmt::Action(ie) => {
+                        s.push_str(&emit_boogie_expr_obligations(
+                            &subst_expr_vars(ie, &renames),
+                            r,
+                            m,
+                            revealed,
+                            indent,
+                            strings,
+                        ));
+                    }
+                    IoStmt::Bind(v, ie) => {
+                        let ie_sub = subst_expr_vars(ie, &renames);
+                        s.push_str(&emit_boogie_expr_obligations(
+                            &ie_sub, r, m, revealed, indent, strings,
+                        ));
+                        // The outside world decides this value.
+                        let gty = boogie_prelude_ctx()
+                            .and_then(|ctx| infer_gardel_type(&ie_sub, m, &ctx));
+                        let (fresh, bty) = match &gty {
+                            Some(t) => fresh_obligation_local(v, t, m),
+                            None => {
+                                let k = BOOGIE_OBLIGATION_COUNTER.with(|c| {
+                                    let n = c.get();
+                                    c.set(n + 1);
+                                    n
+                                });
+                                (format!("_ob{k}_{v}"), infer_boogie_expr_type(&ie_sub, r, m))
+                            }
+                        };
+                        s.push_str(&format!("{pad}havoc {fresh};\n"));
+                        declare_obligation_locals(vec![(fresh.clone(), bty)]);
+                        renames.push((v.clone(), Expr::Var(fresh)));
+                    }
+                }
+            }
+            s.push_str(&emit_boogie_expr_obligations(
+                &subst_expr_vars(final_e, &renames),
+                r,
+                m,
+                revealed,
+                indent,
+                strings,
+            ));
+        }
+        // Logic, never run: arithmetic in a quantifier is mathematical (§3).
+        Expr::Forall(_, _, _) | Expr::Exists(_, _, _) => {}
+        Expr::Int(_)
+        | Expr::Float(_)
+        | Expr::Char(_)
+        | Expr::Unit
+        | Expr::Bool(_)
+        | Expr::Str(_)
+        | Expr::Var(_) => {}
     }
 
     s
@@ -10882,7 +11859,7 @@ fn emit_boogie_expr_with_strings(
                 _ => None,
             };
             if let Some(fn_name) = b_fn {
-                return format!(
+                let bits = format!(
                     "{fn_name}({}, {})",
                     emit_boogie_expr_with_strings(
                         l,
@@ -10901,14 +11878,34 @@ fn emit_boogie_expr_with_strings(
                         strings
                     )
                 );
+                // Wrapping on `I64` is two's complement (the C cast through `uint64_t`).
+                if matches!(op.as_str(), "+%" | "-%" | "*%")
+                    && operands_kind(l, r, m) == NumKind::Signed
+                {
+                    return format!("i64_of_bits({bits})");
+                }
+                return bits;
+            }
+            if matches!(op.as_str(), "/" | "%") {
+                // Only a dividend known to be non-negative may use Boogie's own operators.
+                // They are easier on the solver, and truncation is right for any other.
+                let l_bpl =
+                    emit_boogie_expr_with_strings(l, m, implicit_fields, revealed, fuel_var, strings);
+                let r_bpl =
+                    emit_boogie_expr_with_strings(r, m, implicit_fields, revealed, fuel_var, strings);
+                let natural = matches!(numeric_kind(l, m), NumKind::Unsigned | NumKind::Literal);
+                return match (op.as_str(), natural) {
+                    ("/", true) => format!("({l_bpl} div {r_bpl})"),
+                    ("%", true) => format!("({l_bpl} mod {r_bpl})"),
+                    ("/", false) => format!("gdl_div({l_bpl}, {r_bpl})"),
+                    _ => format!("gdl_mod({l_bpl}, {r_bpl})"),
+                };
             }
             let b_op = match op.as_str() {
                 "=" => "==",
                 "and" => "&&",
                 "or" => "||",
                 "implies" => "==>",
-                "/" => "div",
-                "%" => "mod",
                 other => other,
             };
             format!(
@@ -11284,23 +12281,30 @@ fn emit_boogie_expr_with_strings(
             if cases.is_empty() {
                 return s_str;
             }
-            let mut acc = emit_boogie_match_case(
-                &s_str,
-                cases.last().expect("non-empty cases"),
-                m,
-                implicit_fields,
-                fuel_var,
-                strings,
-            );
-            for c in cases.iter().rev().skip(1) {
-                let branch_val =
-                    emit_boogie_match_case(&s_str, c, m, implicit_fields, fuel_var, strings);
-                acc = format!(
-                    "(if {}({s_str}) then {branch_val} else {acc})",
-                    boogie_ctor_tester(c.ctor(), m)
+            // Built from the last arm backwards. A catch-all arm (`_` or a bare binder) is
+            // unconditional, so it drops every later (unreachable) arm instead of testing a
+            // constructor; the last arm is the final `else` (exhaustiveness is checked
+            // separately).
+            let mut acc: Option<String> = None;
+            for c in cases.iter().rev() {
+                let branch_val = emit_boogie_match_case(
+                    scrut,
+                    &s_str,
+                    c,
+                    m,
+                    implicit_fields,
+                    fuel_var,
+                    strings,
                 );
+                acc = Some(match acc {
+                    Some(rest) if !c.is_catch_all() => format!(
+                        "(if {}({s_str}) then {branch_val} else {rest})",
+                        boogie_ctor_tester(c.ctor(), m)
+                    ),
+                    _ => branch_val,
+                });
             }
-            acc
+            acc.unwrap_or(s_str)
         }
         Expr::RecordLit(fields) => {
             if let ReprKind::Product(decl_fields) = &m.repr {
@@ -11534,6 +12538,7 @@ fn emit_boogie_expr_with_strings(
 }
 
 fn emit_boogie_match_case(
+    scrut: &Expr,
     scrut_bpl: &str,
     c: &MatchCase,
     m: &ModuleDecl,
@@ -11541,8 +12546,8 @@ fn emit_boogie_match_case(
     fuel_var: &str,
     strings: &[String],
 ) -> String {
-    let mut expr = c.body.clone();
-    for st in c.stmts.iter().rev() {
+    let (stmts, mut expr) = c.with_binder_substituted(scrut);
+    for st in stmts.iter().rev() {
         if let Stmt::Let(var, val) = st {
             expr = subst_expr_var(&expr, var, val);
         }
@@ -12181,6 +13186,29 @@ pub fn parse_boogie_output(
                     "require" => "Phase 3 Boogie (Precondition Violation)",
                     _ => "Phase 3 Boogie (Verification Condition Failed)",
                 };
+                // A line with no tag is not a proof failure. Boogie refused the generated
+                // text, so nothing was verified.
+                if routine == "Unknown" {
+                    let detail = line.rsplit("Error:").next().unwrap_or(line).trim();
+                    let message = format!(
+                        "E0199: verifier_translation_failed: `{}` could not be translated for the verifier, so it is not verified. This is a limit of `gardelc`, not a fault shown in the program ({detail}). `GARDEL_KEEP_BPL=1` keeps the generated file",
+                        m.name
+                    );
+                    if !diags.iter().any(|d| d.message == message) {
+                        diags.push(
+                            Diagnostic::basic(
+                                "error",
+                                "E0199: verifier_translation_failed",
+                                m.name.clone(),
+                                "verifier_translation_failed".to_string(),
+                                message,
+                            )
+                            .with_module(&m.name),
+                        );
+                    }
+                    i += 1;
+                    continue;
+                }
                 diags.push(
                     Diagnostic::basic("error", static_rule, routine, tag, line.to_string())
                         .with_module(&m.name)
@@ -12739,6 +13767,44 @@ enum EvalFault {
 
 /// Runs the Phase 3/4 Direct Verification & Assume Audit pass over `m`.
 pub fn verify_module_phase3(
+    m: &ModuleDecl,
+    src: &str,
+    input_path: &str,
+    fuel_limit: usize,
+    strict_mode: bool,
+    audit_mode: bool,
+    bounded_check: bool,
+) -> Vec<Diagnostic> {
+    let mut diags =
+        verify_module_obligations(m, src, input_path, fuel_limit, strict_mode, audit_mode, bounded_check);
+    // `shutdown_must_stop` is an ordinary postcondition, so the fixpoint of Task B.9 handles
+    // it like any other. Only the report names it as the rule it is.
+    if m.kind == ModuleKind::ReactiveProgram {
+        for d in &mut diags {
+            if d.tag == "shutdown_must_stop" && d.rule == "Phase 3 Boogie (Postcondition Violation)" {
+                d.rule = REACTIVE_VIOLATION.into();
+                // The clause is implicit, so it has no text to find: point at `step`.
+                d.span = source_line_of(src, input_path, "step(");
+            }
+        }
+    }
+    diags
+}
+
+/// The span of the first line of `src` that starts with `prefix`, ignoring indentation.
+fn source_line_of(src: &str, input_path: &str, prefix: &str) -> Option<Span> {
+    let (idx, line) = src.lines().enumerate().find(|(_, l)| l.trim_start().starts_with(prefix))?;
+    let column = line.len() - line.trim_start().len() + 1;
+    Some(Span {
+        file: input_path.to_string(),
+        line: idx + 1,
+        column,
+        end_line: idx + 1,
+        end_column: line.len() + 1,
+    })
+}
+
+fn verify_module_obligations(
     m: &ModuleDecl,
     src: &str,
     input_path: &str,
@@ -13330,8 +14396,10 @@ fn eval_expr_symbolic_with_branches(
             let s_val = eval_expr_symbolic(scrut, env, m, revealed, fuel_limit)
                 .map_err(|f| fault_to_diagnostic(f, r, m, src, input_path, env, pcs))?;
             if let GardelVal::Variant(ctor, args) = &s_val {
-                if let Some(matched) = cases.iter().find(|c| c.ctor() == ctor) {
-                    let pat = if matched.bindings().is_empty() {
+                if let Some(matched) = cases.iter().find(|c| c.is_catch_all() || c.ctor() == ctor) {
+                    let pat = if matched.is_catch_all() {
+                        "_".to_string()
+                    } else if matched.bindings().is_empty() {
                         matched.ctor().to_string()
                     } else {
                         format!("{}({})", matched.ctor(), matched.bindings().join(", "))
@@ -14070,7 +15138,7 @@ fn eval_expr_symbolic(
         Expr::Match(scrut, cases) => {
             let sv = eval_expr_symbolic(scrut, env, m, revealed, fuel)?;
             if let GardelVal::Variant(ctor, args) = sv {
-                if let Some(c) = cases.iter().find(|c| c.ctor() == ctor) {
+                if let Some(c) = cases.iter().find(|c| c.is_catch_all() || c.ctor() == ctor) {
                     let mut sub_env = env.clone();
                     let mut sub_rev = revealed.clone();
                     for (b, av) in c.bindings().iter().zip(args.into_iter()) {
@@ -14516,25 +15584,206 @@ pub fn emit_c11_runtime_header() -> String {
 typedef uint8_t GARDEL_UNIT;
 #define UNIT_VAL 0
 
+/* What each thread keeps for itself. */
+#define GARDEL_CLASS_SHIFT 4
+#define GARDEL_CLASSES 16 /* 16, 32, .. 256 bytes */
+
+struct gardel_block;
+struct gardel_thread {
+    int task_depth; /* nesting of the running code; deeper `let` groups run inline */
+    struct gardel_block* active[GARDEL_CLASSES + 1];
+    struct gardel_block* spare[GARDEL_CLASSES + 1];
+    uint32_t active_bytes[GARDEL_CLASSES + 1];
+    char* chunk;
+    size_t chunk_left;
+};
+
+#if defined(_WIN32) && defined(__x86_64__)
+/* gcc on Windows makes every _Thread_local access a function call, and that alone was 30%
+   of seq_bench on one thread. A TLS slot is a word at a fixed offset in the thread's TEB,
+   which is what TlsGetValue reads too, and it holds only the first 64 indices. */
+__declspec(dllimport) unsigned long __stdcall TlsAlloc(void);
+__declspec(dllimport) int __stdcall TlsSetValue(unsigned long, void*);
+
+static unsigned long gardel_thread_slot;
+
+__attribute__((constructor)) static void gardel_thread_slot_init(void) {
+    gardel_thread_slot = TlsAlloc();
+    if (gardel_thread_slot >= 64) {
+        fputs("error: no thread-local slot is free\n", stderr);
+        exit(1);
+    }
+}
+
+__attribute__((noinline)) static struct gardel_thread* gardel_thread_new(void) {
+    struct gardel_thread* t = (struct gardel_thread*)calloc(1, sizeof *t);
+    if (!t) {
+        fputs("Out of memory\n", stderr);
+        exit(1);
+    }
+    TlsSetValue(gardel_thread_slot, t);
+    return t;
+}
+
+static inline struct gardel_thread* gardel_thread_get(void) {
+    struct gardel_thread* t;
+    __asm__ volatile("movq %%gs:0x1480(,%1,8), %0" : "=r"(t) : "r"((unsigned long long)gardel_thread_slot));
+    return t ? t : gardel_thread_new();
+}
+#else
+static _Thread_local struct gardel_thread gardel_thread_tls;
+static inline struct gardel_thread* gardel_thread_get(void) { return &gardel_thread_tls; }
+#endif
+
+/* The allocator (Task C.4.2). Most Gardel values are a few small, fixed sizes, and every
+   release knows the size, so a block needs no header. Each thread keeps a free list per
+   size class and carves new blocks from its own chunk, so the common path takes no lock.
+   A list that reaches GARDEL_MAGAZINE_BYTES becomes the thread's spare, and a previous
+   spare goes to a shared depot, which is what stops one thread that only frees from
+   hoarding what another thread allocates. Blocks return to their class, never to the
+   system, so a program's footprint is the peak of each class. Larger blocks use malloc.
+   -DGARDEL_SYSTEM_ALLOC uses malloc for everything, for sanitizers. -DGARDEL_COUNT_ALLOCS
+   counts live blocks for the leak tests: the counter is a contended atomic, so it is off
+   in a normal build, and gardel_live_allocations then does not exist. */
+#ifdef GARDEL_COUNT_ALLOCS
 static _Atomic uint64_t g_gardel_live_allocs = 0;
+uint64_t gardel_live_allocations(void) {
+    return atomic_load(&g_gardel_live_allocs);
+}
+#define GARDEL_LIVE_ADD() atomic_fetch_add(&g_gardel_live_allocs, 1)
+#define GARDEL_LIVE_SUB() atomic_fetch_sub(&g_gardel_live_allocs, 1)
+#else
+#define GARDEL_LIVE_ADD() ((void)0)
+#define GARDEL_LIVE_SUB() ((void)0)
+#endif
+
+static void gardel_out_of_memory(void) {
+    fputs("Out of memory\n", stderr);
+    exit(1);
+}
+
+#ifdef GARDEL_SYSTEM_ALLOC
 
 static inline void* gardel_alloc(size_t sz) {
     void* p = malloc(sz);
-    if (!p) { fprintf(stderr, "Out of memory\n"); exit(1); }
-    atomic_fetch_add(&g_gardel_live_allocs, 1);
+    if (!p) gardel_out_of_memory();
+    GARDEL_LIVE_ADD();
     return p;
 }
 
-static inline void gardel_free(void* p) {
+static inline void gardel_free(void* p, size_t sz) {
+    (void)sz;
     if (p) {
-        atomic_fetch_sub(&g_gardel_live_allocs, 1);
+        GARDEL_LIVE_SUB();
         free(p);
     }
 }
 
-uint64_t gardel_live_allocations(void) {
-    return atomic_load(&g_gardel_live_allocs);
+#else
+
+#define GARDEL_SMALL_MAX ((size_t)GARDEL_CLASSES << GARDEL_CLASS_SHIFT)
+#define GARDEL_MAGAZINE_BYTES (64u * 1024u)
+#define GARDEL_CHUNK_BYTES ((size_t)1 << 20)
+
+/* A free block. `batch` is used only by the first block of a list in the depot. */
+struct gardel_block { struct gardel_block* next; struct gardel_block* batch; };
+
+/* A cache line each. `batches` is atomic because a refill reads it without the lock: a
+   program that is only growing has an empty depot, and must not meet other threads there. */
+static struct {
+    atomic_flag busy;
+    struct gardel_block* _Atomic batches;
+    char pad[48];
+} gardel_depot[GARDEL_CLASSES + 1] __attribute__((aligned(64)));
+
+static void gardel_depot_lock(unsigned c) {
+    while (atomic_flag_test_and_set_explicit(&gardel_depot[c].busy, memory_order_acquire)) {}
 }
+
+static void gardel_depot_unlock(unsigned c) {
+    atomic_flag_clear_explicit(&gardel_depot[c].busy, memory_order_release);
+}
+
+static uint32_t gardel_magazine_size(unsigned c) {
+    uint32_t block = (uint32_t)c << GARDEL_CLASS_SHIFT;
+    return (GARDEL_MAGAZINE_BYTES + block - 1) / block * block;
+}
+
+__attribute__((noinline)) static void* gardel_alloc_refill(struct gardel_thread* h, unsigned c) {
+    struct gardel_block* got = h->spare[c];
+    h->spare[c] = NULL;
+    if (!got && atomic_load_explicit(&gardel_depot[c].batches, memory_order_relaxed)) {
+        gardel_depot_lock(c);
+        got = atomic_load_explicit(&gardel_depot[c].batches, memory_order_relaxed);
+        if (got) atomic_store_explicit(&gardel_depot[c].batches, got->batch, memory_order_relaxed);
+        gardel_depot_unlock(c);
+    }
+    if (got) {
+        h->active[c] = got->next;
+        h->active_bytes[c] = gardel_magazine_size(c) - ((uint32_t)c << GARDEL_CLASS_SHIFT);
+        return got;
+    }
+    size_t block = (size_t)c << GARDEL_CLASS_SHIFT;
+    if (h->chunk_left < block) {
+        h->chunk = (char*)malloc(GARDEL_CHUNK_BYTES);
+        if (!h->chunk) gardel_out_of_memory();
+        h->chunk_left = GARDEL_CHUNK_BYTES;
+    }
+    void* p = h->chunk;
+    h->chunk += block;
+    h->chunk_left -= block;
+    return p;
+}
+
+__attribute__((noinline)) static void gardel_free_overflow(struct gardel_thread* h, unsigned c) {
+    struct gardel_block* full = h->spare[c];
+    if (full) {
+        gardel_depot_lock(c);
+        full->batch = atomic_load_explicit(&gardel_depot[c].batches, memory_order_relaxed);
+        atomic_store_explicit(&gardel_depot[c].batches, full, memory_order_relaxed);
+        gardel_depot_unlock(c);
+    }
+    h->spare[c] = h->active[c];
+    h->active[c] = NULL;
+    h->active_bytes[c] = 0;
+}
+
+static inline void* gardel_alloc(size_t sz) {
+    GARDEL_LIVE_ADD();
+    if (sz <= GARDEL_SMALL_MAX) {
+        unsigned c = (unsigned)((sz + (1u << GARDEL_CLASS_SHIFT) - 1) >> GARDEL_CLASS_SHIFT);
+        struct gardel_thread* h = gardel_thread_get();
+        struct gardel_block* b = h->active[c];
+        if (b) {
+            h->active[c] = b->next;
+            h->active_bytes[c] -= (uint32_t)c << GARDEL_CLASS_SHIFT;
+            return b;
+        }
+        return gardel_alloc_refill(h, c);
+    }
+    void* p = malloc(sz);
+    if (!p) gardel_out_of_memory();
+    return p;
+}
+
+/* `sz` is the size given to gardel_alloc. */
+static inline void gardel_free(void* p, size_t sz) {
+    if (!p) return;
+    GARDEL_LIVE_SUB();
+    if (sz <= GARDEL_SMALL_MAX) {
+        unsigned c = (unsigned)((sz + (1u << GARDEL_CLASS_SHIFT) - 1) >> GARDEL_CLASS_SHIFT);
+        struct gardel_thread* h = gardel_thread_get();
+        struct gardel_block* b = (struct gardel_block*)p;
+        b->next = h->active[c];
+        h->active[c] = b;
+        h->active_bytes[c] += (uint32_t)c << GARDEL_CLASS_SHIFT;
+        if (h->active_bytes[c] >= GARDEL_MAGAZINE_BYTES) gardel_free_overflow(h, c);
+        return;
+    }
+    free(p);
+}
+
+#endif
 
 /* Runtime STRING (spec 6.4.C): a contiguous, NUL-terminated buffer of well-formed UTF-8
    (one byte per octet) plus its length and its cached code-point count. The verification
@@ -14554,19 +15803,27 @@ typedef struct {
     void* owner; /* as for GardelString */
 } GardelBytes;
 
-/* Counted text buffers: the reference count precedes the octets. */
-typedef struct gardel_buf { _Atomic uint64_t rc; } gardel_buf;
+/* Counted text buffers: the reference count and the block's size precede the octets. */
+typedef struct gardel_buf { _Atomic uint64_t rc; uint64_t size; } gardel_buf;
 static inline char* gardel_buf_alloc(size_t n, void** owner) {
     gardel_buf* b = (gardel_buf*)gardel_alloc(sizeof(gardel_buf) + n);
     atomic_init(&b->rc, 1);
+    b->size = sizeof(gardel_buf) + n;
     *owner = b;
     return (char*)(b + 1);
+}
+/* Gives up a reference, and says if it was the last. A count of 1 is ours alone: no other
+   thread holds a reference to race with, and a borrower has finished before its owner
+   releases. So that case needs no atomic update, and it is the common one. */
+static inline bool gardel_rc_release(_Atomic uint64_t* rc) {
+    if (atomic_load_explicit(rc, memory_order_acquire) == 1) return true;
+    return atomic_fetch_sub_explicit(rc, 1, memory_order_acq_rel) == 1;
 }
 static inline void gardel_owner_dup(void* o) {
     if (o) atomic_fetch_add_explicit(&((gardel_buf*)o)->rc, 1, memory_order_relaxed);
 }
 static inline void gardel_owner_drop(void* o) {
-    if (o && atomic_fetch_sub_explicit(&((gardel_buf*)o)->rc, 1, memory_order_acq_rel) == 1) gardel_free(o);
+    if (o && gardel_rc_release(&((gardel_buf*)o)->rc)) gardel_free(o, (size_t)((gardel_buf*)o)->size);
 }
 static inline GardelString gardel_string_dup(GardelString s) { gardel_owner_dup(s.owner); return s; }
 static inline void gardel_string_drop(GardelString s) { gardel_owner_drop(s.owner); }
@@ -14703,26 +15960,11 @@ pub fn emit_c11_read_line_runtime() -> String {
     format!(
         r#"#include <errno.h>
 /* IO boundary (spec 11): IO.read_line : IO[RESULT[IO_ERROR, STRING]] */
-static struct {r}* gardel_io_read_line_result(void) {{
-    size_t cap = 128, len = 0;
-    char* buf = (char*)malloc(cap);
-    int c, saw_any = 0;
-    if (!buf) return make_{r}_Error(make_IO_ERROR_OsError((int64_t)ENOMEM));
-    while ((c = fgetc(stdin)) != EOF) {{
-        saw_any = 1;
-        if (c == '\n') break;
-        if ((uint64_t)len + 1 >= {max_line}ULL) {{ free(buf); return make_{r}_Error(make_IO_ERROR_OsError((int64_t)EOVERFLOW)); }}
-        if (len + 1 >= cap) {{
-            char* nb = (char*)realloc(buf, cap * 2);
-            if (!nb) {{ free(buf); return make_{r}_Error(make_IO_ERROR_OsError((int64_t)ENOMEM)); }}
-            buf = nb;
-            cap *= 2;
-        }}
-        buf[len++] = (char)c;
-    }}
-    if (ferror(stdin)) {{ free(buf); return make_{r}_Error(make_IO_ERROR_OsError((int64_t)errno)); }}
-    if (!saw_any) {{ free(buf); return make_{r}_Error(make_IO_ERROR_EndOfInput()); }}
-    if (len > 0 && buf[len - 1] == '\r') len--;
+static struct {r}* gardel_line_at_end(void) {{
+    return make_{r}_Error(make_IO_ERROR_EndOfInput());
+}}
+/* A line of untrusted bytes, without its line break. Takes `buf`, from malloc. */
+static struct {r}* gardel_line_from_bytes(char* buf, size_t len) {{
     uint64_t chars = 0;
     struct STRING_ERROR* derr = gardel_utf8_validate((const uint8_t*)buf, (uint64_t)len, &chars);
     if (derr) {{ free(buf); return make_{r}_Error(make_IO_ERROR_Decode(derr)); }}
@@ -14733,6 +15975,46 @@ static struct {r}* gardel_io_read_line_result(void) {{
     free(buf);
     GardelString s = {{ data, (uint64_t)len, chars, owner }};
     return make_{r}_Ok(s);
+}}
+static struct {r}* gardel_line_failed(int64_t code) {{
+    return make_{r}_Error(make_IO_ERROR_OsError(code));
+}}
+/* The bytes of one line, apart from what they mean, which an event log needs. */
+enum {{ GARDEL_LINE_READ, GARDEL_LINE_ENDED, GARDEL_LINE_FAILED }};
+static int gardel_line_read(char** out, size_t* out_len, int64_t* code) {{
+    size_t cap = 128, len = 0;
+    char* buf = (char*)malloc(cap);
+    int c, saw_any = 0;
+    if (!buf) {{ *code = ENOMEM; return GARDEL_LINE_FAILED; }}
+    while ((c = fgetc(stdin)) != EOF) {{
+        saw_any = 1;
+        if (c == '\n') break;
+        if ((uint64_t)len + 1 >= {max_line}ULL) {{ free(buf); *code = EOVERFLOW; return GARDEL_LINE_FAILED; }}
+        if (len + 1 >= cap) {{
+            char* nb = (char*)realloc(buf, cap * 2);
+            if (!nb) {{ free(buf); *code = ENOMEM; return GARDEL_LINE_FAILED; }}
+            buf = nb;
+            cap *= 2;
+        }}
+        buf[len++] = (char)c;
+    }}
+    if (ferror(stdin)) {{ free(buf); *code = errno; return GARDEL_LINE_FAILED; }}
+    if (!saw_any) {{ free(buf); return GARDEL_LINE_ENDED; }}
+    if (len > 0 && buf[len - 1] == '\r') len--;
+    *out = buf;
+    *out_len = len;
+    return GARDEL_LINE_READ;
+}}
+static struct {r}* gardel_line_value(int state, char* buf, size_t len, int64_t code) {{
+    if (state == GARDEL_LINE_READ) return gardel_line_from_bytes(buf, len);
+    return state == GARDEL_LINE_ENDED ? gardel_line_at_end() : gardel_line_failed(code);
+}}
+static struct {r}* gardel_io_read_line_result(void) {{
+    char* buf = NULL;
+    size_t len = 0;
+    int64_t code = 0;
+    int state = gardel_line_read(&buf, &len, &code);
+    return gardel_line_value(state, buf, len, code);
 }}
 
 "#
@@ -14824,6 +16106,7 @@ pub fn format_module_interface(m: &ModuleDecl) -> String {
         ModuleKind::Module => "module",
         ModuleKind::Functions => "functions",
         ModuleKind::Program => "program",
+        ModuleKind::ReactiveProgram => "reactive program",
     };
     let tp = if m.type_params.is_empty() {
         String::new()
@@ -15337,12 +16620,45 @@ fn looks_like_input(s: &str) -> bool {
         || std::path::Path::new(s).exists()
 }
 
+/// Flags followed by a value.
+const VALUE_FLAGS: &[&str] = &["--fuel", "--z3-seed", "--z3-rlimit"];
+/// Flags with no value, or with an optional one (`--inspect`, `--emit-stdlib`).
+const PLAIN_FLAGS: &[&str] = &[
+    "--stdlib",
+    "--no-prelude",
+    "--inspect",
+    "--emit-stdlib",
+    "--json-diagnostics",
+    "--audit",
+    "--strict",
+    "--bounded-check",
+    "--run",
+];
+
+/// The first command-line word that looks like a flag and is not one. A mistyped `--strict`
+/// that was ignored would report a weaker check as passing.
+fn first_unknown_flag(args: &[String]) -> Option<&String> {
+    let mut i = 1;
+    while i < args.len() {
+        let a = &args[i];
+        if VALUE_FLAGS.contains(&a.as_str()) {
+            i += 2;
+            continue;
+        }
+        if a.starts_with("--") && !PLAIN_FLAGS.contains(&a.as_str()) {
+            return Some(a);
+        }
+        i += 1;
+    }
+    None
+}
+
 fn input_operands(args: &[String]) -> Vec<String> {
     let mut ops = Vec::new();
     let mut i = 1;
     while i < args.len() {
         let a = &args[i];
-        if a == "--fuel" || a == "--z3-seed" || a == "--z3-rlimit" {
+        if VALUE_FLAGS.contains(&a.as_str()) {
             i += 2;
             continue;
         }
@@ -15448,7 +16764,8 @@ pub fn check_and_verify_project(units: &mut [SourceUnit], opts: VerifyOptions) -
         None
     };
     if let Some(table) = &link {
-        let fatal = check_module_dependency_cycles(units, table);
+        let mut fatal = check_module_dependency_cycles(units, table);
+        fatal.extend(check_entry_point_references(units, table));
         if !fatal.is_empty() {
             return CheckedProject {
                 diags: Vec::new(),
@@ -15457,6 +16774,24 @@ pub fn check_and_verify_project(units: &mut [SourceUnit], opts: VerifyOptions) -
                 link,
             };
         }
+    }
+    let name_errors = names::check_names(units, opts.prelude_mode, &concept_map);
+    if !name_errors.is_empty() {
+        // Nothing can be verified, but what the static checks found still stands.
+        let mut fatal: Vec<Diagnostic> = pre
+            .iter()
+            .flatten()
+            .flatten()
+            .filter(|d| d.level == "error")
+            .cloned()
+            .collect();
+        fatal.extend(name_errors);
+        return CheckedProject {
+            diags: Vec::new(),
+            fatal,
+            concept_map,
+            link,
+        };
     }
 
     let mut diags: Vec<(usize, Diagnostic)> = Vec::new();
@@ -15559,6 +16894,17 @@ fn main() {
             "  several files, a directory (its *.gdl files, searched recursively, skipping build/ and target/) or a wildcard pattern such as src/*.gdl form one project with a flat module namespace (§4.2)"
         );
         std::process::exit(1);
+    }
+
+    if let Some(flag) = first_unknown_flag(&args) {
+        exit_with_frontend_error(
+            args.iter().any(|a| a == "--json-diagnostics"),
+            "Command Line",
+            "gardelc",
+            "unknown_flag",
+            format!("unknown flag `{flag}`. Run `gardelc` with no arguments to list the flags"),
+            "",
+        );
     }
 
     if let Some(i) = args.iter().position(|a| a == "--emit-stdlib") {
@@ -15825,7 +17171,7 @@ fn main() {
     let all_modules: Vec<&ModuleDecl> = units.iter().flat_map(|u| u.ast.modules.iter()).collect();
     let programs: Vec<&&ModuleDecl> = all_modules
         .iter()
-        .filter(|m| m.kind == ModuleKind::Program)
+        .filter(|m| m.kind.is_entry_point())
         .collect();
     let module = if project_mode && programs.len() == 1 {
         (*programs[0]).clone()
@@ -16050,9 +17396,10 @@ fn main() {
         }
     }
 
-    let gcc_compiled = if module.kind == ModuleKind::Program {
+    let gcc_compiled = if module.kind.is_entry_point() {
         Command::new("gcc")
             .args(["-O3", "-fopenmp", &primary_c, "-o", &primary_exe])
+                .args(GCC_NET_LIBS)
             .status()
             .is_ok_and(|s| s.success())
     } else {
@@ -16302,7 +17649,7 @@ end
         let stdlib = parse_phase4_stdlib().expect("Phase 4 stdlib should parse");
         assert_eq!(stdlib.group, None);
         assert_eq!(stdlib.concepts.len(), 3);
-        assert_eq!(stdlib.modules.len(), 10);
+        assert_eq!(stdlib.modules.len(), 15);
         for m in &stdlib.modules {
             let mut diags = check_visibility_and_semantics(m);
             diags.extend(verify_module_phase3(
@@ -16792,7 +18139,7 @@ end
     #[test]
     fn test_plan3_multi_module_stdlib_pipeline() {
         let ast = parse_phase4_stdlib().expect("stdlib parses cleanly");
-        assert_eq!(ast.modules.len(), 10);
+        assert_eq!(ast.modules.len(), 15);
         let mut prog_env = ProgramEnv {
             modules: HashMap::new(),
             concepts: HashMap::new(),
@@ -16886,8 +18233,7 @@ end
     fn test_plan4_perceus_refcounting_zero_memory_leaks() {
         let hdr = emit_c11_runtime_header();
         assert!(hdr.contains("gardel_live_allocations(void)"));
-        assert!(hdr.contains("atomic_fetch_add(&g_gardel_live_allocs, 1);"));
-        assert!(hdr.contains("atomic_fetch_sub(&g_gardel_live_allocs, 1);"));
+        assert!(hdr.contains("#ifdef GARDEL_COUNT_ALLOCS"));
     }
 
     #[test]
@@ -18050,9 +19396,10 @@ end
         let exe = dir.join(format!("{tag}.exe"));
         fs::write(&c_path, c).unwrap();
         let out = Command::new("gcc")
-            .args(["-std=gnu11", "-O1", "-fopenmp", "-o"])
+            .args(["-std=gnu11", "-O1", "-fopenmp", "-DGARDEL_COUNT_ALLOCS", "-o"])
             .arg(&exe)
             .arg(&c_path)
+            .args(GCC_NET_LIBS)
             .output()
             .ok()?;
         assert!(
@@ -18289,6 +19636,154 @@ end
         }
     }
 
+    /// The generated C, reporting at exit how many heap objects are still live.
+    fn c4_with_exit_report(c: &str) -> String {
+        c.replace(
+            "int main(int argc, char** argv) {",
+            "static void gardel_report(void) {\n    printf(\"%llu \", (unsigned long long)gardel_live_allocations());\n}\nint main(int argc, char** argv) {\n    atexit(gardel_report);",
+        )
+    }
+
+    #[test]
+    fn test_c4_a_dying_program_does_not_release() {
+        // A `main` only ends through `IO.exit`, which never returns, so what it holds in
+        // scope was never released. What remained is the argument itself: here the tree of
+        // `sum(from_range(1, n))`, a temporary inside it.
+        let bench = c3_verify_and_emit(include_str!("../../examples/seq_bench.gdl"), "seq_bench.gdl");
+        if let Some(runs) = c3_native_runs(&c4_with_exit_report(&bench), "c4exit", &[b"1000\n"]) {
+            assert_eq!(runs[0].0, 0);
+            let live: u64 = runs[0].1.trim().parse().unwrap();
+            assert!(live >= 1999, "the 1999 nodes of the tree stay alive, got {live}");
+        }
+        // A lambda inside the argument still releases: it runs once per element, so it would
+        // otherwise pile up, and that is not the cheap end of a program.
+        let src = "program LAMBDA_EXIT\n\nfeature {ANY}\n\n  main(args: SEQ[STRING]): IO[EXIT_CODE]\n    do\n      let s = SEQ.singleton(1).concat(SEQ.singleton(2)).concat(SEQ.singleton(3))\n      IO.exit(s.map(fn(x: U64): U64 do SEQ.singleton(x).length end).length - 3)\n    end\n\nend\n";
+        let c = c3_verify_and_emit(src, "lambda_exit.gdl");
+        if let Some(runs) = c3_native_runs(&c4_with_exit_report(&c), "c4lambda", &[b""]) {
+            assert_eq!(runs[0].0, 0);
+            let live: u64 = runs[0].1.trim().parse().unwrap();
+            // Three leaves and two nodes, the same again for the map's result, and `args`. Each
+            // of the three calls would leave one more value.
+            assert!(live <= 11, "the lambda's values are released, got {live}");
+        }
+    }
+
+    #[test]
+    fn test_c4_the_allocator_keeps_blocks_apart_and_does_not_hoard() {
+        let c = format!(
+            "#include <stdlib.h>\nstatic int g_chunks;\nstatic void* counted_malloc(size_t n) {{\n    if (n >= (size_t)1 << 20) __atomic_add_fetch(&g_chunks, 1, __ATOMIC_RELAXED);\n    return malloc(n);\n}}\n#define malloc counted_malloc\n{}\n{}",
+            emit_c11_runtime_header(),
+            r#"
+#undef malloc
+#include <omp.h>
+#define ROUNDS 3000000
+#define SLOTS 256
+static void* _Atomic g_box[SLOTS];
+
+/* One thread only allocates and one only frees, in every size class and past it. Without
+   the depot the first would take a new chunk for all of it (about 450), and the second
+   would hoard it. */
+static int one_way(void) {
+    int bad = 0;
+    #pragma omp parallel num_threads(2) reduction(+:bad)
+    {
+        int me = omp_get_thread_num();
+        for (uint64_t i = 0; i < ROUNDS; i++) {
+            size_t size = 16 + (i % 40) * 8;
+            _Atomic(void*)* slot = (_Atomic(void*)*)&g_box[i % SLOTS];
+            if (me == 0) {
+                while (atomic_load(slot)) {}
+                uint64_t* p = (uint64_t*)gardel_alloc(size);
+                p[0] = i;
+                p[size / 8 - 1] = ~i;
+                atomic_store(slot, p);
+            } else {
+                void* got;
+                while (!(got = atomic_load(slot))) {}
+                uint64_t* p = (uint64_t*)got;
+                if (p[0] != i || p[size / 8 - 1] != ~i) bad++;
+                atomic_store(slot, NULL);
+                gardel_free(p, size);
+            }
+        }
+    }
+    return bad;
+}
+
+/* Blocks held at once never overlap: each is filled with its own byte, and checked. */
+static int apart(void) {
+    int bad = 0;
+    #pragma omp parallel num_threads(4) reduction(+:bad)
+    {
+        enum { HELD = 4000 };
+        static _Thread_local unsigned char* held[HELD];
+        static _Thread_local size_t sizes[HELD];
+        uint64_t x = 88172645463325252ULL + (uint64_t)omp_get_thread_num();
+        for (int i = 0; i < 400000; i++) {
+            x ^= x << 13; x ^= x >> 7; x ^= x << 17;
+            int k = (int)(x % HELD);
+            if (held[k]) {
+                for (size_t j = 0; j < sizes[k]; j++) if (held[k][j] != (unsigned char)k) bad++;
+                gardel_free(held[k], sizes[k]);
+            }
+            sizes[k] = 8 + (size_t)((x >> 20) % 400);
+            held[k] = (unsigned char*)gardel_alloc(sizes[k]);
+            if ((uintptr_t)held[k] % 16) bad++;
+            memset(held[k], k, sizes[k]);
+        }
+        for (int k = 0; k < HELD; k++) {
+            if (held[k]) {
+                gardel_free(held[k], sizes[k]);
+                held[k] = NULL;
+            }
+        }
+    }
+    return bad;
+}
+
+int main(void) {
+    omp_set_dynamic(0);
+    int bad = one_way();
+    int chunks = g_chunks;
+    bad += apart();
+    printf("%d %d %llu\n", bad, chunks, (unsigned long long)gardel_live_allocations());
+    return 0;
+}
+"#
+        );
+        if let Some(runs) = c3_native_runs(&c, "c4alloc", &[b""]) {
+            let parts: Vec<u64> = runs[0].1.split_whitespace().map(|x| x.parse().unwrap()).collect();
+            assert_eq!(parts[0], 0, "a block was changed or misaligned");
+            assert!(parts[1] <= 16, "one-way traffic took {} chunks", parts[1]);
+            assert_eq!(parts[2], 0, "live blocks at the end");
+        }
+    }
+
+    #[test]
+    fn test_c4_ownership_moves_are_correct_and_leak_nothing() {
+        let tree = include_str!("../tests/c_backend/pair_tree.gdl");
+        let prog = include_str!("../tests/c_backend/ownership.gdl");
+        let mut units = b4_units(&[("pair_tree.gdl", tree), ("ownership.gdl", prog)]);
+        let checked = check_and_verify_project(&mut units, b4_opts(true, true));
+        assert!(checked.fatal.is_empty());
+        let diags: Vec<&Diagnostic> = checked.diags.iter().map(|(_, d)| d).collect();
+        assert!(diags.is_empty(), "{diags:?}");
+        let lib_m = units[0].ast.modules[0].clone();
+        let prog_m = units[1].ast.modules[0].clone();
+        let (c, errs) = emit_c11_typed(&prog_m, &[&lib_m]);
+        assert!(errs.is_empty(), "{errs:?}");
+        // The moves happen: `a.join(b)` hands over both, with no copy in the caller.
+        assert!(c.contains("sink_PAIR_TREE__join(a, b)"), "a last use must give the value away");
+        // Not when the value is used again.
+        assert!(c.contains("struct PAIR_TREE* d = sink_PAIR_TREE__join(c, dup_PAIR_TREE(a))"), "a is used again");
+        if let Some(runs) = c3_native_runs(&c, "ownership", &[b""]) {
+            assert_eq!(runs[0].0, 0, "first failing check");
+        }
+        if let Some(live) = c3_live_after(&c, "ownleak", "OWNERSHIP__first_failure()") {
+            assert_eq!(live, (0, 0), "live heap objects after the call");
+        }
+    }
+
     #[test]
     fn test_d_pattern_compilation() {
         // Literal, tuple and nested patterns are compiled to flat matches and `if`s; the
@@ -18422,6 +19917,1507 @@ end
     }
 
     #[test]
+    fn test_d0_wildcard_arms_verify_on_own_prelude_and_linked_adts() {
+        // Task D.0: `case _` and a bare binder `case x` lower to the final `else` (or to the
+        // whole match when first) instead of an undeclared `is_` tester, on the module's
+        // own ADT, on a prelude ADT and on a linked user ADT inside a `program`.
+        let own = include_str!("../tests/boogie/wild_own.gdl").replace("\r\n", "\n");
+        let own = own.as_str();
+        let prelude = include_str!("../tests/boogie/wild_prelude.gdl");
+        let diags = c3_verify(own, "wild_own.gdl");
+        assert!(diags.is_empty(), "wild_own: {diags:?}");
+        let diags = c3_verify(prelude, "wild_prelude.gdl");
+        assert!(diags.is_empty(), "wild_prelude: {diags:?}");
+        let light = include_str!("../tests/boogie/wild_linked/light.gdl");
+        let prog = include_str!("../tests/boogie/wild_linked/wild_prog.gdl");
+        let linked = |prog: &str| {
+            let mut units = b4_units(&[("light.gdl", light), ("wild_prog.gdl", prog)]);
+            let checked = check_and_verify_project(&mut units, b4_opts(true, true));
+            assert!(checked.fatal.is_empty());
+            checked.diags.into_iter().map(|(_, d)| d).collect::<Vec<Diagnostic>>()
+        };
+        let diags = linked(prog);
+        assert!(diags.is_empty(), "wild_linked: {diags:?}");
+
+        // Mutants: a wrong wildcard (or bind-all) arm is rejected in every position.
+        let own_mutants = [
+            // last arm, own ADT
+            ("case _ then False", "case _ then True", "exact"),
+            // a wildcard after a constructor arm
+            ("red_zero: Current = Red implies Result = 0", "red_zero: Current = Red implies Result = 1", "red_zero"),
+            // first arm takes every value
+            ("case _ then 1", "case _ then 3", "one"),
+            // a bind-all arm after a constructor arm
+            ("red_stays: Current = Red implies Result = Red", "red_stays: Current = Red implies Result = Amber", "red_stays"),
+            // bind-all binder is the scrutinee
+            ("case other then other", "case other then Red", "others_stay"),
+        ];
+        for (from, to, tag) in own_mutants {
+            assert!(own.contains(from), "wild_own.gdl changed: {from}");
+            let diags = c3_verify(&own.replace(from, to), "wild_own_mutant.gdl");
+            assert!(diags.iter().any(|d| d.tag == tag), "{tag} must fail, got {diags:?}");
+        }
+        let prelude_mutants = [
+            ("case _ then 7", "case _ then 8", "seven"),
+            ("case None then Some(0)", "case None then None", "some"),
+            ("case _ then False", "case _ then True", "none_false"),
+        ];
+        for (from, to, tag) in prelude_mutants {
+            assert!(prelude.contains(from), "wild_prelude.gdl changed: {from}");
+            let diags = c3_verify(&prelude.replace(from, to), "wild_prelude_mutant.gdl");
+            assert!(diags.iter().any(|d| d.tag == tag), "{tag} must fail, got {diags:?}");
+        }
+        let linked_mutants = [
+            ("case _ then False", "case _ then True", "exact"),
+            ("case other then other", "case other then Amber", "no_amber"),
+        ];
+        for (from, to, tag) in linked_mutants {
+            assert!(prog.contains(from), "wild_prog.gdl changed: {from}");
+            let diags = linked(&prog.replace(from, to));
+            assert!(diags.iter().any(|d| d.tag == tag), "{tag} must fail, got {diags:?}");
+        }
+
+        // Exhaustiveness of a match without a catch-all is unchanged.
+        let partial = own.replace("        case Red then Green(30)\n        case other then other\n", "        case Red then Green(30)\n        case Amber then Amber\n");
+        assert_ne!(partial, own);
+        let diags = c3_verify(&partial, "wild_own_partial.gdl");
+        assert!(!diags.is_empty(), "a non-exhaustive match must still be rejected");
+    }
+
+    const D3_REACTIVE: &str = include_str!("../tests/reactive/tick_reactive.gdl");
+
+    /// Diagnostics of `tick_reactive.gdl` as `src`, checked and verified in its project.
+    fn d3_diags(src: &str) -> Vec<Diagnostic> {
+        let mut units = b4_units(&[("tick_state.gdl", D2_STATE), ("tick_reactive.gdl", src)]);
+        let checked = check_and_verify_project(&mut units, b4_opts(true, true));
+        let mut diags = checked.fatal;
+        diags.extend(checked.diags.into_iter().map(|(_, d)| d));
+        diags
+    }
+
+    /// `d3_diags` must report `tag` under the reactive rule.
+    fn d3_rejects(src: &str, tag: &str) {
+        let diags = d3_diags(src);
+        assert!(
+            diags.iter().any(|d| d.tag == tag && d.rule == "Phase 4 (Reactive Violation)"),
+            "{tag} must be reported, got {diags:?}"
+        );
+    }
+
+    #[test]
+    fn test_d3_reactive_program_verifies() {
+        let diags = d3_diags(D3_REACTIVE);
+        assert!(diags.is_empty(), "{diags:?}");
+        let m = parse_user_module_with_prelude(D3_REACTIVE);
+        assert_eq!(m.kind, ModuleKind::ReactiveProgram);
+        let (_, step) = m.feature_routines.iter().find(|(_, r)| r.name == "step").unwrap();
+        assert!(step.ensures.iter().any(|(t, _)| t == "shutdown_must_stop"));
+        // `--inspect` shows what kind of unit it is, and the obligation.
+        let text = format_module_interface(&m);
+        assert!(text.starts_with("reactive program TICK_REACTIVE"), "{text}");
+        assert!(text.contains("shutdown_must_stop"), "{text}");
+        // `reactive` is a keyword only directly before `program`.
+        let src = "functions REACT\n\nfeature {ANY}\n\n  reactive(n: U64): U64\n    do\n      let program = n\n      program\n    end\n\nend\n";
+        assert!(c3_verify(src, "react.gdl").is_empty());
+    }
+
+    #[test]
+    fn test_d3_form_of_a_reactive_program() {
+        let cut = |from: &str, to: &str| {
+            let s = D3_REACTIVE.replace(from, to);
+            assert_ne!(s, D3_REACTIVE, "tick_reactive.gdl changed: {from}");
+            s
+        };
+        d3_rejects(&cut("  init(args: SEQ[STRING])", "  start(args: SEQ[STRING])"), "missing_init");
+        d3_rejects(&cut("  step(s: TICK_STATE, e: EVENT)", "  stepper(s: TICK_STATE, e: EVENT)"), "missing_step");
+        let main = "  main(args: SEQ[STRING]): U64\n    do\n      0\n    end\n\n  grow(s: TICK_STATE)";
+        d3_rejects(&cut("  grow(s: TICK_STATE)", main), "main_in_reactive");
+        let io = "  helper: IO[EXIT_CODE]\n    do\n      IO.exit(0)\n    end\n\n  grow(s: TICK_STATE)";
+        d3_rejects(&cut("  grow(s: TICK_STATE)", io), "io_in_reactive");
+        d3_rejects(&cut("init(args: SEQ[STRING]): STEP[TICK_STATE]", "init(args: SEQ[STRING]): STEP[NAT]"), "state_type_mismatch");
+        d3_rejects(&cut("step(s: TICK_STATE, e: EVENT): STEP[TICK_STATE]", "step(s: TICK_STATE, e: EVENT): STEP[NAT]"), "state_type_mismatch");
+        d3_rejects(&cut("init(args: SEQ[STRING])", "init(n: NAT)"), "bad_init_signature");
+        d3_rejects(&cut("step(s: TICK_STATE, e: EVENT)", "step(s: TICK_STATE, e: NAT)"), "bad_step_signature");
+        d3_rejects(&cut("step(s: TICK_STATE, e: EVENT)", "step(s: TICK_STATE)"), "bad_step_signature");
+        // Aliases are the same type.
+        let aliased = "reactive program ALIAS\n\nfeature {ANY}\n\n  init(args: SEQ[STRING]): STEP[NAT]\n    do\n      Continue(0, LIST.empty)\n    end\n\n  step(s: U64, e: EVENT): STEP[U64]\n    do\n      Stop(s, LIST.empty)\n    end\n\nend\n";
+        assert!(check_visibility_and_semantics(&parse_user_module_with_prelude(aliased)).iter().all(|d| d.level != "error"));
+        // Parse errors, as for `program`.
+        for (from, to) in [
+            ("reactive program TICK_REACTIVE", "reactive program TICK_REACTIVE[A]"),
+            ("feature {ANY}", "specify {ANY}\n\n  law l\n    ensure\n      t: True\n    end\n\nfeature {ANY}"),
+            ("feature {ANY}", "invariant\n  t: True\n\nfeature {ANY}"),
+        ] {
+            let tokens = tokenize(&cut(from, to)).expect("lexing");
+            assert!(Parser::new(tokens).parse_file().is_err(), "`{to}` must not parse");
+        }
+    }
+
+    #[test]
+    fn test_d3_entry_points_cannot_assume_anything() {
+        // The runtime calls `step` with every event, so a `require` would be an assumption
+        // nobody proves. `require False` would otherwise discharge `shutdown_must_stop`.
+        let vacuous = D3_REACTIVE
+            .replace("step(s: TICK_STATE, e: EVENT): STEP[TICK_STATE]\n    do", "step(s: TICK_STATE, e: EVENT): STEP[TICK_STATE]\n    require\n      never: False\n    do")
+            .replace(r#"Stop(s.value, LIST.empty.prepend(Print("bye")))"#, "Continue(s, LIST.empty)");
+        assert!(vacuous.contains("never: False"), "tick_reactive.gdl changed");
+        d3_rejects(&vacuous, "entry_point_require");
+        let init = D3_REACTIVE.replace("init(args: SEQ[STRING]): STEP[TICK_STATE]\n    do", "init(args: SEQ[STRING]): STEP[TICK_STATE]\n    require\n      t: True\n    do");
+        assert_ne!(init, D3_REACTIVE);
+        d3_rejects(&init, "entry_point_require");
+        // A weaker clause under the same tag does not replace the obligation.
+        let weak = D3_REACTIVE
+            .replace("          grow(s)\n      end\n    end", "          grow(s)\n      end\n    ensure\n      shutdown_must_stop: True\n    end")
+            .replace(r#"Stop(s.value, LIST.empty.prepend(Print("bye")))"#, "Continue(s, LIST.empty)");
+        assert!(weak.contains("shutdown_must_stop: True"), "tick_reactive.gdl changed");
+        d3_rejects(&weak, "shutdown_must_stop");
+    }
+
+    #[test]
+    fn test_d3_step_obligations() {
+        // A step that continues on `Shutdown`.
+        let no_stop = D3_REACTIVE.replace(r#"Stop(s.value, LIST.empty.prepend(Print("bye")))"#, "Continue(s, LIST.empty)");
+        assert_ne!(no_stop, D3_REACTIVE);
+        d3_rejects(&no_stop, "shutdown_must_stop");
+        // The clause is implicit, and the diagnostic still points at `step`.
+        let want = no_stop.lines().position(|l| l.starts_with("  step(")).unwrap() + 1;
+        let diags = d3_diags(&no_stop);
+        let d = diags.iter().find(|d| d.tag == "shutdown_must_stop").unwrap();
+        assert_eq!(d.span.as_ref().map(|s| s.line), Some(want), "{d:?}");
+        // A step that breaks the state's `require`.
+        let no_guard = D3_REACTIVE.replace("if s.has_room then Continue", "if True then Continue");
+        assert_ne!(no_guard, D3_REACTIVE);
+        let diags = d3_diags(&no_guard);
+        assert!(diags.iter().any(|d| d.tag == "room"), "{diags:?}");
+        // An invariant failure names the state's clause.
+        let state = D2_STATE.replace("room: Current.has_room", "room: True");
+        assert_ne!(state, D2_STATE);
+        let mut units = b4_units(&[("tick_state.gdl", &state), ("tick_reactive.gdl", D3_REACTIVE)]);
+        let checked = check_and_verify_project(&mut units, b4_opts(true, true));
+        assert!(checked.diags.iter().any(|(_, d)| d.tag == "within_limit"), "{:?}", checked.diags);
+    }
+
+    #[test]
+    fn test_d3_nothing_may_refer_to_an_entry_point() {
+        let client = "functions USER\n\nfeature {ANY}\n\n  f(n: U64): U64\n    do\n      TARGET.helper(n)\n    end\n\nend\n";
+        let helper = "  helper(n: U64): U64\n    do\n      n\n    end\n\n";
+        for target in [
+            format!("program TARGET\n\nfeature {{ANY}}\n\n{helper}  main(args: SEQ[STRING]): IO[EXIT_CODE]\n    do\n      IO.exit(0)\n    end\n\nend\n"),
+            format!("reactive program TARGET\n\nfeature {{ANY}}\n\n{helper}  init(args: SEQ[STRING]): STEP[NAT]\n    do\n      Stop(0, LIST.empty)\n    end\n\n  step(s: NAT, e: EVENT): STEP[NAT]\n    do\n      Stop(s, LIST.empty)\n    end\n\nend\n"),
+        ] {
+            let mut units = b4_units(&[("target.gdl", &target), ("user.gdl", client)]);
+            let checked = check_and_verify_project(&mut units, b4_opts(true, true));
+            assert!(
+                checked.fatal.iter().any(|d| d.rule == "E0104: entry_point_reference" && d.routine == "USER"),
+                "{:?}",
+                checked.fatal
+            );
+        }
+    }
+
+    /// C of a verified reactive program with the given library files (the program last).
+    fn d4_c(files: &[(&str, &str)]) -> String {
+        let (diags, c) = d2_project(files);
+        assert!(diags.is_empty(), "{diags:?}");
+        assert!(!c.contains("#error"), "{}", c.lines().nth(1).unwrap_or(""));
+        c
+    }
+
+    /// Runs C with `GARDEL_EVENTS` set: (exit code, stdout, stderr). `None` without gcc.
+    fn d4_run(c: &str, tag: &str, events: &str, args: &[&str]) -> Option<(i32, String, String)> {
+        let (dir, exe) = c3_compile(c, tag)?;
+        let o = Command::new(&exe).args(args).env("GARDEL_EVENTS", events).output().unwrap();
+        let _ = fs::remove_dir_all(&dir);
+        let text = |b: &[u8]| String::from_utf8_lossy(b).replace("\r\n", "\n");
+        Some((o.status.code().unwrap_or(-1), text(&o.stdout), text(&o.stderr)))
+    }
+
+    const D4_HELLO: &str = include_str!("../../examples/reactive_hello.gdl");
+
+    #[test]
+    fn test_d4_hello_runs_and_stops_on_shutdown() {
+        let c = d4_c(&[("reactive_hello.gdl", D4_HELLO)]);
+        if let Some((code, out, err)) = d4_run(&c, "rhello", "Shutdown", &[]) {
+            assert_eq!(code, 0, "{err}");
+            assert_eq!(out, "Hello. Press Ctrl-C to stop.\nGoodbye.\n");
+        }
+        // A script that ends is a shutdown, so a scripted run always ends.
+        if let Some((code, out, _)) = d4_run(&c, "rhelloempty", "", &[]) {
+            assert_eq!(code, 0);
+            assert!(out.ends_with("Goodbye.\n"), "{out}");
+        }
+        // An unknown event is an error, not a silently ignored line.
+        if let Some((code, _, err)) = d4_run(&c, "rhellobad", "Nonsense", &[]) {
+            assert_eq!(code, 2);
+            assert!(err.contains("unknown event `Nonsense`"), "{err}");
+        }
+    }
+
+    #[test]
+    fn test_d4_exit_codes_and_command_order_come_from_the_program() {
+        let src = "reactive program ORDER\n\nfeature {ANY}\n\n  init(args: SEQ[STRING]): STEP[NAT]\n    do\n      Continue(7, LIST.empty.prepend(Print(\"two\")).prepend(Print(\"one\")))\n    end\n\n  step(s: NAT, e: EVENT): STEP[NAT]\n    do\n      Stop(s, LIST.empty.prepend(Print(\"four\")).prepend(Print(\"three\")))\n    end\n\nend\n";
+        let c = d4_c(&[("order.gdl", src)]);
+        if let Some((code, out, err)) = d4_run(&c, "rorder", "Shutdown", &[]) {
+            assert_eq!(code, 7, "{err}");
+            assert_eq!(out, "one\ntwo\nthree\nfour\n");
+        }
+    }
+
+    #[test]
+    fn test_d4_init_can_refuse_to_start() {
+        // `init` returning `Stop` runs its commands and exits: `step` is never called, and
+        // no event is awaited.
+        let src = "reactive program REFUSE\n\nfeature {ANY}\n\n  init(args: SEQ[STRING]): STEP[NAT]\n    do\n      if args.length = 0 then\n        Stop(3, LIST.empty.prepend(Print(\"usage\")))\n      else\n        Continue(0, LIST.empty)\n      end\n    end\n\n  step(s: NAT, e: EVENT): STEP[NAT]\n    do\n      Stop(9, LIST.empty.prepend(Print(\"step ran\")))\n    end\n\nend\n";
+        let c = d4_c(&[("refuse.gdl", src)]);
+        if let Some((code, out, err)) = d4_run(&c, "rrefuse", "Shutdown", &[]) {
+            assert_eq!(code, 3, "{err}");
+            assert_eq!(out, "usage\n");
+        }
+        // With an argument it starts, so `args` reached `init`.
+        if let Some((code, out, _)) = d4_run(&c, "rrefuse2", "Shutdown", &["x"]) {
+            assert_eq!(code, 9);
+            assert_eq!(out, "step ran\n");
+        }
+    }
+
+    #[test]
+    fn test_d4_host_frees_state_commands_and_events() {
+        // A heap state, commands and strings, through the whole loop, many times.
+        let c = d4_c(&[("tick_state.gdl", D2_STATE), ("tick_reactive.gdl", D3_REACTIVE)]);
+        if let Some((code, out, err)) = d4_run(&c, "rtick", "Shutdown", &[]) {
+            assert_eq!((code, out.as_str()), (0, "ready\nbye\n"), "{err}");
+        }
+        let c = c.replace("int main(int argc, char** argv) {", "int gardel_unused_main(int argc, char** argv) {");
+        let harness = format!(
+            "{c}\nint main(void) {{\n    char* argv[] = {{ (char*)\"x\", NULL }};\n    for (int i = 0; i < 50; i++) {{\n        gardel_host_script = \"Shutdown\";\n        gardel_reactive_main(1, argv);\n    }}\n    fprintf(stderr, \"live=%llu\\n\", (unsigned long long)gardel_live_allocations());\n    return 0;\n}}\n"
+        );
+        if let Some((dir, exe)) = c3_compile(&harness, "rleak") {
+            let o = Command::new(&exe).output().unwrap();
+            let _ = fs::remove_dir_all(&dir);
+            let err = String::from_utf8_lossy(&o.stderr).to_string();
+            assert!(err.contains("live=0"), "everything must be freed: {err}");
+        }
+    }
+
+    #[test]
+    fn test_d4_output_is_flushed_before_waiting() {
+        // No script: the program waits for a real signal, and may wait for days. What it
+        // printed must already be out, also through a pipe, where stdout is fully buffered.
+        use std::io::BufRead;
+        let c = d4_c(&[("reactive_hello.gdl", D4_HELLO)]);
+        let Some((dir, exe)) = c3_compile(&c, "rflush") else { return };
+        let mut child = Command::new(&exe)
+            .env_remove("GARDEL_EVENTS")
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let stdout = child.stdout.take().unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let mut line = String::new();
+            let _ = std::io::BufReader::new(stdout).read_line(&mut line);
+            let _ = tx.send(line);
+        });
+        let line = rx.recv_timeout(std::time::Duration::from_secs(20));
+        let still_running = child.try_wait().unwrap().is_none();
+        let _ = child.kill();
+        let _ = child.wait();
+        let _ = fs::remove_dir_all(&dir);
+        assert!(line.is_ok_and(|l| l.starts_with("Hello.")), "the greeting must be out before the wait");
+        assert!(still_running, "with no script, the program must wait for a signal");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_d4_sigint_and_sigterm_stop_the_program() {
+        use std::io::BufRead;
+        let c = d4_c(&[("reactive_hello.gdl", D4_HELLO)]);
+        for sig in ["-INT", "-TERM"] {
+            let Some((dir, exe)) = c3_compile(&c, "rsignal") else { return };
+            let mut child = Command::new(&exe)
+                .env_remove("GARDEL_EVENTS")
+                .stdout(std::process::Stdio::piped())
+                .spawn()
+                .unwrap();
+            let mut out = std::io::BufReader::new(child.stdout.take().unwrap());
+            let mut line = String::new();
+            out.read_line(&mut line).unwrap();
+            let sent = Command::new("kill").arg(sig).arg(child.id().to_string()).status().unwrap();
+            assert!(sent.success());
+            let mut rest = String::new();
+            out.read_line(&mut rest).unwrap();
+            let status = child.wait().unwrap();
+            let _ = fs::remove_dir_all(&dir);
+            assert_eq!(rest.trim_end(), "Goodbye.", "{sig}");
+            assert_eq!(status.code(), Some(0), "{sig}");
+        }
+    }
+
+    #[test]
+    fn test_d4_host_is_exhaustive_over_commands_and_events() {
+        // A variant with no host code must stop the build, or the runtime would ignore it.
+        let prelude = standard_prelude();
+        let variants = |m: &str| match &prelude.module(m).unwrap().repr {
+            ReprKind::Sum(vs) => vs.iter().map(|v| v.name.clone()).collect::<Vec<_>>(),
+            ReprKind::Product(_) => panic!("{m} is a sum type"),
+        };
+        for v in variants("COMMAND") {
+            assert!(c11_typed::host_command_code(&v).is_some(), "COMMAND.{v}");
+        }
+        for v in variants("EVENT") {
+            assert!(c11_typed::host_event_code(&v).is_some(), "EVENT.{v}");
+        }
+        for v in variants("KEY") {
+            assert!(c11_typed::host_key_code(&v).is_some(), "KEY.{v}");
+        }
+        assert!(c11_typed::host_key_code("Nonsense").is_none());
+        assert!(c11_typed::host_command_code("Nonsense").is_none());
+        assert!(c11_typed::host_event_code("Nonsense").is_none());
+        let c = d4_c(&[("reactive_hello.gdl", D4_HELLO)]);
+        assert!(c.contains("case TAG_COMMAND_SetTimer:"), "one case per variant");
+        // One OpenMP region around the loop: a region per call wakes the team for every event.
+        let host = &c[c.find("int gardel_reactive_main").unwrap()..];
+        assert_eq!(host.matches("#pragma omp parallel").count(), 1, "{host}");
+    }
+
+    /// Runs C with this stdin and no script: (exit code, stdout).
+    fn d6_run_stdin(c: &str, tag: &str, input: &[u8]) -> Option<(i32, String)> {
+        let runs = c3_native_runs(c, tag, &[input])?;
+        Some((runs[0].0, runs[0].1.replace("\r\n", "\n")))
+    }
+
+    const D6_LINES: &str = include_str!("../tests/reactive/echo_lines.gdl");
+
+    #[test]
+    fn test_d6_lines_arrive_as_events_and_bad_input_never_crashes() {
+        let c = d4_c(&[("echo_lines.gdl", D6_LINES)]);
+        // Real stdin, through the reader thread. Malformed UTF-8 is an `Error` event.
+        let input: &[u8] = b"hello\nh\xC3\xA9llo\n\xFF\xFE\nlast";
+        let expected = "hello\nh\u{e9}llo\nbad input\nlast\nend";
+        if let Some((code, out)) = d6_run_stdin(&c, "rlines", input) {
+            assert_eq!((code, out.as_str()), (0, expected));
+        }
+        // Scripted runs give identical output.
+        if let Some((code, out, err)) = d4_run(&c, "rlinesscript", "Line:hello Line:h%C3%A9llo Line:%FF%FE Line:last LineEnd", &[]) {
+            assert_eq!((code, out.trim_end()), (0, expected), "{err}");
+        }
+    }
+
+    #[test]
+    fn test_d6_a_blocked_reader_does_not_stop_the_program_or_its_exit() {
+        // stdin stays open and silent, so the reader is blocked. Timers still run through the
+        // same wait, and the process still exits: exit() would wait on the stdin stream.
+        let src = "reactive program BLOCKED\n\nfeature {ANY}\n\n  init(args: SEQ[STRING]): STEP[NAT]\n    do\n      Continue(0, LIST.empty.prepend(SetTimer(1, 50)).prepend(ReadLine))\n    end\n\n  step(s: NAT, e: EVENT): STEP[NAT]\n    do\n      match e\n        case Tick(id) then Stop(5, LIST.empty.prepend(Print(\"timer fired\")))\n        case _ then Stop(9, LIST.empty)\n      end\n    end\n\nend\n";
+        let c = d4_c(&[("blocked.gdl", src)]);
+        let Some((dir, exe)) = c3_compile(&c, "rblocked") else { return };
+        let mut child = Command::new(&exe)
+            .env_remove("GARDEL_EVENTS")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let held_open = child.stdin.take();
+        let start = std::time::Instant::now();
+        let status = loop {
+            if let Some(s) = child.try_wait().unwrap() {
+                break Some(s);
+            }
+            if start.elapsed() > std::time::Duration::from_secs(20) {
+                break None;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        };
+        if status.is_none() {
+            let _ = child.kill();
+        }
+        drop(held_open);
+        let o = child.wait_with_output().unwrap();
+        let _ = fs::remove_dir_all(&dir);
+        assert_eq!(status.and_then(|s| s.code()), Some(5), "the program must exit while the reader is blocked");
+        assert!(String::from_utf8_lossy(&o.stdout).starts_with("timer fired"));
+    }
+
+    const D6_BOARD: &str = include_str!("../../examples/reactive_game/track_board.gdl");
+    const D6_GAME: &str = include_str!("../../examples/reactive_game/reactive_game.gdl");
+
+    #[test]
+    fn test_d6_game_verifies_and_plays() {
+        let c = d4_c(&[("track_board.gdl", D6_BOARD), ("reactive_game.gdl", D6_GAME)]);
+        let win = "Reach the G. Arrows or h and l move, q quits.\n@...G\n.@..G\n..@.G\n...@G\n....@\nYou win.";
+        // Scripted: keys by name and by scalar. A wall stops the move, and the board stays legal.
+        if let Some((code, out, err)) = d4_run(&c, "rgame", "Key:Left Key:Right Key:Other Key:108 Key:Right Key:Right", &[]) {
+            assert_eq!(code, 0, "{err}");
+            assert_eq!(out.trim_end(), "Reach the G. Arrows or h and l move, q quits.\n@...G\n@...G\n.@..G\n..@.G\n...@G\n....@\nYou win.");
+        }
+        // Real stdin through a pipe: identical output, with an arrow as its escape sequence
+        // on POSIX, where a lone byte 27 can be told from one.
+        if let Some((code, out)) = d6_run_stdin(&c, "rgamepipe", b"llll") {
+            assert_eq!((code, out.as_str()), (0, win));
+        }
+        // Malformed bytes are `Other`: they never become a CHAR, and never crash.
+        if let Some((code, out)) = d6_run_stdin(&c, "rgamebad", b"\xFF\xC0\x80\xED\xA0\x80\xF4\x90\x80\x80q") {
+            assert_eq!(code, 0, "{out}");
+            assert!(out.ends_with("Bye."), "{out}");
+        }
+        // End of input is an event, so a program cannot hang on a closed stdin.
+        if let Some((code, out)) = d6_run_stdin(&c, "rgameeof", b"l") {
+            assert_eq!(code, 1, "{out}");
+            assert!(out.ends_with("Input ended."), "{out}");
+        }
+        // The invariant is what proves the board legal.
+        let bad = D6_BOARD.replace("if Current.pos + 1 < 5 then", "if True then");
+        assert_ne!(bad, D6_BOARD);
+        let (diags, _) = d2_project(&[("track_board.gdl", &bad), ("reactive_game.gdl", D6_GAME)]);
+        assert!(diags.iter().any(|d| d.tag == "on_board"), "{diags:?}");
+    }
+
+    const D7_STATE: &str = include_str!("../../examples/echo_server/server_state.gdl");
+    const D7_ECHO: &str = include_str!("../../examples/echo_server/echo_server.gdl");
+    const D7_RULES: &str = include_str!("../tests/reactive/net_rules.gdl");
+    const D7_FLOOD: &str = include_str!("../tests/reactive/net_flood.gdl");
+
+    /// A port nothing listens on: the system's choice, given back at once.
+    fn d7_free_port() -> u16 {
+        std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port()
+    }
+
+    fn d7_echo_c(port: u16) -> String {
+        d4_c(&[("server_state.gdl", D7_STATE), ("echo_server.gdl", &D7_ECHO.replace("8888", &port.to_string()))])
+    }
+
+    fn d7_spawn(exe: &std::path::Path) -> std::process::Child {
+        Command::new(exe)
+            .env_remove("GARDEL_EVENTS")
+            .env_remove("GARDEL_LISTEN_ADDR")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap()
+    }
+
+    /// Waits for a server to end by itself. One that hangs fails the test.
+    fn d7_finish(mut server: std::process::Child) -> std::process::Output {
+        for _ in 0..3000 {
+            if server.try_wait().unwrap().is_some() {
+                return server.wait_with_output().unwrap();
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let _ = server.kill();
+        panic!("the server did not stop: {:?}", server.wait_with_output().unwrap());
+    }
+
+    /// A client of a server that may still be starting, with a read timeout, so that a server
+    /// that hangs fails the test and does not stop it.
+    fn d7_connect(port: u16) -> std::net::TcpStream {
+        for _ in 0..500 {
+            if let Ok(s) = std::net::TcpStream::connect(("127.0.0.1", port)) {
+                s.set_read_timeout(Some(std::time::Duration::from_secs(10))).unwrap();
+                s.set_nodelay(true).unwrap();
+                return s;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        panic!("no server on port {port}");
+    }
+
+    fn d7_round_trip(s: &mut std::net::TcpStream, text: &[u8]) {
+        use std::io::{Read, Write};
+        s.write_all(text).unwrap();
+        let mut got = vec![0u8; text.len()];
+        s.read_exact(&mut got).unwrap();
+        assert_eq!(got, text);
+    }
+
+    /// True when the server let this client in: it echoes, where a refused one sees the end.
+    fn d7_admitted(s: &mut std::net::TcpStream) -> bool {
+        use std::io::{Read, Write};
+        let _ = s.write_all(b"?");
+        let mut b = [0u8; 1];
+        matches!(s.read(&mut b), Ok(1))
+    }
+
+    #[test]
+    fn test_d7_conn_id_laws_are_proven_and_a_handle_cannot_be_forged() {
+        let stdlib = parse_phase4_stdlib().unwrap();
+        let conn = stdlib.modules.iter().find(|m| m.name == "CONN_ID").expect("CONN_ID");
+        assert!(matches!(conn.repr_vis, Visibility::None));
+        assert!(conn.create_routines.is_empty(), "a creator would forge handles");
+        let laws: Vec<&str> = conn.specify_laws.iter().map(|(_, l)| l.name.as_str()).collect();
+        for law in ["reflexive", "symmetric", "transitive", "agrees_with_structural", "irreflexive", "total"] {
+            assert!(laws.contains(&law), "{law}: {laws:?}");
+        }
+        // Handles compare with `=` (it is CANONICAL_EQ), and that is all a client can do.
+        let client = |body: &str, ret: &str| {
+            format!("reactive program CLIENT\n\nfeature {{ANY}}\n\n  probe(a: CONN_ID, b: CONN_ID): {ret}\n    do\n      {body}\n    end\n\n  init(args: SEQ[STRING]): STEP[NAT]\n    do\n      Stop(0, LIST.empty)\n    end\n\n  step(s: NAT, e: EVENT): STEP[NAT]\n    do\n      Stop(s, LIST.empty)\n    end\n\nend\n")
+        };
+        for (body, ret) in [("a = b", "BOOL"), ("a != b", "BOOL"), ("a.equals(b)", "BOOL"), ("a.less_than(b)", "BOOL")] {
+            let (diags, _) = d2_project(&[("client.gdl", &client(body, ret))]);
+            assert!(diags.is_empty(), "`{body}` must stay legal: {diags:?}");
+        }
+        // Hiding is enforced by types: a record literal is always the current module's record,
+        // and a field is a function of its own module's sort.
+        for (body, ret) in [("a.id", "U64"), ("{ id = 1 }", "CONN_ID"), ("{ a with id = 5 }", "CONN_ID"), ("CONN_ID.make(1)", "CONN_ID")] {
+            let (diags, _) = d2_project(&[("client.gdl", &client(body, ret))]);
+            assert!(diags.iter().any(|d| d.level == "error"), "`{body}` forges or opens a handle");
+        }
+    }
+
+    #[test]
+    fn test_d7_the_limit_is_proven() {
+        let c = d7_echo_c(8888);
+        assert!(c.contains("case TAG_COMMAND_Listen:"), "one case per variant");
+        // `within_limit` needs `room`, and `step` must prove `room`.
+        let no_require = D7_STATE.replace("    require\n      room: Current.has_room\n", "").replace("    require\r\n      room: Current.has_room\r\n", "");
+        assert_ne!(no_require, D7_STATE);
+        let (diags, _) = d2_project(&[("server_state.gdl", &no_require), ("echo_server.gdl", D7_ECHO)]);
+        assert!(diags.iter().any(|d| d.tag == "within_limit"), "{diags:?}");
+        let no_guard = D7_ECHO.replace("if s.has_room then", "if True then");
+        assert_ne!(no_guard, D7_ECHO);
+        let (diags, _) = d2_project(&[("server_state.gdl", D7_STATE), ("echo_server.gdl", &no_guard)]);
+        assert!(diags.iter().any(|d| d.tag == "room"), "{diags:?}");
+        // A shutdown must stop, here as everywhere.
+        let no_stop = D7_ECHO.replace("case Shutdown then\n          Stop(0, LIST.empty)", "case Shutdown then\n          Continue(s, LIST.empty)")
+            .replace("case Shutdown then\r\n          Stop(0, LIST.empty)", "case Shutdown then\r\n          Continue(s, LIST.empty)");
+        assert_ne!(no_stop, D7_ECHO);
+        let (diags, _) = d2_project(&[("server_state.gdl", D7_STATE), ("echo_server.gdl", &no_stop)]);
+        assert!(diags.iter().any(|d| d.tag == "shutdown_must_stop"), "{diags:?}");
+    }
+
+    #[test]
+    fn test_d7_scripted_sockets() {
+        // No socket is opened: the script is the world, and the commands are written out.
+        let c = d7_echo_c(8888);
+        let script = "Accepted:1 Accepted:2 Received:1:hi%20there SendFailed:1:32 Closed:1 Received:2:%FF%00 Closed:2 Shutdown";
+        if let Some((code, out, err)) = d4_run(&c, "rnet", script, &[]) {
+            assert_eq!((code, out.as_str()), (0, ""), "{err}");
+            assert_eq!(err.replace("\r\n", "\n"), "net: Listen 8888\nnet: Send 1 hi%20there\nnet: Send 2 %FF%00\n");
+        }
+        // The limit, exactly: the 64 first are in, the next is refused, and a free slot is
+        // used again.
+        let mut script: String = (1..=65).map(|i| format!("Accepted:{i} ")).collect();
+        script.push_str("Closed:1 Accepted:66 Accepted:67");
+        if let Some((code, _, err)) = d4_run(&c, "rnetlimit", &script, &[]) {
+            assert_eq!(code, 0, "{err}");
+            let closes: Vec<&str> = err.lines().filter(|l| l.starts_with("net: Close")).collect();
+            assert_eq!(closes, ["net: Close 65", "net: Close 67"], "{err}");
+        }
+        if let Some((code, out, _)) = d4_run(&c, "rnetfail", "ListenFailed:8888:98", &[]) {
+            assert_eq!((code, out.trim_end()), (1, "cannot listen on port 8888"));
+        }
+        for bad in ["Accepted:x", "Accepted:", "Closed:1:2", "Received:1", "Received:1:%ZZ", "SendFailed:1:", "ListenFailed:80"] {
+            if let Some((code, _, err)) = d4_run(&c, "rnetbad", bad, &[]) {
+                assert_eq!(code, 2, "`{bad}`: {err}");
+                assert!(err.contains("unknown event"), "`{bad}`: {err}");
+            }
+        }
+    }
+
+    #[test]
+    fn test_d7_echo_server_over_real_sockets() {
+        use std::io::{Read, Write};
+        let port = d7_free_port();
+        let Some((dir, exe)) = c3_compile(&d7_echo_c(port), "recho") else { return };
+        let mut server = d7_spawn(&exe);
+
+        // The limit under more clients than allowed: the 64 first are in and keep working.
+        let mut live: Vec<std::net::TcpStream> = Vec::new();
+        for i in 0..64u32 {
+            let mut c = d7_connect(port);
+            d7_round_trip(&mut c, format!("hello {i}").as_bytes());
+            live.push(c);
+        }
+        for _ in 0..6 {
+            assert!(!d7_admitted(&mut d7_connect(port)), "the 65th client got in");
+        }
+        for (i, c) in live.iter_mut().enumerate() {
+            d7_round_trip(c, format!("still here {i}").as_bytes());
+        }
+        // A slot is free again once its client has gone.
+        live.pop();
+        let mut replaced = false;
+        for _ in 0..200 {
+            if d7_admitted(&mut d7_connect(port)) {
+                replaced = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(replaced, "a closed connection must free its slot");
+        live.clear();
+
+        let mut admitted = None;
+        for _ in 0..200 {
+            let mut c = d7_connect(port);
+            if d7_admitted(&mut c) {
+                admitted = Some(c);
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let mut sink = admitted.expect("the slots come back");
+
+        // A client that sends and never reads stops only itself. The server stops reading it,
+        // so its send blocks, and everyone else is served.
+        let mut stalled = d7_connect(port);
+        stalled.set_write_timeout(Some(std::time::Duration::from_millis(300))).unwrap();
+        let chunk = vec![7u8; 65536];
+        let mut sent = 0usize;
+        let mut blocked = false;
+        while sent < 400 * 1024 * 1024 {
+            match stalled.write(&chunk) {
+                Ok(n) => sent += n,
+                Err(_) => {
+                    blocked = true;
+                    break;
+                }
+            }
+        }
+        assert!(blocked, "the server read {sent} bytes that it cannot send back");
+        d7_round_trip(&mut sink, b"not blocked");
+        drop(stalled);
+
+        // A long stream with both directions busy, ended by half a close: all of the echo
+        // arrives after the client has finished sending.
+        let mut big = d7_connect(port);
+        let data: Vec<u8> = (0..4 * 1024 * 1024u32).map(|i| (i % 251) as u8).collect();
+        let mut writer = big.try_clone().unwrap();
+        let to_send = data.clone();
+        let t = std::thread::spawn(move || {
+            writer.write_all(&to_send).unwrap();
+            writer.shutdown(std::net::Shutdown::Write).unwrap();
+        });
+        let mut got = Vec::new();
+        big.read_to_end(&mut got).unwrap();
+        t.join().unwrap();
+        assert_eq!(got.len(), data.len());
+        assert!(got == data, "the stream came back different");
+
+        assert!(server.try_wait().unwrap().is_none(), "the server must still run");
+        #[cfg(unix)]
+        {
+            let sent = Command::new("kill").arg("-TERM").arg(server.id().to_string()).status().unwrap();
+            assert!(sent.success());
+            assert_eq!(server.wait().unwrap().code(), Some(0), "`Shutdown` stops with code 0");
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = server.kill();
+            let _ = server.wait();
+        }
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_d7_listen_failures_are_events() {
+        // The port is taken.
+        let taken = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = taken.local_addr().unwrap().port();
+        let Some((dir, exe)) = c3_compile(&d7_echo_c(port), "rlisten") else { return };
+        let o = Command::new(&exe).env_remove("GARDEL_EVENTS").env_remove("GARDEL_LISTEN_ADDR").output().unwrap();
+        assert_eq!(o.status.code(), Some(1), "{}", String::from_utf8_lossy(&o.stderr));
+        assert!(String::from_utf8_lossy(&o.stdout).contains("cannot listen"));
+        // An address that is not one.
+        let o = Command::new(&exe).env_remove("GARDEL_EVENTS").env("GARDEL_LISTEN_ADDR", "not.an.address").output().unwrap();
+        assert_eq!(o.status.code(), Some(1));
+        drop(taken);
+        let _ = fs::remove_dir_all(&dir);
+        // Ports that cannot be listened on: too large, and 0, which the program could not learn.
+        for port in ["70000", "0"] {
+            let src = D7_ECHO.replace("Listen(8888)", &format!("Listen({port})"));
+            let c = d4_c(&[("server_state.gdl", D7_STATE), ("echo_server.gdl", &src)]);
+            let Some((dir, exe)) = c3_compile(&c, "rlistenbad") else { return };
+            let o = Command::new(&exe).env_remove("GARDEL_EVENTS").output().unwrap();
+            assert_eq!(o.status.code(), Some(1), "port {port}");
+            let _ = fs::remove_dir_all(&dir);
+        }
+    }
+
+    #[test]
+    fn test_d7_a_closed_handle_stays_quiet() {
+        use std::io::{Read, Write};
+        // After Close(c) a program may still name c, by mistake: the bytes of the earlier Send
+        // arrive, the later Send does nothing, and exactly one event mentions c: its Closed.
+        let port = d7_free_port();
+        let src = D7_RULES.replace("8888", &port.to_string());
+        let c = d4_c(&[("net_rules.gdl", &src)]);
+        let Some((dir, exe)) = c3_compile(&c, "rrules") else { return };
+        let server = d7_spawn(&exe);
+        for _ in 0..2 {
+            let mut s = d7_connect(port);
+            s.write_all(b"x").unwrap();
+            let mut got = Vec::new();
+            s.read_to_end(&mut got).unwrap();
+            assert_eq!(got, b"bye", "the Send before Close arrives, and the one after it does not");
+        }
+        let o = d7_finish(server);
+        let _ = fs::remove_dir_all(&dir);
+        assert_eq!(o.status.code(), Some(0));
+        assert_eq!(String::from_utf8_lossy(&o.stdout).replace("\r\n", "\n"), "received\nclosed\nreceived\nclosed\n");
+    }
+
+    #[test]
+    fn test_d7_a_failed_send_ends_the_connection() {
+        use std::io::Write;
+        // A client that reads nothing: the queue fills, and a Send fails in place of blocking.
+        // Its SendFailed comes first, and Closed follows, so a program has one ending to handle.
+        let port = d7_free_port();
+        let src = D7_FLOOD.replace("8888", &port.to_string());
+        let c = d4_c(&[("net_flood.gdl", &src)]);
+        let Some((dir, exe)) = c3_compile(&c, "rflood") else { return };
+        let server = d7_spawn(&exe);
+        let mut client = d7_connect(port);
+        client.write_all(&[7u8; 65536]).unwrap();
+        let o = d7_finish(server);
+        drop(client);
+        assert_eq!(o.status.code(), Some(0));
+        assert_eq!(String::from_utf8_lossy(&o.stdout).replace("\r\n", "\n"), "send failed\nclosed\n");
+        // After Close, not even that failure is reported.
+        let port = d7_free_port();
+        let src = D7_FLOOD.replace("8888", &port.to_string()).replace("1000, LIST.empty)", "1000, LIST.empty.prepend(Close(c)))");
+        assert!(src.contains("prepend(Close(c))"));
+        let c = d4_c(&[("net_flood.gdl", &src)]);
+        let (dir2, exe) = c3_compile(&c, "rfloodclose").unwrap();
+        let server = d7_spawn(&exe);
+        let mut client = d7_connect(port);
+        client.write_all(&[7u8; 65536]).unwrap();
+        let o = d7_finish(server);
+        drop(client);
+        let _ = fs::remove_dir_all(&dir);
+        let _ = fs::remove_dir_all(&dir2);
+        assert_eq!(o.status.code(), Some(0));
+        assert_eq!(String::from_utf8_lossy(&o.stdout).replace("\r\n", "\n"), "closed\n");
+    }
+
+    #[test]
+    fn test_d7_live_allocations_do_not_grow_across_connections() {
+        use std::io::{Read, Write};
+        // Three events per client: Accepted, Received, Closed. The live count is sampled during
+        // the run, so a leak per connection shows even if the program frees it all at exit.
+        let port = d7_free_port();
+        let c = d7_echo_c(port);
+        let harness = format!(
+            "#define GARDEL_HOST_PROBE gardel_probe\nstatic void gardel_probe(void);\n{c}\n\
+             static uint64_t gardel_seen = 0, gardel_early = 0, gardel_peak = 0;\n\
+             static void gardel_probe(void) {{\n    uint64_t live = gardel_live_allocations();\n    gardel_seen++;\n    if (gardel_seen == 300) gardel_early = live;\n    if (gardel_seen >= 300 && live > gardel_peak) gardel_peak = live;\n    if (gardel_seen == 5900) {{\n        fprintf(stderr, \"early=%llu peak=%llu\\n\", (unsigned long long)gardel_early, (unsigned long long)gardel_peak);\n        fflush(stderr);\n        _Exit(0);\n    }}\n}}\n"
+        );
+        let Some((dir, exe)) = c3_compile(&harness, "rcycles") else { return };
+        let server = d7_spawn(&exe);
+        for i in 0..2000u32 {
+            let Ok(mut s) = std::net::TcpStream::connect(("127.0.0.1", port)).or_else(|_| {
+                std::thread::sleep(std::time::Duration::from_millis(50));
+                std::net::TcpStream::connect(("127.0.0.1", port))
+            }) else {
+                break; // the probe saw enough, and the server has gone
+            };
+            s.set_read_timeout(Some(std::time::Duration::from_secs(10))).unwrap();
+            if s.write_all(b"cycle").is_err() {
+                break;
+            }
+            let mut got = [0u8; 5];
+            if s.read_exact(&mut got).is_err() {
+                assert!(i > 1900, "the server stopped early, at client {i}");
+                break;
+            }
+        }
+        let o = d7_finish(server);
+        let _ = fs::remove_dir_all(&dir);
+        let err = String::from_utf8_lossy(&o.stderr).to_string();
+        let field = |k: &str| -> u64 {
+            let at = err.find(&format!("{k}=")).unwrap_or_else(|| panic!("{err}"));
+            err[at + k.len() + 1..].split_whitespace().next().unwrap().parse().unwrap()
+        };
+        // At most one client at a time: a list cell, a handle and the bytes in flight.
+        assert!(field("peak") <= field("early") + 8, "live allocations grew: {err}");
+    }
+
+    #[test]
+    fn test_prelude_constructor_names_are_unique() {
+        // Constructors resolve by name alone, so a repeated name would silently capture the
+        // other module's constructor in every client.
+        let mut owner: HashMap<String, String> = HashMap::new();
+        for m in &standard_prelude().modules {
+            if let ReprKind::Sum(vs) = &m.repr {
+                for v in vs {
+                    if let Some(other) = owner.insert(v.name.clone(), m.name.clone()) {
+                        panic!("constructor `{}` is in both `{other}` and `{}`", v.name, m.name);
+                    }
+                }
+            }
+        }
+    }
+
+    /// `E0311` diagnostics of a one-file module with the given source.
+    fn d6b_e0311(src: &str) -> usize {
+        let m = parse_user_module_with_prelude(src);
+        let diags = with_prelude_injection(true, || check_string_semantics(&m, src, "eq.gdl"));
+        diags.iter().filter(|d| d.rule.starts_with("E0311")).count()
+    }
+
+    #[test]
+    fn test_d6b_runtime_equality_needs_a_canonical_type() {
+        // `=` in running code is a real structural comparison in C.
+        let f = |sig: &str, body: &str| format!("functions EQF\n\nfeature {{ANY}}\n\n  {sig}: BOOL\n    do\n      {body}\n    end\n\nend\n");
+        for (sig, body) in [
+            ("r(a: SEQ[U64], b: SEQ[U64])", "a = b"),
+            ("r(a: SEQ[U64], b: SEQ[U64])", "a != b"),
+            ("r(a: STRING, b: STRING)", "a = b"),
+            ("r(a: BIGNAT, b: BIGNAT)", "a = b"),
+            ("r(a: F64, b: F64)", "a = b"),
+            ("r(a: OPTION[SEQ[U64]], b: OPTION[SEQ[U64]])", "a = b"),
+            ("r(a: LIST[SEQ[U64]], b: LIST[SEQ[U64]])", "a = b"),
+            ("r[T](a: T, b: T)", "a = b"),
+            ("r(e: EVENT)", "e = Shutdown"),
+            ("r(a: OPTION[SEQ[U64]])", "a = None"),
+            ("r(a: TUPLE[U64, STRING], b: TUPLE[U64, STRING])", "a = b"),
+            ("r(a: U64, b: SEQ[U64])", "SEQ.singleton(a).map(fn(x: U64): BOOL do b = b end).length = 0"),
+        ] {
+            assert!(d6b_e0311(&f(sig, body)) > 0, "`{body}` on {sig} must be refused");
+        }
+        for (sig, body) in [
+            ("r(a: U64, b: U64)", "a = b"),
+            ("r(a: CHAR, b: CHAR)", "a = b"),
+            ("r(a: BOOL, b: BOOL)", "a != b"),
+            ("r(a: LIST[U64], b: LIST[U64])", "a = b"),
+            ("r(a: TUPLE[U64, BOOL], b: TUPLE[U64, BOOL])", "a = b"),
+            ("r(a: OPTION[U64], b: OPTION[U64])", "a = b"),
+            ("r(a: OPTION[SEQ[U64]])", "a.is_none"),
+        ] {
+            assert_eq!(d6b_e0311(&f(sig, body)), 0, "`{body}` on {sig} must stay legal");
+        }
+        // A plain enum: a constructor test is what `match` does; two values are not comparable.
+        let e = |body: &str| format!("module PAINT\n\nrepresentation {{ANY}}\n  | Red\n  | Blue(n: NAT)\n\nfeature {{ANY}}\n\n  r(o: PAINT): BOOL\n    do\n      {body}\n    end\n\nend\n");
+        assert_eq!(d6b_e0311(&e("Current = Red")), 0);
+        assert!(d6b_e0311(&e("Current = o")) > 0);
+        assert!(d6b_e0311(&e("Current = Blue(1)")) > 0);
+        // A bounded type parameter is canonical.
+        let g = "module KEEP[A: CANONICAL_EQ]\n\nrepresentation {NONE}\n  x: A\n\nfeature {ANY}\n\n  same(o: KEEP[A]): BOOL\n    do\n      Current.x = o.x\n    end\n\nend\n";
+        assert_eq!(d6b_e0311(g), 0);
+        assert!(d6b_e0311(&g.replace("A: CANONICAL_EQ", "A")) > 0);
+    }
+
+    #[test]
+    fn test_d6b_contracts_may_compare_unless_the_type_says_not() {
+        let c = |sig: &str, clause: &str| format!("functions EQC\n\nfeature {{ANY}}\n\n  {sig}: U64\n    do\n      0\n    ensure\n      c: {clause}\n    end\n\nend\n");
+        for (sig, clause) in [
+            ("r(a: SEQ[U64], b: SEQ[U64])", "a = b"),
+            ("r(a: STRING, b: STRING)", "a = b"),
+            ("r(a: BIGNAT, b: BIGNAT)", "a = b"),
+            ("r(a: F64, b: F64)", "a = b"),
+            ("r(a: OPTION[SEQ[U64]], b: OPTION[SEQ[U64]])", "a = b"),
+            ("r(e: EVENT)", "e = Shutdown"),
+        ] {
+            assert!(d6b_e0311(&c(sig, clause)) > 0, "`{clause}` on {sig} must be refused");
+        }
+        for (sig, clause) in [
+            ("r(a: SEQ[U64], b: SEQ[U64])", "a.model = b.model"),
+            ("r(a: STRING, b: STRING)", "a.chars = b.chars"),
+            ("r(a: BIGNAT, b: BIGNAT)", "a.model = b.model"),
+            ("r(a: OPTION[U64], b: OPTION[U64])", "a = b"),
+            ("r[T](a: T, b: T)", "a = b"),
+            ("r[T](a: OPTION[T], b: OPTION[T])", "a = b"),
+        ] {
+            assert_eq!(d6b_e0311(&c(sig, clause)), 0, "`{clause}` on {sig} must stay legal");
+        }
+    }
+
+    #[test]
+    fn test_d6b_an_opaque_type_cannot_be_compared_by_a_client() {
+        // The layout of an opaque type is hidden, so a client cannot depend on it, in code
+        // or in a contract. Finding 10: `x != c` on a plain handle verified 0/0.
+        let handle = "module HANDLE\n\nrepresentation {NONE}\n  id: NAT\n\ncreate {ANY}\n\n  of(n: NAT): HANDLE\n    do\n      { id = n }\n    end\n\nfeature {ANY}\n\n  same(o: HANDLE): BOOL\n    do\n      Current.id = o.id\n    end\n\nend\n";
+        let client = |body: &str| format!("functions USER\n\nfeature {{ANY}}\n\n  r(a: HANDLE, b: HANDLE): U64\n    do\n      {body}\n    end\n\nend\n");
+        let run = |src: &str| {
+            let mut units = b4_units(&[("handle.gdl", handle), ("user.gdl", src)]);
+            let checked = check_and_verify_project(&mut units, b4_opts(true, true));
+            checked.diags.into_iter().map(|(_, d)| d).filter(|d| d.rule.starts_with("E0311")).count()
+        };
+        assert!(run(&client("if a != b then 1 else 0 end")) > 0);
+        assert_eq!(run(&client("if a.same(b) then 1 else 0 end")), 0);
+    }
+
+    /// A run with no outside setting of its own: (exit code, stdout, stderr).
+    fn d8_run(exe: &std::path::Path, envs: &[(&str, &std::ffi::OsStr)], input: &[u8], args: &[&str]) -> (i32, String, String) {
+        use std::io::Write;
+        let mut cmd = Command::new(exe);
+        for name in ["GARDEL_EVENTS", "GARDEL_RECORD", "GARDEL_REPLAY", "GARDEL_LISTEN_ADDR"] {
+            cmd.env_remove(name);
+        }
+        let mut child = cmd
+            .envs(envs.iter().copied())
+            .args(args)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        // A program that stops early may not read it all.
+        let _ = child.stdin.take().unwrap().write_all(input);
+        let o = child.wait_with_output().unwrap();
+        let text = |b: &[u8]| String::from_utf8_lossy(b).replace("\r\n", "\n");
+        (o.status.code().unwrap_or(-1), text(&o.stdout), text(&o.stderr))
+    }
+
+    fn d8_replay(exe: &std::path::Path, log: &std::path::Path) -> (i32, String, String) {
+        d8_run(exe, &[("GARDEL_REPLAY", log.as_os_str())], b"", &[])
+    }
+
+    /// The events of a log, as a script.
+    fn d8_script(log: &str) -> String {
+        log.lines().filter_map(|l| l.strip_prefix("event ")).collect::<Vec<_>>().join(" ")
+    }
+
+    /// The acceptance check on a recorded run, and it does not rest on the runtime's own
+    /// comparison: its events, given to a fresh run as a plain script, write the same log.
+    fn d8_check_replay(exe: &std::path::Path, log: &std::path::Path, live: &(i32, String, String)) {
+        let text = fs::read_to_string(log).unwrap();
+        let replay = d8_replay(exe, log);
+        assert_eq!((replay.0, &replay.1), (live.0, &live.1), "{text}\n{}", replay.2);
+        let again = log.with_extension("again");
+        let scripted = d8_run(exe, &[("GARDEL_EVENTS", d8_script(&text).as_ref()), ("GARDEL_RECORD", again.as_os_str())], b"", &[]);
+        assert_eq!(scripted.0, live.0);
+        assert_eq!(fs::read_to_string(&again).unwrap(), text);
+    }
+
+    #[test]
+    fn test_d8_replay_of_the_game_reproduces_its_commands() {
+        let c = d4_c(&[("track_board.gdl", D6_BOARD), ("reactive_game.gdl", D6_GAME)]);
+        let Some((dir, exe)) = c3_compile(&c, "d8game") else { return };
+        let log = dir.join("run.log");
+        // A win, a quit after malformed bytes, and input that ends, from real stdin.
+        for input in [&b"llll"[..], b"lhx\xFF\xC0\x80q", b"l", b""] {
+            let live = d8_run(&exe, &[("GARDEL_RECORD", log.as_os_str())], input, &[]);
+            let text = fs::read_to_string(&log).unwrap();
+            assert!(text.starts_with("gardel-log 1 REACTIVE_GAME\ncommand Print:"), "{text}");
+            assert!(text.contains("command ReadKey\nevent Key:"), "{text}");
+            assert!(text.ends_with(&format!("exit {}\n", live.0)), "{text}");
+            d8_check_replay(&exe, &log, &live);
+            assert_eq!(d8_replay(&exe, &log).2, "", "a whole log replays with nothing to report");
+        }
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_d8_replay_does_not_wait_for_timers() {
+        let state = include_str!("../../examples/reactive_clock/clock_state.gdl");
+        let clock = include_str!("../../examples/reactive_clock/reactive_clock.gdl");
+        let c = d4_c(&[("clock_state.gdl", state), ("reactive_clock.gdl", clock)]);
+        let Some((dir, exe)) = c3_compile(&c, "d8clock") else { return };
+        let log = dir.join("run.log");
+        let live = d8_run(&exe, &[("GARDEL_RECORD", log.as_os_str())], b"", &[]);
+        assert_eq!(live.0, 0, "{}", live.2);
+        assert_eq!(d8_script(&fs::read_to_string(&log).unwrap()), "Tick:1 Tick:1 Tick:1");
+        let start = std::time::Instant::now();
+        d8_check_replay(&exe, &log, &live);
+        // The run took two seconds of timers, and this is two runs with none.
+        assert!(start.elapsed() < std::time::Duration::from_millis(1800), "{:?}", start.elapsed());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_d8_every_event_survives_the_log() {
+        let src = "reactive program ANY_EVENT\n\nfeature {ANY}\n\n  init(args: SEQ[STRING]): STEP[NAT]\n    do\n      Continue(0, LIST.empty)\n    end\n\n  step(s: NAT, e: EVENT): STEP[NAT]\n    do\n      match e\n        case Shutdown then Stop(0, LIST.empty)\n        case _ then Continue(s, LIST.empty)\n      end\n    end\n\nend\n";
+        let c = d4_c(&[("any_event.gdl", src)]);
+        let Some((dir, exe)) = c3_compile(&c, "d8any") else { return };
+        let log = dir.join("run.log");
+        let script = "Tick:18446744073709551615 Line: Line:a%20b Line:%FF%FE%00%0A LineEnd LineFailed:5 Key:Up Key:Down Key:Left Key:Right Key:Enter Key:Escape Key:Backspace Key:Tab Key:Other Key:KeysEnded Key:0 Key:1114111 Accepted:7 Received:7: Received:7:%00%25%0A%20%FFz ListenFailed:70000:98 SendFailed:7:18446744073709551615 Closed:7 Shutdown";
+        let run = d8_run(&exe, &[("GARDEL_EVENTS", script.as_ref()), ("GARDEL_RECORD", log.as_os_str())], b"", &[]);
+        assert_eq!(run.0, 0, "{}", run.2);
+        assert_eq!(d8_script(&fs::read_to_string(&log).unwrap()), script);
+        d8_check_replay(&exe, &log, &run);
+        let _ = fs::remove_dir_all(&dir);
+
+        // A line's meaning comes back from its bytes, and a read error from its code.
+        let c = d4_c(&[("echo_lines.gdl", D6_LINES)]);
+        let Some((dir, exe)) = c3_compile(&c, "d8lines") else { return };
+        let log = dir.join("run.log");
+        let live = d8_run(&exe, &[("GARDEL_RECORD", log.as_os_str())], b"caf\xC3\xA9 au lait\r\n\xFF\n%41\n", &[]);
+        assert_eq!((live.0, live.1.as_str()), (0, "caf\u{e9} au lait\nbad input\n%41\nend\n"), "{}", live.2);
+        assert_eq!(d8_script(&fs::read_to_string(&log).unwrap()), "Line:caf%C3%A9%20au%20lait Line:%FF Line:%2541 LineEnd");
+        d8_check_replay(&exe, &log, &live);
+        let failed = d8_run(&exe, &[("GARDEL_EVENTS", "Line:a LineFailed:5".as_ref()), ("GARDEL_RECORD", log.as_os_str())], b"", &[]);
+        assert_eq!((failed.0, failed.1.as_str()), (1, "a\nread failed\n"));
+        d8_check_replay(&exe, &log, &failed);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_d8_a_replay_gets_the_arguments_of_its_run() {
+        let src = "reactive program COUNT_ARGS\n\nfeature {ANY}\n\n  init(args: SEQ[STRING]): STEP[NAT]\n    do\n      Stop(args.length, LIST.empty)\n    end\n\n  step(s: NAT, e: EVENT): STEP[NAT]\n    do\n      Stop(s, LIST.empty)\n    end\n\nend\n";
+        let c = d4_c(&[("count_args.gdl", src)]);
+        let Some((dir, exe)) = c3_compile(&c, "d8args") else { return };
+        let log = dir.join("run.log");
+        let live = d8_run(&exe, &[("GARDEL_RECORD", log.as_os_str())], b"", &["a b", "", "\u{e9}"]);
+        assert_eq!(live.0, 3, "{}", live.2);
+        assert_eq!(fs::read_to_string(&log).unwrap(), "gardel-log 1 COUNT_ARGS\narg a%20b\narg \narg %C3%A9\nexit 3\n");
+        assert_eq!(d8_replay(&exe, &log).0, 3);
+        // Silently using these instead would be a replay of a run that never happened.
+        let other = d8_run(&exe, &[("GARDEL_REPLAY", log.as_os_str())], b"", &["x"]);
+        assert_eq!(other.0, 2, "{}", other.2);
+        assert!(other.2.contains("takes its arguments from the log"), "{}", other.2);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_d8_a_network_run_replays_with_no_network() {
+        use std::io::{Read, Write};
+        let port = d7_free_port();
+        let src = D7_RULES.replace("8888", &port.to_string());
+        let c = d4_c(&[("net_rules.gdl", &src)]);
+        let Some((dir, exe)) = c3_compile(&c, "d8rules") else { return };
+        let log = dir.join("run.log");
+        let spawn = |exe: &std::path::Path, log: &std::path::Path| {
+            Command::new(exe)
+                .env_remove("GARDEL_EVENTS")
+                .env_remove("GARDEL_LISTEN_ADDR")
+                .env("GARDEL_RECORD", log)
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .spawn()
+                .unwrap()
+        };
+        let server = spawn(&exe, &log);
+        for payload in [&b"\x00 %\n\xFF"[..], b"plain"] {
+            let mut s = d7_connect(port);
+            s.write_all(payload).unwrap();
+            let mut got = Vec::new();
+            s.read_to_end(&mut got).unwrap();
+            assert_eq!(got, b"bye");
+        }
+        let o = d7_finish(server);
+        let text = |b: &[u8]| String::from_utf8_lossy(b).replace("\r\n", "\n");
+        let live = (o.status.code().unwrap_or(-1), text(&o.stdout), String::new());
+        let recorded = fs::read_to_string(&log).unwrap();
+        assert_eq!(live.0, 0, "{}", text(&o.stderr));
+        assert!(recorded.contains(&format!("command Listen:{port}\n")), "{recorded}");
+        assert!(recorded.contains("event Received:1:%00%20%25%0A%FF\n"), "{recorded}");
+        assert!(recorded.contains("command Send:1:bye\n"), "{recorded}");
+        assert!(recorded.contains("command Close:1\n"), "{recorded}");
+
+        // Someone else holds the port, so this passes only if the replay leaves it alone.
+        let held = std::net::TcpListener::bind(("127.0.0.1", port)).unwrap();
+        d8_check_replay(&exe, &log, &live);
+        let replay = d8_replay(&exe, &log);
+        assert!(replay.2.contains("net: Send 1 bye\n"), "{}", replay.2);
+        drop(held);
+
+        // A server is usually stopped from outside. One that is killed leaves a log with no
+        // `exit`, which is still a run: it replays up to there, and says that it stopped.
+        let port = d7_free_port();
+        let Some((dir2, exe)) = c3_compile(&d7_echo_c(port), "d8killed") else { return };
+        let log = dir2.join("run.log");
+        let mut server = spawn(&exe, &log);
+        let mut s = d7_connect(port);
+        d7_round_trip(&mut s, b"one");
+        d7_round_trip(&mut s, b"two");
+        server.kill().unwrap();
+        server.wait().unwrap();
+        let recorded = fs::read_to_string(&log).unwrap();
+        assert!(recorded.contains("event Received:1:one\ncommand Send:1:one\n"), "{recorded}");
+        assert!(!recorded.contains("exit"), "{recorded}");
+        let replay = d8_replay(&exe, &log);
+        assert_eq!(replay.0, 0, "{}", replay.2);
+        assert!(replay.2.contains("net: Send 1 one\n"), "{}", replay.2);
+        assert!(replay.2.contains("the log ends before the run does"), "{}", replay.2);
+        let _ = fs::remove_dir_all(&dir);
+        let _ = fs::remove_dir_all(&dir2);
+    }
+
+    #[test]
+    fn test_d8_a_replay_that_differs_is_an_error() {
+        let c = d4_c(&[("track_board.gdl", D6_BOARD), ("reactive_game.gdl", D6_GAME)]);
+        let Some((dir, exe)) = c3_compile(&c, "d8differs") else { return };
+        let log = dir.join("run.log");
+        let live = d8_run(&exe, &[("GARDEL_RECORD", log.as_os_str())], b"llll", &[]);
+        assert_eq!(live.0, 0);
+        let good = fs::read_to_string(&log).unwrap();
+        let edited = dir.join("edited.log");
+
+        // The log says one thing and the program does another. The check runs before the
+        // command does, so nothing wrong is printed.
+        let win = "command Print:You%20win%2E\n";
+        let cases = [
+            (good.replace(win, "command Print:You%20lose%2E\n"), "log: command Print:You%20lose"),
+            (good.replace(win, ""), "log: exit 0"),
+            (good.replacen("command ReadKey\nevent", "event", 1), "run: command ReadKey"),
+            (good.replacen("command ReadKey\n", "command ReadKey\ncommand ReadKey\n", 1), "run: waiting for an event"),
+            (good.replace("exit 0\n", "exit 7\n"), "log: exit 7"),
+            (good.replace("exit 0\n", "event Shutdown\nexit 0\n"), "log: event Shutdown"),
+        ];
+        for (text, shown) in &cases {
+            assert_ne!(text, &good);
+            fs::write(&edited, text).unwrap();
+            let r = d8_replay(&exe, &edited);
+            assert_eq!(r.0, 3, "{text}\n{}", r.2);
+            assert!(r.2.contains("the run differs from the log at line"), "{}", r.2);
+            assert!(r.2.contains(shown), "wanted `{shown}` in {}", r.2);
+            assert!(!r.1.contains("You lose"), "{}", r.1);
+        }
+
+        // A program that changed since the run: the use replay has for finding a regression.
+        let changed = D6_GAME.replace("You win.", "You won.");
+        assert_ne!(changed, D6_GAME);
+        let c = d4_c(&[("track_board.gdl", D6_BOARD), ("reactive_game.gdl", &changed)]);
+        let Some((dir2, changed_exe)) = c3_compile(&c, "d8changed") else { return };
+        let r = d8_replay(&changed_exe, &log);
+        assert_eq!(r.0, 3, "{}", r.2);
+        assert!(r.2.contains("log: command Print:You%20win") && r.2.contains("run: command Print:You%20won"), "{}", r.2);
+
+        // Not a replay at all.
+        fs::write(&edited, good.replace("REACTIVE_GAME", "OTHER_GAME")).unwrap();
+        let other = d8_replay(&exe, &edited);
+        assert_eq!(other.0, 2);
+        assert!(other.2.contains("not a log of this program"), "{}", other.2);
+        fs::write(&edited, good.replacen("event Key:108", "event Nonsense", 1)).unwrap();
+        let bad = d8_replay(&exe, &edited);
+        assert_eq!(bad.0, 2);
+        assert!(bad.2.contains("GARDEL_REPLAY: unknown event `Nonsense`"), "{}", bad.2);
+        assert_eq!(d8_replay(&exe, &dir.join("missing.log")).0, 2);
+        let path = log.as_os_str();
+        for envs in [
+            vec![("GARDEL_REPLAY", path), ("GARDEL_EVENTS", "Key:Left".as_ref())],
+            vec![("GARDEL_REPLAY", path), ("GARDEL_RECORD", edited.as_os_str())],
+            vec![("GARDEL_RECORD", dir.as_os_str())],
+        ] {
+            let r = d8_run(&exe, &envs, b"", &[]);
+            assert_eq!(r.0, 2, "{}", r.2);
+            assert_eq!(r.1, "", "nothing runs");
+        }
+        let _ = fs::remove_dir_all(&dir);
+        let _ = fs::remove_dir_all(&dir2);
+    }
+
+    #[test]
+    fn test_d8_any_log_replays_or_is_refused_without_a_crash() {
+        let c = d4_c(&[("track_board.gdl", D6_BOARD), ("reactive_game.gdl", D6_GAME)]);
+        let Some((dir, exe)) = c3_compile(&c, "d8cut") else { return };
+        let log = dir.join("run.log");
+        // Exit 1: the input ended. That code tells a whole log from one replayed to its end.
+        let live = d8_run(&exe, &[("GARDEL_RECORD", log.as_os_str())], b"l", &[]);
+        assert_eq!(live.0, 1);
+        let good = fs::read(&log).unwrap();
+        let header = good.iter().position(|b| *b == b'\n').unwrap() + 1;
+        let cut = dir.join("cut.log");
+        // Cut anywhere, as a kill during a write would. What is left is an honest prefix.
+        for end in header..good.len() {
+            fs::write(&cut, &good[..end]).unwrap();
+            let r = d8_replay(&exe, &cut);
+            assert!([0, 1].contains(&r.0), "cut at {end}: {r:?}");
+            assert!(r.2.contains("the log ends before the run does"), "cut at {end}: {r:?}");
+        }
+        // Any byte wrong: refused, or a different run, and never a crash.
+        for at in 0..good.len() {
+            for byte in [b'%', b'\n', 0xFF] {
+                let mut bad = good.clone();
+                bad[at] = byte;
+                fs::write(&cut, &bad).unwrap();
+                let r = d8_replay(&exe, &cut);
+                assert!([0, 1, 2, 3].contains(&r.0), "byte {at} as {byte}: {r:?}");
+            }
+        }
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_d6_scripted_input_is_checked() {
+        let c = d4_c(&[("echo_lines.gdl", D6_LINES)]);
+        for bad in ["Key:Nonsense", "Key:55296", "Key:1114112", "Line:%Z1", "Line:%4", "Nope"] {
+            if let Some((code, _, err)) = d4_run(&c, "rscriptbad", bad, &[]) {
+                assert_eq!(code, 2, "{bad}");
+                assert!(err.contains("unknown event"), "{bad}: {err}");
+            }
+        }
+    }
+
+    const D5_BEAT_STATE: &str = include_str!("../tests/reactive/beat_state.gdl");
+    const D5_BEAT: &str = include_str!("../tests/reactive/beat.gdl");
+
+    /// Runs a real program with no script: (exit code, stdout, elapsed milliseconds).
+    fn d5_run_live(c: &str, tag: &str) -> Option<(i32, String, u128)> {
+        let (dir, exe) = c3_compile(c, tag)?;
+        let start = std::time::Instant::now();
+        let o = Command::new(&exe).env_remove("GARDEL_EVENTS").output().unwrap();
+        let ms = start.elapsed().as_millis();
+        let _ = fs::remove_dir_all(&dir);
+        Some((o.status.code().unwrap_or(-1), String::from_utf8_lossy(&o.stdout).replace("\r\n", "\n"), ms))
+    }
+
+    #[test]
+    fn test_d5_timers_fire_in_deadline_order_and_can_be_replaced() {
+        // Timer 3 is set twice, and only the second setting counts, so it fires last, once.
+        let src = "reactive program TIMERS\n\nfeature {ANY}\n\n  init(args: SEQ[STRING]): STEP[NAT]\n    do\n      Continue(0, LIST.empty.prepend(SetTimer(3, 240)).prepend(SetTimer(3, 1)).prepend(SetTimer(1, 120)).prepend(SetTimer(2, 20)))\n    end\n\n  step(s: NAT, e: EVENT): STEP[NAT]\n    do\n      match e\n        case Tick(id) then\n          if id = 1 then\n            Continue(s, LIST.empty.prepend(Print(\"one\")))\n          else if id = 2 then\n            Continue(s, LIST.empty.prepend(Print(\"two\")))\n          else\n            Stop(id, LIST.empty.prepend(Print(\"three\")))\n          end end\n        case Shutdown then\n          Stop(99, LIST.empty)\n        case _ then\n          Continue(s, LIST.empty)\n      end\n    end\n\nend\n";
+        let c = d4_c(&[("timers.gdl", src)]);
+        if let Some((code, out, ms)) = d5_run_live(&c, "rtimers") {
+            assert_eq!((code, out.as_str()), (3, "two\none\nthree\n"));
+            assert!(ms >= 230, "the replaced deadline must hold, ran for {ms} ms");
+        }
+        // A zero delay fires, and equal deadlines keep the order they were set in.
+        let src = "reactive program ZERO\n\nfeature {ANY}\n\n  init(args: SEQ[STRING]): STEP[NAT]\n    do\n      Continue(0, LIST.empty.prepend(SetTimer(2, 0)).prepend(SetTimer(1, 0)))\n    end\n\n  step(s: NAT, e: EVENT): STEP[NAT]\n    do\n      match e\n        case Tick(id) then\n          if id = 1 then Continue(s, LIST.empty.prepend(Print(\"first\"))) else Stop(0, LIST.empty.prepend(Print(\"second\"))) end\n        case Shutdown then\n          Stop(99, LIST.empty)\n        case _ then\n          Continue(s, LIST.empty)\n      end\n    end\n\nend\n";
+        let c = d4_c(&[("zero.gdl", src)]);
+        if let Some((code, out, _)) = d5_run_live(&c, "rzero") {
+            assert_eq!((code, out.as_str()), (0, "first\nsecond\n"));
+        }
+    }
+
+    #[test]
+    fn test_d5_scripts_do_not_depend_on_the_clock() {
+        // Timers do not run in a script, so a scripted run is instant and deterministic.
+        let c = d4_c(&[("beat_state.gdl", D5_BEAT_STATE), ("beat.gdl", D5_BEAT)]);
+        if let Some((code, _, err)) = d4_run(&c, "rbeat", "Tick:1 Tick:2 Tick:3 Shutdown", &[]) {
+            assert_eq!(code, 3, "three events recorded: {err}");
+        }
+        for bad in ["Tick:", "Tick:x", "Tick:99999999999999999999", "Tock:1"] {
+            if let Some((code, _, err)) = d4_run(&c, "rbeatbad", bad, &[]) {
+                assert_eq!(code, 2, "{bad}");
+                assert!(err.contains("unknown event"), "{bad}: {err}");
+            }
+        }
+    }
+
+    #[test]
+    fn test_d5_live_allocations_do_not_grow_over_a_long_run() {
+        // Each step allocates a state, a list, commands and an event. The count at exit could
+        // not see a state that grows and is then freed, so it is sampled during the run.
+        let c = d4_c(&[("beat_state.gdl", D5_BEAT_STATE), ("beat.gdl", D5_BEAT)]);
+        let harness = format!(
+            "#define GARDEL_HOST_PROBE gardel_probe\nstatic void gardel_probe(void);\n{}\n\
+             static uint64_t gardel_seen = 0, gardel_early = 0, gardel_peak = 0;\n\
+             static void gardel_probe(void) {{\n    uint64_t live = gardel_live_allocations();\n    gardel_seen++;\n    if (gardel_seen == 1000) gardel_early = live;\n    if (gardel_seen >= 1000 && live > gardel_peak) gardel_peak = live;\n}}\n\
+             int main(void) {{\n    size_t n = 100000;\n    char* s = (char*)malloc(n * 7 + 1);\n    for (size_t i = 0; i < n; i++) memcpy(s + i * 7, \"Tick:1 \", 7);\n    s[n * 7] = 0;\n    gardel_host_script = s;\n    char* argv[] = {{ (char*)\"x\", NULL }};\n    gardel_reactive_main(1, argv);\n    fprintf(stderr, \"seen=%llu early=%llu peak=%llu end=%llu\\n\", (unsigned long long)gardel_seen, (unsigned long long)gardel_early, (unsigned long long)gardel_peak, (unsigned long long)gardel_live_allocations());\n    return 0;\n}}\n",
+            c.replace("int main(int argc, char** argv) {", "int gardel_unused_main(int argc, char** argv) {")
+        );
+        let Some((dir, exe)) = c3_compile(&harness, "rlong") else { return };
+        let o = Command::new(&exe).output().unwrap();
+        let _ = fs::remove_dir_all(&dir);
+        let err = String::from_utf8_lossy(&o.stderr).to_string();
+        let field = |k: &str| -> u64 {
+            let at = err.find(&format!("{k}=")).unwrap_or_else(|| panic!("{err}"));
+            err[at + k.len() + 1..].split_whitespace().next().unwrap().parse().unwrap()
+        };
+        // The end of the script is one more event: the Shutdown.
+        assert_eq!(field("seen"), 100001, "{err}");
+        // BEAT_STATE holds at most 8 items, so the state's size may vary by that much.
+        assert!(field("peak") <= field("early") + 8, "live allocations grew: {err}");
+        assert_eq!(field("end"), 0, "{err}");
+    }
+
+    #[test]
+    fn test_d5_clock_example_verifies_and_counts_down() {
+        let state = include_str!("../../examples/reactive_clock/clock_state.gdl");
+        let clock = include_str!("../../examples/reactive_clock/reactive_clock.gdl");
+        let c = d4_c(&[("clock_state.gdl", state), ("reactive_clock.gdl", clock)]);
+        if let Some((code, out, err)) = d4_run(&c, "rclock", "Tick:1 Tick:1 Tick:1", &[]) {
+            assert_eq!(code, 0, "{err}");
+            assert_eq!(out, "Counting down from 3.\ntick\ntick\nDone.\n");
+        }
+        if let Some((code, out, _)) = d4_run(&c, "rclockstop", "Tick:1 Shutdown", &[]) {
+            assert_eq!(code, 1);
+            assert!(out.ends_with("Interrupted.\n"), "{out}");
+        }
+        // The state's invariant is what proves `advance` safe.
+        let weak = state.replace("left: Current.has_left", "left: True");
+        assert_ne!(weak, state);
+        let (diags, _) = d2_project(&[("clock_state.gdl", &weak), ("reactive_clock.gdl", clock)]);
+        assert!(diags.iter().any(|d| d.level == "error"), "the guard must be needed: {diags:?}");
+    }
+
+    /// Verifies a multi-file project (the program last) and returns its diagnostics and C.
+    fn d2_project(files: &[(&str, &str)]) -> (Vec<Diagnostic>, String) {
+        let mut units = b4_units(files);
+        let checked = check_and_verify_project(&mut units, b4_opts(true, true));
+        if !checked.fatal.is_empty() {
+            return (checked.fatal, String::new());
+        }
+        let diags: Vec<Diagnostic> = checked.diags.into_iter().map(|(_, d)| d).collect();
+        let mods: Vec<ModuleDecl> = units.iter().map(|u| u.ast.modules[0].clone()).collect();
+        let (root, libs) = mods.split_last().expect("a program");
+        let libs: Vec<&ModuleDecl> = libs.iter().collect();
+        (diags, emit_c11_typed(root, &libs).0)
+    }
+
+    const D2_STATE: &str = include_str!("../tests/reactive/tick_state.gdl");
+    const D2_LOGIC: &str = include_str!("../tests/reactive/tick_logic.gdl");
+    const D2_PROG: &str = include_str!("../tests/reactive/tick_prog.gdl");
+
+    #[test]
+    fn test_d2_prelude_step_types_work_from_user_code() {
+        // A step function over the prelude STEP, COMMAND and EVENT with an opaque state.
+        let files = [("tick_state.gdl", D2_STATE), ("tick_logic.gdl", D2_LOGIC), ("tick_prog.gdl", D2_PROG)];
+        let (diags, c) = d2_project(&files);
+        assert!(diags.is_empty(), "{diags:?}");
+        assert!(!c.contains("#error"), "{}", c.lines().nth(1).unwrap_or(""));
+        if let Some(runs) = c3_native_runs(&c, "tickprog", &[b""]) {
+            assert_eq!(runs[0].0, 0, "tick_prog: first failing check");
+        }
+        if let Some((first, after)) = c3_live_after(&c, "tickleak", "TICK_PROG__first_failure()") {
+            assert_eq!((first, after), (0, 0), "states, commands and strings must be freed");
+        }
+        // The guarantees are not vacuous.
+        let no_guard = D2_LOGIC.replace("if s.has_room then Continue", "if True then Continue");
+        assert_ne!(no_guard, D2_LOGIC);
+        let (diags, _) = d2_project(&[("tick_state.gdl", D2_STATE), ("tick_logic.gdl", &no_guard), ("tick_prog.gdl", D2_PROG)]);
+        assert!(diags.iter().any(|d| d.tag == "room"), "{diags:?}");
+        let no_stop = D2_LOGIC.replace(r#"Stop(s.value, LIST.empty.prepend(Print("bye")))"#, "Continue(s, LIST.empty)");
+        assert_ne!(no_stop, D2_LOGIC);
+        let (diags, _) = d2_project(&[("tick_state.gdl", D2_STATE), ("tick_logic.gdl", &no_stop), ("tick_prog.gdl", D2_PROG)]);
+        assert!(diags.iter().any(|d| d.tag == "shutdown_must_stop"), "{diags:?}");
+    }
+
+    #[test]
+    fn test_d2_user_constructors_win_over_prelude_constructors() {
+        // JOB has its own `Stop` and `Print`. Adding them to the prelude must not change what
+        // a client of JOB means, even one that also uses the prelude STEP.
+        let job = include_str!("../tests/reactive/job.gdl");
+        let prog = include_str!("../tests/reactive/job_prog.gdl");
+        let (diags, c) = d2_project(&[("job.gdl", job), ("job_prog.gdl", prog)]);
+        assert!(diags.is_empty(), "{diags:?}");
+        if let Some(runs) = c3_native_runs(&c, "jobprog", &[b""]) {
+            assert_eq!(runs[0].0, 7, "JOB's own constructors must run");
+        }
+    }
+
+    #[test]
+    fn test_d2_prelude_step_names_are_reserved() {
+        for name in ["STEP", "COMMAND", "EVENT"] {
+            let src = format!("module {name}\n\nrepresentation {{ANY}}\n  | A\n\nend\n");
+            let m = parse_user_module_with_prelude(&src);
+            let ast = FileAst { group: None, concepts: Vec::new(), modules: vec![m] };
+            let diags = check_prelude_collisions(&ast, &src, "x.gdl");
+            assert!(diags.iter().any(|d| d.rule.starts_with("E0101")), "{name}: {diags:?}");
+        }
+    }
+
+    #[test]
+    fn test_d0_arm_after_a_catch_all_is_rejected() {
+        // Boogie stopped at the catch-all while a C `switch` still honoured a later `case`,
+        // so the binary could disagree with the proof. Such an arm is now an error.
+        let parse = |src: &str| {
+            let tokens = tokenize(src).expect("lexing");
+            Parser::new(tokens).parse_file().map(|_| ()).map_err(|e| e.message)
+        };
+        let wrap = |m: &str| {
+            format!("module L\n\nrepresentation {{ANY}}\n  | A\n  | B\n  | C\n\nfeature {{ANY}}\n\n  r: U64\n    do\n      {m}\n    end\n\nend\n")
+        };
+        for bad in [
+            "match Current case A then 1 case _ then 2 case B then 3 end",
+            "match Current case _ then 2 case B then 3 end",
+            "match Current case x then 2 case B then 3 end",
+            "match Current case _ then 2 case _ then 3 end",
+            "if True then 1 else match Current case _ then 2 case B then 3 end end",
+        ] {
+            let err = parse(&wrap(bad)).expect_err(bad);
+            assert!(err.starts_with("E0316: unreachable_match_arm"), "{err}");
+            assert!(err.contains("`L.r`"), "{err}");
+        }
+        for good in [
+            "match Current case A then 1 case B then 2 case C then 3 end",
+            "match Current case A then 1 case _ then 2 end",
+            "match Current case _ then 2 end",
+            "match Current case x then 2 end",
+        ] {
+            assert!(parse(&wrap(good)).is_ok(), "{good}");
+        }
+        // In a law too.
+        let src = "functions F\n\nspecify {ANY}\n\n  law l(o: OPTION[U64])\n    do\n      match o\n        case _ then True\n        case None then True\n      end\n    ensure\n      t: True\n    end\n\nend\n";
+        let err = parse(src).expect_err("law");
+        assert!(err.contains("`F.l`"), "{err}");
+    }
+
+    #[test]
+    fn test_d0_no_law_proof_step_is_dropped() {
+        // Compiled patterns put `let`s in law blocks, and such blocks and `case _` arms used
+        // to lose their proof steps without a word. A step is asserted in every position:
+        // the false one is reported and the true one verifies.
+        let bodies = [
+            ("tuple", "p: TUPLE[U64, U64]", "match p case (a, b) then STEP end"),
+            ("literal", "n: U64", "match n case 0 then STEP case _ then True end"),
+            ("literal_else", "n: U64", "match n case 0 then True case _ then STEP end"),
+            ("binder_else", "n: U64", "match n case 0 then True case k then STEP end"),
+            ("call_scrutinee", "n: U64", "match id(n) case 0 then STEP case _ then True end"),
+            ("last_wildcard", "o: OPTION[U64]", "match o case None then True case _ then STEP end"),
+            ("only_wildcard", "o: OPTION[U64]", "match o case _ then STEP end"),
+            ("bind_all", "o: OPTION[U64]", "match o case None then True case other then STEP end"),
+            ("nested", "o: OPTION[OPTION[U64]]", "match o case Some(Some(x)) then STEP case _ then True end"),
+        ];
+        let module = |law: &str, params: &str, body: &str, step: &str| {
+            format!(
+                "functions STEPS\n\nfeature {{ANY}}\n\n  id(n: U64): U64\n    do\n      n\n    end\n\nspecify {{ANY}}\n\n  law {law}({params})\n    do\n      {}\n    ensure\n      holds: 1 = 1\n    end\n\nend\n",
+                body.replace("STEP", step)
+            )
+        };
+        for (name, params, body) in bodies {
+            let good = module(name, params, body, "1 = 1");
+            let diags = c3_verify(&good, "steps.gdl");
+            assert!(diags.is_empty(), "{name}: a true step must verify: {diags:?}");
+            let bad = module(name, params, body, "1 = 2");
+            let diags = c3_verify(&bad, "steps.gdl");
+            assert!(diags.iter().any(|d| d.tag == "proof_step"), "{name}: a false step must be reported: {diags:?}");
+        }
+    }
+
+    #[test]
+    fn test_d0_induction_hypothesis_survives_a_catch_all_arm() {
+        // `count_is_n` needs its recursive call, which sits in a bare-binder arm. Dropped, the
+        // law cannot be proven. So this verifying shows that the hypothesis was used.
+        let src = "functions IND\n\nfeature {ANY}\n\n  count(n: U64): U64\n    variant\n      n\n    do\n      if n = 0 then 0 else count(n - 1) end\n    end\n\nspecify {ANY}\n\n  law count_is_n(n: U64)\n    variant\n      n\n    do\n      match n\n        case 0 then True\n        case k then count_is_n(k - 1)\n      end\n    ensure\n      same: count(n) = 0\n    end\n\nend\n";
+        let diags = c3_verify(src, "ind.gdl");
+        assert!(diags.is_empty(), "{diags:?}");
+        let without = src.replace("case k then count_is_n(k - 1)", "case k then True");
+        let diags = c3_verify(&without, "ind.gdl");
+        assert!(diags.iter().any(|d| d.level == "error"), "the law must need its hypothesis: {diags:?}");
+    }
+
+    #[test]
+    fn test_d0_bounded_evaluator_takes_catch_all_arms() {
+        // The fallback evaluator agrees with Boogie on `case _`, so a verdict does not depend
+        // on whether the solvers are installed.
+        let src = include_str!("../tests/boogie/wild_own.gdl");
+        let m = parse_user_module_with_prelude(src);
+        let diags = with_prelude_injection(true, || {
+            verify_module_phase3(&m, src, "wild_own.gdl", DEFAULT_FUEL, true, false, true)
+        });
+        assert!(diags.iter().all(|d| d.level != "error"), "{diags:?}");
+    }
+
+    #[test]
+    fn test_d0_nested_type_arguments_map_to_boogie() {
+        // Type arguments split at top-level commas only.
+        let m = parse_single_module("functions T\n\nfeature {ANY}\n\n  f: U64\n    do\n      0\n    end\n\nend\n");
+        assert_eq!(map_boogie_type("BOX[TUPLE[U64, BOOL]]", &m), "(BOX (Tuple2 int bool))");
+        assert_eq!(
+            map_boogie_type("TUPLE[PAIR[U64, BOOL], U64]", &m),
+            "(Tuple2 (PAIR int bool) int)"
+        );
+        assert_eq!(
+            map_boogie_type("MAP[TUPLE[U64, U64], STEP[TUPLE[BOOL, U64]]]", &m),
+            "(MAP (Tuple2 int int) (STEP (Tuple2 bool int)))"
+        );
+    }
+
+    #[test]
+    fn test_d0_patterns_in_laws_are_compiled() {
+        // Literal and tuple patterns in law bodies and contracts are desugared like routine
+        // bodies, so they verify in Boogie; a wrong conclusion is still rejected.
+        let src = include_str!("../tests/boogie/law_patterns.gdl");
+        let diags = c3_verify(src, "law_patterns.gdl");
+        assert!(diags.is_empty(), "law_patterns: {diags:?}");
+        let mutants = [
+            ("small: n <= 1", "small: n <= 2", "ten_or_eleven"),
+            ("case 1 then False case _ then True", "case _ then True", "twelve"),
+        ];
+        for (from, to, tag) in mutants {
+            assert!(src.contains(from), "law_patterns.gdl changed: {from}");
+            let diags = c3_verify(&src.replace(from, to), "law_patterns_mutant.gdl");
+            assert!(diags.iter().any(|d| d.tag == tag), "{tag} must fail, got {diags:?}");
+        }
+        let m = parse_user_module_with_prelude(src);
+        let text = format!("{:?}", m.specify_laws);
+        assert!(!text.contains("Lit("), "literal patterns must be compiled away: {text}");
+    }
+
+    #[test]
     fn test_d_generic_call_inside_its_module_uses_the_right_instance() {
         // `BOX.make(..)` inside `BOX[A].map[B]` builds a `BOX[B]`, not the caller's `BOX[A]`.
         let box_src = include_str!("../tests/c_backend/box.gdl");
@@ -18507,6 +21503,351 @@ end
         assert!(diags.is_empty(), "{diags:?}");
         let diags = verify(&ok.replace("exact: Result = x + 5", "exact: Result = x + 6"));
         assert!(diags.iter().any(|d| d.tag == "exact"), "{diags:?}");
+    }
+
+    /// Verifies one routine (with the helpers `id` and `app`) and returns the failed tags.
+    fn failed_tags_of_routine(routine: &str) -> Vec<String> {
+        let src = format!(
+            "functions OBL\n\nfeature {{ANY}}\n\n  id(x: U64): U64\n    do\n      x\n    end\n\n  needs_positive(x: U64): U64\n    require\n      positive: x > 0\n    do\n      x\n    end\n\n  app(f: U64 -> U64, x: U64): U64\n    do\n      f(x)\n    end\n\n{routine}\nend\n"
+        );
+        let m = parse_user_module_with_prelude(&src);
+        with_prelude_injection(true, || {
+            verify_module_phase3(&m, &src, "obl.gdl", DEFAULT_FUEL, true, false, false)
+        })
+        .into_iter()
+        .map(|d| d.tag)
+        .collect()
+    }
+
+    #[test]
+    fn test_obligations_reach_every_expression_position() {
+        // Every one of these verified, and ran unchecked, while the walker skipped the
+        // expression kinds it did not list.
+        let rejected = [
+            ("if x > 3 then id(x * 10) else 2 end", "U64", "overflow_mul"),
+            ("id(if x > 3 then x * 10 else 2 end)", "U64", "overflow_mul"),
+            ("1 +% (if x > 3 then x * 10 else 2 end)", "U64", "overflow_mul"),
+            ("id(match Some(x) case Some(v) then v * 10 case None then 0 end)", "U64", "overflow_mul"),
+            ("match Some(x * 10) case Some(v) then v case None then 0 end", "U64", "overflow_mul"),
+            ("not (x * 10 > 3)", "BOOL", "overflow_mul"),
+            ("(x * 10, 1)", "TUPLE[U64, U64]", "overflow_mul"),
+            ("app(fn(y: U64): U64 do y * 10 end, x)", "U64", "overflow_mul"),
+            ("app(fn(y: U64): U64 do x / y end, x)", "U64", "div_by_zero"),
+            ("app(fn(y: U64): U64 do needs_positive(y) end, x)", "U64", "positive"),
+            ("app(fn(y: U64): U64 do id(if y > 1 then y * 10 else 0 end) end, x)", "U64", "overflow_mul"),
+            ("app(fn(y: U64): U64 do match Some(y) case Some(v) then v * 10 case None then 0 end end, x)", "U64", "overflow_mul"),
+        ];
+        for (body, ty, tag) in rejected {
+            let routine = format!("  t(x: U64): {ty}\n    do\n      {body}\n    end\n");
+            let tags = failed_tags_of_routine(&routine);
+            assert!(tags.iter().any(|t| t == tag), "{body}: wanted {tag}, got {tags:?}");
+        }
+        // A `let` of a lambda, and a `check` that nested blocks used to drop.
+        let let_lambda = "  t(x: U64): U64\n    do\n      let f = fn(y: U64): U64 do y * 10 end\n      f(x)\n    end\n";
+        assert!(failed_tags_of_routine(let_lambda).iter().any(|t| t == "overflow_mul"));
+        let nested_check = "  t(x: U64): U64\n    do\n      id(if x > 3 then\n        check too_big: x > 100 end\n        1\n      else 2 end)\n    end\n";
+        assert!(failed_tags_of_routine(nested_check).iter().any(|t| t == "too_big"));
+        let lambda_check = "  t(x: U64): U64\n    do\n      app(fn(y: U64): U64 do\n        check too_big: y > 100 end\n        y\n      end, x)\n    end\n";
+        assert!(failed_tags_of_routine(lambda_check).iter().any(|t| t == "too_big"));
+    }
+
+    #[test]
+    fn test_obligations_in_record_fields() {
+        let module = |routine: &str| {
+            format!(
+                "module REC\n\nrepresentation {{ANY}}\n  a: U64\n  b: U64\n\nfeature {{ANY}}\n\n{routine}\nend\n"
+            )
+        };
+        let tags_of = |src: String| -> Vec<String> {
+            let m = parse_user_module_with_prelude(&src);
+            with_prelude_injection(true, || {
+                verify_module_phase3(&m, &src, "rec.gdl", DEFAULT_FUEL, true, false, false)
+            })
+            .into_iter()
+            .map(|d| d.tag)
+            .collect()
+        };
+        let literal = "  t(x: U64): REC\n    do\n      { a = x * 10, b = 1 }\n    end\n";
+        assert!(tags_of(module(literal)).iter().any(|t| t == "overflow_mul"));
+        let update = "  t(x: U64): REC\n    do\n      { Current with a = x * 10 }\n    end\n";
+        assert!(tags_of(module(update)).iter().any(|t| t == "overflow_mul"));
+        let guarded = "  t(x: U64): REC\n    require\n      small: x < 100\n    do\n      { Current with a = x * 10 }\n    end\n";
+        assert_eq!(tags_of(module(guarded)), Vec::<String>::new());
+    }
+
+    #[test]
+    fn test_obligations_respect_guards_and_nothing_leaks() {
+        // A guard protects what it guards.
+        let verified = [
+            "x != 0 and 10 / x > 1",
+            "x = 0 or 10 / x > 1",
+            "(x != 0) implies (10 / x > 1)",
+        ];
+        for body in verified {
+            let routine = format!("  t(x: U64): BOOL\n    do\n      {body}\n    end\n");
+            assert_eq!(failed_tags_of_routine(&routine), Vec::<String>::new(), "{body}");
+        }
+        let verified = [
+            "id(if x > 0 then 10 / x else 0 end)",
+            "id(match Some(x % 100) case Some(v) then v * 10 case None then 0 end)",
+            "app(fn(y: U64): U64 do y % 100 end, x)",
+            "app(fn(y: U64): U64 do if y < 100 then y * 10 else 0 end end, x)",
+            "if x > 0 then app(fn(y: U64): U64 do y / x end, 1) else 0 end",
+        ];
+        for body in verified {
+            let routine = format!("  t(x: U64): U64\n    do\n      {body}\n    end\n");
+            assert_eq!(failed_tags_of_routine(&routine), Vec::<String>::new(), "{body}");
+        }
+        let let_capture = "  t(x: U64): U64\n    do\n      let z = x % 7 + 1\n      app(fn(y: U64): U64 do y / z end, x)\n    end\n";
+        assert_eq!(failed_tags_of_routine(let_capture), Vec::<String>::new());
+        let require_capture = "  t(x: U64, z: U64): U64\n    require\n      nonzero: z > 0\n    do\n      app(fn(y: U64): U64 do y / z end, x)\n    end\n";
+        assert_eq!(failed_tags_of_routine(require_capture), Vec::<String>::new());
+        // The wrong guard protects nothing: the division runs exactly when `x` is 0.
+        for body in ["x = 0 and 10 / x > 1", "x != 0 or 10 / x > 1", "(x = 0) implies (10 / x > 1)"] {
+            let routine = format!("  t(x: U64): BOOL\n    do\n      {body}\n    end\n");
+            let tags = failed_tags_of_routine(&routine);
+            assert!(tags.iter().any(|t| t == "div_by_zero"), "{body}: {tags:?}");
+        }
+        for body in [
+            "id(if x > 0 then 0 else 10 / x end)",
+            "if x > 0 then 0 else app(fn(y: U64): U64 do y / x end, 1) end",
+        ] {
+            let routine = format!("  t(x: U64): U64\n    do\n      {body}\n    end\n");
+            let tags = failed_tags_of_routine(&routine);
+            assert!(tags.iter().any(|t| t == "div_by_zero"), "{body}: {tags:?}");
+        }
+        // What a nested branch or lambda assumes stays there: `x * 10` must still fail.
+        for inner in [
+            "let f = fn(y: U64): U64 do\n        assume small: x < 100 end\n        y\n      end\n      let v = app(f, 1)\n      x * 10 + v % 2",
+            "let v = id(if x % 2 = 0 then\n        assume small: x < 100 end\n        1\n      else 2 end)\n      x * 10 + v % 2",
+        ] {
+            let routine = format!("  t(x: U64): U64\n    do\n      {inner}\n    end\n");
+            let tags = failed_tags_of_routine(&routine);
+            assert!(tags.iter().any(|t| t == "overflow_mul"), "{inner}: {tags:?}");
+        }
+    }
+
+    #[test]
+    fn test_i64_arithmetic_is_checked_against_its_own_range() {
+        const SMALL: &str = "    require\n      lo: x > -100\n      hi: x < 100\n";
+        let rejected = [
+            ("  t(x: I64): I64\n    do\n      -x\n    end\n", "overflow_neg"),
+            ("  t(x: I64, y: I64): I64\n    do\n      x + y\n    end\n", "overflow_add"),
+            // The result fits `U64`, the range these used to be checked against.
+            ("  t(x: I64, y: I64): I64\n    require\n      a: x >= 0\n      b: y >= 0\n    do\n      x + y\n    end\n", "overflow_add"),
+            ("  t(x: I64): I64\n    require\n      n: x < 0\n    do\n      x * 2\n    end\n", "overflow_mul"),
+            ("  t(x: I64, y: I64): I64\n    require\n      nz: y != 0\n    do\n      x / y\n    end\n", "overflow_div"),
+            ("  t(x: I64, y: I64): I64\n    require\n      nz: y != 0\n    do\n      x % y\n    end\n", "overflow_div"),
+            ("  t(x: I64): I64\n    do\n      x & 3\n    end\n", "bitwise_on_signed"),
+            ("  t(x: I64): I64\n    do\n      x >> 1\n    end\n", "bitwise_on_signed"),
+            ("  t(x: U64): U64\n    do\n      -x\n    end\n", "overflow_neg"),
+            ("  t(x: U64): U64\n    do\n      3 - x\n    end\n", "overflow_sub"),
+            ("  t: I64\n    do\n      (-7) / 2\n    ensure\n      floor: Result = -4\n    end\n", "floor"),
+            ("  t: I64\n    do\n      (-7) % 2\n    ensure\n      euclid: Result = 1\n    end\n", "euclid"),
+            ("  half(x: I64): I64\n    do\n      x / 2\n    end\n\n  t: I64\n    do\n      half(-7)\n    ensure\n      floor: Result = -4\n    end\n", "floor"),
+            ("  t(p: TUPLE[I64, I64]): I64\n    do\n      p.first + p.second\n    end\n", "overflow_add"),
+            ("  t(o: OPTION[I64]): I64\n    do\n      match o\n        case Some(n) then -n\n        case None then 0\n      end\n    end\n", "overflow_neg"),
+        ];
+        for (routine, tag) in rejected {
+            let tags = failed_tags_of_routine(routine);
+            assert!(tags.iter().any(|t| t == tag), "{routine}: wanted {tag}, got {tags:?}");
+        }
+        let verified = [
+            format!("  t(x: I64): I64\n{SMALL}    do\n      x - 200\n    end\n"),
+            format!("  t(x: I64): I64\n{SMALL}    do\n      5 - x\n    end\n"),
+            format!("  t(x: I64): I64\n{SMALL}    do\n      x * 3\n    end\n"),
+            format!("  t(x: I64): I64\n{SMALL}    do\n      -x\n    end\n"),
+            format!("  t(x: I64): I64\n{SMALL}    do\n      let y = 5 - x\n      y - 200\n    end\n"),
+            format!("  t(c: BOOL, x: I64): I64\n{SMALL}    do\n      let v = if c then 0 else x end\n      v - 500\n    end\n"),
+            "  t(x: I64): I64\n    require\n      n: x > -9223372036854775808\n    do\n      if x < 0 then -x else x end\n    ensure\n      non_negative: Result >= 0\n    end\n".to_string(),
+            "  t(x: I64): BOOL\n    do\n      x <= 9223372036854775807\n    ensure\n      in_range: Result\n    end\n".to_string(),
+            "  t(x: I64): I64\n    do\n      x / 2 + x % 7\n    end\n".to_string(),
+            "  t: I64\n    do\n      -5 + 3\n    ensure\n      exact: Result = -2\n    end\n".to_string(),
+            "  t(x: U64): U64\n    require\n      s: x < 9223372036854775808\n    do\n      x + 9223372036854775807\n    end\n".to_string(),
+        ];
+        for routine in &verified {
+            assert_eq!(failed_tags_of_routine(routine), Vec::<String>::new(), "{routine}");
+        }
+    }
+
+    #[test]
+    fn test_i64_results_proven_by_the_verifier_are_what_the_binary_computes() {
+        // `/`, `%` and wrapping on negative numbers: each routine proves its exact result,
+        // and the program checks the same value at run time.
+        let src = include_str!("../tests/c_backend/signed_ops.gdl");
+        let c = c3_verify_and_emit(src, "signed_ops.gdl");
+        if let Some(runs) = c3_native_runs(&c, "signed_ops", &[b""]) {
+            assert_eq!(runs[0].0, 0, "signed_ops: first failing check");
+        }
+    }
+
+    /// Runs the project through the checks and returns (rule, file:line) of what is fatal.
+    fn e0_fatal(files: &[(&str, &str)]) -> Vec<(String, String)> {
+        let mut units = b4_units(files);
+        let project = files.len() > 1;
+        let checked = check_and_verify_project(&mut units, b4_opts(project, false));
+        checked
+            .fatal
+            .iter()
+            .map(|d| {
+                let at = d.span.as_ref().map_or(String::new(), |s| format!("{}:{}", s.file, s.line));
+                (d.rule.to_string(), at)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn test_e0_every_undefined_name_has_a_rule_and_a_location() {
+        let routine = |body: &str| format!("functions T\n\nfeature {{ANY}}\n\n  id(x: U64): U64\n    do\n      x\n    end\n\n{body}\nend\n");
+        let cases = [
+            ("  t: U64\n    do\n      NO_MOD.two\n    end\n", "E0106: unknown_module", 12),
+            ("  t: U64\n    do\n      1\n    ensure\n      c: Result = NO_MOD.two\n    end\n", "E0106: unknown_module", 14),
+            ("  t: NO_TYPE\n    do\n      1\n    end\n", "E0107: unknown_type", 10),
+            ("  t(x: SEQ[NO_TYPE]): U64\n    do\n      1\n    end\n", "E0107: unknown_type", 10),
+            ("  t: U64\n    do\n      let f = fn(y: NO_TYPE): U64 do 1 end\n      1\n    end\n", "E0107: unknown_type", 12),
+            ("  t: U64\n    do\n      nothing(1)\n    end\n", "E0108: unknown_routine", 12),
+            ("  t: U64\n    do\n      T.nothing(1)\n    end\n", "E0108: unknown_routine", 12),
+            ("  t: SEQ[U64]\n    do\n      SEQ.nothing\n    end\n", "E0108: unknown_routine", 12),
+            ("  t(s: SEQ[U64]): U64\n    do\n      s.nothing\n    end\n", "E0108: unknown_routine", 12),
+            ("  t: U64\n    do\n      reveal nothing\n      1\n    end\n", "E0108: unknown_routine", 12),
+            ("  t: U64\n    do\n      id(NoCtor(1))\n    end\n", "E0109: unknown_constructor", 12),
+            ("  t(o: OPTION[U64]): U64\n    do\n      match o\n        case NoCtor(v) then v\n        case _ then 0\n      end\n    end\n", "E0109: unknown_constructor", 13),
+            ("  t: U64\n    do\n      nope + 1\n    end\n", "E0110: unknown_variable", 12),
+            ("  t: U64\n    do\n      id(1, 2)\n    end\n", "E0111: wrong_argument_count", 12),
+        ];
+        for (body, rule, line) in cases {
+            let src = routine(body);
+            let fatal = e0_fatal(&[("t.gdl", &src)]);
+            assert!(
+                fatal.iter().any(|(r, at)| r == rule && at == &format!("t.gdl:{line}")),
+                "{body}: wanted {rule} at line {line}, got {fatal:?}"
+            );
+        }
+        // Scopes: a local may hide a routine, and each of these is fine.
+        for body in [
+            "  t(f: U64 -> U64): U64\n    do\n      f(1)\n    end\n",
+            "  t: U64\n    do\n      let f = fn(y: U64): U64 do y end\n      f(1)\n    end\n",
+            "  t(o: OPTION[U64]): U64\n    do\n      match o\n        case Some(v) then v\n        case None then 0\n      end\n    end\n",
+            "  t(s: SEQ[U64]): BOOL\n    do\n      forall i: NAT. s.length >= i or i > 0\n    end\n",
+        ] {
+            let src = routine(body);
+            assert_eq!(e0_fatal(&[("t.gdl", &src)]), Vec::new(), "{body}");
+        }
+    }
+
+    #[test]
+    fn test_e0_all_repository_sources_resolve() {
+        // A false rejection here would stop a valid program from compiling at all.
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../examples");
+        let mut projects: Vec<Vec<std::path::PathBuf>> = Vec::new();
+        for entry in fs::read_dir(&root).unwrap() {
+            let p = entry.unwrap().path();
+            if p.is_dir() {
+                projects.push(fs::read_dir(&p).unwrap().map(|e| e.unwrap().path()).collect());
+            } else {
+                projects.push(vec![p]);
+            }
+        }
+        assert!(projects.len() >= 11, "{projects:?}");
+        let mut concepts = HashMap::new();
+        for c in &standard_prelude().concepts {
+            concepts.insert(c.name.clone(), c.clone());
+        }
+        for project in projects {
+            let sources: Vec<(String, String)> = project
+                .iter()
+                .map(|p| (p.display().to_string(), fs::read_to_string(p).unwrap()))
+                .collect();
+            let files: Vec<(&str, &str)> = sources.iter().map(|(p, s)| (p.as_str(), s.as_str())).collect();
+            let units = b4_units(&files);
+            let diags = names::check_names(&units, true, &concepts);
+            assert!(diags.is_empty(), "{project:?}: {diags:?}");
+        }
+        let stdlib = parse_phase4_stdlib().expect("stdlib parses");
+        let unit = SourceUnit { path: "stdlib".to_string(), src: String::new(), ast: stdlib };
+        let concepts: HashMap<String, ConceptDecl> =
+            unit.ast.concepts.iter().map(|c| (c.name.clone(), c.clone())).collect();
+        let diags = names::check_names(std::slice::from_ref(&unit), false, &concepts);
+        assert!(diags.is_empty(), "{diags:?}");
+    }
+
+    #[test]
+    fn test_e0_private_members_stay_private() {
+        let secret = "module SECRET\n\nrepresentation {NONE}\n  v: U64\n\ncreate {ANY}\n\n  make: SECRET\n    do\n      { v = 1 }\n    end\n\nfeature {ANY}\n\n  open_one: U64\n    do\n      Current.v\n    end\n\nfeature {NONE}\n\n  hidden: U64\n    do\n      Current.v\n    end\n\nfeature {FRIEND}\n\n  shared: U64\n    do\n      Current.v\n    end\n\nend\n";
+        let client = |name: &str, body: &str| {
+            format!("functions {name}\n\nfeature {{ANY}}\n\n  t(s: SECRET): U64\n    do\n      {body}\n    end\n\nend\n")
+        };
+        for body in ["s.v", "s.hidden", "SECRET.make.v", "SECRET.make.hidden", "s.shared"] {
+            let src = client("PEEK", body);
+            let fatal = e0_fatal(&[("secret.gdl", secret), ("peek.gdl", &src)]);
+            assert!(fatal.iter().any(|(r, _)| r == "E0113: hidden_member"), "{body}: {fatal:?}");
+        }
+        let exported = client("PEEK", "s.open_one");
+        assert_eq!(e0_fatal(&[("secret.gdl", secret), ("peek.gdl", &exported)]), Vec::new());
+
+        // A hidden sum type: its constructors are its representation.
+        let shade = "module SHADE\n\nrepresentation {NONE}\n  | Light(v: U64)\n  | Dark\n\ncreate {ANY}\n\n  make: SHADE\n    do\n      Dark\n    end\n\nend\n";
+        for (ret, body) in [
+            ("U64", "match s\n        case Light(v) then v\n        case _ then 0\n      end"),
+            ("SHADE", "Light(1)"),
+            ("SHADE", "Dark"),
+        ] {
+            let spy = format!("functions SPY\n\nfeature {{ANY}}\n\n  t(s: SHADE): {ret}\n    do\n      {body}\n    end\n\nend\n");
+            let fatal = e0_fatal(&[("shade.gdl", shade), ("spy.gdl", &spy)]);
+            assert!(fatal.iter().any(|(r, _)| r == "E0113: hidden_member"), "{body}: {fatal:?}");
+        }
+    }
+
+    #[test]
+    fn test_e0_constructors_of_one_name() {
+        let a = "module TOK_A\n\nrepresentation {ANY}\n  | Leaf(v: U64)\n  | End_a\n\nend\n";
+        let b = "module TOK_B\n\nrepresentation {ANY}\n  | Leaf(v: BOOL)\n  | End_b\n\nend\n";
+        // Used from a third module, they cannot be told apart, and both uses are reported.
+        let user = "functions USE_C\n\nfeature {ANY}\n\n  one: TOK_A\n    do\n      Leaf(1)\n    end\n\n  two: TOK_B\n    do\n      Leaf(True)\n    end\n\nend\n";
+        let fatal = e0_fatal(&[("tok_a.gdl", a), ("tok_b.gdl", b), ("use_c.gdl", user)]);
+        let at: Vec<&str> = fatal.iter().map(|(_, at)| at.as_str()).collect();
+        assert_eq!(fatal.len(), 2, "{fatal:?}");
+        assert!(fatal.iter().all(|(r, _)| r == "E0112: ambiguous_constructor"), "{fatal:?}");
+        assert_eq!(at, ["use_c.gdl:7", "use_c.gdl:12"]);
+        // Two modules that never meet are fine, as is a name used with no rival in reach.
+        let lone = "functions USE_D\n\nfeature {ANY}\n\n  one: TOK_A\n    do\n      End_a\n    end\n\nend\n";
+        assert_eq!(e0_fatal(&[("tok_a.gdl", a), ("tok_b.gdl", b), ("use_d.gdl", lone)]), Vec::new());
+        // A module's own constructor wins, as over the prelude's (§4.1).
+        let own = "module OWN\n\nrepresentation {ANY}\n  | Leaf(v: BOOL)\n  | Nope\n\nfeature {ANY}\n\n  flag: BOOL\n    do\n      match Current\n        case Leaf(b) then b\n        case Nope then False\n      end\n    end\n\nend\n";
+        assert_eq!(e0_fatal(&[("tok_a.gdl", a), ("own.gdl", own)]), Vec::new());
+    }
+
+    #[test]
+    fn test_e0_what_boogie_refuses_is_not_shown_as_boogie_text() {
+        let src = "functions T\n\nfeature {ANY}\n\n  t(x: U64): U64\n    do\n      x.nothing\n    end\n\nend\n";
+        let mut units = b4_units(&[("t.gdl", src)]);
+        let checked = check_and_verify_project(&mut units, b4_opts(false, false));
+        let diags: Vec<Diagnostic> = checked.diags.into_iter().map(|(_, d)| d).collect();
+        assert!(!diags.is_empty(), "it must not read as verified");
+        for d in &diags {
+            assert_eq!(d.rule, "E0199: verifier_translation_failed", "{d:?}");
+            assert!(!d.message.contains(".bpl"), "{}", d.message);
+        }
+        assert_eq!(diags.len(), 1, "one report per module: {diags:?}");
+    }
+
+    #[test]
+    fn test_e0_flags_are_known_or_refused() {
+        let args = |list: &[&str]| -> Vec<String> {
+            std::iter::once("gardelc").chain(list.iter().copied()).map(String::from).collect()
+        };
+        let unknown = |list: &[&str]| first_unknown_flag(&args(list)).cloned();
+        assert_eq!(unknown(&["a.gdl", "--stric"]), Some("--stric".to_string()));
+        assert_eq!(unknown(&["--project", "."]), Some("--project".to_string()));
+        assert_eq!(unknown(&["--boogie", "a.gdl"]), Some("--boogie".to_string()));
+        for good in [
+            &["a.gdl", "--strict", "--audit", "--run"][..],
+            &["--stdlib", "--inspect", "SEQ", "--json-diagnostics"],
+            &["a.gdl", "--fuel", "3", "--z3-seed", "1", "--z3-rlimit", "9"],
+            &["--emit-stdlib", "out", "--no-prelude", "--bounded-check"],
+        ] {
+            assert_eq!(unknown(good), None, "{good:?}");
+        }
     }
 
     #[test]
@@ -19631,7 +22972,7 @@ end
         // wrapped values are unequal must NOT verify. Previously element `.equals` inside
         // OPTION/RESULT was lowered to `==` (keyed on variable names) and `A_eq <==> ==` was a
         // module-wide axiom, so this false contract verified.
-        let src = "functions OPTSEQ\n\nfeature {ANY}\n\n  wrap_differs(s1: SEQ[U64], s2: SEQ[U64]): BOOL\n    require\n      behaviourally_equal: s1.equals(s2)\n      different_shape: not (s1 = s2)\n    do\n      Some(s1).equals(Some(s2))\n    ensure\n      claims_unequal: Result = False\n    end\n\nend\n";
+        let src = "functions OPTSEQ\n\nfeature {ANY}\n\n  is_leaf(s: SEQ[U64]): BOOL\n    do\n      match s\n        case Leaf(_) then True\n        case _ then False\n      end\n    end\n\n  wrap_differs(s1: SEQ[U64], s2: SEQ[U64]): BOOL\n    require\n      behaviourally_equal: s1.equals(s2)\n      different_shape: is_leaf(s1) and not is_leaf(s2)\n    do\n      Some(s1).equals(Some(s2))\n    ensure\n      claims_unequal: Result = False\n    end\n\nend\n";
         let diags = soundness_verify(src, "optseq.gdl");
         assert!(
             diags
@@ -20077,7 +23418,7 @@ end
     #[test]
     fn test_product_module_type_params_and_not_equal() {
         // A bounded type parameter of a record module verifies, and its `EQ` theory is usable.
-        let pair = "module PAIR[A: EQ]\n\nrepresentation {ANY}\n  fst: A\n  snd: A\n\nfeature {ANY}\n\n  same: BOOL\n    do\n      Current.fst = Current.snd\n    ensure\n      sym: Result = (Current.snd = Current.fst)\n    end\n\n  distinct: BOOL\n    do\n      Current.fst != Current.snd\n    ensure\n      sym_ne: Result = (Current.snd != Current.fst)\n    end\n\n  twisted: BOOL\n    do\n      Current.fst = Current.snd\n    ensure\n      wrong: Result\n    end\n\nend\n";
+        let pair = "module PAIR[A: EQ]\n\nrepresentation {ANY}\n  fst: A\n  snd: A\n\nfeature {ANY}\n\n  same: BOOL\n    do\n      Current.fst.equals(Current.snd)\n    ensure\n      sym: Result = Current.snd.equals(Current.fst)\n    end\n\n  distinct: BOOL\n    do\n      not Current.fst.equals(Current.snd)\n    ensure\n      sym_ne: Result = (not Current.snd.equals(Current.fst))\n    end\n\n  twisted: BOOL\n    do\n      Current.fst.equals(Current.snd)\n    ensure\n      wrong: Result\n    end\n\nend\n";
         let diags = soundness_verify(pair, "pair.gdl");
         assert_eq!(
             diags.len(),

@@ -4,6 +4,28 @@ All notable changes, theoretical soundess fixes, verification overhauls, front-e
 
 ---
 
+## [Unreleased]
+
+Spec draft v0.5. [plan/Roadmap.md](plan/Roadmap.md) holds the detail for each task.
+
+### Language and runtime
+- **Reactive programs** (Phase D): `reactive program`, with `init` and `step` as total routines, `STEP`, `COMMAND`, `EVENT`, `KEY` and `CONN_ID` in the prelude, timers, console input, TCP sockets, and event logs with replay.
+- **Standard library** (Phase C): one module per file under `stdlib/`, verified UTF-8 `STRING` and `BYTES`, `RESULT`, and a law catalogue.
+- **C backend**: every module lowers from source. Reference counting with ownership transfer, a thread-local allocator, and self tail calls as loops.
+- **Dafny removed.** Boogie and Z3 are the only verifier, and a run has five steps. Solver limits count work, not time.
+
+### Soundness fixes
+- **Obligations reach every expression** (D.9). Overflow, division by zero, callee preconditions and `check` were skipped in lambdas, in `if` and `match` nested in an expression, in tuples, under `not`, in record fields and in a body `match`'s scrutinee. Such programs verified, then wrapped or crashed at run time.
+- **`I64`** (D.10). `/` and `%` proved Euclidean results while the binary truncated, so `(-7) / 2 = -4` verified and the program computed `-3`. `-x` at `I64.min` and `I64.min / -1` had no check. Wrapping on `I64` was read as unsigned.
+- **Private members** (E.0). Private routines and the constructors of a hidden representation were reachable from other modules, so a client could forge a value of an opaque type.
+
+### Behaviour changes that can reject existing code
+- Bitwise operators on `I64` are refused (`bitwise_on_signed`), and `-x` on `U64` needs `x = 0`.
+- Unknown command-line flags are errors.
+- New rules `E0106` to `E0113` report undefined names and hidden members before verification. `E0199` reports what the verifier cannot accept.
+
+---
+
 ## [0.4.0] - 2026-10-28
 
 This release represents a comprehensive overhaul of the Gardel Language Specification (Draft v0.4) and the `gardelc` compiler implementation, closing critical theoretical soundness holes, replacing bounded concrete sampling with genuine Boogie/Z3 SMT verification, completing the front-end grammar and type system, implementing general AST-driven C11 and Bend v2 lowering, integrating Perceus reference counting, and completing the standard library.
@@ -13,7 +35,7 @@ The remediation and implementation proceeded across four distinct phases:
 ---
 
 ### Phase 1: Specification Soundness & Theoretical Semantics Patch
-*Target: `spec/gardel_language_specification_draft_v0_4.md`*
+*Target: `spec/gardel_language_specification_draft_v0_5.md`*
 
 - **Decoupled `EQ` from SMT Leibniz Identity (§9)**:
   - Replaced the contradictory law `agrees_with_structural` (`a.equals(b) = (a = b)`) in concept `EQ` with standard equivalence relation laws: `reflexive`, `symmetric`, and `transitive`.

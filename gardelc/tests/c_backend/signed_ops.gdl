@@ -1,0 +1,162 @@
+program SIGNED_OPS
+
+-- Each routine proves its exact result, and `first_failure` checks the same value at run
+-- time, so a verifier that disagrees with the binary fails one way or the other. Exit
+-- code 0 means all checks passed; k > 0 names the first failing check. The operands are
+-- routine calls, so the C compiler does not fold them.
+
+feature {ANY}
+
+  v(x: I64): I64
+    do
+      x
+    end
+
+  div_pp: I64
+    do
+      v(7) / 2
+    ensure
+      exact: Result = 3
+    end
+
+  div_np: I64
+    do
+      v(-7) / 2
+    ensure
+      exact: Result = -3
+    end
+
+  div_pn: I64
+    do
+      v(7) / -2
+    ensure
+      exact: Result = -3
+    end
+
+  div_nn: I64
+    do
+      v(-7) / -2
+    ensure
+      exact: Result = 3
+    end
+
+  mod_pp: I64
+    do
+      v(7) % 2
+    ensure
+      exact: Result = 1
+    end
+
+  mod_np: I64
+    do
+      v(-7) % 2
+    ensure
+      exact: Result = -1
+    end
+
+  mod_pn: I64
+    do
+      v(7) % -2
+    ensure
+      exact: Result = 1
+    end
+
+  mod_nn: I64
+    do
+      v(-7) % -2
+    ensure
+      exact: Result = -1
+    end
+
+  negated: I64
+    do
+      -v(-9223372036854775807)
+    ensure
+      exact: Result = 9223372036854775807
+    end
+
+  sum: I64
+    do
+      v(-5) + 3
+    ensure
+      exact: Result = -2
+    end
+
+  difference: I64
+    do
+      5 - v(200)
+    ensure
+      exact: Result = -195
+    end
+
+  product: I64
+    do
+      v(-4) * 5
+    ensure
+      exact: Result = -20
+    end
+
+  wrapped_up(x: I64): I64
+    require
+      pinned: x = 9223372036854775807
+    do
+      x +% 1
+    ensure
+      exact: Result = -9223372036854775808
+    end
+
+  wrapped_down(x: I64): I64
+    require
+      pinned: x = -9223372036854775808
+    do
+      x -% 1
+    ensure
+      exact: Result = 9223372036854775807
+    end
+
+  wrapped_small(x: I64): I64
+    require
+      pinned: x = -1
+    do
+      x +% 0
+    ensure
+      exact: Result = -1
+    end
+
+  wrapped_mul(x: I64): I64
+    require
+      pinned: x = -3
+    do
+      x *% 4
+    ensure
+      exact: Result = -12
+    end
+
+  first_failure: U64
+    do
+      if div_pp != 3 then 1
+      else if div_np != -3 then 2
+      else if div_pn != -3 then 3
+      else if div_nn != 3 then 4
+      else if mod_pp != 1 then 5
+      else if mod_np != -1 then 6
+      else if mod_pn != 1 then 7
+      else if mod_nn != -1 then 8
+      else if negated != 9223372036854775807 then 9
+      else if sum != -2 then 10
+      else if difference != -195 then 11
+      else if product != -20 then 12
+      else if wrapped_up(9223372036854775807) != -9223372036854775808 then 13
+      else if wrapped_down(-9223372036854775808) != 9223372036854775807 then 14
+      else if wrapped_small(-1) != -1 then 15
+      else if wrapped_mul(-3) != -12 then 16
+      else 0
+      end end end end end end end end end end end end end end end end
+    end
+
+  main(args: SEQ[STRING]): IO[EXIT_CODE]
+    do
+      IO.exit(first_failure)
+    end
+
+end

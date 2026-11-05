@@ -1,0 +1,33 @@
+module BEAT_STATE
+
+representation {NONE}
+  recent: LIST[NAT]
+  seen: NAT
+
+invariant
+  bounded: recent.length <= 8
+
+create {ANY}
+
+  make: BEAT_STATE
+    do
+      { recent = LIST.empty, seen = 0 }
+    end
+
+feature {ANY}
+
+  total: NAT
+    do
+      Current.seen
+    end
+
+  record(id: NAT): BEAT_STATE
+    do
+      if Current.recent.length < 8 then
+        { recent = Current.recent.prepend(id), seen = Current.seen +% 1 }
+      else
+        { recent = LIST.empty, seen = Current.seen +% 1 }
+      end
+    end
+
+end

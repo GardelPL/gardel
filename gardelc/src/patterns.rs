@@ -27,6 +27,10 @@ struct Row {
 
 struct Compiler {
     counter: usize,
+    /// The routine, law or invariant being rewritten, for diagnostics.
+    site: String,
+    /// Sites holding a `match` arm after a catch-all arm.
+    unreachable_arms: Vec<String>,
 }
 
 fn is_flat(p: &Pattern) -> bool {
@@ -238,6 +242,11 @@ fn rewrite_expr(e: &mut Expr, c: &mut Compiler) {
             rewrite_block(es, ee, c);
         }
         Expr::Match(scrut, cases) => {
+            // An arm after a catch-all can never run. The backends would each have to decide
+            // what it means (a C `switch` still honours a later `case`), so it is rejected.
+            if cases.iter().rev().skip(1).any(MatchCase::is_catch_all) {
+                c.unreachable_arms.push(c.site.clone());
+            }
             rewrite_expr(scrut, c);
             for k in cases.iter_mut() {
                 rewrite_block(&mut k.stmts, &mut k.body, c);
@@ -304,20 +313,43 @@ fn rewrite_block(stmts: &mut [Stmt], body: &mut Expr, c: &mut Compiler) {
 }
 
 /// Compiles every non-flat `match` of `m` (routine bodies, contracts and law bodies).
-pub(crate) fn desugar_patterns(m: &mut ModuleDecl) {
-    let mut c = Compiler { counter: 0 };
+/// Returns the routines and laws that hold an arm after a catch-all (`E0316`).
+pub(crate) fn desugar_patterns(m: &mut ModuleDecl) -> Vec<String> {
+    let mut c = Compiler { counter: 0, site: String::new(), unreachable_arms: Vec::new() };
     for (_, r) in m
         .create_routines
         .iter_mut()
         .chain(m.feature_routines.iter_mut())
         .chain(m.specify_routines.iter_mut())
     {
+        c.site = r.name.clone();
         for (_, e) in r.requires.iter_mut().chain(r.ensures.iter_mut()) {
             rewrite_expr(e, &mut c);
         }
         rewrite_block(&mut r.stmts, &mut r.body, &mut c);
     }
+    c.site = "invariant".to_string();
     for (_, e) in m.invariants.iter_mut() {
         rewrite_expr(e, &mut c);
     }
+    for (_, law) in m.specify_laws.iter_mut() {
+        c.site = law.name.clone();
+        for (_, e) in law.requires.iter_mut().chain(law.ensures.iter_mut()) {
+            rewrite_expr(e, &mut c);
+        }
+        match &mut law.body {
+            Some(body) => rewrite_block(&mut law.stmts, body, &mut c),
+            None => {
+                for st in law.stmts.iter_mut() {
+                    match st {
+                        Stmt::Let(_, x) | Stmt::Check(_, x) | Stmt::Assume(_, x) => {
+                            rewrite_expr(x, &mut c)
+                        }
+                        Stmt::Reveal(_) => {}
+                    }
+                }
+            }
+        }
+    }
+    c.unreachable_arms
 }

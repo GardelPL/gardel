@@ -19,8 +19,8 @@
    Contracts are discharged statically by SMT solvers (Boogie / Z3) and **erased** at runtime. Verified code executes with zero runtime assertion overhead.
 3. **Pure, Total & Deterministic**:
    All functions are pure transformers and proven to terminate (via well-founded `variant` expressions). By Church-Rosser confluence, evaluation order never alters computation results.
-4. **Automatic Parallelism via Bend v2 & C11**:
-   Independent expressions and divide-and-conquer bindings automatically execute in parallel across CPU cores and GPUs (CUDA / Metal) without locks, mutexes, or data races.
+4. **Automatic Parallelism**:
+   Independent divide-and-conquer bindings run in parallel across CPU cores through C11 and OpenMP, without locks, mutexes, or data races. A Bend v2 file is also emitted, the intended route to GPUs, but no emitted file has been executed yet.
 5. **Safe 64-Bit Numerics**:
    Runtime arithmetic uses native 64-bit machine types (`U64`, `I64`, `F64`), while contract logic reasons in unbounded mathematical integers (`MATH_INT`). Every checked arithmetic operation must be statically proven not to overflow.
 6. **Linear I/O Firewall**:
@@ -34,7 +34,7 @@ Gardel stands on the shoulders of three foundational language paradigms:
 
 * **Eiffel**: The elegant, human-readable syntax for Design by Contract (`require`, `ensure`, `invariant`), the Uniform Access Principle, `Current` and `Result` conventions, selective export visibility, and contract inspection tools (`--inspect` / `short` view).
 * **Dafny**: Automated SMT-backed formal verification, inductive reasoning and ghost specifications (`specify`), termination metrics (`variant`), and proof-erased code generation.
-* **Bend**: Massive, deterministic parallel execution, interaction-net and task-ring runtime concepts (BendRT), divide-and-conquer parallelism, and seamless targeting of multi-core CPUs, CUDA, and Apple Metal GPUs.
+* **Bend**: Deterministic parallelism without locks, from divide-and-conquer recursion. Bend v2 is an intended backend, with CUDA and Apple Metal as the goal.
 
 ---
 
@@ -111,25 +111,29 @@ end
 ```text
 ├── README.md              # Project overview and introduction
 ├── spec/                  # Gardel language specifications
-│   └── gardel_language_specification_draft_v0_4.md
+│   └── gardel_language_specification_draft_v0_5.md
 ├── scripts/               # Setup and verification tool installers
 │   ├── install_tools.ps1  # Windows PowerShell installer (Dafny, Z3, Boogie)
 │   └── install_tools.sh   # Linux/macOS Bash installer
 ├── examples/              # Standalone Gardel (.gdl) example programs
 │   ├── bounded_stack.gdl
+│   ├── echo_server/           # TCP echo server with a proven connection limit
 │   ├── greeter.gdl
+│   ├── reactive_clock/        # Countdown: a reactive program with timers and a proven state
+│   ├── reactive_game/         # A small terminal game with a proven board
+│   ├── reactive_hello.gdl
 │   ├── peano_ord.gdl
 │   └── tree.gdl
 ├── stdlib/                # Standard Prelude sources, one module per file (embedded into gardelc)
 │   ├── concepts/          # EQ, CANONICAL_EQ, ORD
-│   ├── core/              # OPTION, RESULT, IO_ERROR
+│   ├── core/              # OPTION, RESULT, IO_ERROR, and the reactive types
 │   ├── collections/       # LIST_OPS, SEQ
 │   ├── numeric/           # BIGNAT
-│   ├── text/              # STRING, STRING_ERROR
+│   ├── text/              # STRING, BYTES, STRING_ERROR
 │   └── functional/        # FUNCTION_OPS
 ├── gardelc/               # The self-contained Gardel Rust compiler
 │   ├── Cargo.toml
-│   └── src/main.rs        # Parser, type checker, Boogie/Z3 verifier & code generators
+│   └── src/               # Parser, name resolution, Boogie/Z3 verifier & code generators
 └── SETUP.md               # Tooling setup and workflow commands
 ```
 
@@ -183,7 +187,7 @@ From the `gardelc` folder:
 ```bash
 cd gardelc
 
-# Verify the standard library sources in ../stdlib/ (all 12 files, linked as one project)
+# Verify the standard library sources in ../stdlib/ (all 18 files, linked as one project)
 cargo run -- --stdlib
 
 # Inspect the public contract interface of all modules (short view)

@@ -1,0 +1,37 @@
+-- Breaks the rules of a handle on purpose: it uses a connection after closing it. The runtime
+-- must then stay silent about it, apart from one `Closed` (spec 11.6).
+reactive program NET_RULES
+
+feature {ANY}
+
+  init(args: SEQ[STRING]): STEP[NAT]
+    do
+      Continue(0, LIST.empty.prepend(Listen(8888)))
+    end
+
+  step(s: NAT, e: EVENT): STEP[NAT]
+    do
+      match e
+        case Received(c, data) then
+          Continue(s, LIST.empty
+            .prepend(Close(c))
+            .prepend(Send(c, "late".to_utf8))
+            .prepend(Close(c))
+            .prepend(Send(c, "bye".to_utf8))
+            .prepend(Print("received")))
+        case SendFailed(c, err) then
+          Continue(s, LIST.empty.prepend(Print("send failed")))
+        case Closed(c) then
+          if s >= 1 then
+            Stop(0, LIST.empty.prepend(Print("closed")))
+          else
+            Continue(1, LIST.empty.prepend(Print("closed")))
+          end
+        case Shutdown then
+          Stop(9, LIST.empty)
+        case _ then
+          Continue(s, LIST.empty)
+      end
+    end
+
+end

@@ -1,0 +1,48 @@
+functions LAW_PATTERNS
+
+feature {ANY}
+
+  classify(n: U64): U64
+    do
+      match n
+        case 0 then 10
+        case 1 then 11
+        case _ then 12
+      end
+    end
+
+specify {ANY}
+
+  -- Literal patterns in a law body.
+  law classify_small(n: U64)
+    require
+      small: n <= 1
+    do
+      match n
+        case 0 then True
+        case _ then True
+      end
+    ensure
+      ten_or_eleven: classify(n) = 10 or classify(n) = 11
+    end
+
+  -- Literal pattern in a law contract.
+  law classify_big(n: U64)
+    require
+      big: (match n case 0 then False case 1 then False case _ then True end)
+    ensure
+      twelve: classify(n) = 12
+    end
+
+  -- Tuple pattern in a law body.
+  law swap_twice(p: TUPLE[U64, U64])
+    do
+      match p
+        case (a, b) then a = a and b = b
+      end
+    ensure
+      same: p.first = p.first
+    end
+
+end
+

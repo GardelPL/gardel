@@ -1,0 +1,36 @@
+-- Sends back whatever a client sends, to at most 64 clients at once. The limit is proven: see
+-- `within_limit` in server_state.gdl. Press Ctrl-C to stop.
+--
+--   gardelc examples/echo_server --strict
+reactive program ECHO_SERVER
+
+feature {ANY}
+
+  init(args: SEQ[STRING]): STEP[SERVER_STATE]
+    do
+      Continue(SERVER_STATE.make(64), LIST.empty.prepend(Listen(8888)))
+    end
+
+  step(s: SERVER_STATE, e: EVENT): STEP[SERVER_STATE]
+    do
+      match e
+        case Accepted(c) then
+          if s.has_room then
+            Continue(s.admit(c), LIST.empty)
+          else
+            Continue(s, LIST.empty.prepend(Close(c)))
+          end
+        case Received(c, data) then
+          Continue(s, LIST.empty.prepend(Send(c, data)))
+        case Closed(c) then
+          Continue(s.release(c), LIST.empty)
+        case ListenFailed(_, _) then
+          Stop(1, LIST.empty.prepend(Print("cannot listen on port 8888")))
+        case Shutdown then
+          Stop(0, LIST.empty)
+        case _ then
+          Continue(s, LIST.empty)
+      end
+    end
+
+end

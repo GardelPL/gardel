@@ -1,0 +1,32 @@
+program WILD_PROG
+
+feature {ANY}
+
+  -- Wildcard on a linked (user) ADT inside a program.
+  is_red(l: LIGHT): BOOL
+    do
+      match l
+        case Red then True
+        case _ then False
+      end
+    ensure
+      exact: Result = (l = Red)
+    end
+
+  -- Wildcard first, then a bind-all arm on the linked ADT.
+  normalize(l: LIGHT): LIGHT
+    do
+      match l
+        case Amber then Red
+        case other then other
+      end
+    ensure
+      no_amber: Result != Amber
+    end
+
+  main(args: SEQ[STRING]): IO[EXIT_CODE]
+    do
+      IO.exit(if is_red(Red) and not is_red(Amber) then 0 else 1 end)
+    end
+
+end

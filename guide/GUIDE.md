@@ -1,9 +1,9 @@
 # The Gardel Programming Guide
 
-Welcome to the definitive guide to **Gardel**, a pure, total, statically verified programming language that fuses **Eiffel's Design by Contract**, **Dafny-style automated SMT verification** (carried out by Boogie and Z3), and **Bend's massively parallel runtime**.
+Welcome to the definitive guide to **Gardel**, a pure, total, statically verified programming language built on **Tony Hoare's axiomatic semantics**. Every routine is a triple $\{P\}\;C\;\{Q\}$, proved at compile time by Boogie and Z3 and then erased. Gardel's contract syntax comes from Eiffel, its style of automated proof from Dafny, and its model of parallelism from Bend.
 
 This guide is written for two audiences:
-1. **Software engineers** seeking mathematical certainty, zero-cost static contracts, and lock-free parallel execution on modern CPUs and GPUs.
+1. **Software engineers** seeking mathematical certainty, zero-cost static contracts, and automatic lock-free parallelism.
 2. **AI coding agents (LLMs)** generating, evaluating, and repairing high-integrity code via structured SMT diagnostics.
 
 ---
@@ -11,7 +11,8 @@ This guide is written for two audiences:
 ## Table of Contents
 
 - [1. Philosophy and Mental Model](#1-philosophy-and-mental-model)
-  - [The Triad: Eiffel + Dafny + Bend](#the-triad-eiffel--dafny--bend)
+  - [The Foundation: Axiomatic Semantics](#the-foundation-axiomatic-semantics)
+  - [What Gardel Borrows](#what-gardel-borrows)
   - [The Core Invariant: Total Purity and Determinism](#the-core-invariant-total-purity-and-determinism)
   - [Contracts as Static Proofs, Not Runtime Assertions](#contracts-as-static-proofs-not-runtime-assertions)
 - [2. Getting Started: Hello World](#2-getting-started-hello-world)
@@ -31,7 +32,7 @@ This guide is written for two audiences:
   - [Product Types (Records) and Functional Updates](#product-types-records-and-functional-updates)
   - [Sum Types (Algebraic Variants)](#sum-types-algebraic-variants)
   - [Refinement-Aware Pattern Matching](#refinement-aware-pattern-matching)
-- [6. Eiffel-Style Design by Contract](#6-eiffel-style-design-by-contract)
+- [6. Contracts: Hoare Triples in Practice](#6-contracts-hoare-triples-in-practice)
   - [Preconditions: `require`](#preconditions-require)
   - [Postconditions: `ensure`](#postconditions-ensure)
   - [The Roles of `Current` and `Result`](#the-roles-of-current-and-result)
@@ -55,7 +56,7 @@ This guide is written for two audiences:
   - [Divide-and-Conquer Parallel Fork-Join](#divide-and-conquer-parallel-fork-join)
   - [Church-Rosser Confluence](#church-rosser-confluence)
   - [The `SEQ[A]` Balanced Tree Collection](#the-seqa-balanced-tree-collection)
-  - [BendRT Runtime: CPU Cores, CUDA, and Apple Metal](#bendrt-runtime-cpu-cores-cuda-and-apple-metal)
+  - [Backends Today](#backends-today)
 - [11. Higher-Order Functions and Closures](#11-higher-order-functions-and-closures)
   - [Function Signatures and Refined Types](#function-signatures-and-refined-types)
   - [Lambda Syntax (`fn`)](#lambda-syntax-fn)
@@ -72,20 +73,26 @@ This guide is written for two audiences:
   - [Linear `IO[A]` Actions and `with IO`](#linear-ioa-actions-and-with-io)
   - [Reading Input: `IO.read_line`](#reading-input-ioread_line)
   - [Boundary Ingestion: Untrusted Data to Verified ADTs](#boundary-ingestion-untrusted-data-to-verified-adts)
-- [14. SMT Proofs & AI Agent Verification Workflow](#14-smt-proofs--ai-agent-verification-workflow)
+- [14. Reactive Programs](#14-reactive-programs)
+  - [Two Total Routines](#two-total-routines)
+  - [The State Proves Itself](#the-state-proves-itself)
+  - [What Is and Is Not Guaranteed](#what-is-and-is-not-guaranteed)
+  - [Scripted Runs, Record and Replay](#scripted-runs-record-and-replay)
+- [15. SMT Proofs & AI Agent Verification Workflow](#15-smt-proofs--ai-agent-verification-workflow)
   - [The Boogie / Z3 Verification Engine](#the-boogie--z3-verification-engine)
   - [The AI Autonomous Repair Loop (`--json-diagnostics`)](#the-ai-autonomous-repair-loop---json-diagnostics)
   - [Reading Counterexample Models](#reading-counterexample-models)
   - [Repair Patterns for LLMs](#repair-patterns-for-llms)
-- [15. Complete Real-World Examples](#15-complete-real-world-examples)
+- [16. Complete Real-World Examples](#16-complete-real-world-examples)
   - [Example A: `BOUNDED_STACK[A]`](#example-a-bounded_stacka)
   - [Example B: Verified Parallel Tree Construction & Maximum](#example-b-verified-parallel-tree-construction--maximum)
   - [Example C: Peano Numbers with Formally Verified Total Ordering](#example-c-peano-numbers-with-formally-verified-total-ordering)
-- [16. Projects and the Standard Prelude](#16-projects-and-the-standard-prelude)
+- [17. Projects and the Standard Prelude](#17-projects-and-the-standard-prelude)
   - [The Prelude Is Always There](#the-prelude-is-always-there)
   - [Multi-File Projects](#multi-file-projects)
+  - [Name Resolution](#name-resolution)
   - [The Standard Library Sources (`stdlib/`)](#the-standard-library-sources-stdlib)
-- [17. Compiler CLI Cheatsheet & Grammar Reference](#17-compiler-cli-cheatsheet--grammar-reference)
+- [18. Compiler CLI Cheatsheet & Grammar Reference](#18-compiler-cli-cheatsheet--grammar-reference)
   - [CLI Commands](#cli-commands)
   - [Formal Grammar (EBNF Summary)](#formal-grammar-ebnf-summary)
   - [Comparison Matrix: Gardel vs Bend vs Eiffel vs Rust vs Dafny](#comparison-matrix-gardel-vs-bend-vs-eiffel-vs-rust-vs-dafny)
@@ -94,35 +101,36 @@ This guide is written for two audiences:
 
 ## 1. Philosophy and Mental Model
 
-### The Triad: Eiffel + Dafny + Bend
+### The Foundation: Axiomatic Semantics
 
-Modern programming languages force developers into compromises:
-- **Imperative languages (C, Rust, Go)** offer high performance and machine control, but concurrency introduces race conditions, deadlocks, and mutation hazards.
-- **Verification languages (Dafny, Lean, Coq)** provide rock-solid formal proofs, but compiling them into high-performance, massively parallel binaries is often secondary.
-- **Parallel languages (Bend / HVM)** enable effortless, lock-free parallel scaling across CPUs and GPUs, but lack integrated specification contracts and formal correctness proofs.
+Gardel's core is the axiomatic semantics Tony Hoare published in 1969. The meaning of a program is what can be proved about it, stated as a triple:
 
-**Gardel synthesizes all three into a single, cohesive paradigm:**
+$$\{P\}\;C\;\{Q\}$$
 
-```
-                  ┌──────────────────────────────────────┐
-                  │                GARDEL                │
-                  └──────────────────┬───────────────────┘
-                                     │
-         ┌───────────────────────────┼───────────────────────────┐
-         ▼                           ▼                           ▼
-  [ Eiffel Heritage ]         [ Dafny Heritage ]          [ Bend Backend ]
-  • Design by Contract        • SMT proofs (Boogie + Z3)  • Automatic Fork-Join
-  • require / ensure          • Proofs erased at runtime  • Massive Parallelism
-  • Class Invariants          • Refinement types          • CPU (C11), GPU (CUDA/Metal)
-  • Uniform Access & Current  • Inductive ghost models    • Church-Rosser Confluence
-```
+If $P$ holds before $C$ runs, then $Q$ holds after it. Each part of a routine is a part of that triple:
+
+| Axiomatic semantics | In Gardel | Proved by |
+| :--- | :--- | :--- |
+| Precondition $\{P\}$ | `require` | Every caller, at the call site |
+| Command $C$ | `do` | Not applicable: this is the code being verified |
+| Postcondition $\{Q\}$ | `ensure` | The routine, assuming $P$ |
+| Data invariant | `invariant` | Every routine that builds a value of the type |
+| Termination, for total correctness | `variant` | Every recursive routine |
+
+A call follows Hoare's rule for procedures: prove the callee's precondition, then use its postcondition. Boogie turns each triple into verification conditions and Z3 discharges them. A triple that cannot be proved stops the build.
+
+### What Gardel Borrows
+
+- **Eiffel's Design by Contract** is one implementation of these ideas in a programming language. Gardel borrows its readable vocabulary: `require`, `ensure`, `invariant`, `Current`, `Result`, and selective export. Eiffel usually monitors assertions at run time, while Gardel proves them.
+- **Dafny** showed that SMT-backed proofs, ghost specifications and `variant`-style termination measures work in everyday code.
+- **Bend** is the model for parallelism without locks, and an intended backend. See [Backends Today](#backends-today) for what runs now.
 
 ### The Core Invariant: Total Purity and Determinism
 
 In Gardel:
 1. **Values are immutable.** There are no variables that change over time, no pointers, and no in-place mutation.
 2. **All routines are total functions.** A routine cannot loop forever, crash with an unhandled exception, or return undefined. Given valid inputs meeting its `require` clause, it is mathematically proven to terminate and produce a result satisfying its `ensure` clause.
-3. **Strict Church-Rosser confluence.** Because every expression is purely functional and total, evaluating independent expressions sequentially, interleaved, or in parallel on thousands of GPU threads produces the **exact same bit-for-bit result** for discrete types.
+3. **Strict Church-Rosser confluence.** Because every expression is purely functional and total, evaluating independent expressions sequentially, interleaved, or in parallel produces the **exact same bit-for-bit result** for discrete types.
 
 ### Contracts as Static Proofs, Not Runtime Assertions
 
@@ -151,7 +159,7 @@ Before compiling and verifying Gardel programs, you need to build the `gardelc` 
   # Download and run rustup-init.exe from https://rustup.rs/
   ```
 - **C11 Compiler (Optional, for native CPU binaries):** GCC or Clang with OpenMP support (e.g., `gcc -fopenmp`).
-- **Bend / BendRT (Optional, for GPU / parallel interaction nets):** Install Bend v2 via `cargo install bend-lang` if you plan to execute `.bend` files on CUDA or Apple Metal.
+- **Bend (not needed):** `gardelc` writes a `.bend` file on each run, but no emitted file has been executed yet. See [Backends Today](#backends-today).
 
 #### 2. Compiling the Compiler
 
@@ -176,7 +184,7 @@ Confirm that all compiler components (parser, visibility rules, concept laws, Bo
 
 ```bash
 cargo test
-# Output: test result: ok. 73 passed; 0 failed
+# Output: test result: ok. 164 passed; 0 failed
 ```
 
 #### 4. Installing `gardelc` to Your PATH
@@ -266,12 +274,8 @@ gardelc hello.gdl --json-diagnostics
 gardelc --inspect hello.gdl
 
 # Run the emitted C11 binary (in build/):
-gcc -O3 -fopenmp build/hello.c -o hello
+gcc -O3 -fopenmp build/hello.c -o hello    # a reactive program on Windows also needs -lws2_32
 ./hello
-
-# Run the emitted Bend v2 file (in build/):
-bend run-c build/hello.bend     # Multi-core CPU
-bend run-cu build/hello.bend    # NVIDIA CUDA GPU
 ```
 
 ---
@@ -296,10 +300,17 @@ Inside contracts (`require`, `ensure`, `invariant`), runtime numbers **automatic
 
 ### Checked Operators & Overflow Proofs
 
-Standard arithmetic operators (`+`, `-`, `*`, `/`, `%`) generate static proof obligations:
-- For `a + b`, you must prove $a + b \le 2^{64} - 1$ (for `U64`).
-- For `a - b`, you must prove $a - b \ge 0$ (for `U64`).
-- For `a / b` and `a % b`, you must prove $b \ne 0$.
+Arithmetic operators generate static proof obligations, each checked against the range of its operands' type, on the path where the operation runs:
+
+| Operation | What you must prove |
+| :--- | :--- |
+| `a + b`, `a - b`, `a * b` | The mathematical result fits the type: $[0, 2^{64}-1]$ for `U64`, $[-2^{63}, 2^{63}-1]$ for `I64` |
+| `a / b`, `a % b` | $b \ne 0$, and for `I64`, not `I64.min / -1` or `I64.min % -1`, which trap on real hardware |
+| `-a` | The result fits: `a` is not `I64.min` for `I64`, and `a = 0` for `U64` |
+
+`/` truncates toward zero and `%` takes the sign of the dividend, as in C, so `(-7) / 2 = -3` and `(-7) % 2 = -1`. This holds in running code and in contracts.
+
+A guard protects what it guards. `x != 0 and 10 / x > 1` verifies, because `and`, `or` and `implies` evaluate their right side only when the left allows it. So does `id(if x > 0 then 10 / x else 0 end)`.
 
 If the compiler cannot prove an operation will never overflow or divide by zero, compilation fails!
 
@@ -328,8 +339,8 @@ midpoint(lo: NAT, hi: NAT): NAT
 ### Wrapping and Bitwise Operators
 
 When implementing cryptographic algorithms, hashing, or low-level encodings where overflow is intentional:
-- Use wrapping operators: `+%`, `-%`, `*%`. These are total and defined modulo $2^{64}$.
-- Use bitwise operators: `&`, `|`, `^`, `<<`, `>>`. Verified via Z3's `(_ BitVec 64)` bitvector theory. Shifts require proving `shift_amount < 64`.
+- Use wrapping operators: `+%`, `-%`, `*%`. These are total and defined modulo $2^{64}$, and on `I64` they are two's complement.
+- Use bitwise operators: `&`, `|`, `^`, `<<`, `>>`. They are defined on `U64` only, and rejected on `I64` (`bitwise_on_signed`). Shifts require proving `shift_amount < 64`.
 
 ### Deterministic Floating Point (`F64`)
 
@@ -473,9 +484,9 @@ get: A
 
 ---
 
-## 6. Eiffel-Style Design by Contract
+## 6. Contracts: Hoare Triples in Practice
 
-Contracts form the central nervous system of Gardel. Inspired by Bertrand Meyer's Eiffel, contracts express clear mathematical agreements between callers and suppliers.
+A contract is the $P$ and $Q$ of a routine's Hoare triple: a mathematical agreement between callers and the routine they call. The keywords follow Eiffel, whose Design by Contract brought this idea into a programming language.
 
 ### Preconditions: `require`
 
@@ -716,7 +727,7 @@ binary_search_range(lo: NAT, hi: NAT, target: NAT): BOOL
   end
 ```
 
-Tail-recursive calls are automatically lowered by `gardelc` into **zero-allocation native C `while` loops** and BendRT tail jumps.
+Tail-recursive calls are automatically lowered by `gardelc` into **zero-allocation native C `while` loops**. Only self tail calls are loops; mutual recursion uses the stack.
 
 ### Lexicographic Variants
 
@@ -816,16 +827,19 @@ if left_max >= right_max then left_max else right_max end
 
 Because `left_max` and `right_max` do not depend on one another and are purely functional, `gardelc` automatically compiles this into a parallel fork:
 ```c
-// Emitted Bend / BendRT task fork:
-left_max right_max = max_value(l) max_value(r)
+// Emitted C11, simplified:
+#pragma omp task shared(left_max)
+left_max = max_value(l);
+right_max = max_value(r);
+#pragma omp taskwait
 ```
 
-Both branches run in parallel on separate CPU cores or GPU threads.
+Both branches run in parallel on separate CPU cores, and task depth is capped so that small subtrees do not pay for a fork.
 
 ### Church-Rosser Confluence
 
 Because functions have no side effects, the order in which parallel tasks finish has zero impact on the final result:
-$$\text{Sequential Evaluation} \equiv \text{Parallel CPU Execution} \equiv \text{Massive CUDA/Metal GPU Execution}$$
+$$\text{Sequential Evaluation} \equiv \text{Parallel Execution}$$
 
 Data races are mathematically impossible by design.
 
@@ -842,7 +856,17 @@ representation {ANY}
   | Concat(left: SEQ[A], right: SEQ[A], len: NAT)
 ```
 
-Operations like `map`, `reduce`, and `filter` over `SEQ[A]` split work evenly across CPU task rings and GPU SIMD lanes.
+Operations like `map`, `reduce`, and `filter` over `SEQ[A]` split work between the two halves of the tree, which run as parallel tasks.
+
+### Backends Today
+
+| Output | Status |
+| :--- | :--- |
+| Boogie (`.bpl`) | The only verifier. Z3 discharges the obligations, bounded by solver work rather than time, so machine load cannot change a verdict. |
+| C11 with OpenMP (`.c`) | Runs natively, and compiled by `gcc` when the input contains a `program`. |
+| Bend v2 (`.bend`) | Written on each run, and the intended route to CUDA and Apple Metal GPUs. No emitted file has been executed yet, so treat GPU execution as a goal. |
+
+There is no tracing garbage collector. Values are immutable and acyclic, so atomic reference counting frees everything, ownership moves on last use, and a thread-local allocator serves small blocks. Reusing a unique value in place is deferred.
 
 ---
 
@@ -867,6 +891,8 @@ Anonymous functions use the `fn` keyword:
 ```eiffel
 let add_one = fn(x: NAT): NAT do x + 1 end
 ```
+
+A lambda can be applied to any value of its parameter types, so its body is proved for all of them, using what is known where it is created. This one is rejected, because `x + 1` overflows at `NAT.max`. A captured fact counts: `fn(y: U64): U64 do y / z end` verifies where `z > 0` is known, and is rejected with `div_by_zero` otherwise. A lambda passed to a refined function type cannot yet use that type's `require`.
 
 ### Compile-Time Closure Conversion (Lambda Lifting)
 
@@ -1116,7 +1142,122 @@ Once inside `Some(port)`, all downstream code relies on the static guarantees of
 
 ---
 
-## 14. SMT Proofs & AI Agent Verification Workflow
+## 14. Reactive Programs
+
+A `program` runs and exits. A `reactive program` runs until told to stop, as a server, a terminal interface or a game does, and every routine in it is still total. Non-termination lives in one visible place, the runtime's event loop.
+
+### Two Total Routines
+
+```eiffel
+reactive program REACTIVE_HELLO
+
+feature {ANY}
+
+  init(args: SEQ[STRING]): STEP[NAT]
+    do
+      Continue(0, LIST.empty.prepend(Print("Hello. Press Ctrl-C to stop.")))
+    end
+
+  step(s: NAT, e: EVENT): STEP[NAT]
+    do
+      match e
+        case Shutdown then Stop(0, LIST.empty.prepend(Print("Goodbye.")))
+        case _ then Continue(s, LIST.empty)
+      end
+    end
+
+end
+```
+
+The runtime calls `init`, performs the commands it returns, waits for an event, calls `step`, and repeats until a step returns `Stop`. Routines describe commands as values and the host performs them:
+
+| Prelude type | Contents |
+| :--- | :--- |
+| `STEP[S]` | `Continue(next, cmds)` or `Stop(code, cmds)` |
+| `COMMAND` | `Print`, `SetTimer`, `ReadLine`, `ReadKey`, `Listen`, `Send`, `Close` |
+| `EVENT` | `Tick`, `Line`, `Key`, `Accepted`, `ListenFailed`, `Received`, `SendFailed`, `Closed`, `Shutdown` |
+| `KEY` | `Char(c)`, arrows, `Enter`, `Escape`, `Backspace`, `Tab`, `Other`, `KeysEnded` |
+| `CONN_ID` | An opaque connection handle: it can be compared and stored, never forged |
+
+Rules worth knowing:
+- There is no `main`, no `IO` type and no `with IO`. `Stop` is the only way out, and its `code` is the exit status.
+- `init` and `step` have no `require`, because the runtime calls them with every input.
+- End a `match` on `EVENT` with `case _`.
+- A command never blocks the loop. One that can fail reports it as a later event.
+- The compiler adds `e.is_shutdown implies Result.is_stop` to every `step`, tagged `shutdown_must_stop`, and a clause you write cannot replace it.
+
+### The State Proves Itself
+
+Put the state in an opaque module with an `invariant`. Only that module can build a value, so the invariant holds after `init` and after every step, however long the program runs, with no new kind of proof:
+
+```eiffel
+module SERVER_STATE
+
+representation {NONE}
+  live: LIST[CONN_ID]
+  limit: NAT
+
+invariant
+  within_limit: live.length <= limit
+
+create {ANY}
+
+  make(cap: NAT): SERVER_STATE
+    do
+      { live = LIST.empty, limit = cap }
+    end
+
+feature {ANY}
+
+  has_room: BOOL
+    do
+      Current.live.length < Current.limit
+    end
+
+  admit(c: CONN_ID): SERVER_STATE
+    require
+      room: Current.has_room
+    do
+      { Current with live = Current.live.prepend(c) }
+    end
+
+end
+```
+
+`step` must test `s.has_room` before calling `s.admit(c)`, or its `room` precondition fails. See the complete programs in `examples/echo_server/`, `examples/reactive_clock/` and `examples/reactive_game/`. Give the folder to `gardelc`:
+
+```bash
+gardelc examples/reactive_game --strict
+./build/reactive_game_bin
+```
+
+### What Is and Is Not Guaranteed
+
+| Guaranteed, given the proofs | Not guaranteed |
+| :--- | :--- |
+| No crash, out-of-bounds access or overflow in any step | That events ever arrive |
+| The state invariant after every step | That commands succeed, or how long they take |
+| Each event is handled in finite time | The arrival order of concurrent events |
+| A `Shutdown` ends the run with the code `step` chose | Liveness, or `Shutdown` on `SIGKILL` or power loss |
+
+### Scripted Runs, Record and Replay
+
+A reactive program is a pure function of its arguments and its events, so a run can be repeated exactly:
+
+| Variable | Effect |
+| :--- | :--- |
+| `GARDEL_EVENTS=<script>` | Run from a script, such as `Tick:1 Key:Up Line:hello%20there Shutdown`. The end of the script is a `Shutdown`. |
+| `GARDEL_RECORD=<file>` | Write a log of the run |
+| `GARDEL_REPLAY=<file>` | Run from a log, with no timers, reads or sockets |
+| `GARDEL_LISTEN_ADDR=<ip>` | Bind `Listen` to an address other than loopback |
+
+The log holds the commands and the exit code as well as the events. A replay compares each command before it takes effect, and the first difference stops the program with exit status 3 and the line that differs, so a log from a working build is a regression test for a changed one. These are environment variables, not flags, because the command line belongs to the program and is part of what is replayed.
+
+A log holds everything the program received, in the clear, and has no size limit. A replay shows that the commands repeat, not that their real effects did.
+
+---
+
+## 15. SMT Proofs & AI Agent Verification Workflow
 
 Gardel is specifically engineered for autonomous collaboration between human architects and AI coding agents.
 
@@ -1202,7 +1343,7 @@ When repairing failing Gardel code:
 
 ---
 
-## 15. Complete Real-World Examples
+## 16. Complete Real-World Examples
 
 ### Example A: `BOUNDED_STACK[A]`
 
@@ -1333,7 +1474,7 @@ feature {ANY}
         case Leaf(v) then
           v
         case Node(l, r) then
-          -- Independent recursive calls fork onto BendRT parallel rings:
+          -- Independent recursive calls run as parallel tasks:
           let ml = l.max_value
           let mr = r.max_value
           if ml >= mr then ml else mr end
@@ -1472,7 +1613,7 @@ Each recursive law call (`reflexive(p)`, `total(p, q)`, ...) is the induction hy
 
 ---
 
-## 16. Projects and the Standard Prelude
+## 17. Projects and the Standard Prelude
 
 ### The Prelude Is Always There
 
@@ -1482,10 +1623,11 @@ Every program automatically sees the **Standard Prelude**:
 | :--- | :--- |
 | Concepts | `EQ`, `CANONICAL_EQ`, `ORD` |
 | Core types | `OPTION[A]`, `RESULT[E, A]`, `IO_ERROR` |
-| Collections | `SEQ[A]`, `LIST_OPS` |
+| Collections | `SEQ[A]`, `LIST[A]`, `LIST_OPS` |
 | Numbers | `BIGNAT` |
 | Text | `STRING`, `STRING_ERROR` |
 | Functions | `FUNCTION_OPS` |
+| Reactive programs | `STEP[S]`, `COMMAND`, `EVENT`, `KEY`, `CONN_ID` |
 
 The prelude is verified once, on its own (`gardelc --stdlib`). In user programs its contracts and laws are trusted facts, and calls into it must still establish its preconditions. Declaring a top-level name that the prelude already uses is an error (`E0101: duplicate_prelude_symbol`). Pass `--no-prelude` only to build a prelude-free program on purpose.
 
@@ -1504,6 +1646,24 @@ Rules:
 - **No duplicates:** two files declaring the same module is `E0102`.
 - **No cycles between files:** each file's proofs trust the contracts of the files it uses, so a cycle would let two modules prove each other. Cross-file cycles are rejected with `E0103: cyclic_module_dependency`; genuinely mutually dependent modules belong in one file.
 
+### Name Resolution
+
+There are no import statements. Before anything is verified, `gardelc` resolves every name in the run against the project and the prelude, and reports each failure at its source location:
+
+| Rule | Meaning |
+| :--- | :--- |
+| `E0106: unknown_module` | A module that is not in the run or the prelude |
+| `E0107: unknown_type` | A type that is not declared |
+| `E0108: unknown_routine` | A routine or field the module does not have |
+| `E0109: unknown_constructor` | A constructor no module declares |
+| `E0110: unknown_variable` | A name that is not a parameter, local, field or routine |
+| `E0111: wrong_argument_count` | A call with the wrong number of arguments |
+| `E0112: ambiguous_constructor` | A constructor declared by two other modules. Constructors resolve by name alone, so rename one. A module's own constructor always wins. |
+| `E0113: hidden_member` | A member another module does not export: a private routine, a hidden field, or a constructor of a hidden representation, which can be neither built nor matched |
+| `E0199: verifier_translation_failed` | The verifier could not accept what `gardelc` generated. The module is not verified. This is a limit of the compiler, not a fault shown in your program, and `GARDEL_KEEP_BPL=1` keeps the generated file. |
+
+Exporting to a named module across files, as in `feature {OTHER}`, is not usable yet: the export list counts as a dependency, so it forms a cycle (`E0103`).
+
 ### The Standard Library Sources (`stdlib/`)
 
 The prelude's source code lives in the repository's `stdlib/` folder, one module or concept per file, and is embedded into `gardelc` when the compiler is built:
@@ -1511,10 +1671,11 @@ The prelude's source code lives in the repository's `stdlib/` folder, one module
 ```text
 stdlib/
 ├── concepts/      eq.gdl, canonical_eq.gdl, ord.gdl
-├── core/          option.gdl, result.gdl, io_error.gdl
+├── core/          option.gdl, result.gdl, io_error.gdl, step.gdl,
+│                  command.gdl, event.gdl, key.gdl, conn_id.gdl
 ├── collections/   list_ops.gdl, seq.gdl
 ├── numeric/       bignat.gdl
-├── text/          string.gdl, string_error.gdl
+├── text/          string.gdl, bytes.gdl, string_error.gdl
 └── functional/    function_ops.gdl
 ```
 
@@ -1528,7 +1689,7 @@ When working on the standard library itself:
 
 ---
 
-## 17. Compiler CLI Cheatsheet & Grammar Reference
+## 18. Compiler CLI Cheatsheet & Grammar Reference
 
 ### Building & Installing from Source
 
@@ -1564,6 +1725,10 @@ gardelc --stdlib --strict
 
 # Run verification with structured JSON diagnostics for AI agents
 gardelc <file.gdl> --json-diagnostics
+
+# Fix the solver seed, to check that a proof is stable, or its work limit per procedure
+gardelc <file.gdl> --z3-seed <N>
+gardelc <file.gdl> --z3-rlimit <N>
 
 # Audit all 'assume' blocks in the file or project
 gardelc <file.gdl> --audit
@@ -1616,7 +1781,7 @@ ModuleDecl    ::= "module" UpperIdent TypeParams? Satisfies? WhereClause?
                   "end"
 
 FunctionsDecl ::= "functions" UpperIdent ( FeatureSection | SpecifySection )* "end"
-ProgramDecl   ::= "program" UpperIdent FeatureSection* "end"
+ProgramDecl   ::= "reactive"? "program" UpperIdent FeatureSection* "end"
 ConceptDecl   ::= "concept" UpperIdent TypeParams? Refines?
                     ( Signature | RoutineDecl | LawDecl )*
                   "end"
@@ -1683,10 +1848,10 @@ UnOp          ::= "not" | "-"
 | Feature | Gardel | Bend | Eiffel | Rust | Dafny |
 | :--- | :--- | :--- | :--- | :--- | :--- |
 | **Purity & Total Determinism** | **100% Total & Pure** | Pure | Imperative & Object | Imperative & Functional | Total / Imperative |
-| **Design by Contract** | **Native First-Class** | None | Native (Runtime/Debug) | Crates / Assertions | Method contracts |
+| **Hoare-Style Contracts** | **Native First-Class** | None | Native (Runtime/Debug) | Crates / Assertions | Method contracts |
 | **Formal Verification** | **Compile-Time SMT (Boogie/Z3)** | None | AutoProof (Research) | Prusti / Kani / Creusot | Compile-Time SMT (Z3) |
 | **Runtime Assertion Overhead** | **0% (100% Erased)** | 0% | Configurable (5%–40%) | Configurable (`debug_assert`) | 0% (Erased) |
-| **Parallel Execution Target** | **Automatic BendRT / C11 (CPU/CUDA/Metal)** | Automatic HVM/BendRT | Manual Threads (SCOOP) | Manual / Rayon / Tokio | Single-threaded C# / Go / C++ |
+| **Parallel Execution Target** | **Automatic C11 + OpenMP (CPU). Bend output not yet run** | Automatic HVM/BendRT | Manual Threads (SCOOP) | Manual / Rayon / Tokio | Single-threaded C# / Go / C++ |
 | **Numerics** | **64-bit Checked (`U64`/`I64`) + `MATH_INT`** | Native 64-bit / 24-bit | Machine Ints | Machine Ints (Debug panic) | Machine Ints + `int` |
 | **AI Agent Diagnostics** | **Structured JSON (`--json-diagnostics`)** | Human text | Human text | Human text / JSON | Human text |
 | **I/O Isolation** | **Linear `IO[A]` Firewall** | Monadic `IO` | Open everywhere | Open everywhere | Interactive / Method effects |

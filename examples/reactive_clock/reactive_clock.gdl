@@ -1,0 +1,35 @@
+-- Counts down once a second. A timer fires once, so each tick sets the next one.
+-- Press Ctrl-C to stop early.
+--
+--   gardelc examples/reactive_clock --strict
+reactive program REACTIVE_CLOCK
+
+feature {ANY}
+
+  init(args: SEQ[STRING]): STEP[CLOCK_STATE]
+    do
+      Continue(CLOCK_STATE.make(3),
+               LIST.empty.prepend(SetTimer(1, 1000)).prepend(Print("Counting down from 3.")))
+    end
+
+  tick(s: CLOCK_STATE): STEP[CLOCK_STATE]
+    do
+      if s.is_last then
+        Stop(0, LIST.empty.prepend(Print("Done.")))
+      else if s.has_left then
+        Continue(s.advance, LIST.empty.prepend(SetTimer(1, 1000)).prepend(Print("tick")))
+      else
+        Stop(0, LIST.empty.prepend(Print("Done.")))
+      end end
+    end
+
+  step(s: CLOCK_STATE, e: EVENT): STEP[CLOCK_STATE]
+    do
+      match e
+        case Tick(id) then tick(s)
+        case Shutdown then Stop(1, LIST.empty.prepend(Print("Interrupted.")))
+        case _ then Continue(s, LIST.empty)
+      end
+    end
+
+end

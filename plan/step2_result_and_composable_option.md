@@ -10,7 +10,7 @@
 **Target Files:**
 - `../stdlib/stdlib.gdl`
 - `../gardelc/stdlib/stdlib.gdl` (if present) / `../gardelc/src/main.rs` (`phase4_stdlib_source()` and stdlib verification unit tests)
-- `../spec/gardel_language_specification_draft_v0_4.md` (§5, §7.4, §8, §11.4, §16)
+- `../spec/gardel_language_specification_draft_v0_5.md` (§5, §7.4, §8, §11.4, §16)
 
 ---
 
@@ -387,7 +387,7 @@ During the execution of Step 2, several deep interactions between higher-order p
   - Added `test_step2_result_and_option_soundness_and_precondition_failures` validating that calling `get` on an `Error` value or `get_error` on an `Ok` value triggers precondition failures (`ok_present` / `err_present`).
 - `gardelc stdlib/stdlib.gdl --strict`:
   - 0 errors, 0 warnings across `SEQ`, `BIGNAT`, `STRING`, `OPTION`, and `RESULT`.
-- `spec/gardel_language_specification_draft_v0_4.md`:
+- `spec/gardel_language_specification_draft_v0_5.md`:
   - Updated §7.4 with `try_make_result`.
   - Updated §16 roadmap locking `RESULT[E, A]`.
 

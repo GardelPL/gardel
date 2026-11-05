@@ -14,7 +14,7 @@
 - [step3_verified_functional_core.md](step3_verified_functional_core.md)
 - [step4_algebraic_law_catalogue_and_concept_conformance.md](step4_algebraic_law_catalogue_and_concept_conformance.md)
 **Primary Artifacts Targeted:**
-- `../spec/gardel_language_specification_draft_v0_4.md`
+- `../spec/gardel_language_specification_draft_v0_5.md`
 - `../gardelc/src/main.rs`
 - `../stdlib/` (`stdlib.gdl` and modular subdirectories)
 - `../examples/` (`greeter.gdl`, `peano_ord.gdl`, `bounded_stack.gdl`)
@@ -86,7 +86,7 @@ flowchart TD
         C1 --> C2 --> C3 --> C4
     end
 
-    subgraph PhaseD ["Phase D: Reactive Programs (draft)"]
+    subgraph PhaseD ["Phase D: Reactive Programs"]
         D0["Task D.0: Fix `case _` in Boogie"]
         D1["Task D.1: Spec v0.5"]
         D2["Tasks D.2-D.4: Prelude, Checker, Host Loop Slice"]
@@ -104,7 +104,7 @@ flowchart TD
 
 ---
 
-### Phase A: Language Specification Harmonization (`spec/gardel_language_specification_draft_v0_4.md`)
+### Phase A: Language Specification Harmonization (`spec/gardel_language_specification_draft_v0_5.md`)
 
 **Objective:** Align the language specification draft v0.4 with the architectural breakthroughs of Steps 1–4 and the planning analyses.
 
@@ -397,29 +397,55 @@ Source: [review/review.md](review/review.md). The verification notes for each fi
   - **Calibration (2026-11-04).** All VCs of `--stdlib`, the six examples and `cargo test` were captured: 136 unique files, 65 of them clean. Each clean file was run on seeds 0–3 at rising limits. Every proof passed on every seed. Resources needed: 245 of 260 file/seed pairs at most 500K, heaviest 3M (`BYTES`, seed 1). One proof varies by up to 6x across seeds. The limit is 30M, 10x the heaviest proof. No clean file changes verdict between 3M and 100M. If a proof passes 10M, recalibrate rather than raising the limit in passing.
   - Tests `test_boogie_inconclusive_is_never_a_pass`, `test_solver_giving_up_is_unproven_not_refuted`, `test_z3_rlimit_verdict_is_decided_by_the_limit`. `cargo test` 102/102.
 
-#### Task C.4: Memory Management Performance [📋 Planned]
+#### Task C.4: Memory Management Performance [✅ Completed, reuse deferred]
 
 **Objective:** make memory management cheaper while keeping reference counting, which suits Gardel's immutable, acyclic values and frees deterministically (tracing GC was considered and rejected: pauses and non-deterministic timing conflict with the bounded-work-per-event goal of reactive programs, and it complicates the OpenMP tasks).
 
-**Baseline** (`examples/seq_bench.gdl`, n = 4,000,000, i9-12900HK, after C.3 follow-up 2): 832 ms on 1 thread, 591 ms on 20. Of this, counting costs about 70 ms on the 1-thread build (atomic updates, mostly the copy/release pair around each `concat`), and freeing the 8M-node tree costs 260–325 ms, one `free()` per node on one thread. Most of the cost is the allocator, not the counting. Subtasks are ordered by payoff for effort; each is measured with `scripts/c3_regression.ps1` and must keep the leak tests (`test_d_reference_counting_frees_everything`) at 0.
+**Baseline** (`examples/seq_bench.gdl`, n = 4,000,000, i9-12900HK, after C.3 follow-up 2): 832 ms on 1 thread, 591 ms on 20. Of this, counting costs about 70 ms on the 1-thread build (atomic updates, mostly the copy/release pair around each `concat`), and freeing the 8M-node tree costs 260–325 ms, one `free()` per node on one thread.
 
-- [ ] **C.4.1 Skip freeing at program exit.** When `main` returns, or `IO.exit` ends the process, the operating system reclaims all memory, so the final drops are wasted work. Leave values alive at those points (e.g. `IO.exit` does not unwind, and `main`'s result path skips its pending drops).
-  - Acceptance: `seq_bench` no longer frees its tree before exiting (about 300 ms less at n = 4M); the leak tests still report 0 for routines that return normally (they measure inside the program, not at exit).
-- [ ] **C.4.2 Faster allocator.** Replace `malloc`/`free` in `gardel_alloc`/`gardel_free` with per-thread free lists by size class (most Gardel nodes are a few fixed sizes), or link an existing allocator such as mimalloc. Keep the live-allocation counter for tests, but make it per thread or debug-only so it is not a contended atomic.
-  - Acceptance: lower allocation and free time on 1 thread, and the 20-thread build no longer limited by heap contention; measured against the baseline above.
-- [ ] **C.4.3 Optimized reference counting (Perceus / Lean 4 style).**
-  - **Ownership transfer on last use:** pass a variable's reference instead of copying it when this is its last use, so `left.concat(right)` does not pay a copy then a release. Needs an owned-parameter calling convention where profitable, or borrow inference.
-  - **Reuse:** when a value's count is 1, a `match` arm that builds a value of the same shape updates it in place instead of freeing and allocating ("functional but in place").
-  - **Non-atomic counts for unshared values:** use atomics only for values another task can see; mark values as shared when they are passed into a task (as Lean does).
-  - Acceptance: most of the ~70 ms counting overhead removed; leak tests at 0; the native runs and the C.2 text program unchanged.
-- [ ] **C.4.4 Arena per step for reactive programs (evaluate with Phase D).** A reactive `step` is pure and returns the next state, so after each event everything not reachable from the new state (and the commands) is garbage. Allocate during a step in a bump arena, copy out only the surviving state, then release the whole arena at once. Cost scales with the live state rather than with allocation volume. Risk: a large state copied on every step; mitigate with an older generation (reference counted) for long-lived state.
-  - Acceptance: a prototype on a reactive example compared with plain reference counting (time per event and peak memory), and a decision recorded here.
+**Result** (best of 5, wall clock with process start, one session, the D.8 compiler rebuilt for the left column; `seq_churn` best of 3 at n = 1,000,000):
+
+| | D.8, 1 thread | C.4, 1 thread | D.8, 20 threads | C.4, 20 threads |
+| :--- | ---: | ---: | ---: | ---: |
+| `seq_bench` (builds one tree, exits) | 812 ms | 196 ms | 602 ms | 66 ms |
+| `seq_churn` (builds and frees four trees) | 829 ms | 214 ms | 567 ms | 127 ms |
+| `tests/reactive/beat.gdl`, per event | 0.29 us | 0.08 us | 0.29 us | 0.08 us |
+
+Peak memory is unchanged: `seq_bench` 375 MB and `seq_churn` 99 MB on 1 thread, before and after. The steps on `seq_bench`, 1 and 20 threads: skipping the frees 540 / 143 ms, the allocator 394 / 71 ms, direct thread-local access 245 / 64 ms, ownership transfer 171 / 59 ms. A run's noise here is about 10%.
+
+- [x] **C.4.1 Skip freeing at program exit.** A `main` can end only through `IO.exit`, which never returns, so what `main` holds in scope was never released. The task's "`main`'s result path" does not exist, and code written for it was removed as dead. What remained was the argument of `IO.exit`, where `sum(from_range(1, n))` freed its tree before exiting: its scopes no longer release. A lambda inside the argument still does, because it runs once per element and is not the end of the program.
+  - The cost of this is that temporaries in that one expression live until it ends. Only `drop` is skipped, which has no visible effect in a pure language.
+- [x] **C.4.2 Faster allocator.** Thread-local free lists for 16 size classes up to 256 bytes, with no block header, because every release now knows the size (`gardel_free(p, size)`; text buffers store theirs). Larger blocks use `malloc`. mimalloc was not used: this is about 100 lines in the emitted C, and it keeps gcc as the only dependency.
+  - **One-way traffic.** A thread that only frees would hoard what another only allocates, and that other would grow without limit. A list reaching 64 KB becomes the thread's spare, and a previous spare goes to a shared depot under a spinlock. With the depot, 3M blocks passed one way take at most 16 chunks. Without it, 311.
+  - **The first version made 20 threads 6 times slower** (4,248 ms): a refill took the depot's lock even when the depot was empty, which is always, in a program that is only growing. A refill now reads the depot without the lock first, and each entry has its own cache line.
+  - **The live-allocation counter** is under `-DGARDEL_COUNT_ALLOCS`, and `gardel_live_allocations` does not exist without it, so a test cannot read a silent zero. The tests build with it, and the allocator is otherwise the production one.
+  - **`-DGARDEL_SYSTEM_ALLOC`** uses `malloc` for everything. A sanitizer cannot see a block reused inside a pool, so sanitizer builds need this.
+- [x] **Not in the task: thread-local access was the largest remaining cost.** gcc on Windows makes every `_Thread_local` access a function call, measured as 118 of 395 ms, more than all the counting. On x86-64 Windows `gardel_thread_get` now reads a TLS slot from the TEB directly, as `TlsGetValue` does and as mimalloc does. Only the first 64 slots live there, so a program started with none free stops with an error. `gardel_task_depth`, read on every call past the task cutoff, moved there too. Elsewhere it stays `_Thread_local`, which is cheap on Linux.
+- [x] **C.4.3 Optimized reference counting: ownership transfer done, non-atomic counts rejected, reuse deferred.**
+  - **Ownership transfer on last use.** A constructor or call takes over an owned local when nothing evaluated after it uses that local: at the result of a block, and in a `let` whose later `let`s and result do not name it. A routine whose body ends by storing a parameter in a new value, as `concat` does, also gets a variant that owns its parameters (`sink_...`). So `left.concat(right)` costs no copy and no release. `seq_bench`'s build has no counting left, and that step was worth 74 ms on 1 thread.
+  - **Limits of it.** There is no general owned-parameter convention. A local inside one arm of an `if` or `match`, in a parallel `let` group, or in a call that is not itself the `let`'s value is still copied. `Current` is never taken by a `let`, since a bare name can use it unseen.
+  - **A release of the only reference needs no atomic update** (`gardel_rc_release`): no other thread holds a reference, and a borrower has finished before its owner releases.
+  - **Non-atomic counts: rejected.** With every count on `seq_churn` made plain, as an upper bound valid on one thread only, it took 211–213 ms against 188–202 ms, so there is nothing left to gain there. The Lean scheme needs a pass over every value passed to a task, and a pass that misses one is a data race in a verified program. `seq_bench`'s sum would pay it for 8M nodes and has no counting to save.
+  - **Reuse: not done.** It needs a value known to be unique, and parameters are borrowed, so it needs the general owned convention above. No benchmark here shows the need.
+- [x] **C.4.4 Arena per step: prototyped and rejected.** A hand patch of the generated `beat`, in its best case: bump allocation, every drop a no-op, the state copied out after each step. One million events, 1 thread:
+
+  | State | D.8 | C.4 | Arena |
+  | :--- | ---: | ---: | ---: |
+  | up to 8 entries | 0.29 us | 0.075 us | 0.051 us |
+  | up to 1000 entries | 0.95 us | 0.71 us | 1.76 us |
+
+  Memory growth during the run was between 0.4 and 1.0 MB for all of them, with no pattern. The arena saves 24 ns per event on the smallest state and costs 2.4 times as much on a moderate one, because it copies the live state on every step, and it would need generated copy code for every type. Free lists gave most of the gain with none of that. **Decision: keep reference counting.** The 1000-entry row is mostly `recent.length`, a list walk, in all three columns.
+- Tests `test_c4_a_dying_program_does_not_release`, `test_c4_the_allocator_keeps_blocks_apart_and_does_not_hoard`, `test_c4_ownership_moves_are_correct_and_leak_nothing`. `tests/c_backend/ownership.gdl` gives values away in 19 ways. Seven mutants were rejected: a moved value still released, a local taken though used later, one local given twice, sink parameters never released, `IO.exit`'s flag leaking into a lambda, no depot, and blocks 8 bytes short. The second survived at first, because a freed block keeps its contents and because two `let`s it relied on formed a parallel group: `stored_twice_current_unused` now reuses the block before reading it.
+- Checked by hand, not in `cargo test`. Ubuntu 24.04: AddressSanitizer and UBSan with `-DGARDEL_SYSTEM_ALLOC` on `ownership`, `seq_ops`, `seq_churn`, the game with malformed input and its replay, and echo over TCP stopped by `SIGTERM`, leak checking off. The real allocator on native TLS: `seq_churn` 198 ms on 1 thread, 112 ms on 8. ThreadSanitizer on the allocator, with 8 threads passing blocks in pairs: clean, and it reports the race in `gardel_alloc_refill` when the depot's lock is removed. OpenMP was not under ThreadSanitizer, because libgomp is not instrumented.
+- `cargo test` 153/153. `--stdlib --strict` 0/0 on seeds 0–3, and the eleven examples 0/0. `examples/seq_churn.gdl` is new, since `seq_bench` no longer frees.
+- **Known limits.** Blocks return to their size class and never to the system, so a program's footprint is the peak of each class. A thread that ends leaves its lists and chunk behind. This is not reached today: OpenMP keeps its threads, and the host's reader thread, which allocates each line for the main thread to free, lives until the process ends. The depot's spinlock waits without yielding, for a section of a few instructions. On Windows on ARM, thread-local access is still a function call. All timings but the two Ubuntu ones are from one machine, on Windows, with gcc 13.
+- Acceptance: C.4.1, the tree is not freed, and leak tests report 0 for routines that return. C.4.2, lower time on 1 thread, and 20 threads no longer limited by the heap. C.4.3, the counting overhead is gone from `seq_bench`. C.4.4, prototype compared and decision recorded.
 
 ---
 
 ### Phase D: Reactive Programs
 
-**Status:** 📋 Draft, not started (2026-11-04).
+**Status:** ✅ Completed: D.0 to D.8 (2026-11-05).
 
 **Objective:** let Gardel express programs that run until told to stop (servers, TUIs, games) without weakening totality. Every routine stays total. Non-termination lives in one place, the runtime's host loop, and a `reactive program` declares it. The design is [reactive/reactive_programs.md](reactive/reactive_programs.md) (revision 2), corrected by the findings below.
 
@@ -438,6 +464,9 @@ Small multi-file programs shaped like the proposal were run through the compiler
 | 5 | `e = Shutdown` breaks the §9 equality rules, because `EVENT` holds `STRING`/`BYTES` and is not `CANONICAL_EQ`. `Result is Stop` has no syntax. | Fixed by decision 2. The postcondition form was tested in finding 3. |
 | 6 | `specify` is not permitted in `program` (`main.rs`, §4), but proposal §3 allows `specify` lemmas in a reactive program. | Lemmas go in the state module or a `functions` module (proposal §7.3). |
 | 7 | Proposal §9 assumes `poll`/`epoll`, and development is on Windows. `IO.read_line` blocks, while a command must never block the loop. | Decisions 4 and 5. |
+| 8 | `let t = LIST.empty.prepend(..)` inside a `program` fails in Boogie (`cannot assign Seq EVENT to int`): local type inference does not follow that chain. It fails loudly. A routine with a declared return type avoids it. | Known limit. Fix it if D.5's test programs need it. |
+| 9 | `satisfies CANONICAL_EQ` on `CONN_ID` needs proofs of four concept laws (`reflexive`, `symmetric`, `transitive`, `agrees_with_structural`), and `ORD` needs more. The proposal treated it as a simple handle. | Task D.7 proved them, in `stdlib/core/conn_id.gdl`. |
+| 10 | `x != c` on a module that is not `CANONICAL_EQ` verifies 0/0. The §9 rule that `=` needs `CANONICAL_EQ` is enforced only for `STRING` (`E0311`). | An existing gap, not specific to Phase D. **Decision (2026-11-04): enforce the rule**, done in Task D.6b. |
 
 #### Decisions
 
@@ -469,58 +498,250 @@ flowchart TD
     D5 --> C44
 ```
 
-#### Task D.0: Fix `case _` on Sum Types in Boogie [📋 Planned]
-- [ ] Lower a wildcard arm to the negation of the earlier constructors, or to the final `else`, instead of emitting `is_`.
-- [ ] Check a wildcard on a module's own ADT, on a linked ADT, and on a prelude ADT, and a bind-all arm in each position.
-- Acceptance: a test where `case _` verifies in all three cases, and a mutant where a wrong wildcard arm is rejected. Exhaustiveness checks on non-wildcard matches are unchanged. `cargo test` and `--stdlib --strict` stay clean.
+#### Task D.0: Fix `case _` on Sum Types in Boogie, Nested Type Arguments, and Patterns in Laws [✅ Completed]
+- [x] Lower a wildcard arm to the final `else` (or to the whole match when it comes first), instead of emitting `is_`. An arm after a catch-all is rejected (`E0316`, below). A bare binder `case x` is replaced by the scrutinee.
+- [x] Check a wildcard on a module's own ADT, on a linked ADT, and on a prelude ADT, and a bind-all arm in each position (`gardelc/tests/boogie/wild_own.gdl`, `wild_prelude.gdl`, `wild_linked/`).
+- [x] Widened from review findings, since reactive programs hit them directly: `map_boogie_type` splits type arguments at top-level commas only, so `BOX[TUPLE[A, B]]` and `OPTION[RESULT[TUPLE[..], ..]]` map correctly. A reactive state or `STEP[...]` holding a `TUPLE` or `RESULT` hits the same path.
+- [x] Widened: `desugar_patterns` also compiles law bodies and law `require`/`ensure` clauses, so literal and tuple patterns in laws verify in Boogie (`tests/boogie/law_patterns.gdl`). Multi-step lemmas about `step` need this.
+- [x] **D.0 review fixes.**
+  - **Verifier and binary disagreed after a catch-all.** Boogie stopped at the first `case _`, while a C `switch` still honoured a later `case`, so a verified routine could return another value at run time. An arm after a catch-all is now `E0316: unreachable_match_arm`, reported during pattern compilation, so it covers routines, contracts, invariants and laws, and no backend has to decide what such an arm means. Spec v0.5 §5.1 documents `E0316`.
+  - **Law proof steps were silently dropped.** Blocks with `let`s (which compiled patterns produce) and `case _` arms lost their steps and induction hypotheses. The law's own `ensure` was still proven, so no false law passed, but a false step went unreported and a valid induction could not be proven. `LawProofCtx::block` now substitutes `let`s and keeps `check`/`assume`, a catch-all arm is the final `else`, and an unknown constructor is an error instead of a skipped arm. The stdlib laws verify with their steps enforced.
+  - **Binder of a foreign generic field in a law** (`Some(x)` on `OPTION` in a client): the Boogie local had the undeclared type `A`. The binder now stands for the projection. This was hidden while those arms were dropped.
+  - **Bounded evaluator:** arms are taken in order and catch-alls match, so `case _` gets the same verdict with and without the solvers.
+  - **Nested type arguments:** `collect_monomorphized_instances` splits at top-level commas too. The D.0 test no longer depends on the checkout's line endings.
+  - Tests `test_d0_arm_after_a_catch_all_is_rejected`, `test_d0_no_law_proof_step_is_dropped` (a false step in 9 positions is reported, a true one verifies), `test_d0_induction_hypothesis_survives_a_catch_all_arm`, `test_d0_bounded_evaluator_takes_catch_all_arms`. `cargo test` 109/109. `--stdlib --strict` 0/0 on seeds 0–3.
+- Acceptance: a test where `case _` verifies in all three cases, and a mutant where a wrong wildcard arm is rejected. Exhaustiveness checks on non-wildcard matches are unchanged. `cargo test` and `--stdlib --strict` stay clean. Tests: `test_d0_wildcard_arms_verify_on_own_prelude_and_linked_adts`, `test_d0_nested_type_arguments_map_to_boogie`, `test_d0_patterns_in_laws_are_compiled`.
 
-#### Task D.1: Spec v0.5 and Proposal Revision 3 [📋 Planned]
-- [ ] Apply the table in proposal §12 to the spec, leaving out the `partial` rows.
-- [ ] Update `reactive_programs.md` with the findings and decisions above. Rewrite the echo example over an opaque `SERVER_STATE`, drop the `specify` claim in §3, and state rule 4 with `is_shutdown` / `is_stop`.
-- [ ] Add a new §16 section for Phase D.
-- Acceptance: every example in the proposal has been compiled by `gardelc` or is marked as depending on a named later task.
+#### Task D.1: Spec v0.5 and Proposal Revision 3 [✅ Completed]
+- [x] Applied the table in proposal §12 to the spec, leaving out the `partial` rows: §2 principle 2, §3 `EXIT_CODE`, §4 and §4.1, §11 item 1, §12 obligations, §13 and §15. New §11.6 holds the normative reactive rules.
+- [x] Spec file renamed to `spec/gardel_language_specification_draft_v0_5.md`, with its links. "Changes in v0.5" in §1 lists the changes and states what is implemented. Also documented: `E0316` (§5.1), the solver limit and fail-closed results (§7.3, §12), and the seed and limit options. §16.1 and §16.2 are brought up to date.
+- [x] `reactive_programs.md` revision 3: opaque `SERVER_STATE`, no `specify` in a reactive program, rule 4 with `is_shutdown` / `is_stop`, open questions closed as decided above, and the plan moved here.
+- [x] Added spec §16.5 for Phase D.
+- [x] **Checked against the compiler.** `SERVER_STATE`, the full `STEP`, `COMMAND` and `EVENT` shapes as user modules, and the echo logic as `functions ECHO_LOGIC` verify 0/0 under `--strict`. A test program fed it four events, and the native run gave the expected result. Mutants are rejected: no capacity guard (`room`), no `require` on `admit` (`within_limit`), `Continue` on `Shutdown` (`shutdown_must_stop`). This gave findings 8 to 10.
+- Acceptance: every example in the proposal has been compiled by `gardelc` or is marked as depending on a named later task (proposal §13).
 
-#### Task D.2: Prelude Modules [📋 Planned]
-- [ ] Add `stdlib/core/step.gdl`, `command.gdl` and `event.gdl`: `STEP[S]` with `is_stop`, `COMMAND` with `Print`, and `EVENT` with `Shutdown` and `is_shutdown`.
-- [ ] Register them in `STDLIB_SOURCES` and `phase4_stdlib_source()` in dependency order, and in the §4.1 prelude inventory.
-- [ ] Note the user-visible change: `STEP`, `COMMAND` and `EVENT` become reserved through `E0101`.
+#### Task D.2: Prelude Modules [✅ Completed]
+- [x] Added `stdlib/core/step.gdl`, `command.gdl` and `event.gdl`: `STEP[S]` with `is_stop`, `COMMAND` with `Print`, and `EVENT` with `Shutdown` and `is_shutdown`. `is_shutdown` keeps a `case _` arm, so it stays total when later tasks add variants.
+- [x] Registered them in `STDLIB_SOURCES`, `phase4_stdlib_source()` and `BOOGIE_INJECTED_PRELUDE` (without the last, user code could not reach them, while `--stdlib` still passed). The §4.1 inventory is in spec v0.5.
+- [x] User-visible change: `STEP`, `COMMAND` and `EVENT` are reserved through `E0101`.
+- [x] **User constructors win over prelude constructors** (spec §4.1). The Boogie context let the prelude win, so a linked user `Stop` or `Print` resolved to the prelude's once these modules arrived, and every later variant (`Tick`, `Key`, `Line`, `Closed`) would have taken more names. This also covers `Some`, `Ok` and `Error`.
+- [x] C backend: a nullary constructor as a receiver (`Shutdown.is_shutdown`) was taken for a module name.
+- [x] Tests `test_d2_prelude_step_types_work_from_user_code` (`tests/reactive/`: a step function over an opaque state verifies and runs, frees everything, and rejects the mutants `room` and `shutdown_must_stop`), `test_d2_user_constructors_win_over_prelude_constructors`, `test_d2_prelude_step_names_are_reserved`.
+- `cargo test` 112/112. `--stdlib --strict` 0/0 on seeds 0–3 with 16 files, and the six examples 0/0.
+- **Known limit:** a module that sees a user `Stop` cannot build the prelude `Stop`, since there is no qualified constructor syntax. It fails loudly.
 - Acceptance: `--stdlib --strict` 0/0, and existing examples unchanged.
 
-#### Task D.3: Parser and Checker [📋 Planned]
-- [ ] Add `ModuleKind::ReactiveProgram` and accept `reactive program`. Treat it like `Program` at the existing `ModuleKind` sites, including the ban on `specify`.
-- [ ] Require `init(args: SEQ[STRING]): STEP[S]` and `step(s: S, e: EVENT): STEP[S]`, and reject `main`.
-- [ ] Diagnostics in family `"Phase 4 (Reactive Violation)"`: `missing_init`, `missing_step`, `main_in_reactive`, `state_type_mismatch`, `io_in_reactive`, `shutdown_must_stop`.
-- [ ] Add the implicit `shutdown_must_stop` postcondition (decision 2). Keep it as an ordinary obligation so the fixpoint in Task B.9 handles it.
-- [ ] Label the unit in `--inspect`. A reactive program is an entry-point root, like `program`.
+#### Task D.3: Parser and Checker [✅ Completed]
+- [x] Added `ModuleKind::ReactiveProgram` and `reactive program`. `reactive` is a keyword only directly before `program`. As for `program`, there is no `specify`, `representation`, `create` or `invariant` section. Type parameters are rejected.
+- [x] Required `init(args: SEQ[STRING]): STEP[S]` and `step(s: S, e: EVENT): STEP[S]`, and rejected `main`. Type aliases are the same type (`STEP[NAT]` with `s: U64`).
+- [x] Diagnostics in family `"Phase 4 (Reactive Violation)"`: `missing_init`, `missing_step`, `main_in_reactive`, `state_type_mismatch`, `io_in_reactive`, `shutdown_must_stop`, plus `bad_init_signature` and `bad_step_signature`.
+- [x] Added the implicit `shutdown_must_stop` postcondition (decision 2). It stays an ordinary postcondition, so the fixpoint in Task B.9 handles it, and only the report names the reactive rule. It is always added, so a weak clause under the same tag cannot replace it.
+- [x] Labelled the unit in `--inspect`.
+- [x] **Not in the original task: `entry_point_require`.** The proposal allowed `require` on `init` and `step`, but the runtime calls them with every input and proves nothing. `require False` on `step` would have made its contract vacuous, `shutdown_must_stop` included.
+- [x] **Not in the original task: `E0104: entry_point_reference`.** The proposal said an entry point cannot be referenced, but nothing enforced it, for `program` either: a `functions` module could call into a `program`. It now applies to both, using the cross-file reference scan of `E0103`.
+- [x] Until D.4 adds the host loop, a reactive program builds as a library: `init` and `step` compile to C and no executable is linked.
+- Tests `test_d3_reactive_program_verifies`, `test_d3_form_of_a_reactive_program`, `test_d3_entry_points_cannot_assume_anything`, `test_d3_step_obligations`, `test_d3_nothing_may_refer_to_an_entry_point`, `test_d3_logic_compiles_to_c_without_a_host_loop_yet`. `cargo test` 118/118. `--stdlib --strict` 0/0 on seeds 0–3, and the six examples 0/0.
+- **Known limit:** `E0104` uses the cross-file reference scan, so a reference inside one file is not caught. Same-file modules are not linked to each other anyway (Task B.4), so such a reference does not verify.
 - Acceptance: one test per diagnostic, including a `step` that continues on `Shutdown` and a `step` that breaks the state's `require`. The diagnostic for an invariant failure names the state's clause.
 
-#### Task D.4: Host Loop, `Print` + `Shutdown` Slice [📋 Planned]
-- [ ] Emit a C entry point for a reactive root in `c11_typed.rs`: call `init`, run its commands in order, wait for an event, call `step`, and repeat. Run `Stop`'s commands, then exit with its code.
-- [ ] Follow the reference-counting rules: the loop owns the current state, and releases the old state and the command list after each step.
-- [ ] Implement the OS and scripted event sources (decision 6), and shutdown through `SetConsoleCtrlHandler` / `sigaction`.
-- [ ] Add `examples/reactive_hello.gdl`: print a greeting, wait, print a goodbye on Ctrl-C, exit 0.
+#### Task D.4: Host Loop, `Print` + `Shutdown` Slice [✅ Completed]
+- [x] `reactive_host` in `c11_typed.rs` emits the entry point: call `init`, run its commands in order, wait for an event, call `step`, and repeat. It runs `Stop`'s commands, then exits with its code. The CLI builds an executable for a reactive root.
+- [x] Reference counting: the loop holds its own reference to the state, and releases the `STEP` (with its commands), the old state and the event. An OpenMP region opens per call, not around the loop, so no thread team is held during a wait.
+- [x] OS and scripted event sources behind `gardel_next_event` (decision 6). Shutdown uses `SetConsoleCtrlHandler`, or `sigaction` with a self-pipe and `poll`, which D.7's socket loop can share. On a closing console, a logoff or a system shutdown, the Windows handler waits for the loop, because the process ends when it returns. `GARDEL_EVENTS` holds a script, and its end is a `Shutdown`, so a scripted run always ends.
+- [x] The host switches on every `COMMAND` and `EVENT` variant. A variant with no host code is a compile error, so a later task cannot add one that the runtime ignores.
+- [x] `Print` writes the text and a newline (the spec had not said). Output is flushed after each command list: without this, a greeting through a pipe stayed in the buffer for the whole wait (0 bytes on stdout while waiting, in a control run). A test cannot see this through a script, because the process exits and flushes.
+- [x] Added `examples/reactive_hello.gdl`: print a greeting, wait, print a goodbye on Ctrl-C, exit 0.
+- [x] **Real signals.** Windows, sent by a driver to a process in its own console, stdout on a file: Ctrl-C stops it in 15 ms with exit code 0 and the goodbye; Ctrl-Break prints the goodbye too; 0.000 s of CPU over 1.5 s of waiting. Linux, the same generated C in a container: no compiler warnings, and `SIGINT` and `SIGTERM` each exit 0 with the goodbye. A console close, logoff or system shutdown was not exercised.
+- Tests `test_d4_hello_runs_and_stops_on_shutdown`, `test_d4_exit_codes_and_command_order_come_from_the_program`, `test_d4_init_can_refuse_to_start`, `test_d4_host_frees_state_commands_and_events` (0 live allocations after 50 runs of the loop), `test_d4_output_is_flushed_before_waiting` (no script, through a pipe), `test_d4_host_is_exhaustive_over_commands_and_events`, and `test_d4_sigint_and_sigterm_stop_the_program` (Unix only). `cargo test` 123/123. `--stdlib --strict` 0/0 on seeds 0–3, and the seven examples 0/0.
 - Acceptance: verifies 0/0, and runs natively on Windows with a real Ctrl-C and in tests with a scripted `Shutdown`. Exit codes come from `Stop`. `init` returning `Stop` exits without calling `step`.
 
-#### Task D.5: `SetTimer` / `Tick` [📋 Planned]
-- [ ] Add `COMMAND.SetTimer(id, millis)` and `EVENT.Tick(id)`, with the event loop's wait bounded by the next timer.
-- [ ] Add a timer example whose state module has a proven invariant.
+#### Task D.5: `SetTimer` / `Tick` [✅ Completed]
+- [x] Added `COMMAND.SetTimer(id, millis)` and `EVENT.Tick(id)`, with the wait bounded by the next timer (`gardel_next_event`). Timers are one-shot, on a monotonic clock. Setting a pending id replaces it. Order is deadline, then setting order. A pending `Shutdown` comes before a due timer, so a zero-timer loop cannot starve it. Spec §11.6 states all of this. The host finds the next timer by a linear scan, which suits a few timers, not thousands.
+- [x] Scripts: `Tick:<id>` delivers a tick, and timers do not run, so a scripted run does not depend on the clock (needed by D.8).
+- [x] Added `examples/reactive_clock/` (`gardelc examples/reactive_clock --strict`): a countdown whose opaque state proves `within_total`, and `advance` needs its `left` guard.
+- [x] Adding the variants before the host code gave `COMMAND.SetTimer has no host implementation` and no binary, so the D.4 guard works. `host_command_code` and `host_event_code` make it testable.
+- [x] **Host corrected: one OpenMP region around the loop.** D.4 opened a region per call, to avoid holding a team during a wait. That was wrong: parked threads sleep anyway, as under `main`, and the region woke 20 threads per event.
+- [x] **Baseline for C.4.4** (`tests/reactive/beat.gdl`: one state, list cell, command and event per step; `-O3`, i9-12900HK, 100,000 scripted events, best of 5): **0.29 us per event on 20 threads, 0.28 us on 1 thread.** With a region per call it was 95 us and 2.8 us. Idle waiting: 0.000 s of CPU over 1.2 s. Fork-join inside `step` still scales: `work(38)` takes 935 ms on 1 thread and 130 ms on 20.
+- [x] **Real signals.** Windows: Ctrl-C during a timer wait exits 1 with `Interrupted.`, and Ctrl-C stops a zero-timer flood at once. Linux, in a container: the clock runs to the end, `SIGTERM` during a timer wait exits 1 with `Interrupted.`, and `SIGINT` stops the flood.
+- Tests `test_d5_timers_fire_in_deadline_order_and_can_be_replaced` (real timers), `test_d5_scripts_do_not_depend_on_the_clock`, `test_d5_live_allocations_do_not_grow_over_a_long_run` (sampled during the run: 5 live at event 1,000, at most 12 after, 0 at exit), `test_d5_clock_example_verifies_and_counts_down`. `cargo test` 127/127. `--stdlib --strict` 0/0 on seeds 0–3, and the eight examples 0/0.
 - Acceptance: live allocations do not grow over 100,000 scripted ticks (the first long-run leak test), and time per event is recorded as the baseline for C.4.4.
 
-#### Task D.6: `ReadLine` and `Key` [📋 Planned]
-- [ ] Add `ReadLine` / `Line(RESULT[IO_ERROR, STRING])`, reusing the RFC 3629 validation of `gardel_io_read_line_result`, on a reader thread (decision 5).
-- [ ] Add raw-mode `Key(code)` on the Windows console and POSIX terminals. Restore the terminal on every exit path.
-- [ ] Add an example: a small turn-based TUI game whose board invariant is proven.
+#### Task D.6: `ReadLine` and `Key` [✅ Completed]
+- [x] Added `ReadLine` / `Line(RESULT[IO_ERROR, STRING])`, reusing the RFC 3629 validation of `gardel_io_read_line_result`, on a reader thread (decision 5). The wait now also wakes on an answer, so a blocked read holds up neither timers nor a `Shutdown`.
+- [x] Added raw-mode key input on the Windows console and POSIX terminals, restored on `Stop`, a `Shutdown` and `exit()`. Ctrl-C stays a signal in raw mode.
+- [x] **Changes to the design.** The proposal had a `Key` event but no way to ask for one, so `ReadKey` was added, one request and one answer like `ReadLine`. `Key(code: NAT)` needed numbers outside Unicode for arrows and had no way to report the end of input, so it is now `Key(key: KEY)`, a prelude sum type: `match` checks it, malformed bytes are `Other` and can never make an invalid `CHAR`, and `KeysEnded` means a program cannot hang on a closed input.
+- [x] **Exit with a blocked reader.** `exit()` waits for the `stdin` stream that a blocked reader holds, so a program that has started a reader ends with `_Exit`, after restoring the terminal and flushing.
+- [x] **Prelude constructor names are unique.** `KEY.EndOfInput` captured `IO_ERROR.EndOfInput`, since constructors resolve by name alone, so it is `KeysEnded`, and `test_prelude_constructor_names_are_unique` guards D.7's names.
+- [x] Programs that match on `EVENT` need `case _` (spec §11.6, rule 8): `reactive_clock` and `tests/reactive/beat.gdl` did not have it and stopped compiling when `Line` and `Key` arrived, as that rule predicts.
+- [x] Scripts: `Line:<text>` with `%XX` bytes, `LineEnd`, `Key:<name>`, `Key:<scalar>`.
+- [x] Added `examples/reactive_game/` (`gardelc examples/reactive_game --strict`): walk the `@` to the `G`, with `on_board` proven for every reachable board.
+- [x] **Real terminals.** Windows, keys injected into the console input buffer of a separate console: the expected board after each key, including a wall, a bare Shift (no event) and F5 (`Other`). Line and echo bits are off during play and back after a win and after Ctrl-C (`0x1f1`, then `0x1e7`). Linux, in a container, on a real pty: arrow escape sequences, Delete (`ESC [ 3 ~`), a lone Escape, a multi-byte character and a bad byte. `ICANON` and `ECHO` are off during play, and `termios` is restored after a win, `q`, Ctrl-C from the terminal and `SIGTERM`.
+- Tests `test_d6_lines_arrive_as_events_and_bad_input_never_crashes` (real stdin and a script give identical output), `test_d6_a_blocked_reader_does_not_stop_the_program_or_its_exit`, `test_d6_game_verifies_and_plays`, `test_d6_scripted_input_is_checked`, `test_prelude_constructor_names_are_unique`. The real-terminal checks above are not in `cargo test`, which has no terminal. `cargo test` 132/132. `--stdlib --strict` 0/0 on seeds 0–3, and the nine examples 0/0. The Task D.5 baseline holds, at 0.30 us per event.
+- **Known limits:** a read cannot be cancelled, so a `ReadLine` waits until a line arrives. Mixing `ReadLine` and `ReadKey` on piped input is not defined, because `ReadLine` reads through a stdio buffer and `ReadKey` does not. On Windows, piped input (not a console) has no arrow keys, and a byte 27 is always `Escape`. A crash, `SIGKILL` or Ctrl-Z leaves a POSIX terminal raw.
 - Acceptance: malformed input arrives as an `Error` event and never crashes. The terminal is restored after `Stop` and after Ctrl-C. Scripted runs give identical output.
 
-#### Task D.7: Sockets and the Echo Server [📋 Planned]
-- [ ] Add opaque `CONN_ID` (`representation {NONE}`, `CANONICAL_EQ`, `ORD`), `Listen`, `Send`, `Close`, and `Accepted`, `ListenFailed`, `Received`, `SendFailed`, `Closed`.
-- [ ] Enforce the runtime's handle guarantees (proposal §6): one `Accepted` per id, and at most one `Closed` after `Close`.
-- [ ] Add `examples/echo_server.gdl` with a verified connection limit.
-- Acceptance: the limit holds under a client test that opens more connections than allowed. Removing the limit guard is rejected by the verifier. Live allocations do not grow across many connect/close cycles.
+#### Task D.6b: Enforce the `=` Rule for Modules [✅ Completed]
+- [x] **Measured first**, with a temporary build logging every `=`: 355 in `stdlib/`, `examples/` and the fixtures. 299 were fine, 8 had an unknown type, and 48 broke the rule as §9 stated it. All 48 were in contracts and laws, none in running code. 5 were `MATH_INT`, which `type_satisfies` had omitted. Most of the rest were §9's own catalogue laws on unbounded type parameters (`Some(v).map(f) = Some(f(v))`), which cannot be stated any other way, so the rule as written could not be enforced.
+- [x] **Spec §9 changed** to separate what runs from what is proven. In running code `=` is a real structural comparison: the type must be canonical and known, and a type parameter needs a bound. A comparison with a field-less constructor is allowed (`l = Red`, what `match` does). In a contract, `=` is refused only where the type says it is not its equality: it declares `EQ` without `CANONICAL_EQ`, holds such a type, is `F64`, or is opaque to the module.
+- [x] `E0311` is now `non_canonical_equality`, with `a.equals(b)` or `a.model = b.model` as the fix its message suggests. It rejects nothing in `stdlib/`, `examples/` or the `.gdl` fixtures. It did reject two inline test sources, rightly, and both were rewritten keeping what they prove: `PAIR[A: EQ]` used `=` where `A` only promises `EQ`, and a soundness test said "differently shaped" as `not (s1 = s2)` on `SEQ`, now `is_leaf(s1) and not is_leaf(s2)`. It closes finding 10: `x != c` on an opaque handle is refused, so D.7's `CONN_ID` needs its `CANONICAL_EQ` proofs.
+- [x] The fix `E0311` suggests did not compile in one case: `x.f.equals(y)` on a record field typed by a bounded parameter emitted an undeclared `fn_equals`. `elem_receiver_type` now resolves fields.
+- Tests `test_d6b_runtime_equality_needs_a_canonical_type`, `test_d6b_contracts_may_compare_unless_the_type_says_not`, `test_d6b_an_opaque_type_cannot_be_compared_by_a_client`.
+- `cargo test` 135/135. `--stdlib --strict` 0/0 on seeds 0–3, and the nine examples 0/0.
+- **Known limit:** as before, the check runs on user modules, not on `stdlib/`, and a contract operand whose type cannot be inferred is not checked (8 cases in the stdlib, all function applications or `None.map(f)`).
+- Acceptance: `=` on a non-canonical module is rejected, canonical and primitive uses are unchanged, and `--stdlib --strict` and the examples stay 0/0.
 
-#### Task D.8: Event Log and Replay [📋 Planned]
-- [ ] Add a runtime flag that records events, and one that replays a log through the scripted source.
-- Acceptance: replaying a recorded run of the D.6 example reproduces its commands exactly, which tests the determinism claim in proposal §5.
+#### Task D.7: Sockets and the Echo Server [✅ Completed]
+- [x] Added opaque `CONN_ID` (`representation {NONE}`, `ORD`, `CANONICAL_EQ`, no creator, so only the host makes one), `Listen`, `Send`, `Close`, and `Accepted`, `ListenFailed`, `Received`, `SendFailed`, `Closed`. All seven law proofs pass (finding 9). `agrees_with_structural` needed two proof steps, `{ id = a.id } = a` and the same for `b`, because the extensionality axiom triggers only on a rebuilt record; the steps are proven, so nothing was added to the trusted theory.
+- [x] Host: one non-blocking loop with no socket thread, on `poll`, sharing the D.4 self-pipes, or on `WSAPoll` with one `WSAEventSelect` event beside the D.4 events. On Windows a reactive program links `ws2_32`: `gardelc` passes `-lws2_32`, and a hand-written `gcc` line must too. A first version avoided the flag by resolving Winsock at run time with `LoadLibraryA` and `GetProcAddress`. Defender flagged one such build as `Trojan:Win32/Bearfoos.A!ml`, a machine-learning verdict on code we wrote, so a false positive, but a small binary that hides its socket imports and then listens is a fair thing to flag. Normal imports are less code and show what the program does. They are no promise about a scanner's verdict.
+- [x] Handle guarantees (proposal §6). Ids only grow. A read happens when its event is delivered, so there is no buffered `Received` to outlive a `Close`. A command naming a closed id does nothing, and `Close` drops a `SendFailed` not yet delivered.
+- [x] **Decisions the proposal left open**, now in spec §11.6. `Close` sends what is queued first. A peer's half close still gets its queue. A failed `Send` ends the connection, so `SendFailed` is always followed by `Closed`. A connection with 64 KiB queued is not read, and a `Send` fails at 1 MiB, so a client that never reads cannot grow the process. An ending connection is dropped after 5 seconds with no progress. A listener out of files rests 100 ms, or it would spin. `Listen` is on loopback unless `GARDEL_LISTEN_ADDR` says otherwise, and port 0 is refused.
+- [x] Scripts: `Accepted:`, `Received:`, `SendFailed:`, `ListenFailed:` and `Closed:` tokens, and `Listen`, `Send` and `Close` written to stderr, so D.8 can replay a network run with no sockets.
+- [x] Added `examples/echo_server/`, a directory like `reactive_clock/`, because the opaque state needs its own file. It has a fixed port, 8888, since Docker Desktop publishes 8080 on the development machine (see the known limits). Tests replace the port in the source.
+- Tests `test_d7_conn_id_laws_are_proven_and_a_handle_cannot_be_forged`, `test_d7_the_limit_is_proven`, `test_d7_scripted_sockets`, `test_d7_echo_server_over_real_sockets`, `test_d7_listen_failures_are_events`, `test_d7_a_closed_handle_stays_quiet`, `test_d7_a_failed_send_ends_the_connection`, `test_d7_live_allocations_do_not_grow_across_connections`, with `tests/reactive/net_rules.gdl` and `net_flood.gdl`. The socket tests have a client over real TCP and fail, not hang, on a stuck server.
+- Checked by hand, not in `cargo test`. POSIX: the emitted C in Ubuntu 24.04 with a Python client, plain and under AddressSanitizer and UBSan, passed the same scenarios, a peer reset mid-send (no `SIGPIPE`), 500 cycles, and `SIGTERM` ending with code 0. Windows: a real Ctrl-Break with a client connected ended with code 0 in 7 ms and the client saw the end of the stream, and 160 fresh servers, 80 of them with all 20 cores busy, answered their first client within 1 ms, so no wake-up is lost between `WSAEventSelect` and `WSAPoll`.
+- `cargo test` 143/143, twice. `--stdlib --strict` 0/0 on seeds 0–3, and the ten examples 0/0.
+- **Known limits.** `SendFailed` is tested only for a full queue, not for an OS error from `send`. IPv4 only, with one address for all `Listen`s, and no outgoing connections. Hiding a representation across modules is enforced, but only as a Boogie type error, so a client reading `c.id` gets an internal message and not a `gardelc` rule. A connection that stalls while open stays open: a program that wants a timeout sets a timer and `Close`s. A module named `C` fails in Boogie ("reserved for type constructor"). On Windows a bind to `127.0.0.1:8080` succeeds beside a wildcard listener on the same port, and such a listener can take the connections: Docker Desktop publishing `8080` did this during testing, so the example then seems to hang. The tests use free ports.
+- Acceptance: the limit holds under a client test that opens more connections than allowed (70 against 64, and exactly in a script). Removing the limit guard is rejected by the verifier (`room`, and `within_limit` without the `require`). Live allocations do not grow across 2,000 connect/close cycles.
+
+#### Task D.8: Event Log and Replay [✅ Completed]
+- [x] `GARDEL_RECORD=<file>` writes a log and `GARDEL_REPLAY=<file>` replays one through the scripted source, as spec §11.6 defines. The "flags" of the original task are environment variables, because the command line is the program's own: taking a flag from it would change `args`, which is an input to the run.
+- [x] **The log holds the commands and the exit code as well as the events, which the task did not ask for.** The events alone would make a replay that nothing could fail. With the commands in the log, the replay compares each one before it takes effect and stops with exit status 3 and the line that differs, so a log from a working build finds a regression in a changed program.
+- [x] **Arguments are logged too**, since determinism is stated over `args` and the events. A replay uses the logged ones, and refuses any given on its command line. `gardel_main_args` was split in two for this.
+- [x] **A line's raw bytes are kept for the log**, since a `RESULT` has lost them and a malformed line has no text. `gardel_io_read_line_result` was split into reading and interpreting, and `LineFailed:<code>` was added to scripts, because a failed read had no token.
+- [x] **Every command needs a log form.** `host_command_log` has one case per variant, and a variant with none stops the build, as `host_command_code` does.
+- [x] A log may end anywhere: a kill leaves no `exit` line and perhaps half a line. That half is dropped, the rest replays, a note says the remainder was not checked, and the exit code is the program's. A log that cannot be written ends the recording with one warning, not the run.
+- Tests `test_d8_replay_of_the_game_reproduces_its_commands`, `test_d8_replay_does_not_wait_for_timers`, `test_d8_every_event_survives_the_log`, `test_d8_a_replay_gets_the_arguments_of_its_run`, `test_d8_a_network_run_replays_with_no_network`, `test_d8_a_replay_that_differs_is_an_error`, `test_d8_any_log_replays_or_is_refused_without_a_crash`. The acceptance check does not rest on the runtime's own comparison: the events of a log, given to a fresh run as a plain `GARDEL_EVENTS` script, write a byte-identical log. The network replay runs while another listener holds the port. The last test cuts a game log at every byte, and replaces every byte with each of three values. Two mutants were rejected: a replay that never compares, and a raw line break in logged text.
+- Checked by hand, not in `cargo test`. Windows: a real Ctrl-Break during a recorded echo session ended with code 0, the log held `event Shutdown` and `exit 0`, and it replayed with code 0. Ubuntu 24.04 under AddressSanitizer and UBSan: the game with malformed input, a 51 KB echo over real TCP stopped by `SIGTERM`, both replayed, and a log created as `-rw-------`. Recording to `/dev/full` warned once and the game played to the end with its own exit code. Leak checking was off.
+- `cargo test` 150/150. `--stdlib --strict` 0/0 on seeds 0–3, and the ten examples 0/0.
+- **Known limits.** A log has no size limit, holds what clients sent in the clear, and is protected by file mode only on POSIX. The header names the program, not its build, so a changed program is noticed only when a command differs, not when only its state does. A cut log checks nothing past its end. Replay shows that commands repeat, and nothing about the real effects of those commands, such as bytes reaching a client. The cost of recording, two flushes per event, was not measured. `GARDEL_RECORD` and `GARDEL_REPLAY` go through `getenv` and `fopen`, so on Windows a path outside the ANSI code page may fail, and it does so with exit status 2.
+- Acceptance: replaying a recorded run of the D.6 example reproduces its commands exactly, which tests the determinism claim in proposal §5. The run came from real stdin, with malformed bytes in it, and it also holds for the D.5 clock on real timers and for a network run.
+
+#### Task D.9: Obligations Reach Every Expression [✅ Completed]
+- [x] **Soundness: most nested expressions had no proof obligations.** `emit_boogie_expr_obligations` listed some `Expr` kinds and ended with `_ => {}`. A program with `y * 10` in a lambda body verified 0/0 and wrapped at run time, and one with `10 / z` in a lambda verified 0/0 and died with `0xC0000094`. The same gap covered `if` and `match` nested in an expression, `not`, tuples, record fields (`{ size = Current.size + 1 }` was never checked), a call's `require` inside a lambda, a `check` in a nested block or a lambda (dropped, so a false `check` passed), and the scrutinee of a `match` that is a routine's body. A probe of 29 cases found 15 unchecked.
+- [x] The match is now exhaustive, with no wildcard, so a new `Expr` variant must say what it obliges. Nested `if`, `match`, `and`, `or` and `implies` become Boogie branches, so a guard protects what it guards. This also removes a false rejection: `x != 0 and 10 / x > 1` was refused, although the C backend short-circuits. Nested `let`s are substituted, as `emit_boogie_block_expr` does. Nested binders get fresh locals, declared only if used.
+- [x] A lambda body runs in `if (*) { havoc params; assume they are values of their types; ...; assume false; }`. It is proven for every argument, and it sees what holds where it is created, which is sound because captures are immutable.
+- [x] **Fragile proofs found by the change.** The new `in_u64` asserts tipped `STRING.push_utf8_2` and `push_utf8_3` over, as `utf8_step_4` was in Task C.3: the proof of `valid_bytes` needed the solver to unfold `valid_utf8` itself. `push_utf8_3` failed on every seed in the unit-test harness, whose theory has six more equality axioms, and more solver budget did not help. `push_utf8_2` failed on seed 3 of `--stdlib --strict`. Added the proven laws `BYTES.utf8_step_2` and `utf8_step_3`.
+- Tests `test_obligations_reach_every_expression_position`, `test_obligations_in_record_fields`, `test_obligations_respect_guards_and_nothing_leaks` (includes the wrong guards, which must still fail). `cargo test` 156/156. `--stdlib --strict` 0/0 on seeds 0-9 and 42, the unit-test harness on seeds 0-3, and the eleven examples 0/0 on seeds 0-3.
+- **Known limits.** A lambda passed to a refined function type is proven for every value of the parameter type, so it cannot use that type's `require`, and a correct lambda can be rejected. That needs `f(x)` to prove the `require` as well. Arithmetic in law bodies is ghost and has no obligations.
+
+#### Task D.10: `I64` in the Verifier [✅ Completed]
+- [x] **Soundness: `/` and `%` proved values the binary does not compute.** They were Boogie's Euclidean `div` and `mod`, and C truncates. The two agree only for a non-negative dividend, so `(-7) / 2 = -4` verified while the program computed `-3`. Added `gdl_div` and `gdl_mod`, which truncate. They are used unless the dividend is known to be unsigned, so a type that is not known is still right. They are not used for every type because the case split they add took `examples/seq_ops.gdl` from seconds to minutes on seed 2.
+- [x] **Soundness: three traps had no check.** `-x` at `I64.min`, `I64.min / -1` and `I64.min % -1` verified. Added `overflow_neg` and `overflow_div`. `-x` on `U64` needs `x = 0`, since the verifier's value is negative and C's wraps.
+- [x] **The other direction.** `+`, `-` and `*` used the `U64` range for every type, so `x - 200` on a small `I64` was refused, and `I64` parameters, results and fields had no range at all, so `x <= I64.max` could not be proven. They now have `in_i64`, at the five places `U64` has `in_u64`.
+- [x] `numeric_kind` picks the range. An untyped number adopts the type it meets, and `let`s take their signedness from their value. When a type is not determined, the check requires both ranges, so a wrong guess cannot let a value through. In `stdlib/` and the examples only `.code` reaches that path, and it proves.
+- [x] Wrapping on `I64` was read as unsigned: `x +% 0` at `-1` was `2^64 - 1` in a contract. It is now two's complement, matching the C cast. Bitwise operators on `I64` are refused (`bitwise_on_signed`), as §3 defines them on `U64` only and the verifier's model reads the bits as unsigned.
+- [x] `tests/c_backend/signed_ops.gdl` proves 16 exact results and checks the same values at run time, so a verifier and a binary that disagree fail. Two mutants were rejected: Euclidean division fails `div_np` and `div_nn`, and unsigned wrapping fails three routines.
+- Tests `test_i64_arithmetic_is_checked_against_its_own_range`, `test_i64_results_proven_by_the_verifier_are_what_the_binary_computes`. A probe of 61 cases had 17 of the first 35 wrong, and all are right now.
+- **Known limit.** Z3 gives up on a wrapping operator applied to a routine's result (`v(1) +% 1`) in an exact postcondition. It reports unproven, not verified, and a parameter pinned by `require` proves. `F64` operators are unchanged.
+
+### Phase E: Projects and Packages (the "Verified Universe")
+
+**Status:** Task E.0 ✅ Completed (2026-11-05). E.1 onwards 📋 proposed, and waits until a real second package exists, or until the decisions below are taken.
+
+**Objective:** let a Gardel project depend on other Gardel packages without import statements, and without trusting anything that was not proven on this machine. Source stays declaration-only. A manifest, `Gardel.toml`, states what is in the universe. Modular reasoning stays Hoare's rule for a call: prove the callee's precondition, then use its postcondition.
+
+**Review verdict:** the direction is right and fits what exists. No imports is already the language (§4.2): a project run links every file into one flat namespace with the prelude in scope. A manifest was anticipated in [stdlib_file_organization.md](stdlib_file_organization.md). Accepted with four corrections: a certificate cannot be the trust root, an interface file cannot replace source, collisions go beyond module names, and "bare by default" needs a rule for names that appear later.
+
+**Not in this phase:** a public registry, binary-only packages, signed certificates, two versions of one package in a build, and any change to `group`.
+
+#### Findings from probing the proposal against `gardelc` (2026-11-05)
+
+Small projects shaped like the proposal were run through the compiler at `58fcc88` plus Task D.10.
+
+| # | Finding | Effect on the plan |
+| :--- | :--- | :--- |
+| 1 | **A false dependency contract proves anything in the client.** A `LIB.f` with `assume c: False` and `ensure lie: Result = 2`, whose body returns 1: a client verified `absurd: Result = 3`, and `x * 1000` in the client reported no overflow, at exit 0. `--strict` catches it only because the source is in the run. | "Assume the library's postconditions as axioms" is safe only for what this machine proved. A downloaded `.gds` must never be trusted: it could state `False`. Decision 1. |
+| 2 | **Clients see public bodies today.** A client proved `Result = 5` for `DEP.five`, a routine with no `ensure`. | "Opaque bodies" is a semantic change: such proofs stop verifying, and today a dependency's body change can break or fix a client's proof silently. Decision 2. |
+| 3 | **Bodies are needed for code.** The C backend monomorphizes from source (Task C.3), so a generic module cannot be built from contracts. | A `.gds` cannot be the distributed form. A package ships source, and the interface is a derived cache for the verifier. Decision 3. |
+| 4 | **Constructors collide too.** `Leaf` in two modules of one project fails with a raw Boogie type error. Constructors resolve by name alone and have no qualified syntax (§4.1). | `JSON::PARSER` alone does not solve collisions: two libraries both defining `Leaf` or `Error` is more likely than two defining `PARSER`. Task E.0. |
+| 5 | **A unique name is assumed throughout.** Modules are found by bare name (`ctx.module` at 35 sites, 231 uses of `m.name` in `main.rs`, 15 in `c11_typed.rs`), and bare names form Boogie and C symbols (`PARSER__fn_x`, `struct PARSER`). | Most of the work. Two packages with one module name need identity by (package, name) and mangled symbols in Boogie and C. The `::` token is the small part. Task E.4. |
+| 6 | **"Bare by default" is fragile.** Under the proposal, a dependency adding a module `PARSER` in a minor release breaks every client using another `PARSER` bare. The prelude already has this shape: Phase D added `EVENT`, `KEY` and `COMMAND`, so a user module with one of those names now fails with `E0101`. | Decision 4 for local names, and a lockfile so nothing changes without an action. The prelude case is an open question. |
+| 7 | **Undefined and unknown things are reported badly.** An undefined module gives raw Boogie errors with a temp-file path (`Unknown`, `invalid type`). An unknown flag is ignored: `--project` and `--no-such-flag` both exit 0. | Must be real errors before a manifest adds paths and flags that can be mistyped. Task E.0. |
+| 8 | Directories are already recursive: `gardelc nested` linked `nested/sub/b_mod.gdl`. Spec §4.2 says they are not. | `src/**/*.gdl` already works. Fix the spec in Task E.0. |
+| 9 | The prelude is the proposal's interface model in a special case: its contracts are injected as trusted theory, proven by `--stdlib`. Cost today: 0.8 s for `bounded_stack.gdl`, 14.6 s for all 18 stdlib files under `--strict`. | The mechanism exists, so E.2 generalizes it. No claim about "hours" or "instant" can be made yet, and the "80% of trivial build errors" figure has no source. Measure in E.3. |
+| 10 | `[dependencies]` in `gardelc/Cargo.toml` is empty. `E0105` is unused. | Parsing `Gardel.toml` needs a dependency or a small TOML subset. Open question. |
+
+#### Decisions
+
+1. **Proofs are checked locally. A certificate is a cache, not evidence.** A dependency is verified from source on first use, and the result is cached under a hash of its source, the interfaces it depends on, the verifier version, the Boogie and Z3 versions, the solver limit and the flags. Nothing downloaded can mark a package as proven. The hash includes the verifier because soundness fixes change what is proven: Tasks D.9 and D.10 invalidated proofs from earlier compilers.
+2. **Contracts only across a package boundary.** A client of another package sees signatures, contracts, public ghost models and laws, never a `do` body. Within a project, linking stays as it is. Changing a body inside its contract then cannot change a client's proof.
+3. **Packages ship source.** The interface file is derived, for the verifier, and code generation reads source. Private routines stay hidden from clients by visibility.
+4. **Names resolve nearest first.** A project's own module wins over a dependency's, so a new module in a dependency never changes what local code means, the rule §4.1 already uses for constructors. Two direct dependencies with one name, used bare, are `E0105: ambiguous_module_reference`, fixed by qualifying.
+5. **Only direct dependencies are in the universe.** A package resolves its own names against its own manifest, so a transitive dependency adds no names. One version of a package per build, and a conflict is an error.
+6. **`--strict` is transitive.** A package's `assume`s are recorded in its cached result and reported to clients. `--strict` refuses them in any dependency, and `--bounded-check` results never count as proven.
+7. **Export lists stop at the package.** `{FRIENDS}` and `{M}` name modules of the same package. A `group` cannot cross packages, and an entry point is never exported (`E0104`).
+
+#### Open questions
+
+- **Prelude growth (finding 6):** let user modules shadow a prelude name added after a stated language edition, or keep `E0101` and accept that a new prelude name can break projects.
+- **Qualified constructors:** `TOK_A.Leaf(1)` or resolution from the expected type, or both. The C backend already uses the expected type.
+- **Manifest parser:** a TOML subset in `gardelc`, keeping it dependency-free, or the `toml` crate.
+- **Package aliases:** the proposal writes `package = "json"` and `JSON::PARSER`. The rule proposed here is the uppercased package name, unless `as` overrides it.
+
+#### Dependency graph
+
+```mermaid
+flowchart TD
+    E0["E.0: Names, errors & flags"]
+    E1["E.1: Gardel.toml, no dependencies"]
+    E2["E.2: Contract-only interfaces"]
+    E3["E.3: Local verification cache"]
+    E4["E.4: Path dependencies & package identity"]
+    E5["E.5: PKG::MODULE & E0105"]
+    E6["E.6: Git dependencies & lockfile"]
+    E7["E.7: Contract compatibility check"]
+    E0 --> E1 --> E4
+    E0 --> E2 --> E3 --> E4 --> E5 --> E6
+    E2 --> E7
+```
+
+#### Task E.0: Names, Errors and Flags [✅ Completed]
+- [x] **Name resolution before Boogie** (`gardelc/src/names.rs`). Undefined names reached Boogie and came back as `Phase 3 Boogie (Verification Condition Failed) in Unknown` with a temp-file path. Sixteen kinds were probed and all did this. Now `E0106` module, `E0107` type, `E0108` routine, `E0109` constructor, `E0110` variable and `E0111` argument count, each at its source location. They are fatal, and are reported together with what the static checks found, not in place of it.
+- [x] **Soundness: private members were not private across modules.** `SECRET.make.hidden`, a `feature {NONE}` routine, was callable from another module. A client could also match or build a constructor of a `representation {NONE}` sum type, so `Light(1)` forged a value the invariant never saw, which breaks the guarantee reactive state rests on. Reading a hidden field failed only by accident, as a Boogie error (the known limit of Task D.7). All three are `E0113: hidden_member`.
+- [x] Constructors of one name: a module's own wins. Declared by two other modules, a use is `E0112: ambiguous_constructor`, at each use. Qualified constructors stay an open question.
+- [x] **Backstop.** What Boogie refuses is `E0199: verifier_translation_failed`, once per module, with no Boogie file path: the module is not verified, and this is reported as a limit of `gardelc`. `x.nothing` on a `U64` lands here, because a receiver's type is followed only through parameters, `let`s and routine results.
+- [x] An unknown flag is an error. A mistyped `--stric` used to run the weaker check and report success. `--boogie`, used by the old tutorial, was one such flag.
+- [x] Spec §4.2 corrected: directories are recursive. The guide's table of contents linked to a section that did not exist.
+- Tests `test_e0_every_undefined_name_has_a_rule_and_a_location` (rule and line), `test_e0_all_repository_sources_resolve` (every example and the stdlib, so a false rejection fails here), `test_e0_private_members_stay_private`, `test_e0_constructors_of_one_name`, `test_e0_what_boogie_refuses_is_not_shown_as_boogie_text`, `test_e0_flags_are_known_or_refused`. `cargo test` 164/164. `--stdlib --strict` 0/0 and the eleven examples 0/0.
+- **Known limits.** A member on a receiver of unknown type is not resolved here, and reaches `E0199` or the verifier. `feature {OTHER}` across files is not usable, as the export list forms a cycle (`E0103`), so `E0113` is tested only for `{NONE}` and for a module outside the list.
+
+#### Task E.1: `Gardel.toml` Without Dependencies [ ]
+- [ ] `[project]` with `name` and `version`. `gardelc` with no input, or `--project DIR`, reads it and uses `src/`.
+- [ ] Spec §4.2 and §13: the manifest, and that it never changes what a source file means.
+- Acceptance: `examples/echo_server` with a manifest gives the same `.bpl` and `.c` as `gardelc examples/echo_server`.
+
+#### Task E.2: Contract-Only Interfaces [ ]
+- [ ] Define the `.gds` content from `--inspect`: signatures, `require`, `ensure`, public ghost signatures and laws. A ghost query over a hidden representation stays uninterpreted for a client.
+- [ ] Add a boundary to linking that withholds bodies, generalizing `prelude_contract_interface`.
+- [ ] **Measure first:** run `examples/` with bodies withheld, and record which proofs need new `ensure` clauses.
+- Acceptance: a client relying on a dependency's body fails with the missing fact named, and a body change inside the contract leaves the client's proof and result unchanged.
+
+#### Task E.3: Local Verification Cache [ ]
+- [ ] Cache key and contents as in decision 1. Any change to a key input re-verifies.
+- [ ] Record `assume`s, and make `--strict` transitive (decision 6).
+- [ ] Add `--verify-deps`, which ignores the cache, for CI.
+- [ ] Measure the time saved on the stdlib before and after.
+- Acceptance: a mutated cache entry or a false `.gds` cannot make a client verify (finding 1 is the test). Changing the verifier version re-verifies everything.
+
+#### Task E.4: Path Dependencies and Package Identity [ ]
+- [ ] `[dependencies]` with `path`. The universe is the prelude, the project and its direct dependencies (decision 5).
+- [ ] Identify modules by (package, name). Mangle Boogie and C symbols by package.
+- [ ] Apply decisions 4 and 7.
+- Acceptance: two packages that both define `PARSER` and `Leaf`, each used inside its own package, verify, link and run, and each keeps its own proofs.
+
+#### Task E.5: `PKG::MODULE` and `E0105` [ ]
+- [ ] Add the `::` token, and qualified names in expressions and types, including nested type arguments.
+- [ ] Add `E0105: ambiguous_module_reference`, listing the candidates and the qualified spellings. Allow qualification when it is not needed.
+- Acceptance: with two dependencies defining `PARSER`, bare use is `E0105` and both qualified uses verify and run.
+
+#### Task E.6: Git Dependencies and Lockfile [ ]
+- [ ] `git` dependencies pinned to a commit, with `Gardel.lock` holding source hashes and the Boogie and Z3 versions.
+- [ ] A build uses the locked sources and never fetches without being asked.
+- Acceptance: a fresh clone with the lockfile gives the same proofs, and a changed upstream commit is refused until the lock is updated.
+
+#### Task E.7: Contract Compatibility Check [ ]
+- [ ] Compare the interfaces of two versions: a stronger `require`, a weaker `ensure` or a removed routine is a breaking change.
+- Acceptance: a stronger `require` is reported as breaking and a body-only change is not. Implication between contracts is checked with the solver, and an unproven comparison counts as breaking.
 
 ---
 
@@ -528,7 +749,7 @@ flowchart TD
 
 | Phase | Milestone | Acceptance Criteria |
 | :---: | :--- | :--- |
-| **A** | **Spec v0.4 Synchronized** | [gardel_language_specification_draft_v0_4.md](../spec/gardel_language_specification_draft_v0_4.md) updated with: Dual-Layer Principle (§2), Prelude & Multi-File (§4), `RESULT` & Error Doctrine (§5, §7), Three-Layer Text & String Literals (§3, §11, §15), Strict Equality & Law Catalogue (§9), AI Diagnostics (§12), and Roadmap (§16). |
+| **A** | **Spec v0.4 Synchronized** | [gardel_language_specification_draft_v0_5.md](../spec/gardel_language_specification_draft_v0_5.md) updated with: Dual-Layer Principle (§2), Prelude & Multi-File (§4), `RESULT` & Error Doctrine (§5, §7), Three-Layer Text & String Literals (§3, §11, §15), Strict Equality & Law Catalogue (§9), AI Diagnostics (§12), and Roadmap (§16). |
 | **B** | **Compiler Prelude Injection** | `gardelc examples/greeter.gdl --strict` succeeds without `greeter.gdl` duplicating standard library definitions or faking `group` headers. |
 | **B** | **String Literal Lowering** | String literals in user programs type-check as prelude `STRING` and execute in C11 backend. |
 | **C** | **Modular Standard Library** | `stdlib/` organized into subdirectories (`concepts/`, `core/`, `collections/`, `numeric/`, `text/`, `functional/`). `phase4_stdlib_source()` bundles cleanly. |
@@ -536,14 +757,18 @@ flowchart TD
 | **D** | **Reactive Slice** | `examples/reactive_hello.gdl` verifies with **0 errors and 0 warnings**, runs natively, and exits through `Stop` on a real Ctrl-C and on a scripted `Shutdown`. Each reactive diagnostic has a test. |
 | **D** | **Unbounded Runs** | A timer program shows no growth in live allocations over 100,000 events. `examples/echo_server.gdl` holds its verified connection limit under test, and removing the guard is rejected by the verifier. |
 | **D** | **Determinism** | Replaying a recorded event log reproduces the run's commands exactly. |
+| **E** | **Nothing Unproven Is Trusted** | A false `.gds` or cache entry cannot make a client verify, `--strict` covers dependencies, and a changed verifier re-verifies them. |
+| **E** | **Two Libraries, One Name** | Two packages defining the same module and constructor names build and run together, with `E0105` on bare use across them. |
 
 ---
 
 ## 6. Immediate Next Step
 
+**Phase E: Projects and Packages:** Task E.0 is completed. E.1 onwards is proposed above, and waits for its decisions and for a real second package.
+
 With **Phase A: Language Specification Harmonization**, **Phase B: Compiler Engine & Prelude Tooling**, **Task C.1: Physical Decomposition of `stdlib/`**, **Task C.2: High-Performance Smart String (`stdlib/text/string.gdl`)**, and **Task C.3: Regression Verification & Performance Benchmarking** completely executed and verified with 0 errors and 0 warnings under `--strict`, Phase C's planned work is done. The verification baseline is clean, and every module compiles from source to C with reference-counted memory (C.3 follow-ups).
 
-The next step is **Phase D: Reactive Programs**, now drafted above with its tasks, dependency graph and acceptance criteria. The C prerequisites of [reactive/reactive_programs.md](reactive/reactive_programs.md) are in place (C.3 follow-ups): every module compiles from source, closures work, and memory is reference counted, so a program that runs forever does not leak. Start with Task D.0 and Task D.1, then build the `Print` + `Shutdown` slice (D.2–D.4).
+**Phase D: Reactive Programs** is defined above with its tasks, dependency graph and acceptance criteria. The C prerequisites of [reactive/reactive_programs.md](reactive/reactive_programs.md) are in place (C.3 follow-ups): every module compiles from source, closures work, and memory is reference counted, so a program that runs forever does not leak. Tasks D.0 to D.6 are completed, so `examples/reactive_hello.gdl`, `examples/reactive_clock/` and `examples/reactive_game/` run. Tasks D.6b and D.7 are completed too, so `examples/echo_server/` runs over real sockets with a proven connection limit, and D.8 records and replays any of them, so Phase D is complete. C.4.4 has its baseline (Task D.5).
 
-**Task C.4 (memory management performance)** is planned. C.4.1–C.4.3 do not depend on Phase D and can be done before or alongside it. C.4.1 and C.4.2 are small and have the largest payoff measured on `seq_bench`, but a reactive program rarely exits, so C.4.1 does little for Phase D and C.4.2 matters more. C.4.4 needs a reactive program to measure against, and D.5 provides its baseline.
+**Task C.4 (memory management performance)** is completed, with reuse deferred: `seq_bench` takes 196 ms on 1 thread and 66 ms on 20, down from 812 and 602, and the arena per step was prototyped and rejected.
 

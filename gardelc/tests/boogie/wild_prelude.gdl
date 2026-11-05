@@ -1,0 +1,61 @@
+functions WILD_PRELUDE
+
+feature {ANY}
+
+  -- Wildcard on a prelude ADT, last arm.
+  has_value(o: OPTION[U64]): BOOL
+    do
+      match o
+        case Some(_) then True
+        case _ then False
+      end
+    ensure
+      none_false: o = None implies not Result
+    end
+
+  -- A wildcard as the only arm on a prelude ADT.
+  ignore(r: RESULT[U64, BOOL]): U64
+    do
+      match r
+        case _ then 7
+      end
+    ensure
+      seven: Result = 7
+    end
+
+  -- Bind-all arm after a constructor.
+  or_zero(o: OPTION[U64]): OPTION[U64]
+    do
+      match o
+        case None then Some(0)
+        case other then other
+      end
+    ensure
+      some: Result != None
+    end
+
+  -- Nested type arguments (Boogie type mapping).
+  pair_first(o: OPTION[TUPLE[U64, BOOL]]): U64
+    do
+      match o
+        case Some(p) then p.first
+        case _ then 0
+      end
+    end
+
+  wrap(r: RESULT[TUPLE[U64, U64], OPTION[BOOL]]): OPTION[RESULT[TUPLE[U64, U64], OPTION[BOOL]]]
+    do
+      Some(r)
+    ensure
+      is_some: Result != None
+    end
+
+  pick(t: TUPLE[OPTION[U64], RESULT[U64, BOOL]]): U64
+    do
+      match t.first
+        case Some(x) then x
+        case _ then 1
+      end
+    end
+
+end

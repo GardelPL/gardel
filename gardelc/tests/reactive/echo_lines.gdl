@@ -1,0 +1,32 @@
+reactive program ECHO_LINES
+
+feature {ANY}
+
+  init(args: SEQ[STRING]): STEP[NAT]
+    do
+      Continue(0, LIST.empty.prepend(ReadLine))
+    end
+
+  failed(s: NAT, err: IO_ERROR): STEP[NAT]
+    do
+      match err
+        case EndOfInput then Stop(0, LIST.empty.prepend(Print("end")))
+        case Decode(cause) then Continue(s, LIST.empty.prepend(ReadLine).prepend(Print("bad input")))
+        case OsError(code) then Stop(1, LIST.empty.prepend(Print("read failed")))
+      end
+    end
+
+  step(s: NAT, e: EVENT): STEP[NAT]
+    do
+      match e
+        case Line(res) then
+          match res
+            case Ok(text) then Continue(s, LIST.empty.prepend(ReadLine).prepend(Print(text)))
+            case Error(err) then failed(s, err)
+          end
+        case Shutdown then Stop(2, LIST.empty)
+        case _ then Continue(s, LIST.empty)
+      end
+    end
+
+end

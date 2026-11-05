@@ -115,7 +115,7 @@ pub(crate) fn norm_type(t: &str) -> String {
 /// `EXIT_CODE` are `U64`, `INT` is `I64`), since they are the same C type. Without this a
 /// function value `(U64) -> U64` and a parameter `(NAT) -> NAT` would get two different
 /// C function types.
-fn cnorm(t: &str) -> String {
+pub(crate) fn cnorm(t: &str) -> String {
     norm_type_with(t, true)
 }
 
@@ -249,6 +249,13 @@ struct Ctx {
     /// Owned values in scope at the current tail position, outermost first. A tail call
     /// releases them before it jumps, as the blocks it leaves would have.
     tail_drops: Vec<(String, String)>,
+    /// C names of the owned locals the next constructor or call may take over, because
+    /// nothing evaluated after it uses them. Like `tail`, this holds for one expression.
+    moves: Vec<String>,
+    /// Those that were taken over: their scope no longer releases them.
+    moved: Vec<String>,
+    /// Parameters a sink routine owns, for its outermost block to release.
+    sink_params: Vec<(String, String)>,
     /// C name of the routine being emitted (empty inside a lambda).
     fn_cname: String,
     /// The routine's C parameters, `Current` first.
@@ -321,6 +328,8 @@ struct FnReq {
     routine: String,
     rtargs: Vec<String>,
     cname: String,
+    /// Emit the variant that owns its parameters (`is_sink`).
+    sink: bool,
 }
 
 /// Statements to run before an expression (binding owned temporaries) and after it
@@ -351,6 +360,9 @@ pub(crate) struct TypedC<'a> {
     /// The routine being emitted jumped to its own start (spec §10: tail calls are loops).
     tail_used: bool,
     needs_from_utf8: bool,
+    /// Inside the argument of `IO.exit`: the process ends right after, so scopes do not
+    /// release what they own (Task C.4.1).
+    exiting: bool,
     pub(crate) errors: Vec<String>,
 }
 
@@ -385,6 +397,7 @@ impl<'a> TypedC<'a> {
             needs_validator: false,
             needs_read_line: false,
             tail_used: false,
+            exiting: false,
             needs_from_utf8: false,
             errors: Vec::new(),
         }
@@ -460,6 +473,15 @@ impl<'a> TypedC<'a> {
         Ok(format!("{}({code});\n", self.rc_name(ty, "drop")?))
     }
 
+    /// `drop_stmt` for the end of a scope, where a dying program does not release. Only
+    /// for names: an expression must still be evaluated.
+    fn scope_drop(&mut self, ty: &str, name: &str) -> Result<String, String> {
+        if self.exiting {
+            return Ok(String::new());
+        }
+        self.drop_stmt(ty, name)
+    }
+
     fn rc_name(&mut self, ty: &str, which: &str) -> Result<String, String> {
         let ty = cnorm(ty);
         Ok(match ty.as_str() {
@@ -491,7 +513,7 @@ impl<'a> TypedC<'a> {
         let k = self.next();
         let ct = self.ctype(&v.ty)?;
         t.pre.push_str(&format!("{ct} _t{k} = {};\n", v.code));
-        let d = self.drop_stmt(&v.ty, &format!("_t{k}"))?;
+        let d = self.scope_drop(&v.ty, &format!("_t{k}"))?;
         t.post = format!("{d}{}", t.post);
         Ok(format!("_t{k}"))
     }
@@ -655,7 +677,7 @@ impl<'a> TypedC<'a> {
         };
         self.rc_protos.push(format!("static void drop_{inst}(struct {inst}* p);\n"));
         self.bodies.push(format!(
-            "static void drop_{inst}(struct {inst}* p) {{\n    while (p && atomic_fetch_sub_explicit(&p->_rc, 1, memory_order_acq_rel) == 1) {{\n        struct {inst}* next = NULL;\n{inner}        gardel_free(p);\n        p = next;\n    }}\n}}\n\n"
+            "static void drop_{inst}(struct {inst}* p) {{\n    while (p && gardel_rc_release(&p->_rc)) {{\n        struct {inst}* next = NULL;\n{inner}        gardel_free(p, sizeof(struct {inst}));\n        p = next;\n    }}\n}}\n\n"
         ));
         Ok(())
     }
@@ -751,8 +773,8 @@ impl<'a> TypedC<'a> {
         self.bodies.push(format!(
             "/* LIST[{elem}] runtime: immutable counted cons list, NULL is the empty list */\n\
 static void drop_{inst}(struct {inst}* p) {{\n\
-    while (p && atomic_fetch_sub_explicit(&p->_rc, 1, memory_order_acq_rel) == 1) {{\n\
-        struct {inst}* next = p->tail;\n        {drop_h}        gardel_free(p);\n        p = next;\n    }}\n}}\n\
+    while (p && gardel_rc_release(&p->_rc)) {{\n\
+        struct {inst}* next = p->tail;\n        {drop_h}        gardel_free(p, sizeof(struct {inst}));\n        p = next;\n    }}\n}}\n\
 static struct {inst}* {inst}__prepend(struct {inst}* xs, {ce} x) {{\n\
     struct {inst}* c = (struct {inst}*)gardel_alloc(sizeof(struct {inst}));\n\
     atomic_init(&c->_rc, 1);\n    c->head = {dup_x};\n    c->tail = dup_{inst}(xs);\n    return c;\n}}\n\
@@ -883,9 +905,40 @@ static bool {inst}__has(struct {inst}* xs, {ce} x) {{\n\
                 routine: routine.to_string(),
                 rtargs: rtargs.to_vec(),
                 cname: cname.clone(),
+                sink: false,
             });
         }
         cname
+    }
+
+    /// The variant of a routine that owns its counted parameters (Task C.4.3). Module names
+    /// are upper case, so the prefix cannot meet another routine's C name.
+    fn request_sink(&mut self, module: &str, mod_targs: &[String], routine: &str, rtargs: &[String]) -> String {
+        let plain = self.request_fn(module, mod_targs, routine, rtargs);
+        let cname = format!("sink_{plain}");
+        if self.done_fns.insert(cname.clone()) {
+            self.queue.push_back(FnReq {
+                module: module.to_string(),
+                mod_targs: mod_targs.to_vec(),
+                routine: routine.to_string(),
+                rtargs: rtargs.to_vec(),
+                cname: cname.clone(),
+                sink: true,
+            });
+        }
+        cname
+    }
+
+    /// A routine whose body ends by storing a parameter in a new value, as `concat` does.
+    /// The usual convention makes such a routine copy that parameter and its caller
+    /// release it, so a caller finished with the value gives it to a variant instead.
+    fn is_sink(md: &ModuleDecl, rd: &RoutineDecl) -> bool {
+        let ReprKind::Sum(vs) = &md.repr else { return false };
+        let Expr::Call(f, args) = &rd.body else { return false };
+        vs.iter().any(|v| v.name == *f)
+            && args.iter().any(|a| {
+                matches!(a, Expr::Var(v) if v == "Current" || rd.params.iter().any(|(p, _)| p == v))
+            })
     }
 
     fn emit_fn(&mut self, req: FnReq) -> Result<(), String> {
@@ -916,6 +969,9 @@ static bool {inst}__has(struct {inst}* xs, {ce} x) {{\n\
             tail: true,
             tail_site: false,
             tail_drops: Vec::new(),
+            moves: Vec::new(),
+            moved: Vec::new(),
+            sink_params: Vec::new(),
             fn_cname: req.cname.clone(),
             params: Vec::new(),
         };
@@ -933,10 +989,16 @@ static bool {inst}__has(struct {inst}* xs, {ce} x) {{\n\
             params.push(format!("{ct} {cn}"));
             cx.params.push((cn, ty));
         }
+        if req.sink {
+            cx.sink_params = cx.params.clone();
+        }
         let ret = subst(&rd.ret_type, &tmap);
         let cret = self.ctype(&ret)?;
         let body = self.lower_block(&mut cx, &rd.stmts, &rd.body, Some(&ret), has_cur)?;
         let body = self.own(body)?;
+        if req.sink && self.tail_used {
+            return Err("a routine that owns its parameters cannot be a loop".into());
+        }
         let sig = format!(
             "static {cret} {}({})",
             req.cname,
@@ -1025,8 +1087,10 @@ static bool {inst}__has(struct {inst}* xs, {ce} x) {{\n\
         let tail = cx.tail;
         let depth = cx.tail_drops.len();
         let mut retyped: HashMap<String, String> = HashMap::new();
+        let sink_params = std::mem::take(&mut cx.sink_params);
         loop {
             cx.tail = tail;
+            cx.sink_params = sink_params.clone();
             let res = self.lower_block_once(cx, stmts, body, expect, has_cur, &retyped);
             cx.tail_drops.truncate(depth);
             let Err(e) = &res else { return res };
@@ -1052,12 +1116,17 @@ static bool {inst}__has(struct {inst}* xs, {ce} x) {{\n\
         let tail = std::mem::take(&mut cx.tail);
         let mark = cx.locals.len();
         let mut code = String::new();
-        let mut owned_locals: Vec<(String, String)> = Vec::new();
-        for group in analyze_parallel_lets(stmts) {
+        let mut owned_locals: Vec<(String, String)> = std::mem::take(&mut cx.sink_params);
+        let groups = analyze_parallel_lets(stmts);
+        for (at, group) in groups.iter().enumerate() {
             if group.len() == 1 {
                 let (v, e) = &group[0];
                 let soft = !retyped.contains_key(v) && cx.untyped_num(e);
-                let x = self.lower(cx, e, retyped.get(v).map(String::as_str), has_cur)?;
+                cx.moves = Self::unused_after(cx, &owned_locals, &groups[at + 1..], body);
+                let x = self.lower(cx, e, retyped.get(v).map(String::as_str), has_cur);
+                cx.moves.clear();
+                Self::settle_moves(cx, &mut owned_locals);
+                let x = x?;
                 let t = x.ty.clone();
                 let c = self.own(x)?;
                 let ct = self.ctype(&t)?;
@@ -1067,7 +1136,7 @@ static bool {inst}__has(struct {inst}* xs, {ce} x) {{\n\
             } else {
                 let mut lowered = Vec::new();
                 let mut soft = Vec::new();
-                for (v, e) in &group {
+                for (v, e) in group {
                     soft.push(!retyped.contains_key(v) && cx.untyped_num(e));
                     let x = self.lower(cx, e, retyped.get(v).map(String::as_str), has_cur)?;
                     let t = x.ty.clone();
@@ -1123,20 +1192,65 @@ static bool {inst}__has(struct {inst}* xs, {ce} x) {{\n\
             cx.tail = true;
             cx.tail_drops.extend(owned_locals.iter().cloned());
         }
-        let b = self.lower(cx, body, expect, has_cur)?;
+        // Nothing of this block runs after its result, so all its locals may be taken over.
+        cx.moves = owned_locals.iter().map(|(cn, _)| cn.clone()).collect();
+        let b = self.lower(cx, body, expect, has_cur);
+        cx.moves.clear();
+        Self::settle_moves(cx, &mut owned_locals);
+        let b = b?;
         cx.locals.truncate(mark);
-        if code.is_empty() {
+        if code.is_empty() && owned_locals.is_empty() {
             return Ok(b);
         }
         let t = b.ty.clone();
         let bc = self.own(b)?;
         let mut drops = String::new();
         for (cn, lt) in owned_locals.iter().rev() {
-            drops.push_str(&self.drop_stmt(lt, cn)?);
+            drops.push_str(&self.scope_drop(lt, cn)?);
         }
         let k = self.next();
         let ct = self.ctype(&t)?;
         Ok(owned(format!("({{\n{code}{ct} _b{k} = {bc};\n{drops}_b{k};\n}})"), t))
+    }
+
+    /// The owned locals that no later `let` and not the block's result can see. `Current`
+    /// is left out, since a bare field name uses it without naming it.
+    fn unused_after(
+        cx: &Ctx,
+        owned: &[(String, String)],
+        later: &[Vec<(String, Expr)>],
+        body: &Expr,
+    ) -> Vec<String> {
+        let mut free = Vec::new();
+        for (_, e) in later.iter().flatten() {
+            expr_free_vars(e, &mut Vec::new(), &mut free);
+        }
+        expr_free_vars(body, &mut Vec::new(), &mut free);
+        owned
+            .iter()
+            .filter(|(cn, _)| {
+                cx.locals.iter().any(|l| l.cname == *cn && !free.contains(&l.name))
+            })
+            .map(|(cn, _)| cn.clone())
+            .collect()
+    }
+
+    /// Takes out of `owned` what the expression just lowered took over.
+    fn settle_moves(cx: &mut Ctx, owned: &mut Vec<(String, String)>) {
+        let moved = std::mem::take(&mut cx.moved);
+        owned.retain(|(cn, _)| !moved.contains(cn));
+    }
+
+    /// An owned version of `v` for a consumer: a local in `moves` is taken over, once.
+    fn take_or_own(&mut self, cx: &mut Ctx, moves: &mut Vec<String>, v: V) -> Result<String, String> {
+        if !v.owned {
+            if let Some(i) = moves.iter().position(|m| *m == v.code) {
+                moves.remove(i);
+                cx.moved.push(v.code.clone());
+                return Ok(v.code);
+            }
+        }
+        self.own(v)
     }
 
     fn int_lit(n: u128, ty: &str) -> String {
@@ -1251,6 +1365,7 @@ static bool {inst}__has(struct {inst}* xs, {ce} x) {{\n\
 
     /// A constructor call; it consumes owned values of its fields.
     fn lower_ctor(&mut self, cx: &mut Ctx, md: &'a ModuleDecl, ctor: &str, args: &[Expr], expect: Option<&str>, hc: bool) -> Lowered {
+        let mut moves = std::mem::take(&mut cx.moves);
         let ReprKind::Sum(vs) = &md.repr else { unreachable!() };
         let vd = vs.iter().find(|v| v.name == ctor).expect("variant");
         if vd.fields.len() != args.len() {
@@ -1283,7 +1398,9 @@ static bool {inst}__has(struct {inst}* xs, {ce} x) {{\n\
                 Some(v) => v,
                 None => self.lower(cx, a, Some(ft), hc)?,
             };
-            cargs.push(self.own(v)?);
+            // The other arguments read a local taken here before the constructor stores
+            // it, so it is alive for them.
+            cargs.push(self.take_or_own(cx, &mut moves, v)?);
         }
         Ok(owned(format!("make_{}_{ctor}({})", c_instance_name(&ty), cargs.join(", ")), ty))
     }
@@ -1302,6 +1419,7 @@ static bool {inst}__has(struct {inst}* xs, {ce} x) {{\n\
         hc: bool,
     ) -> Lowered {
         let tail_site = std::mem::take(&mut cx.tail_site);
+        let mut moves = std::mem::take(&mut cx.moves);
         let (rd, kind) = Self::find_routine(md, r).ok_or_else(|| format!("`{}` has no routine `{r}`", md.name))?;
         if kind == "specify" {
             return Err(format!(
@@ -1396,6 +1514,31 @@ static bool {inst}__has(struct {inst}* xs, {ce} x) {{\n\
             let ret = subst(&rd.ret_type, &map);
             let code = self.tail_jump(cx, vals, &ret)?;
             return Ok(owned(code, ret));
+        }
+        let takes_current = Self::has_current(md, kind);
+        if Self::is_sink(md, rd) && (!takes_current || recv.is_some() || (hc && md.name == cx.owner)) {
+            let self_ty = Self::self_type(md, &mod_targs);
+            let mut vals = Vec::new();
+            if takes_current {
+                vals.push(recv.clone().unwrap_or_else(|| borrowed("Current".to_string(), self_ty.clone())));
+            }
+            vals.extend(lowered.iter().flatten().cloned());
+            // Worth it only when the caller has something to give: a value it would
+            // otherwise release right after the call.
+            let mut gives = false;
+            for v in &vals {
+                gives |= self.is_rc(&v.ty) && (v.owned || moves.contains(&v.code));
+            }
+            if gives {
+                let sink = self.request_sink(&md.name, &mod_targs, r, &rtargs);
+                let mut cargs = Vec::new();
+                for v in vals {
+                    cargs.push(self.take_or_own(cx, &mut moves, v)?);
+                }
+                map.insert("Current".into(), self_ty);
+                let ret = subst(&rd.ret_type, &map);
+                return Ok(owned(format!("{sink}({})", cargs.join(", ")), ret));
+            }
         }
         let mut t = Temps::default();
         let mut cargs = Vec::new();
@@ -1538,6 +1681,9 @@ static bool {inst}__has(struct {inst}* xs, {ce} x) {{\n\
             tail: false,
             tail_site: false,
             tail_drops: Vec::new(),
+            moves: Vec::new(),
+            moved: Vec::new(),
+            sink_params: Vec::new(),
             fn_cname: String::new(),
             params: Vec::new(),
         };
@@ -1573,7 +1719,11 @@ static bool {inst}__has(struct {inst}* xs, {ce} x) {{\n\
         let rty = subst(ret, &cx.tmap);
         let cret = self.ctype(&rty)?;
         let hc_inner = captures.iter().any(|(g, _, _)| g == "Current");
-        let b = self.lower_block(&mut lcx, stmts, body, Some(&rty), hc_inner)?;
+        // A lambda runs later, perhaps many times: `IO.exit` around it says nothing about it.
+        let outer = std::mem::take(&mut self.exiting);
+        let b = self.lower_block(&mut lcx, stmts, body, Some(&rty), hc_inner);
+        self.exiting = outer;
+        let b = b?;
         let b = self.own(b)?;
         let sig = format!("static {cret} {name}({})", cps.join(", "));
         self.protos.push(format!("{sig};\n"));
@@ -1585,7 +1735,7 @@ static bool {inst}__has(struct {inst}* xs, {ce} x) {{\n\
             ));
             self.protos.push(format!("static void {env}_drop(struct gardel_env* h);\n"));
             self.bodies.push(format!(
-                "static void {env}_drop(struct gardel_env* h) {{\n    struct {env}* e = (struct {env}*)h;\n    {env_drops}    gardel_free(e);\n}}\n\
+                "static void {env}_drop(struct gardel_env* h) {{\n    struct {env}* e = (struct {env}*)h;\n    {env_drops}    gardel_free(e, sizeof(struct {env}));\n}}\n\
                  {sig} {{\n{prologue}    return {b};\n}}\n\n"
             ));
         }
@@ -1729,7 +1879,7 @@ static bool {inst}__has(struct {inst}* xs, {ce} x) {{\n\
         }
         s.push_str("}\n");
         if scrut_owned {
-            s.push_str(&self.drop_stmt(&st, &sv)?);
+            s.push_str(&self.scope_drop(&st, &sv)?);
         }
         s.push_str(&format!("{rv};\n}})"));
         Ok(owned(s, rt))
@@ -1763,6 +1913,8 @@ static bool {inst}__has(struct {inst}* xs, {ce} x) {{\n\
         // subexpression starts with it cleared.
         let tail = std::mem::take(&mut cx.tail);
         cx.tail_site = false;
+        // Like `tail`, for this expression only, and only a constructor or a call uses it.
+        let moves = std::mem::take(&mut cx.moves);
         let expect_n = expect.map(norm_type);
         let expect = expect_n.as_deref();
         match e {
@@ -1861,11 +2013,13 @@ static bool {inst}__has(struct {inst}* xs, {ce} x) {{\n\
                     return self.call_value(cx, borrowed(l.cname, l.ty), args, hc);
                 }
                 if let Some(md) = self.ctor_owner(f, expect, cx) {
+                    cx.moves = moves;
                     return self.lower_ctor(cx, md, f, args, expect, hc);
                 }
                 let owner = self.module(&cx.owner).ok_or("no owner module")?;
                 if Self::find_routine(owner, f).is_some() {
                     cx.tail_site = tail;
+                    cx.moves = moves;
                     return self.lower_call(cx, owner, f, None, args, expect, hc);
                 }
                 Err(format!("unknown function `{f}`"))
@@ -1878,7 +2032,9 @@ static bool {inst}__has(struct {inst}* xs, {ce} x) {{\n\
                             .self_ty
                             .clone()
                             .and_then(|st| self.variant_fields(&st, None))
-                            .is_some_and(|fs| fs.iter().any(|(f, _)| f == v)));
+                            .is_some_and(|fs| fs.iter().any(|(f, _)| f == v)))
+                        // A nullary constructor as a receiver: `Shutdown.is_shutdown`.
+                        || (self.module(v).is_none() && self.ctor_owner(v, None, cx).is_some());
                     if !is_value {
                         cx.tail_site = tail;
                         return self.lower_static(cx, v, m, args, expect, hc);
@@ -1935,6 +2091,7 @@ static bool {inst}__has(struct {inst}* xs, {ce} x) {{\n\
                     }
                 }
                 cx.tail_site = tail;
+                cx.moves = moves;
                 self.lower_call(cx, md, m, Some(rv), args, expect, hc)
             }
             // A block written as an expression by pattern compilation. Its dead branch is a
@@ -2060,7 +2217,7 @@ static bool {inst}__has(struct {inst}* xs, {ce} x) {{\n\
                 let ct = self.ctype(&t)?;
                 s.push_str(&format!("{ct} _io{k} = {fc};\n"));
                 for (cn, lt) in owned_locals.iter().rev() {
-                    s.push_str(&self.drop_stmt(lt, cn)?);
+                    s.push_str(&self.scope_drop(lt, cn)?);
                 }
                 s.push_str(&format!("_io{k};\n}})"));
                 Ok(owned(s, t))
@@ -2158,8 +2315,11 @@ static bool {inst}__has(struct {inst}* xs, {ce} x) {{\n\
                 ));
             }
             ("IO", "exit", 1) => {
-                let a = self.lower(cx, &args[0], Some("EXIT_CODE"), hc)?;
-                return Ok(owned(format!("gardel_io_exit({})", a.code), "IO[EXIT_CODE]"));
+                // Nothing runs after the argument, so its scopes do not release.
+                let outer = std::mem::replace(&mut self.exiting, true);
+                let a = self.lower(cx, &args[0], Some("EXIT_CODE"), hc);
+                self.exiting = outer;
+                return Ok(owned(format!("gardel_io_exit({})", a?.code), "IO[EXIT_CODE]"));
             }
             ("IO", _, _) => return Err(format!("`IO.{m}` has no C runtime implementation")),
             ("STRING", "from_utf8", 1) => {
@@ -2228,7 +2388,8 @@ static struct SEQ_STRING* gardel_args_range(GardelString* xs, uint64_t lo, uint6
     struct SEQ_STRING* r = gardel_args_range(xs, mid, hi);
     return make_SEQ_STRING_Concat(l, r, hi - lo);
 }
-static struct SEQ_STRING* gardel_main_args(int argc, char** argv) {
+/* The arguments as UTF-8, with the program's name first. An entry that cannot be converted is NULL. */
+static int gardel_args_utf8(int argc, char** argv, char*** out) {
     int n = argc;
     char** u = argv;
 #ifdef _WIN32
@@ -2248,6 +2409,10 @@ static struct SEQ_STRING* gardel_main_args(int argc, char** argv) {
         n = argc;
     }
 #endif
+    *out = u;
+    return n;
+}
+static struct SEQ_STRING* gardel_args_value(int n, char** u) {
     if (n <= 1) return make_SEQ_STRING_Empty();
     GardelString* xs = (GardelString*)malloc(sizeof(GardelString) * (size_t)(n - 1));
     for (int i = 1; i < n; i++) {
@@ -2265,9 +2430,141 @@ static struct SEQ_STRING* gardel_main_args(int argc, char** argv) {
     free(xs);
     return s;
 }
+static struct SEQ_STRING* gardel_main_args(int argc, char** argv) {
+    char** u;
+    int n = gardel_args_utf8(argc, argv, &u);
+    return gardel_args_value(n, u);
+}
 
 "#
         .to_string())
+    }
+
+    /// The entry point of a `reactive program` (spec 11.6). `init` and `step` return owned
+    /// values and borrow their arguments. The loop holds its own reference to the state, so
+    /// the `STEP` that carried it can go. One OpenMP region surrounds the loop, as it does
+    /// `main`: parked threads sleep during a wait and pick up the tasks of a `step`. A region
+    /// per call would wake the whole team for every event (95 us instead of 3 us per event
+    /// on 20 threads).
+    fn reactive_host(&mut self, root: &ModuleDecl) -> Result<(String, String), String> {
+        let name = root.name.clone();
+        let ret = root
+            .feature_routines
+            .iter()
+            .find(|(_, r)| r.name == "init")
+            .map(|(_, r)| cnorm(&r.ret_type))
+            .ok_or("a reactive program needs `init`")?;
+        let state = ret
+            .strip_prefix("STEP[")
+            .and_then(|t| t.strip_suffix(']'))
+            .ok_or("`init` must return `STEP[S]`")?
+            .to_string();
+        let args_rt = self.args_runtime()?;
+        let init = self.request_fn(&name, &[], "init", &[]);
+        let step = self.request_fn(&name, &[], "step", &[]);
+        let rct = self.ctype(&ret)?;
+        let sct = self.ctype(&state)?;
+        self.needs_read_line = true;
+        self.needs_validator = true;
+        self.ctype(READ_LINE_RESULT_TYPE)?;
+        let keyt = self.ctype("KEY")?;
+        let evt = self.ctype("EVENT")?;
+        let cmd = self.ctype("COMMAND")?;
+        let cmds = self.ctype("LIST[COMMAND]")?;
+        self.drain();
+
+        // One case per variant, so a variant with no host code cannot be ignored at run time.
+        let mut run = String::new();
+        for v in self.variants_of("COMMAND")? {
+            let body = host_command_code(&v).ok_or_else(|| format!("`COMMAND.{v}` has no host implementation"))?;
+            let log = host_command_log(&v).ok_or_else(|| format!("`COMMAND.{v}` has no log form"))?;
+            run.push_str(&format!(
+                "        case TAG_COMMAND_{v}:\n            if (gardel_log_active()) {{ gardel_log_word(\"command \"); {log} gardel_log_finish(false); }}\n            {body} break;\n"
+            ));
+        }
+        let mut make = String::new();
+        for v in self.variants_of("EVENT")? {
+            let case = host_event_code(&v).ok_or_else(|| format!("`EVENT.{v}` has no host implementation"))?;
+            make.push_str(&format!("        {case}\n"));
+        }
+        let mut make_key = String::new();
+        for v in self.variants_of("KEY")? {
+            let case = host_key_code(&v).ok_or_else(|| format!("`KEY.{v}` has no host implementation"))?;
+            make_key.push_str(&format!("        {case}\n"));
+        }
+        let inst = c_instance_name(&ret);
+        let keep = self.own(borrowed("r->Continue.next".to_string(), state.clone()))?;
+        let drop_step = self.drop_stmt(&ret, "r")?;
+        let drop_state = self.drop_stmt(&state, "state")?;
+        let drop_event = self.drop_stmt("EVENT", "e")?;
+        let drop_args = self.drop_stmt("SEQ[STRING]", "args")?;
+        Ok((
+            format!(
+                "{REACTIVE_RUNTIME}\n\
+                 static void gardel_run_commands({cmds} p) {{\n    for (; p; p = p->tail) {{\n        {cmd} c = p->head;\n        switch (c->tag) {{\n{run}        default: abort();\n        }}\n    }}\n    gardel_log_flush();\n    /* The program may now wait for days: what it printed must already be out. */\n    fflush(stdout);\n}}\n\n\
+                 static {keyt} gardel_key_value(struct gardel_host_event ev) {{\n    switch (ev.key) {{\n{make_key}        default: abort();\n    }}\n}}\n\n\
+                 static {evt} gardel_event_value(struct gardel_host_event ev) {{\n    switch (ev.kind) {{\n{make}        default: abort();\n    }}\n}}\n\n\
+                 int gardel_reactive_main(int argc, char** argv) {{\n\
+                 \x20   gardel_host_install();\n\
+                 \x20   gardel_timer_count = 0;\n\
+                 \x20   const char* script = getenv(\"GARDEL_EVENTS\");\n\
+                 \x20   if (script) gardel_host_script = script;\n\
+                 \x20   char** argu;\n\
+                 \x20   int argn = gardel_args_utf8(argc, argv, &argu);\n\
+                 \x20   gardel_log_start(\"{name}\", &argn, &argu);\n\
+                 \x20   struct SEQ_STRING* args = gardel_args_value(argn, argu);\n\
+                 \x20   gardel_log_args(argn, argu);\n\
+                 \x20   int code = 0;\n\
+                 \x20   #pragma omp parallel\n\
+                 \x20   #pragma omp single\n\
+                 \x20   {{\n\
+                 \x20       {rct} r = {init}(args);\n\
+                 \x20       {drop_args}\
+                 \x20       while (r->tag != TAG_{inst}_Stop) {{\n\
+                 \x20           gardel_run_commands(r->Continue.cmds);\n\
+                 \x20           {sct} state = {keep};\n\
+                 \x20           {drop_step}\
+                 \x20           struct gardel_host_event got = gardel_next_event();\n\
+                 \x20           gardel_log_event(&got);\n\
+                 \x20           {evt} e = gardel_event_value(got);\n\
+                 \x20           r = {step}(state, e);\n\
+                 \x20           {drop_event}\
+                 \x20           {drop_state}\
+                 #ifdef GARDEL_HOST_PROBE\n\
+                 \x20           GARDEL_HOST_PROBE();\n\
+                 #endif\n\
+                 \x20       }}\n\
+                 \x20       gardel_run_commands(r->Stop.cmds);\n\
+                 \x20       code = (int)r->Stop.code;\n\
+                 \x20       gardel_log_exit(code);\n\
+                 \x20       {drop_step}\
+                 \x20   }}\n\
+                 \x20   gardel_net_finish();\n\
+                 \x20   gardel_term_restore();\n\
+                 \x20   gardel_host_finished();\n\
+                 \x20   return code;\n\
+                 }}\n\n\
+                 int main(int argc, char** argv) {{\n\
+                 \x20   int code = gardel_reactive_main(argc, argv);\n\
+                 \x20   /* The reader may be blocked on stdin, and exit() would wait for that stream. */\n\
+                 \x20   if (gardel_reader_started) {{\n\
+                 \x20       fflush(stdout);\n\
+                 \x20       fflush(stderr);\n\
+                 \x20       _Exit(code);\n\
+                 \x20   }}\n\
+                 \x20   return code;\n\
+                 }}\n"
+            ),
+            args_rt,
+        ))
+    }
+
+    /// The variant names of a sum module in scope.
+    fn variants_of(&self, module: &str) -> Result<Vec<String>, String> {
+        match self.module(module).map(|m| &m.repr) {
+            Some(ReprKind::Sum(vs)) => Ok(vs.iter().map(|v| v.name.clone()).collect()),
+            _ => Err(format!("`{module}` is not available to the reactive host")),
+        }
     }
 
     fn assemble(&mut self, entry: &str, args_rt: &str) -> String {
@@ -2284,12 +2581,11 @@ static struct SEQ_STRING* gardel_main_args(int argc, char** argv) {
         out.push_str(&emit_c11_runtime_header());
         out.push_str(
             "\n#ifndef GARDEL_TASK_DEPTH\n#define GARDEL_TASK_DEPTH 12\n#endif\n\
-             /* Task nesting depth of the running code; deeper `let` groups run inline. */\n\
-             static _Thread_local int gardel_task_depth __attribute__((unused)) = 0;\n\n\
+             #define gardel_task_depth (gardel_thread_get()->task_depth)\n\n\
              /* Counted closure environment: captured values follow the header. */\n\
              struct gardel_env { _Atomic uint64_t rc; void (*drop)(struct gardel_env*); };\n\
              static inline void gardel_env_dup(struct gardel_env* e) {\n    if (e) atomic_fetch_add_explicit(&e->rc, 1, memory_order_relaxed);\n}\n\
-             static inline void gardel_env_drop(struct gardel_env* e) {\n    if (e && atomic_fetch_sub_explicit(&e->rc, 1, memory_order_acq_rel) == 1) e->drop(e);\n}\n\n",
+             static inline void gardel_env_drop(struct gardel_env* e) {\n    if (e && gardel_rc_release(&e->rc)) e->drop(e);\n}\n\n",
         );
         for s in &self.struct_fwd {
             out.push_str(s);
@@ -2328,6 +2624,1515 @@ static struct SEQ_STRING* gardel_main_args(int argc, char** argv) {
     }
 }
 
+/// The host side of a `reactive program` (spec 11.6): shutdown signals, timers and the event
+/// sources. The loop itself is generated by `reactive_host`, which knows the state type.
+/// Event sources go through `gardel_next_event`, so tests and replay need no real signals.
+const REACTIVE_RUNTIME: &str = r#"/* Reactive host (spec 11.6). */
+enum gardel_host_kind {
+    GARDEL_HOST_SHUTDOWN, GARDEL_HOST_TICK, GARDEL_HOST_LINE, GARDEL_HOST_KEY, GARDEL_HOST_ACCEPTED,
+    GARDEL_HOST_LISTEN_FAILED, GARDEL_HOST_RECEIVED, GARDEL_HOST_SEND_FAILED, GARDEL_HOST_CLOSED
+};
+enum gardel_host_key {
+    GARDEL_KEY_CHAR, GARDEL_KEY_UP, GARDEL_KEY_DOWN, GARDEL_KEY_LEFT, GARDEL_KEY_RIGHT,
+    GARDEL_KEY_ENTER, GARDEL_KEY_ESCAPE, GARDEL_KEY_BACKSPACE, GARDEL_KEY_TAB,
+    GARDEL_KEY_OTHER, GARDEL_KEY_END_OF_INPUT
+};
+struct gardel_host_event {
+    enum gardel_host_kind kind;
+    uint64_t id;                /* Tick: the timer. Sockets: the connection, or the port */
+    void* line;                 /* Line: an owned RESULT[IO_ERROR, STRING] */
+    enum gardel_host_key key;   /* Key */
+    uint32_t ch;                /* Key: a Unicode scalar, for GARDEL_KEY_CHAR */
+    GardelBytes data;           /* Received: owned */
+    int64_t err;                /* ListenFailed, SendFailed, Line: the OS error code */
+    int line_state;             /* Line: a GARDEL_LINE_* */
+    char* raw;                  /* Line: the bytes read, kept only when recording */
+    size_t raw_len;
+};
+
+/* Scripted events, from GARDEL_EVENTS: names separated by spaces. NULL reads the OS. */
+static const char* gardel_host_script = NULL;
+static const char* gardel_event_source = "GARDEL_EVENTS";
+/* Set before any thread starts. A line's bytes are gone once it is a RESULT, and a bad line has
+   no text to log, so the reader keeps them for a recording. */
+static bool gardel_log_capture = false;
+
+#ifdef _WIN32
+__declspec(dllimport) int __stdcall SetConsoleCtrlHandler(int (__stdcall*)(unsigned long), int);
+__declspec(dllimport) void* __stdcall CreateEventA(void*, int, int, const char*);
+__declspec(dllimport) int __stdcall SetEvent(void*);
+__declspec(dllimport) unsigned long __stdcall WaitForSingleObject(void*, unsigned long);
+__declspec(dllimport) unsigned long long __stdcall GetTickCount64(void);
+__declspec(dllimport) int __stdcall ResetEvent(void*);
+__declspec(dllimport) unsigned long __stdcall WaitForMultipleObjects(unsigned long, void* const*, int, unsigned long);
+__declspec(dllimport) void* __stdcall CreateThread(void*, size_t, unsigned long (__stdcall*)(void*), void*, unsigned long, unsigned long*);
+__declspec(dllimport) void __stdcall AcquireSRWLockExclusive(void**);
+__declspec(dllimport) void __stdcall ReleaseSRWLockExclusive(void**);
+__declspec(dllimport) int __stdcall SleepConditionVariableSRW(void**, void**, unsigned long, unsigned long);
+__declspec(dllimport) void __stdcall WakeConditionVariable(void**);
+__declspec(dllimport) void* __stdcall GetStdHandle(unsigned long);
+__declspec(dllimport) int __stdcall GetConsoleMode(void*, unsigned long*);
+__declspec(dllimport) int __stdcall SetConsoleMode(void*, unsigned long);
+__declspec(dllimport) int __stdcall ReadFile(void*, void*, unsigned long, unsigned long*, void*);
+__declspec(dllimport) int __stdcall ReadConsoleInputW(void*, void*, unsigned long, unsigned long*);
+
+/* Sockets: WS2_32, so a program links with -lws2_32. All sockets share one event: it only says
+   that a socket changed, and WSAPoll says which. Levels are read again after each reset, so a
+   change during a pass sets the event and cannot be lost. */
+typedef unsigned long long gardel_sock;
+#define GARDEL_NO_SOCK (~(gardel_sock)0)
+#define GARDEL_POLLIN 0x0300
+#define GARDEL_POLLOUT 0x0010
+#define GARDEL_POLL_BASE 0
+#define GARDEL_ERR_INVALID 10022
+#define GARDEL_ERR_NO_BUFFERS 10055
+struct gardel_pollfd { gardel_sock fd; short events, revents; };
+struct gardel_sockaddr { short family; unsigned short port; uint32_t addr; char zero[8]; };
+static struct gardel_pollfd* gardel_pfds = NULL;
+static size_t gardel_poll_count = 0;
+__declspec(dllimport) int __stdcall WSAStartup(unsigned short, void*);
+__declspec(dllimport) int __stdcall WSAGetLastError(void);
+__declspec(dllimport) int __stdcall WSAPoll(struct gardel_pollfd*, unsigned long, int);
+__declspec(dllimport) int __stdcall WSAEventSelect(gardel_sock, void*, long);
+__declspec(dllimport) gardel_sock __stdcall socket(int, int, int);
+__declspec(dllimport) int __stdcall bind(gardel_sock, const struct gardel_sockaddr*, int);
+__declspec(dllimport) int __stdcall listen(gardel_sock, int);
+__declspec(dllimport) gardel_sock __stdcall accept(gardel_sock, void*, int*);
+__declspec(dllimport) int __stdcall recv(gardel_sock, char*, int, int);
+__declspec(dllimport) int __stdcall send(gardel_sock, const char*, int, int);
+__declspec(dllimport) int __stdcall shutdown(gardel_sock, int);
+__declspec(dllimport) int __stdcall closesocket(gardel_sock);
+__declspec(dllimport) unsigned long __stdcall inet_addr(const char*);
+static void* gardel_net_event = NULL;
+static bool gardel_sock_start(void) {
+    if (gardel_net_event) return true;
+    _Alignas(8) char data[512]; /* WSADATA */
+    if (WSAStartup(0x0202, data) != 0) return false;
+    gardel_net_event = CreateEventA(NULL, 1, 0, NULL);
+    return gardel_net_event != NULL;
+}
+static int gardel_sock_error(void) { return WSAGetLastError(); }
+/* 10035 WSAEWOULDBLOCK, 10004 WSAEINTR */
+static bool gardel_sock_again(int err) { return err == 10035 || err == 10004; }
+/* 10053 WSAECONNABORTED, 10054 WSAECONNRESET: that client went, and the listener is fine. */
+static bool gardel_sock_client_gone(int err) { return err == 10053 || err == 10054; }
+static gardel_sock gardel_sock_tcp(void) { return socket(2, 1, 0); }
+static uint32_t gardel_sock_ipv4(const char* text) { return (uint32_t)inet_addr(text); }
+/* Windows' SO_REUSEADDR would let another process take the port over, so it is not set. */
+static bool gardel_sock_bind(gardel_sock s, uint64_t port, uint32_t ip) {
+    struct gardel_sockaddr a;
+    memset(&a, 0, sizeof a);
+    a.family = 2;
+    a.port = (unsigned short)(((port & 0xFF) << 8) | (port >> 8));
+    a.addr = ip;
+    return bind(s, &a, sizeof a) == 0 && listen(s, 128) == 0;
+}
+static gardel_sock gardel_sock_accept(gardel_sock s) { return accept(s, NULL, NULL); }
+/* FD_ACCEPT, or FD_READ | FD_WRITE | FD_CLOSE. WSAEventSelect also makes the socket non-blocking. */
+static void gardel_sock_watch(gardel_sock s, bool listener) {
+    if (WSAEventSelect(s, gardel_net_event, listener ? 8 : 1 | 2 | 32) != 0) abort();
+}
+static long gardel_sock_recv(gardel_sock s, char* buf, size_t n) { return recv(s, buf, (int)n, 0); }
+static long gardel_sock_send(gardel_sock s, const char* buf, size_t n) {
+    return send(s, buf, n > 0x40000000 ? 0x40000000 : (int)n, 0);
+}
+static void gardel_sock_shutdown(gardel_sock s) { shutdown(s, 1); }
+static void gardel_sock_close(gardel_sock s) { closesocket(s); }
+static int gardel_sock_poll(struct gardel_pollfd* p, size_t n, int ms) {
+    return WSAPoll(p, (unsigned long)n, ms);
+}
+/* Every pass starts here, even one with nothing to watch: an event left set would spin the loop. */
+static void gardel_sock_rearm(void) {
+    if (gardel_net_event) ResetEvent(gardel_net_event);
+}
+
+static void* gardel_stop_requested = NULL;
+static void* gardel_stop_finished = NULL;
+static void* gardel_input_ready = NULL;
+static int __stdcall gardel_console_ctrl(unsigned long kind) {
+    SetEvent(gardel_stop_requested);
+    /* 0 is Ctrl-C, 1 Ctrl-Break. For a closing console, a logoff or a shutdown, Windows ends
+       the process when this handler returns, so let the Stop commands finish first. */
+    if (kind >= 2) WaitForSingleObject(gardel_stop_finished, 4000);
+    return 1;
+}
+static void gardel_host_install(void) {
+    if (gardel_stop_requested) return;
+    gardel_stop_requested = CreateEventA(NULL, 1, 0, NULL);
+    gardel_stop_finished = CreateEventA(NULL, 1, 0, NULL);
+    gardel_input_ready = CreateEventA(NULL, 1, 0, NULL);
+    SetConsoleCtrlHandler(gardel_console_ctrl, 1);
+}
+static void gardel_host_finished(void) {
+    if (gardel_stop_finished) SetEvent(gardel_stop_finished);
+}
+static uint64_t gardel_host_now_ms(void) {
+    return (uint64_t)GetTickCount64();
+}
+/* Returns on a shutdown request or after `ms`. The request stays set, so it cannot be lost. */
+static void gardel_host_wait(uint64_t ms) {
+    void* all[3] = { gardel_stop_requested, gardel_input_ready, gardel_net_event };
+    WaitForMultipleObjects(gardel_net_event ? 3 : 2, all, 0, ms > 0x7FFFFFFFULL ? 0x7FFFFFFFUL : (unsigned long)ms);
+}
+static bool gardel_host_stop_pending(void) {
+    return WaitForSingleObject(gardel_stop_requested, 0) == 0;
+}
+static void gardel_input_signal(void) { SetEvent(gardel_input_ready); }
+static void gardel_input_clear(void) { ResetEvent(gardel_input_ready); }
+
+static void* gardel_lock_word = NULL;
+static void* gardel_request_cv = NULL;
+static void gardel_lock(void) { AcquireSRWLockExclusive(&gardel_lock_word); }
+static void gardel_unlock(void) { ReleaseSRWLockExclusive(&gardel_lock_word); }
+static void gardel_request_wait(void) { SleepConditionVariableSRW(&gardel_request_cv, &gardel_lock_word, 0xFFFFFFFFUL, 0); }
+static void gardel_request_wake(void) { WakeConditionVariable(&gardel_request_cv); }
+static void gardel_reader_main(void);
+static unsigned long __stdcall gardel_reader_entry(void* unused) {
+    (void)unused;
+    gardel_reader_main();
+    return 0;
+}
+static void gardel_reader_start(void) {
+    if (!CreateThread(NULL, 0, gardel_reader_entry, NULL, 0, NULL)) abort();
+}
+
+/* The terminal. Ctrl-C stays a signal in raw mode (ENABLE_PROCESSED_INPUT). */
+static void* gardel_term_in = NULL;
+static unsigned long gardel_term_saved = 0;
+static bool gardel_term_is_console = false, gardel_term_is_raw = false;
+static void gardel_term_open(void) {
+    gardel_term_in = GetStdHandle((unsigned long)-10);
+    gardel_term_is_console = GetConsoleMode(gardel_term_in, &gardel_term_saved) != 0;
+}
+static void gardel_term_set_raw(bool raw) {
+    if (!gardel_term_is_console || raw == gardel_term_is_raw) return;
+    SetConsoleMode(gardel_term_in, raw ? (gardel_term_saved & ~6UL) : gardel_term_saved);
+    gardel_term_is_raw = raw;
+}
+static int gardel_read_byte(void) {
+    unsigned char b;
+    unsigned long got = 0;
+    if (!ReadFile(gardel_term_in, &b, 1, &got, NULL) || got == 0) return -1;
+    return b;
+}
+static bool gardel_byte_soon(void) { return false; }
+struct gardel_console_key {
+    unsigned short type, pad;
+    int down;
+    unsigned short repeat, vk, scan;
+    wchar_t ch;
+    unsigned long state;
+};
+static void gardel_read_console_key(struct gardel_host_event* ev) {
+    uint32_t high = 0;
+    for (;;) {
+        struct gardel_console_key k;
+        unsigned long got = 0;
+        if (!ReadConsoleInputW(gardel_term_in, &k, 1, &got) || got == 0) {
+            ev->key = GARDEL_KEY_END_OF_INPUT;
+            return;
+        }
+        if (k.type != 1 || !k.down) continue;
+        switch (k.vk) {
+            case 0x25: ev->key = GARDEL_KEY_LEFT; return;
+            case 0x26: ev->key = GARDEL_KEY_UP; return;
+            case 0x27: ev->key = GARDEL_KEY_RIGHT; return;
+            case 0x28: ev->key = GARDEL_KEY_DOWN; return;
+            case 0x0D: ev->key = GARDEL_KEY_ENTER; return;
+            case 0x1B: ev->key = GARDEL_KEY_ESCAPE; return;
+            case 0x08: ev->key = GARDEL_KEY_BACKSPACE; return;
+            case 0x09: ev->key = GARDEL_KEY_TAB; return;
+            default: break;
+        }
+        uint32_t c = (uint32_t)k.ch;
+        if (c == 0) {
+            /* Shift, Ctrl, Alt and Caps Lock alone are not keys of their own. */
+            if ((k.vk >= 0x10 && k.vk <= 0x12) || k.vk == 0x14 || (k.vk >= 0xA0 && k.vk <= 0xA5)) continue;
+            ev->key = GARDEL_KEY_OTHER;
+            return;
+        }
+        if (c >= 0xD800 && c <= 0xDBFF) {
+            high = c;
+            continue;
+        }
+        if (c >= 0xDC00 && c <= 0xDFFF) {
+            if (!high) {
+                ev->key = GARDEL_KEY_OTHER;
+                return;
+            }
+            c = 0x10000 + ((high - 0xD800) << 10) + (c - 0xDC00);
+        }
+        ev->key = c < 32 ? GARDEL_KEY_OTHER : GARDEL_KEY_CHAR;
+        ev->ch = c;
+        return;
+    }
+}
+#else
+#include <arpa/inet.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <netinet/in.h>
+#include <poll.h>
+#include <pthread.h>
+#include <signal.h>
+#include <sys/socket.h>
+#include <termios.h>
+#include <time.h>
+#include <unistd.h>
+typedef int gardel_sock;
+#define gardel_pollfd pollfd
+#define GARDEL_NO_SOCK (-1)
+#define GARDEL_POLLIN POLLIN
+#define GARDEL_POLLOUT POLLOUT
+#define GARDEL_POLL_BASE 2 /* the wake pipes come first */
+#define GARDEL_ERR_INVALID EINVAL
+#define GARDEL_ERR_NO_BUFFERS ENOBUFS
+/* What the last pass over the sockets watched, after the two wake pipes. */
+static struct pollfd* gardel_pfds = NULL;
+static size_t gardel_poll_count = 0;
+/* A peer that closed must end as an error on this send, not end the process. */
+static bool gardel_sock_start(void) {
+    signal(SIGPIPE, SIG_IGN);
+    return true;
+}
+static int gardel_sock_error(void) { return errno; }
+static bool gardel_sock_again(int err) { return err == EAGAIN || err == EWOULDBLOCK || err == EINTR; }
+static bool gardel_sock_client_gone(int err) { return err == ECONNABORTED || err == ECONNRESET || err == EPROTO; }
+static gardel_sock gardel_sock_tcp(void) { return socket(AF_INET, SOCK_STREAM, 0); }
+static uint32_t gardel_sock_ipv4(const char* text) { return (uint32_t)inet_addr(text); }
+/* SO_REUSEADDR: a server restarted at once can have its port back. */
+static bool gardel_sock_bind(gardel_sock s, uint64_t port, uint32_t ip) {
+    int on = 1;
+    struct sockaddr_in a;
+    setsockopt(s, SOL_SOCKET, SO_REUSEADDR, &on, sizeof on);
+    memset(&a, 0, sizeof a);
+    a.sin_family = AF_INET;
+    a.sin_port = htons((uint16_t)port);
+    a.sin_addr.s_addr = ip;
+    return bind(s, (const struct sockaddr*)&a, sizeof a) == 0 && listen(s, 128) == 0;
+}
+static gardel_sock gardel_sock_accept(gardel_sock s) { return accept(s, NULL, NULL); }
+static void gardel_sock_watch(gardel_sock s, bool listener) {
+    (void)listener;
+    int flags = fcntl(s, F_GETFL, 0);
+    if (flags < 0 || fcntl(s, F_SETFL, flags | O_NONBLOCK) != 0) abort();
+}
+static long gardel_sock_recv(gardel_sock s, char* buf, size_t n) { return (long)recv(s, buf, n, 0); }
+static long gardel_sock_send(gardel_sock s, const char* buf, size_t n) { return (long)send(s, buf, n, 0); }
+static void gardel_sock_shutdown(gardel_sock s) { shutdown(s, SHUT_WR); }
+static void gardel_sock_close(gardel_sock s) { close(s); }
+static int gardel_sock_poll(struct gardel_pollfd* p, size_t n, int ms) { return poll(p, (nfds_t)n, ms); }
+static void gardel_sock_rearm(void) {}
+
+/* A self-pipe: the handler only writes a byte, and the loop waits with poll. */
+static int gardel_signal_pipe[2] = {-1, -1};
+static int gardel_input_pipe[2] = {-1, -1};
+static void gardel_on_signal(int sig) {
+    int saved = errno;
+    char c = (char)sig;
+    ssize_t ignored = write(gardel_signal_pipe[1], &c, 1);
+    (void)ignored;
+    errno = saved;
+}
+static void gardel_host_install(void) {
+    if (gardel_signal_pipe[0] != -1) return;
+    if (pipe(gardel_signal_pipe) != 0 || pipe(gardel_input_pipe) != 0) {
+        perror("gardel: pipe");
+        exit(2);
+    }
+    struct sigaction sa;
+    memset(&sa, 0, sizeof sa);
+    sa.sa_handler = gardel_on_signal;
+    sigemptyset(&sa.sa_mask);
+    sa.sa_flags = SA_RESTART;
+    sigaction(SIGINT, &sa, NULL);
+    sigaction(SIGTERM, &sa, NULL);
+}
+static void gardel_host_finished(void) {}
+static uint64_t gardel_host_now_ms(void) {
+    struct timespec t;
+    clock_gettime(CLOCK_MONOTONIC, &t);
+    return (uint64_t)t.tv_sec * 1000 + (uint64_t)t.tv_nsec / 1000000;
+}
+/* The pipe is never read, so a shutdown request stays visible and cannot be lost. */
+static void gardel_host_wait(uint64_t ms) {
+    struct pollfd wake[2] = { { gardel_signal_pipe[0], POLLIN, 0 }, { gardel_input_pipe[0], POLLIN, 0 } };
+    int timeout = ms > 0x3FFFFFFFULL ? 0x3FFFFFFF : (int)ms;
+    struct pollfd* p = wake;
+    size_t n = 2;
+    if (gardel_poll_count > 0) {
+        gardel_pfds[0] = wake[0];
+        gardel_pfds[1] = wake[1];
+        p = gardel_pfds;
+        n = GARDEL_POLL_BASE + gardel_poll_count;
+    }
+    if (poll(p, (nfds_t)n, timeout) < 0 && errno != EINTR) {
+        perror("gardel: poll");
+        exit(2);
+    }
+}
+static bool gardel_host_stop_pending(void) {
+    struct pollfd p = { gardel_signal_pipe[0], POLLIN, 0 };
+    return poll(&p, 1, 0) > 0;
+}
+static void gardel_input_signal(void) {
+    char c = 1;
+    ssize_t ignored = write(gardel_input_pipe[1], &c, 1);
+    (void)ignored;
+}
+static void gardel_input_clear(void) {
+    char c;
+    ssize_t ignored = read(gardel_input_pipe[0], &c, 1);
+    (void)ignored;
+}
+
+static pthread_mutex_t gardel_mutex = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t gardel_request_cv = PTHREAD_COND_INITIALIZER;
+static void gardel_lock(void) { pthread_mutex_lock(&gardel_mutex); }
+static void gardel_unlock(void) { pthread_mutex_unlock(&gardel_mutex); }
+static void gardel_request_wait(void) { pthread_cond_wait(&gardel_request_cv, &gardel_mutex); }
+static void gardel_request_wake(void) { pthread_cond_signal(&gardel_request_cv); }
+static void gardel_reader_main(void);
+static void* gardel_reader_entry(void* unused) {
+    (void)unused;
+    gardel_reader_main();
+    return NULL;
+}
+static void gardel_reader_start(void) {
+    pthread_t t;
+    /* Signals belong to the loop's self-pipe, not to this thread. */
+    sigset_t all, old;
+    sigfillset(&all);
+    pthread_sigmask(SIG_BLOCK, &all, &old);
+    if (pthread_create(&t, NULL, gardel_reader_entry, NULL) != 0) abort();
+    pthread_sigmask(SIG_SETMASK, &old, NULL);
+}
+
+/* The terminal. Ctrl-C stays a signal in raw mode (ISIG is kept). */
+static struct termios gardel_term_saved;
+static bool gardel_term_is_console = false, gardel_term_is_raw = false;
+static void gardel_term_open(void) {
+    gardel_term_is_console = isatty(0) && tcgetattr(0, &gardel_term_saved) == 0;
+}
+static void gardel_term_set_raw(bool raw) {
+    if (!gardel_term_is_console || raw == gardel_term_is_raw) return;
+    struct termios t = gardel_term_saved;
+    if (raw) {
+        t.c_lflag &= ~(tcflag_t)(ICANON | ECHO);
+        t.c_cc[VMIN] = 1;
+        t.c_cc[VTIME] = 0;
+    }
+    tcsetattr(0, TCSANOW, &t);
+    gardel_term_is_raw = raw;
+}
+static int gardel_read_byte(void) {
+    unsigned char b;
+    ssize_t n;
+    while ((n = read(0, &b, 1)) < 0 && errno == EINTR) {}
+    return n == 1 ? b : -1;
+}
+/* An escape sequence arrives at once; a lone Escape is followed by nothing. */
+static bool gardel_byte_soon(void) {
+    struct pollfd p = { 0, POLLIN, 0 };
+    return poll(&p, 1, 50) > 0;
+}
+#endif
+
+/* Pending one-shot timers. Fired in deadline order, and in setting order on a tie. */
+struct gardel_timer { uint64_t id, deadline, seq; };
+static struct gardel_timer* gardel_timers = NULL;
+static size_t gardel_timer_count = 0, gardel_timer_cap = 0;
+static uint64_t gardel_timer_seq = 0;
+
+/* A pending timer with the same id is replaced. Scripted runs deliver Tick themselves, so
+   they do not depend on the clock. */
+static void gardel_host_set_timer(uint64_t id, uint64_t millis) {
+    if (gardel_host_script) return;
+    uint64_t now = gardel_host_now_ms();
+    uint64_t deadline = millis > UINT64_MAX - now ? UINT64_MAX : now + millis;
+    size_t i = 0;
+    while (i < gardel_timer_count && gardel_timers[i].id != id) i++;
+    if (i == gardel_timer_count) {
+        if (gardel_timer_count == gardel_timer_cap) {
+            gardel_timer_cap = gardel_timer_cap ? gardel_timer_cap * 2 : 8;
+            gardel_timers = (struct gardel_timer*)realloc(gardel_timers, gardel_timer_cap * sizeof *gardel_timers);
+            if (!gardel_timers) abort();
+        }
+        gardel_timer_count++;
+    }
+    gardel_timers[i] = (struct gardel_timer){ id, deadline, gardel_timer_seq++ };
+}
+
+/* Blocking input runs on one reader thread, so that a command never blocks the loop (spec
+   11.6, rule 5). Requests are served in order, and each answer is queued for the loop. */
+struct gardel_request { bool is_key; struct gardel_request* next; };
+struct gardel_answer { struct gardel_host_event ev; struct gardel_answer* next; };
+static struct gardel_request* gardel_requests = NULL;
+static struct gardel_request** gardel_requests_end = &gardel_requests;
+static struct gardel_answer* gardel_answers = NULL;
+static struct gardel_answer** gardel_answers_end = &gardel_answers;
+static bool gardel_reader_started = false;
+static int gardel_pending_answers = 0;
+
+static void gardel_keep_line(struct gardel_host_event* ev, const char* buf, size_t len) {
+    if (!gardel_log_capture) return;
+    ev->raw = (char*)malloc(len + 1);
+    if (!ev->raw) abort();
+    memcpy(ev->raw, buf, len);
+    ev->raw_len = len;
+}
+
+/* Every exit path: after Stop, after a shutdown, and through exit(). */
+static void gardel_term_restore(void) { gardel_term_set_raw(false); }
+
+static void gardel_host_request_input(bool is_key) {
+    if (gardel_host_script) return;
+    struct gardel_request* r = (struct gardel_request*)malloc(sizeof *r);
+    if (!r) abort();
+    r->is_key = is_key;
+    r->next = NULL;
+    if (!gardel_reader_started) {
+        gardel_reader_started = true;
+        gardel_term_open();
+        atexit(gardel_term_restore);
+        gardel_reader_start();
+    }
+    gardel_lock();
+    *gardel_requests_end = r;
+    gardel_requests_end = &r->next;
+    gardel_request_wake();
+    gardel_unlock();
+}
+
+/* One Unicode scalar from its lead byte. A malformed sequence is Other, so that a Char always
+   holds a valid CHAR (spec 3): these bytes are untrusted. */
+static void gardel_decode_key_byte(int b, struct gardel_host_event* ev) {
+    ev->key = GARDEL_KEY_OTHER;
+    if (b < 0) { ev->key = GARDEL_KEY_END_OF_INPUT; return; }
+    if (b == '\n' || b == '\r') { ev->key = GARDEL_KEY_ENTER; return; }
+    if (b == '\t') { ev->key = GARDEL_KEY_TAB; return; }
+    if (b == 8 || b == 127) { ev->key = GARDEL_KEY_BACKSPACE; return; }
+    if (b == 27) {
+        ev->key = GARDEL_KEY_ESCAPE;
+        if (!gardel_byte_soon()) return;
+        int c = gardel_read_byte();
+        ev->key = GARDEL_KEY_OTHER;
+        if (c != '[' && c != 'O') return;
+        c = gardel_read_byte();
+        switch (c) {
+            case 'A': ev->key = GARDEL_KEY_UP; return;
+            case 'B': ev->key = GARDEL_KEY_DOWN; return;
+            case 'C': ev->key = GARDEL_KEY_RIGHT; return;
+            case 'D': ev->key = GARDEL_KEY_LEFT; return;
+            default: break;
+        }
+        /* Skip the rest of a longer sequence, such as ESC [ 3 ~. */
+        while (c >= '0' && c <= ';') c = gardel_read_byte();
+        return;
+    }
+    if (b < 32) return;
+    if (b < 128) { ev->key = GARDEL_KEY_CHAR; ev->ch = (uint32_t)b; return; }
+    int extra = b >= 0xF0 ? 3 : b >= 0xE0 ? 2 : b >= 0xC0 ? 1 : -1;
+    if (extra < 0 || b > 0xF4) return;
+    uint32_t c = (uint32_t)b & (0x3Fu >> extra);
+    for (int i = 0; i < extra; i++) {
+        int n = gardel_read_byte();
+        if (n < 0x80 || n > 0xBF) return;
+        c = (c << 6) | ((uint32_t)n & 0x3F);
+    }
+    static const uint32_t least[4] = { 0, 0x80, 0x800, 0x10000 };
+    if (c < least[extra] || c > 0x10FFFF || (c >= 0xD800 && c <= 0xDFFF)) return;
+    ev->key = GARDEL_KEY_CHAR;
+    ev->ch = c;
+}
+
+static void gardel_read_key(struct gardel_host_event* ev) {
+#ifdef _WIN32
+    if (gardel_term_is_console) {
+        gardel_read_console_key(ev);
+        return;
+    }
+#endif
+    gardel_decode_key_byte(gardel_read_byte(), ev);
+}
+
+static void gardel_reader_main(void) {
+    for (;;) {
+        gardel_lock();
+        while (!gardel_requests) gardel_request_wait();
+        struct gardel_request* r = gardel_requests;
+        gardel_requests = r->next;
+        if (!gardel_requests) gardel_requests_end = &gardel_requests;
+        gardel_unlock();
+        struct gardel_answer* a = (struct gardel_answer*)calloc(1, sizeof *a);
+        if (!a) abort();
+        gardel_term_set_raw(r->is_key);
+        if (r->is_key) {
+            a->ev.kind = GARDEL_HOST_KEY;
+            gardel_read_key(&a->ev);
+        } else {
+            char* buf = NULL;
+            size_t len = 0;
+            a->ev.kind = GARDEL_HOST_LINE;
+            a->ev.line_state = gardel_line_read(&buf, &len, &a->ev.err);
+            if (a->ev.line_state == GARDEL_LINE_READ) gardel_keep_line(&a->ev, buf, len);
+            a->ev.line = gardel_line_value(a->ev.line_state, buf, len, a->ev.err);
+        }
+        free(r);
+        gardel_lock();
+        *gardel_answers_end = a;
+        gardel_answers_end = &a->next;
+        gardel_pending_answers++;
+        gardel_input_signal();
+        gardel_unlock();
+    }
+}
+
+static bool gardel_take_answer(struct gardel_host_event* ev) {
+    if (!gardel_reader_started) return false;
+    gardel_lock();
+    struct gardel_answer* a = gardel_answers;
+    if (a) {
+        gardel_answers = a->next;
+        if (!gardel_answers) gardel_answers_end = &gardel_answers;
+#ifdef _WIN32
+        if (--gardel_pending_answers == 0) gardel_input_clear();
+#else
+        gardel_pending_answers--;
+        gardel_input_clear();
+#endif
+    }
+    gardel_unlock();
+    if (!a) return false;
+    *ev = a->ev;
+    free(a);
+    return true;
+}
+
+/* Sockets (spec 11.6). A read happens when its event is delivered, never before: there is no
+   buffered Received to outlive a Close, and every ready socket gets a turn per pass, so one busy
+   client cannot starve the others. A command never blocks: what the kernel will not take now
+   waits in the connection's queue.
+
+   The handle guarantees of spec 11.6 come from here. Ids only grow, so each comes from exactly
+   one Accepted. A connection leaves the table when its Closed is queued, and a command naming
+   an id no longer in the table does nothing, so no event mentions an id after its Closed. */
+#define GARDEL_NET_READ 65536
+#define GARDEL_NET_PAUSE 65536       /* queued bytes at which a connection stops being read */
+#define GARDEL_NET_QUEUE_MAX 1048576 /* queued bytes at which a Send fails */
+#define GARDEL_NET_LINGER_MS 5000    /* how long a closing peer may take no data */
+#define GARDEL_NET_EXIT_MS 1000      /* how long Stop waits for queued data */
+#define GARDEL_NET_RETRY_MS 100      /* pause of a listener that cannot accept, say out of files */
+
+struct gardel_listener { gardel_sock fd; uint64_t retry_at; };
+struct gardel_conn {
+    uint64_t id;
+    gardel_sock fd;
+    char* out;
+    size_t out_off, out_len, out_cap;
+    bool closing;       /* Close ran: send what is queued, then Closed */
+    bool peer_ended;    /* the peer sent all it will: the same, but Send still works */
+    uint64_t deadline;  /* of a connection ending, moved by each byte the peer takes */
+};
+struct gardel_poll_entry { uint64_t conn; size_t listener; }; /* conn 0 is a listener */
+
+static struct gardel_listener* gardel_listeners = NULL;
+static size_t gardel_listener_count = 0, gardel_listener_cap = 0;
+static struct gardel_conn* gardel_conns = NULL; /* sorted by id: new ids are the largest */
+static size_t gardel_conn_count = 0, gardel_conn_cap = 0;
+static uint64_t gardel_next_conn = 1;
+static struct gardel_answer* gardel_net_queue = NULL; /* failures and Closed, in order */
+static struct gardel_answer** gardel_net_queue_end = &gardel_net_queue;
+static struct gardel_poll_entry* gardel_poll_entries = NULL;
+static size_t gardel_entry_cap = 0, gardel_pfd_cap = 0, gardel_poll_next = 0;
+static bool gardel_net_turn = false, gardel_net_exiting = false;
+static char gardel_net_buf[GARDEL_NET_READ];
+
+static void* gardel_grow(void* p, size_t* cap, size_t need, size_t item) {
+    if (need <= *cap) return p;
+    size_t c = *cap ? *cap : 8;
+    while (c < need) c *= 2;
+    p = realloc(p, c * item);
+    if (!p) abort();
+    *cap = c;
+    return p;
+}
+
+static GardelBytes gardel_bytes_copy(const void* src, size_t n) {
+    void* owner = NULL;
+    char* buf = gardel_buf_alloc(n + 1, &owner);
+    memcpy(buf, src, n);
+    buf[n] = '\0';
+    GardelBytes b = { (const uint8_t*)buf, (uint64_t)n, owner };
+    return b;
+}
+
+static void gardel_net_push(enum gardel_host_kind kind, uint64_t id, int64_t err) {
+    struct gardel_answer* a = (struct gardel_answer*)calloc(1, sizeof *a);
+    if (!a) abort();
+    a->ev.kind = kind;
+    a->ev.id = id;
+    a->ev.err = err;
+    *gardel_net_queue_end = a;
+    gardel_net_queue_end = &a->next;
+}
+
+static bool gardel_net_pop(struct gardel_host_event* ev) {
+    struct gardel_answer* a = gardel_net_queue;
+    if (!a) return false;
+    gardel_net_queue = a->next;
+    if (!gardel_net_queue) gardel_net_queue_end = &gardel_net_queue;
+    *ev = a->ev;
+    free(a);
+    return true;
+}
+
+/* After Close(c), the only event left for c is Closed(c). */
+static void gardel_net_forget_failure(uint64_t id) {
+    struct gardel_answer** p = &gardel_net_queue;
+    while (*p) {
+        struct gardel_answer* a = *p;
+        if (a->ev.kind == GARDEL_HOST_SEND_FAILED && a->ev.id == id) {
+            *p = a->next;
+            free(a);
+        } else {
+            p = &a->next;
+        }
+    }
+    gardel_net_queue_end = p;
+}
+
+static struct gardel_conn* gardel_conn_find(uint64_t id) {
+    size_t lo = 0, hi = gardel_conn_count;
+    while (lo < hi) {
+        size_t mid = lo + (hi - lo) / 2;
+        if (gardel_conns[mid].id == id) return &gardel_conns[mid];
+        if (gardel_conns[mid].id < id) lo = mid + 1;
+        else hi = mid;
+    }
+    return NULL;
+}
+
+static bool gardel_conn_has_queue(const struct gardel_conn* c) { return c->out_off < c->out_len; }
+static bool gardel_conn_ending(const struct gardel_conn* c) { return c->closing || c->peer_ended; }
+
+/* Input that was never read would turn the close into a reset, and a reset can take back data
+   the peer has not read yet. */
+static void gardel_conn_remove(struct gardel_conn* c) {
+    gardel_sock_shutdown(c->fd);
+    for (int i = 0; i < 16 && gardel_sock_recv(c->fd, gardel_net_buf, GARDEL_NET_READ) > 0; i++) {}
+    gardel_sock_close(c->fd);
+    free(c->out);
+    size_t i = (size_t)(c - gardel_conns);
+    memmove(c, c + 1, (gardel_conn_count - i - 1) * sizeof *c);
+    gardel_conn_count--;
+}
+
+static void gardel_conn_ended(struct gardel_conn* c) {
+    gardel_net_push(GARDEL_HOST_CLOSED, c->id, 0);
+    gardel_conn_remove(c);
+}
+
+/* A failed send ends the connection, since the stream has a hole from there on. */
+static void gardel_conn_failed(struct gardel_conn* c, int err) {
+    if (!c->closing) gardel_net_push(GARDEL_HOST_SEND_FAILED, c->id, err);
+    gardel_conn_ended(c);
+}
+
+/* False when the connection is gone. */
+static bool gardel_conn_flush(struct gardel_conn* c) {
+    while (gardel_conn_has_queue(c)) {
+        long n = gardel_sock_send(c->fd, c->out + c->out_off, c->out_len - c->out_off);
+        if (n < 0) {
+            int err = gardel_sock_error();
+            if (gardel_sock_again(err)) return true;
+            gardel_conn_failed(c, err);
+            return false;
+        }
+        c->out_off += (size_t)n;
+        c->deadline = gardel_host_now_ms() + GARDEL_NET_LINGER_MS;
+    }
+    c->out_off = c->out_len = 0;
+    if (c->out_cap > GARDEL_NET_PAUSE) {
+        free(c->out);
+        c->out = NULL;
+        c->out_cap = 0;
+    }
+    return true;
+}
+
+/* A script has no sockets: the commands are written out, so a run can be checked. */
+static void gardel_trace_bytes(GardelBytes b) {
+    for (uint64_t i = 0; i < b.len; i++) {
+        unsigned char c = b.data[i];
+        bool plain = (c >= '0' && c <= '9') || (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z');
+        if (plain) fputc(c, stderr);
+        else fprintf(stderr, "%%%02X", c);
+    }
+}
+
+/* All interfaces are an opt-in, GARDEL_LISTEN_ADDR=0.0.0.0: a program that only says `Listen`
+   is not put on the network. */
+static void gardel_host_listen(uint64_t port) {
+    if (gardel_host_script) {
+        fprintf(stderr, "net: Listen %llu\n", (unsigned long long)port);
+        return;
+    }
+    /* Port 0 would be a port the program can never learn. */
+    if (port == 0 || port > 65535) {
+        gardel_net_push(GARDEL_HOST_LISTEN_FAILED, port, GARDEL_ERR_INVALID);
+        return;
+    }
+    if (!gardel_sock_start()) {
+        gardel_net_push(GARDEL_HOST_LISTEN_FAILED, port, GARDEL_ERR_NO_BUFFERS);
+        return;
+    }
+    const char* addr = getenv("GARDEL_LISTEN_ADDR");
+    uint32_t ip = gardel_sock_ipv4(addr ? addr : "127.0.0.1");
+    if (ip == 0xFFFFFFFFu) {
+        gardel_net_push(GARDEL_HOST_LISTEN_FAILED, port, GARDEL_ERR_INVALID);
+        return;
+    }
+    gardel_sock s = gardel_sock_tcp();
+    if (s == GARDEL_NO_SOCK || !gardel_sock_bind(s, port, ip)) {
+        int err = gardel_sock_error();
+        if (s != GARDEL_NO_SOCK) gardel_sock_close(s);
+        gardel_net_push(GARDEL_HOST_LISTEN_FAILED, port, err);
+        return;
+    }
+    gardel_sock_watch(s, true);
+    gardel_listeners = (struct gardel_listener*)gardel_grow(gardel_listeners, &gardel_listener_cap, gardel_listener_count + 1, sizeof *gardel_listeners);
+    gardel_listeners[gardel_listener_count++] = (struct gardel_listener){ s, 0 };
+}
+
+static void gardel_host_send(uint64_t id, GardelBytes data) {
+    if (gardel_host_script) {
+        fprintf(stderr, "net: Send %llu ", (unsigned long long)id);
+        gardel_trace_bytes(data);
+        fprintf(stderr, "\n");
+        return;
+    }
+    struct gardel_conn* c = gardel_conn_find(id);
+    if (!c || c->closing || data.len == 0) return;
+    size_t queued = c->out_len - c->out_off;
+    if (queued >= GARDEL_NET_QUEUE_MAX) {
+        gardel_conn_failed(c, GARDEL_ERR_NO_BUFFERS);
+        return;
+    }
+    if (c->out_off > 0) {
+        memmove(c->out, c->out + c->out_off, queued);
+        c->out_off = 0;
+        c->out_len = queued;
+    }
+    c->out = (char*)gardel_grow(c->out, &c->out_cap, queued + (size_t)data.len, 1);
+    memcpy(c->out + queued, data.data, (size_t)data.len);
+    c->out_len = queued + (size_t)data.len;
+    /* With data already queued the kernel is full, and the socket will say when it is not. */
+    if (queued == 0) gardel_conn_flush(c);
+}
+
+static void gardel_host_close(uint64_t id) {
+    if (gardel_host_script) {
+        fprintf(stderr, "net: Close %llu\n", (unsigned long long)id);
+        return;
+    }
+    gardel_net_forget_failure(id);
+    struct gardel_conn* c = gardel_conn_find(id);
+    if (!c || c->closing) return;
+    c->closing = true;
+    if (gardel_conn_has_queue(c)) c->deadline = gardel_host_now_ms() + GARDEL_NET_LINGER_MS;
+    else gardel_conn_ended(c);
+}
+
+/* What the next pass watches: every listener not pausing, and each connection for what it can
+   take. A connection with a long queue is not read: a client that sends and never reads then
+   fills its own TCP window, and not this process. */
+static void gardel_net_build(uint64_t now) {
+    size_t want = gardel_listener_count + gardel_conn_count;
+    gardel_poll_entries = (struct gardel_poll_entry*)gardel_grow(gardel_poll_entries, &gardel_entry_cap, want + 1, sizeof *gardel_poll_entries);
+    gardel_pfds = (struct gardel_pollfd*)gardel_grow(gardel_pfds, &gardel_pfd_cap, want + 1 + GARDEL_POLL_BASE, sizeof *gardel_pfds);
+    gardel_poll_count = 0;
+    for (size_t i = 0; i < gardel_listener_count; i++) {
+        if (gardel_listeners[i].retry_at > now) continue;
+        gardel_pfds[GARDEL_POLL_BASE + gardel_poll_count] = (struct gardel_pollfd){ gardel_listeners[i].fd, GARDEL_POLLIN, 0 };
+        gardel_poll_entries[gardel_poll_count++] = (struct gardel_poll_entry){ 0, i };
+    }
+    for (size_t i = 0; i < gardel_conn_count; i++) {
+        const struct gardel_conn* c = &gardel_conns[i];
+        short events = gardel_conn_has_queue(c) ? GARDEL_POLLOUT : 0;
+        if (!gardel_net_exiting && !gardel_conn_ending(c) && c->out_len - c->out_off < GARDEL_NET_PAUSE) events |= GARDEL_POLLIN;
+        gardel_pfds[GARDEL_POLL_BASE + gardel_poll_count] = (struct gardel_pollfd){ c->fd, events, 0 };
+        gardel_poll_entries[gardel_poll_count++] = (struct gardel_poll_entry){ c->id, 0 };
+    }
+}
+
+/* One pass: true when some socket is ready. */
+static bool gardel_net_poll(void) {
+    gardel_poll_next = gardel_poll_count = 0;
+    gardel_sock_rearm();
+    if (gardel_listener_count + gardel_conn_count == 0) return false;
+    uint64_t now = gardel_host_now_ms();
+    for (size_t i = gardel_conn_count; i-- > 0;) {
+        struct gardel_conn* c = &gardel_conns[i];
+        if (gardel_conn_ending(c) && c->deadline <= now) gardel_conn_ended(c);
+    }
+    gardel_net_build(now);
+    if (gardel_poll_count == 0) return false;
+    int ready = gardel_sock_poll(gardel_pfds + GARDEL_POLL_BASE, gardel_poll_count, 0);
+    if (ready < 0 && !gardel_sock_again(gardel_sock_error())) {
+        fprintf(stderr, "gardel: poll on sockets failed: %d\n", gardel_sock_error());
+        exit(2);
+    }
+    if (ready > 0) return true;
+    gardel_poll_next = gardel_poll_count;
+    return false;
+}
+
+static bool gardel_net_accept(size_t i, struct gardel_host_event* ev) {
+    gardel_sock s = gardel_sock_accept(gardel_listeners[i].fd);
+    if (s == GARDEL_NO_SOCK) {
+        /* The listener stays ready while there is no file to accept with, so it must rest. */
+        int err = gardel_sock_error();
+        if (!gardel_sock_again(err) && !gardel_sock_client_gone(err)) {
+            gardel_listeners[i].retry_at = gardel_host_now_ms() + GARDEL_NET_RETRY_MS;
+        }
+        return false;
+    }
+    gardel_sock_watch(s, false);
+    gardel_conns = (struct gardel_conn*)gardel_grow(gardel_conns, &gardel_conn_cap, gardel_conn_count + 1, sizeof *gardel_conns);
+    memset(&gardel_conns[gardel_conn_count], 0, sizeof *gardel_conns);
+    gardel_conns[gardel_conn_count].id = gardel_next_conn++;
+    gardel_conns[gardel_conn_count].fd = s;
+    ev->kind = GARDEL_HOST_ACCEPTED;
+    ev->id = gardel_conns[gardel_conn_count].id;
+    gardel_conn_count++;
+    return true;
+}
+
+/* Serves one socket of the pass. Sends go first, since a read can only add to the queue. */
+static bool gardel_net_serve(size_t i, struct gardel_host_event* ev) {
+    if (gardel_pfds[GARDEL_POLL_BASE + i].revents == 0) return false;
+    struct gardel_poll_entry e = gardel_poll_entries[i];
+    if (e.conn == 0) return gardel_net_accept(e.listener, ev);
+    /* Commands ran since the pass: this one may have gone, or be closing. */
+    struct gardel_conn* c = gardel_conn_find(e.conn);
+    if (!c || !gardel_conn_flush(c)) return false;
+    if (gardel_conn_ending(c)) {
+        if (!gardel_conn_has_queue(c)) gardel_conn_ended(c);
+        return false;
+    }
+    if (c->out_len - c->out_off >= GARDEL_NET_PAUSE) return false;
+    long n = gardel_sock_recv(c->fd, gardel_net_buf, GARDEL_NET_READ);
+    if (n > 0) {
+        ev->kind = GARDEL_HOST_RECEIVED;
+        ev->id = c->id;
+        ev->data = gardel_bytes_copy(gardel_net_buf, (size_t)n);
+        return true;
+    }
+    if (n == 0) {
+        /* What is still queued can reach a peer that only closed its sending side. */
+        c->peer_ended = true;
+        if (gardel_conn_has_queue(c)) c->deadline = gardel_host_now_ms() + GARDEL_NET_LINGER_MS;
+        else gardel_conn_ended(c);
+        return false;
+    }
+    if (!gardel_sock_again(gardel_sock_error())) gardel_conn_ended(c);
+    return false;
+}
+
+static bool gardel_net_take(struct gardel_host_event* ev) {
+    for (;;) {
+        if (gardel_net_pop(ev)) return true;
+        if (gardel_poll_next >= gardel_poll_count) {
+            bool ready = gardel_net_poll();
+            if (gardel_net_pop(ev)) return true;
+            if (!ready) return false;
+        }
+        if (gardel_net_serve(gardel_poll_next++, ev)) return true;
+    }
+}
+
+/* The longest wait that misses no deadline of the sockets. */
+static uint64_t gardel_net_wait_limit(uint64_t ms) {
+    uint64_t now = gardel_host_now_ms();
+    for (size_t i = 0; i < gardel_listener_count; i++) {
+        uint64_t at = gardel_listeners[i].retry_at;
+        if (at > now && at - now < ms) ms = at - now;
+    }
+    for (size_t i = 0; i < gardel_conn_count; i++) {
+        const struct gardel_conn* c = &gardel_conns[i];
+        if (!gardel_conn_ending(c)) continue;
+        uint64_t left = c->deadline > now ? c->deadline - now : 0;
+        if (left < ms) ms = left;
+    }
+    return ms;
+}
+
+/* After Stop: its commands ran, so what they queued gets a moment to leave. */
+static void gardel_net_finish(void) {
+    uint64_t end = gardel_host_now_ms() + GARDEL_NET_EXIT_MS;
+    while (gardel_listener_count > 0) gardel_sock_close(gardel_listeners[--gardel_listener_count].fd);
+    gardel_net_exiting = true;
+    for (;;) {
+        bool pending = false;
+        for (size_t i = gardel_conn_count; i-- > 0;) {
+            struct gardel_conn* c = &gardel_conns[i];
+            if (gardel_conn_has_queue(c) && gardel_conn_flush(c) && gardel_conn_has_queue(c)) pending = true;
+        }
+        uint64_t now = gardel_host_now_ms();
+        if (!pending || now >= end) break;
+        gardel_net_build(now);
+        gardel_sock_poll(gardel_pfds + GARDEL_POLL_BASE, gardel_poll_count, (int)(end - now));
+    }
+    gardel_net_exiting = false;
+    while (gardel_conn_count > 0) gardel_conn_remove(&gardel_conns[gardel_conn_count - 1]);
+    struct gardel_host_event ev;
+    while (gardel_net_pop(&ev)) {
+        if (ev.kind == GARDEL_HOST_RECEIVED) gardel_bytes_drop(ev.data);
+    }
+    gardel_poll_next = gardel_poll_count = 0;
+}
+
+static int gardel_hex_digit(char c) {
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+    return -1;
+}
+
+/* Decimal digits of a script token, from `*i`. */
+static bool gardel_script_number(const char* name, size_t n, size_t* i, uint64_t* out) {
+    size_t start = *i;
+    uint64_t v = 0;
+    while (*i < n && name[*i] >= '0' && name[*i] <= '9') {
+        uint64_t d = (uint64_t)(name[*i] - '0');
+        if (v > (UINT64_MAX - d) / 10) return false;
+        v = v * 10 + d;
+        (*i)++;
+    }
+    *out = v;
+    return *i > start;
+}
+
+/* The text of a script token from `i`, with %XX for a byte: a space cannot be written otherwise,
+   and neither can bad UTF-8. NULL on a bad escape. */
+static char* gardel_script_text(const char* name, size_t n, size_t i, size_t* len) {
+    char* buf = (char*)malloc(n + 1);
+    if (!buf) abort();
+    *len = 0;
+    while (i < n) {
+        if (name[i] != '%') {
+            buf[(*len)++] = name[i++];
+            continue;
+        }
+        int hi = i + 2 < n ? gardel_hex_digit(name[i + 1]) : -1;
+        int lo = i + 2 < n ? gardel_hex_digit(name[i + 2]) : -1;
+        if (hi < 0 || lo < 0) {
+            free(buf);
+            return NULL;
+        }
+        buf[(*len)++] = (char)(hi * 16 + lo);
+        i += 3;
+    }
+    return buf;
+}
+
+static const struct { const char* name; enum gardel_host_key key; } gardel_key_names[] = {
+    {"Up", GARDEL_KEY_UP}, {"Down", GARDEL_KEY_DOWN}, {"Left", GARDEL_KEY_LEFT},
+    {"Right", GARDEL_KEY_RIGHT}, {"Enter", GARDEL_KEY_ENTER}, {"Escape", GARDEL_KEY_ESCAPE},
+    {"Backspace", GARDEL_KEY_BACKSPACE}, {"Tab", GARDEL_KEY_TAB}, {"Other", GARDEL_KEY_OTHER},
+    {"KeysEnded", GARDEL_KEY_END_OF_INPUT},
+};
+
+/* The event log (spec 11.6). GARDEL_RECORD writes one, and GARDEL_REPLAY runs one through the
+   scripted source. Lines in order of occurrence, each text %XX-escaped so that a line is a line:
+
+       gardel-log 1 ECHO_SERVER
+       arg some%20argument
+       command Listen:8888
+       event Accepted:1
+       event Received:1:hi
+       command Send:1:hi
+       exit 0
+
+   Events are what makes a run repeatable, and the commands and the exit code are what a replay
+   checks. A log ends wherever its program was killed, so a last line with no line break is
+   dropped, and a replay that runs out of log gets the `Shutdown` of a script's end. */
+#define GARDEL_LOG_VERSION "1"
+#define GARDEL_REPLAY_DIVERGED 3
+static FILE* gardel_log_file = NULL;
+static char* gardel_log_line = NULL;
+static size_t gardel_log_len = 0, gardel_log_cap = 0;
+static bool gardel_replaying = false, gardel_replay_cut = false;
+static const char* gardel_replay_pos = NULL;
+static const char* gardel_replay_end = NULL;
+static uint64_t gardel_replay_line_no = 0;
+
+static bool gardel_log_active(void) { return gardel_log_file || gardel_replaying; }
+
+static void gardel_log_put(const char* s, size_t n) {
+    gardel_log_line = (char*)gardel_grow(gardel_log_line, &gardel_log_cap, gardel_log_len + n + 1, 1);
+    memcpy(gardel_log_line + gardel_log_len, s, n);
+    gardel_log_len += n;
+}
+static void gardel_log_word(const char* s) { gardel_log_put(s, strlen(s)); }
+static void gardel_log_number(uint64_t v) {
+    char t[24];
+    gardel_log_put(t, (size_t)snprintf(t, sizeof t, "%llu", (unsigned long long)v));
+}
+static void gardel_log_text(const void* data, uint64_t n) {
+    static const char hex[] = "0123456789ABCDEF";
+    const unsigned char* p = (const unsigned char*)data;
+    gardel_log_line = (char*)gardel_grow(gardel_log_line, &gardel_log_cap, gardel_log_len + 3 * (size_t)n + 1, 1);
+    char* w = gardel_log_line + gardel_log_len;
+    for (uint64_t i = 0; i < n; i++) {
+        unsigned char c = p[i];
+        if ((c >= '0' && c <= '9') || (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z')) {
+            *w++ = (char)c;
+        } else {
+            *w++ = '%';
+            *w++ = hex[c >> 4];
+            *w++ = hex[c & 15];
+        }
+    }
+    gardel_log_len = (size_t)(w - gardel_log_line);
+}
+
+/* A full disk is no reason to end a server. What was written is a good log of a run cut short. */
+static void gardel_log_lost(void) {
+    fprintf(stderr, "warning: GARDEL_RECORD: cannot write the log, so recording stops here\n");
+    fclose(gardel_log_file);
+    gardel_log_file = NULL;
+}
+
+/* The next line of the log. False once it has run out, which a replay says once. */
+static bool gardel_replay_next(const char** line, size_t* n) {
+    size_t left = (size_t)(gardel_replay_end - gardel_replay_pos);
+    const char* eol = left ? (const char*)memchr(gardel_replay_pos, '\n', left) : NULL;
+    if (!eol) {
+        if (!gardel_replay_cut) fprintf(stderr, "replay: the log ends before the run does, so the rest is not checked\n");
+        gardel_replay_cut = true;
+        return false;
+    }
+    *line = gardel_replay_pos;
+    *n = (size_t)(eol - gardel_replay_pos);
+    gardel_replay_pos = eol + 1;
+    gardel_replay_line_no++;
+    return true;
+}
+
+static void gardel_replay_show(const char* label, const char* s, size_t n) {
+    fprintf(stderr, "  %s %.*s%s\n", label, (int)(n > 120 ? 120 : n), s, n > 120 ? "..." : "");
+}
+static void gardel_replay_diverged(const char* line, size_t n, const char* run, size_t run_n) {
+    fflush(stdout);
+    fprintf(stderr, "error: replay: the run differs from the log at line %llu\n", (unsigned long long)gardel_replay_line_no);
+    gardel_replay_show("log:", line, n);
+    gardel_replay_show("run:", run, run_n);
+    exit(GARDEL_REPLAY_DIVERGED);
+}
+
+/* The line just built: written when recording, and compared with the log when replaying. */
+static void gardel_log_finish(bool flush) {
+    if (gardel_log_file) {
+        gardel_log_put("\n", 1);
+        if (fwrite(gardel_log_line, 1, gardel_log_len, gardel_log_file) != gardel_log_len
+            || (flush && fflush(gardel_log_file) != 0)) gardel_log_lost();
+    } else if (gardel_replaying) {
+        const char* line;
+        size_t n;
+        if (gardel_replay_next(&line, &n) && (n != gardel_log_len || memcmp(line, gardel_log_line, n) != 0)) {
+            gardel_replay_diverged(line, n, gardel_log_line, gardel_log_len);
+        }
+    }
+    gardel_log_len = 0;
+}
+
+/* After a batch of commands, before the wait. */
+static void gardel_log_flush(void) {
+    if (gardel_log_file && fflush(gardel_log_file) != 0) gardel_log_lost();
+}
+
+static void gardel_log_refused(const char* source, const char* what) {
+    fprintf(stderr, "error: %s: %s\n", source, what);
+    exit(2);
+}
+
+static FILE* gardel_log_create(const char* path) {
+#ifdef _WIN32
+    return fopen(path, "wb");
+#else
+    /* A log holds what clients sent and what was typed, so it is the owner's alone. */
+    int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+    return fd < 0 ? NULL : fdopen(fd, "wb");
+#endif
+}
+
+static char* gardel_log_load(const char* path, size_t* len) {
+    FILE* f = fopen(path, "rb");
+    if (!f) return NULL;
+    size_t cap = 65536, n = 0, got;
+    char* buf = (char*)malloc(cap);
+    if (!buf) abort();
+    while ((got = fread(buf + n, 1, cap - n, f)) > 0) {
+        n += got;
+        if (n == cap) {
+            cap *= 2;
+            buf = (char*)realloc(buf, cap);
+            if (!buf) abort();
+        }
+    }
+    bool failed = ferror(f) != 0;
+    fclose(f);
+    if (failed) {
+        free(buf);
+        return NULL;
+    }
+    *len = n;
+    return buf;
+}
+
+/* A replay runs with the arguments of its run: they are an input like the events. */
+static void gardel_replay_args(int* argn, char*** argu) {
+    if (*argn > 1) gardel_log_refused("GARDEL_REPLAY", "a replay takes its arguments from the log");
+    int n = 1;
+    char** u = (char**)malloc(sizeof(char*));
+    if (!u) abort();
+    u[0] = NULL;
+    while (gardel_replay_end - gardel_replay_pos >= 4 && memcmp(gardel_replay_pos, "arg ", 4) == 0) {
+        const char* line;
+        size_t len, got;
+        if (!gardel_replay_next(&line, &len)) break;
+        char* text = gardel_script_text(line, len, 4, &got);
+        if (!text) gardel_log_refused("GARDEL_REPLAY", "an argument in the log is malformed");
+        text[got] = '\0';
+        u = (char**)realloc(u, sizeof(char*) * (size_t)(n + 1));
+        if (!u) abort();
+        u[n++] = text;
+    }
+    *argn = n;
+    *argu = u;
+}
+
+/* Before anything else that can be observed: `init` may already print. */
+static void gardel_log_start(const char* program, int* argn, char*** argu) {
+    const char* record = getenv("GARDEL_RECORD");
+    const char* replay = getenv("GARDEL_REPLAY");
+    if (replay && (record || gardel_host_script)) {
+        gardel_log_refused("GARDEL_REPLAY", "it cannot be used with GARDEL_RECORD or GARDEL_EVENTS");
+    }
+    gardel_log_word("gardel-log " GARDEL_LOG_VERSION " ");
+    gardel_log_word(program);
+    if (record) {
+        gardel_log_capture = true;
+        gardel_log_file = gardel_log_create(record);
+        if (!gardel_log_file) gardel_log_refused("GARDEL_RECORD", "cannot create the log");
+        gardel_log_finish(true);
+    } else if (replay) {
+        size_t len = 0;
+        char* text = gardel_log_load(replay, &len);
+        if (!text) gardel_log_refused("GARDEL_REPLAY", "cannot read the log");
+        const char* line;
+        size_t n;
+        gardel_replay_pos = text;
+        gardel_replay_end = text + len;
+        if (!gardel_replay_next(&line, &n) || n != gardel_log_len || memcmp(line, gardel_log_line, n) != 0) {
+            gardel_log_refused("GARDEL_REPLAY", "this is not a log of this program");
+        }
+        /* Scripted: timers, reads and sockets do not run. */
+        gardel_host_script = "";
+        gardel_event_source = "GARDEL_REPLAY";
+        gardel_replaying = true;
+        gardel_replay_args(argn, argu);
+    }
+    gardel_log_len = 0;
+}
+
+static void gardel_log_args(int argn, char** argu) {
+    if (!gardel_log_file) return;
+    for (int i = 1; i < argn; i++) {
+        gardel_log_word("arg ");
+        gardel_log_text(argu[i], strlen(argu[i]));
+        gardel_log_finish(false);
+    }
+}
+
+/* Called as an event is delivered, so the order in the log is the order `step` saw. The line
+   reaches the disk before `step` runs: the event that breaks a run is the one to keep. */
+static void gardel_log_event(struct gardel_host_event* ev) {
+    if (gardel_log_file) {
+        gardel_log_word("event ");
+        switch (ev->kind) {
+        case GARDEL_HOST_SHUTDOWN: gardel_log_word("Shutdown"); break;
+        case GARDEL_HOST_TICK: gardel_log_word("Tick:"); gardel_log_number(ev->id); break;
+        case GARDEL_HOST_LINE:
+            if (ev->line_state == GARDEL_LINE_ENDED) {
+                gardel_log_word("LineEnd");
+            } else if (ev->line_state == GARDEL_LINE_FAILED) {
+                gardel_log_word("LineFailed:");
+                gardel_log_number((uint64_t)ev->err);
+            } else {
+                gardel_log_word("Line:");
+                gardel_log_text(ev->raw, ev->raw_len);
+            }
+            break;
+        case GARDEL_HOST_KEY:
+            gardel_log_word("Key:");
+            if (ev->key == GARDEL_KEY_CHAR) {
+                gardel_log_number(ev->ch);
+            } else {
+                size_t k = 0;
+                while (gardel_key_names[k].key != ev->key) k++;
+                gardel_log_word(gardel_key_names[k].name);
+            }
+            break;
+        case GARDEL_HOST_ACCEPTED: gardel_log_word("Accepted:"); gardel_log_number(ev->id); break;
+        case GARDEL_HOST_CLOSED: gardel_log_word("Closed:"); gardel_log_number(ev->id); break;
+        case GARDEL_HOST_RECEIVED:
+            gardel_log_word("Received:");
+            gardel_log_number(ev->id);
+            gardel_log_word(":");
+            gardel_log_text(ev->data.data, ev->data.len);
+            break;
+        case GARDEL_HOST_LISTEN_FAILED:
+        case GARDEL_HOST_SEND_FAILED:
+            gardel_log_word(ev->kind == GARDEL_HOST_SEND_FAILED ? "SendFailed:" : "ListenFailed:");
+            gardel_log_number(ev->id);
+            gardel_log_word(":");
+            gardel_log_number((uint64_t)ev->err);
+            break;
+        default: abort();
+        }
+        gardel_log_finish(true);
+    }
+    free(ev->raw);
+    ev->raw = NULL;
+}
+
+static void gardel_log_exit(int code) {
+    if (!gardel_log_active()) return;
+    gardel_log_word("exit ");
+    gardel_log_number((uint32_t)code);
+    gardel_log_finish(true);
+    if (gardel_log_file && fclose(gardel_log_file) != 0) {
+        fprintf(stderr, "warning: GARDEL_RECORD: cannot finish the log\n");
+    }
+    gardel_log_file = NULL;
+}
+
+/* Socket tokens of a script: `Accepted:<id>`, `Closed:<id>`, `Received:<id>:<text>`,
+   `ListenFailed:<port>:<code>`, `SendFailed:<id>:<code>`. */
+static bool gardel_script_net(const char* name, size_t n, struct gardel_host_event* ev) {
+    static const struct { const char* name; enum gardel_host_kind kind; } kinds[] = {
+        {"Accepted:", GARDEL_HOST_ACCEPTED}, {"Closed:", GARDEL_HOST_CLOSED},
+        {"Received:", GARDEL_HOST_RECEIVED}, {"ListenFailed:", GARDEL_HOST_LISTEN_FAILED},
+        {"SendFailed:", GARDEL_HOST_SEND_FAILED},
+    };
+    for (size_t k = 0; k < sizeof kinds / sizeof kinds[0]; k++) {
+        size_t i = strlen(kinds[k].name);
+        if (n <= i || memcmp(name, kinds[k].name, i) != 0) continue;
+        uint64_t id, code;
+        if (!gardel_script_number(name, n, &i, &id)) return false;
+        if (kinds[k].kind == GARDEL_HOST_ACCEPTED || kinds[k].kind == GARDEL_HOST_CLOSED) {
+            if (i != n) return false;
+        } else {
+            if (i == n || name[i] != ':') return false;
+            i++;
+            if (kinds[k].kind == GARDEL_HOST_RECEIVED) {
+                size_t len;
+                char* text = gardel_script_text(name, n, i, &len);
+                if (!text) return false;
+                ev->data = gardel_bytes_copy(text, len);
+                free(text);
+            } else {
+                if (!gardel_script_number(name, n, &i, &code) || i != n) return false;
+                ev->err = (int64_t)code;
+            }
+        }
+        ev->kind = kinds[k].kind;
+        ev->id = id;
+        return true;
+    }
+    return false;
+}
+
+static struct gardel_host_event gardel_next_scripted_event(void) {
+    struct gardel_host_event ev = { GARDEL_HOST_SHUTDOWN, 0, NULL, GARDEL_KEY_OTHER, 0, {NULL, 0, NULL}, 0 };
+    const char* name;
+    size_t n;
+    /* The end of a script or of a log is a shutdown: `step` is proven to stop on it, so a
+       scripted run ends. */
+    if (gardel_replaying) {
+        if (!gardel_replay_next(&name, &n)) return ev;
+        if (n < 6 || memcmp(name, "event ", 6) != 0) {
+            static const char waiting[] = "waiting for an event";
+            gardel_replay_diverged(name, n, waiting, sizeof waiting - 1);
+        }
+        name += 6;
+        n -= 6;
+    } else {
+        while (*gardel_host_script == ' ') gardel_host_script++;
+        if (!*gardel_host_script) return ev;
+        n = strcspn(gardel_host_script, " ");
+        name = gardel_host_script;
+        gardel_host_script += n;
+    }
+    if (n == 8 && memcmp(name, "Shutdown", 8) == 0) return ev;
+    if (gardel_script_net(name, n, &ev)) return ev;
+    if (n > 5 && memcmp(name, "Tick:", 5) == 0) {
+        size_t i = 5;
+        if (gardel_script_number(name, n, &i, &ev.id) && i == n) {
+            ev.kind = GARDEL_HOST_TICK;
+            return ev;
+        }
+    }
+    if (n >= 5 && memcmp(name, "Line:", 5) == 0) {
+        size_t len;
+        char* buf = gardel_script_text(name, n, 5, &len);
+        if (buf) {
+            ev.kind = GARDEL_HOST_LINE;
+            gardel_keep_line(&ev, buf, len);
+            ev.line = gardel_line_from_bytes(buf, len);
+            return ev;
+        }
+    }
+    if (n == 7 && memcmp(name, "LineEnd", 7) == 0) {
+        ev.kind = GARDEL_HOST_LINE;
+        ev.line_state = GARDEL_LINE_ENDED;
+        ev.line = gardel_line_at_end();
+        return ev;
+    }
+    if (n > 11 && memcmp(name, "LineFailed:", 11) == 0) {
+        size_t i = 11;
+        uint64_t code;
+        if (gardel_script_number(name, n, &i, &code) && i == n) {
+            ev.kind = GARDEL_HOST_LINE;
+            ev.line_state = GARDEL_LINE_FAILED;
+            ev.err = (int64_t)code;
+            ev.line = gardel_line_failed(ev.err);
+            return ev;
+        }
+    }
+    /* Key:<name>, or Key:<scalar> for a character. */
+    if (n > 4 && memcmp(name, "Key:", 4) == 0) {
+        ev.kind = GARDEL_HOST_KEY;
+        for (size_t k = 0; k < sizeof gardel_key_names / sizeof gardel_key_names[0]; k++) {
+            if (strlen(gardel_key_names[k].name) == n - 4 && memcmp(name + 4, gardel_key_names[k].name, n - 4) == 0) {
+                ev.key = gardel_key_names[k].key;
+                return ev;
+            }
+        }
+        uint64_t c = 0;
+        size_t i = 4;
+        while (i < n && name[i] >= '0' && name[i] <= '9' && c <= 0x10FFFF) c = c * 10 + (uint64_t)(name[i++] - '0');
+        if (i == n && c <= 0x10FFFF && !(c >= 0xD800 && c <= 0xDFFF)) {
+            ev.key = GARDEL_KEY_CHAR;
+            ev.ch = (uint32_t)c;
+            return ev;
+        }
+    }
+    fprintf(stderr, "error: %s: unknown event `%.*s`\n", gardel_event_source, (int)n, name);
+    exit(2);
+}
+
+static struct gardel_host_event gardel_next_event(void) {
+    if (gardel_host_script) return gardel_next_scripted_event();
+    for (;;) {
+        /* Before anything else: a program re-arming a zero timer cannot starve a shutdown. */
+        struct gardel_host_event ev = { GARDEL_HOST_SHUTDOWN, 0, NULL, GARDEL_KEY_OTHER, 0, {NULL, 0, NULL}, 0 };
+        if (gardel_host_stop_pending()) return ev;
+        if (gardel_take_answer(&ev)) return ev;
+        /* Sockets and timers take turns going first, so neither can starve the other. */
+        gardel_net_turn = !gardel_net_turn;
+        if (gardel_net_turn && gardel_net_take(&ev)) return ev;
+        uint64_t wait = UINT64_MAX;
+        if (gardel_timer_count > 0) {
+            size_t first = 0;
+            for (size_t i = 1; i < gardel_timer_count; i++) {
+                const struct gardel_timer* a = &gardel_timers[i];
+                const struct gardel_timer* b = &gardel_timers[first];
+                if (a->deadline < b->deadline || (a->deadline == b->deadline && a->seq < b->seq)) first = i;
+            }
+            uint64_t now = gardel_host_now_ms();
+            if (gardel_timers[first].deadline <= now) {
+                ev.kind = GARDEL_HOST_TICK;
+                ev.id = gardel_timers[first].id;
+                gardel_timers[first] = gardel_timers[--gardel_timer_count];
+                return ev;
+            }
+            wait = gardel_timers[first].deadline - now;
+        }
+        if (!gardel_net_turn && gardel_net_take(&ev)) return ev;
+        gardel_host_wait(gardel_net_wait_limit(wait));
+    }
+}
+"#;
+
+/// What the host does for a `COMMAND` variant, bound as `c`. `None` stops the build: a variant
+/// with no code here must not reach a program, or the runtime would ignore it.
+pub(crate) fn host_command_code(variant: &str) -> Option<&'static str> {
+    match variant {
+        "Print" => Some("gardel_io_print_line(c->Print.text);"),
+        "SetTimer" => Some("gardel_host_set_timer(c->SetTimer.id, c->SetTimer.millis);"),
+        "ReadLine" => Some("gardel_host_request_input(false);"),
+        "ReadKey" => Some("gardel_host_request_input(true);"),
+        "Listen" => Some("gardel_host_listen(c->Listen.port);"),
+        "Send" => Some("gardel_host_send(c->Send.conn->id, c->Send.data);"),
+        "Close" => Some("gardel_host_close(c->Close.conn->id);"),
+        _ => None,
+    }
+}
+
+/// How a `COMMAND` variant, bound as `c`, is written in the event log, so a replay can compare
+/// it. `None` stops the build, as for `host_command_code`: a command left out of the log would
+/// be one that replay does not check.
+pub(crate) fn host_command_log(variant: &str) -> Option<&'static str> {
+    match variant {
+        "Print" => Some("gardel_log_word(\"Print:\"); gardel_log_text(c->Print.text.data, c->Print.text.len);"),
+        "SetTimer" => Some("gardel_log_word(\"SetTimer:\"); gardel_log_number(c->SetTimer.id); gardel_log_word(\":\"); gardel_log_number(c->SetTimer.millis);"),
+        "ReadLine" => Some("gardel_log_word(\"ReadLine\");"),
+        "ReadKey" => Some("gardel_log_word(\"ReadKey\");"),
+        "Listen" => Some("gardel_log_word(\"Listen:\"); gardel_log_number(c->Listen.port);"),
+        "Send" => Some("gardel_log_word(\"Send:\"); gardel_log_number(c->Send.conn->id); gardel_log_word(\":\"); gardel_log_text(c->Send.data.data, c->Send.data.len);"),
+        "Close" => Some("gardel_log_word(\"Close:\"); gardel_log_number(c->Close.conn->id);"),
+        _ => None,
+    }
+}
+
+/// The `switch` case that builds an `EVENT` variant from the host's `ev`.
+pub(crate) fn host_event_code(variant: &str) -> Option<&'static str> {
+    match variant {
+        "Shutdown" => Some("case GARDEL_HOST_SHUTDOWN: return make_EVENT_Shutdown();"),
+        "Tick" => Some("case GARDEL_HOST_TICK: return make_EVENT_Tick(ev.id);"),
+        "Line" => Some("case GARDEL_HOST_LINE: return make_EVENT_Line((struct RESULT_IO_ERROR_STRING*)ev.line);"),
+        "Key" => Some("case GARDEL_HOST_KEY: return make_EVENT_Key(gardel_key_value(ev));"),
+        "Accepted" => Some("case GARDEL_HOST_ACCEPTED: return make_EVENT_Accepted(make_CONN_ID(ev.id));"),
+        "ListenFailed" => Some("case GARDEL_HOST_LISTEN_FAILED: return make_EVENT_ListenFailed(ev.id, make_IO_ERROR_OsError(ev.err));"),
+        "Received" => Some("case GARDEL_HOST_RECEIVED: return make_EVENT_Received(make_CONN_ID(ev.id), ev.data);"),
+        "SendFailed" => Some("case GARDEL_HOST_SEND_FAILED: return make_EVENT_SendFailed(make_CONN_ID(ev.id), make_IO_ERROR_OsError(ev.err));"),
+        "Closed" => Some("case GARDEL_HOST_CLOSED: return make_EVENT_Closed(make_CONN_ID(ev.id));"),
+        _ => None,
+    }
+}
+
+/// The `switch` case that builds a `KEY` variant from the host's `ev`.
+pub(crate) fn host_key_code(variant: &str) -> Option<&'static str> {
+    match variant {
+        "Char" => Some("case GARDEL_KEY_CHAR: return make_KEY_Char(ev.ch);"),
+        "Up" => Some("case GARDEL_KEY_UP: return make_KEY_Up();"),
+        "Down" => Some("case GARDEL_KEY_DOWN: return make_KEY_Down();"),
+        "Left" => Some("case GARDEL_KEY_LEFT: return make_KEY_Left();"),
+        "Right" => Some("case GARDEL_KEY_RIGHT: return make_KEY_Right();"),
+        "Enter" => Some("case GARDEL_KEY_ENTER: return make_KEY_Enter();"),
+        "Escape" => Some("case GARDEL_KEY_ESCAPE: return make_KEY_Escape();"),
+        "Backspace" => Some("case GARDEL_KEY_BACKSPACE: return make_KEY_Backspace();"),
+        "Tab" => Some("case GARDEL_KEY_TAB: return make_KEY_Tab();"),
+        "Other" => Some("case GARDEL_KEY_OTHER: return make_KEY_Other();"),
+        "KeysEnded" => Some("case GARDEL_KEY_END_OF_INPUT: return make_KEY_KeysEnded();"),
+        _ => None,
+    }
+}
+
 /// C11 for a `program`: its routines and every module instance they use, in one
 /// translation unit, with `main` running the program's `main` inside an OpenMP region.
 /// For a module, a library build of its executable routines. Returns the C text and the
@@ -2343,7 +4148,6 @@ pub fn emit_c11_typed(root: &ModuleDecl, extra: &[&ModuleDecl]) -> (String, Vec<
                 let cname = b.request_fn(&root.name, &[], "main", &[]);
                 let mut setup = String::new();
                 let mut call_args = Vec::new();
-                let mut release = String::new();
                 for (_, t) in &mr.params {
                     let t = cnorm(t);
                     if t == "SEQ[STRING]" {
@@ -2352,7 +4156,6 @@ pub fn emit_c11_typed(root: &ModuleDecl, extra: &[&ModuleDecl]) -> (String, Vec<
                                 args_rt = rt;
                                 setup.push_str("    struct SEQ_STRING* args = gardel_main_args(argc, argv);\n");
                                 call_args.push("args".to_string());
-                                release.push_str("    drop_SEQ_STRING(args);\n");
                             }
                             Err(e) => b.errors.push(e),
                         }
@@ -2362,11 +4165,19 @@ pub fn emit_c11_typed(root: &ModuleDecl, extra: &[&ModuleDecl]) -> (String, Vec<
                 }
                 b.drain();
                 entry = format!(
-                    "int main(int argc, char** argv) {{\n    (void)argc;\n    (void)argv;\n{setup}    int64_t rc = 0;\n    #pragma omp parallel\n    #pragma omp single\n    rc = (int64_t){cname}({});\n{release}    return (int)rc;\n}}\n",
+                    "int main(int argc, char** argv) {{\n    (void)argc;\n    (void)argv;\n{setup}    int64_t rc = 0;\n    #pragma omp parallel\n    #pragma omp single\n    rc = (int64_t){cname}({});\n    return (int)rc;\n}}\n",
                     call_args.join(", ")
                 );
             }
             None => b.errors.push("program has no `main`".into()),
+        }
+    } else if root.kind == ModuleKind::ReactiveProgram {
+        match b.reactive_host(root) {
+            Ok((host, rt)) => {
+                entry = host;
+                args_rt = rt;
+            }
+            Err(e) => b.errors.push(e),
         }
     } else if matches!(root.name.as_str(), "STRING" | "BYTES") {
         // Runtime-provided: the C runtime header implements these types (`GardelString`,
