@@ -1,6 +1,7 @@
 module EVENT
 
 representation {ANY}
+  | Tick(id: NAT)
   | Shutdown
 
 feature {ANY}

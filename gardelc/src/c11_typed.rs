@@ -2274,8 +2274,10 @@ static struct SEQ_STRING* gardel_main_args(int argc, char** argv) {
 
     /// The entry point of a `reactive program` (spec 11.6). `init` and `step` return owned
     /// values and borrow their arguments. The loop holds its own reference to the state, so
-    /// the `STEP` that carried it can go. An OpenMP region opens per call, not around the
-    /// loop: a program may wait for days, and no thread team should be held meanwhile.
+    /// the `STEP` that carried it can go. One OpenMP region surrounds the loop, as it does
+    /// `main`: parked threads sleep during a wait and pick up the tasks of a `step`. A region
+    /// per call would wake the whole team for every event (95 us instead of 3 us per event
+    /// on 20 threads).
     fn reactive_host(&mut self, root: &ModuleDecl) -> Result<(String, String), String> {
         let name = root.name.clone();
         let ret = root
@@ -2302,19 +2304,13 @@ static struct SEQ_STRING* gardel_main_args(int argc, char** argv) {
         // One case per variant, so a variant with no host code cannot be ignored at run time.
         let mut run = String::new();
         for v in self.variants_of("COMMAND")? {
-            let body = match v.as_str() {
-                "Print" => "gardel_io_print_line(c->Print.text);",
-                other => return Err(format!("`COMMAND.{other}` has no host implementation")),
-            };
+            let body = host_command_code(&v).ok_or_else(|| format!("`COMMAND.{v}` has no host implementation"))?;
             run.push_str(&format!("        case TAG_COMMAND_{v}: {body} break;\n"));
         }
         let mut make = String::new();
         for v in self.variants_of("EVENT")? {
-            let host = match v.as_str() {
-                "Shutdown" => "GARDEL_HOST_SHUTDOWN",
-                other => return Err(format!("`EVENT.{other}` has no host implementation")),
-            };
-            make.push_str(&format!("        case {host}: return make_EVENT_{v}();\n"));
+            let case = host_event_code(&v).ok_or_else(|| format!("`EVENT.{v}` has no host implementation"))?;
+            make.push_str(&format!("        {case}\n"));
         }
         let inst = c_instance_name(&ret);
         let keep = self.own(borrowed("r->Continue.next".to_string(), state.clone()))?;
@@ -2326,31 +2322,35 @@ static struct SEQ_STRING* gardel_main_args(int argc, char** argv) {
             format!(
                 "{REACTIVE_RUNTIME}\n\
                  static void gardel_run_commands({cmds} p) {{\n    for (; p; p = p->tail) {{\n        {cmd} c = p->head;\n        switch (c->tag) {{\n{run}        default: abort();\n        }}\n    }}\n    /* The program may now wait for days: what it printed must already be out. */\n    fflush(stdout);\n}}\n\n\
-                 static {evt} gardel_event_value(enum gardel_host_event k) {{\n    switch (k) {{\n{make}        default: abort();\n    }}\n}}\n\n\
+                 static {evt} gardel_event_value(struct gardel_host_event ev) {{\n    switch (ev.kind) {{\n{make}        default: abort();\n    }}\n}}\n\n\
                  int gardel_reactive_main(int argc, char** argv) {{\n\
                  \x20   gardel_host_install();\n\
+                 \x20   gardel_timer_count = 0;\n\
                  \x20   const char* script = getenv(\"GARDEL_EVENTS\");\n\
                  \x20   if (script) gardel_host_script = script;\n\
                  \x20   struct SEQ_STRING* args = gardel_main_args(argc, argv);\n\
-                 \x20   {rct} r;\n\
+                 \x20   int code = 0;\n\
                  \x20   #pragma omp parallel\n\
                  \x20   #pragma omp single\n\
-                 \x20   r = {init}(args);\n\
-                 \x20   {drop_args}\
-                 \x20   while (r->tag != TAG_{inst}_Stop) {{\n\
-                 \x20       gardel_run_commands(r->Continue.cmds);\n\
-                 \x20       {sct} state = {keep};\n\
+                 \x20   {{\n\
+                 \x20       {rct} r = {init}(args);\n\
+                 \x20       {drop_args}\
+                 \x20       while (r->tag != TAG_{inst}_Stop) {{\n\
+                 \x20           gardel_run_commands(r->Continue.cmds);\n\
+                 \x20           {sct} state = {keep};\n\
+                 \x20           {drop_step}\
+                 \x20           {evt} e = gardel_event_value(gardel_next_event());\n\
+                 \x20           r = {step}(state, e);\n\
+                 \x20           {drop_event}\
+                 \x20           {drop_state}\
+                 #ifdef GARDEL_HOST_PROBE\n\
+                 \x20           GARDEL_HOST_PROBE();\n\
+                 #endif\n\
+                 \x20       }}\n\
+                 \x20       gardel_run_commands(r->Stop.cmds);\n\
+                 \x20       code = (int)r->Stop.code;\n\
                  \x20       {drop_step}\
-                 \x20       {evt} e = gardel_event_value(gardel_next_event());\n\
-                 \x20       #pragma omp parallel\n\
-                 \x20       #pragma omp single\n\
-                 \x20       r = {step}(state, e);\n\
-                 \x20       {drop_event}\
-                 \x20       {drop_state}\
                  \x20   }}\n\
-                 \x20   gardel_run_commands(r->Stop.cmds);\n\
-                 \x20   int code = (int)r->Stop.code;\n\
-                 \x20   {drop_step}\
                  \x20   gardel_host_finished();\n\
                  \x20   return code;\n\
                  }}\n\n\
@@ -2426,11 +2426,12 @@ static struct SEQ_STRING* gardel_main_args(int argc, char** argv) {
     }
 }
 
-/// The host side of a `reactive program` (spec 11.6): shutdown signals and the event sources.
-/// The loop itself is generated by `reactive_host`, which knows the state type. Event sources
-/// go through `gardel_next_event`, so tests and replay need no real signals.
+/// The host side of a `reactive program` (spec 11.6): shutdown signals, timers and the event
+/// sources. The loop itself is generated by `reactive_host`, which knows the state type.
+/// Event sources go through `gardel_next_event`, so tests and replay need no real signals.
 const REACTIVE_RUNTIME: &str = r#"/* Reactive host (spec 11.6). */
-enum gardel_host_event { GARDEL_HOST_SHUTDOWN };
+enum gardel_host_kind { GARDEL_HOST_SHUTDOWN, GARDEL_HOST_TICK };
+struct gardel_host_event { enum gardel_host_kind kind; uint64_t id; };
 
 /* Scripted events, from GARDEL_EVENTS: names separated by spaces. NULL reads the OS. */
 static const char* gardel_host_script = NULL;
@@ -2440,6 +2441,7 @@ __declspec(dllimport) int __stdcall SetConsoleCtrlHandler(int (__stdcall*)(unsig
 __declspec(dllimport) void* __stdcall CreateEventA(void*, int, int, const char*);
 __declspec(dllimport) int __stdcall SetEvent(void*);
 __declspec(dllimport) unsigned long __stdcall WaitForSingleObject(void*, unsigned long);
+__declspec(dllimport) unsigned long long __stdcall GetTickCount64(void);
 static void* gardel_stop_requested = NULL;
 static void* gardel_stop_finished = NULL;
 static int __stdcall gardel_console_ctrl(unsigned long kind) {
@@ -2458,13 +2460,21 @@ static void gardel_host_install(void) {
 static void gardel_host_finished(void) {
     if (gardel_stop_finished) SetEvent(gardel_stop_finished);
 }
-static void gardel_host_wait_for_shutdown(void) {
-    WaitForSingleObject(gardel_stop_requested, 0xFFFFFFFFUL);
+static uint64_t gardel_host_now_ms(void) {
+    return (uint64_t)GetTickCount64();
+}
+/* Returns on a shutdown request or after `ms`. The request stays set, so it cannot be lost. */
+static void gardel_host_wait(uint64_t ms) {
+    WaitForSingleObject(gardel_stop_requested, ms > 0x7FFFFFFFULL ? 0x7FFFFFFFUL : (unsigned long)ms);
+}
+static bool gardel_host_stop_pending(void) {
+    return WaitForSingleObject(gardel_stop_requested, 0) == 0;
 }
 #else
 #include <errno.h>
 #include <poll.h>
 #include <signal.h>
+#include <time.h>
 #include <unistd.h>
 /* A self-pipe: the handler only writes a byte, and the loop waits with poll. */
 static int gardel_signal_pipe[2] = {-1, -1};
@@ -2490,28 +2500,127 @@ static void gardel_host_install(void) {
     sigaction(SIGTERM, &sa, NULL);
 }
 static void gardel_host_finished(void) {}
-static void gardel_host_wait_for_shutdown(void) {
+static uint64_t gardel_host_now_ms(void) {
+    struct timespec t;
+    clock_gettime(CLOCK_MONOTONIC, &t);
+    return (uint64_t)t.tv_sec * 1000 + (uint64_t)t.tv_nsec / 1000000;
+}
+/* The pipe is never read, so a shutdown request stays visible and cannot be lost. */
+static void gardel_host_wait(uint64_t ms) {
     struct pollfd p = { gardel_signal_pipe[0], POLLIN, 0 };
-    while (poll(&p, 1, -1) < 0 && errno == EINTR) {}
+    int timeout = ms > 0x3FFFFFFFULL ? 0x3FFFFFFF : (int)ms;
+    if (poll(&p, 1, timeout) < 0 && errno != EINTR) {
+        perror("gardel: poll");
+        exit(2);
+    }
+}
+static bool gardel_host_stop_pending(void) {
+    struct pollfd p = { gardel_signal_pipe[0], POLLIN, 0 };
+    return poll(&p, 1, 0) > 0;
 }
 #endif
 
-static enum gardel_host_event gardel_next_event(void) {
-    if (!gardel_host_script) {
-        gardel_host_wait_for_shutdown();
-        return GARDEL_HOST_SHUTDOWN;
+/* Pending one-shot timers. Fired in deadline order, and in setting order on a tie. */
+struct gardel_timer { uint64_t id, deadline, seq; };
+static struct gardel_timer* gardel_timers = NULL;
+static size_t gardel_timer_count = 0, gardel_timer_cap = 0;
+static uint64_t gardel_timer_seq = 0;
+
+/* A pending timer with the same id is replaced. Scripted runs deliver Tick themselves, so
+   they do not depend on the clock. */
+static void gardel_host_set_timer(uint64_t id, uint64_t millis) {
+    if (gardel_host_script) return;
+    uint64_t now = gardel_host_now_ms();
+    uint64_t deadline = millis > UINT64_MAX - now ? UINT64_MAX : now + millis;
+    size_t i = 0;
+    while (i < gardel_timer_count && gardel_timers[i].id != id) i++;
+    if (i == gardel_timer_count) {
+        if (gardel_timer_count == gardel_timer_cap) {
+            gardel_timer_cap = gardel_timer_cap ? gardel_timer_cap * 2 : 8;
+            gardel_timers = (struct gardel_timer*)realloc(gardel_timers, gardel_timer_cap * sizeof *gardel_timers);
+            if (!gardel_timers) abort();
+        }
+        gardel_timer_count++;
     }
+    gardel_timers[i] = (struct gardel_timer){ id, deadline, gardel_timer_seq++ };
+}
+
+static struct gardel_host_event gardel_next_scripted_event(void) {
+    struct gardel_host_event ev = { GARDEL_HOST_SHUTDOWN, 0 };
     while (*gardel_host_script == ' ') gardel_host_script++;
     /* The end of a script is a shutdown: `step` is proven to stop on it, so a script ends. */
-    if (!*gardel_host_script) return GARDEL_HOST_SHUTDOWN;
+    if (!*gardel_host_script) return ev;
     size_t n = strcspn(gardel_host_script, " ");
     const char* name = gardel_host_script;
     gardel_host_script += n;
-    if (n == 8 && memcmp(name, "Shutdown", 8) == 0) return GARDEL_HOST_SHUTDOWN;
+    if (n == 8 && memcmp(name, "Shutdown", 8) == 0) return ev;
+    if (n > 5 && memcmp(name, "Tick:", 5) == 0) {
+        uint64_t id = 0;
+        size_t i = 5;
+        while (i < n && name[i] >= '0' && name[i] <= '9') {
+            uint64_t d = (uint64_t)(name[i] - '0');
+            if (id > (UINT64_MAX - d) / 10) break;
+            id = id * 10 + d;
+            i++;
+        }
+        if (i == n) {
+            ev.kind = GARDEL_HOST_TICK;
+            ev.id = id;
+            return ev;
+        }
+    }
     fprintf(stderr, "error: GARDEL_EVENTS: unknown event `%.*s`\n", (int)n, name);
     exit(2);
 }
+
+static struct gardel_host_event gardel_next_event(void) {
+    if (gardel_host_script) return gardel_next_scripted_event();
+    for (;;) {
+        /* Before any timer: a program re-arming a zero timer cannot starve a shutdown. */
+        if (gardel_host_stop_pending()) {
+            struct gardel_host_event ev = { GARDEL_HOST_SHUTDOWN, 0 };
+            return ev;
+        }
+        if (gardel_timer_count == 0) {
+            gardel_host_wait(UINT64_MAX);
+            continue;
+        }
+        size_t first = 0;
+        for (size_t i = 1; i < gardel_timer_count; i++) {
+            const struct gardel_timer* a = &gardel_timers[i];
+            const struct gardel_timer* b = &gardel_timers[first];
+            if (a->deadline < b->deadline || (a->deadline == b->deadline && a->seq < b->seq)) first = i;
+        }
+        uint64_t now = gardel_host_now_ms();
+        if (gardel_timers[first].deadline > now) {
+            gardel_host_wait(gardel_timers[first].deadline - now);
+            continue;
+        }
+        struct gardel_host_event ev = { GARDEL_HOST_TICK, gardel_timers[first].id };
+        gardel_timers[first] = gardel_timers[--gardel_timer_count];
+        return ev;
+    }
+}
 "#;
+
+/// What the host does for a `COMMAND` variant, bound as `c`. `None` stops the build: a variant
+/// with no code here must not reach a program, or the runtime would ignore it.
+pub(crate) fn host_command_code(variant: &str) -> Option<&'static str> {
+    match variant {
+        "Print" => Some("gardel_io_print_line(c->Print.text);"),
+        "SetTimer" => Some("gardel_host_set_timer(c->SetTimer.id, c->SetTimer.millis);"),
+        _ => None,
+    }
+}
+
+/// The `switch` case that builds an `EVENT` variant from the host's `ev`.
+pub(crate) fn host_event_code(variant: &str) -> Option<&'static str> {
+    match variant {
+        "Shutdown" => Some("case GARDEL_HOST_SHUTDOWN: return make_EVENT_Shutdown();"),
+        "Tick" => Some("case GARDEL_HOST_TICK: return make_EVENT_Tick(ev.id);"),
+        _ => None,
+    }
+}
 
 /// C11 for a `program`: its routines and every module instance they use, in one
 /// translation unit, with `main` running the program's `main` inside an OpenMP region.

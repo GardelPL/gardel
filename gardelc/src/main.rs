@@ -19115,10 +19115,117 @@ end
 
     #[test]
     fn test_d4_host_is_exhaustive_over_commands_and_events() {
-        // A variant with no host code must not build, or the runtime would ignore it.
+        // A variant with no host code must stop the build, or the runtime would ignore it.
+        let prelude = standard_prelude();
+        let variants = |m: &str| match &prelude.module(m).unwrap().repr {
+            ReprKind::Sum(vs) => vs.iter().map(|v| v.name.clone()).collect::<Vec<_>>(),
+            ReprKind::Product(_) => panic!("{m} is a sum type"),
+        };
+        for v in variants("COMMAND") {
+            assert!(c11_typed::host_command_code(&v).is_some(), "COMMAND.{v}");
+        }
+        for v in variants("EVENT") {
+            assert!(c11_typed::host_event_code(&v).is_some(), "EVENT.{v}");
+        }
+        assert!(c11_typed::host_command_code("Nonsense").is_none());
+        assert!(c11_typed::host_event_code("Nonsense").is_none());
         let c = d4_c(&[("reactive_hello.gdl", D4_HELLO)]);
-        assert!(c.contains("case TAG_COMMAND_Print:"), "one case per variant");
-        assert!(c.contains("return make_EVENT_Shutdown();"), "one case per variant");
+        assert!(c.contains("case TAG_COMMAND_SetTimer:"), "one case per variant");
+        // One OpenMP region around the loop: a region per call wakes the team for every event.
+        let host = &c[c.find("int gardel_reactive_main").unwrap()..];
+        assert_eq!(host.matches("#pragma omp parallel").count(), 1, "{host}");
+    }
+
+    const D5_BEAT_STATE: &str = include_str!("../tests/reactive/beat_state.gdl");
+    const D5_BEAT: &str = include_str!("../tests/reactive/beat.gdl");
+
+    /// Runs a real program with no script: (exit code, stdout, elapsed milliseconds).
+    fn d5_run_live(c: &str, tag: &str) -> Option<(i32, String, u128)> {
+        let (dir, exe) = c3_compile(c, tag)?;
+        let start = std::time::Instant::now();
+        let o = Command::new(&exe).env_remove("GARDEL_EVENTS").output().unwrap();
+        let ms = start.elapsed().as_millis();
+        let _ = fs::remove_dir_all(&dir);
+        Some((o.status.code().unwrap_or(-1), String::from_utf8_lossy(&o.stdout).replace("\r\n", "\n"), ms))
+    }
+
+    #[test]
+    fn test_d5_timers_fire_in_deadline_order_and_can_be_replaced() {
+        // Timer 3 is set twice, and only the second setting counts, so it fires last, once.
+        let src = "reactive program TIMERS\n\nfeature {ANY}\n\n  init(args: SEQ[STRING]): STEP[NAT]\n    do\n      Continue(0, LIST.empty.prepend(SetTimer(3, 240)).prepend(SetTimer(3, 1)).prepend(SetTimer(1, 120)).prepend(SetTimer(2, 20)))\n    end\n\n  step(s: NAT, e: EVENT): STEP[NAT]\n    do\n      match e\n        case Tick(id) then\n          if id = 1 then\n            Continue(s, LIST.empty.prepend(Print(\"one\")))\n          else if id = 2 then\n            Continue(s, LIST.empty.prepend(Print(\"two\")))\n          else\n            Stop(id, LIST.empty.prepend(Print(\"three\")))\n          end end\n        case Shutdown then\n          Stop(99, LIST.empty)\n      end\n    end\n\nend\n";
+        let c = d4_c(&[("timers.gdl", src)]);
+        if let Some((code, out, ms)) = d5_run_live(&c, "rtimers") {
+            assert_eq!((code, out.as_str()), (3, "two\none\nthree\n"));
+            assert!(ms >= 230, "the replaced deadline must hold, ran for {ms} ms");
+        }
+        // A zero delay fires, and equal deadlines keep the order they were set in.
+        let src = "reactive program ZERO\n\nfeature {ANY}\n\n  init(args: SEQ[STRING]): STEP[NAT]\n    do\n      Continue(0, LIST.empty.prepend(SetTimer(2, 0)).prepend(SetTimer(1, 0)))\n    end\n\n  step(s: NAT, e: EVENT): STEP[NAT]\n    do\n      match e\n        case Tick(id) then\n          if id = 1 then Continue(s, LIST.empty.prepend(Print(\"first\"))) else Stop(0, LIST.empty.prepend(Print(\"second\"))) end\n        case Shutdown then\n          Stop(99, LIST.empty)\n      end\n    end\n\nend\n";
+        let c = d4_c(&[("zero.gdl", src)]);
+        if let Some((code, out, _)) = d5_run_live(&c, "rzero") {
+            assert_eq!((code, out.as_str()), (0, "first\nsecond\n"));
+        }
+    }
+
+    #[test]
+    fn test_d5_scripts_do_not_depend_on_the_clock() {
+        // Timers do not run in a script, so a scripted run is instant and deterministic.
+        let c = d4_c(&[("beat_state.gdl", D5_BEAT_STATE), ("beat.gdl", D5_BEAT)]);
+        if let Some((code, _, err)) = d4_run(&c, "rbeat", "Tick:1 Tick:2 Tick:3 Shutdown", &[]) {
+            assert_eq!(code, 3, "three events recorded: {err}");
+        }
+        for bad in ["Tick:", "Tick:x", "Tick:99999999999999999999", "Tock:1"] {
+            if let Some((code, _, err)) = d4_run(&c, "rbeatbad", bad, &[]) {
+                assert_eq!(code, 2, "{bad}");
+                assert!(err.contains("unknown event"), "{bad}: {err}");
+            }
+        }
+    }
+
+    #[test]
+    fn test_d5_live_allocations_do_not_grow_over_a_long_run() {
+        // Each step allocates a state, a list, commands and an event. The count at exit could
+        // not see a state that grows and is then freed, so it is sampled during the run.
+        let c = d4_c(&[("beat_state.gdl", D5_BEAT_STATE), ("beat.gdl", D5_BEAT)]);
+        let harness = format!(
+            "#define GARDEL_HOST_PROBE gardel_probe\nstatic void gardel_probe(void);\n{}\n\
+             static uint64_t gardel_seen = 0, gardel_early = 0, gardel_peak = 0;\n\
+             static void gardel_probe(void) {{\n    uint64_t live = gardel_live_allocations();\n    gardel_seen++;\n    if (gardel_seen == 1000) gardel_early = live;\n    if (gardel_seen >= 1000 && live > gardel_peak) gardel_peak = live;\n}}\n\
+             int main(void) {{\n    size_t n = 100000;\n    char* s = (char*)malloc(n * 7 + 1);\n    for (size_t i = 0; i < n; i++) memcpy(s + i * 7, \"Tick:1 \", 7);\n    s[n * 7] = 0;\n    gardel_host_script = s;\n    char* argv[] = {{ (char*)\"x\", NULL }};\n    gardel_reactive_main(1, argv);\n    fprintf(stderr, \"seen=%llu early=%llu peak=%llu end=%llu\\n\", (unsigned long long)gardel_seen, (unsigned long long)gardel_early, (unsigned long long)gardel_peak, (unsigned long long)gardel_live_allocations());\n    return 0;\n}}\n",
+            c.replace("int main(int argc, char** argv) {", "int gardel_unused_main(int argc, char** argv) {")
+        );
+        let Some((dir, exe)) = c3_compile(&harness, "rlong") else { return };
+        let o = Command::new(&exe).output().unwrap();
+        let _ = fs::remove_dir_all(&dir);
+        let err = String::from_utf8_lossy(&o.stderr).to_string();
+        let field = |k: &str| -> u64 {
+            let at = err.find(&format!("{k}=")).unwrap_or_else(|| panic!("{err}"));
+            err[at + k.len() + 1..].split_whitespace().next().unwrap().parse().unwrap()
+        };
+        // The end of the script is one more event: the Shutdown.
+        assert_eq!(field("seen"), 100001, "{err}");
+        // BEAT_STATE holds at most 8 items, so the state's size may vary by that much.
+        assert!(field("peak") <= field("early") + 8, "live allocations grew: {err}");
+        assert_eq!(field("end"), 0, "{err}");
+    }
+
+    #[test]
+    fn test_d5_clock_example_verifies_and_counts_down() {
+        let state = include_str!("../../examples/reactive_clock/clock_state.gdl");
+        let clock = include_str!("../../examples/reactive_clock/reactive_clock.gdl");
+        let c = d4_c(&[("clock_state.gdl", state), ("reactive_clock.gdl", clock)]);
+        if let Some((code, out, err)) = d4_run(&c, "rclock", "Tick:1 Tick:1 Tick:1", &[]) {
+            assert_eq!(code, 0, "{err}");
+            assert_eq!(out, "Counting down from 3.\ntick\ntick\nDone.\n");
+        }
+        if let Some((code, out, _)) = d4_run(&c, "rclockstop", "Tick:1 Shutdown", &[]) {
+            assert_eq!(code, 1);
+            assert!(out.ends_with("Interrupted.\n"), "{out}");
+        }
+        // The state's invariant is what proves `advance` safe.
+        let weak = state.replace("left: Current.has_left", "left: True");
+        assert_ne!(weak, state);
+        let (diags, _) = d2_project(&[("clock_state.gdl", &weak), ("reactive_clock.gdl", clock)]);
+        assert!(diags.iter().any(|d| d.level == "error"), "the guard must be needed: {diags:?}");
     }
 
     /// Verifies a multi-file project (the program last) and returns its diagnostics and C.

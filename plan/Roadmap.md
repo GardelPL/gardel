@@ -413,13 +413,13 @@ Source: [review/review.md](review/review.md). The verification notes for each fi
   - **Non-atomic counts for unshared values:** use atomics only for values another task can see; mark values as shared when they are passed into a task (as Lean does).
   - Acceptance: most of the ~70 ms counting overhead removed; leak tests at 0; the native runs and the C.2 text program unchanged.
 - [ ] **C.4.4 Arena per step for reactive programs (evaluate with Phase D).** A reactive `step` is pure and returns the next state, so after each event everything not reachable from the new state (and the commands) is garbage. Allocate during a step in a bump arena, copy out only the surviving state, then release the whole arena at once. Cost scales with the live state rather than with allocation volume. Risk: a large state copied on every step; mitigate with an older generation (reference counted) for long-lived state.
-  - Acceptance: a prototype on a reactive example compared with plain reference counting (time per event and peak memory), and a decision recorded here.
+  - Acceptance: a prototype on a reactive example compared with plain reference counting (time per event and peak memory), and a decision recorded here. Baseline: 0.29 us per event (Task D.5).
 
 ---
 
 ### Phase D: Reactive Programs
 
-**Status:** 🔄 In progress: D.0 to D.4 completed, D.5 next (2026-11-04).
+**Status:** 🔄 In progress: D.0 to D.5 completed, D.6 next (2026-11-04).
 
 **Objective:** let Gardel express programs that run until told to stop (servers, TUIs, games) without weakening totality. Every routine stays total. Non-termination lives in one place, the runtime's host loop, and a `reactive program` declares it. The design is [reactive/reactive_programs.md](reactive/reactive_programs.md) (revision 2), corrected by the findings below.
 
@@ -502,7 +502,7 @@ flowchart TD
 - [x] C backend: a nullary constructor as a receiver (`Shutdown.is_shutdown`) was taken for a module name.
 - [x] Tests `test_d2_prelude_step_types_work_from_user_code` (`tests/reactive/`: a step function over an opaque state verifies and runs, frees everything, and rejects the mutants `room` and `shutdown_must_stop`), `test_d2_user_constructors_win_over_prelude_constructors`, `test_d2_prelude_step_names_are_reserved`.
 - `cargo test` 112/112. `--stdlib --strict` 0/0 on seeds 0–3 with 16 files, and the six examples 0/0.
-- **Known limits:** a module that sees a user `Stop` cannot build the prelude `Stop`, since there is no qualified constructor syntax. It fails loudly. Until `EVENT` has a second variant, a `case _` arm on `EVENT` is unreachable, so a false call there verifies, correctly: `tests/reactive/tick_logic.gdl` keeps its logic in a separate routine for that reason.
+- **Known limit:** a module that sees a user `Stop` cannot build the prelude `Stop`, since there is no qualified constructor syntax. It fails loudly.
 - Acceptance: `--stdlib --strict` 0/0, and existing examples unchanged.
 
 #### Task D.3: Parser and Checker [✅ Completed]
@@ -529,9 +529,15 @@ flowchart TD
 - Tests `test_d4_hello_runs_and_stops_on_shutdown`, `test_d4_exit_codes_and_command_order_come_from_the_program`, `test_d4_init_can_refuse_to_start`, `test_d4_host_frees_state_commands_and_events` (0 live allocations after 50 runs of the loop), `test_d4_output_is_flushed_before_waiting` (no script, through a pipe), `test_d4_host_is_exhaustive_over_commands_and_events`, and `test_d4_sigint_and_sigterm_stop_the_program` (Unix only). `cargo test` 123/123. `--stdlib --strict` 0/0 on seeds 0–3, and the seven examples 0/0.
 - Acceptance: verifies 0/0, and runs natively on Windows with a real Ctrl-C and in tests with a scripted `Shutdown`. Exit codes come from `Stop`. `init` returning `Stop` exits without calling `step`.
 
-#### Task D.5: `SetTimer` / `Tick` [📋 Planned]
-- [ ] Add `COMMAND.SetTimer(id, millis)` and `EVENT.Tick(id)`, with the event loop's wait bounded by the next timer.
-- [ ] Add a timer example whose state module has a proven invariant.
+#### Task D.5: `SetTimer` / `Tick` [✅ Completed]
+- [x] Added `COMMAND.SetTimer(id, millis)` and `EVENT.Tick(id)`, with the wait bounded by the next timer (`gardel_next_event`). Timers are one-shot, on a monotonic clock. Setting a pending id replaces it. Order is deadline, then setting order. A pending `Shutdown` comes before a due timer, so a zero-timer loop cannot starve it. Spec §11.6 states all of this. The host finds the next timer by a linear scan, which suits a few timers, not thousands.
+- [x] Scripts: `Tick:<id>` delivers a tick, and timers do not run, so a scripted run does not depend on the clock (needed by D.8).
+- [x] Added `examples/reactive_clock/` (`gardelc examples/reactive_clock --strict`): a countdown whose opaque state proves `within_total`, and `advance` needs its `left` guard.
+- [x] Adding the variants before the host code gave `COMMAND.SetTimer has no host implementation` and no binary, so the D.4 guard works. `host_command_code` and `host_event_code` make it testable.
+- [x] **Host corrected: one OpenMP region around the loop.** D.4 opened a region per call, to avoid holding a team during a wait. That was wrong: parked threads sleep anyway, as under `main`, and the region woke 20 threads per event.
+- [x] **Baseline for C.4.4** (`tests/reactive/beat.gdl`: one state, list cell, command and event per step; `-O3`, i9-12900HK, 100,000 scripted events, best of 5): **0.29 us per event on 20 threads, 0.28 us on 1 thread.** With a region per call it was 95 us and 2.8 us. Idle waiting: 0.000 s of CPU over 1.2 s. Fork-join inside `step` still scales: `work(38)` takes 935 ms on 1 thread and 130 ms on 20.
+- [x] **Real signals.** Windows: Ctrl-C during a timer wait exits 1 with `Interrupted.`, and Ctrl-C stops a zero-timer flood at once. Linux, in a container: the clock runs to the end, `SIGTERM` during a timer wait exits 1 with `Interrupted.`, and `SIGINT` stops the flood.
+- Tests `test_d5_timers_fire_in_deadline_order_and_can_be_replaced` (real timers), `test_d5_scripts_do_not_depend_on_the_clock`, `test_d5_live_allocations_do_not_grow_over_a_long_run` (sampled during the run: 5 live at event 1,000, at most 12 after, 0 at exit), `test_d5_clock_example_verifies_and_counts_down`. `cargo test` 127/127. `--stdlib --strict` 0/0 on seeds 0–3, and the eight examples 0/0.
 - Acceptance: live allocations do not grow over 100,000 scripted ticks (the first long-run leak test), and time per event is recorded as the baseline for C.4.4.
 
 #### Task D.6: `ReadLine` and `Key` [📋 Planned]
@@ -576,7 +582,7 @@ flowchart TD
 
 With **Phase A: Language Specification Harmonization**, **Phase B: Compiler Engine & Prelude Tooling**, **Task C.1: Physical Decomposition of `stdlib/`**, **Task C.2: High-Performance Smart String (`stdlib/text/string.gdl`)**, and **Task C.3: Regression Verification & Performance Benchmarking** completely executed and verified with 0 errors and 0 warnings under `--strict`, Phase C's planned work is done. The verification baseline is clean, and every module compiles from source to C with reference-counted memory (C.3 follow-ups).
 
-The next step is **Phase D: Reactive Programs**, defined above with its tasks, dependency graph and acceptance criteria. The C prerequisites of [reactive/reactive_programs.md](reactive/reactive_programs.md) are in place (C.3 follow-ups): every module compiles from source, closures work, and memory is reference counted, so a program that runs forever does not leak. Tasks D.0 to D.4 are completed, so `examples/reactive_hello.gdl` runs. Next, timers (D.5), which also give the first long-run leak test and the baseline for C.4.4.
+The next step is **Phase D: Reactive Programs**, defined above with its tasks, dependency graph and acceptance criteria. The C prerequisites of [reactive/reactive_programs.md](reactive/reactive_programs.md) are in place (C.3 follow-ups): every module compiles from source, closures work, and memory is reference counted, so a program that runs forever does not leak. Tasks D.0 to D.5 are completed, so `examples/reactive_hello.gdl` and `examples/reactive_clock/` run. Next, console input (D.6). C.4.4 now has its baseline (Task D.5).
 
 **Task C.4 (memory management performance)** is planned. C.4.1–C.4.3 do not depend on Phase D and can be done before or alongside it. C.4.1 and C.4.2 are small and have the largest payoff measured on `seq_bench`, but a reactive program rarely exits, so C.4.1 does little for Phase D and C.4.2 matters more. C.4.4 needs a reactive program to measure against, and D.5 provides its baseline.
 

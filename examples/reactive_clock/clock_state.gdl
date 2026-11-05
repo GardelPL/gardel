@@ -1,0 +1,41 @@
+-- The state of the countdown. It is opaque, so only these routines can build one, and the
+-- invariant holds for every value of the type, however long the program runs.
+module CLOCK_STATE
+
+representation {NONE}
+  remaining: NAT
+  total: NAT
+
+invariant
+  within_total: remaining <= total
+
+create {ANY}
+
+  make(from: NAT): CLOCK_STATE
+    do
+      { remaining = from, total = from }
+    end
+
+feature {ANY}
+
+  has_left: BOOL
+    do
+      Current.remaining > 0
+    end
+
+  is_last: BOOL
+    do
+      Current.remaining = 1
+    end
+
+  -- Without `left`, this would underflow.
+  advance: CLOCK_STATE
+    require
+      left: Current.has_left
+    do
+      { Current with remaining = Current.remaining - 1 }
+    ensure
+      fewer: Result.is_last implies Current.has_left
+    end
+
+end

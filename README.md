@@ -118,6 +118,7 @@ end
 ├── examples/              # Standalone Gardel (.gdl) example programs
 │   ├── bounded_stack.gdl
 │   ├── greeter.gdl
+│   ├── reactive_clock/        # Countdown: a reactive program with timers and a proven state
 │   ├── reactive_hello.gdl
 │   ├── peano_ord.gdl
 │   └── tree.gdl

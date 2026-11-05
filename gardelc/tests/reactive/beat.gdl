@@ -1,0 +1,20 @@
+reactive program BEAT
+
+feature {ANY}
+
+  init(args: SEQ[STRING]): STEP[BEAT_STATE]
+    do
+      Continue(BEAT_STATE.make, LIST.empty.prepend(SetTimer(1, 1)))
+    end
+
+  step(s: BEAT_STATE, e: EVENT): STEP[BEAT_STATE]
+    do
+      match e
+        case Tick(id) then
+          Continue(s.record(id), LIST.empty.prepend(SetTimer(id, 1)))
+        case Shutdown then
+          Stop(s.total, LIST.empty)
+      end
+    end
+
+end

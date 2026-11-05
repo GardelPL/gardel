@@ -32,7 +32,7 @@ Gardel is a pure, total, deterministic, statically verified language designed fo
 | Entry points | Nothing may refer to a `program` or `reactive program` (`E0104`, §4). |
 | `EXIT_CODE` | Defined in §3. |
 
-**Implementation status:** the `match` rule, the solver limit and the entry-point rule are implemented. Reactive programs run, with `Print` and `Shutdown`; the other commands and events are being built in Phase D (§16.5).
+**Implementation status:** the `match` rule, the solver limit and the entry-point rule are implemented. Reactive programs run, with `Print`, `SetTimer`, `Tick` and `Shutdown`; the other commands and events are being built in Phase D (§16.5).
 
 ---
 
@@ -2208,7 +2208,9 @@ Rules:
 7. **Handles.** Each `CONN_ID` comes from exactly one `Accepted` event. After `Close(c)` runs, at most one more event mentions `c`, and it is `Closed(c)`.
 8. **Closed types.** `COMMAND` and `EVENT` are closed, and adding a variant is a prelude change. A program should end a `match` on `EVENT` with `case _` (§5.1).
 
-For tests and replay, `GARDEL_EVENTS` replaces the outside world with a script: event names separated by spaces. An unknown name stops the program with exit status 2. The end of a script is a `Shutdown`, so a scripted run always ends.
+**Timers.** A timer fires once: `SetTimer(id, millis)` is answered by one `Tick(id)` after at least `millis` milliseconds, on a monotonic clock. A repeating timer sets the next one in `step`. Setting an id that is pending replaces it. Timers fire in deadline order, and in the order they were set on a tie. A pending `Shutdown` comes before any timer that is due, so a program that keeps setting a zero timer can still be stopped. Timers end with the program.
+
+For tests and replay, `GARDEL_EVENTS` replaces the outside world with a script: event names separated by spaces, such as `Tick:1 Tick:2 Shutdown`. Timers do not run in a script, so it does not depend on the clock. An unknown name stops the program with exit status 2. The end of a script is a `Shutdown`, so a scripted run always ends.
 
 Guaranteed, given the proof obligations hold: no crash, out-of-bounds access or overflow in any step; the state invariant after every step; finite handling of each event by Gardel code; every run that receives `Shutdown` ends with the code chosen by `step`; and determinism: the states and commands are a function of `args` and the observed event sequence.
 
@@ -2916,7 +2918,7 @@ Phase D builds the `reactive program` of §11.6. `plan/Roadmap.md` holds its tas
 | D.2 | Prelude `STEP`, `COMMAND` (`Print`), `EVENT` (`Shutdown`) | ✅ Completed |
 | D.3 | Parser and checker, including `shutdown_must_stop` | ✅ Completed |
 | D.4 | Host loop: the `Print` + `Shutdown` slice | ✅ Completed |
-| D.5 | `SetTimer`, `Tick` | 📋 Planned |
+| D.5 | `SetTimer`, `Tick` | ✅ Completed |
 | D.6 | `ReadLine`, `Line`, `Key` | 📋 Planned |
 | D.7 | `CONN_ID`, sockets, the echo server | 📋 Planned |
 | D.8 | Event log and replay | 📋 Planned |

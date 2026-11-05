@@ -7,8 +7,6 @@ feature {ANY}
       Continue(TICK_STATE.make(cap), LIST.empty.prepend(Print("ready")))
     end
 
-  -- A routine of its own: EVENT has only `Shutdown` so far, so the `case _` arm of `step`
-  -- is unreachable, and a false call there would be accepted, correctly.
   grow(s: TICK_STATE): STEP[TICK_STATE]
     do
       if s.has_room then Continue(s.bump, LIST.empty) else Continue(s, LIST.empty) end

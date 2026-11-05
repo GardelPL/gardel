@@ -345,8 +345,8 @@ Applied in spec v0.5, except the rows and clauses about `partial`, which wait fo
 | --- | --- | --- |
 | §3 `reactive program` form | Compiled and run (`examples/reactive_hello.gdl`) | |
 | §3 `STEP`, with `is_stop` | In the prelude (`stdlib/core/step.gdl`) | |
-| §3 `COMMAND`: `Print`, `Listen`, `Send`, `Close` | Compiled | `SetTimer`: D.5. `ReadLine`: D.6 |
-| §6 `EVENT`: `Accepted`, `ListenFailed`, `Received`, `Line`, `Closed`, `Shutdown`, with `is_shutdown` | Compiled | `Tick`: D.5. `Key`: D.6. `SendFailed`: D.7 |
+| §3 `COMMAND`: `Print`, `Listen`, `Send`, `Close` | Compiled | `SetTimer` is in the prelude. `ReadLine`: D.6 |
+| §6 `EVENT`: `Accepted`, `ListenFailed`, `Received`, `Line`, `Closed`, `Shutdown`, with `is_shutdown` | Compiled | `Tick` is in the prelude. `Key`: D.6. `SendFailed`: D.7 |
 | §7.1 `SERVER_STATE` | Compiled, with `CONN_ID` as a plain opaque module (no `satisfies`) | D.7 for the prelude `CONN_ID` |
 | §7.1 `init` and `step` logic | Compiled as `functions ECHO_LOGIC`, with the `shutdown_must_stop` postcondition written by hand. A test program fed it four events and the native run gave the expected connection count. Three mutants were rejected as section 7.1 states | D.7 for real sockets and the full `EVENT` |
 | §7.2 game loop | Prose only | D.6 |
