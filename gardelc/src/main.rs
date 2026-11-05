@@ -4363,6 +4363,11 @@ fn elem_receiver_type(e: &Expr, m: &ModuleDecl) -> Option<String> {
             if rt != module_self_type(m) && rt != m.name {
                 return None;
             }
+            if let ReprKind::Product(fields) = &m.repr {
+                if let Some((_, ty)) = fields.iter().find(|(f, _)| f == r) {
+                    return Some(ty.clone());
+                }
+            }
             let (rd, _) = find_module_routine(m, r)?;
             Some(if rd.ret_type == "Current" {
                 module_self_type(m)
@@ -5512,7 +5517,7 @@ fn bind_boogie_env_type(v: &str, ty: &str) {
 
 /// Task B.3 / §9: static checks on prelude `STRING` values in a user module (prelude mode).
 ///
-/// * `E0311 non_canonical_string_equality`: `a = b` with a `STRING` operand. `STRING` is
+/// * `E0311 non_canonical_equality`: `a = b` with a `STRING` operand. `STRING` is
 ///   `EQ` but not `CANONICAL_EQ` (two values with equal `chars` may differ in hidden
 ///   capacity), so structural Leibniz `=` is forbidden (§9); use `a.equals(b)` or
 ///   `a.chars = b.chars`.
@@ -5548,7 +5553,7 @@ fn type_satisfies(ty: &str, concept: &str, m: &ModuleDecl, ctx: &BoogiePreludeCt
     let ty = ty.trim();
     if matches!(
         ty,
-        "U64" | "NAT" | "I64" | "INT" | "BOOL" | "CHAR" | "UNIT" | "()" | "EXIT_CODE"
+        "U64" | "NAT" | "I64" | "INT" | "BOOL" | "CHAR" | "UNIT" | "()" | "EXIT_CODE" | "MATH_INT"
     ) {
         return matches!(concept, "EQ" | "CANONICAL_EQ" | "ORD");
     }
@@ -5846,14 +5851,128 @@ pub fn check_where_constraints(m: &ModuleDecl, src: &str, input_path: &str) -> V
         .collect()
 }
 
+/// Where an expression sits, for the equality rule (§9).
+struct EqSite<'a> {
+    routine: &'a str,
+    /// Type parameters of the routine.
+    type_params: &'a [String],
+    /// In code that runs. A contract is proven and erased, so it is held to less.
+    runtime: bool,
+}
+
+impl EqSite<'_> {
+    fn contract(&self) -> EqSite<'_> {
+        EqSite { routine: self.routine, type_params: self.type_params, runtime: false }
+    }
+}
+
+/// Whether a contract may not use `=` on `ty` (§9): the type says equality is not structural,
+/// by declaring `EQ` without `CANONICAL_EQ`, or holds such a type. `F64` is not reflexive, and
+/// the layout of a type opaque to `m` is not `m`'s to compare. A type parameter can be: a
+/// contract on one says that a generic routine returns this very value.
+fn leibniz_forbidden(ty: &str, m: &ModuleDecl, ctx: &BoogiePreludeCtx, seen: &mut Vec<String>) -> bool {
+    let ty = ty.trim();
+    if ty == "F64" {
+        return true;
+    }
+    if seen.iter().any(|s| s == ty) {
+        return false;
+    }
+    seen.push(ty.to_string());
+    let (head, args) = split_type_app(ty);
+    if head == "LIST" {
+        return false;
+    }
+    if head == "TUPLE" {
+        return args.iter().any(|a| leibniz_forbidden(a, m, ctx, seen));
+    }
+    let Some(owner) = (if head == m.name { Some(m) } else { ctx.module(head) }) else {
+        return false;
+    };
+    if let Some(sat) = &owner.satisfies {
+        let closure: Vec<String> = sat.concepts.iter().flat_map(|c| concept_closure(c)).collect();
+        if closure.iter().any(|c| c == "EQ") && !closure.iter().any(|c| c == "CANONICAL_EQ") {
+            return true;
+        }
+    }
+    let visible = owner.name == m.name
+        || match &owner.repr_vis {
+            Visibility::Any => true,
+            Visibility::None => false,
+            Visibility::Modules(ms) => ms.iter().any(|n| n == &m.name),
+        };
+    let canonical = owner.satisfies.as_ref().is_some_and(|sat| {
+        sat.concepts.iter().flat_map(|c| concept_closure(c)).any(|c| c == "CANONICAL_EQ")
+    });
+    if !visible && !canonical {
+        return true;
+    }
+    if args.iter().any(|a| leibniz_forbidden(a, m, ctx, seen)) {
+        return true;
+    }
+    if canonical {
+        return false;
+    }
+    // A plain ADT is compared field by field.
+    let fields: Vec<&String> = match &owner.repr {
+        ReprKind::Product(fs) => fs.iter().map(|(_, t)| t).collect(),
+        ReprKind::Sum(vs) => vs.iter().flat_map(|v| v.fields.iter().map(|(_, t)| t)).collect(),
+    };
+    fields.into_iter().any(|t| leibniz_forbidden(t, m, ctx, seen))
+}
+
+/// Whether running code may compare `ty` with `=` (§9): the comparison is a real structural
+/// one in C, so the type must be primitive, a `LIST` or a `TUPLE` of such, or `CANONICAL_EQ`.
+fn leibniz_runtime_allowed(ty: &str, m: &ModuleDecl, ctx: &BoogiePreludeCtx, site: &EqSite<'_>) -> bool {
+    let ty = ty.trim();
+    let (head, args) = split_type_app(ty);
+    if matches!(head, "LIST" | "TUPLE") {
+        return args.iter().all(|a| leibniz_runtime_allowed(a, m, ctx, site));
+    }
+    if site.type_params.iter().any(|t| t == ty) {
+        return false; // a routine's type parameter has no bound
+    }
+    type_satisfies(ty, "CANONICAL_EQ", m, ctx)
+}
+
+/// True for the name of a constructor with no fields.
+fn is_nullary_ctor(e: &Expr, m: &ModuleDecl, ctx: &BoogiePreludeCtx) -> bool {
+    let name = match e {
+        Expr::Var(v) => v,
+        Expr::Call(f, args) if args.is_empty() => f,
+        _ => return false,
+    };
+    let nullary = |o: &ModuleDecl| matches!(&o.repr, ReprKind::Sum(vs) if vs.iter().any(|v| &v.name == name && v.fields.is_empty()));
+    nullary(m) || ctx.modules.iter().any(nullary)
+}
+
+/// `E0311: non_canonical_equality` for the expression `l = r`, or `None` (§9).
+fn equality_violation(e: &Expr, l: &Expr, r: &Expr, m: &ModuleDecl, ctx: &BoogiePreludeCtx, site: &EqSite<'_>) -> Option<String> {
+    let (tl, tr) = (infer_gardel_type(l, m, ctx), infer_gardel_type(r, m, ctx));
+    let text = format_gardel_expr(e);
+    let advice = "use `a.equals(b)` or compare models (`a.model = b.model`)";
+    for t in tl.iter().chain(tr.iter()) {
+        if leibniz_forbidden(t, m, ctx, &mut Vec::new()) {
+            return Some(format!("E0311: non_canonical_equality: `{text}` compares `{t}` with structural `=`, which is not its equality (§9): {advice}"));
+        }
+    }
+    if !site.runtime {
+        return None;
+    }
+    let Some(t) = tl.as_ref().or(tr.as_ref()) else {
+        return Some(format!("E0311: non_canonical_equality: `{text}` runs, and the type of its operands cannot be inferred, so `=` cannot be checked (§9)"));
+    };
+    if leibniz_runtime_allowed(t, m, ctx, site) || is_nullary_ctor(l, m, ctx) || is_nullary_ctor(r, m, ctx) {
+        return None;
+    }
+    Some(format!("E0311: non_canonical_equality: `{text}` runs, and `{t}` is not `CANONICAL_EQ`, so `=` would compare structure (§9): {advice}, or declare `satisfies CANONICAL_EQ`"))
+}
+
 pub fn check_string_semantics(m: &ModuleDecl, src: &str, input_path: &str) -> Vec<Diagnostic> {
     if !prelude_injection_enabled() || standard_prelude().declares(&m.name) {
         return Vec::new();
     }
     let ctx = Rc::new(BoogiePreludeCtx::for_module(m));
-    if ctx.module("STRING").is_none() {
-        return Vec::new();
-    }
     let prev = BOOGIE_PRELUDE_CTX.with(|c| c.replace(Some(ctx.clone())));
     let mut found: Vec<(String, &'static str, String)> = Vec::new();
 
@@ -5869,7 +5988,7 @@ pub fn check_string_semantics(m: &ModuleDecl, src: &str, input_path: &str) -> Ve
     }
     fn walk_stmts(
         stmts: &[Stmt],
-        rn: &str,
+        rn: &EqSite<'_>,
         m: &ModuleDecl,
         ctx: &BoogiePreludeCtx,
         out: &mut Vec<(String, &'static str, String)>,
@@ -5882,14 +6001,14 @@ pub fn check_string_semantics(m: &ModuleDecl, src: &str, input_path: &str) -> Ve
                         bind_boogie_env_type(v, &t);
                     }
                 }
-                Stmt::Check(_, e) | Stmt::Assume(_, e) => walk(e, rn, m, ctx, out),
+                Stmt::Check(_, e) | Stmt::Assume(_, e) => walk(e, &rn.contract(), m, ctx, out),
                 Stmt::Reveal(_) => {}
             }
         }
     }
     fn walk(
         e: &Expr,
-        rn: &str,
+        rn: &EqSite<'_>,
         m: &ModuleDecl,
         ctx: &BoogiePreludeCtx,
         out: &mut Vec<(String, &'static str, String)>,
@@ -5899,18 +6018,13 @@ pub fn check_string_semantics(m: &ModuleDecl, src: &str, input_path: &str) -> Ve
                 walk(l, rn, m, ctx, out);
                 walk(r, rn, m, ctx, out);
                 let s_operand = is_string(l, m, ctx) || is_string(r, m, ctx);
-                if op == "=" && s_operand {
-                    out.push((
-                        rn.to_string(),
-                        "E0311: non_canonical_string_equality",
-                        format!(
-                            "E0311: non_canonical_string_equality: `{}` compares STRING values with structural `=`; STRING satisfies EQ but not CANONICAL_EQ (§9), so use `a.equals(b)` or `a.chars = b.chars`",
-                            format_gardel_expr(e)
-                        ),
-                    ));
+                if op == "=" {
+                    if let Some(msg) = equality_violation(e, l, r, m, ctx, rn) {
+                        out.push((rn.routine.to_string(), "E0311: non_canonical_equality", msg));
+                    }
                 } else if op == "+" && s_operand {
                     out.push((
-                        rn.to_string(),
+                        rn.routine.to_string(),
                         "E0312: string_plus_operator",
                         format!(
                             "E0312: string_plus_operator: `{}` applies `+` to STRING; `+` is not part of the prelude STRING API (§3.1); use `a.concat(b)`",
@@ -5937,7 +6051,7 @@ pub fn check_string_semantics(m: &ModuleDecl, src: &str, input_path: &str) -> Ve
                 for c in cases {
                     if pat_has_str(&c.pattern) {
                         out.push((
-                            rn.to_string(),
+                            rn.routine.to_string(),
                             "E0313: string_literal_pattern",
                             format!(
                                 "E0313: string_literal_pattern: `case {}` matches a STRING structurally; STRING is not CANONICAL_EQ (§9), use `if s.equals(...)`",
@@ -5986,23 +6100,27 @@ pub fn check_string_semantics(m: &ModuleDecl, src: &str, input_path: &str) -> Ve
         .map(|(_, r)| r);
     for r in routines {
         set_boogie_type_env(m, &r.params, Some(&r.ret_type));
+        let ghost = m.specify_routines.iter().any(|(_, g)| std::ptr::eq(g, r));
+        let body = EqSite { routine: &r.name, type_params: &r.type_params, runtime: !ghost };
+        let contract = body.contract();
         for (_, e) in &r.requires {
-            walk(e, &r.name, m, &ctx, &mut found);
+            walk(e, &contract, m, &ctx, &mut found);
         }
-        walk_stmts(&r.stmts, &r.name, m, &ctx, &mut found);
-        walk(&r.body, &r.name, m, &ctx, &mut found);
+        walk_stmts(&r.stmts, &body, m, &ctx, &mut found);
+        walk(&r.body, &body, m, &ctx, &mut found);
         for (_, e) in &r.ensures {
-            walk(e, &r.name, m, &ctx, &mut found);
+            walk(e, &contract, m, &ctx, &mut found);
         }
     }
     for (_, law) in &m.specify_laws {
         set_boogie_type_env(m, &law.params, None);
+        let site = EqSite { routine: &law.name, type_params: &[], runtime: false };
         for (_, e) in law.requires.iter().chain(law.ensures.iter()) {
-            walk(e, &law.name, m, &ctx, &mut found);
+            walk(e, &site, m, &ctx, &mut found);
         }
-        walk_stmts(&law.stmts, &law.name, m, &ctx, &mut found);
+        walk_stmts(&law.stmts, &site, m, &ctx, &mut found);
         if let Some(b) = &law.body {
-            walk(b, &law.name, m, &ctx, &mut found);
+            walk(b, &site, m, &ctx, &mut found);
         }
     }
     clear_boogie_type_env();
@@ -19261,6 +19379,95 @@ end
         }
     }
 
+    /// `E0311` diagnostics of a one-file module with the given source.
+    fn d6b_e0311(src: &str) -> usize {
+        let m = parse_user_module_with_prelude(src);
+        let diags = with_prelude_injection(true, || check_string_semantics(&m, src, "eq.gdl"));
+        diags.iter().filter(|d| d.rule.starts_with("E0311")).count()
+    }
+
+    #[test]
+    fn test_d6b_runtime_equality_needs_a_canonical_type() {
+        // `=` in running code is a real structural comparison in C.
+        let f = |sig: &str, body: &str| format!("functions EQF\n\nfeature {{ANY}}\n\n  {sig}: BOOL\n    do\n      {body}\n    end\n\nend\n");
+        for (sig, body) in [
+            ("r(a: SEQ[U64], b: SEQ[U64])", "a = b"),
+            ("r(a: SEQ[U64], b: SEQ[U64])", "a != b"),
+            ("r(a: STRING, b: STRING)", "a = b"),
+            ("r(a: BIGNAT, b: BIGNAT)", "a = b"),
+            ("r(a: F64, b: F64)", "a = b"),
+            ("r(a: OPTION[SEQ[U64]], b: OPTION[SEQ[U64]])", "a = b"),
+            ("r(a: LIST[SEQ[U64]], b: LIST[SEQ[U64]])", "a = b"),
+            ("r[T](a: T, b: T)", "a = b"),
+            ("r(e: EVENT)", "e = Shutdown"),
+            ("r(a: OPTION[SEQ[U64]])", "a = None"),
+            ("r(a: TUPLE[U64, STRING], b: TUPLE[U64, STRING])", "a = b"),
+            ("r(a: U64, b: SEQ[U64])", "SEQ.singleton(a).map(fn(x: U64): BOOL do b = b end).length = 0"),
+        ] {
+            assert!(d6b_e0311(&f(sig, body)) > 0, "`{body}` on {sig} must be refused");
+        }
+        for (sig, body) in [
+            ("r(a: U64, b: U64)", "a = b"),
+            ("r(a: CHAR, b: CHAR)", "a = b"),
+            ("r(a: BOOL, b: BOOL)", "a != b"),
+            ("r(a: LIST[U64], b: LIST[U64])", "a = b"),
+            ("r(a: TUPLE[U64, BOOL], b: TUPLE[U64, BOOL])", "a = b"),
+            ("r(a: OPTION[U64], b: OPTION[U64])", "a = b"),
+            ("r(a: OPTION[SEQ[U64]])", "a.is_none"),
+        ] {
+            assert_eq!(d6b_e0311(&f(sig, body)), 0, "`{body}` on {sig} must stay legal");
+        }
+        // A plain enum: a constructor test is what `match` does; two values are not comparable.
+        let e = |body: &str| format!("module PAINT\n\nrepresentation {{ANY}}\n  | Red\n  | Blue(n: NAT)\n\nfeature {{ANY}}\n\n  r(o: PAINT): BOOL\n    do\n      {body}\n    end\n\nend\n");
+        assert_eq!(d6b_e0311(&e("Current = Red")), 0);
+        assert!(d6b_e0311(&e("Current = o")) > 0);
+        assert!(d6b_e0311(&e("Current = Blue(1)")) > 0);
+        // A bounded type parameter is canonical.
+        let g = "module KEEP[A: CANONICAL_EQ]\n\nrepresentation {NONE}\n  x: A\n\nfeature {ANY}\n\n  same(o: KEEP[A]): BOOL\n    do\n      Current.x = o.x\n    end\n\nend\n";
+        assert_eq!(d6b_e0311(g), 0);
+        assert!(d6b_e0311(&g.replace("A: CANONICAL_EQ", "A")) > 0);
+    }
+
+    #[test]
+    fn test_d6b_contracts_may_compare_unless_the_type_says_not() {
+        let c = |sig: &str, clause: &str| format!("functions EQC\n\nfeature {{ANY}}\n\n  {sig}: U64\n    do\n      0\n    ensure\n      c: {clause}\n    end\n\nend\n");
+        for (sig, clause) in [
+            ("r(a: SEQ[U64], b: SEQ[U64])", "a = b"),
+            ("r(a: STRING, b: STRING)", "a = b"),
+            ("r(a: BIGNAT, b: BIGNAT)", "a = b"),
+            ("r(a: F64, b: F64)", "a = b"),
+            ("r(a: OPTION[SEQ[U64]], b: OPTION[SEQ[U64]])", "a = b"),
+            ("r(e: EVENT)", "e = Shutdown"),
+        ] {
+            assert!(d6b_e0311(&c(sig, clause)) > 0, "`{clause}` on {sig} must be refused");
+        }
+        for (sig, clause) in [
+            ("r(a: SEQ[U64], b: SEQ[U64])", "a.model = b.model"),
+            ("r(a: STRING, b: STRING)", "a.chars = b.chars"),
+            ("r(a: BIGNAT, b: BIGNAT)", "a.model = b.model"),
+            ("r(a: OPTION[U64], b: OPTION[U64])", "a = b"),
+            ("r[T](a: T, b: T)", "a = b"),
+            ("r[T](a: OPTION[T], b: OPTION[T])", "a = b"),
+        ] {
+            assert_eq!(d6b_e0311(&c(sig, clause)), 0, "`{clause}` on {sig} must stay legal");
+        }
+    }
+
+    #[test]
+    fn test_d6b_an_opaque_type_cannot_be_compared_by_a_client() {
+        // The layout of an opaque type is hidden, so a client cannot depend on it, in code
+        // or in a contract. Finding 10: `x != c` on a plain handle verified 0/0.
+        let handle = "module HANDLE\n\nrepresentation {NONE}\n  id: NAT\n\ncreate {ANY}\n\n  of(n: NAT): HANDLE\n    do\n      { id = n }\n    end\n\nfeature {ANY}\n\n  same(o: HANDLE): BOOL\n    do\n      Current.id = o.id\n    end\n\nend\n";
+        let client = |body: &str| format!("functions USER\n\nfeature {{ANY}}\n\n  r(a: HANDLE, b: HANDLE): U64\n    do\n      {body}\n    end\n\nend\n");
+        let run = |src: &str| {
+            let mut units = b4_units(&[("handle.gdl", handle), ("user.gdl", src)]);
+            let checked = check_and_verify_project(&mut units, b4_opts(true, true));
+            checked.diags.into_iter().map(|(_, d)| d).filter(|d| d.rule.starts_with("E0311")).count()
+        };
+        assert!(run(&client("if a != b then 1 else 0 end")) > 0);
+        assert_eq!(run(&client("if a.same(b) then 1 else 0 end")), 0);
+    }
+
     #[test]
     fn test_d6_scripted_input_is_checked() {
         let c = d4_c(&[("echo_lines.gdl", D6_LINES)]);
@@ -20766,7 +20973,7 @@ end
         // wrapped values are unequal must NOT verify. Previously element `.equals` inside
         // OPTION/RESULT was lowered to `==` (keyed on variable names) and `A_eq <==> ==` was a
         // module-wide axiom, so this false contract verified.
-        let src = "functions OPTSEQ\n\nfeature {ANY}\n\n  wrap_differs(s1: SEQ[U64], s2: SEQ[U64]): BOOL\n    require\n      behaviourally_equal: s1.equals(s2)\n      different_shape: not (s1 = s2)\n    do\n      Some(s1).equals(Some(s2))\n    ensure\n      claims_unequal: Result = False\n    end\n\nend\n";
+        let src = "functions OPTSEQ\n\nfeature {ANY}\n\n  is_leaf(s: SEQ[U64]): BOOL\n    do\n      match s\n        case Leaf(_) then True\n        case _ then False\n      end\n    end\n\n  wrap_differs(s1: SEQ[U64], s2: SEQ[U64]): BOOL\n    require\n      behaviourally_equal: s1.equals(s2)\n      different_shape: is_leaf(s1) and not is_leaf(s2)\n    do\n      Some(s1).equals(Some(s2))\n    ensure\n      claims_unequal: Result = False\n    end\n\nend\n";
         let diags = soundness_verify(src, "optseq.gdl");
         assert!(
             diags
@@ -21212,7 +21419,7 @@ end
     #[test]
     fn test_product_module_type_params_and_not_equal() {
         // A bounded type parameter of a record module verifies, and its `EQ` theory is usable.
-        let pair = "module PAIR[A: EQ]\n\nrepresentation {ANY}\n  fst: A\n  snd: A\n\nfeature {ANY}\n\n  same: BOOL\n    do\n      Current.fst = Current.snd\n    ensure\n      sym: Result = (Current.snd = Current.fst)\n    end\n\n  distinct: BOOL\n    do\n      Current.fst != Current.snd\n    ensure\n      sym_ne: Result = (Current.snd != Current.fst)\n    end\n\n  twisted: BOOL\n    do\n      Current.fst = Current.snd\n    ensure\n      wrong: Result\n    end\n\nend\n";
+        let pair = "module PAIR[A: EQ]\n\nrepresentation {ANY}\n  fst: A\n  snd: A\n\nfeature {ANY}\n\n  same: BOOL\n    do\n      Current.fst.equals(Current.snd)\n    ensure\n      sym: Result = Current.snd.equals(Current.fst)\n    end\n\n  distinct: BOOL\n    do\n      not Current.fst.equals(Current.snd)\n    ensure\n      sym_ne: Result = (not Current.snd.equals(Current.fst))\n    end\n\n  twisted: BOOL\n    do\n      Current.fst.equals(Current.snd)\n    ensure\n      wrong: Result\n    end\n\nend\n";
         let diags = soundness_verify(pair, "pair.gdl");
         assert_eq!(
             diags.len(),

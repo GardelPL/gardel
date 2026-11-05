@@ -82,7 +82,7 @@ representation {ANY}
 end
 ```
 
-`EVENT` is defined in section 6. `CONN_ID` is an opaque prelude handle (`representation {NONE}`, `satisfies CANONICAL_EQ, ORD`), so programs can compare and store handles but never forge one. `satisfies` here is a real proof burden: Task D.7 must prove the `EQ`, `CANONICAL_EQ` and `ORD` laws for it. `STEP` also has the query `is_stop`, and `EVENT` the query `is_shutdown` (section 4).
+`EVENT` is defined in section 6. `CONN_ID` is an opaque prelude handle (`representation {NONE}`, `satisfies CANONICAL_EQ, ORD`), so programs can compare and store handles but never forge one. `satisfies` here is a real proof burden: Task D.7 must prove the `EQ`, `CANONICAL_EQ` and `ORD` laws for it, and without them `x != c` is refused (`E0311`). `STEP` also has the query `is_stop`, and `EVENT` the query `is_shutdown` (section 4).
 
 Commands in one `cmds` list run in list order. A command never blocks the loop. A command that can fail reports its failure as an event, never as a crash, in line with the Error Handling Doctrine (§7.2).
 

@@ -1687,10 +1687,15 @@ Structural Leibniz equality denotes syntactic term identity in First-Order Logic
 $$\forall x, y \in T.\; x = y \implies (\forall P.\; P(x) \iff P(y))$$
 
 **Scope of Validity:**
-Leibniz equality (`=`) is permitted **strictly** for:
+Leibniz equality (`=`) is canonical for:
 1. Exact discrete primitive scalar types (`UNIT`, `U64`, `I64`, `BOOL`, `CHAR`, and `MATH_INT`). Floating-point `F64` is explicitly excluded because IEEE-754 `NaN != NaN` and signed zeroes (`+0.0` vs `-0.0`) violate reflexivity and Leibniz indiscernibility (§3).
 2. Canonical inductive ghost models (`LIST[A]`).
 3. User ADTs that explicitly prove conformance to `concept CANONICAL_EQ refines EQ`.
+
+`E0311: non_canonical_equality` enforces it, differently where `=` runs and where it is only proven:
+
+- **In code that runs**, `=` is a real structural comparison, so two equal `SEQ` values of different shapes would compare unequal. The type must be canonical as above (a `TUPLE` or `LIST` of canonical types is), and it must be known: a type parameter needs a `CANONICAL_EQ` bound, and operands whose type cannot be inferred are refused. The one exception is a comparison with a constructor that has no fields, `l = Red`, on a type allowed in contracts: it asks which constructor a value has, as `match` does.
+- **In a contract** (`require`, `ensure`, `check`, `specify`, laws), `=` is a proven statement about values, and is refused only where the type says it is not its equality: a type that declares `EQ` without `CANONICAL_EQ` (`SEQ`, `BIGNAT`, `STRING`), a type holding one (`OPTION[SEQ[U64]]`, `EVENT`), `F64`, and a type opaque to the module, whose layout is not the module's to compare. A type parameter is allowed: the catalogue laws such as `Some(v).map(f) = Some(f(v))` say that a generic routine returns this very value, and no `equals` exists on an unbounded `B` to say it with.
 
 **The Non-Canonical / Quotient Unsoundness Hazard:**
 For runtime collections and quotient structures with internal structural degrees of freedom (such as binary tree balance in `SEQ[A]`, chunk boundaries, or buffer capacity in `STRING`), two distinct physical terms represent the exact same mathematical value. For example, in `SEQ[NAT]`:
@@ -2938,6 +2943,7 @@ Phase D builds the `reactive program` of §11.6. `plan/Roadmap.md` holds its tas
 | D.4 | Host loop: the `Print` + `Shutdown` slice | ✅ Completed |
 | D.5 | `SetTimer`, `Tick` | ✅ Completed |
 | D.6 | `ReadLine`, `ReadKey`, `Line`, `Key`, `KEY` | ✅ Completed |
+| D.6b | `=` enforced for every type (§9) | ✅ Completed |
 | D.7 | `CONN_ID`, sockets, the echo server | 📋 Planned |
 | D.8 | Event log and replay | 📋 Planned |
 

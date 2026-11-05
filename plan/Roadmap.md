@@ -419,7 +419,7 @@ Source: [review/review.md](review/review.md). The verification notes for each fi
 
 ### Phase D: Reactive Programs
 
-**Status:** 🔄 In progress: D.0 to D.6 completed, D.6b next (2026-11-04).
+**Status:** 🔄 In progress: D.0 to D.6b completed, D.7 next (2026-11-04).
 
 **Objective:** let Gardel express programs that run until told to stop (servers, TUIs, games) without weakening totality. Every routine stays total. Non-termination lives in one place, the runtime's host loop, and a `reactive program` declares it. The design is [reactive/reactive_programs.md](reactive/reactive_programs.md) (revision 2), corrected by the findings below.
 
@@ -440,7 +440,7 @@ Small multi-file programs shaped like the proposal were run through the compiler
 | 7 | Proposal §9 assumes `poll`/`epoll`, and development is on Windows. `IO.read_line` blocks, while a command must never block the loop. | Decisions 4 and 5. |
 | 8 | `let t = LIST.empty.prepend(..)` inside a `program` fails in Boogie (`cannot assign Seq EVENT to int`): local type inference does not follow that chain. It fails loudly. A routine with a declared return type avoids it. | Known limit. Fix it if D.5's test programs need it. |
 | 9 | `satisfies CANONICAL_EQ` on `CONN_ID` needs proofs of four concept laws (`reflexive`, `symmetric`, `transitive`, `agrees_with_structural`), and `ORD` needs more. The proposal treated it as a simple handle. | Task D.7 budgets for these proofs. |
-| 10 | `x != c` on a module that is not `CANONICAL_EQ` verifies 0/0. The §9 rule that `=` needs `CANONICAL_EQ` is enforced only for `STRING` (`E0311`). | An existing gap, not specific to Phase D. **Decision (2026-11-04): enforce the rule**, in Task D.6b, before D.7 relies on it. |
+| 10 | `x != c` on a module that is not `CANONICAL_EQ` verifies 0/0. The §9 rule that `=` needs `CANONICAL_EQ` is enforced only for `STRING` (`E0311`). | An existing gap, not specific to Phase D. **Decision (2026-11-04): enforce the rule**, done in Task D.6b. |
 
 #### Decisions
 
@@ -554,9 +554,14 @@ flowchart TD
 - **Known limits:** a read cannot be cancelled, so a `ReadLine` waits until a line arrives. Mixing `ReadLine` and `ReadKey` on piped input is not defined, because `ReadLine` reads through a stdio buffer and `ReadKey` does not. On Windows, piped input (not a console) has no arrow keys, and a byte 27 is always `Escape`. A crash, `SIGKILL` or Ctrl-Z leaves a POSIX terminal raw.
 - Acceptance: malformed input arrives as an `Error` event and never crashes. The terminal is restored after `Stop` and after Ctrl-C. Scripted runs give identical output.
 
-#### Task D.6b: Enforce the `=` Rule for Modules [📋 Planned]
-- [ ] Extend `E0311` from `STRING` to every type that is not primitive or `CANONICAL_EQ` (spec §9, finding 10), with `a.equals(b)` or `a.model = b.model` as the fix the message suggests.
-- [ ] Measure what it rejects in `stdlib/`, `examples/` and the fixtures, and fix those uses.
+#### Task D.6b: Enforce the `=` Rule for Modules [✅ Completed]
+- [x] **Measured first**, with a temporary build logging every `=`: 355 in `stdlib/`, `examples/` and the fixtures. 299 were fine, 8 had an unknown type, and 48 broke the rule as §9 stated it. All 48 were in contracts and laws, none in running code. 5 were `MATH_INT`, which `type_satisfies` had omitted. Most of the rest were §9's own catalogue laws on unbounded type parameters (`Some(v).map(f) = Some(f(v))`), which cannot be stated any other way, so the rule as written could not be enforced.
+- [x] **Spec §9 changed** to separate what runs from what is proven. In running code `=` is a real structural comparison: the type must be canonical and known, and a type parameter needs a bound. A comparison with a field-less constructor is allowed (`l = Red`, what `match` does). In a contract, `=` is refused only where the type says it is not its equality: it declares `EQ` without `CANONICAL_EQ`, holds such a type, is `F64`, or is opaque to the module.
+- [x] `E0311` is now `non_canonical_equality`, with `a.equals(b)` or `a.model = b.model` as the fix its message suggests. It rejects nothing in `stdlib/`, `examples/` or the `.gdl` fixtures. It did reject two inline test sources, rightly, and both were rewritten keeping what they prove: `PAIR[A: EQ]` used `=` where `A` only promises `EQ`, and a soundness test said "differently shaped" as `not (s1 = s2)` on `SEQ`, now `is_leaf(s1) and not is_leaf(s2)`. It closes finding 10: `x != c` on an opaque handle is refused, so D.7's `CONN_ID` needs its `CANONICAL_EQ` proofs.
+- [x] The fix `E0311` suggests did not compile in one case: `x.f.equals(y)` on a record field typed by a bounded parameter emitted an undeclared `fn_equals`. `elem_receiver_type` now resolves fields.
+- Tests `test_d6b_runtime_equality_needs_a_canonical_type`, `test_d6b_contracts_may_compare_unless_the_type_says_not`, `test_d6b_an_opaque_type_cannot_be_compared_by_a_client`.
+- `cargo test` 135/135. `--stdlib --strict` 0/0 on seeds 0–3, and the nine examples 0/0.
+- **Known limit:** as before, the check runs on user modules, not on `stdlib/`, and a contract operand whose type cannot be inferred is not checked (8 cases in the stdlib, all function applications or `None.map(f)`).
 - Acceptance: `=` on a non-canonical module is rejected, canonical and primitive uses are unchanged, and `--stdlib --strict` and the examples stay 0/0.
 
 #### Task D.7: Sockets and the Echo Server [📋 Planned]
@@ -590,7 +595,7 @@ flowchart TD
 
 With **Phase A: Language Specification Harmonization**, **Phase B: Compiler Engine & Prelude Tooling**, **Task C.1: Physical Decomposition of `stdlib/`**, **Task C.2: High-Performance Smart String (`stdlib/text/string.gdl`)**, and **Task C.3: Regression Verification & Performance Benchmarking** completely executed and verified with 0 errors and 0 warnings under `--strict`, Phase C's planned work is done. The verification baseline is clean, and every module compiles from source to C with reference-counted memory (C.3 follow-ups).
 
-The next step is **Phase D: Reactive Programs**, defined above with its tasks, dependency graph and acceptance criteria. The C prerequisites of [reactive/reactive_programs.md](reactive/reactive_programs.md) are in place (C.3 follow-ups): every module compiles from source, closures work, and memory is reference counted, so a program that runs forever does not leak. Tasks D.0 to D.6 are completed, so `examples/reactive_hello.gdl`, `examples/reactive_clock/` and `examples/reactive_game/` run. Next, enforce the `=` rule (D.6b), then sockets (D.7). C.4.4 has its baseline (Task D.5).
+The next step is **Phase D: Reactive Programs**, defined above with its tasks, dependency graph and acceptance criteria. The C prerequisites of [reactive/reactive_programs.md](reactive/reactive_programs.md) are in place (C.3 follow-ups): every module compiles from source, closures work, and memory is reference counted, so a program that runs forever does not leak. Tasks D.0 to D.6 are completed, so `examples/reactive_hello.gdl`, `examples/reactive_clock/` and `examples/reactive_game/` run. Task D.6b is completed too. Next, sockets (D.7). C.4.4 has its baseline (Task D.5).
 
 **Task C.4 (memory management performance)** is planned. C.4.1–C.4.3 do not depend on Phase D and can be done before or alongside it. C.4.1 and C.4.2 are small and have the largest payoff measured on `seq_bench`, but a reactive program rarely exits, so C.4.1 does little for Phase D and C.4.2 matters more. C.4.4 needs a reactive program to measure against, and D.5 provides its baseline.
 
