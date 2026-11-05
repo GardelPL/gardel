@@ -3666,6 +3666,10 @@ pub const STDLIB_SOURCES: &[(&str, &str)] = &[
         include_str!("../../stdlib/core/command.gdl"),
     ),
     (
+        "stdlib/core/key.gdl",
+        include_str!("../../stdlib/core/key.gdl"),
+    ),
+    (
         "stdlib/core/event.gdl",
         include_str!("../../stdlib/core/event.gdl"),
     ),
@@ -3705,6 +3709,8 @@ pub fn phase4_stdlib_source() -> &'static str {
         include_str!("../../stdlib/functional/function_ops.gdl"),
         "\n",
         include_str!("../../stdlib/core/command.gdl"),
+        "\n",
+        include_str!("../../stdlib/core/key.gdl"),
         "\n",
         include_str!("../../stdlib/core/event.gdl"),
         "\n",
@@ -4745,7 +4751,7 @@ pub fn check_module_dependency_cycles(units: &[SourceUnit], table: &LinkTable) -
 /// `STRING` is injected for modules that mention it, contain string literals or use `IO`
 /// (Task B.3: literals denote prelude `STRING` values); `LIST_OPS` / `FUNCTION_OPS` are realized by the built-in
 /// `Seq_*` / `Fn1_*` preamble theories already present in every Boogie file.
-const BOOGIE_INJECTED_PRELUDE: [&str; 11] = [
+const BOOGIE_INJECTED_PRELUDE: [&str; 12] = [
     "OPTION",
     "RESULT",
     "SEQ",
@@ -4755,6 +4761,7 @@ const BOOGIE_INJECTED_PRELUDE: [&str; 11] = [
     "STRING",
     "IO_ERROR",
     "COMMAND",
+    "KEY",
     "EVENT",
     "STEP",
 ];
@@ -15057,6 +15064,22 @@ pub fn emit_c11_read_line_runtime() -> String {
     format!(
         r#"#include <errno.h>
 /* IO boundary (spec 11): IO.read_line : IO[RESULT[IO_ERROR, STRING]] */
+static struct {r}* gardel_line_at_end(void) {{
+    return make_{r}_Error(make_IO_ERROR_EndOfInput());
+}}
+/* A line of untrusted bytes, without its line break. Takes `buf`, from malloc. */
+static struct {r}* gardel_line_from_bytes(char* buf, size_t len) {{
+    uint64_t chars = 0;
+    struct STRING_ERROR* derr = gardel_utf8_validate((const uint8_t*)buf, (uint64_t)len, &chars);
+    if (derr) {{ free(buf); return make_{r}_Error(make_IO_ERROR_Decode(derr)); }}
+    void* owner = NULL;
+    char* data = gardel_buf_alloc(len + 1, &owner);
+    memcpy(data, buf, len);
+    data[len] = '\0';
+    free(buf);
+    GardelString s = {{ data, (uint64_t)len, chars, owner }};
+    return make_{r}_Ok(s);
+}}
 static struct {r}* gardel_io_read_line_result(void) {{
     size_t cap = 128, len = 0;
     char* buf = (char*)malloc(cap);
@@ -15075,18 +15098,9 @@ static struct {r}* gardel_io_read_line_result(void) {{
         buf[len++] = (char)c;
     }}
     if (ferror(stdin)) {{ free(buf); return make_{r}_Error(make_IO_ERROR_OsError((int64_t)errno)); }}
-    if (!saw_any) {{ free(buf); return make_{r}_Error(make_IO_ERROR_EndOfInput()); }}
+    if (!saw_any) {{ free(buf); return gardel_line_at_end(); }}
     if (len > 0 && buf[len - 1] == '\r') len--;
-    uint64_t chars = 0;
-    struct STRING_ERROR* derr = gardel_utf8_validate((const uint8_t*)buf, (uint64_t)len, &chars);
-    if (derr) {{ free(buf); return make_{r}_Error(make_IO_ERROR_Decode(derr)); }}
-    void* owner = NULL;
-    char* data = gardel_buf_alloc(len + 1, &owner);
-    memcpy(data, buf, len);
-    data[len] = '\0';
-    free(buf);
-    GardelString s = {{ data, (uint64_t)len, chars, owner }};
-    return make_{r}_Ok(s);
+    return gardel_line_from_bytes(buf, len);
 }}
 
 "#
@@ -16658,7 +16672,7 @@ end
         let stdlib = parse_phase4_stdlib().expect("Phase 4 stdlib should parse");
         assert_eq!(stdlib.group, None);
         assert_eq!(stdlib.concepts.len(), 3);
-        assert_eq!(stdlib.modules.len(), 13);
+        assert_eq!(stdlib.modules.len(), 14);
         for m in &stdlib.modules {
             let mut diags = check_visibility_and_semantics(m);
             diags.extend(verify_module_phase3(
@@ -17148,7 +17162,7 @@ end
     #[test]
     fn test_plan3_multi_module_stdlib_pipeline() {
         let ast = parse_phase4_stdlib().expect("stdlib parses cleanly");
-        assert_eq!(ast.modules.len(), 13);
+        assert_eq!(ast.modules.len(), 14);
         let mut prog_env = ProgramEnv {
             modules: HashMap::new(),
             concepts: HashMap::new(),
@@ -19127,6 +19141,10 @@ end
         for v in variants("EVENT") {
             assert!(c11_typed::host_event_code(&v).is_some(), "EVENT.{v}");
         }
+        for v in variants("KEY") {
+            assert!(c11_typed::host_key_code(&v).is_some(), "KEY.{v}");
+        }
+        assert!(c11_typed::host_key_code("Nonsense").is_none());
         assert!(c11_typed::host_command_code("Nonsense").is_none());
         assert!(c11_typed::host_event_code("Nonsense").is_none());
         let c = d4_c(&[("reactive_hello.gdl", D4_HELLO)]);
@@ -19134,6 +19152,124 @@ end
         // One OpenMP region around the loop: a region per call wakes the team for every event.
         let host = &c[c.find("int gardel_reactive_main").unwrap()..];
         assert_eq!(host.matches("#pragma omp parallel").count(), 1, "{host}");
+    }
+
+    /// Runs C with this stdin and no script: (exit code, stdout).
+    fn d6_run_stdin(c: &str, tag: &str, input: &[u8]) -> Option<(i32, String)> {
+        let runs = c3_native_runs(c, tag, &[input])?;
+        Some((runs[0].0, runs[0].1.replace("\r\n", "\n")))
+    }
+
+    const D6_LINES: &str = include_str!("../tests/reactive/echo_lines.gdl");
+
+    #[test]
+    fn test_d6_lines_arrive_as_events_and_bad_input_never_crashes() {
+        let c = d4_c(&[("echo_lines.gdl", D6_LINES)]);
+        // Real stdin, through the reader thread. Malformed UTF-8 is an `Error` event.
+        let input: &[u8] = b"hello\nh\xC3\xA9llo\n\xFF\xFE\nlast";
+        let expected = "hello\nh\u{e9}llo\nbad input\nlast\nend";
+        if let Some((code, out)) = d6_run_stdin(&c, "rlines", input) {
+            assert_eq!((code, out.as_str()), (0, expected));
+        }
+        // Scripted runs give identical output.
+        if let Some((code, out, err)) = d4_run(&c, "rlinesscript", "Line:hello Line:h%C3%A9llo Line:%FF%FE Line:last LineEnd", &[]) {
+            assert_eq!((code, out.trim_end()), (0, expected), "{err}");
+        }
+    }
+
+    #[test]
+    fn test_d6_a_blocked_reader_does_not_stop_the_program_or_its_exit() {
+        // stdin stays open and silent, so the reader is blocked. Timers still run through the
+        // same wait, and the process still exits: exit() would wait on the stdin stream.
+        let src = "reactive program BLOCKED\n\nfeature {ANY}\n\n  init(args: SEQ[STRING]): STEP[NAT]\n    do\n      Continue(0, LIST.empty.prepend(SetTimer(1, 50)).prepend(ReadLine))\n    end\n\n  step(s: NAT, e: EVENT): STEP[NAT]\n    do\n      match e\n        case Tick(id) then Stop(5, LIST.empty.prepend(Print(\"timer fired\")))\n        case _ then Stop(9, LIST.empty)\n      end\n    end\n\nend\n";
+        let c = d4_c(&[("blocked.gdl", src)]);
+        let Some((dir, exe)) = c3_compile(&c, "rblocked") else { return };
+        let mut child = Command::new(&exe)
+            .env_remove("GARDEL_EVENTS")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let held_open = child.stdin.take();
+        let start = std::time::Instant::now();
+        let status = loop {
+            if let Some(s) = child.try_wait().unwrap() {
+                break Some(s);
+            }
+            if start.elapsed() > std::time::Duration::from_secs(20) {
+                break None;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        };
+        if status.is_none() {
+            let _ = child.kill();
+        }
+        drop(held_open);
+        let o = child.wait_with_output().unwrap();
+        let _ = fs::remove_dir_all(&dir);
+        assert_eq!(status.and_then(|s| s.code()), Some(5), "the program must exit while the reader is blocked");
+        assert!(String::from_utf8_lossy(&o.stdout).starts_with("timer fired"));
+    }
+
+    const D6_BOARD: &str = include_str!("../../examples/reactive_game/track_board.gdl");
+    const D6_GAME: &str = include_str!("../../examples/reactive_game/reactive_game.gdl");
+
+    #[test]
+    fn test_d6_game_verifies_and_plays() {
+        let c = d4_c(&[("track_board.gdl", D6_BOARD), ("reactive_game.gdl", D6_GAME)]);
+        let win = "Reach the G. Arrows or h and l move, q quits.\n@...G\n.@..G\n..@.G\n...@G\n....@\nYou win.";
+        // Scripted: keys by name and by scalar. A wall stops the move, and the board stays legal.
+        if let Some((code, out, err)) = d4_run(&c, "rgame", "Key:Left Key:Right Key:Other Key:108 Key:Right Key:Right", &[]) {
+            assert_eq!(code, 0, "{err}");
+            assert_eq!(out.trim_end(), "Reach the G. Arrows or h and l move, q quits.\n@...G\n@...G\n.@..G\n..@.G\n...@G\n....@\nYou win.");
+        }
+        // Real stdin through a pipe: identical output, with an arrow as its escape sequence
+        // on POSIX, where a lone byte 27 can be told from one.
+        if let Some((code, out)) = d6_run_stdin(&c, "rgamepipe", b"llll") {
+            assert_eq!((code, out.as_str()), (0, win));
+        }
+        // Malformed bytes are `Other`: they never become a CHAR, and never crash.
+        if let Some((code, out)) = d6_run_stdin(&c, "rgamebad", b"\xFF\xC0\x80\xED\xA0\x80\xF4\x90\x80\x80q") {
+            assert_eq!(code, 0, "{out}");
+            assert!(out.ends_with("Bye."), "{out}");
+        }
+        // End of input is an event, so a program cannot hang on a closed stdin.
+        if let Some((code, out)) = d6_run_stdin(&c, "rgameeof", b"l") {
+            assert_eq!(code, 1, "{out}");
+            assert!(out.ends_with("Input ended."), "{out}");
+        }
+        // The invariant is what proves the board legal.
+        let bad = D6_BOARD.replace("if Current.pos + 1 < 5 then", "if True then");
+        assert_ne!(bad, D6_BOARD);
+        let (diags, _) = d2_project(&[("track_board.gdl", &bad), ("reactive_game.gdl", D6_GAME)]);
+        assert!(diags.iter().any(|d| d.tag == "on_board"), "{diags:?}");
+    }
+
+    #[test]
+    fn test_prelude_constructor_names_are_unique() {
+        // Constructors resolve by name alone, so a repeated name would silently capture the
+        // other module's constructor in every client.
+        let mut owner: HashMap<String, String> = HashMap::new();
+        for m in &standard_prelude().modules {
+            if let ReprKind::Sum(vs) = &m.repr {
+                for v in vs {
+                    if let Some(other) = owner.insert(v.name.clone(), m.name.clone()) {
+                        panic!("constructor `{}` is in both `{other}` and `{}`", v.name, m.name);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_d6_scripted_input_is_checked() {
+        let c = d4_c(&[("echo_lines.gdl", D6_LINES)]);
+        for bad in ["Key:Nonsense", "Key:55296", "Key:1114112", "Line:%Z1", "Line:%4", "Nope"] {
+            if let Some((code, _, err)) = d4_run(&c, "rscriptbad", bad, &[]) {
+                assert_eq!(code, 2, "{bad}");
+                assert!(err.contains("unknown event"), "{bad}: {err}");
+            }
+        }
     }
 
     const D5_BEAT_STATE: &str = include_str!("../tests/reactive/beat_state.gdl");
@@ -19152,14 +19288,14 @@ end
     #[test]
     fn test_d5_timers_fire_in_deadline_order_and_can_be_replaced() {
         // Timer 3 is set twice, and only the second setting counts, so it fires last, once.
-        let src = "reactive program TIMERS\n\nfeature {ANY}\n\n  init(args: SEQ[STRING]): STEP[NAT]\n    do\n      Continue(0, LIST.empty.prepend(SetTimer(3, 240)).prepend(SetTimer(3, 1)).prepend(SetTimer(1, 120)).prepend(SetTimer(2, 20)))\n    end\n\n  step(s: NAT, e: EVENT): STEP[NAT]\n    do\n      match e\n        case Tick(id) then\n          if id = 1 then\n            Continue(s, LIST.empty.prepend(Print(\"one\")))\n          else if id = 2 then\n            Continue(s, LIST.empty.prepend(Print(\"two\")))\n          else\n            Stop(id, LIST.empty.prepend(Print(\"three\")))\n          end end\n        case Shutdown then\n          Stop(99, LIST.empty)\n      end\n    end\n\nend\n";
+        let src = "reactive program TIMERS\n\nfeature {ANY}\n\n  init(args: SEQ[STRING]): STEP[NAT]\n    do\n      Continue(0, LIST.empty.prepend(SetTimer(3, 240)).prepend(SetTimer(3, 1)).prepend(SetTimer(1, 120)).prepend(SetTimer(2, 20)))\n    end\n\n  step(s: NAT, e: EVENT): STEP[NAT]\n    do\n      match e\n        case Tick(id) then\n          if id = 1 then\n            Continue(s, LIST.empty.prepend(Print(\"one\")))\n          else if id = 2 then\n            Continue(s, LIST.empty.prepend(Print(\"two\")))\n          else\n            Stop(id, LIST.empty.prepend(Print(\"three\")))\n          end end\n        case Shutdown then\n          Stop(99, LIST.empty)\n        case _ then\n          Continue(s, LIST.empty)\n      end\n    end\n\nend\n";
         let c = d4_c(&[("timers.gdl", src)]);
         if let Some((code, out, ms)) = d5_run_live(&c, "rtimers") {
             assert_eq!((code, out.as_str()), (3, "two\none\nthree\n"));
             assert!(ms >= 230, "the replaced deadline must hold, ran for {ms} ms");
         }
         // A zero delay fires, and equal deadlines keep the order they were set in.
-        let src = "reactive program ZERO\n\nfeature {ANY}\n\n  init(args: SEQ[STRING]): STEP[NAT]\n    do\n      Continue(0, LIST.empty.prepend(SetTimer(2, 0)).prepend(SetTimer(1, 0)))\n    end\n\n  step(s: NAT, e: EVENT): STEP[NAT]\n    do\n      match e\n        case Tick(id) then\n          if id = 1 then Continue(s, LIST.empty.prepend(Print(\"first\"))) else Stop(0, LIST.empty.prepend(Print(\"second\"))) end\n        case Shutdown then\n          Stop(99, LIST.empty)\n      end\n    end\n\nend\n";
+        let src = "reactive program ZERO\n\nfeature {ANY}\n\n  init(args: SEQ[STRING]): STEP[NAT]\n    do\n      Continue(0, LIST.empty.prepend(SetTimer(2, 0)).prepend(SetTimer(1, 0)))\n    end\n\n  step(s: NAT, e: EVENT): STEP[NAT]\n    do\n      match e\n        case Tick(id) then\n          if id = 1 then Continue(s, LIST.empty.prepend(Print(\"first\"))) else Stop(0, LIST.empty.prepend(Print(\"second\"))) end\n        case Shutdown then\n          Stop(99, LIST.empty)\n        case _ then\n          Continue(s, LIST.empty)\n      end\n    end\n\nend\n";
         let c = d4_c(&[("zero.gdl", src)]);
         if let Some((code, out, _)) = d5_run_live(&c, "rzero") {
             assert_eq!((code, out.as_str()), (0, "first\nsecond\n"));

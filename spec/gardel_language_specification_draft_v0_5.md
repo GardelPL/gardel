@@ -26,13 +26,13 @@ Gardel is a pure, total, deterministic, statically verified language designed fo
 | Area | Change |
 | --- | --- |
 | Non-termination | New unit kind `reactive program`. Every routine stays total. A program runs without end only through the runtime's event loop (§2, §4, §11.6). |
-| Prelude | `STEP`, `COMMAND`, `EVENT` and `CONN_ID` join the prelude inventory (§4.1, §11.6). A user constructor wins over a prelude constructor of the same name (§4.1). |
+| Prelude | `STEP`, `COMMAND`, `EVENT`, `KEY` and `CONN_ID` join the prelude inventory (§4.1, §11.6). A user constructor wins over a prelude constructor of the same name (§4.1). |
 | `match` | A catch-all arm must be the last arm (`E0316`, §5.1). |
 | Solver limit | Verification is bounded by solver work, not by time, so a verdict does not depend on machine load. A solver that gives up is reported as unproven, never as verified or refuted (§7.3, §12). |
 | Entry points | Nothing may refer to a `program` or `reactive program` (`E0104`, §4). |
 | `EXIT_CODE` | Defined in §3. |
 
-**Implementation status:** the `match` rule, the solver limit and the entry-point rule are implemented. Reactive programs run, with `Print`, `SetTimer`, `Tick` and `Shutdown`; the other commands and events are being built in Phase D (§16.5).
+**Implementation status:** the `match` rule, the solver limit and the entry-point rule are implemented. Reactive programs run, with timers and console input; sockets are being built in Phase D (§16.5).
 
 ---
 
@@ -284,7 +284,7 @@ The Standard Prelude provides an irreducible core of verified concepts, algebrai
   - `module BYTES`: The standard opaque boundary byte buffer ADT (`representation {NONE}`) with ghost model `specify model: LIST[U64]` (§3.1, §11).
   - `module STRING_ERROR` & `module IO_ERROR`: Standard boundary error sum types for text decoding (`STRING.from_utf8`) and external I/O operations (§11).
   - `module BIGNAT`: Arbitrary-precision natural numbers represented as little-endian limbs in `LIST[U64]` with ghost model `specify model: MATH_INT` (§3, §6.4.B).
-  - `module STEP[S]`, `module COMMAND`, `module EVENT`: The result of a reactive step, the effects a step requests, and the outside events it receives (§11.6). `module CONN_ID`: An opaque connection handle (§11.6). Their variants are added with the runtime that can deliver them (§16.5).
+  - `module STEP[S]`, `module COMMAND`, `module EVENT`, `module KEY`: The result of a reactive step, the effects a step requests, the outside events it receives, and a key press (§11.6). `module CONN_ID`: An opaque connection handle (§11.6). Their variants are added with the runtime that can deliver them (§16.5).
 
 - **Mathematical Ghost Types & Specification Modules (§2, §6, §8):**
   - `LIST[A]`: The canonical inductive sequence ADT (`Nil | Cons(head: A, tail: LIST[A])`). `LIST` has **dual status**: it is the canonical ghost model of Dual-Layer Model Refinement (§2) *and* an ordinary sequential runtime structure that may appear in `representation` sections (e.g., `BOUNDED_STACK.items`, `BIGNAT.limbs`, `STRING.bytes`) and in runtime `do` bodies. Only its use as a model (inside `specify` queries and contracts) is erased.
@@ -294,7 +294,7 @@ The Standard Prelude provides an irreducible core of verified concepts, algebrai
 
 #### 3. Namespace Collision, Shadowing & Bootstrap Rules
 - **No Prelude Shadowing:** Prelude types and concepts reside in the root namespace. In standard compilation mode, user modules, functions, or concepts CANNOT redeclare or shadow any prelude identifier. Attempting to declare a top-level `module OPTION` or `concept EQ` is rejected by the compiler with fatal error `E0101: duplicate_prelude_symbol`.
-- **Constructors may be reused:** A user module may declare a constructor named like a prelude constructor (`Stop`, `Print`). In a module that sees both, the user's constructor wins, so a new prelude variant never changes what existing user code means. There is no qualified constructor syntax, so such a module cannot build the prelude's constructor: rename the user's.
+- **Constructors may be reused:** A user module may declare a constructor named like a prelude constructor (`Stop`, `Print`). In a module that sees both, the user's constructor wins, so a new prelude variant never changes what existing user code means. There is no qualified constructor syntax, so such a module cannot build the prelude's constructor: rename the user's. Constructors resolve by name alone, so the prelude's own constructor names are unique across all its modules.
 - **Standard Library Bootstrap (`--no-prelude`):** When compiling or verifying the Standard Prelude source files themselves, the compiler operates in `--no-prelude` bootstrap mode, suppressing automatic prelude injection so prelude modules can be defined and verified from source without self-collision. The prelude sources are the one-module-per-file tree `stdlib/` (`concepts/`, `core/`, `collections/`, `numeric/`, `text/`, `functional/`), embedded into `gardelc` at build time. A file is recognized as a prelude source by its location in that tree, not by its text. Because the prelude modules depend on each other, `gardelc --stdlib`, `gardelc stdlib/` and `gardelc stdlib/<dir>/<file>.gdl` all verify the whole tree as one linked project (§4.2); prelude files cannot be compiled together with user files. A copy of a prelude file elsewhere is an ordinary user file and collides with the prelude (`E0101`).
 - **Lexical Scoping of Type Parameters:** Type parameters (such as `[A]`, `[E]`, `[T]`) are lexically scoped to their declaring module or routine. A generic parameter `[A]` in `module STACK[A]` shadows any ambient type `A` strictly within the syntactic bounds of that module.
 
@@ -2178,6 +2178,7 @@ representation {ANY}
   | Print(text: STRING)               -- text and a newline on standard output
   | SetTimer(id: NAT, millis: U64)    -- answered by Tick(id)
   | ReadLine                          -- answered by Line
+  | ReadKey                           -- answered by Key
   | Listen(port: NAT)                 -- answered by Accepted / ListenFailed
   | Send(conn: CONN_ID, data: BYTES)  -- a failure is answered by SendFailed
   | Close(conn: CONN_ID)
@@ -2186,7 +2187,7 @@ end
 module EVENT
 representation {ANY}
   | Tick(id: NAT)
-  | Key(code: NAT)
+  | Key(key: KEY)
   | Line(res: RESULT[IO_ERROR, STRING])
   | Accepted(conn: CONN_ID)
   | ListenFailed(port: NAT, err: IO_ERROR)
@@ -2194,6 +2195,21 @@ representation {ANY}
   | SendFailed(conn: CONN_ID, err: IO_ERROR)
   | Closed(conn: CONN_ID)
   | Shutdown
+end
+
+module KEY
+representation {ANY}
+  | Char(c: CHAR)
+  | Up
+  | Down
+  | Left
+  | Right
+  | Enter
+  | Escape
+  | Backspace
+  | Tab
+  | Other      -- any other key, and malformed input
+  | KeysEnded  -- standard input ended
 end
 ```
 
@@ -2210,7 +2226,9 @@ Rules:
 
 **Timers.** A timer fires once: `SetTimer(id, millis)` is answered by one `Tick(id)` after at least `millis` milliseconds, on a monotonic clock. A repeating timer sets the next one in `step`. Setting an id that is pending replaces it. Timers fire in deadline order, and in the order they were set on a tie. A pending `Shutdown` comes before any timer that is due, so a program that keeps setting a zero timer can still be stopped. Timers end with the program.
 
-For tests and replay, `GARDEL_EVENTS` replaces the outside world with a script: event names separated by spaces, such as `Tick:1 Tick:2 Shutdown`. Timers do not run in a script, so it does not depend on the clock. An unknown name stops the program with exit status 2. The end of a script is a `Shutdown`, so a scripted run always ends.
+**Console input.** `ReadLine` and `ReadKey` ask for one line or one key, and are answered by one `Line` or `Key` event. A program asks again for the next. Requests are served in order, on a thread of their own, so a blocked read never holds up timers or a `Shutdown`. `Line` carries the result of `IO.read_line` (§11, item 4): an `Error` for malformed UTF-8 or the end of input. `KEY` has no error case: malformed input is `Other`, so `Char` always holds a valid `CHAR`, and the end of input is `KeysEnded`, so a program cannot hang on a closed input. `ReadKey` puts a terminal in raw mode, with no line editing or echo, and `ReadLine` takes it back. Ctrl-C stays a `Shutdown` in raw mode. The terminal is restored when the program ends through `Stop`, a `Shutdown` or a host error. It cannot be restored after a crash or `SIGKILL`.
+
+For tests and replay, `GARDEL_EVENTS` replaces the outside world with a script: event names separated by spaces, such as `Tick:1 Key:Up Key:113 Line:hello%20there LineEnd Shutdown`. `Key:<n>` is a `Char` by scalar value, and `%XX` in a line is a byte, so a script can hold a space or malformed input. `LineEnd` is the end of input. Timers and reads do not run in a script, so it does not depend on the clock or the terminal. An unknown name stops the program with exit status 2. The end of a script is a `Shutdown`, so a scripted run always ends.
 
 Guaranteed, given the proof obligations hold: no crash, out-of-bounds access or overflow in any step; the state invariant after every step; finite handling of each event by Gardel code; every run that receives `Shutdown` ends with the code chosen by `step`; and determinism: the states and commands are a function of `args` and the observed event sequence.
 
@@ -2919,7 +2937,7 @@ Phase D builds the `reactive program` of §11.6. `plan/Roadmap.md` holds its tas
 | D.3 | Parser and checker, including `shutdown_must_stop` | ✅ Completed |
 | D.4 | Host loop: the `Print` + `Shutdown` slice | ✅ Completed |
 | D.5 | `SetTimer`, `Tick` | ✅ Completed |
-| D.6 | `ReadLine`, `Line`, `Key` | 📋 Planned |
+| D.6 | `ReadLine`, `ReadKey`, `Line`, `Key`, `KEY` | ✅ Completed |
 | D.7 | `CONN_ID`, sockets, the echo server | 📋 Planned |
 | D.8 | Event log and replay | 📋 Planned |
 

@@ -1,0 +1,53 @@
+-- A small turn-based game: walk the @ to the G. Each key is one turn.
+--
+--   gardelc examples/reactive_game --strict
+--   ./build/reactive_game_bin
+reactive program REACTIVE_GAME
+
+feature {ANY}
+
+  init(args: SEQ[STRING]): STEP[TRACK_BOARD]
+    do
+      let board = TRACK_BOARD.start
+      Continue(board, LIST.empty.prepend(ReadKey).prepend(Print(board.view)).prepend(Print("Reach the G. Arrows or h and l move, q quits.")))
+    end
+
+  turn(board: TRACK_BOARD): STEP[TRACK_BOARD]
+    do
+      if board.at_goal then
+        Stop(0, LIST.empty.prepend(Print("You win.")).prepend(Print(board.view)))
+      else
+        Continue(board, LIST.empty.prepend(ReadKey).prepend(Print(board.view)))
+      end
+    end
+
+  letter(board: TRACK_BOARD, c: CHAR): STEP[TRACK_BOARD]
+    do
+      if c = 'q' then Stop(0, LIST.empty.prepend(Print("Bye.")))
+      else if c = 'h' then turn(board.left)
+      else if c = 'l' then turn(board.right)
+      else Continue(board, LIST.empty.prepend(ReadKey))
+      end end end
+    end
+
+  pressed(board: TRACK_BOARD, k: KEY): STEP[TRACK_BOARD]
+    do
+      match k
+        case Left then turn(board.left)
+        case Right then turn(board.right)
+        case Char(c) then letter(board, c)
+        case KeysEnded then Stop(1, LIST.empty.prepend(Print("Input ended.")))
+        case _ then Continue(board, LIST.empty.prepend(ReadKey))
+      end
+    end
+
+  step(board: TRACK_BOARD, e: EVENT): STEP[TRACK_BOARD]
+    do
+      match e
+        case Key(k) then pressed(board, k)
+        case Shutdown then Stop(1, LIST.empty.prepend(Print("Interrupted.")))
+        case _ then Continue(board, LIST.empty)
+      end
+    end
+
+end

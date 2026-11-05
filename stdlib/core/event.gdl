@@ -2,6 +2,8 @@ module EVENT
 
 representation {ANY}
   | Tick(id: NAT)
+  | Line(res: RESULT[IO_ERROR, STRING])
+  | Key(key: KEY)
   | Shutdown
 
 feature {ANY}

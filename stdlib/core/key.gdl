@@ -1,0 +1,18 @@
+-- One key press, answering `ReadKey` (spec §11.6). A sum type, so that a program handles keys
+-- by name and `match` checks it. Malformed input is `Other`, so `Char` is always a valid CHAR.
+module KEY
+
+representation {ANY}
+  | Char(c: CHAR)
+  | Up
+  | Down
+  | Left
+  | Right
+  | Enter
+  | Escape
+  | Backspace
+  | Tab
+  | Other
+  | KeysEnded
+
+end

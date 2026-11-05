@@ -119,6 +119,7 @@ end
 │   ├── bounded_stack.gdl
 │   ├── greeter.gdl
 │   ├── reactive_clock/        # Countdown: a reactive program with timers and a proven state
+│   ├── reactive_game/         # A small terminal game with a proven board
 │   ├── reactive_hello.gdl
 │   ├── peano_ord.gdl
 │   └── tree.gdl

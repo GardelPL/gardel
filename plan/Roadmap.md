@@ -419,7 +419,7 @@ Source: [review/review.md](review/review.md). The verification notes for each fi
 
 ### Phase D: Reactive Programs
 
-**Status:** 🔄 In progress: D.0 to D.5 completed, D.6 next (2026-11-04).
+**Status:** 🔄 In progress: D.0 to D.6 completed, D.6b next (2026-11-04).
 
 **Objective:** let Gardel express programs that run until told to stop (servers, TUIs, games) without weakening totality. Every routine stays total. Non-termination lives in one place, the runtime's host loop, and a `reactive program` declares it. The design is [reactive/reactive_programs.md](reactive/reactive_programs.md) (revision 2), corrected by the findings below.
 
@@ -540,10 +540,18 @@ flowchart TD
 - Tests `test_d5_timers_fire_in_deadline_order_and_can_be_replaced` (real timers), `test_d5_scripts_do_not_depend_on_the_clock`, `test_d5_live_allocations_do_not_grow_over_a_long_run` (sampled during the run: 5 live at event 1,000, at most 12 after, 0 at exit), `test_d5_clock_example_verifies_and_counts_down`. `cargo test` 127/127. `--stdlib --strict` 0/0 on seeds 0–3, and the eight examples 0/0.
 - Acceptance: live allocations do not grow over 100,000 scripted ticks (the first long-run leak test), and time per event is recorded as the baseline for C.4.4.
 
-#### Task D.6: `ReadLine` and `Key` [📋 Planned]
-- [ ] Add `ReadLine` / `Line(RESULT[IO_ERROR, STRING])`, reusing the RFC 3629 validation of `gardel_io_read_line_result`, on a reader thread (decision 5).
-- [ ] Add raw-mode `Key(code)` on the Windows console and POSIX terminals. Restore the terminal on every exit path.
-- [ ] Add an example: a small turn-based TUI game whose board invariant is proven.
+#### Task D.6: `ReadLine` and `Key` [✅ Completed]
+- [x] Added `ReadLine` / `Line(RESULT[IO_ERROR, STRING])`, reusing the RFC 3629 validation of `gardel_io_read_line_result`, on a reader thread (decision 5). The wait now also wakes on an answer, so a blocked read holds up neither timers nor a `Shutdown`.
+- [x] Added raw-mode key input on the Windows console and POSIX terminals, restored on `Stop`, a `Shutdown` and `exit()`. Ctrl-C stays a signal in raw mode.
+- [x] **Changes to the design.** The proposal had a `Key` event but no way to ask for one, so `ReadKey` was added, one request and one answer like `ReadLine`. `Key(code: NAT)` needed numbers outside Unicode for arrows and had no way to report the end of input, so it is now `Key(key: KEY)`, a prelude sum type: `match` checks it, malformed bytes are `Other` and can never make an invalid `CHAR`, and `KeysEnded` means a program cannot hang on a closed input.
+- [x] **Exit with a blocked reader.** `exit()` waits for the `stdin` stream that a blocked reader holds, so a program that has started a reader ends with `_Exit`, after restoring the terminal and flushing.
+- [x] **Prelude constructor names are unique.** `KEY.EndOfInput` captured `IO_ERROR.EndOfInput`, since constructors resolve by name alone, so it is `KeysEnded`, and `test_prelude_constructor_names_are_unique` guards D.7's names.
+- [x] Programs that match on `EVENT` need `case _` (spec §11.6, rule 8): `reactive_clock` and `tests/reactive/beat.gdl` did not have it and stopped compiling when `Line` and `Key` arrived, as that rule predicts.
+- [x] Scripts: `Line:<text>` with `%XX` bytes, `LineEnd`, `Key:<name>`, `Key:<scalar>`.
+- [x] Added `examples/reactive_game/` (`gardelc examples/reactive_game --strict`): walk the `@` to the `G`, with `on_board` proven for every reachable board.
+- [x] **Real terminals.** Windows, keys injected into the console input buffer of a separate console: the expected board after each key, including a wall, a bare Shift (no event) and F5 (`Other`). Line and echo bits are off during play and back after a win and after Ctrl-C (`0x1f1`, then `0x1e7`). Linux, in a container, on a real pty: arrow escape sequences, Delete (`ESC [ 3 ~`), a lone Escape, a multi-byte character and a bad byte. `ICANON` and `ECHO` are off during play, and `termios` is restored after a win, `q`, Ctrl-C from the terminal and `SIGTERM`.
+- Tests `test_d6_lines_arrive_as_events_and_bad_input_never_crashes` (real stdin and a script give identical output), `test_d6_a_blocked_reader_does_not_stop_the_program_or_its_exit`, `test_d6_game_verifies_and_plays`, `test_d6_scripted_input_is_checked`, `test_prelude_constructor_names_are_unique`. The real-terminal checks above are not in `cargo test`, which has no terminal. `cargo test` 132/132. `--stdlib --strict` 0/0 on seeds 0–3, and the nine examples 0/0. The Task D.5 baseline holds, at 0.30 us per event.
+- **Known limits:** a read cannot be cancelled, so a `ReadLine` waits until a line arrives. Mixing `ReadLine` and `ReadKey` on piped input is not defined, because `ReadLine` reads through a stdio buffer and `ReadKey` does not. On Windows, piped input (not a console) has no arrow keys, and a byte 27 is always `Escape`. A crash, `SIGKILL` or Ctrl-Z leaves a POSIX terminal raw.
 - Acceptance: malformed input arrives as an `Error` event and never crashes. The terminal is restored after `Stop` and after Ctrl-C. Scripted runs give identical output.
 
 #### Task D.6b: Enforce the `=` Rule for Modules [📋 Planned]
@@ -582,7 +590,7 @@ flowchart TD
 
 With **Phase A: Language Specification Harmonization**, **Phase B: Compiler Engine & Prelude Tooling**, **Task C.1: Physical Decomposition of `stdlib/`**, **Task C.2: High-Performance Smart String (`stdlib/text/string.gdl`)**, and **Task C.3: Regression Verification & Performance Benchmarking** completely executed and verified with 0 errors and 0 warnings under `--strict`, Phase C's planned work is done. The verification baseline is clean, and every module compiles from source to C with reference-counted memory (C.3 follow-ups).
 
-The next step is **Phase D: Reactive Programs**, defined above with its tasks, dependency graph and acceptance criteria. The C prerequisites of [reactive/reactive_programs.md](reactive/reactive_programs.md) are in place (C.3 follow-ups): every module compiles from source, closures work, and memory is reference counted, so a program that runs forever does not leak. Tasks D.0 to D.5 are completed, so `examples/reactive_hello.gdl` and `examples/reactive_clock/` run. Next, console input (D.6). C.4.4 now has its baseline (Task D.5).
+The next step is **Phase D: Reactive Programs**, defined above with its tasks, dependency graph and acceptance criteria. The C prerequisites of [reactive/reactive_programs.md](reactive/reactive_programs.md) are in place (C.3 follow-ups): every module compiles from source, closures work, and memory is reference counted, so a program that runs forever does not leak. Tasks D.0 to D.6 are completed, so `examples/reactive_hello.gdl`, `examples/reactive_clock/` and `examples/reactive_game/` run. Next, enforce the `=` rule (D.6b), then sockets (D.7). C.4.4 has its baseline (Task D.5).
 
 **Task C.4 (memory management performance)** is planned. C.4.1–C.4.3 do not depend on Phase D and can be done before or alongside it. C.4.1 and C.4.2 are small and have the largest payoff measured on `seq_bench`, but a reactive program rarely exits, so C.4.1 does little for Phase D and C.4.2 matters more. C.4.4 needs a reactive program to measure against, and D.5 provides its baseline.
 

@@ -28,6 +28,7 @@ feature {ANY}
       match e
         case Tick(id) then tick(s)
         case Shutdown then Stop(1, LIST.empty.prepend(Print("Interrupted.")))
+        case _ then Continue(s, LIST.empty)
       end
     end
 

@@ -74,6 +74,7 @@ module COMMAND
 representation {ANY}
   | Print(text: STRING)
   | ReadLine                                      -- ask for one line; answered by a Line event
+  | ReadKey                                       -- ask for one key; answered by a Key event
   | SetTimer(id: NAT, millis: U64)                -- answered by Tick(id)
   | Listen(port: NAT)                             -- answered by Accepted / ListenFailed
   | Send(conn: CONN_ID, data: BYTES)              -- failure answered by SendFailed
@@ -118,7 +119,7 @@ A small, closed set to start with:
 module EVENT
 representation {ANY}
   | Tick(id: NAT)                                -- a SetTimer(id, _) fired
-  | Key(code: NAT)                               -- raw-mode key input (TUI / games)
+  | Key(key: KEY)                                -- raw-mode key input (TUI / games)
   | Line(res: RESULT[IO_ERROR, STRING])          -- answer to ReadLine
   | Accepted(conn: CONN_ID)                      -- new connection on a Listen port
   | ListenFailed(port: NAT, err: IO_ERROR)
@@ -229,7 +230,7 @@ The invariant also bounds the state: the connection list can never grow past `li
 
 ### 7.2 Turn-based game or TUI loop
 
-The state is the board, a module whose invariant states that the position is legal. `step` handles `Key(code)` by calling a pure `apply_move(board, code): BOARD` whose contracts preserve that invariant, then returns `Continue(next, LIST.empty.prepend(Print(view(next))))`, where `view(board): STRING` is pure. A `SetTimer`/`Tick` pair drives animation or a turn clock. Because the whole loop is a function of the event sequence, replays and lockstep netcode only need the event log.
+The state is the board, a module whose invariant states that the position is legal. `step` asks with `ReadKey`, and handles `Key(k)` by calling a pure `apply_move(board, code): BOARD` whose contracts preserve that invariant, then returns `Continue(next, LIST.empty.prepend(Print(view(next))))`, where `view(board): STRING` is pure. A `SetTimer`/`Tick` pair drives animation or a turn clock. Because the whole loop is a function of the event sequence, replays and lockstep netcode only need the event log.
 
 ### 7.3 Testing a step function
 
@@ -345,10 +346,10 @@ Applied in spec v0.5, except the rows and clauses about `partial`, which wait fo
 | --- | --- | --- |
 | §3 `reactive program` form | Compiled and run (`examples/reactive_hello.gdl`) | |
 | §3 `STEP`, with `is_stop` | In the prelude (`stdlib/core/step.gdl`) | |
-| §3 `COMMAND`: `Print`, `Listen`, `Send`, `Close` | Compiled | `SetTimer` is in the prelude. `ReadLine`: D.6 |
-| §6 `EVENT`: `Accepted`, `ListenFailed`, `Received`, `Line`, `Closed`, `Shutdown`, with `is_shutdown` | Compiled | `Tick` is in the prelude. `Key`: D.6. `SendFailed`: D.7 |
+| §3 `COMMAND`: `Print`, `SetTimer`, `ReadLine`, `ReadKey` | In the prelude | `Listen`, `Send`, `Close`: compiled as user modules, D.7 for the prelude |
+| §6 `EVENT`: `Accepted`, `ListenFailed`, `Received`, `Line`, `Closed`, `Shutdown`, with `is_shutdown` | Compiled | `Tick`, `Line` and `Key` are in the prelude. The rest: D.7 |
 | §7.1 `SERVER_STATE` | Compiled, with `CONN_ID` as a plain opaque module (no `satisfies`) | D.7 for the prelude `CONN_ID` |
 | §7.1 `init` and `step` logic | Compiled as `functions ECHO_LOGIC`, with the `shutdown_must_stop` postcondition written by hand. A test program fed it four events and the native run gave the expected connection count. Three mutants were rejected as section 7.1 states | D.7 for real sockets and the full `EVENT` |
-| §7.2 game loop | Prose only | D.6 |
+| §7.2 game loop | Compiled and run (`examples/reactive_game/`) | |
 | §7.3 test program | Compiled and run, as above. `let t = LIST.empty.prepend(..)` in a `program` fails in Boogie, so the event list came from a routine with a declared return type | Roadmap, Phase D finding 8 |
 | §10 partial functions | Not compiled | Not in Phase D |

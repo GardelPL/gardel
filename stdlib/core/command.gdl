@@ -3,5 +3,7 @@ module COMMAND
 representation {ANY}
   | Print(text: STRING)
   | SetTimer(id: NAT, millis: U64)
+  | ReadLine
+  | ReadKey
 
 end

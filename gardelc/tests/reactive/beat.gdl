@@ -14,6 +14,8 @@ feature {ANY}
           Continue(s.record(id), LIST.empty.prepend(SetTimer(id, 1)))
         case Shutdown then
           Stop(s.total, LIST.empty)
+        case _ then
+          Continue(s, LIST.empty)
       end
     end
 
