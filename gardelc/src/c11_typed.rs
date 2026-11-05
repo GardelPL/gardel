@@ -249,6 +249,13 @@ struct Ctx {
     /// Owned values in scope at the current tail position, outermost first. A tail call
     /// releases them before it jumps, as the blocks it leaves would have.
     tail_drops: Vec<(String, String)>,
+    /// C names of the owned locals the next constructor or call may take over, because
+    /// nothing evaluated after it uses them. Like `tail`, this holds for one expression.
+    moves: Vec<String>,
+    /// Those that were taken over: their scope no longer releases them.
+    moved: Vec<String>,
+    /// Parameters a sink routine owns, for its outermost block to release.
+    sink_params: Vec<(String, String)>,
     /// C name of the routine being emitted (empty inside a lambda).
     fn_cname: String,
     /// The routine's C parameters, `Current` first.
@@ -321,6 +328,8 @@ struct FnReq {
     routine: String,
     rtargs: Vec<String>,
     cname: String,
+    /// Emit the variant that owns its parameters (`is_sink`).
+    sink: bool,
 }
 
 /// Statements to run before an expression (binding owned temporaries) and after it
@@ -351,6 +360,9 @@ pub(crate) struct TypedC<'a> {
     /// The routine being emitted jumped to its own start (spec §10: tail calls are loops).
     tail_used: bool,
     needs_from_utf8: bool,
+    /// Inside the argument of `IO.exit`: the process ends right after, so scopes do not
+    /// release what they own (Task C.4.1).
+    exiting: bool,
     pub(crate) errors: Vec<String>,
 }
 
@@ -385,6 +397,7 @@ impl<'a> TypedC<'a> {
             needs_validator: false,
             needs_read_line: false,
             tail_used: false,
+            exiting: false,
             needs_from_utf8: false,
             errors: Vec::new(),
         }
@@ -460,6 +473,15 @@ impl<'a> TypedC<'a> {
         Ok(format!("{}({code});\n", self.rc_name(ty, "drop")?))
     }
 
+    /// `drop_stmt` for the end of a scope, where a dying program does not release. Only
+    /// for names: an expression must still be evaluated.
+    fn scope_drop(&mut self, ty: &str, name: &str) -> Result<String, String> {
+        if self.exiting {
+            return Ok(String::new());
+        }
+        self.drop_stmt(ty, name)
+    }
+
     fn rc_name(&mut self, ty: &str, which: &str) -> Result<String, String> {
         let ty = cnorm(ty);
         Ok(match ty.as_str() {
@@ -491,7 +513,7 @@ impl<'a> TypedC<'a> {
         let k = self.next();
         let ct = self.ctype(&v.ty)?;
         t.pre.push_str(&format!("{ct} _t{k} = {};\n", v.code));
-        let d = self.drop_stmt(&v.ty, &format!("_t{k}"))?;
+        let d = self.scope_drop(&v.ty, &format!("_t{k}"))?;
         t.post = format!("{d}{}", t.post);
         Ok(format!("_t{k}"))
     }
@@ -655,7 +677,7 @@ impl<'a> TypedC<'a> {
         };
         self.rc_protos.push(format!("static void drop_{inst}(struct {inst}* p);\n"));
         self.bodies.push(format!(
-            "static void drop_{inst}(struct {inst}* p) {{\n    while (p && atomic_fetch_sub_explicit(&p->_rc, 1, memory_order_acq_rel) == 1) {{\n        struct {inst}* next = NULL;\n{inner}        gardel_free(p);\n        p = next;\n    }}\n}}\n\n"
+            "static void drop_{inst}(struct {inst}* p) {{\n    while (p && gardel_rc_release(&p->_rc)) {{\n        struct {inst}* next = NULL;\n{inner}        gardel_free(p, sizeof(struct {inst}));\n        p = next;\n    }}\n}}\n\n"
         ));
         Ok(())
     }
@@ -751,8 +773,8 @@ impl<'a> TypedC<'a> {
         self.bodies.push(format!(
             "/* LIST[{elem}] runtime: immutable counted cons list, NULL is the empty list */\n\
 static void drop_{inst}(struct {inst}* p) {{\n\
-    while (p && atomic_fetch_sub_explicit(&p->_rc, 1, memory_order_acq_rel) == 1) {{\n\
-        struct {inst}* next = p->tail;\n        {drop_h}        gardel_free(p);\n        p = next;\n    }}\n}}\n\
+    while (p && gardel_rc_release(&p->_rc)) {{\n\
+        struct {inst}* next = p->tail;\n        {drop_h}        gardel_free(p, sizeof(struct {inst}));\n        p = next;\n    }}\n}}\n\
 static struct {inst}* {inst}__prepend(struct {inst}* xs, {ce} x) {{\n\
     struct {inst}* c = (struct {inst}*)gardel_alloc(sizeof(struct {inst}));\n\
     atomic_init(&c->_rc, 1);\n    c->head = {dup_x};\n    c->tail = dup_{inst}(xs);\n    return c;\n}}\n\
@@ -883,9 +905,40 @@ static bool {inst}__has(struct {inst}* xs, {ce} x) {{\n\
                 routine: routine.to_string(),
                 rtargs: rtargs.to_vec(),
                 cname: cname.clone(),
+                sink: false,
             });
         }
         cname
+    }
+
+    /// The variant of a routine that owns its counted parameters (Task C.4.3). Module names
+    /// are upper case, so the prefix cannot meet another routine's C name.
+    fn request_sink(&mut self, module: &str, mod_targs: &[String], routine: &str, rtargs: &[String]) -> String {
+        let plain = self.request_fn(module, mod_targs, routine, rtargs);
+        let cname = format!("sink_{plain}");
+        if self.done_fns.insert(cname.clone()) {
+            self.queue.push_back(FnReq {
+                module: module.to_string(),
+                mod_targs: mod_targs.to_vec(),
+                routine: routine.to_string(),
+                rtargs: rtargs.to_vec(),
+                cname: cname.clone(),
+                sink: true,
+            });
+        }
+        cname
+    }
+
+    /// A routine whose body ends by storing a parameter in a new value, as `concat` does.
+    /// The usual convention makes such a routine copy that parameter and its caller
+    /// release it, so a caller finished with the value gives it to a variant instead.
+    fn is_sink(md: &ModuleDecl, rd: &RoutineDecl) -> bool {
+        let ReprKind::Sum(vs) = &md.repr else { return false };
+        let Expr::Call(f, args) = &rd.body else { return false };
+        vs.iter().any(|v| v.name == *f)
+            && args.iter().any(|a| {
+                matches!(a, Expr::Var(v) if v == "Current" || rd.params.iter().any(|(p, _)| p == v))
+            })
     }
 
     fn emit_fn(&mut self, req: FnReq) -> Result<(), String> {
@@ -916,6 +969,9 @@ static bool {inst}__has(struct {inst}* xs, {ce} x) {{\n\
             tail: true,
             tail_site: false,
             tail_drops: Vec::new(),
+            moves: Vec::new(),
+            moved: Vec::new(),
+            sink_params: Vec::new(),
             fn_cname: req.cname.clone(),
             params: Vec::new(),
         };
@@ -933,10 +989,16 @@ static bool {inst}__has(struct {inst}* xs, {ce} x) {{\n\
             params.push(format!("{ct} {cn}"));
             cx.params.push((cn, ty));
         }
+        if req.sink {
+            cx.sink_params = cx.params.clone();
+        }
         let ret = subst(&rd.ret_type, &tmap);
         let cret = self.ctype(&ret)?;
         let body = self.lower_block(&mut cx, &rd.stmts, &rd.body, Some(&ret), has_cur)?;
         let body = self.own(body)?;
+        if req.sink && self.tail_used {
+            return Err("a routine that owns its parameters cannot be a loop".into());
+        }
         let sig = format!(
             "static {cret} {}({})",
             req.cname,
@@ -1025,8 +1087,10 @@ static bool {inst}__has(struct {inst}* xs, {ce} x) {{\n\
         let tail = cx.tail;
         let depth = cx.tail_drops.len();
         let mut retyped: HashMap<String, String> = HashMap::new();
+        let sink_params = std::mem::take(&mut cx.sink_params);
         loop {
             cx.tail = tail;
+            cx.sink_params = sink_params.clone();
             let res = self.lower_block_once(cx, stmts, body, expect, has_cur, &retyped);
             cx.tail_drops.truncate(depth);
             let Err(e) = &res else { return res };
@@ -1052,12 +1116,17 @@ static bool {inst}__has(struct {inst}* xs, {ce} x) {{\n\
         let tail = std::mem::take(&mut cx.tail);
         let mark = cx.locals.len();
         let mut code = String::new();
-        let mut owned_locals: Vec<(String, String)> = Vec::new();
-        for group in analyze_parallel_lets(stmts) {
+        let mut owned_locals: Vec<(String, String)> = std::mem::take(&mut cx.sink_params);
+        let groups = analyze_parallel_lets(stmts);
+        for (at, group) in groups.iter().enumerate() {
             if group.len() == 1 {
                 let (v, e) = &group[0];
                 let soft = !retyped.contains_key(v) && cx.untyped_num(e);
-                let x = self.lower(cx, e, retyped.get(v).map(String::as_str), has_cur)?;
+                cx.moves = Self::unused_after(cx, &owned_locals, &groups[at + 1..], body);
+                let x = self.lower(cx, e, retyped.get(v).map(String::as_str), has_cur);
+                cx.moves.clear();
+                Self::settle_moves(cx, &mut owned_locals);
+                let x = x?;
                 let t = x.ty.clone();
                 let c = self.own(x)?;
                 let ct = self.ctype(&t)?;
@@ -1067,7 +1136,7 @@ static bool {inst}__has(struct {inst}* xs, {ce} x) {{\n\
             } else {
                 let mut lowered = Vec::new();
                 let mut soft = Vec::new();
-                for (v, e) in &group {
+                for (v, e) in group {
                     soft.push(!retyped.contains_key(v) && cx.untyped_num(e));
                     let x = self.lower(cx, e, retyped.get(v).map(String::as_str), has_cur)?;
                     let t = x.ty.clone();
@@ -1123,20 +1192,65 @@ static bool {inst}__has(struct {inst}* xs, {ce} x) {{\n\
             cx.tail = true;
             cx.tail_drops.extend(owned_locals.iter().cloned());
         }
-        let b = self.lower(cx, body, expect, has_cur)?;
+        // Nothing of this block runs after its result, so all its locals may be taken over.
+        cx.moves = owned_locals.iter().map(|(cn, _)| cn.clone()).collect();
+        let b = self.lower(cx, body, expect, has_cur);
+        cx.moves.clear();
+        Self::settle_moves(cx, &mut owned_locals);
+        let b = b?;
         cx.locals.truncate(mark);
-        if code.is_empty() {
+        if code.is_empty() && owned_locals.is_empty() {
             return Ok(b);
         }
         let t = b.ty.clone();
         let bc = self.own(b)?;
         let mut drops = String::new();
         for (cn, lt) in owned_locals.iter().rev() {
-            drops.push_str(&self.drop_stmt(lt, cn)?);
+            drops.push_str(&self.scope_drop(lt, cn)?);
         }
         let k = self.next();
         let ct = self.ctype(&t)?;
         Ok(owned(format!("({{\n{code}{ct} _b{k} = {bc};\n{drops}_b{k};\n}})"), t))
+    }
+
+    /// The owned locals that no later `let` and not the block's result can see. `Current`
+    /// is left out, since a bare field name uses it without naming it.
+    fn unused_after(
+        cx: &Ctx,
+        owned: &[(String, String)],
+        later: &[Vec<(String, Expr)>],
+        body: &Expr,
+    ) -> Vec<String> {
+        let mut free = Vec::new();
+        for (_, e) in later.iter().flatten() {
+            expr_free_vars(e, &mut Vec::new(), &mut free);
+        }
+        expr_free_vars(body, &mut Vec::new(), &mut free);
+        owned
+            .iter()
+            .filter(|(cn, _)| {
+                cx.locals.iter().any(|l| l.cname == *cn && !free.contains(&l.name))
+            })
+            .map(|(cn, _)| cn.clone())
+            .collect()
+    }
+
+    /// Takes out of `owned` what the expression just lowered took over.
+    fn settle_moves(cx: &mut Ctx, owned: &mut Vec<(String, String)>) {
+        let moved = std::mem::take(&mut cx.moved);
+        owned.retain(|(cn, _)| !moved.contains(cn));
+    }
+
+    /// An owned version of `v` for a consumer: a local in `moves` is taken over, once.
+    fn take_or_own(&mut self, cx: &mut Ctx, moves: &mut Vec<String>, v: V) -> Result<String, String> {
+        if !v.owned {
+            if let Some(i) = moves.iter().position(|m| *m == v.code) {
+                moves.remove(i);
+                cx.moved.push(v.code.clone());
+                return Ok(v.code);
+            }
+        }
+        self.own(v)
     }
 
     fn int_lit(n: u128, ty: &str) -> String {
@@ -1251,6 +1365,7 @@ static bool {inst}__has(struct {inst}* xs, {ce} x) {{\n\
 
     /// A constructor call; it consumes owned values of its fields.
     fn lower_ctor(&mut self, cx: &mut Ctx, md: &'a ModuleDecl, ctor: &str, args: &[Expr], expect: Option<&str>, hc: bool) -> Lowered {
+        let mut moves = std::mem::take(&mut cx.moves);
         let ReprKind::Sum(vs) = &md.repr else { unreachable!() };
         let vd = vs.iter().find(|v| v.name == ctor).expect("variant");
         if vd.fields.len() != args.len() {
@@ -1283,7 +1398,9 @@ static bool {inst}__has(struct {inst}* xs, {ce} x) {{\n\
                 Some(v) => v,
                 None => self.lower(cx, a, Some(ft), hc)?,
             };
-            cargs.push(self.own(v)?);
+            // The other arguments read a local taken here before the constructor stores
+            // it, so it is alive for them.
+            cargs.push(self.take_or_own(cx, &mut moves, v)?);
         }
         Ok(owned(format!("make_{}_{ctor}({})", c_instance_name(&ty), cargs.join(", ")), ty))
     }
@@ -1302,6 +1419,7 @@ static bool {inst}__has(struct {inst}* xs, {ce} x) {{\n\
         hc: bool,
     ) -> Lowered {
         let tail_site = std::mem::take(&mut cx.tail_site);
+        let mut moves = std::mem::take(&mut cx.moves);
         let (rd, kind) = Self::find_routine(md, r).ok_or_else(|| format!("`{}` has no routine `{r}`", md.name))?;
         if kind == "specify" {
             return Err(format!(
@@ -1396,6 +1514,31 @@ static bool {inst}__has(struct {inst}* xs, {ce} x) {{\n\
             let ret = subst(&rd.ret_type, &map);
             let code = self.tail_jump(cx, vals, &ret)?;
             return Ok(owned(code, ret));
+        }
+        let takes_current = Self::has_current(md, kind);
+        if Self::is_sink(md, rd) && (!takes_current || recv.is_some() || (hc && md.name == cx.owner)) {
+            let self_ty = Self::self_type(md, &mod_targs);
+            let mut vals = Vec::new();
+            if takes_current {
+                vals.push(recv.clone().unwrap_or_else(|| borrowed("Current".to_string(), self_ty.clone())));
+            }
+            vals.extend(lowered.iter().flatten().cloned());
+            // Worth it only when the caller has something to give: a value it would
+            // otherwise release right after the call.
+            let mut gives = false;
+            for v in &vals {
+                gives |= self.is_rc(&v.ty) && (v.owned || moves.contains(&v.code));
+            }
+            if gives {
+                let sink = self.request_sink(&md.name, &mod_targs, r, &rtargs);
+                let mut cargs = Vec::new();
+                for v in vals {
+                    cargs.push(self.take_or_own(cx, &mut moves, v)?);
+                }
+                map.insert("Current".into(), self_ty);
+                let ret = subst(&rd.ret_type, &map);
+                return Ok(owned(format!("{sink}({})", cargs.join(", ")), ret));
+            }
         }
         let mut t = Temps::default();
         let mut cargs = Vec::new();
@@ -1538,6 +1681,9 @@ static bool {inst}__has(struct {inst}* xs, {ce} x) {{\n\
             tail: false,
             tail_site: false,
             tail_drops: Vec::new(),
+            moves: Vec::new(),
+            moved: Vec::new(),
+            sink_params: Vec::new(),
             fn_cname: String::new(),
             params: Vec::new(),
         };
@@ -1573,7 +1719,11 @@ static bool {inst}__has(struct {inst}* xs, {ce} x) {{\n\
         let rty = subst(ret, &cx.tmap);
         let cret = self.ctype(&rty)?;
         let hc_inner = captures.iter().any(|(g, _, _)| g == "Current");
-        let b = self.lower_block(&mut lcx, stmts, body, Some(&rty), hc_inner)?;
+        // A lambda runs later, perhaps many times: `IO.exit` around it says nothing about it.
+        let outer = std::mem::take(&mut self.exiting);
+        let b = self.lower_block(&mut lcx, stmts, body, Some(&rty), hc_inner);
+        self.exiting = outer;
+        let b = b?;
         let b = self.own(b)?;
         let sig = format!("static {cret} {name}({})", cps.join(", "));
         self.protos.push(format!("{sig};\n"));
@@ -1585,7 +1735,7 @@ static bool {inst}__has(struct {inst}* xs, {ce} x) {{\n\
             ));
             self.protos.push(format!("static void {env}_drop(struct gardel_env* h);\n"));
             self.bodies.push(format!(
-                "static void {env}_drop(struct gardel_env* h) {{\n    struct {env}* e = (struct {env}*)h;\n    {env_drops}    gardel_free(e);\n}}\n\
+                "static void {env}_drop(struct gardel_env* h) {{\n    struct {env}* e = (struct {env}*)h;\n    {env_drops}    gardel_free(e, sizeof(struct {env}));\n}}\n\
                  {sig} {{\n{prologue}    return {b};\n}}\n\n"
             ));
         }
@@ -1729,7 +1879,7 @@ static bool {inst}__has(struct {inst}* xs, {ce} x) {{\n\
         }
         s.push_str("}\n");
         if scrut_owned {
-            s.push_str(&self.drop_stmt(&st, &sv)?);
+            s.push_str(&self.scope_drop(&st, &sv)?);
         }
         s.push_str(&format!("{rv};\n}})"));
         Ok(owned(s, rt))
@@ -1763,6 +1913,8 @@ static bool {inst}__has(struct {inst}* xs, {ce} x) {{\n\
         // subexpression starts with it cleared.
         let tail = std::mem::take(&mut cx.tail);
         cx.tail_site = false;
+        // Like `tail`, for this expression only, and only a constructor or a call uses it.
+        let moves = std::mem::take(&mut cx.moves);
         let expect_n = expect.map(norm_type);
         let expect = expect_n.as_deref();
         match e {
@@ -1861,11 +2013,13 @@ static bool {inst}__has(struct {inst}* xs, {ce} x) {{\n\
                     return self.call_value(cx, borrowed(l.cname, l.ty), args, hc);
                 }
                 if let Some(md) = self.ctor_owner(f, expect, cx) {
+                    cx.moves = moves;
                     return self.lower_ctor(cx, md, f, args, expect, hc);
                 }
                 let owner = self.module(&cx.owner).ok_or("no owner module")?;
                 if Self::find_routine(owner, f).is_some() {
                     cx.tail_site = tail;
+                    cx.moves = moves;
                     return self.lower_call(cx, owner, f, None, args, expect, hc);
                 }
                 Err(format!("unknown function `{f}`"))
@@ -1937,6 +2091,7 @@ static bool {inst}__has(struct {inst}* xs, {ce} x) {{\n\
                     }
                 }
                 cx.tail_site = tail;
+                cx.moves = moves;
                 self.lower_call(cx, md, m, Some(rv), args, expect, hc)
             }
             // A block written as an expression by pattern compilation. Its dead branch is a
@@ -2062,7 +2217,7 @@ static bool {inst}__has(struct {inst}* xs, {ce} x) {{\n\
                 let ct = self.ctype(&t)?;
                 s.push_str(&format!("{ct} _io{k} = {fc};\n"));
                 for (cn, lt) in owned_locals.iter().rev() {
-                    s.push_str(&self.drop_stmt(lt, cn)?);
+                    s.push_str(&self.scope_drop(lt, cn)?);
                 }
                 s.push_str(&format!("_io{k};\n}})"));
                 Ok(owned(s, t))
@@ -2160,8 +2315,11 @@ static bool {inst}__has(struct {inst}* xs, {ce} x) {{\n\
                 ));
             }
             ("IO", "exit", 1) => {
-                let a = self.lower(cx, &args[0], Some("EXIT_CODE"), hc)?;
-                return Ok(owned(format!("gardel_io_exit({})", a.code), "IO[EXIT_CODE]"));
+                // Nothing runs after the argument, so its scopes do not release.
+                let outer = std::mem::replace(&mut self.exiting, true);
+                let a = self.lower(cx, &args[0], Some("EXIT_CODE"), hc);
+                self.exiting = outer;
+                return Ok(owned(format!("gardel_io_exit({})", a?.code), "IO[EXIT_CODE]"));
             }
             ("IO", _, _) => return Err(format!("`IO.{m}` has no C runtime implementation")),
             ("STRING", "from_utf8", 1) => {
@@ -2423,12 +2581,11 @@ static struct SEQ_STRING* gardel_main_args(int argc, char** argv) {
         out.push_str(&emit_c11_runtime_header());
         out.push_str(
             "\n#ifndef GARDEL_TASK_DEPTH\n#define GARDEL_TASK_DEPTH 12\n#endif\n\
-             /* Task nesting depth of the running code; deeper `let` groups run inline. */\n\
-             static _Thread_local int gardel_task_depth __attribute__((unused)) = 0;\n\n\
+             #define gardel_task_depth (gardel_thread_get()->task_depth)\n\n\
              /* Counted closure environment: captured values follow the header. */\n\
              struct gardel_env { _Atomic uint64_t rc; void (*drop)(struct gardel_env*); };\n\
              static inline void gardel_env_dup(struct gardel_env* e) {\n    if (e) atomic_fetch_add_explicit(&e->rc, 1, memory_order_relaxed);\n}\n\
-             static inline void gardel_env_drop(struct gardel_env* e) {\n    if (e && atomic_fetch_sub_explicit(&e->rc, 1, memory_order_acq_rel) == 1) e->drop(e);\n}\n\n",
+             static inline void gardel_env_drop(struct gardel_env* e) {\n    if (e && gardel_rc_release(&e->rc)) e->drop(e);\n}\n\n",
         );
         for s in &self.struct_fwd {
             out.push_str(s);
@@ -3991,7 +4148,6 @@ pub fn emit_c11_typed(root: &ModuleDecl, extra: &[&ModuleDecl]) -> (String, Vec<
                 let cname = b.request_fn(&root.name, &[], "main", &[]);
                 let mut setup = String::new();
                 let mut call_args = Vec::new();
-                let mut release = String::new();
                 for (_, t) in &mr.params {
                     let t = cnorm(t);
                     if t == "SEQ[STRING]" {
@@ -4000,7 +4156,6 @@ pub fn emit_c11_typed(root: &ModuleDecl, extra: &[&ModuleDecl]) -> (String, Vec<
                                 args_rt = rt;
                                 setup.push_str("    struct SEQ_STRING* args = gardel_main_args(argc, argv);\n");
                                 call_args.push("args".to_string());
-                                release.push_str("    drop_SEQ_STRING(args);\n");
                             }
                             Err(e) => b.errors.push(e),
                         }
@@ -4010,7 +4165,7 @@ pub fn emit_c11_typed(root: &ModuleDecl, extra: &[&ModuleDecl]) -> (String, Vec<
                 }
                 b.drain();
                 entry = format!(
-                    "int main(int argc, char** argv) {{\n    (void)argc;\n    (void)argv;\n{setup}    int64_t rc = 0;\n    #pragma omp parallel\n    #pragma omp single\n    rc = (int64_t){cname}({});\n{release}    return (int)rc;\n}}\n",
+                    "int main(int argc, char** argv) {{\n    (void)argc;\n    (void)argv;\n{setup}    int64_t rc = 0;\n    #pragma omp parallel\n    #pragma omp single\n    rc = (int64_t){cname}({});\n    return (int)rc;\n}}\n",
                     call_args.join(", ")
                 );
             }

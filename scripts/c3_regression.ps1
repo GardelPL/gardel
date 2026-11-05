@@ -197,12 +197,22 @@ function Invoke-SeqBench([string]$Label, [string]$Exe, [scriptblock]$RunOnce) {
 Step "SEQ benchmark: compiled from Gardel (examples/seq_bench.gdl)"
 $benchExe = Join-Path $Root "build\seq_bench_bin.exe"
 if (Test-Path $benchExe) {
-    Invoke-SeqBench "- **Compiled from Gardel** by gardelc: ``examples/seq_bench.gdl`` (verified 0/0) with the stdlib ``SEQ`` lowered from ``stdlib/collections/seq.gdl`` (``gcc -O3 -fopenmp``). The build (``from_range``: ``SEQ.singleton`` + ``concat``) and the sum (a structural recursion on SEQ's constructors) fork their halves as OpenMP tasks. Memory is reference counted: the tree is freed before the program exits. ``n`` is read from stdin." $benchExe {
+    Invoke-SeqBench "- **Compiled from Gardel** by gardelc: ``examples/seq_bench.gdl`` (verified 0/0) with the stdlib ``SEQ`` lowered from ``stdlib/collections/seq.gdl`` (``gcc -O3 -fopenmp``). The build (``from_range``: ``SEQ.singleton`` + ``concat``) and the sum (a structural recursion on SEQ's constructors) fork their halves as OpenMP tasks. Memory is reference counted, and the tree is not freed, since the program exits right after (Task C.4.1). ``n`` is read from stdin." $benchExe {
         param($exe, $n)
         "$n" | & $exe | Out-Null
         $LASTEXITCODE
     }
 } else { Fail "seq_bench: $benchExe was not built" }
+
+Step "SEQ benchmark: build and free (examples/seq_churn.gdl)"
+$churnExe = Join-Path $Root "build\seq_churn_bin.exe"
+if (Test-Path $churnExe) {
+    Invoke-SeqBench "- **Build and free**: ``examples/seq_churn.gdl``, four rounds of building, summing and freeing the same tree, which is the allocator's benchmark." $churnExe {
+        param($exe, $n)
+        "$n" | & $exe | Out-Null
+        $LASTEXITCODE
+    }
+} else { Fail "seq_churn: $churnExe was not built" }
 
 Step "SEQ benchmark: hand-written reference runtime (not compiled from Gardel)"
 $seqC = Join-Path $Root "gardelc\runtime\reference\seq.c"

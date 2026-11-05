@@ -1,0 +1,39 @@
+module PAIR_TREE
+
+representation {ANY}
+  | Tip(weight: U64)
+  | Fork(left: PAIR_TREE, right: PAIR_TREE, total: U64)
+
+feature {ANY}
+
+  size: U64
+    variant
+      Current
+    do
+      match Current
+        case Tip(w) then w
+        case Fork(_, _, t) then t
+      end
+    end
+
+  join(other: PAIR_TREE): PAIR_TREE
+    do
+      Fork(Current, other, Current.size +% other.size)
+    end
+
+  -- `other` is stored twice and `Current` not at all, so the variant that owns both
+  -- must take one reference, copy one and release the other.
+  twice(other: PAIR_TREE): PAIR_TREE
+    do
+      Fork(other, other, other.size +% other.size)
+    end
+
+  -- `Current` is read after `n`, so a `let` must not take it.
+  with_total(other: PAIR_TREE): PAIR_TREE
+    do
+      let n = Current.size +% other.size
+      let keep = other.join(other)
+      Fork(Current, keep, n +% keep.size)
+    end
+
+end

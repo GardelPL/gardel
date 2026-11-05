@@ -1,0 +1,179 @@
+program OWNERSHIP
+
+-- Every way a value can be given away (Task C.4.3). Each routine returns a number the
+-- caller checks, so a value released too early reads wrong or crashes, and the leak test
+-- calls `first_failure` to see that nothing stays live.
+
+feature {ANY}
+
+  leaf(n: U64): PAIR_TREE
+    do
+      Tip(n)
+    end
+
+  both_locals(n: U64): U64
+    do
+      let a = leaf(n)
+      let b = leaf(n +% 1)
+      a.join(b).size
+    end
+
+  result_is_the_join(n: U64): PAIR_TREE
+    do
+      let a = leaf(n)
+      let b = leaf(n +% 1)
+      a.join(b)
+    end
+
+  same_local_twice(n: U64): PAIR_TREE
+    do
+      let a = leaf(n)
+      a.join(a)
+    end
+
+  used_again_later(n: U64): U64
+    do
+      let a = leaf(n)
+      let b = leaf(n +% 1)
+      let c = a.join(b)
+      let d = c.join(a)
+      d.size +% a.size
+    end
+
+  last_use_in_a_let(n: U64): U64
+    do
+      let a = leaf(n)
+      let b = leaf(n +% 2)
+      let c = a.join(b)
+      c.size
+    end
+
+  param_is_only_borrowed(p: PAIR_TREE): PAIR_TREE
+    do
+      let a = leaf(5)
+      p.join(a)
+    end
+
+  temporaries(n: U64): U64
+    do
+      leaf(n).join(leaf(n)).join(leaf(n)).size
+    end
+
+  temporary_and_param(p: PAIR_TREE): PAIR_TREE
+    do
+      p.join(leaf(7))
+    end
+
+  in_an_option(n: U64): U64
+    do
+      let a = leaf(n)
+      let o = Some(a)
+      match o
+        case Some(t) then t.size
+        case None then 0
+      end
+    end
+
+  one_arm_only(n: U64, go: BOOL): U64
+    do
+      let a = leaf(n)
+      if go then a.join(a).size else a.size end
+    end
+
+  -- `twice` releases its receiver, so if `a` were given to it, `reused` would land on `a`.
+  stored_twice_current_unused(n: U64): U64
+    do
+      let a = leaf(n)
+      let b = leaf(n +% 1)
+      let c = a.twice(b)
+      let reused = leaf(c.size +% 95)
+      c.size +% reused.size +% a.size
+    end
+
+  implicit_current(n: U64): U64
+    do
+      let a = leaf(n)
+      let b = leaf(n +% 1)
+      a.with_total(b).size
+    end
+
+  lambda_keeps_it(n: U64): U64
+    do
+      let a = leaf(n)
+      let f = fn(x: U64): U64 do a.size +% x end
+      let b = a.join(a)
+      f(b.size)
+    end
+
+  parallel_readers(n: U64): U64
+    do
+      let a = leaf(n)
+      let b = leaf(n +% 1)
+      let c = a.join(b)
+      let d = b.join(a)
+      c.join(d).size
+    end
+
+  shadowed(n: U64): U64
+    do
+      let a = leaf(n)
+      let b = a.join(a)
+      let c = b.join(a)
+      c.join(b).size
+    end
+
+  strings(s: STRING): U64
+    do
+      let a = SEQ.singleton(s)
+      let b = SEQ.singleton(s)
+      let c = a.concat(b)
+      let d = c.concat(c)
+      d.length
+    end
+
+  deep(n: U64, acc: PAIR_TREE): U64
+    variant
+      n
+    do
+      if n = 0 then
+        acc.size
+      else
+        let next = acc.join(leaf(1))
+        deep(n - 1, next)
+      end
+    end
+
+  first_failure: U64
+    do
+      let p = leaf(3)
+      let joined = param_is_only_borrowed(p)
+      let mixed = temporary_and_param(p)
+      if both_locals(1) != 3 then 1
+      else if result_is_the_join(2).size != 5 then 2
+      else if same_local_twice(4).size != 8 then 3
+      else if used_again_later(1) != 5 then 4
+      else if last_use_in_a_let(1) != 4 then 5
+      else if joined.size != 8 then 6
+      else if p.size != 3 then 7
+      else if temporaries(2) != 6 then 8
+      else if mixed.size != 10 then 9
+      else if in_an_option(6) != 6 then 10
+      else if one_arm_only(2, True) != 4 then 11
+      else if one_arm_only(2, False) != 2 then 12
+      else if stored_twice_current_unused(1) != 104 then 13
+      else if implicit_current(1) != 7 then 14
+      else if lambda_keeps_it(2) != 6 then 15
+      else if parallel_readers(1) != 6 then 16
+      else if shadowed(1) != 5 then 17
+      else if strings("hello") != 4 then 18
+      else if deep(1000, leaf(0)) != 1000 then 19
+      else 0
+      end end end end end end end end end end end end end end end end end end end
+    end
+
+  main(args: SEQ[STRING]): IO[EXIT_CODE]
+    do
+      IO.exit(first_failure)
+    end
+
+end

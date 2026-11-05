@@ -1,0 +1,98 @@
+program SEQ_CHURN
+
+-- The allocator's benchmark. `seq_bench` builds one tree and exits, so it never frees, and
+-- this one builds and frees a balanced SEQ[U64] of 1..n `rounds` times. The tree is freed by
+-- whichever thread drops the last reference, so blocks move between threads. `n` is read
+-- from standard input (one decimal line, 1 <= n <= 1000000000). Exit code: 0 when every sum
+-- is n(n+1)/2, 1 when one is not, 2 when the input is not a valid `n`.
+
+feature {ANY}
+
+  from_range(lo: U64, hi: U64): SEQ[U64]
+    require
+      valid_range: lo <= hi
+      bounded: hi <= 1000000000
+    variant
+      hi - lo
+    do
+      if lo = hi then
+        SEQ.singleton(lo)
+      else
+        let mid = lo + (hi - lo) / 2
+        let left = from_range(lo, mid)
+        let right = from_range(mid + 1, hi)
+        left.concat(right)
+      end
+    ensure
+      exact_length: Result.length = hi - lo + 1
+    end
+
+  sum(s: SEQ[U64]): U64
+    variant
+      s
+    do
+      match s
+        case Empty then 0
+        case Leaf(v) then v
+        case Concat(l, r, _) then
+          let a = sum(l)
+          let b = sum(r)
+          a +% b
+      end
+    end
+
+  rounds(n: U64, expected: U64, left_to_do: U64): BOOL
+    require
+      valid_n: n >= 1 and n <= 1000000000
+    variant
+      left_to_do
+    do
+      if left_to_do = 0 then
+        True
+      else
+        let total = sum(from_range(1, n))
+        total = expected and rounds(n, expected, left_to_do - 1)
+      end
+    end
+
+  parse_nat(s: STRING, i: U64, acc: U64): U64
+    require
+      in_range: i <= s.code_point_count
+      acc_bounded: acc <= 1000000000
+    variant
+      s.code_point_count - i
+    do
+      if i = s.code_point_count then
+        acc
+      else
+        let c = s.character_at(i).code
+        if c >= 48 and c <= 57 then
+          let next = acc * 10 + (c - 48)
+          if next > 1000000000 then 0 else parse_nat(s, i + 1, next) end
+        else
+          0
+        end
+      end
+    ensure
+      bounded: Result <= 1000000000
+    end
+
+  main(args: SEQ[STRING]): IO[EXIT_CODE]
+    do
+      with IO
+        line_res <- IO.read_line
+        match line_res
+          case Ok(line) then
+            let n = parse_nat(line, 0, 0)
+            if n = 0 then
+              IO.exit(2)
+            else
+              IO.exit(if rounds(n, n * (n + 1) / 2, 4) then 0 else 1 end)
+            end
+          case Error(_) then
+            IO.exit(2)
+        end
+      end
+    end
+
+end

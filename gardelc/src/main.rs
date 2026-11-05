@@ -15006,25 +15006,206 @@ pub fn emit_c11_runtime_header() -> String {
 typedef uint8_t GARDEL_UNIT;
 #define UNIT_VAL 0
 
+/* What each thread keeps for itself. */
+#define GARDEL_CLASS_SHIFT 4
+#define GARDEL_CLASSES 16 /* 16, 32, .. 256 bytes */
+
+struct gardel_block;
+struct gardel_thread {
+    int task_depth; /* nesting of the running code; deeper `let` groups run inline */
+    struct gardel_block* active[GARDEL_CLASSES + 1];
+    struct gardel_block* spare[GARDEL_CLASSES + 1];
+    uint32_t active_bytes[GARDEL_CLASSES + 1];
+    char* chunk;
+    size_t chunk_left;
+};
+
+#if defined(_WIN32) && defined(__x86_64__)
+/* gcc on Windows makes every _Thread_local access a function call, and that alone was 30%
+   of seq_bench on one thread. A TLS slot is a word at a fixed offset in the thread's TEB,
+   which is what TlsGetValue reads too, and it holds only the first 64 indices. */
+__declspec(dllimport) unsigned long __stdcall TlsAlloc(void);
+__declspec(dllimport) int __stdcall TlsSetValue(unsigned long, void*);
+
+static unsigned long gardel_thread_slot;
+
+__attribute__((constructor)) static void gardel_thread_slot_init(void) {
+    gardel_thread_slot = TlsAlloc();
+    if (gardel_thread_slot >= 64) {
+        fputs("error: no thread-local slot is free\n", stderr);
+        exit(1);
+    }
+}
+
+__attribute__((noinline)) static struct gardel_thread* gardel_thread_new(void) {
+    struct gardel_thread* t = (struct gardel_thread*)calloc(1, sizeof *t);
+    if (!t) {
+        fputs("Out of memory\n", stderr);
+        exit(1);
+    }
+    TlsSetValue(gardel_thread_slot, t);
+    return t;
+}
+
+static inline struct gardel_thread* gardel_thread_get(void) {
+    struct gardel_thread* t;
+    __asm__ volatile("movq %%gs:0x1480(,%1,8), %0" : "=r"(t) : "r"((unsigned long long)gardel_thread_slot));
+    return t ? t : gardel_thread_new();
+}
+#else
+static _Thread_local struct gardel_thread gardel_thread_tls;
+static inline struct gardel_thread* gardel_thread_get(void) { return &gardel_thread_tls; }
+#endif
+
+/* The allocator (Task C.4.2). Most Gardel values are a few small, fixed sizes, and every
+   release knows the size, so a block needs no header. Each thread keeps a free list per
+   size class and carves new blocks from its own chunk, so the common path takes no lock.
+   A list that reaches GARDEL_MAGAZINE_BYTES becomes the thread's spare, and a previous
+   spare goes to a shared depot, which is what stops one thread that only frees from
+   hoarding what another thread allocates. Blocks return to their class, never to the
+   system, so a program's footprint is the peak of each class. Larger blocks use malloc.
+   -DGARDEL_SYSTEM_ALLOC uses malloc for everything, for sanitizers. -DGARDEL_COUNT_ALLOCS
+   counts live blocks for the leak tests: the counter is a contended atomic, so it is off
+   in a normal build, and gardel_live_allocations then does not exist. */
+#ifdef GARDEL_COUNT_ALLOCS
 static _Atomic uint64_t g_gardel_live_allocs = 0;
+uint64_t gardel_live_allocations(void) {
+    return atomic_load(&g_gardel_live_allocs);
+}
+#define GARDEL_LIVE_ADD() atomic_fetch_add(&g_gardel_live_allocs, 1)
+#define GARDEL_LIVE_SUB() atomic_fetch_sub(&g_gardel_live_allocs, 1)
+#else
+#define GARDEL_LIVE_ADD() ((void)0)
+#define GARDEL_LIVE_SUB() ((void)0)
+#endif
+
+static void gardel_out_of_memory(void) {
+    fputs("Out of memory\n", stderr);
+    exit(1);
+}
+
+#ifdef GARDEL_SYSTEM_ALLOC
 
 static inline void* gardel_alloc(size_t sz) {
     void* p = malloc(sz);
-    if (!p) { fprintf(stderr, "Out of memory\n"); exit(1); }
-    atomic_fetch_add(&g_gardel_live_allocs, 1);
+    if (!p) gardel_out_of_memory();
+    GARDEL_LIVE_ADD();
     return p;
 }
 
-static inline void gardel_free(void* p) {
+static inline void gardel_free(void* p, size_t sz) {
+    (void)sz;
     if (p) {
-        atomic_fetch_sub(&g_gardel_live_allocs, 1);
+        GARDEL_LIVE_SUB();
         free(p);
     }
 }
 
-uint64_t gardel_live_allocations(void) {
-    return atomic_load(&g_gardel_live_allocs);
+#else
+
+#define GARDEL_SMALL_MAX ((size_t)GARDEL_CLASSES << GARDEL_CLASS_SHIFT)
+#define GARDEL_MAGAZINE_BYTES (64u * 1024u)
+#define GARDEL_CHUNK_BYTES ((size_t)1 << 20)
+
+/* A free block. `batch` is used only by the first block of a list in the depot. */
+struct gardel_block { struct gardel_block* next; struct gardel_block* batch; };
+
+/* A cache line each. `batches` is atomic because a refill reads it without the lock: a
+   program that is only growing has an empty depot, and must not meet other threads there. */
+static struct {
+    atomic_flag busy;
+    struct gardel_block* _Atomic batches;
+    char pad[48];
+} gardel_depot[GARDEL_CLASSES + 1] __attribute__((aligned(64)));
+
+static void gardel_depot_lock(unsigned c) {
+    while (atomic_flag_test_and_set_explicit(&gardel_depot[c].busy, memory_order_acquire)) {}
 }
+
+static void gardel_depot_unlock(unsigned c) {
+    atomic_flag_clear_explicit(&gardel_depot[c].busy, memory_order_release);
+}
+
+static uint32_t gardel_magazine_size(unsigned c) {
+    uint32_t block = (uint32_t)c << GARDEL_CLASS_SHIFT;
+    return (GARDEL_MAGAZINE_BYTES + block - 1) / block * block;
+}
+
+__attribute__((noinline)) static void* gardel_alloc_refill(struct gardel_thread* h, unsigned c) {
+    struct gardel_block* got = h->spare[c];
+    h->spare[c] = NULL;
+    if (!got && atomic_load_explicit(&gardel_depot[c].batches, memory_order_relaxed)) {
+        gardel_depot_lock(c);
+        got = atomic_load_explicit(&gardel_depot[c].batches, memory_order_relaxed);
+        if (got) atomic_store_explicit(&gardel_depot[c].batches, got->batch, memory_order_relaxed);
+        gardel_depot_unlock(c);
+    }
+    if (got) {
+        h->active[c] = got->next;
+        h->active_bytes[c] = gardel_magazine_size(c) - ((uint32_t)c << GARDEL_CLASS_SHIFT);
+        return got;
+    }
+    size_t block = (size_t)c << GARDEL_CLASS_SHIFT;
+    if (h->chunk_left < block) {
+        h->chunk = (char*)malloc(GARDEL_CHUNK_BYTES);
+        if (!h->chunk) gardel_out_of_memory();
+        h->chunk_left = GARDEL_CHUNK_BYTES;
+    }
+    void* p = h->chunk;
+    h->chunk += block;
+    h->chunk_left -= block;
+    return p;
+}
+
+__attribute__((noinline)) static void gardel_free_overflow(struct gardel_thread* h, unsigned c) {
+    struct gardel_block* full = h->spare[c];
+    if (full) {
+        gardel_depot_lock(c);
+        full->batch = atomic_load_explicit(&gardel_depot[c].batches, memory_order_relaxed);
+        atomic_store_explicit(&gardel_depot[c].batches, full, memory_order_relaxed);
+        gardel_depot_unlock(c);
+    }
+    h->spare[c] = h->active[c];
+    h->active[c] = NULL;
+    h->active_bytes[c] = 0;
+}
+
+static inline void* gardel_alloc(size_t sz) {
+    GARDEL_LIVE_ADD();
+    if (sz <= GARDEL_SMALL_MAX) {
+        unsigned c = (unsigned)((sz + (1u << GARDEL_CLASS_SHIFT) - 1) >> GARDEL_CLASS_SHIFT);
+        struct gardel_thread* h = gardel_thread_get();
+        struct gardel_block* b = h->active[c];
+        if (b) {
+            h->active[c] = b->next;
+            h->active_bytes[c] -= (uint32_t)c << GARDEL_CLASS_SHIFT;
+            return b;
+        }
+        return gardel_alloc_refill(h, c);
+    }
+    void* p = malloc(sz);
+    if (!p) gardel_out_of_memory();
+    return p;
+}
+
+/* `sz` is the size given to gardel_alloc. */
+static inline void gardel_free(void* p, size_t sz) {
+    if (!p) return;
+    GARDEL_LIVE_SUB();
+    if (sz <= GARDEL_SMALL_MAX) {
+        unsigned c = (unsigned)((sz + (1u << GARDEL_CLASS_SHIFT) - 1) >> GARDEL_CLASS_SHIFT);
+        struct gardel_thread* h = gardel_thread_get();
+        struct gardel_block* b = (struct gardel_block*)p;
+        b->next = h->active[c];
+        h->active[c] = b;
+        h->active_bytes[c] += (uint32_t)c << GARDEL_CLASS_SHIFT;
+        if (h->active_bytes[c] >= GARDEL_MAGAZINE_BYTES) gardel_free_overflow(h, c);
+        return;
+    }
+    free(p);
+}
+
+#endif
 
 /* Runtime STRING (spec 6.4.C): a contiguous, NUL-terminated buffer of well-formed UTF-8
    (one byte per octet) plus its length and its cached code-point count. The verification
@@ -15044,19 +15225,27 @@ typedef struct {
     void* owner; /* as for GardelString */
 } GardelBytes;
 
-/* Counted text buffers: the reference count precedes the octets. */
-typedef struct gardel_buf { _Atomic uint64_t rc; } gardel_buf;
+/* Counted text buffers: the reference count and the block's size precede the octets. */
+typedef struct gardel_buf { _Atomic uint64_t rc; uint64_t size; } gardel_buf;
 static inline char* gardel_buf_alloc(size_t n, void** owner) {
     gardel_buf* b = (gardel_buf*)gardel_alloc(sizeof(gardel_buf) + n);
     atomic_init(&b->rc, 1);
+    b->size = sizeof(gardel_buf) + n;
     *owner = b;
     return (char*)(b + 1);
+}
+/* Gives up a reference, and says if it was the last. A count of 1 is ours alone: no other
+   thread holds a reference to race with, and a borrower has finished before its owner
+   releases. So that case needs no atomic update, and it is the common one. */
+static inline bool gardel_rc_release(_Atomic uint64_t* rc) {
+    if (atomic_load_explicit(rc, memory_order_acquire) == 1) return true;
+    return atomic_fetch_sub_explicit(rc, 1, memory_order_acq_rel) == 1;
 }
 static inline void gardel_owner_dup(void* o) {
     if (o) atomic_fetch_add_explicit(&((gardel_buf*)o)->rc, 1, memory_order_relaxed);
 }
 static inline void gardel_owner_drop(void* o) {
-    if (o && atomic_fetch_sub_explicit(&((gardel_buf*)o)->rc, 1, memory_order_acq_rel) == 1) gardel_free(o);
+    if (o && gardel_rc_release(&((gardel_buf*)o)->rc)) gardel_free(o, (size_t)((gardel_buf*)o)->size);
 }
 static inline GardelString gardel_string_dup(GardelString s) { gardel_owner_dup(s.owner); return s; }
 static inline void gardel_string_drop(GardelString s) { gardel_owner_drop(s.owner); }
@@ -17404,8 +17593,7 @@ end
     fn test_plan4_perceus_refcounting_zero_memory_leaks() {
         let hdr = emit_c11_runtime_header();
         assert!(hdr.contains("gardel_live_allocations(void)"));
-        assert!(hdr.contains("atomic_fetch_add(&g_gardel_live_allocs, 1);"));
-        assert!(hdr.contains("atomic_fetch_sub(&g_gardel_live_allocs, 1);"));
+        assert!(hdr.contains("#ifdef GARDEL_COUNT_ALLOCS"));
     }
 
     #[test]
@@ -18568,7 +18756,7 @@ end
         let exe = dir.join(format!("{tag}.exe"));
         fs::write(&c_path, c).unwrap();
         let out = Command::new("gcc")
-            .args(["-std=gnu11", "-O1", "-fopenmp", "-o"])
+            .args(["-std=gnu11", "-O1", "-fopenmp", "-DGARDEL_COUNT_ALLOCS", "-o"])
             .arg(&exe)
             .arg(&c_path)
             .args(GCC_NET_LIBS)
@@ -18805,6 +18993,154 @@ end
         // A leak is detected: a value that is never released stays live.
         if let Some((first, after)) = c3_live_after(&bench, "benchleak2", "SEQ_BENCH__from_range(1, 10) != NULL") {
             assert_eq!((first, after), (19, 19 * 51), "the harness must see unreleased trees");
+        }
+    }
+
+    /// The generated C, reporting at exit how many heap objects are still live.
+    fn c4_with_exit_report(c: &str) -> String {
+        c.replace(
+            "int main(int argc, char** argv) {",
+            "static void gardel_report(void) {\n    printf(\"%llu \", (unsigned long long)gardel_live_allocations());\n}\nint main(int argc, char** argv) {\n    atexit(gardel_report);",
+        )
+    }
+
+    #[test]
+    fn test_c4_a_dying_program_does_not_release() {
+        // A `main` only ends through `IO.exit`, which never returns, so what it holds in
+        // scope was never released. What remained is the argument itself: here the tree of
+        // `sum(from_range(1, n))`, a temporary inside it.
+        let bench = c3_verify_and_emit(include_str!("../../examples/seq_bench.gdl"), "seq_bench.gdl");
+        if let Some(runs) = c3_native_runs(&c4_with_exit_report(&bench), "c4exit", &[b"1000\n"]) {
+            assert_eq!(runs[0].0, 0);
+            let live: u64 = runs[0].1.trim().parse().unwrap();
+            assert!(live >= 1999, "the 1999 nodes of the tree stay alive, got {live}");
+        }
+        // A lambda inside the argument still releases: it runs once per element, so it would
+        // otherwise pile up, and that is not the cheap end of a program.
+        let src = "program LAMBDA_EXIT\n\nfeature {ANY}\n\n  main(args: SEQ[STRING]): IO[EXIT_CODE]\n    do\n      let s = SEQ.singleton(1).concat(SEQ.singleton(2)).concat(SEQ.singleton(3))\n      IO.exit(s.map(fn(x: U64): U64 do SEQ.singleton(x).length end).length - 3)\n    end\n\nend\n";
+        let c = c3_verify_and_emit(src, "lambda_exit.gdl");
+        if let Some(runs) = c3_native_runs(&c4_with_exit_report(&c), "c4lambda", &[b""]) {
+            assert_eq!(runs[0].0, 0);
+            let live: u64 = runs[0].1.trim().parse().unwrap();
+            // Three leaves and two nodes, the same again for the map's result, and `args`. Each
+            // of the three calls would leave one more value.
+            assert!(live <= 11, "the lambda's values are released, got {live}");
+        }
+    }
+
+    #[test]
+    fn test_c4_the_allocator_keeps_blocks_apart_and_does_not_hoard() {
+        let c = format!(
+            "#include <stdlib.h>\nstatic int g_chunks;\nstatic void* counted_malloc(size_t n) {{\n    if (n >= (size_t)1 << 20) __atomic_add_fetch(&g_chunks, 1, __ATOMIC_RELAXED);\n    return malloc(n);\n}}\n#define malloc counted_malloc\n{}\n{}",
+            emit_c11_runtime_header(),
+            r#"
+#undef malloc
+#include <omp.h>
+#define ROUNDS 3000000
+#define SLOTS 256
+static void* _Atomic g_box[SLOTS];
+
+/* One thread only allocates and one only frees, in every size class and past it. Without
+   the depot the first would take a new chunk for all of it (about 450), and the second
+   would hoard it. */
+static int one_way(void) {
+    int bad = 0;
+    #pragma omp parallel num_threads(2) reduction(+:bad)
+    {
+        int me = omp_get_thread_num();
+        for (uint64_t i = 0; i < ROUNDS; i++) {
+            size_t size = 16 + (i % 40) * 8;
+            _Atomic(void*)* slot = (_Atomic(void*)*)&g_box[i % SLOTS];
+            if (me == 0) {
+                while (atomic_load(slot)) {}
+                uint64_t* p = (uint64_t*)gardel_alloc(size);
+                p[0] = i;
+                p[size / 8 - 1] = ~i;
+                atomic_store(slot, p);
+            } else {
+                void* got;
+                while (!(got = atomic_load(slot))) {}
+                uint64_t* p = (uint64_t*)got;
+                if (p[0] != i || p[size / 8 - 1] != ~i) bad++;
+                atomic_store(slot, NULL);
+                gardel_free(p, size);
+            }
+        }
+    }
+    return bad;
+}
+
+/* Blocks held at once never overlap: each is filled with its own byte, and checked. */
+static int apart(void) {
+    int bad = 0;
+    #pragma omp parallel num_threads(4) reduction(+:bad)
+    {
+        enum { HELD = 4000 };
+        static _Thread_local unsigned char* held[HELD];
+        static _Thread_local size_t sizes[HELD];
+        uint64_t x = 88172645463325252ULL + (uint64_t)omp_get_thread_num();
+        for (int i = 0; i < 400000; i++) {
+            x ^= x << 13; x ^= x >> 7; x ^= x << 17;
+            int k = (int)(x % HELD);
+            if (held[k]) {
+                for (size_t j = 0; j < sizes[k]; j++) if (held[k][j] != (unsigned char)k) bad++;
+                gardel_free(held[k], sizes[k]);
+            }
+            sizes[k] = 8 + (size_t)((x >> 20) % 400);
+            held[k] = (unsigned char*)gardel_alloc(sizes[k]);
+            if ((uintptr_t)held[k] % 16) bad++;
+            memset(held[k], k, sizes[k]);
+        }
+        for (int k = 0; k < HELD; k++) {
+            if (held[k]) {
+                gardel_free(held[k], sizes[k]);
+                held[k] = NULL;
+            }
+        }
+    }
+    return bad;
+}
+
+int main(void) {
+    omp_set_dynamic(0);
+    int bad = one_way();
+    int chunks = g_chunks;
+    bad += apart();
+    printf("%d %d %llu\n", bad, chunks, (unsigned long long)gardel_live_allocations());
+    return 0;
+}
+"#
+        );
+        if let Some(runs) = c3_native_runs(&c, "c4alloc", &[b""]) {
+            let parts: Vec<u64> = runs[0].1.split_whitespace().map(|x| x.parse().unwrap()).collect();
+            assert_eq!(parts[0], 0, "a block was changed or misaligned");
+            assert!(parts[1] <= 16, "one-way traffic took {} chunks", parts[1]);
+            assert_eq!(parts[2], 0, "live blocks at the end");
+        }
+    }
+
+    #[test]
+    fn test_c4_ownership_moves_are_correct_and_leak_nothing() {
+        let tree = include_str!("../tests/c_backend/pair_tree.gdl");
+        let prog = include_str!("../tests/c_backend/ownership.gdl");
+        let mut units = b4_units(&[("pair_tree.gdl", tree), ("ownership.gdl", prog)]);
+        let checked = check_and_verify_project(&mut units, b4_opts(true, true));
+        assert!(checked.fatal.is_empty());
+        let diags: Vec<&Diagnostic> = checked.diags.iter().map(|(_, d)| d).collect();
+        assert!(diags.is_empty(), "{diags:?}");
+        let lib_m = units[0].ast.modules[0].clone();
+        let prog_m = units[1].ast.modules[0].clone();
+        let (c, errs) = emit_c11_typed(&prog_m, &[&lib_m]);
+        assert!(errs.is_empty(), "{errs:?}");
+        // The moves happen: `a.join(b)` hands over both, with no copy in the caller.
+        assert!(c.contains("sink_PAIR_TREE__join(a, b)"), "a last use must give the value away");
+        // Not when the value is used again.
+        assert!(c.contains("struct PAIR_TREE* d = sink_PAIR_TREE__join(c, dup_PAIR_TREE(a))"), "a is used again");
+        if let Some(runs) = c3_native_runs(&c, "ownership", &[b""]) {
+            assert_eq!(runs[0].0, 0, "first failing check");
+        }
+        if let Some(live) = c3_live_after(&c, "ownleak", "OWNERSHIP__first_failure()") {
+            assert_eq!(live, (0, 0), "live heap objects after the call");
         }
     }
 

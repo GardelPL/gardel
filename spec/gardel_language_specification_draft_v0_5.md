@@ -2832,7 +2832,7 @@ The table below records the architectural decisions locked in v0.4 alongside the
 | Recursion primitives | Standard `match` + `variant` + parallel `let` | **Locked in v0.4** (`fold`/`unfold`/`fork`/`Subject` removed; clean induction) |
 | Closure semantics | Unrestricted via compile-time closure conversion | **Locked in v0.4** (lambda lifting to first-order ADTs replaces affine restriction) |
 | Verifier backend | Boogie and Z3 (with native SMT diagnostic indexing) | **Locked in v0.4** (Direct Boogie/Z3 pipeline replaces Phase 0 Dafny prototype; verified under `gardelc --strict`. The Dafny emitter was removed in Roadmap Task B.12: Boogie is the only verifier) |
-| Memory management in C | Atomic reference counting of immutable, acyclic values | **Implemented** (Task C.3 follow-ups). Optimizations: Task C.4; an arena per reactive step is evaluated with Phase D |
+| Memory management in C | Atomic reference counting of immutable, acyclic values | **Implemented** (Task C.3 follow-ups). Optimizations: Task C.4 (size-classed free lists, ownership transfer on last use); an arena per reactive step was prototyped and rejected |
 | Non-termination | `reactive program`: total `init` and `step`, runtime-owned event loop (§11.6) | **Implemented** (Phase D, §16.5) |
 | Catch-all `match` arms | Must be last (`E0316`, §5.1) | **Locked in v0.5** |
 | Verification budget | Z3 resource limit, with no pass unless Boogie reports a clean result (§7.3) | **Locked in v0.5** |
@@ -2860,7 +2860,7 @@ The `gardelc` compiler pipeline (§13) and its `--json-diagnostics` `"rule"` tax
    - `concept` declarations, `refines` hierarchies, conditional module conformance (`satisfies ... where ...`), concept law proof obligations, SMT quantifier `trigger` attributes, and zero-overhead monomorphization (§9, §13). Static and verification diagnostics emit `"Phase 2 (...)"` rules (§12).
 4. **Phase 3: Direct Boogie Verifier & AI Diagnostic Tooling — [✅ Locked in v0.4]**
    - Direct Boogie (`.bpl`) verification condition generation, Z3 discharge, fuel-bounded recursive unfolding, `reveal` directives for opaque `specify` queries (§7.5), counterexample translation, and deterministic `--json-diagnostics` with `relevant_lemmas` law indexing (§12). Verification diagnostics emit `"Phase 3 (...)"` and `"Phase 3 Boogie (...)"` rules.
-5. **Phase 4: Standard Library & Linear IO Architecture — [🔄 Steps 1–4 and Evolution Plan Phases A–D Completed (Task C.4 planned)]**
+5. **Phase 4: Standard Library & Linear IO Architecture — [🔄 Steps 1–4 and Evolution Plan Phases A–D Completed]**
    - Standard Prelude package (`phase4_stdlib_source()`), linear `IO[A]` boundary and branch enforcement emitting `"Phase 4 (IO Boundary Violation)"` and `"Phase 4 (Linear IO Violation)"` diagnostics (§11), foundational library remediation (**Steps 1–4**, §16.3), and modular packaging & tooling (**Phases A–C**, §16.4).
 
 ---
@@ -2928,7 +2928,7 @@ Enhancing the compiler pipeline to provide a seamless developer experience witho
 - **Task B.4:** Multi-file project CLI compilation support (`gardelc src/*.gdl --strict`) linking multiple source files into a unified verification run.
 - **Task B.5:** Stdlib/compiler conformance with the Phase A review: remove the `equals`/`less_than` ghost-access exemption (§4 Rule 3) by giving `SEQ`/`BIGNAT` executable comparison bodies (with a `BIGNAT` normalization invariant); remove the hard-coded `decode_utf8` identity axiom from the Boogie emitter in favour of the proven `same_length`/`decode_injective` lemmas; align `stdlib.gdl` `STRING` with §6.4.C (ASCII bound, `decode_utf8` precondition, `CHAR.from_scalar` precondition); drop the unconditional `sound` postcondition from `OPTION`/`RESULT.equals`; remove the duplicate law `LIST_OPS.fold_left_append_distributivity`; and rename `BIGNAT.push_high_limb` to `shift_in_low_limb`.
 
-#### Phase C: Standard Library Modularization & Smart String Implementation — [✅ Completed: C.1, C.2, C.3 completed; C.4 planned]
+#### Phase C: Standard Library Modularization & Smart String Implementation — [✅ Completed]
 Decomposing the monolithic standard library into physical 1:1 module files (satisfying §4.2 `W0201` under `--strict`) and delivering production text performance:
 - **Task C.1 (completed):** Physical 1:1 file decomposition of `stdlib/` into modular directories:
   - `stdlib/concepts/`: `eq.gdl` (`concept EQ`), `canonical_eq.gdl` (`concept CANONICAL_EQ`), `ord.gdl` (`concept ORD`)
@@ -2946,7 +2946,7 @@ Decomposing the monolithic standard library into physical 1:1 module files (sati
   - Follow-up: a typed C backend compiles modules and programs from source, including the whole stdlib `SEQ` (generic and higher-order routines, with a `LIST` runtime for `to_list`/`equals`). `examples/seq_ops.gdl` checks every SEQ routine at run time, and `examples/seq_bench.gdl` benchmarks SEQ compiled from source against the reference runtime. Independent `let` groups run as OpenMP tasks below a depth cutoff (§10).
   - Follow-up 2: reference-counted memory (every heap value is freed when its last reference goes), closures, compiled literal/tuple/nested patterns (for the verifier and the C backend), validated command-line arguments (§11), and no hand-written C: every module compiles from source.
   - Not done: BendRT execution (`.bend` files are emitted but not run).
-- **Task C.4 (planned):** Memory management performance: skip freeing at program exit, faster allocator (size-classed free lists or mimalloc), optimized reference counting (ownership transfer, reuse, non-atomic counts for unshared values), and bump-pointer per-step arena for reactive programs.
+- **Task C.4 (completed, reuse deferred):** Memory management performance: no release at program exit, size-classed thread-local free lists, ownership transfer on last use, and no atomic update when releasing the only reference. Non-atomic counts and an arena per reactive step were measured and rejected. Reuse in place is deferred, since it needs a general owned-parameter convention.
 
 ### 16.5 Phase D: Reactive Programs — [✅ Completed]
 
