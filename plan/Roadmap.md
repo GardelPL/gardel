@@ -716,21 +716,22 @@ flowchart TD
 - [x] Acceptance: `examples/echo_server/Gardel.toml` added and sources placed in `examples/echo_server/src/`; `gardelc --project examples/echo_server` and `gardelc examples/echo_server` give the exact same `.bpl` and `.c` files. Unit tests: `test_e1_manifest_parser_and_package_name_validation`, `test_e1_echo_server_with_manifest_gives_same_bpl_and_c`, `test_e1_cli_project_argument_handling`, plus strictness unit tests in `manifest.rs`.
 
 #### Task E.2: Contract-Only Interfaces [✅ Completed]
-- [x] Define the `.gds` content from `--inspect`: signatures, `require`, `ensure`, public ghost signatures and laws. A ghost query over a hidden representation stays uninterpreted for a client. Visibility is canonical Eiffel style (`{ANY}`, `{NONE}`, `{M1, M2}`), and routine `do` bodies are withheld.
-- [x] Add a boundary to linking that withholds bodies, generalizing `prelude_contract_interface` across package boundaries (`LinkTable::with_external`, `LinkTable::is_external`, `emit_contract_interface`). Intra-project linking retains definitional axioms; cross-package linking withholds `do` bodies.
+- [x] Define the `.gds` content from `--inspect`: signatures, `require`, `ensure`, public ghost signatures and laws (`contract_only_module`, `format_module_interface`). A ghost query over a hidden representation stays uninterpreted for a client. Private `{NONE}` routines/laws, invariants or contract clauses referencing hidden representation or private routines, and all routine `do` bodies are withheld; type parameter bounds, `satisfies ... where ...` clauses, and law `trigger` clauses are preserved.
+- [x] Add a boundary to linking that withholds bodies, generalizing `prelude_contract_interface` across package boundaries (`BoogieEmitScope`, `LinkTable::with_external`, `LinkTable::is_external_for`, `linked_contract_interface`). Intra-project linking retains definitional axioms; cross-package/prelude linking withholds `do` bodies, hidden representations (`representation {NONE}`), body-derived receiver-independence axioms, body-lifted lambdas, and body string literals while keeping fuel-stabilization axioms (`SuccFuel(SuccFuel(_fuel)) == SuccFuel(_fuel)`) and precondition/trust-guarded return-type frame axioms.
 - [x] **Measure first:** run `examples/` with bodies withheld, and record which proofs need new `ensure` clauses:
-  - Measured all 11 repository examples (`bounded_stack.gdl`, `greeter.gdl`, `peano_ord.gdl`, `seq_bench.gdl`, `seq_churn.gdl`, `seq_ops.gdl`, `tree.gdl`, `reactive_hello.gdl`, `reactive_clock`, `reactive_game`, `echo_server`).
+  - Measured all 11 repository examples (`bounded_stack.gdl`, `greeter.gdl`, `peano_ord.gdl`, `seq_bench.gdl`, `seq_churn.gdl`, `seq_ops.gdl`, `tree.gdl`, `reactive_hello.gdl`, `reactive_clock`, `reactive_game`, `echo_server`), including multi-file projects with their support modules (`CLOCK_STATE`, `TRACK_BOARD`, `SERVER_STATE`) linked across the contract-only boundary.
   - Added necessary contract postconditions / laws:
     - `stdlib/core/step.gdl`: `is_stop` postcondition `ensure def: Result = (match Current case Stop(_, _) then True case _ then False end)`.
     - `stdlib/core/event.gdl`: `is_shutdown` postcondition `ensure def: Result = (match Current case Shutdown then True case _ then False end)`.
     - `stdlib/text/bytes.gdl`: `valid_utf8` postcondition `ensure empty_valid: (bs.length = 0) implies Result`, `to_list` postcondition `ensure len: Result.length = Current.length`, and `law utf8_step_1`.
     - `stdlib/text/string.gdl`: `capacity` postcondition `ensure at_least_byte_length: Result >= Current.byte_length`.
+  - Multi-file support modules (`CLOCK_STATE`, `TRACK_BOARD`, `SERVER_STATE`) needed no additional `ensure` clauses when linked as external contract-only dependencies.
   - With these contract postconditions, all 11 examples verify with 0 errors and 0 warnings under `--strict`.
 - [x] Acceptance: verified by unit test `test_e2_contract_only_interfaces_body_change_and_missing_fact`:
   - A client relying on an external dependency's body fails with the missing fact named (`exact`).
   - Adding the contract postcondition to the dependency allows the client's proof to succeed.
-  - A body change inside the contract leaves the client's proof and result unchanged (and emits byte-identical Boogie background theories for the client).
-  - Ghost queries and hidden representation in `.gds` / `--inspect` are canonically formatted and withhold `do` bodies.
+  - A body change inside the contract (including adding `Current` references, lambdas, or string literals) leaves the client's proof and result unchanged and emits byte-identical Boogie background theories for the client.
+  - Ghost queries, triggers, and hidden representation in `.gds` / `--inspect` are canonically formatted and withhold private invariants, `{NONE}` members, and `do` bodies.
 
 #### Task E.3: Local Verification Cache [ ]
 - [ ] Cache key and contents as in decision 1. Any change to a key input re-verifies.
