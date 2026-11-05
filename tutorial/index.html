@@ -2,1653 +2,1928 @@
 <html lang="en">
 <head>
   <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Gardel Guided Tour — What's Possible Today</title>
-  <meta name="description" content="An interactive guided tour exploring the Gardel programming language: pure, total, Eiffel-inspired Design by Contract, SMT formal verification via Boogie & Z3, and multi-target compilation.">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Gardel Guided Tour</title>
+  <meta name="description" content="A guided tour of the Gardel language at spec v0.5: Hoare-style axiomatic semantics proved by Boogie and Z3, total functions, reactive programs with record and replay, and native C11 output.">
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 144 144'%3E%3Crect width='144' height='144' rx='36' fill='%230B5560'/%3E%3Cg transform='translate(16 34) scale(.28)' fill='none' stroke-linecap='round' stroke-linejoin='round' stroke-width='16'%3E%3Cpath d='M124 74 C128 50 142 32 168 28 C184 26 194 36 208 36 C222 36 232 26 248 30 C270 36 280 54 284 74' stroke='%23F3F1EA'/%3E%3Cpath d='M118 94 C170 106 216 106 256 98' stroke='%23F3F1EA' stroke-width='20'/%3E%3Cpath d='M268 94 L282 108 L306 82' stroke='%2338C58F'/%3E%3Cpath d='M40 124 C90 142 160 144 220 134 C280 124 330 120 376 94' stroke='%23F3F1EA'/%3E%3C/g%3E%3C/svg%3E">
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500;600;700&family=Outfit:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+  <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:ital,wght@0,400;0,500;0,600;1,400&family=JetBrains+Mono:wght@400;500&family=Space+Grotesk:wght@500;600&display=swap" rel="stylesheet">
   <style>
+    /* Palette and logo geometry follow design/gradel-fedora/Main.dc.html. */
     :root {
-      --bg-base: #070a11;
-      --bg-surface: #0f1626;
-      --bg-surface-elevated: #162035;
-      --bg-card: rgba(22, 32, 53, 0.75);
-      --bg-card-hover: rgba(28, 41, 68, 0.85);
-      --border-subtle: rgba(255, 255, 255, 0.08);
-      --border-focus: rgba(34, 211, 238, 0.5);
-      
-      --accent-cyan: #22d3ee;
-      --accent-cyan-glow: rgba(34, 211, 238, 0.25);
-      --accent-indigo: #818cf8;
-      --accent-purple: #c084fc;
-      --accent-emerald: #34d399;
-      --accent-emerald-glow: rgba(52, 211, 153, 0.2);
-      --accent-amber: #fbbf24;
-      --accent-rose: #fb7185;
+      --paper: #F3F1EA;
+      --band: #E4EBE8;
+      --surface: #FBFAF6;
+      --ink: #08272C;
+      --heading: #083F47;
+      --accent: #0B5560;
+      --accent-tint: rgba(11, 85, 96, 0.10);
+      --check: #0F9D6B;
+      --verified-text: #0A6B4A;
+      --muted: #47636A;
+      --line: #CAD6D2;
+      --warn: #8A5A00;
+      --warn-tint: rgba(170, 118, 16, 0.12);
+      --error: #A63A22;
+      --error-tint: rgba(166, 58, 34, 0.10);
+      --hat: #0B5560;
+      --hat-check: #0F9D6B;
+      --tile: #0B5560;
+      --tile-hat: #F3F1EA;
 
-      --text-main: #f1f5f9;
-      --text-muted: #94a3b8;
-      --text-dim: #64748b;
+      --code-bg: #08272C;
+      --code-bar: #0B3138;
+      --code-line: #1D4A51;
+      --code-text: #E4EBE8;
+      --code-dim: #8FB0B0;
+      --code-kw: #7FD0CF;
+      --code-contract: #38C58F;
+      --code-type: #F3F1EA;
+      --code-lit: #E9C88F;
+      --code-error: #F4A68F;
 
-      --code-bg: #090d16;
-      --code-kw: #38bdf8;
-      --code-type: #a78bfa;
-      --code-string: #34d399;
-      --code-comment: #64748b;
-      --code-contract: #fbbf24;
-      --code-num: #f472b6;
-      --code-fn: #67e8f9;
-
-      --radius-sm: 8px;
-      --radius-md: 14px;
-      --radius-lg: 20px;
-      --shadow-glass: 0 8px 32px 0 rgba(0, 0, 0, 0.45);
+      --display: 'Space Grotesk', system-ui, sans-serif;
+      --body: 'IBM Plex Sans', system-ui, -apple-system, 'Segoe UI', sans-serif;
+      --mono: 'JetBrains Mono', ui-monospace, 'Cascadia Code', Consolas, monospace;
+      --radius: 10px;
+      --radius-lg: 18px;
+      color-scheme: light dark;
     }
 
-    * {
-      box-sizing: border-box;
-      margin: 0;
-      padding: 0;
+    @media (prefers-color-scheme: dark) {
+      :root {
+        --paper: #08272C;
+        --band: #0B3138;
+        --surface: #0C333A;
+        --ink: #F3F1EA;
+        --heading: #F3F1EA;
+        --accent: #7FD0CF;
+        --accent-tint: rgba(127, 208, 207, 0.12);
+        --check: #38C58F;
+        --verified-text: #38C58F;
+        --muted: #A9C2C1;
+        --line: #1F4C53;
+        --warn: #E9C88F;
+        --warn-tint: rgba(233, 200, 143, 0.10);
+        --error: #F4A68F;
+        --error-tint: rgba(244, 166, 143, 0.10);
+        --hat: #7FD0CF;
+        --hat-check: #38C58F;
+        --tile: #0C333A;
+        --tile-hat: #7FD0CF;
+        --code-bg: #051C20;
+        --code-bar: #082A30;
+        --code-line: #1D4A51;
+      }
     }
 
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    html { scroll-padding-top: 76px; -webkit-text-size-adjust: 100%; }
     body {
-      background-color: var(--bg-base);
-      color: var(--text-main);
-      font-family: 'Inter', system-ui, -apple-system, sans-serif;
-      line-height: 1.6;
-      overflow-x: hidden;
+      background: var(--paper);
+      color: var(--ink);
+      font-family: var(--body);
+      font-size: 17px;
+      line-height: 1.65;
       min-height: 100vh;
-      background-image: 
-        radial-gradient(circle at 15% 15%, rgba(99, 102, 241, 0.12) 0%, transparent 40%),
-        radial-gradient(circle at 85% 30%, rgba(34, 211, 238, 0.10) 0%, transparent 45%),
-        radial-gradient(circle at 50% 85%, rgba(192, 132, 252, 0.08) 0%, transparent 50%);
-      background-attachment: fixed;
     }
+    a { color: var(--accent); text-underline-offset: 2px; }
+    strong { font-weight: 600; }
+    :focus-visible { outline: 2px solid var(--check); outline-offset: 2px; border-radius: 4px; }
+    code { font-variant-ligatures: none; font-family: var(--mono); font-size: 0.86em; background: var(--accent-tint); padding: 0.08em 0.32em; border-radius: 4px; overflow-wrap: break-word; }
+    pre code { background: none; padding: 0; font-size: inherit; border-radius: 0; overflow-wrap: normal; }
 
-    /* Top Navigation Header */
-    header {
-      position: sticky;
-      top: 0;
-      z-index: 100;
-      backdrop-filter: blur(16px);
-      -webkit-backdrop-filter: blur(16px);
-      background: rgba(7, 10, 17, 0.82);
-      border-bottom: 1px solid var(--border-subtle);
-      padding: 0.85rem 2rem;
+    /* Header */
+    .site-header {
+      position: sticky; top: 0; z-index: 10;
+      background: var(--paper);
+      border-bottom: 1px solid var(--line);
+      padding: 10px 24px;
     }
+    .nav { max-width: 1320px; margin: 0 auto; display: flex; align-items: center; justify-content: space-between; gap: 16px; }
+    .brand { display: flex; align-items: center; gap: 10px; text-decoration: none; color: var(--heading); }
+    .brand svg { width: 70px; height: 30px; display: block; }
+    .wordmark { font-family: var(--display); font-weight: 500; letter-spacing: 0.14em; font-size: 20px; line-height: 1; }
+    .nav-links { display: flex; align-items: center; gap: 20px; font-size: 15px; white-space: nowrap; }
+    .nav-links a { text-decoration: none; font-weight: 500; }
+    .nav-links a:hover { text-decoration: underline; }
+    .version { font-family: var(--mono); font-size: 13px; color: var(--muted); }
 
-    .nav-container {
-      max-width: 1400px;
-      margin: 0 auto;
-      display: flex;
-      align-items: center;
-      justify-content: space-between;
-      gap: 1rem;
-    }
+    /* Hero: the mockup's paper panel above its sage band */
+    .hero { padding: 72px 24px 56px; text-align: center; }
+    .hero svg { width: min(460px, 86vw); height: auto; display: block; margin: 0 auto 28px; }
+    .hero .wordmark { display: block; font-size: clamp(36px, 7vw, 56px); margin-bottom: 28px; padding-left: 0.14em; }
+    .hero h1 { font-family: var(--display); font-weight: 500; font-size: clamp(25px, 4vw, 36px); line-height: 1.2; letter-spacing: -0.01em; color: var(--heading); margin-bottom: 14px; text-wrap: balance; }
+    .hero p { max-width: 660px; margin: 0 auto; color: var(--muted); font-size: 18px; text-wrap: pretty; }
 
-    .brand {
-      display: flex;
-      align-items: center;
-      gap: 0.85rem;
-      text-decoration: none;
-      color: inherit;
-    }
+    .facts { background: var(--band); padding: 28px 24px; }
+    .facts dl { max-width: 1100px; margin: 0 auto; display: grid; grid-template-columns: repeat(4, 1fr); gap: 24px; }
+    .facts dt { font-family: var(--display); font-weight: 500; font-size: 28px; line-height: 1.15; color: var(--heading); }
+    .facts dd { color: var(--muted); font-size: 15px; line-height: 1.4; margin-top: 4px; }
+    .facts code { white-space: nowrap; }
 
-    .brand-logo {
-      width: 38px;
-      height: 38px;
-      border-radius: var(--radius-sm);
-      background: linear-gradient(135deg, #06b6d4, #6366f1, #a855f7);
-      display: flex;
-      align-items: center;
-      justify-content: center;
-      font-family: 'Outfit', sans-serif;
-      font-weight: 800;
-      font-size: 1.25rem;
-      color: #fff;
-      box-shadow: 0 0 20px var(--accent-cyan-glow);
-    }
-
-    .brand-title {
-      font-family: 'Outfit', sans-serif;
-      font-weight: 700;
-      font-size: 1.35rem;
-      letter-spacing: -0.02em;
-      background: linear-gradient(to right, #ffffff, #93c5fd);
-      -webkit-background-clip: text;
-      -webkit-text-fill-color: transparent;
-    }
-
-    .nav-badges {
-      display: flex;
-      align-items: center;
-      gap: 0.6rem;
-    }
-
-    .badge {
-      display: inline-flex;
-      align-items: center;
-      gap: 0.4rem;
-      font-size: 0.75rem;
-      font-weight: 600;
-      padding: 0.25rem 0.65rem;
-      border-radius: 9999px;
-      border: 1px solid var(--border-subtle);
-      background: rgba(255, 255, 255, 0.03);
-      color: var(--text-muted);
-      text-transform: uppercase;
-      letter-spacing: 0.05em;
-    }
-
-    .badge-verified {
-      border-color: rgba(52, 211, 153, 0.35);
-      background: rgba(52, 211, 153, 0.1);
-      color: var(--accent-emerald);
-    }
-
-    .badge-verified::before {
-      content: '';
-      width: 6px;
-      height: 6px;
-      border-radius: 50%;
-      background: var(--accent-emerald);
-      box-shadow: 0 0 8px var(--accent-emerald);
-    }
-
-    /* Hero Section */
-    .hero {
-      max-width: 1200px;
-      margin: 3.5rem auto 2rem;
-      padding: 0 1.5rem;
-      text-align: center;
-    }
-
-    .hero-tag {
-      display: inline-block;
-      font-family: 'JetBrains Mono', monospace;
-      font-size: 0.85rem;
-      font-weight: 600;
-      color: var(--accent-cyan);
-      background: rgba(34, 211, 238, 0.1);
-      border: 1px solid rgba(34, 211, 238, 0.25);
-      padding: 0.3rem 0.9rem;
-      border-radius: 9999px;
-      margin-bottom: 1.25rem;
-    }
-
-    .hero h1 {
-      font-family: 'Outfit', sans-serif;
-      font-size: 3.25rem;
-      font-weight: 800;
-      line-height: 1.15;
-      letter-spacing: -0.03em;
-      margin-bottom: 1.25rem;
-    }
-
-    .gradient-text {
-      background: linear-gradient(135deg, #22d3ee 0%, #818cf8 50%, #c084fc 100%);
-      -webkit-background-clip: text;
-      -webkit-text-fill-color: transparent;
-    }
-
-    .hero p {
-      font-size: 1.15rem;
-      color: var(--text-muted);
-      max-width: 780px;
-      margin: 0 auto 2rem;
-      font-weight: 400;
-    }
-
-    .features-pill-row {
-      display: flex;
-      flex-wrap: wrap;
-      justify-content: center;
-      gap: 0.75rem;
-      margin-bottom: 2.5rem;
-    }
-
-    .feat-pill {
-      display: flex;
-      align-items: center;
-      gap: 0.5rem;
-      background: var(--bg-surface);
-      border: 1px solid var(--border-subtle);
-      border-radius: var(--radius-sm);
-      padding: 0.45rem 0.95rem;
-      font-size: 0.88rem;
-      color: var(--text-main);
-    }
-
-    .feat-pill span.icon {
-      font-size: 1rem;
-    }
-
-    /* Main Guided Tour Layout */
-    .tour-container {
-      max-width: 1400px;
-      margin: 0 auto;
-      padding: 0 1.5rem 5rem;
-      display: grid;
-      grid-template-columns: 290px 1fr;
-      gap: 2rem;
-      align-items: start;
-    }
-
-    /* Sidebar Progress Stepper */
-    .tour-sidebar {
-      position: sticky;
-      top: 5rem;
-      background: var(--bg-card);
-      backdrop-filter: blur(12px);
-      border: 1px solid var(--border-subtle);
-      border-radius: var(--radius-md);
-      padding: 1.25rem;
-      box-shadow: var(--shadow-glass);
-    }
-
-    .sidebar-title {
-      font-family: 'Outfit', sans-serif;
-      font-size: 0.85rem;
-      text-transform: uppercase;
-      letter-spacing: 0.08em;
-      color: var(--text-dim);
-      margin-bottom: 1rem;
-      padding-left: 0.5rem;
-    }
-
-    .stepper-nav {
-      list-style: none;
-      display: flex;
-      flex-direction: column;
-      gap: 0.35rem;
-    }
-
+    /* Layout */
+    .tour { max-width: 1320px; margin: 0 auto; padding: 40px 24px 80px; display: grid; grid-template-columns: 272px minmax(0, 1fr); gap: 48px; align-items: start; }
+    .sidebar { position: sticky; top: 76px; max-height: calc(100vh - 92px); overflow-y: auto; }
+    .part { font-family: var(--display); font-weight: 500; font-size: 13px; letter-spacing: 0.1em; text-transform: uppercase; color: var(--muted); margin: 18px 0 6px 10px; }
+    .part:first-child { margin-top: 0; }
+    .steps { list-style: none; }
     .step-btn {
-      width: 100%;
-      text-align: left;
-      background: transparent;
-      border: 1px solid transparent;
-      border-radius: var(--radius-sm);
-      padding: 0.65rem 0.85rem;
-      color: var(--text-muted);
-      cursor: pointer;
-      font-family: inherit;
-      font-size: 0.9rem;
-      font-weight: 500;
-      display: flex;
-      align-items: center;
-      gap: 0.75rem;
-      transition: all 0.2s ease;
+      width: 100%; display: flex; gap: 10px; align-items: baseline; text-align: left;
+      background: none; border: 0; border-radius: 8px; padding: 7px 10px;
+      font: inherit; font-size: 15px; line-height: 1.35; color: var(--ink); cursor: pointer;
     }
+    .step-btn:hover { background: var(--accent-tint); }
+    .step-btn .n { font-family: var(--mono); font-size: 12px; color: var(--muted); min-width: 18px; }
+    .step-btn.active { background: var(--tile); color: var(--paper); font-weight: 500; }
+    .step-btn.active .n { color: inherit; }
+    @media (prefers-color-scheme: dark) { .step-btn.active { background: var(--accent); color: #08272C; } }
 
-    .step-btn:hover {
-      background: rgba(255, 255, 255, 0.04);
-      color: var(--text-main);
+    /* Chapters */
+    .chapter { display: none; min-width: 0; }
+    .chapter.active { display: block; }
+    .chapter-tag { font-family: var(--mono); font-size: 13px; color: var(--muted); margin-bottom: 6px; }
+    .chapter h2 { font-family: var(--display); font-weight: 500; font-size: clamp(27px, 4vw, 38px); line-height: 1.15; letter-spacing: -0.01em; color: var(--heading); margin-bottom: 14px; text-wrap: balance; }
+    .chapter h3 { font-family: var(--display); font-weight: 500; font-size: 21px; line-height: 1.25; color: var(--heading); margin: 34px 0 8px; }
+    .chapter p, .chapter > ul, .chapter > ol { max-width: 74ch; margin-bottom: 14px; }
+    .lede { font-size: 19px; color: var(--muted); }
+    .chapter > ul, .chapter > ol { padding-left: 1.3em; }
+    .chapter li { margin-bottom: 6px; }
+    .chapter li::marker { color: var(--muted); }
+
+    .note { max-width: 74ch; border-left: 3px solid var(--accent); background: var(--accent-tint); border-radius: 0 var(--radius) var(--radius) 0; padding: 12px 16px; margin: 20px 0; font-size: 16px; }
+    .note p { margin: 0; }
+    .note h4 { font-family: var(--display); font-weight: 500; font-size: 16px; color: var(--heading); margin-bottom: 3px; }
+    .note.warn { border-color: var(--warn); background: var(--warn-tint); }
+    .note.warn h4 { color: var(--warn); }
+    .note.proved { border-color: var(--check); }
+
+    /* Tables */
+    .table-wrap { overflow-x: auto; margin: 16px 0 22px; border: 1px solid var(--line); border-radius: var(--radius); background: var(--surface); }
+    table { border-collapse: collapse; width: 100%; font-size: 15.5px; line-height: 1.45; }
+    th { text-align: left; font-family: var(--display); font-weight: 500; color: var(--heading); background: var(--band); }
+    th, td { padding: 8px 14px; border-bottom: 1px solid var(--line); vertical-align: top; }
+    tr:last-child td { border-bottom: 0; }
+
+    /* Code viewer. Code and terminal panels share one dark tile. */
+    .viewer { background: var(--code-bg); border-radius: var(--radius-lg); overflow: hidden; margin: 20px 0 24px; color: var(--code-text); }
+    .viewer-bar { display: flex; align-items: center; justify-content: space-between; gap: 12px; background: var(--code-bar); padding: 6px 8px 6px 8px; }
+    .tabs { display: flex; gap: 2px; overflow-x: auto; scrollbar-width: none; min-width: 0; }
+    .tabs::-webkit-scrollbar { display: none; }
+    .tab { flex: none; background: none; border: 0; border-radius: 7px; padding: 6px 11px; font-family: var(--mono); font-size: 13px; color: var(--code-dim); cursor: pointer; white-space: nowrap; }
+    .tab:hover { color: var(--code-text); }
+    .tab.active { background: var(--code-bg); color: var(--code-kw); }
+    .tab[data-kind="fail"].active { color: var(--code-error); }
+    .tab[data-kind="pass"].active { color: var(--code-contract); }
+    .copy { flex: none; background: none; border: 1px solid var(--code-line); border-radius: 7px; padding: 4px 10px; font-family: var(--mono); font-size: 12px; color: var(--code-dim); cursor: pointer; }
+    .copy:hover { color: var(--code-text); }
+    .viewer :focus-visible { outline-color: var(--code-contract); }
+    .panel { display: none; }
+    .panel.active { display: block; }
+    .panel pre { padding: 16px 20px; overflow: auto; max-height: 560px; font-family: var(--mono); font-size: 13.5px; line-height: 1.6; tab-size: 2; font-variant-ligatures: none; }
+    .source { padding: 0 20px 12px; font-size: 13px; color: var(--code-dim); font-family: var(--mono); }
+    .source a { color: var(--code-dim); }
+
+    .t-kw { color: var(--code-kw); }
+    .t-contract { color: var(--code-contract); }
+    .t-type { color: var(--code-type); font-weight: 500; }
+    .t-lit { color: var(--code-lit); }
+    .t-comment { color: var(--code-dim); font-style: italic; }
+    .t-prompt { color: var(--code-kw); }
+    .t-ok { color: var(--code-contract); }
+    .t-err { color: var(--code-error); }
+    .t-dim { color: var(--code-dim); }
+
+    /* Backends */
+    .cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(230px, 1fr)); gap: 14px; margin: 20px 0; }
+    .card { background: var(--surface); border: 1px solid var(--line); border-radius: var(--radius); padding: 14px 16px; }
+    .card h4 { font-family: var(--display); font-weight: 500; font-size: 17px; color: var(--heading); }
+    .card .role { font-family: var(--mono); font-size: 12.5px; color: var(--muted); margin-bottom: 6px; }
+    .card p { font-size: 15px; line-height: 1.5; margin: 0 0 8px; }
+    .status { display: inline-flex; align-items: center; gap: 6px; font-size: 13.5px; font-weight: 500; }
+    .status svg { width: 15px; height: 12px; flex: none; }
+    .status.yes { color: var(--verified-text); }
+    .status.no { color: var(--warn); }
+
+    .pager { display: flex; justify-content: space-between; gap: 12px; margin-top: 44px; padding-top: 20px; border-top: 1px solid var(--line); }
+    .pager button { background: none; border: 1px solid var(--line); border-radius: 8px; padding: 9px 14px; font: inherit; font-size: 15px; font-weight: 500; color: var(--accent); cursor: pointer; text-align: left; }
+    .pager button:hover { border-color: var(--accent); background: var(--accent-tint); }
+    .pager .next { margin-left: auto; text-align: right; }
+
+    .site-footer { border-top: 1px solid var(--line); background: var(--band); padding: 22px 24px; color: var(--muted); font-size: 15px; }
+    .site-footer p { max-width: 1320px; margin: 0 auto; }
+
+    @media (max-width: 1000px) {
+      .tour { grid-template-columns: minmax(0, 1fr); gap: 24px; padding-top: 24px; }
+      .sidebar { position: static; max-height: none; overflow: visible; }
+      .steps { display: flex; flex-wrap: wrap; gap: 4px; }
+      .step-btn { width: auto; padding: 5px 9px; font-size: 14px; }
+      .part { margin: 12px 0 4px 2px; }
+      .facts dl { grid-template-columns: repeat(2, 1fr); }
     }
-
-    .step-btn.active {
-      background: rgba(34, 211, 238, 0.1);
-      border-color: rgba(34, 211, 238, 0.3);
-      color: var(--accent-cyan);
-      font-weight: 600;
+    @media (max-width: 560px) {
+      body { font-size: 16px; }
+      .site-header { padding: 8px 16px; }
+      .brand .wordmark, .version { display: none; }
+      .hero { padding: 40px 16px 36px; }
+      .facts { padding: 22px 16px; }
+      .facts dt { font-size: 23px; }
+      .tour { padding: 20px 16px 56px; }
+      .panel pre { padding: 14px; font-size: 12.5px; }
+      .source { padding: 0 14px 10px; }
+      .viewer { border-radius: var(--radius); }
     }
-
-    .step-number {
-      width: 22px;
-      height: 22px;
-      border-radius: 50%;
-      background: rgba(255, 255, 255, 0.06);
-      color: var(--text-dim);
-      font-family: 'JetBrains Mono', monospace;
-      font-size: 0.75rem;
-      display: flex;
-      align-items: center;
-      justify-content: center;
-      font-weight: 700;
-    }
-
-    .step-btn.active .step-number {
-      background: var(--accent-cyan);
-      color: #070a11;
-    }
-
-    /* Content Area */
-    .tour-content {
-      display: flex;
-      flex-direction: column;
-      gap: 2rem;
-    }
-
-    .chapter-card {
-      display: none;
-      background: var(--bg-card);
-      backdrop-filter: blur(12px);
-      border: 1px solid var(--border-subtle);
-      border-radius: var(--radius-lg);
-      padding: 2.25rem;
-      box-shadow: var(--shadow-glass);
-      animation: fadeIn 0.35s ease;
-    }
-
-    .chapter-card.active {
-      display: block;
-    }
-
-    @keyframes fadeIn {
-      from { opacity: 0; transform: translateY(8px); }
-      to { opacity: 1; transform: translateY(0); }
-    }
-
-    .chapter-header {
-      margin-bottom: 1.5rem;
-      border-bottom: 1px solid var(--border-subtle);
-      padding-bottom: 1.25rem;
-    }
-
-    .chapter-tag {
-      font-family: 'JetBrains Mono', monospace;
-      font-size: 0.8rem;
-      font-weight: 600;
-      color: var(--accent-cyan);
-      margin-bottom: 0.35rem;
-    }
-
-    .chapter-title {
-      font-family: 'Outfit', sans-serif;
-      font-size: 2rem;
-      font-weight: 700;
-      letter-spacing: -0.02em;
-      color: #ffffff;
-      margin-bottom: 0.5rem;
-    }
-
-    .chapter-desc {
-      color: var(--text-muted);
-      font-size: 1.05rem;
-      line-height: 1.65;
-    }
-
-    /* Concept & Design Callouts */
-    .callout {
-      border-radius: var(--radius-md);
-      padding: 1.15rem 1.35rem;
-      margin: 1.25rem 0;
-      display: flex;
-      gap: 1rem;
-      font-size: 0.95rem;
-      line-height: 1.6;
-    }
-
-    .callout-eiffel {
-      background: rgba(99, 102, 241, 0.08);
-      border: 1px solid rgba(99, 102, 241, 0.25);
-      border-left: 4px solid var(--accent-indigo);
-    }
-
-    .callout-smt {
-      background: rgba(34, 211, 238, 0.08);
-      border: 1px solid rgba(34, 211, 238, 0.25);
-      border-left: 4px solid var(--accent-cyan);
-    }
-
-    .callout-warn {
-      background: rgba(251, 191, 36, 0.08);
-      border: 1px solid rgba(251, 191, 36, 0.25);
-      border-left: 4px solid var(--accent-amber);
-    }
-
-    .callout-icon {
-      font-size: 1.4rem;
-      flex-shrink: 0;
-      line-height: 1;
-    }
-
-    .callout-text h4 {
-      font-family: 'Outfit', sans-serif;
-      font-size: 1rem;
-      font-weight: 600;
-      color: #fff;
-      margin-bottom: 0.25rem;
-    }
-
-    /* Code Viewer with Tabs */
-    .code-viewer {
-      background: var(--code-bg);
-      border: 1px solid var(--border-subtle);
-      border-radius: var(--radius-md);
-      overflow: hidden;
-      margin: 1.5rem 0;
-      box-shadow: 0 4px 20px rgba(0, 0, 0, 0.4);
-    }
-
-    .viewer-header {
-      background: rgba(255, 255, 255, 0.02);
-      border-bottom: 1px solid var(--border-subtle);
-      padding: 0.5rem 0.85rem;
-      display: flex;
-      align-items: center;
-      justify-content: space-between;
-      gap: 1rem;
-    }
-
-    .tab-list {
-      display: flex;
-      gap: 0.35rem;
-      overflow-x: auto;
-    }
-
-    .tab-btn {
-      background: transparent;
-      border: none;
-      padding: 0.45rem 0.85rem;
-      border-radius: var(--radius-sm);
-      color: var(--text-muted);
-      cursor: pointer;
-      font-family: 'JetBrains Mono', monospace;
-      font-size: 0.82rem;
-      font-weight: 500;
-      display: flex;
-      align-items: center;
-      gap: 0.4rem;
-      transition: all 0.15s ease;
-    }
-
-    .tab-btn:hover {
-      color: var(--text-main);
-      background: rgba(255, 255, 255, 0.05);
-    }
-
-    .tab-btn.active {
-      background: rgba(34, 211, 238, 0.15);
-      color: var(--accent-cyan);
-      font-weight: 600;
-    }
-
-    .copy-btn {
-      background: rgba(255, 255, 255, 0.05);
-      border: 1px solid var(--border-subtle);
-      border-radius: var(--radius-sm);
-      color: var(--text-muted);
-      font-size: 0.75rem;
-      font-family: 'JetBrains Mono', monospace;
-      padding: 0.35rem 0.65rem;
-      cursor: pointer;
-      transition: all 0.2s ease;
-    }
-
-    .copy-btn:hover {
-      color: #fff;
-      border-color: rgba(255, 255, 255, 0.2);
-    }
-
-    .tab-content {
-      display: none;
-      padding: 1.25rem 1.5rem;
-      overflow-x: auto;
-      max-height: 520px;
-    }
-
-    .tab-content.active {
-      display: block;
-    }
-
-    pre code {
-      font-family: 'JetBrains Mono', monospace;
-      font-size: 0.88rem;
-      line-height: 1.65;
-      color: #cbd5e1;
-      white-space: pre;
-    }
-
-    /* Syntax Highlighting */
-    .kw { color: var(--code-kw); font-weight: 600; }
-    .type { color: var(--code-type); font-weight: 600; }
-    .contract { color: var(--code-contract); font-weight: 600; }
-    .str { color: var(--code-string); }
-    .num { color: var(--code-num); }
-    .comment { color: var(--code-comment); font-style: italic; }
-    .fn { color: var(--code-fn); }
-
-    /* Interactive Live Simulation Panel */
-    .sim-panel {
-      background: rgba(10, 15, 26, 0.8);
-      border: 1px solid rgba(34, 211, 238, 0.25);
-      border-radius: var(--radius-md);
-      padding: 1.25rem 1.5rem;
-      margin: 1.5rem 0;
-    }
-
-    .sim-header {
-      display: flex;
-      align-items: center;
-      justify-content: space-between;
-      margin-bottom: 1rem;
-      gap: 1rem;
-    }
-
-    .sim-title {
-      font-family: 'Outfit', sans-serif;
-      font-size: 1.05rem;
-      font-weight: 600;
-      color: #fff;
-      display: flex;
-      align-items: center;
-      gap: 0.5rem;
-    }
-
-    .sim-actions {
-      display: flex;
-      gap: 0.5rem;
-    }
-
-    .btn-run {
-      background: linear-gradient(135deg, #0284c7, #06b6d4);
-      color: #fff;
-      border: none;
-      padding: 0.45rem 1rem;
-      border-radius: var(--radius-sm);
-      font-family: 'JetBrains Mono', monospace;
-      font-size: 0.82rem;
-      font-weight: 600;
-      cursor: pointer;
-      display: flex;
-      align-items: center;
-      gap: 0.4rem;
-      transition: all 0.2s ease;
-      box-shadow: 0 0 15px rgba(6, 182, 212, 0.3);
-    }
-
-    .btn-run:hover {
-      transform: translateY(-1px);
-      box-shadow: 0 0 22px rgba(6, 182, 212, 0.5);
-    }
-
-    .btn-secondary {
-      background: rgba(255, 255, 255, 0.05);
-      color: var(--text-muted);
-      border: 1px solid var(--border-subtle);
-      padding: 0.45rem 0.85rem;
-      border-radius: var(--radius-sm);
-      font-family: 'JetBrains Mono', monospace;
-      font-size: 0.82rem;
-      cursor: pointer;
-      transition: all 0.2s ease;
-    }
-
-    .btn-secondary:hover {
-      color: #fff;
-      border-color: rgba(255, 255, 255, 0.2);
-    }
-
-    .terminal-output {
-      background: #04070d;
-      border: 1px solid rgba(255, 255, 255, 0.06);
-      border-radius: var(--radius-sm);
-      padding: 1rem 1.25rem;
-      font-family: 'JetBrains Mono', monospace;
-      font-size: 0.84rem;
-      line-height: 1.55;
-      color: #e2e8f0;
-      min-height: 110px;
-      max-height: 280px;
-      overflow-y: auto;
-      white-space: pre-wrap;
-    }
-
-    .terminal-prompt {
-      color: var(--accent-cyan);
-    }
-
-    .terminal-success {
-      color: var(--accent-emerald);
-      font-weight: 600;
-    }
-
-    .terminal-error {
-      color: var(--accent-rose);
-      font-weight: 600;
-    }
-
-    .terminal-info {
-      color: var(--accent-indigo);
-    }
-
-    /* Chapter Footer Navigation */
-    .chapter-nav-footer {
-      display: flex;
-      justify-content: space-between;
-      margin-top: 2.5rem;
-      padding-top: 1.5rem;
-      border-top: 1px solid var(--border-subtle);
-    }
-
-    .nav-nav-btn {
-      background: var(--bg-surface-elevated);
-      border: 1px solid var(--border-subtle);
-      color: var(--text-main);
-      padding: 0.65rem 1.25rem;
-      border-radius: var(--radius-sm);
-      cursor: pointer;
-      font-family: inherit;
-      font-size: 0.92rem;
-      font-weight: 600;
-      display: flex;
-      align-items: center;
-      gap: 0.5rem;
-      transition: all 0.2s ease;
-    }
-
-    .nav-nav-btn:hover {
-      border-color: var(--accent-cyan);
-      color: var(--accent-cyan);
-      transform: translateY(-1px);
-    }
-
-    /* Grid for Target Outputs */
-    .target-grid {
-      display: grid;
-      grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
-      gap: 1rem;
-      margin: 1.5rem 0;
-    }
-
-    .target-card {
-      background: var(--bg-surface);
-      border: 1px solid var(--border-subtle);
-      border-radius: var(--radius-md);
-      padding: 1.25rem;
-      transition: all 0.2s ease;
-    }
-
-    .target-card:hover {
-      border-color: rgba(34, 211, 238, 0.4);
-      transform: translateY(-2px);
-    }
-
-    .target-card-header {
-      display: flex;
-      align-items: center;
-      gap: 0.5rem;
-      margin-bottom: 0.5rem;
-    }
-
-    .target-badge {
-      font-family: 'JetBrains Mono', monospace;
-      font-size: 0.72rem;
-      font-weight: 700;
-      padding: 0.15rem 0.5rem;
-      border-radius: 4px;
-      text-transform: uppercase;
-    }
-
-    .badge-bpl { background: rgba(34, 211, 238, 0.15); color: var(--accent-cyan); }
-    .badge-dfy { background: rgba(129, 140, 248, 0.15); color: var(--accent-indigo); }
-    .badge-bend { background: rgba(244, 114, 182, 0.15); color: #f472b6; }
-    .badge-c11 { background: rgba(52, 211, 153, 0.15); color: var(--accent-emerald); }
-
-    .target-name {
-      font-family: 'Outfit', sans-serif;
-      font-size: 1.05rem;
-      font-weight: 600;
-      color: #fff;
-    }
-
-    .target-desc {
-      font-size: 0.85rem;
-      color: var(--text-muted);
-      line-height: 1.5;
-    }
-
-    /* Responsive */
-    @media (max-width: 960px) {
-      .tour-container {
-        grid-template-columns: 1fr;
-      }
-      .tour-sidebar {
-        position: static;
-        margin-bottom: 1.5rem;
-      }
-      .hero h1 {
-        font-size: 2.3rem;
-      }
+    @media print {
+      .sidebar, .site-header, .pager, .copy { display: none; }
+      .chapter { display: block; break-before: page; }
+      .tour { display: block; }
     }
   </style>
+  <noscript><style>.chapter, .panel { display: block; } .pager, .copy, .sidebar { display: none; } .tour { grid-template-columns: minmax(0, 1fr); }</style></noscript>
 </head>
 <body>
 
-  <!-- Top Sticky Navigation -->
-  <header>
-    <div class="nav-container">
-      <a href="#" class="brand">
-        <div class="brand-logo">G</div>
-        <div class="brand-title">Gardel</div>
+  <svg width="0" height="0" style="position:absolute" aria-hidden="true">
+    <symbol id="fedora-large" viewBox="0 30 400 170" fill="none" stroke-linecap="round" stroke-linejoin="round">
+      <path d="M124 104 C 128 80, 142 62, 168 58 C 184 56, 194 66, 208 66 C 222 66, 232 56, 248 60 C 270 66, 280 84, 284 104" stroke="var(--hat)" stroke-width="12"/>
+      <path d="M118 124 C 170 136, 216 136, 256 128" stroke="var(--hat)" stroke-width="16"/>
+      <path d="M268 124 L282 138 L306 112" stroke="var(--hat-check)" stroke-width="12"/>
+      <path d="M40 154 C 90 172, 160 174, 220 164 C 280 154, 330 150, 376 124" stroke="var(--hat)" stroke-width="12"/>
+    </symbol>
+    <symbol id="fedora-small" viewBox="0 30 400 170" fill="none" stroke-linecap="round" stroke-linejoin="round">
+      <path d="M124 104 C 128 80, 142 62, 168 58 C 184 56, 194 66, 208 66 C 222 66, 232 56, 248 60 C 270 66, 280 84, 284 104" stroke="var(--hat)" stroke-width="16"/>
+      <path d="M118 124 C 170 136, 216 136, 256 128" stroke="var(--hat)" stroke-width="20"/>
+      <path d="M268 124 L282 138 L306 112" stroke="var(--hat-check)" stroke-width="16"/>
+      <path d="M40 154 C 90 172, 160 174, 220 164 C 280 154, 330 150, 376 124" stroke="var(--hat)" stroke-width="16"/>
+    </symbol>
+    <symbol id="check" viewBox="264 108 46 34" fill="none" stroke="currentColor" stroke-width="9" stroke-linecap="round" stroke-linejoin="round">
+      <path d="M268 124 L282 138 L306 112"/>
+    </symbol>
+  </svg>
+
+  <header class="site-header">
+    <div class="nav">
+      <a href="#chapter-1" class="brand" aria-label="Gardel tour, first chapter">
+        <svg aria-hidden="true"><use href="#fedora-small"/></svg>
+        <span class="wordmark">gardel</span>
       </a>
-      <div class="nav-badges">
-        <a href="../guide/GUIDE.md" class="badge" style="text-decoration: none; color: var(--accent-cyan); border-color: rgba(34, 211, 238, 0.4); background: rgba(34, 211, 238, 0.08);">📖 Guide.md</a>
-        <div class="badge badge-verified">Phase 2 Soundness Verified</div>
-        <div class="badge">Eiffel Inspired</div>
-        <div class="badge">Boogie & Z3 Formal SMT</div>
-      </div>
+      <nav class="nav-links" aria-label="Project documents">
+        <span class="version">spec v0.5</span>
+        <a href="../guide/GUIDE.md">Guide</a>
+        <a href="../spec/gardel_language_specification_draft_v0_5.md">Spec</a>
+      </nav>
     </div>
   </header>
 
-  <!-- Hero Intro -->
   <section class="hero">
-    <div class="hero-tag">Guided Language Tour & Live Showcase</div>
-    <h1>Total Purity Meets <span class="gradient-text">Design by Contract</span></h1>
-    <p>
-      Discover what is possible in Gardel today: an LLM-targeted, total functional language with Eiffel-grade Design by Contract, compile-time SMT proof obligations via Boogie and Z3, and multi-target compilation to Dafny, Bend v2, and portable C11 with OpenMP.
-    </p>
-
-    <div class="features-pill-row">
-      <div class="feat-pill"><span class="icon">🛡️</span> Eiffel Design by Contract</div>
-      <div class="feat-pill"><span class="icon">⚡</span> Real SMT Proofs (Boogie + Z3)</div>
-      <div class="feat-pill"><span class="icon">🔍</span> AI Counterexample Diagnostics</div>
-      <div class="feat-pill"><span class="icon">🚀</span> Massive Parallelism (Bend v2)</div>
-      <div class="feat-pill"><span class="icon">⚙️</span> Native Zero-Overhead C11</div>
-    </div>
+    <svg role="img" aria-label="Gardel logo: a gardeliano trilby with an emerald check where the bow sits"><use href="#fedora-large"/></svg>
+    <span class="wordmark">gardel</span>
+    <h1>State what a routine must do. Prove it. Ship the C.</h1>
+    <p>Gardel is a pure, total language for people and AI agents, built on Tony Hoare's axiomatic semantics. Every routine is a triple {P} C {Q} that Boogie and Z3 prove at compile time. The proof is then erased, so it costs nothing at run time.</p>
   </section>
 
-  <!-- Main Tour Layout -->
-  <main class="tour-container">
-    
-    <!-- Sidebar Stepper -->
-    <aside class="tour-sidebar">
-      <div class="sidebar-title">Guided Tour Chapters</div>
-      <ul class="stepper-nav" id="stepperNav">
-        <li>
-          <button class="step-btn active" data-step="1">
-            <span class="step-number">1</span>
-            <span>Eiffel Heritage & Contracts</span>
-          </button>
-        </li>
-        <li>
-          <button class="step-btn" data-step="2">
-            <span class="step-number">2</span>
-            <span>Inductive ADTs & Opaque Fuel</span>
-          </button>
-        </li>
-        <li>
-          <button class="step-btn" data-step="3">
-            <span class="step-number">3</span>
-            <span>SMT Proofs & AI Diagnostics</span>
-          </button>
-        </li>
-        <li>
-          <button class="step-btn" data-step="4">
-            <span class="step-number">4</span>
-            <span>Concepts, Laws & Ord</span>
-          </button>
-        </li>
-        <li>
-          <button class="step-btn" data-step="5">
-            <span class="step-number">5</span>
-            <span>Linear IO Monad & Purity</span>
-          </button>
-        </li>
-        <li>
-          <button class="step-btn" data-step="6">
-            <span class="step-number">6</span>
-            <span>Multi-Target Code Generation</span>
-          </button>
-        </li>
-        <li>
-          <button class="step-btn" data-step="7">
-            <span class="step-number">7</span>
-            <span>CLI Explorer & Playground</span>
-          </button>
-        </li>
+  <section class="facts" aria-label="Project status">
+    <dl>
+      <div><dt>156</dt><dd>compiler tests passing</dd></div>
+      <div><dt>18 files</dt><dd>of standard library verified under <code>--strict</code></dd></div>
+      <div><dt>Reactive</dt><dd>servers and games, with record and replay</dd></div>
+      <div><dt>C11</dt><dd>runs natively, with automatic fork-join parallelism</dd></div>
+    </dl>
+  </section>
+
+  <main class="tour">
+    <aside class="sidebar" aria-label="Chapters">
+      <div class="part">Proofs</div>
+      <ul class="steps">
+        <li><button class="step-btn active" data-step="1" aria-current="true"><span class="n">01</span><span>Hoare triples</span></button></li>
+        <li><button class="step-btn" data-step="2"><span class="n">02</span><span>Numbers</span></button></li>
+        <li><button class="step-btn" data-step="3"><span class="n">03</span><span>Recursion</span></button></li>
+        <li><button class="step-btn" data-step="4"><span class="n">04</span><span>Concepts and equality</span></button></li>
+      </ul>
+      <div class="part">Effects</div>
+      <ul class="steps">
+        <li><button class="step-btn" data-step="5"><span class="n">05</span><span>Errors and text</span></button></li>
+        <li><button class="step-btn" data-step="6"><span class="n">06</span><span>Effects</span></button></li>
+        <li><button class="step-btn" data-step="7"><span class="n">07</span><span>Reactive programs</span></button></li>
+        <li><button class="step-btn" data-step="8"><span class="n">08</span><span>Record and replay</span></button></li>
+      </ul>
+      <div class="part">Building</div>
+      <ul class="steps">
+        <li><button class="step-btn" data-step="9"><span class="n">09</span><span>Backends</span></button></li>
+        <li><button class="step-btn" data-step="10"><span class="n">10</span><span>Projects and the prelude</span></button></li>
+        <li><button class="step-btn" data-step="11"><span class="n">11</span><span>Command line</span></button></li>
       </ul>
     </aside>
 
-    <!-- Content Sections -->
-    <div class="tour-content">
+    <div class="content" id="content">
 
-      <!-- ======================================================== -->
-      <!-- CHAPTER 1: EIFFEL HERITAGE & CONTRACTS -->
-      <!-- ======================================================== -->
-      <section class="chapter-card active" id="chapter-1">
-        <div class="chapter-header">
-          <div class="chapter-tag">Chapter 01 // Foundations</div>
-          <h2 class="chapter-title">The Eiffel Heritage: Pure Design by Contract</h2>
-          <p class="chapter-desc">
-            Gardel embraces Bertrand Meyer's Design by Contract principles: routines state preconditions with <code>require</code>, postconditions with <code>ensure</code>, and module invariants with <code>invariant</code>. In Gardel, contracts are not runtime assertions—they are <strong>statically proven refinement types</strong> that are verified at compile-time and erased for zero-cost execution.
-          </p>
-        </div>
+<section class="chapter active" id="chapter-1">
+<div class="chapter-tag">Chapter 01 / Foundations</div>
+<h2>Every routine is a Hoare triple</h2>
+<p class="lede">Gardel's core is Tony Hoare's axiomatic semantics. The meaning of a program is what can be proved about it, stated as a triple {P} C {Q}: if P holds before C runs, then Q holds after it.</p>
+<p>Each part of a routine is a part of that triple. The precondition and postcondition together are its <em>contract</em>.</p>
+<div class="table-wrap"><table>
+  <thead><tr><th>Axiomatic semantics</th><th>In Gardel</th><th>Proved by</th></tr></thead>
+  <tbody>
+    <tr><td>Precondition {P}</td><td><code>require</code></td><td>Every caller, at the call site</td></tr>
+    <tr><td>Command C</td><td><code>do</code></td><td>Not applicable: this is the code being verified</td></tr>
+    <tr><td>Postcondition {Q}</td><td><code>ensure</code></td><td>The routine, assuming P</td></tr>
+    <tr><td>Data invariant</td><td><code>invariant</code></td><td>Every routine that builds a value of the type</td></tr>
+    <tr><td>Termination, for total correctness</td><td><code>variant</code></td><td>Every recursive routine</td></tr>
+  </tbody>
+</table></div>
+<p>Boogie turns each triple into verification conditions and Z3 discharges them. A triple that cannot be proved stops the build, and once proved it is erased.</p>
+<div class="note">
+  <h4>Where the keywords come from</h4>
+  <p>Eiffel's Design by Contract is one implementation of these ideas in a programming language, and Gardel borrows its readable syntax: <code>require</code>, <code>ensure</code>, <code>invariant</code>, <code>Current</code> and <code>Result</code>. The foundation is Hoare logic, not Eiffel. Eiffel usually monitors assertions at run time, while Gardel treats them as theorems to prove.</p>
+</div>
+<div class="viewer">
+  <div class="viewer-bar">
+    <div class="tabs" role="tablist"><button class="tab active" role="tab" aria-selected="true" data-panel="panel-1">bounded_stack.gdl</button><button class="tab" role="tab" aria-selected="false" data-panel="panel-2">--inspect</button><button class="tab" role="tab" aria-selected="false" data-panel="panel-3">Emitted Boogie</button><button class="tab" role="tab" aria-selected="false" data-panel="panel-4">Emitted C11</button></div>
+    <button class="copy" type="button">Copy</button>
+  </div>
+  <div class="panel active" id="panel-1" role="tabpanel"><pre tabindex="0"><code data-lang="gdl" data-source="examples/bounded_stack.gdl">module BOUNDED_STACK[A]
 
-        <div class="callout callout-eiffel">
-          <div class="callout-icon">🏛️</div>
-          <div class="callout-text">
-            <h4>Eiffel Design by Contract Reimagined</h4>
-            Gardel adopts Eiffel's crystal-clear vocabulary: <code>module</code>, <code>feature</code>, <code>specify</code>, <code>create</code>, <code>Current</code>, and <code>Result</code>. Unlike traditional languages that bolt contracts on as runtime assertions, Gardel's compiler verifies all preconditions, postconditions, and invariants before emitting code.
-          </div>
-        </div>
+representation {NONE}
+  items: LIST[A]
+  size: NAT
+  limit: NAT
 
-        <!-- Code Viewer -->
-        <div class="code-viewer">
-          <div class="viewer-header">
-            <div class="tab-list">
-              <button class="tab-btn active" data-tab="ch1-gdl">bounded_stack.gdl</button>
-              <button class="tab-btn" data-tab="ch1-inspect">--inspect Contract View</button>
-              <button class="tab-btn" data-tab="ch1-bpl">Emitted Boogie (.bpl)</button>
-              <button class="tab-btn" data-tab="ch1-c">Emitted C11 (.c)</button>
-            </div>
-            <button class="copy-btn" onclick="copyActiveCode(this)">Copy</button>
-          </div>
+create {ANY}
 
-          <div class="tab-content active" id="ch1-gdl">
-            <pre><code><span class="kw">module</span> <span class="type">BOUNDED_STACK</span>[<span class="type">A</span>]
+  make(cap: NAT): BOUNDED_STACK[A]
+    require
+      positive_capacity: cap &gt; 0
+    do
+      { items = LIST.empty, size = 0, limit = cap }
+    ensure
+      is_empty: Result.count = 0
+      capacity_set: Result.capacity = cap
+    end
 
-<span class="kw">representation</span> {<span class="kw">NONE</span>}
-  items: <span class="type">LIST</span>[<span class="type">A</span>]
-  size: <span class="type">NAT</span>
-  limit: <span class="type">NAT</span>
+feature {ANY}
 
-<span class="kw">create</span> {<span class="kw">ANY</span>}
-  make(cap: <span class="type">NAT</span>): <span class="type">BOUNDED_STACK</span>[<span class="type">A</span>]
-    <span class="contract">require</span>
-      positive_capacity: cap &gt; <span class="num">0</span>
-    <span class="kw">do</span>
-      { items = <span class="type">LIST</span>.empty, size = <span class="num">0</span>, limit = cap }
-    <span class="contract">ensure</span>
-      is_empty: <span class="kw">Result</span>.count = <span class="num">0</span>
-      capacity_set: <span class="kw">Result</span>.capacity = cap
-    <span class="kw">end</span>
+  count: NAT
+    do
+      Current.size
+    end
 
-<span class="kw">feature</span> {<span class="kw">ANY</span>}
-  count: <span class="type">NAT</span> <span class="kw">do</span> <span class="kw">Current</span>.size <span class="kw">end</span>
-  capacity: <span class="type">NAT</span> <span class="kw">do</span> <span class="kw">Current</span>.limit <span class="kw">end</span>
+  capacity: NAT
+    do
+      Current.limit
+    end
 
-  push(x: <span class="type">A</span>): <span class="type">BOUNDED_STACK</span>[<span class="type">A</span>]
-    <span class="contract">require</span>
-      not_full: <span class="kw">Current</span>.count &lt; <span class="kw">Current</span>.capacity
-    <span class="kw">do</span>
-      { items = <span class="kw">Current</span>.items.prepend(x),
-        size = <span class="kw">Current</span>.size + <span class="num">1</span>,
-        limit = <span class="kw">Current</span>.limit }
-    <span class="contract">ensure</span>
-      count_incremented: <span class="kw">Result</span>.count = <span class="kw">Current</span>.count + <span class="num">1</span>
-      capacity_unchanged: <span class="kw">Result</span>.capacity = <span class="kw">Current</span>.capacity
-    <span class="kw">end</span>
+  push(x: A): BOUNDED_STACK[A]
+    require
+      not_full: Current.count &lt; Current.capacity
+    do
+      { items = Current.items.prepend(x),
+        size = Current.size + 1,
+        limit = Current.limit }
+    ensure
+      count_incremented: Result.count = Current.count + 1
+      capacity_unchanged: Result.capacity = Current.capacity
+    end
 
-<span class="contract">invariant</span>
-  positive_capacity: limit &gt; <span class="num">0</span>
+  pop: TUPLE[A, BOUNDED_STACK[A]]
+    require
+      not_empty: Current.count &gt; 0
+    do
+      ( Current.items.head,
+        { items = Current.items.tail,
+          size = Current.size - 1,
+          limit = Current.limit } )
+    ensure
+      count_decremented: Result.second.count = Current.count - 1
+    end
+
+invariant
+  positive_capacity: limit &gt; 0
   size_matches: size = items.length
   within_bounds: size &lt;= limit
-<span class="kw">end</span></code></pre>
-          </div>
 
-          <div class="tab-content" id="ch1-inspect">
-            <pre><code><span class="comment">// The compiler generates this formal specification interface via `cargo run -- ... --inspect`</span>
-<span class="kw">module</span> <span class="type">BOUNDED_STACK</span>[<span class="type">A</span>]
-  <span class="kw">representation</span> {<span class="kw">NONE</span>} <span class="comment">-- opaque ADT layout</span>
-  <span class="kw">create</span>
-    Any make(cap: <span class="type">NAT</span>): <span class="type">BOUNDED_STACK</span>[<span class="type">A</span>]
-      <span class="contract">require</span> positive_capacity: (cap &gt; <span class="num">0</span>)
-      <span class="contract">ensure</span>  is_empty: (<span class="kw">Result</span>.count = <span class="num">0</span>)
-      <span class="contract">ensure</span>  capacity_set: (<span class="kw">Result</span>.capacity = cap)
-  <span class="kw">feature</span>
-    Any count: <span class="type">NAT</span>
-    Any capacity: <span class="type">NAT</span>
-    Any push(x: <span class="type">A</span>): <span class="type">BOUNDED_STACK</span>[<span class="type">A</span>]
-      <span class="contract">require</span> not_full: (<span class="kw">Current</span>.count &lt; <span class="kw">Current</span>.capacity)
-      <span class="contract">ensure</span>  count_incremented: (<span class="kw">Result</span>.count = (<span class="kw">Current</span>.count + <span class="num">1</span>))
-      <span class="contract">ensure</span>  capacity_unchanged: (<span class="kw">Result</span>.capacity = <span class="kw">Current</span>.capacity)
-  <span class="contract">invariant</span>
-    positive_capacity: (limit &gt; <span class="num">0</span>)
+end</code></pre><div class="source"><a href="../examples/bounded_stack.gdl">examples/bounded_stack.gdl</a></div></div>
+  <div class="panel" id="panel-2" role="tabpanel"><pre tabindex="0"><code data-lang="term">$ gardelc examples/bounded_stack.gdl --inspect
+module BOUNDED_STACK[A]
+  representation {NONE} -- opaque ADT layout
+  create
+    Any make(cap: NAT): BOUNDED_STACK[A]
+      require positive_capacity: (cap &gt; 0)
+      ensure  is_empty: (Result.count = 0)
+      ensure  capacity_set: (Result.capacity = cap)
+  feature
+    Any count: NAT
+    Any capacity: NAT
+    Any push(x: A): BOUNDED_STACK[A]
+      require not_full: (Current.count &lt; Current.capacity)
+      ensure  count_incremented: (Result.count = (Current.count + 1))
+      ensure  capacity_unchanged: (Result.capacity = Current.capacity)
+    Any pop: TUPLE[A, BOUNDED_STACK[A]]
+      require not_empty: (Current.count &gt; 0)
+      ensure  count_decremented: (Result.second.count = (Current.count - 1))
+  invariant
+    positive_capacity: (limit &gt; 0)
     size_matches: (size = items.length)
     within_bounds: (size &lt;= limit)
-<span class="kw">end</span></code></pre>
-          </div>
-
-          <div class="tab-content" id="ch1-bpl">
-            <pre><code><span class="comment">// Generated Boogie procedure for formal SMT verification</span>
-<span class="kw">procedure</span> <span class="fn">Verify_push</span>&lt;<span class="type">A</span>&gt;(<span class="kw">Current</span>: (<span class="type">BOUNDED_STACK</span> <span class="type">A</span>), x: <span class="type">A</span>) <span class="kw">returns</span> (<span class="kw">Result</span>: (<span class="type">BOUNDED_STACK</span> <span class="type">A</span>))
-  <span class="contract">requires</span> <span class="fn">BOUNDED_STACK_Invariant</span>(<span class="kw">Current</span>);
-  <span class="contract">requires</span> (fn_count(DefaultFuel, <span class="kw">Current</span>) &lt; fn_capacity(DefaultFuel, <span class="kw">Current</span>)); <span class="comment">// require:not_full</span>
+end</code></pre></div>
+  <div class="panel" id="panel-3" role="tabpanel"><pre tabindex="0"><code data-lang="bpl">procedure Verify_push&lt;A&gt;(Current: (BOUNDED_STACK A), x: A) returns (Result: (BOUNDED_STACK A))
+  requires BOUNDED_STACK_Invariant(Current);
+  requires (fn_count(DefaultFuel, Current) &lt; fn_capacity(DefaultFuel, Current)); // require:not_full
 {
-  <span class="kw">assert</span> {:msg <span class="str">"push::overflow::overflow_add"</span>} in_u64(BOUNDED_STACK_size(<span class="kw">Current</span>) + <span class="num">1</span>);
-  <span class="kw">Result</span> := <span class="fn">BOUNDED_STACK_Ctor</span>(Seq_prepend(x, BOUNDED_STACK_items(<span class="kw">Current</span>)), 
-                               (BOUNDED_STACK_size(<span class="kw">Current</span>) + <span class="num">1</span>), 
-                               BOUNDED_STACK_limit(<span class="kw">Current</span>));
-  <span class="kw">assert</span> {:msg <span class="str">"push::invariant::positive_capacity"</span>} <span class="fn">BOUNDED_STACK_Invariant</span>(<span class="kw">Result</span>);
-  <span class="kw">assert</span> {:msg <span class="str">"push::ensure::count_incremented"</span>} (fn_count(DefaultFuel, <span class="kw">Result</span>) == (fn_count(DefaultFuel, <span class="kw">Current</span>) + <span class="num">1</span>));
-  <span class="kw">assert</span> {:msg <span class="str">"push::ensure::capacity_unchanged"</span>} (fn_capacity(DefaultFuel, <span class="kw">Result</span>) == fn_capacity(DefaultFuel, <span class="kw">Current</span>));
-}</code></pre>
-          </div>
+  assert {:msg "push::overflow::overflow_add"} in_u64(BOUNDED_STACK_size(Current) + 1);
+  assert {:msg "push::invariant::positive_capacity"} BOUNDED_STACK_Invariant(BOUNDED_STACK_Ctor(Seq_prepend(x, BOUNDED_STACK_items(Current)), (BOUNDED_STACK_size(Current) + 1), BOUNDED_STACK_limit(Current)));
+  assert {:msg "push::invariant::size_matches"} BOUNDED_STACK_Invariant(BOUNDED_STACK_Ctor(Seq_prepend(x, BOUNDED_STACK_items(Current)), (BOUNDED_STACK_size(Current) + 1), BOUNDED_STACK_limit(Current)));
+  assert {:msg "push::invariant::within_bounds"} BOUNDED_STACK_Invariant(BOUNDED_STACK_Ctor(Seq_prepend(x, BOUNDED_STACK_items(Current)), (BOUNDED_STACK_size(Current) + 1), BOUNDED_STACK_limit(Current)));
+  Result := BOUNDED_STACK_Ctor(Seq_prepend(x, BOUNDED_STACK_items(Current)), (BOUNDED_STACK_size(Current) + 1), BOUNDED_STACK_limit(Current));
+  assert {:msg "push::invariant::positive_capacity"} BOUNDED_STACK_Invariant(Result);
+  assert {:msg "push::invariant::size_matches"} BOUNDED_STACK_Invariant(Result);
+  assert {:msg "push::invariant::within_bounds"} BOUNDED_STACK_Invariant(Result);
+  assert {:msg "push::ensure::count_incremented"} (fn_count(DefaultFuel, Result) == (fn_count(DefaultFuel, Current) + 1));
+  assert {:msg "push::ensure::capacity_unchanged"} (fn_capacity(DefaultFuel, Result) == fn_capacity(DefaultFuel, Current));
+}</code></pre></div>
+  <div class="panel" id="panel-4" role="tabpanel"><pre tabindex="0"><code data-lang="c">struct BOUNDED_STACK_U64 {
+    _Atomic uint64_t _rc;
+    struct LIST_U64* items;
+    uint64_t size;
+    uint64_t limit;
+};
 
-          <div class="tab-content" id="ch1-c">
-            <pre><code><span class="comment">// Erased high-performance C11 representation</span>
-<span class="kw">typedef struct</span> {
-    <span class="type">uint64_t</span> head;
-    <span class="kw">void</span>* tail;
-} GardelList;
+/* BOUNDED_STACK[U64].push */
+static struct BOUNDED_STACK_U64* BOUNDED_STACK_U64__push(struct BOUNDED_STACK_U64* Current, uint64_t x) {
+    return make_BOUNDED_STACK_U64(LIST_U64__prepend(((Current)-&gt;items), x), (((Current)-&gt;size) + 1ULL), ((Current)-&gt;limit));
+}</code></pre></div>
+</div>
+<p><code>representation {NONE}</code> makes the layout private, so only this module can build a stack. Every <code>{ ... }</code> record it builds is a construction site, and <code>push</code> shows what that means: the Boogie tab proves that <code>size + 1</code> cannot overflow, asserts the three invariants on the new value before <code>Result</code> is assigned, and asserts them again on <code>Result</code>. The <code>requires</code> lines there are P, and the final <code>assert</code> lines are Q. The C tab has none of this. It holds the data, a reference count, and the construction.</p>
+<div class="viewer">
+  <div class="viewer-bar">
+    <div class="tabs" role="tablist"><button class="tab active" role="tab" aria-selected="true" data-panel="panel-5" data-kind="pass">Verify</button></div>
+    <button class="copy" type="button">Copy</button>
+  </div>
+  <div class="panel active" id="panel-5" role="tabpanel"><pre tabindex="0"><code data-lang="term">$ gardelc examples/bounded_stack.gdl --strict
+[0/5] Standard Prelude injected (§4.1): 15 modules […], 3 concepts (trusted, verified in --stdlib bootstrap mode)
+[1/5] Parsed 3 concepts ["ORD", "EQ", "CANONICAL_EQ"], group None, and Module `BOUNDED_STACK` (type params: ["A"], satisfies: None, laws: 0, fuel: 2)
+[2/5] Checked §4 Visibility, §9 Concept Laws, §11 IO Boundary &amp; §12 Direct Verification:
+      0 errors, 0 warnings — all visibility, concept laws, IO linearity, overflow, and contract obligations satisfied.
+[3/5] Emitted direct Boogie VCs &amp; fuel axioms -&gt; build/bounded_stack.bpl
+[4/5] Emitted monomorphized Bend v2 target    -&gt; build/bounded_stack.bend
+[5/5] Emitted C11 runtime target              -&gt; build/bounded_stack.c
+$ echo $?
+0</code></pre></div>
+</div>
+<p>The numbered steps are the compiler's pipeline. Later recordings leave out steps 0 and 1, which only load and parse.</p>
+<div class="note">
+  <h4>Generic code in C</h4>
+  <p>C has no generics, so <code>BOUNDED_STACK[A]</code> becomes one struct per type it is used at. A library built on its own, as here, is instantiated at <code>U64</code>.</p>
+</div>
+<div class="pager"><button class="next" data-step="2">Numbers &rarr;</button></div>
+</section>
 
-<span class="kw">typedef struct</span> {
-    GardelList* items;
-    <span class="type">uint64_t</span> size;
-    <span class="type">uint64_t</span> limit;
-} BOUNDED_STACK;
+<section class="chapter" id="chapter-2">
+<div class="chapter-tag">Chapter 02 / Arithmetic and diagnostics</div>
+<h2>Overflow is a compile error</h2>
+<p class="lede">Runtime numbers are 64-bit machine values. Contracts reason in unbounded mathematics. The gap between the two is where overflow bugs live, so the compiler makes you close it.</p>
+<div class="table-wrap"><table>
+  <thead><tr><th>Type</th><th>At run time</th><th>In contracts</th></tr></thead>
+  <tbody>
+    <tr><td><code>U64</code>, alias <code>NAT</code></td><td><code>uint64_t</code></td><td>Integer from 0 to 2<sup>64</sup> − 1</td></tr>
+    <tr><td><code>I64</code>, alias <code>INT</code></td><td><code>int64_t</code></td><td>Integer from −2<sup>63</sup> to 2<sup>63</sup> − 1</td></tr>
+    <tr><td><code>F64</code></td><td><code>double</code></td><td>IEEE-754, evaluated in source order with no fused operations</td></tr>
+    <tr><td><code>CHAR</code></td><td><code>uint32_t</code></td><td>A Unicode scalar value, so never a surrogate</td></tr>
+    <tr><td><code>BOOL</code>, <code>UNIT</code></td><td><code>uint8_t</code>, nothing</td><td><code>True</code> and <code>False</code>; the single value <code>()</code></td></tr>
+    <tr><td><code>MATH_INT</code></td><td>Does not exist</td><td>Unbounded integer, legal only in contracts and <code>specify</code></td></tr>
+  </tbody>
+</table></div>
+<div class="table-wrap"><table>
+  <thead><tr><th>Operators</th><th>Meaning</th><th>What you must prove</th></tr></thead>
+  <tbody>
+    <tr><td><code>+ - *</code></td><td>Checked</td><td>The true result fits the type</td></tr>
+    <tr><td><code>/ %</code></td><td>Checked</td><td>The divisor is not zero</td></tr>
+    <tr><td><code>+% -% *%</code></td><td>Wrapping, modulo 2<sup>64</sup></td><td>Nothing</td></tr>
+    <tr><td><code>&amp; | ^ &lt;&lt; &gt;&gt;</code></td><td>Bitwise on <code>U64</code></td><td>Shift amounts are below 64</td></tr>
+  </tbody>
+</table></div>
+<h3>The midpoint bug</h3>
+<p>Binary search has shipped with this bug for decades: <code>(lo + hi) / 2</code> overflows when the sum passes the largest value. Here the build stops, and Z3 supplies an input that breaks it.</p>
+<div class="viewer">
+  <div class="viewer-bar">
+    <div class="tabs" role="tablist"><button class="tab active" role="tab" aria-selected="true" data-panel="panel-6">midpoint_bug.gdl</button><button class="tab" role="tab" aria-selected="false" data-panel="panel-7" data-kind="fail">Rejected</button><button class="tab" role="tab" aria-selected="false" data-panel="panel-8">midpoint_fixed.gdl</button><button class="tab" role="tab" aria-selected="false" data-panel="panel-9" data-kind="pass">Verified</button><button class="tab" role="tab" aria-selected="false" data-panel="panel-10">--json-diagnostics</button></div>
+    <button class="copy" type="button">Copy</button>
+  </div>
+  <div class="panel active" id="panel-6" role="tabpanel"><pre tabindex="0"><code data-lang="gdl">module MIDPOINT_BUG
 
-<span class="comment">// All contracts verified & erased -- zero runtime cost</span>
-BOUNDED_STACK* make(<span class="type">uint64_t</span> cap) {
-    BOUNDED_STACK* res = malloc(<span class="kw">sizeof</span>(BOUNDED_STACK));
-    res-&gt;items = NULL;
-    res-&gt;size = <span class="num">0</span>;
-    res-&gt;limit = cap;
-    <span class="kw">return</span> res;
-}</code></pre>
-          </div>
-        </div>
+feature {ANY}
 
-        <!-- Simulation -->
-        <div class="sim-panel">
-          <div class="sim-header">
-            <div class="sim-title">⚡ Live Compiler Verification Simulation</div>
-            <div class="sim-actions">
-              <button class="btn-run" onclick="runSim(1, 'verify')">Run Boogie & Z3</button>
-            </div>
-          </div>
-          <div class="terminal-output" id="term-1"><span class="terminal-prompt">$</span> Click "Run Boogie & Z3" above to verify BOUNDED_STACK with the SMT solver...</div>
-        </div>
-
-        <div class="chapter-nav-footer">
-          <div></div>
-          <button class="nav-nav-btn" onclick="goToStep(2)">Next: Inductive ADTs & Opaque Fuel &rarr;</button>
-        </div>
-      </section>
-
-      <!-- ======================================================== -->
-      <!-- CHAPTER 2: INDUCTIVE ADTS & OPAQUE FUEL -->
-      <!-- ======================================================== -->
-      <section class="chapter-card" id="chapter-2">
-        <div class="chapter-header">
-          <div class="chapter-tag">Chapter 02 // Recursion & Termination</div>
-          <h2 class="chapter-title">Inductive ADTs, Ghost Models & Opaque Fuel</h2>
-          <p class="chapter-desc">
-            To prevent non-termination and solver timeouts during verification of recursive functions, Gardel uses a rigorous <strong>Fuel Theory</strong> (§7.5). Ghost specifications (<code>specify</code>) define mathematical models (e.g., a tree's sequence of <code>leaves</code>), while routines consume bounded fuel until explicitly elevated with the <code>reveal</code> keyword.
-          </p>
-        </div>
-
-        <div class="callout callout-smt">
-          <div class="callout-icon">⛽</div>
-          <div class="callout-text">
-            <h4>Fuel-Guarded Axioms & Reveal</h4>
-            In SMT verification, recursive definitions are bounded by fuel tokens (<code>ZeroFuel</code>, <code>SuccFuel(f)</code>). When fuel runs out, functions become uninterpreted opaque symbols. The Eiffel-inspired <code>reveal leaves</code> statement elevates fuel to <code>RevealFuel</code> within the lexical block, granting the solver permission to unroll inductive definitions.
-          </div>
-        </div>
-
-        <div class="code-viewer">
-          <div class="viewer-header">
-            <div class="tab-list">
-              <button class="tab-btn active" data-tab="ch2-gdl">tree.gdl</button>
-              <button class="tab-btn" data-tab="ch2-bpl">Boogie Fuel Theory (.bpl)</button>
-            </div>
-            <button class="copy-btn" onclick="copyActiveCode(this)">Copy</button>
-          </div>
-
-          <div class="tab-content active" id="ch2-gdl">
-            <pre><code><span class="kw">module</span> <span class="type">TREE</span>
-
-<span class="kw">representation</span> {<span class="kw">ANY</span>}
-  | Leaf(value: <span class="type">NAT</span>)
-  | Node(left: <span class="type">TREE</span>, right: <span class="type">TREE</span>)
-
-<span class="kw">specify</span> {<span class="kw">ANY</span>}
-  <span class="comment">-- Ghost specification function: abstracts tree to a mathematical list</span>
-  leaves: <span class="type">LIST</span>[<span class="type">NAT</span>]
-    <span class="kw">variant</span> <span class="kw">Current</span>
-    <span class="kw">do</span>
-      <span class="kw">match</span> <span class="kw">Current</span>
-        <span class="kw">case</span> Leaf(v)    <span class="kw">then</span> <span class="type">LIST</span>.empty.prepend(v)
-        <span class="kw">case</span> Node(l, r) <span class="kw">then</span> l.leaves.append(r.leaves)
-      <span class="kw">end</span>
-    <span class="kw">end</span>
-
-<span class="kw">feature</span> {<span class="kw">ANY</span>}
-  max_value: <span class="type">NAT</span>
-    <span class="kw">variant</span> <span class="kw">Current</span>
-    <span class="kw">do</span>
-      <span class="kw">reveal</span> leaves  <span class="comment">-- Elevates fuel so Z3 unfolds `leaves`</span>
-      <span class="kw">match</span> <span class="kw">Current</span>
-        <span class="kw">case</span> Leaf(v)    <span class="kw">then</span> v
-        <span class="kw">case</span> Node(l, r) <span class="kw">then</span>
-          <span class="kw">let</span> ml = l.max_value
-          <span class="kw">let</span> mr = r.max_value
-          <span class="kw">if</span> ml &gt;= mr <span class="kw">then</span> ml <span class="kw">else</span> mr <span class="kw">end</span>
-      <span class="kw">end</span>
-    <span class="contract">ensure</span>
-      attained: <span class="kw">Current</span>.leaves.has(<span class="kw">Result</span>)
-    <span class="kw">end</span>
-<span class="kw">end</span></code></pre>
-          </div>
-
-          <div class="tab-content" id="ch2-bpl">
-            <pre><code><span class="comment">// Fuel theory axiomatized in Boogie:</span>
-<span class="kw">type</span> <span class="type">Fuel</span>;
-<span class="kw">const unique</span> ZeroFuel: <span class="type">Fuel</span>;
-<span class="kw">function</span> SuccFuel(f: <span class="type">Fuel</span>) <span class="kw">returns</span> (<span class="type">Fuel</span>);
-<span class="kw">const</span> DefaultFuel: <span class="type">Fuel</span>;
-<span class="kw">const</span> RevealFuel: <span class="type">Fuel</span>;
-<span class="kw">axiom</span> DefaultFuel == SuccFuel(SuccFuel(ZeroFuel));
-<span class="kw">axiom</span> RevealFuel == SuccFuel(DefaultFuel);
-
-<span class="comment">// Inductive leaves function unfolds only with SuccFuel</span>
-<span class="kw">axiom</span> (<span class="kw">forall</span> f: <span class="type">Fuel</span>, <span class="kw">Current</span>: <span class="type">TREE</span> :: { fn_leaves(SuccFuel(f), <span class="kw">Current</span>) }
-  fn_leaves(SuccFuel(f), <span class="kw">Current</span>) == 
-    (<span class="kw">if</span> is_Leaf(<span class="kw">Current</span>) <span class="kw">then</span> Seq_prepend(Leaf_value(<span class="kw">Current</span>), Seq_empty())
-     <span class="kw">else</span> Seq_append(fn_leaves(f, Node_left(<span class="kw">Current</span>)), fn_leaves(f, Node_right(<span class="kw">Current</span>)))));</code></pre>
-          </div>
-        </div>
-
-        <div class="sim-panel">
-          <div class="sim-header">
-            <div class="sim-title">⚡ Interactive Fuel Experiment</div>
-            <div class="sim-actions">
-              <button class="btn-run" onclick="runSim(2, 'reveal')">Verify with `reveal leaves`</button>
-              <button class="btn-secondary" onclick="runSim(2, 'opaque')">Simulate Missing `reveal`</button>
-            </div>
-          </div>
-          <div class="terminal-output" id="term-2"><span class="terminal-prompt">$</span> Test how fuel elevation influences SMT verification above...</div>
-        </div>
-
-        <div class="chapter-nav-footer">
-          <button class="nav-nav-btn" onclick="goToStep(1)">&larr; Previous</button>
-          <button class="nav-nav-btn" onclick="goToStep(3)">Next: SMT Proofs & AI Diagnostics &rarr;</button>
-        </div>
-      </section>
-
-      <!-- ======================================================== -->
-      <!-- CHAPTER 3: SMT PROOFS & AI DIAGNOSTICS -->
-      <!-- ======================================================== -->
-      <section class="chapter-card" id="chapter-3">
-        <div class="chapter-header">
-          <div class="chapter-tag">Chapter 03 // Real Verification</div>
-          <h2 class="chapter-title">Real SMT Proofs & AI Counterexample Diagnostics</h2>
-          <p class="chapter-desc">
-            Gardel does not use shallow concrete fuzzing or sampling. It sends every verification condition to <strong>Microsoft Boogie and Z3</strong>. When a contract fails, Gardel translates Z3's raw internal SMT model into an AI-friendly JSON diagnostic with concrete counterexamples, preconditions, and candidate lemmas.
-          </p>
-        </div>
-
-        <div class="callout callout-warn">
-          <div class="callout-icon">🔍</div>
-          <div class="callout-text">
-            <h4>The Classic Midpoint Bug Detected</h4>
-            In binary search, <code>(lo + hi) / 2</code> overflows if <code>lo + hi &gt; 2^64 - 1</code>. Gardel automatically emits 64-bit overflow assertions (<code>in_u64(lo + hi)</code>). Z3 synthesizes exact counterexamples (e.g. <code>lo = 1, hi = 18446744073709551615</code>) and halts compilation.
-          </div>
-        </div>
-
-        <div class="code-viewer">
-          <div class="viewer-header">
-            <div class="tab-list">
-              <button class="tab-btn active" data-tab="ch3-gdl">midpoint_bug.gdl</button>
-              <button class="tab-btn" data-tab="ch3-fixed">midpoint_fixed.gdl</button>
-              <button class="tab-btn" data-tab="ch3-json">AI JSON Diagnostic</button>
-            </div>
-            <button class="copy-btn" onclick="copyActiveCode(this)">Copy</button>
-          </div>
-
-          <div class="tab-content active" id="ch3-gdl">
-            <pre><code><span class="kw">module</span> <span class="type">MIDPOINT_BUG</span>
-
-<span class="kw">feature</span> {<span class="kw">ANY</span>}
-  midpoint(lo: <span class="type">NAT</span>, hi: <span class="type">NAT</span>): <span class="type">NAT</span>
-    <span class="contract">require</span>
+  midpoint(lo: NAT, hi: NAT): NAT
+    require
       ordered: lo &lt;= hi
-    <span class="kw">do</span>
-      (lo + hi) / <span class="num">2</span>   <span class="comment">-- ⚠️ SMT Prover detects 64-bit arithmetic overflow!</span>
-    <span class="contract">ensure</span>
-      in_range: lo &lt;= <span class="kw">Result</span> <span class="kw">and</span> <span class="kw">Result</span> &lt;= hi
-    <span class="kw">end</span>
-<span class="kw">end</span></code></pre>
-          </div>
+    do
+      (lo + hi) / 2
+    ensure
+      in_range: lo &lt;= Result and Result &lt;= hi
+    end
 
-          <div class="tab-content" id="ch3-fixed">
-            <pre><code><span class="kw">module</span> <span class="type">MIDPOINT_SAFE</span>
+end</code></pre></div>
+  <div class="panel" id="panel-7" role="tabpanel"><pre tabindex="0"><code data-lang="term">$ gardelc midpoint_bug.gdl
+[2/5] Checked §4 Visibility, §9 Concept Laws, §11 IO Boundary &amp; §12 Direct Verification:
+      [ERROR] Phase 3 Boogie (Arithmetic Overflow) in `midpoint` (overflow_add) at midpoint_bug.gdl:5:3: Formal verification condition `overflow_add` failed in `midpoint`
+            counterexample: { hi = 18446744073709551615, lo = 18446744073709551615 … }
+$ echo $?
+1</code></pre></div>
+  <div class="panel" id="panel-8" role="tabpanel"><pre tabindex="0"><code data-lang="gdl">module MIDPOINT_FIXED
 
-<span class="kw">feature</span> {<span class="kw">ANY</span>}
-  midpoint(lo: <span class="type">NAT</span>, hi: <span class="type">NAT</span>): <span class="type">NAT</span>
-    <span class="contract">require</span>
+feature {ANY}
+
+  midpoint(lo: NAT, hi: NAT): NAT
+    require
       ordered: lo &lt;= hi
-    <span class="kw">do</span>
-      lo + (hi - lo) / <span class="num">2</span>  <span class="comment">-- ✅ Formally verified: no overflow possible</span>
-    <span class="contract">ensure</span>
-      in_range: lo &lt;= <span class="kw">Result</span> <span class="kw">and</span> <span class="kw">Result</span> &lt;= hi
-    <span class="kw">end</span>
-<span class="kw">end</span></code></pre>
-          </div>
+    do
+      lo + (hi - lo) / 2
+    ensure
+      in_range: lo &lt;= Result and Result &lt;= hi
+    end
 
-          <div class="tab-content" id="ch3-json">
-            <pre><code><span class="comment">// Structured JSON output when invoked with `--json-diagnostics`:</span>
-{
-  <span class="str">"level"</span>: <span class="str">"error"</span>,
-  <span class="str">"rule"</span>: <span class="str">"Phase 3 Boogie (Arithmetic Overflow)"</span>,
-  <span class="str">"routine"</span>: <span class="str">"midpoint"</span>,
-  <span class="str">"contract_tag"</span>: <span class="str">"overflow_add"</span>,
-  <span class="str">"message"</span>: <span class="str">"Formal verification condition `overflow_add` failed in `midpoint`"</span>,
-  <span class="str">"path_conditions"</span>: [<span class="str">"(lo &lt;= hi)"</span>],
-  <span class="str">"counterexample"</span>: {
-    <span class="str">"lo"</span>: <span class="str">"1"</span>,
-    <span class="str">"hi"</span>: <span class="str">"18446744073709551615"</span>
-  },
-  <span class="str">"relevant_lemmas"</span>: []
-}</code></pre>
-          </div>
-        </div>
+end</code></pre></div>
+  <div class="panel" id="panel-9" role="tabpanel"><pre tabindex="0"><code data-lang="term">$ gardelc midpoint_fixed.gdl
+[2/5] Checked §4 Visibility, §9 Concept Laws, §11 IO Boundary &amp; §12 Direct Verification:
+      0 errors, 0 warnings — all visibility, concept laws, IO linearity, overflow, and contract obligations satisfied.
+[3/5] Emitted direct Boogie VCs &amp; fuel axioms -&gt; build/midpoint_fixed.bpl
+[4/5] Emitted monomorphized Bend v2 target    -&gt; build/midpoint_fixed.bend
+[5/5] Emitted C11 runtime target              -&gt; build/midpoint_fixed.c
+$ echo $?
+0</code></pre></div>
+  <div class="panel" id="panel-10" role="tabpanel"><pre tabindex="0"><code data-lang="json">// 92 solver-internal entries removed from "counterexample"; nothing else is changed.
+[
+  {
+    "level": "error",
+    "rule": "Phase 3 Boogie (Arithmetic Overflow)",
+    "module": "MIDPOINT_BUG",
+    "routine": "midpoint",
+    "tag": "overflow_add",
+    "contract_tag": "overflow_add",
+    "span": {
+      "file": "midpoint_bug.gdl",
+      "line": 5,
+      "column": 3,
+      "end_line": 5,
+      "end_column": 10
+    },
+    "path_conditions": [
+      "(lo &lt;= hi)"
+    ],
+    "counterexample": {
+      "lo": "18446744073709551615",
+      "hi": "18446744073709551615"
+    },
+    "relevant_lemmas": [],
+    "message": "Formal verification condition `overflow_add` failed in `midpoint`"
+  }
+]</code></pre></div>
+</div>
+<p>The exit code is 1 and nothing is emitted. With <code>--json-diagnostics</code> the same failure is a record an agent can act on: the failing clause, the location, the path conditions that held, a counterexample, and any lemmas worth trying.</p>
+<div class="note warn">
+  <h4>Counterexamples are noisy for now</h4>
+  <p>The tabs above show only the two source variables. The real <code>counterexample</code> object also holds 92 solver-internal entries, such as <code>Fn1Type</code> and <code>OPTION__fn_map</code>, and the reported span is the routine, not the expression.</p>
+</div>
+<h3>Checks follow evaluation</h3>
+<p>An obligation holds on the path where its operation runs, so a guard protects what it guards. <code>x != 0 and 10 / x &gt; 1</code> verifies because the division only runs when the left side is true, and <code>id(if x &gt; 0 then 10 / x else 0 end)</code> verifies for the same reason.</p>
+<p>A lambda can be applied to any value of its parameter types, so its body is proved for all of them. It can still use what is known where it is created: <code>fn(y: U64): U64 do y / z end</code> verifies when <code>z &gt; 0</code> is known at that point. Without that fact, it is rejected with <code>div_by_zero</code>.</p>
+<div class="pager"><button data-step="1">&larr; Hoare triples</button><button class="next" data-step="3">Recursion &rarr;</button></div>
+</section>
 
-        <div class="sim-panel">
-          <div class="sim-header">
-            <div class="sim-title">⚡ SMT Counterexample Synthesis</div>
-            <div class="sim-actions">
-              <button class="btn-run" onclick="runSim(3, 'bug')">Analyze Buggy Midpoint</button>
-              <button class="btn-secondary" onclick="runSim(3, 'fix')">Verify Safe Midpoint</button>
-            </div>
-          </div>
-          <div class="terminal-output" id="term-3"><span class="terminal-prompt">$</span> Run the SMT counterexample synthesizer above...</div>
-        </div>
+<section class="chapter" id="chapter-3">
+<div class="chapter-tag">Chapter 03 / Totality</div>
+<h2>Every function ends, and the solver is told how far to look</h2>
+<p class="lede">A Hoare triple on its own says nothing about a C that never finishes. Gardel requires total correctness: it has no loops, and a recursive routine names a <code>variant</code>, a measure that must shrink on every call.</p>
+<div class="viewer">
+  <div class="viewer-bar">
+    <div class="tabs" role="tablist"><button class="tab active" role="tab" aria-selected="true" data-panel="panel-11">tree.gdl</button></div>
+    <button class="copy" type="button">Copy</button>
+  </div>
+  <div class="panel active" id="panel-11" role="tabpanel"><pre tabindex="0"><code data-lang="gdl" data-source="examples/tree.gdl">module TREE
 
-        <div class="chapter-nav-footer">
-          <button class="nav-nav-btn" onclick="goToStep(2)">&larr; Previous</button>
-          <button class="nav-nav-btn" onclick="goToStep(4)">Next: Concepts, Laws & ORD &rarr;</button>
-        </div>
-      </section>
+representation {ANY}
+  | Leaf(value: NAT)
+  | Node(left: TREE, right: TREE)
 
-      <!-- ======================================================== -->
-      <!-- CHAPTER 4: CONCEPTS & LAWS -->
-      <!-- ======================================================== -->
-      <section class="chapter-card" id="chapter-4">
-        <div class="chapter-header">
-          <div class="chapter-tag">Chapter 04 // Generic Mathematical Theories</div>
-          <h2 class="chapter-title">Concepts, Mathematical Laws & Orderings</h2>
-          <p class="chapter-desc">
-            Gardel uses <code>concept</code> to specify abstract algebraic interfaces, accompanied by mathematical <code>law</code> blocks. In Gardel, concept laws are not tests—they are <strong>quantified multi-trigger SMT axioms</strong>. A module stating <code>satisfies ORD</code> must prove every law before compilation succeeds.
-          </p>
-        </div>
+specify {ANY}
 
-        <div class="callout callout-eiffel">
-          <div class="callout-icon">⚖️</div>
-          <div class="callout-text">
-            <h4>Decoupled Behavioral Equivalence & Total Order</h4>
-            Phase 1 resolved the SMT Leibniz identity contradiction by redefining <code>concept EQ</code> as an equivalence relation (<code>reflexive</code>, <code>symmetric</code>, <code>transitive</code>). <code>concept ORD refines EQ</code> introduces strict ordering and totality laws, verified on modules like <code>PEANO</code>.
-          </div>
-        </div>
+  leaves: LIST[NAT]
+    variant
+      Current
+    do
+      match Current
+        case Leaf(v) then LIST.singleton(v)
+        case Node(l, r) then l.leaves.append(r.leaves)
+      end
+    end
 
-        <div class="code-viewer">
-          <div class="viewer-header">
-            <div class="tab-list">
-              <button class="tab-btn active" data-tab="ch4-gdl">peano_ord.gdl</button>
-              <button class="tab-btn" data-tab="ch4-laws">Multi-Trigger Axioms (.bpl)</button>
-            </div>
-            <button class="copy-btn" onclick="copyActiveCode(this)">Copy</button>
-          </div>
+create {ANY}
 
-          <div class="tab-content active" id="ch4-gdl">
-            <pre><code><span class="kw">concept</span> <span class="type">ORD</span> <span class="kw">refines</span> <span class="type">EQ</span>
-  less_than(other: <span class="type">Current</span>): <span class="type">BOOL</span>
+  from_range(lo: NAT, hi: NAT): TREE
+    require
+      valid_range: lo &lt;= hi
+    variant
+      hi - lo
+    do
+      if lo = hi then
+        Leaf(lo)
+      else
+        let mid = lo + (hi - lo) / 2
+        let left_tree = from_range(lo, mid)
+        let right_tree = from_range(mid + 1, hi)
+        Node(left_tree, right_tree)
+      end
+    ensure
+      non_empty: Result.leaves.length &gt; 0
+      in_bounds: forall x: NAT. Result.leaves.has(x) implies (lo &lt;= x and x &lt;= hi)
+      has_lo: Result.leaves.has(lo)
+      has_hi: Result.leaves.has(hi)
+    end
 
-  <span class="kw">law</span> irreflexive(a: <span class="type">Current</span>)
-    <span class="contract">ensure</span>
-      not_less_than_self: <span class="kw">not</span> a.less_than(a)
-    <span class="kw">end</span>
+feature {ANY}
 
-  <span class="kw">law</span> transitive(a: <span class="type">Current</span>, b: <span class="type">Current</span>, c: <span class="type">Current</span>)
-    <span class="contract">require</span>
+  max_value: NAT
+    variant
+      Current
+    do
+      match Current
+        case Leaf(v) then v
+        case Node(l, r) then
+          let ml = l.max_value
+          let mr = r.max_value
+          if ml &gt;= mr then ml else mr end
+      end
+    ensure
+      upper_bound: forall x: NAT. Current.leaves.has(x) implies x &lt;= Result
+      attained: Current.leaves.has(Result)
+    end
+
+end</code></pre><div class="source"><a href="../examples/tree.gdl">examples/tree.gdl</a></div></div>
+</div>
+<p>This file uses two kinds of measure. <code>variant Current</code> is structural: the recursive call is on a smaller piece of the value. <code>variant hi - lo</code> is numeric: a <code>NAT</code> expression that gets smaller. A variant may also list several measures, compared in order.</p>
+<p><code>leaves</code> sits in <code>specify</code>, so it is ghost code. Contracts can use it, it is never compiled, and it gives <code>max_value</code> something to promise about: the result is at least every leaf, and is itself a leaf.</p>
+<div class="viewer">
+  <div class="viewer-bar">
+    <div class="tabs" role="tablist"><button class="tab active" role="tab" aria-selected="true" data-panel="panel-12" data-kind="fail">spin.gdl</button><button class="tab" role="tab" aria-selected="false" data-panel="panel-13" data-kind="fail">no_variant.gdl</button></div>
+    <button class="copy" type="button">Copy</button>
+  </div>
+  <div class="panel active" id="panel-12" role="tabpanel"><pre tabindex="0"><code data-lang="term">$ gardelc spin.gdl
+[2/5] Checked §4 Visibility, §9 Concept Laws, §11 IO Boundary &amp; §12 Direct Verification:
+      [ERROR] Phase 3 Boogie (Termination Variant Violation) in `down` (variant_decrease) at spin.gdl:5:3: Formal verification condition `variant_decrease` failed in `down`
+            counterexample: { n = 1 … }
+$ echo $?
+1</code></pre></div>
+  <div class="panel" id="panel-13" role="tabpanel"><pre tabindex="0"><code data-lang="term">$ gardelc no_variant.gdl
+[2/5] Checked §4 Visibility, §9 Concept Laws, §11 IO Boundary &amp; §12 Direct Verification:
+      [ERROR] Phase 3 Boogie (Termination Variant Violation) in `down` (variant_missing) at no_variant.gdl:5:3: Formal verification condition `variant_missing` failed in `down`
+            counterexample: { … }
+$ echo $?
+1</code></pre></div>
+</div>
+<h3>Fuel and <code>reveal</code></h3>
+<p>An SMT solver can unroll a recursive definition forever, so each definition is guarded by a fuel argument and unfolds one level for each unit of fuel. When fuel runs out, the function is an opaque symbol. The default is 2, which proves <code>tree.gdl</code> as it stands. When a proof needs one more level of a specific definition, <code>reveal leaves</code> raises it for that block.</p>
+<div class="viewer">
+  <div class="viewer-bar">
+    <div class="tabs" role="tablist"><button class="tab active" role="tab" aria-selected="true" data-panel="panel-14" data-kind="fail">--fuel 1, no reveal</button><button class="tab" role="tab" aria-selected="false" data-panel="panel-15" data-kind="pass">--fuel 1, reveal leaves</button><button class="tab" role="tab" aria-selected="false" data-panel="panel-16" data-kind="pass">Default fuel</button><button class="tab" role="tab" aria-selected="false" data-panel="panel-17">Fuel in Boogie</button></div>
+    <button class="copy" type="button">Copy</button>
+  </div>
+  <div class="panel active" id="panel-14" role="tabpanel"><pre tabindex="0"><code data-lang="term">$ gardelc no_reveal/tree.gdl --fuel 1
+[2/5] Checked §4 Visibility, §9 Concept Laws, §11 IO Boundary &amp; §12 Direct Verification:
+      [ERROR] Phase 3 Boogie (Postcondition Violation) in `max_value` (upper_bound) at no_reveal/tree.gdl:33:7: Formal verification condition `upper_bound` failed in `max_value`
+            counterexample: { x = 28103 … }
+            relevant_lemmas: [ORD.irreflexive, ORD.total, ORD.transitive, reveal leaves]
+      [ERROR] Phase 3 Boogie (Postcondition Violation) in `max_value` (attained) at no_reveal/tree.gdl:34:7: Formal verification condition `attained` failed in `max_value`
+            counterexample: { … }
+            relevant_lemmas: [reveal leaves]
+$ echo $?
+1</code></pre></div>
+  <div class="panel" id="panel-15" role="tabpanel"><pre tabindex="0"><code data-lang="term">$ gardelc with_reveal/tree.gdl --fuel 1
+[2/5] Checked §4 Visibility, §9 Concept Laws, §11 IO Boundary &amp; §12 Direct Verification:
+      0 errors, 0 warnings — all visibility, concept laws, IO linearity, overflow, and contract obligations satisfied.
+$ echo $?
+0</code></pre></div>
+  <div class="panel" id="panel-16" role="tabpanel"><pre tabindex="0"><code data-lang="term">$ gardelc examples/tree.gdl
+[2/5] Checked §4 Visibility, §9 Concept Laws, §11 IO Boundary &amp; §12 Direct Verification:
+      0 errors, 0 warnings — all visibility, concept laws, IO linearity, overflow, and contract obligations satisfied.
+$ echo $?
+0</code></pre></div>
+  <div class="panel" id="panel-17" role="tabpanel"><pre tabindex="0"><code data-lang="bpl">// The fuel theory, from build/tree.bpl
+type Fuel;
+const unique ZeroFuel: Fuel;
+function SuccFuel(f: Fuel) returns (Fuel);
+const DefaultFuel: Fuel;
+const RevealFuel: Fuel;
+axiom DefaultFuel == SuccFuel(SuccFuel(ZeroFuel));
+axiom RevealFuel == SuccFuel(DefaultFuel);
+
+// `leaves` unfolds one level for each SuccFuel
+axiom (forall _fuel: Fuel, Current: TREE :: { fn_leaves(SuccFuel(_fuel), Current) } TREE_Invariant(Current) ==&gt; fn_leaves(SuccFuel(_fuel), Current) == (if is_Leaf(Current) then Seq_singleton(Leaf_value(Current)) else Seq_append(fn_leaves(_fuel, Node_left(Current)), fn_leaves(_fuel, Node_right(Current)))));</code></pre></div>
+</div>
+<p>The failing run lists <code>reveal leaves</code> under <code>relevant_lemmas</code>, so the fix is in the diagnostic. <code>no_reveal/tree.gdl</code> and <code>with_reveal/tree.gdl</code> keep only <code>leaves</code> and <code>max_value</code> from <code>examples/tree.gdl</code>, and the second adds <code>reveal leaves</code> at the start of <code>max_value</code>'s <code>do</code> block.</p>
+<h3>Helping the solver, and auditing the help</h3>
+<ul>
+  <li><code>check tag: predicate end</code> proves an intermediate fact, which then joins the proof context.</li>
+  <li><code>assume tag: predicate end</code> takes a fact without proof. It is an escape hatch, so the tools track it.</li>
+</ul>
+<div class="viewer">
+  <div class="viewer-bar">
+    <div class="tabs" role="tablist"><button class="tab active" role="tab" aria-selected="true" data-panel="panel-18">--audit</button><button class="tab" role="tab" aria-selected="false" data-panel="panel-19" data-kind="fail">--strict</button></div>
+    <button class="copy" type="button">Copy</button>
+  </div>
+  <div class="panel active" id="panel-18" role="tabpanel"><pre tabindex="0"><code data-lang="term">$ gardelc halve.gdl --audit
+[2/5] Checked §4 Visibility, §9 Concept Laws, §11 IO Boundary &amp; §12 Direct Verification:
+      [AUDIT] Phase 3 (--audit Assume Report) in `half` (small) at halve.gdl:7:14: Audited `assume small: (x &lt; 100)` in `half`
+            relevant_lemmas: [ORD.irreflexive, ORD.total, ORD.transitive]
+$ echo $?
+0</code></pre></div>
+  <div class="panel" id="panel-19" role="tabpanel"><pre tabindex="0"><code data-lang="term">$ gardelc halve.gdl --strict
+[2/5] Checked §4 Visibility, §9 Concept Laws, §11 IO Boundary &amp; §12 Direct Verification:
+      [ERROR] Phase 3 (--strict Assume Disallowed) in `half` (small) at halve.gdl:7:14: Unproven `assume small: (x &lt; 100)` is rejected under `--strict`
+            relevant_lemmas: [ORD.irreflexive, ORD.total, ORD.transitive]
+$ echo $?
+1</code></pre></div>
+</div>
+<div class="pager"><button data-step="2">&larr; Numbers</button><button class="next" data-step="4">Concepts and equality &rarr;</button></div>
+</section>
+
+<section class="chapter" id="chapter-4">
+<div class="chapter-tag">Chapter 04 / Generic theories</div>
+<h2>Laws are theorems you prove</h2>
+<p class="lede">A <code>concept</code> names an interface and the laws it must obey. A module that says <code>satisfies</code> must prove each law, and generic code may then rely on them.</p>
+<div class="viewer">
+  <div class="viewer-bar">
+    <div class="tabs" role="tablist"><button class="tab active" role="tab" aria-selected="true" data-panel="panel-20">eq.gdl</button><button class="tab" role="tab" aria-selected="false" data-panel="panel-21">canonical_eq.gdl</button><button class="tab" role="tab" aria-selected="false" data-panel="panel-22">ord.gdl</button></div>
+    <button class="copy" type="button">Copy</button>
+  </div>
+  <div class="panel active" id="panel-20" role="tabpanel"><pre tabindex="0"><code data-lang="gdl" data-source="stdlib/concepts/eq.gdl">concept EQ
+
+  equals(other: Current): BOOL
+
+  law reflexive(a: Current)
+    ensure
+      refl: a.equals(a)
+    end
+
+  law symmetric(a: Current, b: Current)
+    require
+      ab: a.equals(b)
+    ensure
+      ba: b.equals(a)
+    end
+
+  law transitive(a: Current, b: Current, c: Current)
+    require
+      ab: a.equals(b)
+      bc: b.equals(c)
+    ensure
+      ac: a.equals(c)
+    end
+
+end</code></pre><div class="source"><a href="../stdlib/concepts/eq.gdl">stdlib/concepts/eq.gdl</a></div></div>
+  <div class="panel" id="panel-21" role="tabpanel"><pre tabindex="0"><code data-lang="gdl" data-source="stdlib/concepts/canonical_eq.gdl">concept CANONICAL_EQ refines EQ
+
+  law agrees_with_structural(a: Current, b: Current)
+    ensure
+      sound: a.equals(b) = (a = b)
+    end
+
+end</code></pre><div class="source"><a href="../stdlib/concepts/canonical_eq.gdl">stdlib/concepts/canonical_eq.gdl</a></div></div>
+  <div class="panel" id="panel-22" role="tabpanel"><pre tabindex="0"><code data-lang="gdl" data-source="stdlib/concepts/ord.gdl">concept ORD refines EQ
+
+  less_than(other: Current): BOOL
+
+  less_or_equal(other: Current): BOOL
+    do
+      Current.less_than(other) or Current.equals(other)
+    ensure
+      definition: Result = (Current.less_than(other) or Current.equals(other))
+    end
+
+  law irreflexive(a: Current)
+    ensure
+      not_less_than_self: not a.less_than(a)
+    end
+
+  law transitive(a: Current, b: Current, c: Current)
+    require
       a_lt_b: a.less_than(b)
       b_lt_c: b.less_than(c)
-    <span class="contract">ensure</span>
+    ensure
       a_lt_c: a.less_than(c)
-    <span class="kw">end</span>
-<span class="kw">end</span>
+    end
 
-<span class="kw">module</span> <span class="type">PEANO</span> <span class="kw">satisfies</span> <span class="type">ORD</span>
-<span class="kw">representation</span> {<span class="kw">ANY</span>}
+  law total(a: Current, b: Current)
+    ensure
+      comparable: a.less_than(b) or a.equals(b) or b.less_than(a)
+    end
+
+end</code></pre><div class="source"><a href="../stdlib/concepts/ord.gdl">stdlib/concepts/ord.gdl</a></div></div>
+</div>
+<p>Each law in <code>PEANO</code> is a recursive proof. The law's <code>do</code> block is structural induction: a call to the law on smaller values is the induction hypothesis, and <code>variant a</code> keeps it well-founded. The <code>specify {ORD}</code> header says which concept the laws belong to, which matters here because <code>EQ</code> and <code>ORD</code> both have a law called <code>transitive</code>.</p>
+<div class="viewer">
+  <div class="viewer-bar">
+    <div class="tabs" role="tablist"><button class="tab active" role="tab" aria-selected="true" data-panel="panel-23">peano_ord.gdl</button><button class="tab" role="tab" aria-selected="false" data-panel="panel-24">A law in Boogie</button><button class="tab" role="tab" aria-selected="false" data-panel="panel-25" data-kind="pass">Verified</button></div>
+    <button class="copy" type="button">Copy</button>
+  </div>
+  <div class="panel active" id="panel-23" role="tabpanel"><pre tabindex="0"><code data-lang="gdl" data-source="examples/peano_ord.gdl">module PEANO satisfies ORD, CANONICAL_EQ
+
+representation {ANY}
   | Zero
-  | Succ(pred: <span class="type">PEANO</span>)
+  | Succ(pred: PEANO)
 
-<span class="kw">feature</span> {<span class="kw">ANY</span>}
-  less_than(other: <span class="type">PEANO</span>): <span class="type">BOOL</span>
-    <span class="kw">variant</span> <span class="kw">Current</span>
-    <span class="kw">do</span>
-      <span class="kw">match</span> <span class="kw">Current</span>
-        <span class="kw">case</span> Zero <span class="kw">then</span>
-          <span class="kw">match</span> other
-            <span class="kw">case</span> Zero    <span class="kw">then</span> <span class="kw">False</span>
-            <span class="kw">case</span> Succ(_) <span class="kw">then</span> <span class="kw">True</span>
-          <span class="kw">end</span>
-        <span class="kw">case</span> Succ(p) <span class="kw">then</span>
-          <span class="kw">match</span> other
-            <span class="kw">case</span> Zero    <span class="kw">then</span> <span class="kw">False</span>
-            <span class="kw">case</span> Succ(q) <span class="kw">then</span> p.less_than(q)
-          <span class="kw">end</span>
-      <span class="kw">end</span>
-    <span class="kw">end</span>
-<span class="kw">end</span></code></pre>
-          </div>
+feature {ANY}
 
-          <div class="tab-content" id="ch4-laws">
-            <pre><code><span class="comment">// Emitted Multi-Trigger SMT Axiom in Boogie:</span>
-<span class="kw">axiom</span> (<span class="kw">forall</span> a: <span class="type">PEANO</span>, b: <span class="type">PEANO</span>, c: <span class="type">PEANO</span> ::
-  { fn_less_than(DefaultFuel, a, b), fn_less_than(DefaultFuel, b, c) }  <span class="comment">// Multi-trigger</span>
-  (fn_less_than(DefaultFuel, a, b) &amp;&amp; fn_less_than(DefaultFuel, b, c)) ==&gt; 
-  fn_less_than(DefaultFuel, a, c));</code></pre>
-          </div>
-        </div>
+  equals(other: PEANO): BOOL
+    variant
+      Current
+    do
+      match Current
+        case Zero then
+          match other
+            case Zero then True
+            case Succ(_) then False
+          end
+        case Succ(p) then
+          match other
+            case Zero then False
+            case Succ(q) then p.equals(q)
+          end
+      end
+    ensure
+      structural: Result = (Current = other)
+    end
 
-        <div class="sim-panel">
-          <div class="sim-header">
-            <div class="sim-title">⚡ Verify Mathematical Laws in PEANO</div>
-            <div class="sim-actions">
-              <button class="btn-run" onclick="runSim(4, 'peano')">Verify PEANO satisfies ORD</button>
-            </div>
-          </div>
-          <div class="terminal-output" id="term-4"><span class="terminal-prompt">$</span> Test concept law verification above...</div>
-        </div>
+  less_than(other: PEANO): BOOL
+    variant
+      Current
+    do
+      match Current
+        case Zero then
+          match other
+            case Zero then False
+            case Succ(_) then True
+          end
+        case Succ(p) then
+          match other
+            case Zero then False
+            case Succ(q) then p.less_than(q)
+          end
+      end
+    end
 
-        <div class="chapter-nav-footer">
-          <button class="nav-nav-btn" onclick="goToStep(3)">&larr; Previous</button>
-          <button class="nav-nav-btn" onclick="goToStep(5)">Next: Linear IO Monad & Purity &rarr;</button>
-        </div>
-      </section>
+specify {EQ}
 
-      <!-- ======================================================== -->
-      <!-- CHAPTER 5: LINEAR IO MONAD -->
-      <!-- ======================================================== -->
-      <section class="chapter-card" id="chapter-5">
-        <div class="chapter-header">
-          <div class="chapter-tag">Chapter 05 // Effect Containment</div>
-          <h2 class="chapter-title">The Linear IO Monad & Purity Firewall</h2>
-          <p class="chapter-desc">
-            Gardel maintains 100% mathematical purity in ADT modules. Side effects are strictly confined to <code>program</code> entrypoints using the <code>with IO</code> construct. The compiler enforces an affine/linear consumption firewall: IO values can never be dropped, duplicated, or leaked into pure functions.
-          </p>
-        </div>
+  law reflexive(a: PEANO)
+    variant
+      a
+    do
+      match a
+        case Zero then True
+        case Succ(p) then reflexive(p)
+      end
+    ensure
+      refl: a.equals(a)
+    end
 
-        <div class="callout callout-smt">
-          <div class="callout-icon">🔒</div>
-          <div class="callout-text">
-            <h4>Strict Linearity & The Program Boundary</h4>
-            Standard ADT modules cannot invoke <code>with IO</code>. Only a <code>program</code> with <code>main(args: LIST[STRING]): IO[EXIT_CODE]</code> may interact with the outside world. This guarantees that all functional code remains Church-Rosser confluent and deterministic.
-          </div>
-        </div>
+  law symmetric(a: PEANO, b: PEANO)
+    require
+      ab: a.equals(b)
+    variant
+      a
+    do
+      match a
+        case Zero then True
+        case Succ(p) then
+          match b
+            case Zero then True
+            case Succ(q) then symmetric(p, q)
+          end
+      end
+    ensure
+      ba: b.equals(a)
+    end
 
-        <div class="code-viewer">
-          <div class="viewer-header">
-            <div class="tab-list">
-              <button class="tab-btn active" data-tab="ch5-gdl">greeter.gdl</button>
-              <button class="tab-btn" data-tab="ch5-bad">Illegal IO Firewall Violation</button>
-            </div>
-            <button class="copy-btn" onclick="copyActiveCode(this)">Copy</button>
-          </div>
+  law transitive(a: PEANO, b: PEANO, c: PEANO)
+    require
+      ab: a.equals(b)
+      bc: b.equals(c)
+    variant
+      a
+    do
+      match a
+        case Zero then True
+        case Succ(p) then
+          match b
+            case Zero then True
+            case Succ(q) then
+              match c
+                case Zero then True
+                case Succ(r) then transitive(p, q, r)
+              end
+          end
+      end
+    ensure
+      ac: a.equals(c)
+    end
 
-          <div class="tab-content active" id="ch5-gdl">
-            <pre><code><span class="kw">group</span> { <span class="type">SEQ</span>, <span class="type">BIGNAT</span>, <span class="type">STRING</span>, <span class="type">OPTION</span>, <span class="type">GREETER</span> }
+specify {CANONICAL_EQ}
 
-<span class="kw">program</span> <span class="type">GREETER</span>
+  law agrees_with_structural(a: PEANO, b: PEANO)
+    variant
+      a
+    do
+      match a
+        case Zero then True
+        case Succ(p) then
+          match b
+            case Zero then True
+            case Succ(q) then agrees_with_structural(p, q)
+          end
+      end
+    ensure
+      sound: a.equals(b) = (a = b)
+    end
 
-<span class="kw">feature</span> {<span class="kw">ANY</span>}
-  main(args: <span class="type">LIST</span>[<span class="type">STRING</span>]): <span class="type">IO</span>[<span class="type">EXIT_CODE</span>]
-    <span class="kw">do</span>
-      <span class="kw">with</span> <span class="type">IO</span>
-        name &lt;- <span class="type">IO</span>.read_line
-        <span class="type">IO</span>.print(<span class="str">"Hello, "</span> + name)
-        <span class="type">IO</span>.exit(<span class="num">0</span>)
-      <span class="kw">end</span>
-    <span class="kw">end</span>
-<span class="kw">end</span></code></pre>
-          </div>
+specify {ORD}
 
-          <div class="tab-content" id="ch5-bad">
-            <pre><code><span class="comment">-- ⚠️ Compiler rejects IO inside pure module:</span>
-<span class="kw">module</span> <span class="type">PURE_BOX</span>
-<span class="kw">representation</span> {<span class="kw">ANY</span>}
-  val: <span class="type">NAT</span>
-<span class="kw">feature</span> {<span class="kw">ANY</span>}
-  bad_effect: <span class="type">IO</span>[<span class="type">EXIT_CODE</span>]
-    <span class="kw">do</span>
-      <span class="kw">with</span> <span class="type">IO</span>  <span class="comment">-- ❌ Phase 4 (IO Boundary Violation): pure modules cannot use with IO</span>
-        <span class="type">IO</span>.print(<span class="str">"illegal side-effect"</span>)
-        <span class="type">IO</span>.exit(<span class="num">0</span>)
-      <span class="kw">end</span>
-    <span class="kw">end</span>
-<span class="kw">end</span></code></pre>
-          </div>
-        </div>
+  law irreflexive(a: PEANO)
+    variant
+      a
+    do
+      match a
+        case Zero then True
+        case Succ(p) then irreflexive(p)
+      end
+    ensure
+      not_less_than_self: not a.less_than(a)
+    end
 
-        <div class="sim-panel">
-          <div class="sim-header">
-            <div class="sim-title">⚡ Execute Native Program & Test Firewall</div>
-            <div class="sim-actions">
-              <button class="btn-run" onclick="runSim(5, 'greeter')">Run Native GREETER</button>
-              <button class="btn-secondary" onclick="runSim(5, 'firewall')">Test IO Firewall</button>
-            </div>
-          </div>
-          <div class="terminal-output" id="term-5"><span class="terminal-prompt">$</span> Test program execution and linearity check above...</div>
-        </div>
+  law transitive(a: PEANO, b: PEANO, c: PEANO)
+    require
+      a_lt_b: a.less_than(b)
+      b_lt_c: b.less_than(c)
+    variant
+      a
+    do
+      match a
+        case Zero then True
+        case Succ(p) then
+          match b
+            case Zero then True
+            case Succ(q) then
+              match c
+                case Zero then True
+                case Succ(r) then transitive(p, q, r)
+              end
+          end
+      end
+    ensure
+      a_lt_c: a.less_than(c)
+    end
 
-        <div class="chapter-nav-footer">
-          <button class="nav-nav-btn" onclick="goToStep(4)">&larr; Previous</button>
-          <button class="nav-nav-btn" onclick="goToStep(6)">Next: Multi-Target Code Generation &rarr;</button>
-        </div>
-      </section>
+  law total(a: PEANO, b: PEANO)
+    variant
+      a
+    do
+      match a
+        case Zero then True
+        case Succ(p) then
+          match b
+            case Zero then True
+            case Succ(q) then total(p, q)
+          end
+      end
+    ensure
+      comparable: a.less_than(b) or a.equals(b) or b.less_than(a)
+    end
 
-      <!-- ======================================================== -->
-      <!-- CHAPTER 6: MULTI-TARGET CODE GENERATION -->
-      <!-- ======================================================== -->
-      <section class="chapter-card" id="chapter-6">
-        <div class="chapter-header">
-          <div class="chapter-tag">Chapter 06 // The Compiler Pipeline</div>
-          <h2 class="chapter-title">One Source, Four Verification & Execution Targets</h2>
-          <p class="chapter-desc">
-            A single Gardel file compiles to four specialized backends simultaneously: SMT verification conditions for Microsoft Boogie, higher-order proof lemmas for Dafny, massively parallel fork-join code for Bend v2, and zero-cost portable C11 with OpenMP.
-          </p>
-        </div>
+end</code></pre><div class="source"><a href="../examples/peano_ord.gdl">examples/peano_ord.gdl</a></div></div>
+  <div class="panel" id="panel-24" role="tabpanel"><pre tabindex="0"><code data-lang="bpl">procedure Verify_law_ORD_total(a: PEANO, b: PEANO)
+  requires PEANO_Invariant(a);
+  requires PEANO_Invariant(b);
+{
+  var _lb0_p: PEANO;
+  var _lb1_q: PEANO;
+  if (is_Zero(a)) {
+  } else if (is_Succ(a)) {
+    _lb0_p := Succ_pred(a);
+    if (is_Zero(b)) {
+    } else if (is_Succ(b)) {
+      _lb1_q := Succ_pred(b);
+      assert {:msg "ORD_total::variant::variant_decrease"} ((PEANO_adt_size(_lb0_p) &lt; PEANO_adt_size(a)));
+      assume ((fn_less_than(DefaultFuel, _lb0_p, _lb1_q) || fn_equals(DefaultFuel, _lb0_p, _lb1_q)) || fn_less_than(DefaultFuel, _lb1_q, _lb0_p));
+    }
+  }
+  assert {:msg "ORD_total::ensure::comparable"} ((fn_less_than(DefaultFuel, a, b) || fn_equals(DefaultFuel, a, b)) || fn_less_than(DefaultFuel, b, a));
+}</code></pre></div>
+  <div class="panel" id="panel-25" role="tabpanel"><pre tabindex="0"><code data-lang="term">$ gardelc examples/peano_ord.gdl --strict
+[2/5] Checked §4 Visibility, §9 Concept Laws, §11 IO Boundary &amp; §12 Direct Verification:
+      0 errors, 0 warnings — all visibility, concept laws, IO linearity, overflow, and contract obligations satisfied.
+$ echo $?
+0</code></pre></div>
+</div>
+<h3>Three kinds of equal</h3>
+<p>A <code>SEQ</code> is a balanced tree, so two sequences holding the same elements can have different shapes. Comparing their structure would be wrong, and if a proof treated it as true, the logic would be unsound. Gardel keeps the three ideas apart.</p>
+<div class="table-wrap"><table>
+  <thead><tr><th>Form</th><th>Means</th><th>Available on</th></tr></thead>
+  <tbody>
+    <tr><td><code>a = b</code></td><td>Same structure, in logic and at run time</td><td>Primitives and <code>CANONICAL_EQ</code> types</td></tr>
+    <tr><td><code>a.equals(b)</code></td><td>Same behaviour, a routine you wrote</td><td><code>EQ</code> types</td></tr>
+    <tr><td><code>a.model = b.model</code></td><td>Same abstract value</td><td>Contracts only, on types with a ghost model</td></tr>
+  </tbody>
+</table></div>
+<div class="viewer">
+  <div class="viewer-bar">
+    <div class="tabs" role="tablist"><button class="tab active" role="tab" aria-selected="true" data-panel="panel-26" data-kind="fail">Using = on SEQ</button></div>
+    <button class="copy" type="button">Copy</button>
+  </div>
+  <div class="panel active" id="panel-26" role="tabpanel"><pre tabindex="0"><code data-lang="term">$ gardelc same_seq.gdl
+[2/5] Checked §4 Visibility, §9 Concept Laws, §11 IO Boundary &amp; §12 Direct Verification:
+      [ERROR] E0311: non_canonical_equality in `same` (non_canonical_equality) at same_seq.gdl:5:3: E0311: non_canonical_equality: `(a = b)` compares `SEQ[U64]` with structural `=`, which is not its equality (§9): use `a.equals(b)` or compare models (`a.model = b.model`)
+$ echo $?
+1</code></pre></div>
+</div>
+<p>The error names the fix. A contract may still use <code>=</code> unless the type declares <code>EQ</code> without <code>CANONICAL_EQ</code>, holds such a type, is <code>F64</code>, or is opaque to the module.</p>
+<div class="pager"><button data-step="3">&larr; Recursion</button><button class="next" data-step="5">Errors and text &rarr;</button></div>
+</section>
 
-        <div class="target-grid">
-          <div class="target-card">
-            <div class="target-card-header">
-              <span class="target-badge badge-bpl">Boogie</span>
-              <span class="target-name">Direct SMT (.bpl)</span>
-            </div>
-            <p class="target-desc">Low-level verification conditions targeting Z3. Fuel theories, variant disjointness, and overflow checks.</p>
-          </div>
+<section class="chapter" id="chapter-5">
+<div class="chapter-tag">Chapter 05 / Data at the edges</div>
+<h2>Bugs are rejected, failures are values</h2>
+<p class="lede">Gardel splits failure in two. If only a mistake in the program could cause it, it is a <code>require</code>, proved at the call site. If the world can cause it, it is a value of type <code>RESULT[E, A]</code> or <code>OPTION[A]</code>, and <code>match</code> must handle it.</p>
+<div class="viewer">
+  <div class="viewer-bar">
+    <div class="tabs" role="tablist"><button class="tab active" role="tab" aria-selected="true" data-panel="panel-27">digits.gdl</button><button class="tab" role="tab" aria-selected="false" data-panel="panel-28" data-kind="pass">Verified</button></div>
+    <button class="copy" type="button">Copy</button>
+  </div>
+  <div class="panel active" id="panel-27" role="tabpanel"><pre tabindex="0"><code data-lang="gdl">functions DIGITS
 
-          <div class="target-card">
-            <div class="target-card-header">
-              <span class="target-badge badge-dfy">Dafny</span>
-              <span class="target-name">Higher-Order (.dfy)</span>
-            </div>
-            <p class="target-desc">Formal inductive datatypes, recursive function definitions, ghost model refinement, and concept law lemmas.</p>
-          </div>
+feature {ANY}
 
-          <div class="target-card">
-            <div class="target-card-header">
-              <span class="target-badge badge-bend">Bend v2</span>
-              <span class="target-name">Massive Parallelism (.bend)</span>
-            </div>
-            <p class="target-desc">Interaction Combinators target compiling to CUDA and Metal GPUs with automatic divide-and-conquer parallelism.</p>
-          </div>
+  digit(c: CHAR): OPTION[NAT]
+    do
+      if c.code &gt;= 48 and c.code &lt;= 57 then Some(c.code - 48) else None end
+    ensure
+      is_digit: Result.is_some implies Result.get &lt;= 9
+    end
 
-          <div class="target-card">
-            <div class="target-card-header">
-              <span class="target-badge badge-c11">C11</span>
-              <span class="target-name">Native C & OpenMP (.c)</span>
-            </div>
-            <p class="target-desc">Clean, portable C11 code compiled with GCC/Clang. Contract erasure for bare-metal runtime efficiency.</p>
-          </div>
-        </div>
+  two_digits(a: CHAR, b: CHAR): OPTION[NAT]
+    do
+      match digit(a)
+        case None then None
+        case Some(x) then
+          match digit(b)
+            case None then None
+            case Some(y) then Some(x * 10 + y)
+          end
+      end
+    ensure
+      at_most_99: Result.is_some implies Result.get &lt;= 99
+    end
 
-        <div class="sim-panel">
-          <div class="sim-header">
-            <div class="sim-title">⚡ Inspect Full Compilation Stages</div>
-            <div class="sim-actions">
-              <button class="btn-run" onclick="runSim(6, 'pipeline')">Run 6-Stage Compiler</button>
-            </div>
-          </div>
-          <div class="terminal-output" id="term-6"><span class="terminal-prompt">$</span> Run full 6-stage multi-target compilation above...</div>
-        </div>
+end</code></pre></div>
+  <div class="panel" id="panel-28" role="tabpanel"><pre tabindex="0"><code data-lang="term">$ gardelc digits.gdl --strict
+[2/5] Checked §4 Visibility, §9 Concept Laws, §11 IO Boundary &amp; §12 Direct Verification:
+      0 errors, 0 warnings — all visibility, concept laws, IO linearity, overflow, and contract obligations satisfied.
+$ echo $?
+0</code></pre></div>
+</div>
+<p>There is no null and no exception. <code>digit</code> returns <code>None</code> for anything that is not a digit, and because the proof can see that <code>x</code> and <code>y</code> are at most 9, the multiplication in <code>two_digits</code> needs no extra guard.</p>
+<p><code>OPTION</code> and <code>RESULT</code> also provide <code>map</code>, <code>and_then</code> and <code>unwrap_or</code>, with their monad laws proven in the standard library. <code>get</code> carries a <code>require</code>, so it only compiles where the value is known to be present.</p>
+<h3>Three layers of text</h3>
+<div class="table-wrap"><table>
+  <thead><tr><th>Type</th><th>What it is</th><th>What it guarantees</th></tr></thead>
+  <tbody>
+    <tr><td><code>BYTES</code></td><td>Raw octets at a boundary</td><td>Nothing about their meaning</td></tr>
+    <tr><td><code>STRING</code></td><td>Opaque UTF-8</td><td>Always valid: the invariant <code>valid_bytes</code> holds for every value</td></tr>
+    <tr><td><code>CHAR</code></td><td>One Unicode scalar value</td><td>Never a surrogate</td></tr>
+  </tbody>
+</table></div>
+<p>A string has two lengths, and the API makes you choose. <code>byte_length</code> counts UTF-8 bytes. <code>code_point_count</code> counts scalars, and is the length of the ghost model <code>chars: LIST[CHAR]</code>. <code>IO.read_line</code> validates its input and returns <code>RESULT[IO_ERROR, STRING]</code>, so a malformed line is an <code>Error</code>, never a crash.</p>
+<div class="viewer">
+  <div class="viewer-bar">
+    <div class="tabs" role="tablist"><button class="tab active" role="tab" aria-selected="true" data-panel="panel-29">lengths.gdl</button><button class="tab" role="tab" aria-selected="false" data-panel="panel-30" data-kind="pass">Run</button></div>
+    <button class="copy" type="button">Copy</button>
+  </div>
+  <div class="panel active" id="panel-29" role="tabpanel"><pre tabindex="0"><code data-lang="gdl">program LENGTHS
 
-        <div class="chapter-nav-footer">
-          <button class="nav-nav-btn" onclick="goToStep(5)">&larr; Previous</button>
-          <button class="nav-nav-btn" onclick="goToStep(7)">Next: CLI Explorer & Playground &rarr;</button>
-        </div>
-      </section>
+feature {ANY}
 
-      <!-- ======================================================== -->
-      <!-- CHAPTER 7: CLI EXPLORER & CHEATSHEET -->
-      <!-- ======================================================== -->
-      <section class="chapter-card" id="chapter-7">
-        <div class="chapter-header">
-          <div class="chapter-tag">Chapter 07 // Practical Usage</div>
-          <h2 class="chapter-title">Compiler CLI Commands & Cheatsheet</h2>
-          <p class="chapter-desc">
-            Everything shown in this tour is available in the repository today. Explore common commands and try them in your local terminal.
-          </p>
-        </div>
+  describe(s: STRING): NAT
+    do
+      s.byte_length - s.code_point_count
+    end
 
-        <div class="code-viewer">
-          <div class="viewer-header">
-            <span style="font-family: 'JetBrains Mono', monospace; font-size: 0.85rem; color: var(--text-muted);">Quick Reference Commands</span>
-            <button class="copy-btn" onclick="copyActiveCode(this)">Copy</button>
-          </div>
-          <div class="tab-content active" id="ch7-cli">
-            <pre><code><span class="comment"># 1. Run all unit tests (11 passing tests)</span>
-<span class="terminal-prompt">cd</span> gardelc
-<span class="terminal-prompt">cargo</span> test
+  main(args: SEQ[STRING]): IO[EXIT_CODE]
+    do
+      with IO
+        line_res &lt;- IO.read_line
+        match line_res
+          case Ok(line) then
+            IO.exit(describe(line))
+          case Error(EndOfInput) then
+            IO.exit(100)
+          case Error(_) then
+            IO.exit(101)
+        end
+      end
+    end
 
-<span class="comment"># 2. Compile and formally verify the standard library</span>
-<span class="terminal-prompt">cargo</span> run -- --stdlib
+end</code></pre></div>
+  <div class="panel" id="panel-30" role="tabpanel"><pre tabindex="0"><code data-lang="term">$ gardelc lengths.gdl --strict
+[2/5] Checked §4 Visibility, §9 Concept Laws, §11 IO Boundary &amp; §12 Direct Verification:
+      0 errors, 0 warnings — all visibility, concept laws, IO linearity, overflow, and contract obligations satisfied.
+      Compiled native executable              -&gt; build/lengths_bin.exe
+$ build/lengths_bin   # the input, and the exit code it gives
+  héllo                    exit 1
+  bytes 62 61 64 20 FF     exit 101
+  no input                 exit 100</code></pre></div>
+</div>
+<p><code>héllo</code> is 6 bytes and 5 scalars, so the program exits with 1. The invalid byte <code>FF</code> takes the <code>Error(_)</code> arm, and an empty input takes <code>Error(EndOfInput)</code>.</p>
+<div class="pager"><button data-step="4">&larr; Concepts and equality</button><button class="next" data-step="6">Effects &rarr;</button></div>
+</section>
 
-<span class="comment"># 3. Inspect public contract specifications (Eiffel short view)</span>
-<span class="terminal-prompt">cargo</span> run -- --stdlib --inspect
-<span class="terminal-prompt">cargo</span> run -- ../examples/bounded_stack.gdl --inspect
+<section class="chapter" id="chapter-6">
+<div class="chapter-tag">Chapter 06 / The IO firewall</div>
+<h2>Effects live in one place</h2>
+<p class="lede">Modules are pure. Only a <code>program</code> can touch the outside world, through <code>main</code> and a linear <code>IO[A]</code> value.</p>
+<div class="viewer">
+  <div class="viewer-bar">
+    <div class="tabs" role="tablist"><button class="tab active" role="tab" aria-selected="true" data-panel="panel-31">greeter.gdl</button><button class="tab" role="tab" aria-selected="false" data-panel="panel-32" data-kind="pass">Run</button><button class="tab" role="tab" aria-selected="false" data-panel="panel-33">pure_box.gdl</button><button class="tab" role="tab" aria-selected="false" data-panel="panel-34" data-kind="fail">Rejected</button></div>
+    <button class="copy" type="button">Copy</button>
+  </div>
+  <div class="panel active" id="panel-31" role="tabpanel"><pre tabindex="0"><code data-lang="gdl" data-source="examples/greeter.gdl">program GREETER
 
-<span class="comment"># 4. Compile and execute natively with input/output</span>
-<span class="terminal-prompt">cargo</span> run -- --stdlib --run
+feature {ANY}
 
-<span class="comment"># 5. Output structured JSON AI diagnostics</span>
-<span class="terminal-prompt">cargo</span> run -- ../examples/tree.gdl --json-diagnostics</code></pre>
-          </div>
-        </div>
+  main(args: SEQ[STRING]): IO[EXIT_CODE]
+    do
+      with IO
+        line_res &lt;- IO.read_line
+        match line_res
+          case Ok(name) then
+            with IO
+              IO.print("Hello, ")
+              IO.print_line(name)
+              IO.exit(0)
+            end
+          case Error(_) then
+            IO.exit(1)
+        end
+      end
+    end
 
-        <div class="sim-panel">
-          <div class="sim-header">
-            <div class="sim-title">⚡ Interactive Command Launcher</div>
-            <div class="sim-actions">
-              <button class="btn-run" onclick="runSim(7, 'test')">Run cargo test</button>
-              <button class="btn-secondary" onclick="runSim(7, 'inspect')">Inspect stdlib</button>
-            </div>
-          </div>
-          <div class="terminal-output" id="term-7"><span class="terminal-prompt">$</span> Click any command button above to preview live output...</div>
-        </div>
+end</code></pre><div class="source"><a href="../examples/greeter.gdl">examples/greeter.gdl</a></div></div>
+  <div class="panel" id="panel-32" role="tabpanel"><pre tabindex="0"><code data-lang="term">$ gardelc examples/greeter.gdl --strict
+[2/5] Checked §4 Visibility, §9 Concept Laws, §11 IO Boundary &amp; §12 Direct Verification:
+      0 errors, 0 warnings — all visibility, concept laws, IO linearity, overflow, and contract obligations satisfied.
+      Compiled native executable              -&gt; build/greeter_bin.exe
+$ echo Ada | build/greeter_bin
+Hello, Ada
+$ echo $?
+0</code></pre></div>
+  <div class="panel" id="panel-33" role="tabpanel"><pre tabindex="0"><code data-lang="gdl">module PURE_BOX
 
-        <div class="chapter-nav-footer">
-          <button class="nav-nav-btn" onclick="goToStep(6)">&larr; Previous</button>
-          <button class="nav-nav-btn" onclick="goToStep(1)">Back to Chapter 1 &uarr;</button>
-        </div>
-      </section>
+representation {ANY}
+  val: NAT
+
+feature {ANY}
+
+  bad_effect: IO[EXIT_CODE]
+    do
+      with IO
+        IO.print("illegal side-effect")
+        IO.exit(0)
+      end
+    end
+
+end</code></pre></div>
+  <div class="panel" id="panel-34" role="tabpanel"><pre tabindex="0"><code data-lang="term">$ gardelc pure_box.gdl
+[2/5] Checked §4 Visibility, §9 Concept Laws, §11 IO Boundary &amp; §12 Direct Verification:
+      [ERROR] Phase 4 (IO Boundary Violation) in `bad_effect` (io_in_pure_module) at pure_box.gdl:8:3: Routine `bad_effect` in `PURE_BOX` uses `IO`, which is only permitted inside a `program` module (§11.1)
+$ echo $?
+1</code></pre></div>
+</div>
+<p>Inside <code>with IO ... end</code>:</p>
+<ul>
+  <li><code>x &lt;- e</code> runs an <code>IO[A]</code> and binds its result to <code>x</code>.</li>
+  <li>A bare statement must be an <code>IO[UNIT]</code>.</li>
+  <li>The last expression gives the block its type.</li>
+</ul>
+<p>An <code>IO</code> value is linear: it is used exactly once on every path, and it cannot be dropped or captured by a closure. In <code>greeter</code>, each <code>match</code> arm is its own <code>IO</code> action, so the <code>Ok</code> arm opens a second <code>with IO</code>. It prints in two calls because <code>STRING.concat</code> requires <code>fits</code>, which cannot be proved for a line of unknown length.</p>
+<div class="note">
+  <h4>Why the firewall matters</h4>
+  <p>Pure code gives the same result however it is scheduled, which is what makes the automatic parallelism in chapter 9 safe. For the verifier, each read from the outside is a fresh, unknown value. The only assumption is the boundary guarantee that an <code>Ok</code> holds a valid <code>STRING</code>.</p>
+</div>
+<div class="pager"><button data-step="5">&larr; Errors and text</button><button class="next" data-step="7">Reactive programs &rarr;</button></div>
+</section>
+
+<section class="chapter" id="chapter-7">
+<div class="chapter-tag">Chapter 07 / Running without end</div>
+<h2>A server that never stops, written in total functions</h2>
+<p class="lede">A <code>program</code> runs and exits. A <code>reactive program</code> runs until told to stop, without any partial function. Non-termination lives in one place, the runtime's event loop, and your code is two total routines.</p>
+<div class="viewer">
+  <div class="viewer-bar">
+    <div class="tabs" role="tablist"><button class="tab active" role="tab" aria-selected="true" data-panel="panel-35">reactive_hello.gdl</button><button class="tab" role="tab" aria-selected="false" data-panel="panel-36">step.gdl</button><button class="tab" role="tab" aria-selected="false" data-panel="panel-37">command.gdl</button><button class="tab" role="tab" aria-selected="false" data-panel="panel-38">event.gdl</button><button class="tab" role="tab" aria-selected="false" data-panel="panel-39">key.gdl</button></div>
+    <button class="copy" type="button">Copy</button>
+  </div>
+  <div class="panel active" id="panel-35" role="tabpanel"><pre tabindex="0"><code data-lang="gdl" data-source="examples/reactive_hello.gdl">-- The smallest reactive program: it greets, waits until told to stop, and says goodbye.
+-- Run it, then press Ctrl-C.
+reactive program REACTIVE_HELLO
+
+feature {ANY}
+
+  init(args: SEQ[STRING]): STEP[NAT]
+    do
+      Continue(0, LIST.empty.prepend(Print("Hello. Press Ctrl-C to stop.")))
+    end
+
+  step(s: NAT, e: EVENT): STEP[NAT]
+    do
+      match e
+        case Shutdown then Stop(0, LIST.empty.prepend(Print("Goodbye.")))
+        case _ then Continue(s, LIST.empty)
+      end
+    end
+
+end</code></pre><div class="source"><a href="../examples/reactive_hello.gdl">examples/reactive_hello.gdl</a></div></div>
+  <div class="panel" id="panel-36" role="tabpanel"><pre tabindex="0"><code data-lang="gdl" data-source="stdlib/core/step.gdl">module STEP[S]
+
+representation {ANY}
+  | Continue(next: S, cmds: LIST[COMMAND])
+  | Stop(code: EXIT_CODE, cmds: LIST[COMMAND])
+
+feature {ANY}
+
+  is_stop: BOOL
+    do
+      match Current
+        case Stop(_, _) then True
+        case _ then False
+      end
+    end
+
+end</code></pre><div class="source"><a href="../stdlib/core/step.gdl">stdlib/core/step.gdl</a></div></div>
+  <div class="panel" id="panel-37" role="tabpanel"><pre tabindex="0"><code data-lang="gdl" data-source="stdlib/core/command.gdl">module COMMAND
+
+representation {ANY}
+  | Print(text: STRING)
+  | SetTimer(id: NAT, millis: U64)
+  | ReadLine
+  | ReadKey
+  | Listen(port: NAT)
+  | Send(conn: CONN_ID, data: BYTES)
+  | Close(conn: CONN_ID)
+
+end</code></pre><div class="source"><a href="../stdlib/core/command.gdl">stdlib/core/command.gdl</a></div></div>
+  <div class="panel" id="panel-38" role="tabpanel"><pre tabindex="0"><code data-lang="gdl" data-source="stdlib/core/event.gdl">module EVENT
+
+representation {ANY}
+  | Tick(id: NAT)
+  | Line(res: RESULT[IO_ERROR, STRING])
+  | Key(key: KEY)
+  | Accepted(conn: CONN_ID)
+  | ListenFailed(port: NAT, err: IO_ERROR)
+  | Received(conn: CONN_ID, data: BYTES)
+  | SendFailed(conn: CONN_ID, err: IO_ERROR)
+  | Closed(conn: CONN_ID)
+  | Shutdown
+
+feature {ANY}
+
+  -- `=` is not available on EVENT, which holds STRING and BYTES payloads (spec §9, §11.6).
+  is_shutdown: BOOL
+    do
+      match Current
+        case Shutdown then True
+        case _ then False
+      end
+    end
+
+end</code></pre><div class="source"><a href="../stdlib/core/event.gdl">stdlib/core/event.gdl</a></div></div>
+  <div class="panel" id="panel-39" role="tabpanel"><pre tabindex="0"><code data-lang="gdl" data-source="stdlib/core/key.gdl">-- One key press, answering `ReadKey` (spec §11.6). A sum type, so that a program handles keys
+-- by name and `match` checks it. Malformed input is `Other`, so `Char` is always a valid CHAR.
+module KEY
+
+representation {ANY}
+  | Char(c: CHAR)
+  | Up
+  | Down
+  | Left
+  | Right
+  | Enter
+  | Escape
+  | Backspace
+  | Tab
+  | Other
+  | KeysEnded
+
+end</code></pre><div class="source"><a href="../stdlib/core/key.gdl">stdlib/core/key.gdl</a></div></div>
+</div>
+<p>The runtime calls <code>init</code>, performs the commands it returns, waits for an event, calls <code>step</code>, and repeats until a step returns <code>Stop</code>. Routines stay pure: they describe commands as values and the host performs them. There is no <code>IO</code> type in a reactive program, and <code>Stop</code> is the only way out. A command that can fail reports it as a later event, and no command blocks the loop.</p>
+<h3>The state proves itself</h3>
+<p>Put the state in an opaque module with an <code>invariant</code>. Since only that module can build a value, the invariant holds after <code>init</code> and after every step, however long the program runs. This small game proves the player can never leave the board, whatever keys arrive.</p>
+<div class="viewer">
+  <div class="viewer-bar">
+    <div class="tabs" role="tablist"><button class="tab active" role="tab" aria-selected="true" data-panel="panel-40">track_board.gdl</button><button class="tab" role="tab" aria-selected="false" data-panel="panel-41">reactive_game.gdl</button><button class="tab" role="tab" aria-selected="false" data-panel="panel-42" data-kind="pass">Verified</button><button class="tab" role="tab" aria-selected="false" data-panel="panel-43" data-kind="pass">Scripted run</button></div>
+    <button class="copy" type="button">Copy</button>
+  </div>
+  <div class="panel active" id="panel-40" role="tabpanel"><pre tabindex="0"><code data-lang="gdl" data-source="examples/reactive_game/track_board.gdl">-- The board of the game. It is opaque, so only these routines can build one, and `on_board`
+-- holds for every position the game can ever reach, whatever keys it receives.
+module TRACK_BOARD
+
+representation {NONE}
+  pos: NAT
+
+invariant
+  on_board: pos &lt; 5
+
+create {ANY}
+
+  start: TRACK_BOARD
+    do
+      { pos = 0 }
+    end
+
+feature {ANY}
+
+  at_goal: BOOL
+    do
+      Current.pos = 4
+    end
+
+  left: TRACK_BOARD
+    do
+      if Current.pos &gt; 0 then { pos = Current.pos - 1 } else Current end
+    end
+
+  right: TRACK_BOARD
+    do
+      if Current.pos + 1 &lt; 5 then { pos = Current.pos + 1 } else Current end
+    end
+
+  view: STRING
+    do
+      if Current.pos = 0 then "@...G"
+      else if Current.pos = 1 then ".@..G"
+      else if Current.pos = 2 then "..@.G"
+      else if Current.pos = 3 then "...@G"
+      else "....@"
+      end end end end
+    end
+
+end</code></pre><div class="source"><a href="../examples/reactive_game/track_board.gdl">examples/reactive_game/track_board.gdl</a></div></div>
+  <div class="panel" id="panel-41" role="tabpanel"><pre tabindex="0"><code data-lang="gdl" data-source="examples/reactive_game/reactive_game.gdl">-- A small turn-based game: walk the @ to the G. Each key is one turn.
+--
+--   gardelc examples/reactive_game --strict
+--   ./build/reactive_game_bin
+reactive program REACTIVE_GAME
+
+feature {ANY}
+
+  init(args: SEQ[STRING]): STEP[TRACK_BOARD]
+    do
+      let board = TRACK_BOARD.start
+      Continue(board, LIST.empty.prepend(ReadKey).prepend(Print(board.view)).prepend(Print("Reach the G. Arrows or h and l move, q quits.")))
+    end
+
+  turn(board: TRACK_BOARD): STEP[TRACK_BOARD]
+    do
+      if board.at_goal then
+        Stop(0, LIST.empty.prepend(Print("You win.")).prepend(Print(board.view)))
+      else
+        Continue(board, LIST.empty.prepend(ReadKey).prepend(Print(board.view)))
+      end
+    end
+
+  letter(board: TRACK_BOARD, c: CHAR): STEP[TRACK_BOARD]
+    do
+      if c = 'q' then Stop(0, LIST.empty.prepend(Print("Bye.")))
+      else if c = 'h' then turn(board.left)
+      else if c = 'l' then turn(board.right)
+      else Continue(board, LIST.empty.prepend(ReadKey))
+      end end end
+    end
+
+  pressed(board: TRACK_BOARD, k: KEY): STEP[TRACK_BOARD]
+    do
+      match k
+        case Left then turn(board.left)
+        case Right then turn(board.right)
+        case Char(c) then letter(board, c)
+        case KeysEnded then Stop(1, LIST.empty.prepend(Print("Input ended.")))
+        case _ then Continue(board, LIST.empty.prepend(ReadKey))
+      end
+    end
+
+  step(board: TRACK_BOARD, e: EVENT): STEP[TRACK_BOARD]
+    do
+      match e
+        case Key(k) then pressed(board, k)
+        case Shutdown then Stop(1, LIST.empty.prepend(Print("Interrupted.")))
+        case _ then Continue(board, LIST.empty)
+      end
+    end
+
+end</code></pre><div class="source"><a href="../examples/reactive_game/reactive_game.gdl">examples/reactive_game/reactive_game.gdl</a></div></div>
+  <div class="panel" id="panel-42" role="tabpanel"><pre tabindex="0"><code data-lang="term">$ gardelc examples/reactive_game --strict
+      examples/reactive_game/reactive_game.gdl: group None, ["ReactiveProgram REACTIVE_GAME"]
+      examples/reactive_game/track_board.gdl: group None, ["Module TRACK_BOARD"]
+[2/5] Checked §4 Visibility, §9 Concept Laws, §11 IO Boundary &amp; §12 Direct Verification:
+      0 errors, 0 warnings — all visibility, concept laws, IO linearity, overflow, and contract obligations satisfied.
+      Compiled native executable              -&gt; build/reactive_game_bin.exe</code></pre></div>
+  <div class="panel" id="panel-43" role="tabpanel"><pre tabindex="0"><code data-lang="term">$ GARDEL_EVENTS='Key:Right Key:Right Key:Left Key:Right Key:Right Key:Right' build/reactive_game_bin
+Reach the G. Arrows or h and l move, q quits.
+@...G
+.@..G
+..@.G
+.@..G
+..@.G
+...@G
+....@
+You win.
+$ echo $?
+0</code></pre></div>
+</div>
+<h3>A bounded echo server</h3>
+<p>The same pattern gives a TCP server with a proven limit of 64 clients. <code>admit</code> requires <code>has_room</code>, so <code>step</code> has to check before it accepts. <code>GARDEL_EVENTS</code> replaces the outside world with a script, which is how the run below works with no sockets at all.</p>
+<div class="viewer">
+  <div class="viewer-bar">
+    <div class="tabs" role="tablist"><button class="tab active" role="tab" aria-selected="true" data-panel="panel-44">server_state.gdl</button><button class="tab" role="tab" aria-selected="false" data-panel="panel-45">echo_server.gdl</button><button class="tab" role="tab" aria-selected="false" data-panel="panel-46" data-kind="pass">Scripted run</button><button class="tab" role="tab" aria-selected="false" data-panel="panel-47" data-kind="fail">Guard removed</button><button class="tab" role="tab" aria-selected="false" data-panel="panel-48" data-kind="fail">Ignoring Shutdown</button></div>
+    <button class="copy" type="button">Copy</button>
+  </div>
+  <div class="panel active" id="panel-44" role="tabpanel"><pre tabindex="0"><code data-lang="gdl" data-source="examples/echo_server/server_state.gdl">-- The live connections of the echo server. It is opaque, so only these routines can build one,
+-- and `within_limit` holds after `init` and after every step of an unbounded run.
+module SERVER_STATE
+
+representation {NONE}
+  live: LIST[CONN_ID]
+  limit: NAT
+
+invariant
+  within_limit: live.length &lt;= limit
+
+create {ANY}
+
+  make(cap: NAT): SERVER_STATE
+    do
+      { live = LIST.empty, limit = cap }
+    end
+
+feature {ANY}
+
+  has_room: BOOL
+    do
+      Current.live.length &lt; Current.limit
+    end
+
+  admit(c: CONN_ID): SERVER_STATE
+    require
+      room: Current.has_room
+    do
+      { Current with live = Current.live.prepend(c) }
+    end
+
+  release(c: CONN_ID): SERVER_STATE
+    do
+      { Current with live = LIST_OPS.filter(Current.live, fn(x: CONN_ID): BOOL do x != c end) }
+    end
+
+end</code></pre><div class="source"><a href="../examples/echo_server/server_state.gdl">examples/echo_server/server_state.gdl</a></div></div>
+  <div class="panel" id="panel-45" role="tabpanel"><pre tabindex="0"><code data-lang="gdl" data-source="examples/echo_server/echo_server.gdl">-- Sends back whatever a client sends, to at most 64 clients at once. The limit is proven: see
+-- `within_limit` in server_state.gdl. Press Ctrl-C to stop.
+--
+--   gardelc examples/echo_server --strict
+reactive program ECHO_SERVER
+
+feature {ANY}
+
+  init(args: SEQ[STRING]): STEP[SERVER_STATE]
+    do
+      Continue(SERVER_STATE.make(64), LIST.empty.prepend(Listen(8888)))
+    end
+
+  step(s: SERVER_STATE, e: EVENT): STEP[SERVER_STATE]
+    do
+      match e
+        case Accepted(c) then
+          if s.has_room then
+            Continue(s.admit(c), LIST.empty)
+          else
+            Continue(s, LIST.empty.prepend(Close(c)))
+          end
+        case Received(c, data) then
+          Continue(s, LIST.empty.prepend(Send(c, data)))
+        case Closed(c) then
+          Continue(s.release(c), LIST.empty)
+        case ListenFailed(_, _) then
+          Stop(1, LIST.empty.prepend(Print("cannot listen on port 8888")))
+        case Shutdown then
+          Stop(0, LIST.empty)
+        case _ then
+          Continue(s, LIST.empty)
+      end
+    end
+
+end</code></pre><div class="source"><a href="../examples/echo_server/echo_server.gdl">examples/echo_server/echo_server.gdl</a></div></div>
+  <div class="panel" id="panel-46" role="tabpanel"><pre tabindex="0"><code data-lang="term">$ GARDEL_EVENTS='Accepted:1 Received:1:hi Closed:1' build/echo_server_bin
+net: Listen 8888
+net: Send 1 hi
+$ echo $?
+0</code></pre></div>
+  <div class="panel" id="panel-47" role="tabpanel"><pre tabindex="0"><code data-lang="term">$ gardelc no_guard --strict
+[2/5] Checked §4 Visibility, §9 Concept Laws, §11 IO Boundary &amp; §12 Direct Verification:
+      [ERROR] Phase 3 Boogie (Precondition Violation) in `step` (room) at no_guard/echo_server.gdl:14:3: Formal verification condition `room` failed in `step`
+            counterexample: { … }
+$ echo $?
+1</code></pre></div>
+  <div class="panel" id="panel-48" role="tabpanel"><pre tabindex="0"><code data-lang="term">$ gardelc bad_step.gdl
+[2/5] Checked §4 Visibility, §9 Concept Laws, §11 IO Boundary &amp; §12 Direct Verification:
+      [ERROR] Phase 4 (Reactive Violation) in `step` (shutdown_must_stop) at bad_step.gdl:10:3: Formal verification condition `shutdown_must_stop` failed in `step`
+            counterexample: { … }
+$ echo $?
+1</code></pre></div>
+</div>
+<p>Two rejections, each a real run. <code>no_guard</code> is <code>echo_server</code> with the <code>has_room</code> test removed, and <code>admit</code>'s precondition <code>room</code> fails. <code>bad_step.gdl</code> always returns <code>Continue</code>. The compiler adds <code>e.is_shutdown implies Result.is_stop</code> to every <code>step</code>, tagged <code>shutdown_must_stop</code>, and you cannot remove it.</p>
+<div class="table-wrap"><table>
+  <thead><tr><th>Guaranteed, given the proofs</th><th>Not guaranteed</th></tr></thead>
+  <tbody>
+    <tr><td>No crash, out-of-bounds access or overflow in any step</td><td>That events ever arrive</td></tr>
+    <tr><td>The state invariant after every step</td><td>That commands succeed, or how long they take</td></tr>
+    <tr><td>Each event is handled in finite time</td><td>The arrival order of concurrent events</td></tr>
+    <tr><td>A <code>Shutdown</code> ends the run with the code <code>step</code> chose</td><td>Liveness, or <code>Shutdown</code> on <code>SIGKILL</code> or power loss</td></tr>
+  </tbody>
+</table></div>
+<div class="pager"><button data-step="6">&larr; Effects</button><button class="next" data-step="8">Record and replay &rarr;</button></div>
+</section>
+
+<section class="chapter" id="chapter-8">
+<div class="chapter-tag">Chapter 08 / Debugging deterministically</div>
+<h2>Same events, same run</h2>
+<p class="lede">A reactive program is a pure function of its arguments and its events. Record those and you can repeat any run exactly, with no terminal, no clock and no network.</p>
+<div class="viewer">
+  <div class="viewer-bar">
+    <div class="tabs" role="tablist"><button class="tab active" role="tab" aria-selected="true" data-panel="panel-49" data-kind="pass">Record</button><button class="tab" role="tab" aria-selected="false" data-panel="panel-50">game.log</button><button class="tab" role="tab" aria-selected="false" data-panel="panel-51" data-kind="pass">Replay</button><button class="tab" role="tab" aria-selected="false" data-panel="panel-52" data-kind="fail">Replay finds a change</button></div>
+    <button class="copy" type="button">Copy</button>
+  </div>
+  <div class="panel active" id="panel-49" role="tabpanel"><pre tabindex="0"><code data-lang="term">$ GARDEL_RECORD=game.log GARDEL_EVENTS='Key:Right Key:Right Key:Right Key:Right' build/reactive_game_bin
+Reach the G. Arrows or h and l move, q quits.
+@...G
+.@..G
+..@.G
+...@G
+....@
+You win.
+$ echo $?
+0</code></pre></div>
+  <div class="panel" id="panel-50" role="tabpanel"><pre tabindex="0"><code data-lang="log">gardel-log 1 REACTIVE_GAME
+command Print:Reach%20the%20G%2E%20Arrows%20or%20h%20and%20l%20move%2C%20q%20quits%2E
+command Print:%40%2E%2E%2EG
+command ReadKey
+event Key:Right
+command Print:%2E%40%2E%2EG
+command ReadKey
+event Key:Right
+command Print:%2E%2E%40%2EG
+command ReadKey
+event Key:Right
+command Print:%2E%2E%2E%40G
+command ReadKey
+event Key:Right
+command Print:%2E%2E%2E%2E%40
+command Print:You%20win%2E
+exit 0</code></pre></div>
+  <div class="panel" id="panel-51" role="tabpanel"><pre tabindex="0"><code data-lang="term">$ GARDEL_REPLAY=game.log build/reactive_game_bin
+Reach the G. Arrows or h and l move, q quits.
+@...G
+.@..G
+..@.G
+...@G
+....@
+You win.
+$ echo $?
+0</code></pre></div>
+  <div class="panel" id="panel-52" role="tabpanel"><pre tabindex="0"><code data-lang="term">$ GARDEL_REPLAY=game.log build/reactive_game_bin   # after changing "You win." to "You won."
+Reach the G. Arrows or h and l move, q quits.
+@...G
+.@..G
+..@.G
+...@G
+....@
+error: replay: the run differs from the log at line 16
+  log: command Print:You%20win%2E
+  run: command Print:You%20won%2E
+$ echo $?
+3</code></pre></div>
+</div>
+<p>The log holds the commands and the exit code as well as the events. Without them a replay could never fail. With them, every command is compared before it takes effect, and the first difference stops the program with exit status 3 and the line that differs. A log from a working build is therefore a regression test for a changed one.</p>
+<div class="table-wrap"><table>
+  <thead><tr><th>Variable</th><th>Effect</th></tr></thead>
+  <tbody>
+    <tr><td><code>GARDEL_RECORD=&lt;file&gt;</code></td><td>Write a log of this run</td></tr>
+    <tr><td><code>GARDEL_REPLAY=&lt;file&gt;</code></td><td>Run from a log. Timers, reads and sockets do not run, so a three-second countdown replays at once.</td></tr>
+    <tr><td><code>GARDEL_EVENTS=&lt;script&gt;</code></td><td>Run from a script of events, such as <code>Tick:1 Key:Up Line:hello%20there Shutdown</code>. The end of the script is a <code>Shutdown</code>.</td></tr>
+    <tr><td><code>GARDEL_LISTEN_ADDR=&lt;ip&gt;</code></td><td>Bind <code>Listen</code> to an address other than loopback</td></tr>
+  </tbody>
+</table></div>
+<p>These are environment variables, not flags, because the command line belongs to the program. A flag would change <code>args</code>, and <code>args</code> are part of the input being replayed.</p>
+<div class="note warn">
+  <h4>What a log does not cover</h4>
+  <p>A log holds everything the program received, in the clear, and has no size limit. On POSIX it is readable by its owner only. A replay shows that the commands repeat, not that their real effects did, such as bytes reaching a client.</p>
+</div>
+<div class="pager"><button data-step="7">&larr; Reactive programs</button><button class="next" data-step="9">Backends &rarr;</button></div>
+</section>
+
+<section class="chapter" id="chapter-9">
+<div class="chapter-tag">Chapter 09 / From source to binary</div>
+<h2>One source, three outputs</h2>
+<p class="lede">Each run writes a Boogie file for the proof, then C11 and Bend for execution. Only C11 runs today.</p>
+<div class="cards">
+  <div class="card">
+    <h4>Boogie</h4>
+    <div class="role">build/&lt;module&gt;.bpl</div>
+    <p>Proof obligations and fuel axioms, discharged by Z3. The verdict is bounded by solver work, not time, so machine load cannot change it. A solver that gives up counts as unproven.</p>
+    <span class="status yes"><svg aria-hidden="true"><use href="#check"/></svg>The only verifier</span>
+  </div>
+  <div class="card">
+    <h4>C11 with OpenMP</h4>
+    <div class="role">build/&lt;module&gt;.c</div>
+    <p>Lowered from source with contracts erased, and compiled by gcc when a <code>program</code> is present. This is the backend behind every run in this tour.</p>
+    <span class="status yes"><svg aria-hidden="true"><use href="#check"/></svg>Runs natively</span>
+  </div>
+  <div class="card">
+    <h4>Bend v2</h4>
+    <div class="role">build/&lt;module&gt;.bend</div>
+    <p>The intended route to CUDA and Metal GPUs. A <code>.bend</code> file is written on each run, but no emitted file has been executed yet.</p>
+    <span class="status no">Emitted, not yet run</span>
+  </div>
+</div>
+<h3>Parallelism you do not write</h3>
+<p>Pure code can be evaluated in any order, so the compiler needs no annotation. When two <code>let</code> bindings make independent recursive calls, they fork. This is <code>max_value</code> from chapter 3.</p>
+<div class="viewer">
+  <div class="viewer-bar">
+    <div class="tabs" role="tablist"><button class="tab active" role="tab" aria-selected="true" data-panel="panel-53">Emitted C11</button><button class="tab" role="tab" aria-selected="false" data-panel="panel-54">Emitted Bend</button></div>
+    <button class="copy" type="button">Copy</button>
+  </div>
+  <div class="panel active" id="panel-53" role="tabpanel"><pre tabindex="0"><code data-lang="c">/* TREE.max_value */
+static uint64_t TREE__max_value(struct TREE* Current) {
+    return ({
+struct TREE* _m2 = Current;
+uint64_t _r2;
+switch (_m2-&gt;tag) {
+case TAG_TREE_Leaf: { uint64_t v = _m2-&gt;Leaf.value; _r2 = v; break; }
+case TAG_TREE_Node: { struct TREE* l = _m2-&gt;Node.left; struct TREE* r = _m2-&gt;Node.right; _r2 = ({
+uint64_t ml;
+uint64_t mr;
+{
+int _pd = gardel_task_depth + 1;
+if (_pd &lt;= GARDEL_TASK_DEPTH) {
+#pragma omp task shared(ml) firstprivate(_pd)
+{ int _s = gardel_task_depth; gardel_task_depth = _pd; ml = TREE__max_value(l); gardel_task_depth = _s; }
+{ int _s = gardel_task_depth; gardel_task_depth = _pd; mr = TREE__max_value(r); gardel_task_depth = _s; }
+#pragma omp taskwait
+} else {</code></pre></div>
+  <div class="panel" id="panel-54" role="tabpanel"><pre tabindex="0"><code data-lang="bend">def max_value(Current):
+  return match Current:
+    case TREE/Leaf { v }:
+      return v
+    case TREE/Node { l, r }:
+      (ml, mr) = (max_value(l), max_value(r))
+      return if (ml &gt;= mr):
+        return ml
+      else:
+        return mr</code></pre></div>
+</div>
+<p>Task depth is capped so that small subtrees do not pay for a fork. On <code>examples/seq_bench.gdl</code>, which builds and sums a balanced <code>SEQ[U64]</code> of 4,000,000 elements on an i9-12900HK, the last roadmap measurement was <strong>196 ms on 1 thread and 66 ms on 20</strong>.</p>
+<div class="note">
+  <h4>Memory</h4>
+  <p>There is no tracing garbage collector. Values are immutable and acyclic, so reference counting frees everything at a predictable point. Counts are atomic, ownership moves on last use to avoid count updates, and a thread-local allocator serves small blocks. Reusing a unique value in place is deferred. Self tail calls become loops; mutual recursion still uses the stack.</p>
+</div>
+<div class="pager"><button data-step="8">&larr; Record and replay</button><button class="next" data-step="10">Projects and the prelude &rarr;</button></div>
+</section>
+
+<section class="chapter" id="chapter-10">
+<div class="chapter-tag">Chapter 10 / Organizing code</div>
+<h2>No imports, one namespace</h2>
+<p class="lede">There are no import statements. Pass the compiler several files, a directory or a wildcard, and they link into one flat namespace, with the prelude already in scope.</p>
+<ul>
+  <li>Each file holds one unit: <code>module</code>, <code>concept</code>, <code>functions</code>, <code>program</code> or <code>reactive program</code>. A file whose name does not match gives warning <code>W0201</code>.</li>
+  <li>Two units with one name are <code>E0102</code>. A dependency cycle across files is <code>E0103</code>, because each proof would trust the other.</li>
+  <li>Nothing may refer to a <code>program</code>: <code>E0104</code>. Entry points are the roots of a run.</li>
+  <li><code>group { A, B }</code> no longer pulls in a library. It is only for modules whose proofs depend on each other in a cycle.</li>
+</ul>
+<h3>What is always available</h3>
+<div class="table-wrap"><table>
+  <thead><tr><th>Area</th><th>Names</th></tr></thead>
+  <tbody>
+    <tr><td>Concepts</td><td><code>EQ</code>, <code>CANONICAL_EQ</code>, <code>ORD</code></td></tr>
+    <tr><td>Core</td><td><code>OPTION</code>, <code>RESULT</code>, <code>IO_ERROR</code></td></tr>
+    <tr><td>Collections</td><td><code>SEQ</code>, <code>LIST</code>, <code>LIST_OPS</code></td></tr>
+    <tr><td>Numeric</td><td><code>BIGNAT</code>, and the ghost <code>MATH_INT</code></td></tr>
+    <tr><td>Text</td><td><code>STRING</code>, <code>BYTES</code>, <code>STRING_ERROR</code></td></tr>
+    <tr><td>Functions</td><td><code>FUNCTION_OPS</code></td></tr>
+    <tr><td>Reactive</td><td><code>STEP</code>, <code>COMMAND</code>, <code>EVENT</code>, <code>KEY</code>, <code>CONN_ID</code></td></tr>
+  </tbody>
+</table></div>
+<h3>Two layers: one to run, one to prove</h3>
+<p><code>SEQ</code>, <code>BIGNAT</code> and <code>STRING</code> split what runs fast from what is easy to reason about. <code>SEQ[A]</code> is a balanced tree with cheap concatenation and natural parallelism, but its contracts are stated over a simple ghost <code>LIST[A]</code> called <code>model</code>. Every operation promises how it changes the model, so a proof never has to think about balance. This is the method of Hoare's 1972 paper on proving data representations correct. For example, <code>concat</code> ensures <code>Result.model = Current.model.append(other.model)</code>.</p>
+<p>The prelude ships inside the <code>gardelc</code> binary and is trusted during a normal run. <code>gardelc --stdlib --strict</code> re-verifies all 18 source files. To read one, use <code>gardelc --stdlib --inspect SEQ</code>, or write the whole set to disk with <code>--emit-stdlib</code>.</p>
+<div class="pager"><button data-step="9">&larr; Backends</button><button class="next" data-step="11">Command line &rarr;</button></div>
+</section>
+
+<section class="chapter" id="chapter-11">
+<div class="chapter-tag">Chapter 11 / Reference</div>
+<h2>Using gardelc</h2>
+<p class="lede">Build the compiler, then point it at a file or a folder. Verification needs Boogie and Z3, and native output needs gcc or clang. <code>scripts/install_tools</code> sets up the two provers.</p>
+<div class="viewer">
+  <div class="viewer-bar">
+    <div class="tabs" role="tablist"><button class="tab active" role="tab" aria-selected="true" data-panel="panel-55">Common commands</button></div>
+    <button class="copy" type="button">Copy</button>
+  </div>
+  <div class="panel active" id="panel-55" role="tabpanel"><pre tabindex="0"><code data-lang="shell"># Build and test, from the repository root
+cargo build --release --manifest-path gardelc/Cargo.toml
+cargo test --manifest-path gardelc/Cargo.toml
+
+# Put gardelc on your PATH
+cargo install --path gardelc
+
+# Verify and compile a file, or a folder as one project
+gardelc examples/bounded_stack.gdl
+gardelc examples/echo_server --strict
+
+# Read a module's public contracts
+gardelc examples/bounded_stack.gdl --inspect
+gardelc --stdlib --inspect SEQ
+
+# Verify the whole standard library
+gardelc --stdlib --strict
+
+# Build and run a program
+gardelc examples/greeter.gdl --run
+
+# Get failures as JSON
+gardelc examples/tree.gdl --json-diagnostics
+
+# Build a reactive program, then run it
+gardelc examples/reactive_game --strict
+./build/reactive_game_bin</code></pre></div>
+</div>
+<div class="table-wrap"><table>
+  <thead><tr><th>Flag</th><th>Effect</th></tr></thead>
+  <tbody>
+    <tr><td><code>--strict</code></td><td>Reject any <code>assume</code></td></tr>
+    <tr><td><code>--audit</code></td><td>Report every <code>assume</code></td></tr>
+    <tr><td><code>--inspect [MODULE]</code></td><td>Print each routine's public contract, as Eiffel's short form does</td></tr>
+    <tr><td><code>--json-diagnostics</code></td><td>Failures as a JSON array, for tools and agents</td></tr>
+    <tr><td><code>--run</code></td><td>Verify, build, and start the program</td></tr>
+    <tr><td><code>--fuel &lt;N&gt;</code></td><td>Depth to unfold recursive definitions, 2 by default</td></tr>
+    <tr><td><code>--z3-seed &lt;N&gt;</code></td><td>Solver seed, used to check that a proof is stable</td></tr>
+    <tr><td><code>--z3-rlimit &lt;N&gt;</code></td><td>Solver work limit for each Boogie procedure</td></tr>
+    <tr><td><code>--stdlib</code></td><td>Verify the standard library sources</td></tr>
+    <tr><td><code>--emit-stdlib [DIR]</code></td><td>Write the embedded library to disk, never overwriting an edited file</td></tr>
+    <tr><td><code>--no-prelude</code></td><td>Compile without the prelude</td></tr>
+    <tr><td><code>--bounded-check</code></td><td>Bounded symbolic checking, not a proof</td></tr>
+  </tbody>
+</table></div>
+<p>For depth, read the <a href="../guide/GUIDE.md">programming guide</a> and the <a href="../spec/gardel_language_specification_draft_v0_5.md">specification</a>. To go further, open the programs in <code>examples/</code>. Each of the reactive ones starts with the command that builds it.</p>
+<div class="pager"><button data-step="10">&larr; Projects and the prelude</button><button class="next" data-step="1">Back to chapter 1</button></div>
+</section>
 
     </div>
   </main>
 
+  <footer class="site-footer">
+    <p>Code tabs that name a repository file hold that file verbatim. Terminal tabs are recorded output from <code>gardelc</code> at commit <code>6c07b80</code> on 2026-11-05, with steps 0 and 1 left out after chapter 1.</p>
+  </footer>
+
   <script>
-    // Tab Switching Logic
-    document.addEventListener('DOMContentLoaded', () => {
-      setupTabs();
-      setupStepper();
-    });
+    const GDL_KEYWORDS = new Set('module functions program reactive concept representation create feature specify law satisfies refines where group do end if then else match case let with fn check assume reveal variant forall exists implies and or not in'.split(' '));
+    const GDL_CONTRACTS = new Set('require ensure invariant'.split(' '));
+    const GDL_SPECIAL = new Set('Current Result True False ANY NONE'.split(' '));
+    const C_KEYWORDS = new Set('static inline return struct if else switch case break default int void sizeof _Atomic'.split(' '));
+    const BPL_KEYWORDS = new Set('procedure returns requires ensures var assert assume if else axiom forall type const unique function int bool'.split(' '));
+    const BEND_KEYWORDS = new Set('def return match case if else type'.split(' '));
+
+    const escapeHtml = s => s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+    const span = (cls, s) => `<span class="${cls}">${escapeHtml(s)}</span>`;
+
+    function highlightCode(src, lang) {
+      const comment = lang === 'gdl' ? '--[^\\n]*' : lang === 'bend' ? '//[^\\n]*' : '//[^\\n]*|/\\*[\\s\\S]*?\\*/';
+      const token = new RegExp(`(${comment})|("(?:[^"\\\\\\n]|\\\\.)*"|'(?:[^'\\\\\\n]|\\\\.)')|(\\b\\d[\\d_]*(?:ULL)?\\b)|(#pragma[^\\n]*)|([A-Za-z_][A-Za-z0-9_]*)`, 'g');
+      let out = '', last = 0;
+      for (const m of src.matchAll(token)) {
+        out += escapeHtml(src.slice(last, m.index));
+        last = m.index + m[0].length;
+        const word = m[5];
+        if (m[1]) out += span('t-comment', m[1]);
+        else if (m[2] || m[3]) out += span('t-lit', m[0]);
+        else if (m[4]) out += span('t-kw', m[4]);
+        else if (lang === 'gdl') {
+          if (GDL_CONTRACTS.has(word)) out += span('t-contract', word);
+          else if (GDL_KEYWORDS.has(word) || GDL_SPECIAL.has(word)) out += span('t-kw', word);
+          else if (/^[A-Z][A-Z0-9_]+$/.test(word)) out += span('t-type', word);
+          else out += word;
+        }
+        else if ((lang === 'c' && C_KEYWORDS.has(word)) || (lang === 'bpl' && BPL_KEYWORDS.has(word)) || (lang === 'bend' && BEND_KEYWORDS.has(word))) out += span('t-kw', word);
+        else if (lang === 'bpl' && (word === 'Result' || word === 'Current')) out += span('t-kw', word);
+        else out += word;
+      }
+      return out + escapeHtml(src.slice(last));
+    }
+
+    function highlightJson(src) {
+      return src.split('\n').map(line => {
+        if (line.startsWith('//')) return span('t-comment', line);
+        return escapeHtml(line).replace(/(&quot;|")([^"]*)"(\s*:)?/g, (all, q, body, colon) =>
+          colon ? `<span class="t-kw">"${body}"</span>${colon}` : `<span class="t-lit">"${body}"</span>`);
+      }).join('\n');
+    }
+
+    function highlightTerm(src) {
+      return src.split('\n').map(line => {
+        if (line.startsWith('$ ')) return `<span class="t-prompt">$</span> ${escapeHtml(line.slice(2))}`;
+        if (/\[ERROR\]|^error:/.test(line)) return span('t-err', line);
+        if (/^\s*(0 errors|Compiled native|You win)/.test(line)) return span('t-ok', line);
+        if (/\[AUDIT\]|\[WARNING\]/.test(line)) return span('t-lit', line);
+        if (/^\[\d\/5\]|^\s*(counterexample|relevant_lemmas):/.test(line)) return span('t-dim', line);
+        return escapeHtml(line);
+      }).join('\n');
+    }
+
+    function highlightLog(src) {
+      return src.split('\n').map(line => {
+        const m = line.match(/^(gardel-log|event|command|exit|arg)(.*)$/);
+        return m ? span(m[1] === 'event' ? 't-contract' : 't-kw', m[1]) + escapeHtml(m[2]) : escapeHtml(line);
+      }).join('\n');
+    }
+
+    function highlightShell(src) {
+      return src.split('\n').map(line => line.startsWith('#') ? span('t-comment', line) : escapeHtml(line)).join('\n');
+    }
+
+    function highlightAll() {
+      for (const code of document.querySelectorAll('pre code[data-lang]')) {
+        const lang = code.dataset.lang;
+        const src = code.textContent;
+        if (lang === 'term') code.innerHTML = highlightTerm(src);
+        else if (lang === 'json') code.innerHTML = highlightJson(src);
+        else if (lang === 'log') code.innerHTML = highlightLog(src);
+        else if (lang === 'shell') code.innerHTML = highlightShell(src);
+        else code.innerHTML = highlightCode(src, lang);
+      }
+    }
 
     function setupTabs() {
-      const viewerHeaders = document.querySelectorAll('.viewer-header');
-      viewerHeaders.forEach(header => {
-        const tabs = header.querySelectorAll('.tab-btn');
-        tabs.forEach(tab => {
+      for (const viewer of document.querySelectorAll('.viewer')) {
+        for (const tab of viewer.querySelectorAll('.tab')) {
           tab.addEventListener('click', () => {
-            const tabId = tab.getAttribute('data-tab');
-            const parent = header.closest('.code-viewer');
-            
-            // Toggle tab buttons
-            header.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
-            tab.classList.add('active');
-
-            // Toggle contents
-            parent.querySelectorAll('.tab-content').forEach(c => c.classList.remove('active'));
-            const target = parent.querySelector(`#${tabId}`);
-            if (target) target.classList.add('active');
+            viewer.querySelectorAll('.tab').forEach(t => {
+              t.classList.toggle('active', t === tab);
+              t.setAttribute('aria-selected', String(t === tab));
+            });
+            viewer.querySelectorAll('.panel').forEach(p => p.classList.toggle('active', p.id === tab.dataset.panel));
+          });
+        }
+        viewer.querySelector('.copy').addEventListener('click', event => {
+          const code = viewer.querySelector('.panel.active code');
+          const button = event.currentTarget;
+          navigator.clipboard.writeText(code.textContent).then(() => {
+            button.textContent = 'Copied';
+            setTimeout(() => { button.textContent = 'Copy'; }, 1500);
           });
         });
-      });
-    }
-
-    function setupStepper() {
-      const stepBtns = document.querySelectorAll('.step-btn');
-      stepBtns.forEach(btn => {
-        btn.addEventListener('click', () => {
-          const stepNum = btn.getAttribute('data-step');
-          goToStep(stepNum);
-        });
-      });
-    }
-
-    function goToStep(num) {
-      // Update stepper active class
-      document.querySelectorAll('.step-btn').forEach(btn => {
-        btn.classList.toggle('active', btn.getAttribute('data-step') === String(num));
-      });
-
-      // Update chapter card active class
-      document.querySelectorAll('.chapter-card').forEach(card => {
-        card.classList.toggle('active', card.id === `chapter-${num}`);
-      });
-
-      // Scroll to content on mobile or top of tour
-      const activeCard = document.querySelector(`#chapter-${num}`);
-      if (activeCard && window.innerWidth < 960) {
-        activeCard.scrollIntoView({ behavior: 'smooth', block: 'start' });
-      } else {
-        window.scrollTo({ top: 380, behavior: 'smooth' });
       }
     }
 
-    function copyActiveCode(btn) {
-      const viewer = btn.closest('.code-viewer');
-      const activeContent = viewer.querySelector('.tab-content.active pre code');
-      if (activeContent) {
-        navigator.clipboard.writeText(activeContent.innerText).then(() => {
-          const orig = btn.innerText;
-          btn.innerText = 'Copied!';
-          setTimeout(() => btn.innerText = orig, 1500);
-        });
+    function showChapter(num, { scroll = true } = {}) {
+      const chapter = document.getElementById(`chapter-${num}`);
+      if (!chapter) return;
+      document.querySelectorAll('.chapter').forEach(c => c.classList.toggle('active', c === chapter));
+      document.querySelectorAll('.step-btn').forEach(b => {
+        const on = b.dataset.step === String(num);
+        b.classList.toggle('active', on);
+        if (on) b.setAttribute('aria-current', 'true'); else b.removeAttribute('aria-current');
+      });
+      if (scroll) {
+        history.replaceState(null, '', `#chapter-${num}`);
+        const reduce = matchMedia('(prefers-reduced-motion: reduce)').matches;
+        chapter.scrollIntoView({ behavior: reduce ? 'auto' : 'smooth', block: 'start' });
       }
     }
 
-    // Interactive Terminal Simulation Outputs
-    const simOutputs = {
-      1: {
-        verify: `<span class="terminal-prompt">$ cargo run -- ../examples/bounded_stack.gdl --boogie</span>
-<span class="terminal-info">[1/6]</span> Parsed 0 concepts [], group None, and Module \`BOUNDED_STACK\` (type params: ["A"], satisfies: None, laws: 0, fuel: 2)
-<span class="terminal-info">[2/6]</span> Checked §4 Visibility, §9 Concept Laws, §11 IO Boundary & §12 Direct Verification:
-      <span class="terminal-success">0 errors, 0 warnings — all visibility, concept laws, IO linearity, overflow, and contract obligations satisfied.</span>
-<span class="terminal-info">[3/6]</span> Emitted direct Boogie VCs & fuel axioms -> build/bounded_stack.bpl
-<span class="terminal-info">[4/6]</span> Emitted Dafny refinement & law lemmas   -> build/bounded_stack.dfy
-<span class="terminal-info">[5/6]</span> Emitted monomorphized Bend v2 target    -> build/bounded_stack.bend
-<span class="terminal-info">[6/6]</span> Emitted C11 runtime target              -> build/bounded_stack.c
-      Compiled native executable              -> build/bounded_stack_bin.exe
-
-<span class="terminal-success">Boogie program verifier finished with 4 verified, 0 errors</span>`
-      },
-      2: {
-        reveal: `<span class="terminal-prompt">$ cargo run -- ../examples/tree.gdl --fuel 2</span>
-<span class="terminal-info">[1/6]</span> Parsed Module \`TREE\`
-<span class="terminal-info">[2/6]</span> Direct Boogie Verification:
-      Verifying procedure Verify_max_value...
-      Unfolding \`leaves\` enabled by \`reveal leaves\` token (fuel elevated to RevealFuel).
-      Proving postcondition \`attained: Current.leaves.has(Result)\`...
-<span class="terminal-success">Verification Succeeded: 2 procedures verified, 0 errors.</span>`,
-        opaque: `<span class="terminal-prompt">$ cargo run -- ../examples/tree.gdl (without reveal)</span>
-<span class="terminal-error">[ERROR] Phase 3 (Opaque Fuel Exhausted) in \`max_value\` (attained):</span>
-      Postcondition \`attained\` could not be proven with fuel=2; add \`reveal leaves\` or increase \`--fuel\`
-      <span class="terminal-info">Suggested remedy:</span> Insert \`reveal leaves\` into routine block.`
-      },
-      3: {
-        bug: `<span class="terminal-prompt">$ cargo run -- test_midpoint_bug.gdl --boogie</span>
-<span class="terminal-error">[ERROR] Phase 3 Boogie (Arithmetic Overflow) in \`midpoint\` (overflow_add) at midpoint.gdl:8:7:</span>
-      Formal verification condition \`overflow_add\` failed in \`midpoint\`
-      <span class="terminal-info">Path Conditions:</span> ["(lo <= hi)"]
-      <span class="terminal-error">Counterexample Model (from Z3 SMT Prover):</span>
-        lo = 1
-        hi = 18446744073709551615
-      <span class="terminal-info">Diagnosis:</span> (lo + hi) = 1 + 18446744073709551615 wraps around in 64-bit integer arithmetic!`,
-        fix: `<span class="terminal-prompt">$ cargo run -- test_midpoint_fixed.gdl --boogie</span>
-<span class="terminal-info">[2/6]</span> Checked Verification Conditions:
-      Evaluating \`lo + (hi - lo) / 2\` under \`lo <= hi\`:
-      - Underflow check: \`hi - lo >= 0\`: <span class="terminal-success">PROVEN</span>
-      - Overflow check: \`lo + (hi - lo)/2 <= hi\`: <span class="terminal-success">PROVEN</span>
-      - Postcondition \`in_range\`: <span class="terminal-success">PROVEN</span>
-<span class="terminal-success">0 errors, 0 warnings — all obligations formally satisfied!</span>`
-      },
-      4: {
-        peano: `<span class="terminal-prompt">$ cargo run -- ../examples/peano_ord.gdl --boogie</span>
-<span class="terminal-info">[1/6]</span> Parsed 2 concepts ["ORD", "EQ"], group None, and Module \`PEANO\` (satisfies: Some(["ORD"]), laws: 4, fuel: 2)
-<span class="terminal-info">[2/6]</span> Checked §9 Concept Laws & §12 Direct Verification:
-      - Law \`agrees_with_structural\`: <span class="terminal-success">PROVEN (Z3 SMT)</span>
-      - Law \`irreflexive\`: <span class="terminal-success">PROVEN (Z3 SMT)</span>
-      - Law \`transitive\`: <span class="terminal-success">PROVEN (Z3 Multi-trigger)</span>
-      - Law \`total\`: <span class="terminal-success">PROVEN (Z3 SMT)</span>
-<span class="terminal-success">0 errors, 0 warnings — all 4 mathematical laws mathematically sound.</span>`
-      },
-      5: {
-        greeter: `<span class="terminal-prompt">$ cargo run -- --stdlib --run</span>
-<span class="terminal-info">=== [0] Direct Boogie + Z3 Verification (build/greeter.bpl) ===</span>
-<span class="terminal-success">Boogie program verifier finished with 1 verified, 0 errors</span>
-<span class="terminal-info">=== [1] Dafny Formal Verification (Routines + Concept Laws) ===</span>
-<span class="terminal-success">Dafny program verifier finished with 2 verified, 0 errors</span>
-<span class="terminal-info">=== [2] Executing Native Executable (build/greeter_bin.exe) ===</span>
-Javier
-<span class="terminal-success">Hello, Javier</span>`,
-        firewall: `<span class="terminal-prompt">$ cargo run -- test_bad_io.gdl</span>
-<span class="terminal-error">[ERROR] Phase 4 (IO Boundary Violation) in module \`PURE_BOX\` at test_bad_io.gdl:7:7:</span>
-      Pure module \`PURE_BOX\` contains \`with IO\`; side-effects are only permitted in \`program\` entrypoints.
-      <span class="terminal-info">Purity Firewall:</span> Pure ADTs must remain referentially transparent and confluent.`
-      },
-      6: {
-        pipeline: `<span class="terminal-prompt">$ cargo run -- ../examples/bounded_stack.gdl --boogie</span>
-<span class="terminal-info">[1/6]</span> Parsed Module \`BOUNDED_STACK[A]\`
-<span class="terminal-info">[2/6]</span> Checked §4 Visibility & §12 Contracts: <span class="terminal-success">0 errors</span>
-<span class="terminal-info">[3/6]</span> Emitted direct Boogie VCs -> <span class="terminal-cyan">build/bounded_stack.bpl</span>
-<span class="terminal-info">[4/6]</span> Emitted Dafny refinement   -> <span class="terminal-indigo">build/bounded_stack.dfy</span>
-<span class="terminal-info">[5/6]</span> Emitted Bend v2 target     -> <span class="terminal-pink">build/bounded_stack.bend</span>
-<span class="terminal-info">[6/6]</span> Emitted C11 runtime target -> <span class="terminal-emerald">build/bounded_stack.c</span>
-      Compiled native binary     -> <span class="terminal-success">build/bounded_stack_bin.exe</span>`
-      },
-      7: {
-        test: `<span class="terminal-prompt">$ cargo test</span>
-   Compiling gardelc v0.1.0 (gardelc)
-    Finished \`test\` profile in 1.45s
-     Running unittests src\\main.rs
-test tests::test_single_module_pipeline_v0_4 ... <span class="terminal-success">ok</span>
-test tests::test_boogie_fuel_monomorphization_bounded_stack ... <span class="terminal-success">ok</span>
-test tests::test_phase3_boogie_emission_and_fuel ... <span class="terminal-success">ok</span>
-test tests::test_phase3_overflow_counterexample_translation ... <span class="terminal-success">ok</span>
-test tests::test_phase3_fuel_exhaustion_and_reveal_fix ... <span class="terminal-success">ok</span>
-test tests::test_phase3_assume_audit_and_strict ... <span class="terminal-success">ok</span>
-test tests::test_phase4_stdlib_package_verifies_all_modules ... <span class="terminal-success">ok</span>
-test tests::test_phase4_io_boundary_and_linearity_firewall ... <span class="terminal-success">ok</span>
-test tests::test_phase4_inspect_module_interface ... <span class="terminal-success">ok</span>
-test tests::test_phase2_variant_disjointness_and_distinct_strings ... <span class="terminal-success">ok</span>
-test tests::test_phase2_canonical_record_ordering ... <span class="terminal-success">ok</span>
-test tests::test_phase2_capture_avoiding_substitution ... <span class="terminal-success">ok</span>
-test tests::test_phase2_general_numeric_variant_termination ... <span class="terminal-success">ok</span>
-
-<span class="terminal-success">test result: ok. 11 passed; 0 failed; finished in 3.28s</span>`,
-        inspect: `<span class="terminal-prompt">$ cargo run -- --stdlib --inspect</span>
-module OPTION[A]
-  feature Any is_some: BOOL, Any get: A (require present: Current.is_some)
-
-module SEQ[A]
-  representation | Empty | Leaf(value: A) | Concat(left: SEQ[A], right: SEQ[A])
-  create  empty (ensure empty_len: Result.length = 0), singleton (ensure unit_len: Result.length = 1)
-  feature length: NAT, concat(other: SEQ[A]): SEQ[A]
-  specify model: LIST[A]
-
-module BIGNAT
-  invariant size_matches: (size = limbs.length), bounded_limbs: (size <= 1024)
-
-program GREETER
-  feature Any main(args: LIST[STRING]): IO[EXIT_CODE]`
-      }
-    };
-
-    function runSim(chapter, action) {
-      const term = document.getElementById(`term-${chapter}`);
-      if (!term) return;
-
-      term.innerHTML = `<span class="terminal-prompt">$</span> Running verification query...`;
-      setTimeout(() => {
-        if (simOutputs[chapter] && simOutputs[chapter][action]) {
-          term.innerHTML = simOutputs[chapter][action];
-        }
-      }, 250);
+    function fromHash(options) {
+      const m = location.hash.match(/^#chapter-(\d+)$/);
+      if (m) showChapter(m[1], options);
     }
+
+    document.addEventListener('DOMContentLoaded', () => {
+      highlightAll();
+      setupTabs();
+      document.querySelectorAll('[data-step]').forEach(b => b.addEventListener('click', () => showChapter(b.dataset.step)));
+      window.addEventListener('hashchange', () => fromHash({ scroll: true }));
+      fromHash({ scroll: true });
+    });
   </script>
 </body>
 </html>

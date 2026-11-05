@@ -5231,6 +5231,11 @@ thread_local! {
     static BOOGIE_LIFTED_LAMBDAS: std::cell::RefCell<String> =
         const { std::cell::RefCell::new(String::new()) };
     static BOOGIE_LAMBDA_COUNTER: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// Procedure locals for the binders and lambda parameters of nested expressions (see
+    /// `emit_boogie_expr_obligations`), drained by `emit_boogie_verify_routine`.
+    static BOOGIE_OBLIGATION_LOCALS: std::cell::RefCell<Vec<(String, String)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+    static BOOGIE_OBLIGATION_COUNTER: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 /// Variables of `e` (and of the statements of nested blocks) that are not bound inside it.
@@ -8661,20 +8666,13 @@ fn emit_boogie_verify_routine(
 
     let mut locals = Vec::new();
     collect_proc_locals(&r.stmts, &r.body, r, m, &mut locals);
-    let mut seen_locals = HashSet::new();
-    for (vname, bty) in &locals {
-        if seen_locals.insert(vname.clone()) {
-            s.push_str(&format!("  var {vname}: {bty};\n"));
-        }
-    }
-    s.push_str(&emit_string_literal_lemma_calls(strings));
+    let mut code = emit_string_literal_lemma_calls(strings);
     for (_, req_e) in &r.requires {
-        s.push_str(&emit_from_scalar_obligation(
+        code.push_str(&emit_from_scalar_obligation(
             req_e, &r.name, m, &revealed, "  ", strings,
         ));
     }
-
-    s.push_str(&emit_boogie_proc_stmts_and_ret(
+    code.push_str(&emit_boogie_proc_stmts_and_ret(
         &r.stmts,
         &r.body,
         r,
@@ -8683,6 +8681,15 @@ fn emit_boogie_verify_routine(
         2,
         strings,
     ));
+    // Emitting the body may have added locals for nested binders and lambda parameters.
+    locals.extend(BOOGIE_OBLIGATION_LOCALS.with(|l| std::mem::take(&mut *l.borrow_mut())));
+    let mut seen_locals = HashSet::new();
+    for (vname, bty) in &locals {
+        if seen_locals.insert(vname.clone()) {
+            s.push_str(&format!("  var {vname}: {bty};\n"));
+        }
+    }
+    s.push_str(&code);
 
     let returns_mod = r.ret_type == "Current"
         || r.ret_type == m.name
@@ -9579,23 +9586,9 @@ fn collect_proc_locals(
             collect_proc_locals(es, ee, r, m, out);
         }
         Expr::Match(scrut, cases) => {
-            let ctx = boogie_prelude_ctx();
             for c in cases {
                 if let Some((proj_prefix, vdecl)) = boogie_match_variant(c.ctor(), m) {
-                    // Prelude variant fields are instantiated from the scrutinee's type.
-                    let mut inst = HashMap::new();
-                    if let (false, Some(ctx)) = (proj_prefix.is_empty(), ctx.as_ref()) {
-                        if let Some(owner) = ctx.module(proj_prefix.trim_end_matches('_')) {
-                            if let Some(st) = infer_gardel_type(scrut, m, ctx) {
-                                unify_type(
-                                    &module_self_type(owner),
-                                    &st,
-                                    &owner.type_params,
-                                    &mut inst,
-                                );
-                            }
-                        }
-                    }
+                    let inst = match_field_instantiation(scrut, &proj_prefix, m);
                     for (opt_b, (_, fty)) in c.top_bindings().iter().zip(vdecl.fields.iter()) {
                         if let Some(b) = opt_b {
                             if proj_prefix.is_empty() {
@@ -9627,6 +9620,27 @@ fn collect_proc_locals(
         }
         _ => {}
     }
+}
+
+/// Type arguments of a prelude constructor's fields, from the type of `scrut`. A module's
+/// own constructors (`proj_prefix` empty) use the field types as declared.
+fn match_field_instantiation(
+    scrut: &Expr,
+    proj_prefix: &str,
+    m: &ModuleDecl,
+) -> HashMap<String, String> {
+    let mut inst = HashMap::new();
+    if proj_prefix.is_empty() {
+        return inst;
+    }
+    if let Some(ctx) = boogie_prelude_ctx() {
+        if let Some(owner) = ctx.module(proj_prefix.trim_end_matches('_')) {
+            if let Some(st) = infer_gardel_type(scrut, m, &ctx) {
+                unify_type(&module_self_type(owner), &st, &owner.type_params, &mut inst);
+            }
+        }
+    }
+    inst
 }
 
 fn infer_boogie_expr_type(e: &Expr, r: &RoutineDecl, m: &ModuleDecl) -> String {
@@ -9832,6 +9846,9 @@ fn emit_boogie_proc_stmts_and_ret(
             ));
         }
         Expr::Match(scrut, cases) => {
+            s.push_str(&emit_boogie_expr_obligations(
+                scrut, r, m, revealed, indent, strings,
+            ));
             let scrut_bpl = emit_boogie_expr_with_strings(
                 scrut,
                 m,
@@ -10340,6 +10357,120 @@ fn is_module_typed_receiver(recv: &Expr, m: &ModuleDecl) -> bool {
     elem_receiver_type(recv, m).is_some_and(|t| t == module_self_type(m) || t == m.name)
 }
 
+/// A fresh local standing for a nested binder or lambda parameter `name` of Gardel type
+/// `gty`. Returns its name and Boogie type; the caller declares it with
+/// `declare_obligation_locals` only if the obligations mention it.
+fn fresh_obligation_local(name: &str, gty: &str, m: &ModuleDecl) -> (String, String) {
+    let k = BOOGIE_OBLIGATION_COUNTER.with(|c| {
+        let v = c.get();
+        c.set(v + 1);
+        v
+    });
+    let fresh = format!("_ob{k}_{name}");
+    bind_boogie_env_type(&fresh, gty);
+    (fresh, map_boogie_type(gty, m))
+}
+
+fn declare_obligation_locals(locals: Vec<(String, String)>) {
+    BOOGIE_OBLIGATION_LOCALS.with(|l| l.borrow_mut().extend(locals));
+}
+
+/// What every value of type `gty` satisfies, assumed of the fresh local `v`. It is the same
+/// list a routine parameter gets as `requires` (`emit_boogie_verify_routine`).
+fn emit_value_assumptions(v: &str, gty: &str, m: &ModuleDecl, pad: &str) -> String {
+    let own = gty == m.name || gty == "Current" || gty.starts_with(&format!("{}[", m.name));
+    if matches!(gty, "NAT" | "U64" | "EXIT_CODE") {
+        format!("{pad}assume in_u64({v});\n")
+    } else if matches!(gty, "INT" | "I64") {
+        format!("{pad}assume in_i64({v});\n")
+    } else if gty == "CHAR" {
+        format!("{pad}assume in_char({v});\n")
+    } else if own {
+        if m.invariants.is_empty() {
+            String::new()
+        } else {
+            format!("{pad}assume {}_Invariant({v});\n", m.name)
+        }
+    } else if let Some(p) = boogie_prelude_ctx().and_then(|ctx| {
+        ctx.module(type_head(gty))
+            .filter(|p| !p.invariants.is_empty())
+            .cloned()
+    }) {
+        format!("{pad}assume {0}__{0}_Invariant({v});\n", p.name)
+    } else {
+        String::new()
+    }
+}
+
+/// Obligations of a nested block, which has no Boogie locals of its own: as in
+/// `emit_boogie_block_expr`, each `let` is substituted into what follows it. A `check` is
+/// asserted and an `assume` taken, in the Boogie branch the caller opened for the block.
+#[allow(clippy::too_many_arguments)]
+fn emit_block_obligations(
+    stmts: &[Stmt],
+    body: &Expr,
+    r: &RoutineDecl,
+    m: &ModuleDecl,
+    revealed: &HashSet<String>,
+    indent: usize,
+    strings: &[String],
+) -> String {
+    let pad = " ".repeat(indent);
+    let mut revealed = revealed.clone();
+    let mut substs: Vec<(String, Expr)> = Vec::new();
+    let mut s = String::new();
+    for st in stmts {
+        match st {
+            Stmt::Let(v, e) => {
+                let e_sub = subst_expr_vars(e, &substs);
+                s.push_str(&emit_boogie_expr_obligations(
+                    &e_sub, r, m, &revealed, indent, strings,
+                ));
+                substs.push((v.clone(), e_sub));
+            }
+            Stmt::Check(tag, e) | Stmt::Assume(tag, e) => {
+                let e_bpl = emit_boogie_expr_with_strings(
+                    &subst_expr_vars(e, &substs),
+                    m,
+                    &HashSet::new(),
+                    &revealed,
+                    "DefaultFuel",
+                    strings,
+                );
+                if matches!(st, Stmt::Check(_, _)) {
+                    s.push_str(&format!(
+                        "{pad}assert {{:msg \"{}::check::{tag}\"}} {e_bpl};\n",
+                        r.name
+                    ));
+                } else {
+                    s.push_str(&format!("{pad}assume {e_bpl}; // assume:{tag}\n"));
+                }
+            }
+            Stmt::Reveal(target) => {
+                revealed.insert(target.clone());
+            }
+        }
+    }
+    s.push_str(&emit_boogie_expr_obligations(
+        &subst_expr_vars(body, &substs),
+        r,
+        m,
+        &revealed,
+        indent,
+        strings,
+    ));
+    s
+}
+
+/// Obligations of every operation in the expression `e`, each on the path where it runs.
+/// `emit_boogie_proc_stmts_and_ret` splits the `if` and `match` that shape a routine body
+/// into Boogie branches; anything nested inside an expression arrives here, so this match
+/// is exhaustive: a new `Expr` variant must say what it obliges.
+///
+/// Nested `if`, `match`, `and`, `or` and `implies` become Boogie branches, so a guard
+/// protects what it guards. A lambda body is checked at the point of creation, under what
+/// holds there (its captures are immutable), for every argument of its parameter types,
+/// since it can be applied to any of them: see the `Expr::Lambda` arm.
 fn emit_boogie_expr_obligations(
     e: &Expr,
     r: &RoutineDecl,
@@ -10360,9 +10491,6 @@ fn emit_boogie_expr_obligations(
             s.push_str(&emit_boogie_expr_obligations(
                 l, r, m, revealed, indent, strings,
             ));
-            s.push_str(&emit_boogie_expr_obligations(
-                rhs, r, m, revealed, indent, strings,
-            ));
             let l_bpl = emit_boogie_expr_with_strings(
                 l,
                 m,
@@ -10371,6 +10499,24 @@ fn emit_boogie_expr_obligations(
                 "DefaultFuel",
                 strings,
             );
+            // These evaluate their right side only when the left allows it (C `&&`, `||`).
+            let short_circuit = match op.as_str() {
+                "and" | "implies" => Some(l_bpl.clone()),
+                "or" => Some(format!("!({l_bpl})")),
+                _ => None,
+            };
+            if let Some(guard) = short_circuit {
+                let right = emit_boogie_expr_obligations(
+                    rhs, r, m, revealed, indent + 2, strings,
+                );
+                if !right.is_empty() {
+                    s.push_str(&format!("{pad}if ({guard}) {{\n{right}{pad}}}\n"));
+                }
+                return s;
+            }
+            s.push_str(&emit_boogie_expr_obligations(
+                rhs, r, m, revealed, indent, strings,
+            ));
             let r_bpl = emit_boogie_expr_with_strings(
                 rhs,
                 m,
@@ -10413,12 +10559,34 @@ fn emit_boogie_expr_obligations(
                 _ => {}
             }
         }
-        Expr::UnaryNeg(inner) => {
+        Expr::UnaryNeg(inner) | Expr::UnaryNot(inner) => {
             s.push_str(&emit_boogie_expr_obligations(
                 inner, r, m, revealed, indent, strings,
             ));
         }
+        Expr::TupleLit(items) => {
+            for item in items {
+                s.push_str(&emit_boogie_expr_obligations(
+                    item, r, m, revealed, indent, strings,
+                ));
+            }
+        }
         Expr::RecordLit(_) | Expr::RecordUpdate(_, _) => {
+            let (base, fields) = match e {
+                Expr::RecordLit(fields) => (None, fields),
+                Expr::RecordUpdate(base, fields) => (Some(&**base), fields),
+                _ => unreachable!("the arm matches only record expressions"),
+            };
+            if let Some(base) = base {
+                s.push_str(&emit_boogie_expr_obligations(
+                    base, r, m, revealed, indent, strings,
+                ));
+            }
+            for (_, value) in fields {
+                s.push_str(&emit_boogie_expr_obligations(
+                    value, r, m, revealed, indent, strings,
+                ));
+            }
             let val_bpl = emit_boogie_expr_with_strings(
                 e,
                 m,
@@ -10572,7 +10740,185 @@ fn emit_boogie_expr_obligations(
                 ));
             }
         }
-        _ => {}
+        Expr::If(c, then_stmts, then_e, else_stmts, else_e) => {
+            s.push_str(&emit_boogie_expr_obligations(
+                c, r, m, revealed, indent, strings,
+            ));
+            let then_part =
+                emit_block_obligations(then_stmts, then_e, r, m, revealed, indent + 2, strings);
+            let else_part =
+                emit_block_obligations(else_stmts, else_e, r, m, revealed, indent + 2, strings);
+            if !then_part.is_empty() || !else_part.is_empty() {
+                let c_bpl = emit_boogie_expr_with_strings(
+                    c,
+                    m,
+                    &empty_fields,
+                    revealed,
+                    "DefaultFuel",
+                    strings,
+                );
+                s.push_str(&format!(
+                    "{pad}if ({c_bpl}) {{\n{then_part}{pad}}} else {{\n{else_part}{pad}}}\n"
+                ));
+            }
+        }
+        Expr::Match(scrut, cases) => {
+            s.push_str(&emit_boogie_expr_obligations(
+                scrut, r, m, revealed, indent, strings,
+            ));
+            let scrut_bpl = emit_boogie_expr_with_strings(
+                scrut,
+                m,
+                &empty_fields,
+                revealed,
+                "DefaultFuel",
+                strings,
+            );
+            // (tester, code) per arm; a catch-all has no tester and ends the chain.
+            let mut arms: Vec<(Option<String>, String)> = Vec::new();
+            for c in cases {
+                if c.is_catch_all() {
+                    let (c_stmts, c_body) = c.with_binder_substituted(scrut);
+                    arms.push((
+                        None,
+                        emit_block_obligations(
+                            &c_stmts, &c_body, r, m, revealed, indent + 2, strings,
+                        ),
+                    ));
+                    break;
+                }
+                let mut head = String::new();
+                let mut renames: Vec<(String, Expr)> = Vec::new();
+                let mut fresh_locals = Vec::new();
+                if let Some((proj_prefix, vdecl)) = boogie_match_variant(c.ctor(), m) {
+                    let inst = match_field_instantiation(scrut, &proj_prefix, m);
+                    for (opt_b, (fname, fty)) in c.top_bindings().iter().zip(vdecl.fields.iter()) {
+                        if let Some(b) = opt_b {
+                            let gty = subst_type_idents(fty, &inst);
+                            let (fresh, bty) = fresh_obligation_local(b, &gty, m);
+                            if proj_prefix.is_empty() {
+                                elem_env_bind(&fresh, fty);
+                            }
+                            head.push_str(&format!(
+                                "{pad}  {fresh} := {proj_prefix}{}_{fname}({scrut_bpl});\n",
+                                c.ctor()
+                            ));
+                            head.push_str(&emit_value_assumptions(
+                                &fresh,
+                                &gty,
+                                m,
+                                &format!("{pad}  "),
+                            ));
+                            renames.push((b.clone(), Expr::Var(fresh.clone())));
+                            fresh_locals.push((fresh, bty));
+                        }
+                    }
+                }
+                let (c_stmts, c_body) = subst_block(&c.stmts, &c.body, &renames);
+                let code = emit_block_obligations(
+                    &c_stmts, &c_body, r, m, revealed, indent + 2, strings,
+                );
+                let tester = format!("{}({scrut_bpl})", boogie_ctor_tester(c.ctor(), m));
+                if code.is_empty() {
+                    arms.push((Some(tester), String::new()));
+                } else {
+                    declare_obligation_locals(fresh_locals);
+                    arms.push((Some(tester), format!("{head}{code}")));
+                }
+            }
+            if arms.iter().any(|(_, code)| !code.is_empty()) {
+                for (idx, (tester, code)) in arms.iter().enumerate() {
+                    let open = match (idx, tester) {
+                        (0, Some(t)) => format!("if ({t})"),
+                        (_, Some(t)) => format!("else if ({t})"),
+                        (0, None) => "if (true)".to_string(),
+                        (_, None) => "else".to_string(),
+                    };
+                    s.push_str(&format!("{pad}{open} {{\n{code}{pad}}}\n"));
+                }
+            }
+        }
+        Expr::Lambda(params, _, stmts, body) => {
+            // A path of its own that stops at the end, so nothing assumed here leaks out.
+            let inner_pad = format!("{pad}  ");
+            let mut head = String::new();
+            let mut renames: Vec<(String, Expr)> = Vec::new();
+            let mut fresh_locals = Vec::new();
+            for (pname, pty) in params {
+                let (fresh, bty) = fresh_obligation_local(pname, pty, m);
+                head.push_str(&format!("{inner_pad}havoc {fresh};\n"));
+                head.push_str(&emit_value_assumptions(&fresh, pty, m, &inner_pad));
+                renames.push((pname.clone(), Expr::Var(fresh.clone())));
+                fresh_locals.push((fresh, bty));
+            }
+            let (l_stmts, l_body) = subst_block(stmts, body, &renames);
+            let code = emit_block_obligations(
+                &l_stmts, &l_body, r, m, revealed, indent + 2, strings,
+            );
+            if !code.is_empty() {
+                declare_obligation_locals(fresh_locals);
+                s.push_str(&format!(
+                    "{pad}if (*) {{\n{head}{code}{inner_pad}assume false;\n{pad}}}\n"
+                ));
+            }
+        }
+        Expr::WithIo(io_stmts, final_e) => {
+            let mut renames: Vec<(String, Expr)> = Vec::new();
+            for io_st in io_stmts {
+                match io_st {
+                    IoStmt::Action(ie) => {
+                        s.push_str(&emit_boogie_expr_obligations(
+                            &subst_expr_vars(ie, &renames),
+                            r,
+                            m,
+                            revealed,
+                            indent,
+                            strings,
+                        ));
+                    }
+                    IoStmt::Bind(v, ie) => {
+                        let ie_sub = subst_expr_vars(ie, &renames);
+                        s.push_str(&emit_boogie_expr_obligations(
+                            &ie_sub, r, m, revealed, indent, strings,
+                        ));
+                        // The outside world decides this value.
+                        let gty = boogie_prelude_ctx()
+                            .and_then(|ctx| infer_gardel_type(&ie_sub, m, &ctx));
+                        let (fresh, bty) = match &gty {
+                            Some(t) => fresh_obligation_local(v, t, m),
+                            None => {
+                                let k = BOOGIE_OBLIGATION_COUNTER.with(|c| {
+                                    let n = c.get();
+                                    c.set(n + 1);
+                                    n
+                                });
+                                (format!("_ob{k}_{v}"), infer_boogie_expr_type(&ie_sub, r, m))
+                            }
+                        };
+                        s.push_str(&format!("{pad}havoc {fresh};\n"));
+                        declare_obligation_locals(vec![(fresh.clone(), bty)]);
+                        renames.push((v.clone(), Expr::Var(fresh)));
+                    }
+                }
+            }
+            s.push_str(&emit_boogie_expr_obligations(
+                &subst_expr_vars(final_e, &renames),
+                r,
+                m,
+                revealed,
+                indent,
+                strings,
+            ));
+        }
+        // Logic, never run: arithmetic in a quantifier is mathematical (§3).
+        Expr::Forall(_, _, _) | Expr::Exists(_, _, _) => {}
+        Expr::Int(_)
+        | Expr::Float(_)
+        | Expr::Char(_)
+        | Expr::Unit
+        | Expr::Bool(_)
+        | Expr::Str(_)
+        | Expr::Var(_) => {}
     }
 
     s
@@ -20860,6 +21206,128 @@ int main(void) {
         assert!(diags.is_empty(), "{diags:?}");
         let diags = verify(&ok.replace("exact: Result = x + 5", "exact: Result = x + 6"));
         assert!(diags.iter().any(|d| d.tag == "exact"), "{diags:?}");
+    }
+
+    /// Verifies one routine (with the helpers `id` and `app`) and returns the failed tags.
+    fn failed_tags_of_routine(routine: &str) -> Vec<String> {
+        let src = format!(
+            "functions OBL\n\nfeature {{ANY}}\n\n  id(x: U64): U64\n    do\n      x\n    end\n\n  needs_positive(x: U64): U64\n    require\n      positive: x > 0\n    do\n      x\n    end\n\n  app(f: U64 -> U64, x: U64): U64\n    do\n      f(x)\n    end\n\n{routine}\nend\n"
+        );
+        let m = parse_user_module_with_prelude(&src);
+        with_prelude_injection(true, || {
+            verify_module_phase3(&m, &src, "obl.gdl", DEFAULT_FUEL, true, false, false)
+        })
+        .into_iter()
+        .map(|d| d.tag)
+        .collect()
+    }
+
+    #[test]
+    fn test_obligations_reach_every_expression_position() {
+        // Every one of these verified, and ran unchecked, while the walker skipped the
+        // expression kinds it did not list.
+        let rejected = [
+            ("if x > 3 then id(x * 10) else 2 end", "U64", "overflow_mul"),
+            ("id(if x > 3 then x * 10 else 2 end)", "U64", "overflow_mul"),
+            ("1 +% (if x > 3 then x * 10 else 2 end)", "U64", "overflow_mul"),
+            ("id(match Some(x) case Some(v) then v * 10 case None then 0 end)", "U64", "overflow_mul"),
+            ("match Some(x * 10) case Some(v) then v case None then 0 end", "U64", "overflow_mul"),
+            ("not (x * 10 > 3)", "BOOL", "overflow_mul"),
+            ("(x * 10, 1)", "TUPLE[U64, U64]", "overflow_mul"),
+            ("app(fn(y: U64): U64 do y * 10 end, x)", "U64", "overflow_mul"),
+            ("app(fn(y: U64): U64 do x / y end, x)", "U64", "div_by_zero"),
+            ("app(fn(y: U64): U64 do needs_positive(y) end, x)", "U64", "positive"),
+            ("app(fn(y: U64): U64 do id(if y > 1 then y * 10 else 0 end) end, x)", "U64", "overflow_mul"),
+            ("app(fn(y: U64): U64 do match Some(y) case Some(v) then v * 10 case None then 0 end end, x)", "U64", "overflow_mul"),
+        ];
+        for (body, ty, tag) in rejected {
+            let routine = format!("  t(x: U64): {ty}\n    do\n      {body}\n    end\n");
+            let tags = failed_tags_of_routine(&routine);
+            assert!(tags.iter().any(|t| t == tag), "{body}: wanted {tag}, got {tags:?}");
+        }
+        // A `let` of a lambda, and a `check` that nested blocks used to drop.
+        let let_lambda = "  t(x: U64): U64\n    do\n      let f = fn(y: U64): U64 do y * 10 end\n      f(x)\n    end\n";
+        assert!(failed_tags_of_routine(let_lambda).iter().any(|t| t == "overflow_mul"));
+        let nested_check = "  t(x: U64): U64\n    do\n      id(if x > 3 then\n        check too_big: x > 100 end\n        1\n      else 2 end)\n    end\n";
+        assert!(failed_tags_of_routine(nested_check).iter().any(|t| t == "too_big"));
+        let lambda_check = "  t(x: U64): U64\n    do\n      app(fn(y: U64): U64 do\n        check too_big: y > 100 end\n        y\n      end, x)\n    end\n";
+        assert!(failed_tags_of_routine(lambda_check).iter().any(|t| t == "too_big"));
+    }
+
+    #[test]
+    fn test_obligations_in_record_fields() {
+        let module = |routine: &str| {
+            format!(
+                "module REC\n\nrepresentation {{ANY}}\n  a: U64\n  b: U64\n\nfeature {{ANY}}\n\n{routine}\nend\n"
+            )
+        };
+        let tags_of = |src: String| -> Vec<String> {
+            let m = parse_user_module_with_prelude(&src);
+            with_prelude_injection(true, || {
+                verify_module_phase3(&m, &src, "rec.gdl", DEFAULT_FUEL, true, false, false)
+            })
+            .into_iter()
+            .map(|d| d.tag)
+            .collect()
+        };
+        let literal = "  t(x: U64): REC\n    do\n      { a = x * 10, b = 1 }\n    end\n";
+        assert!(tags_of(module(literal)).iter().any(|t| t == "overflow_mul"));
+        let update = "  t(x: U64): REC\n    do\n      { Current with a = x * 10 }\n    end\n";
+        assert!(tags_of(module(update)).iter().any(|t| t == "overflow_mul"));
+        let guarded = "  t(x: U64): REC\n    require\n      small: x < 100\n    do\n      { Current with a = x * 10 }\n    end\n";
+        assert_eq!(tags_of(module(guarded)), Vec::<String>::new());
+    }
+
+    #[test]
+    fn test_obligations_respect_guards_and_nothing_leaks() {
+        // A guard protects what it guards.
+        let verified = [
+            "x != 0 and 10 / x > 1",
+            "x = 0 or 10 / x > 1",
+            "(x != 0) implies (10 / x > 1)",
+        ];
+        for body in verified {
+            let routine = format!("  t(x: U64): BOOL\n    do\n      {body}\n    end\n");
+            assert_eq!(failed_tags_of_routine(&routine), Vec::<String>::new(), "{body}");
+        }
+        let verified = [
+            "id(if x > 0 then 10 / x else 0 end)",
+            "id(match Some(x % 100) case Some(v) then v * 10 case None then 0 end)",
+            "app(fn(y: U64): U64 do y % 100 end, x)",
+            "app(fn(y: U64): U64 do if y < 100 then y * 10 else 0 end end, x)",
+            "if x > 0 then app(fn(y: U64): U64 do y / x end, 1) else 0 end",
+        ];
+        for body in verified {
+            let routine = format!("  t(x: U64): U64\n    do\n      {body}\n    end\n");
+            assert_eq!(failed_tags_of_routine(&routine), Vec::<String>::new(), "{body}");
+        }
+        let let_capture = "  t(x: U64): U64\n    do\n      let z = x % 7 + 1\n      app(fn(y: U64): U64 do y / z end, x)\n    end\n";
+        assert_eq!(failed_tags_of_routine(let_capture), Vec::<String>::new());
+        let require_capture = "  t(x: U64, z: U64): U64\n    require\n      nonzero: z > 0\n    do\n      app(fn(y: U64): U64 do y / z end, x)\n    end\n";
+        assert_eq!(failed_tags_of_routine(require_capture), Vec::<String>::new());
+        // The wrong guard protects nothing: the division runs exactly when `x` is 0.
+        for body in ["x = 0 and 10 / x > 1", "x != 0 or 10 / x > 1", "(x = 0) implies (10 / x > 1)"] {
+            let routine = format!("  t(x: U64): BOOL\n    do\n      {body}\n    end\n");
+            let tags = failed_tags_of_routine(&routine);
+            assert!(tags.iter().any(|t| t == "div_by_zero"), "{body}: {tags:?}");
+        }
+        for body in [
+            "id(if x > 0 then 0 else 10 / x end)",
+            "if x > 0 then 0 else app(fn(y: U64): U64 do y / x end, 1) end",
+        ] {
+            let routine = format!("  t(x: U64): U64\n    do\n      {body}\n    end\n");
+            let tags = failed_tags_of_routine(&routine);
+            assert!(tags.iter().any(|t| t == "div_by_zero"), "{body}: {tags:?}");
+        }
+        // What a nested branch or lambda assumes stays there: `x * 10` must still fail.
+        for inner in [
+            "let f = fn(y: U64): U64 do\n        assume small: x < 100 end\n        y\n      end\n      let v = app(f, 1)\n      x * 10 + v % 2",
+            "let v = id(if x % 2 = 0 then\n        assume small: x < 100 end\n        1\n      else 2 end)\n      x * 10 + v % 2",
+        ] {
+            let routine = format!("  t(x: U64): U64\n    do\n      {inner}\n    end\n");
+            let tags = failed_tags_of_routine(&routine);
+            assert!(tags.iter().any(|t| t == "overflow_mul"), "{inner}: {tags:?}");
+        }
     }
 
     #[test]

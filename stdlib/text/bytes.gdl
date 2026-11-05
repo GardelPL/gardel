@@ -244,6 +244,38 @@ specify {ANY}
       same_bytes: xs = ys
     end
 
+  -- One well-formed 2-byte and 3-byte step, for `STRING.push_utf8_2` and `push_utf8_3`. See
+  -- `utf8_step_4`: their invariant proofs failed the same way, on some Z3 seeds, once overflow
+  -- checks on record fields joined those routines.
+  law utf8_step_2(b0: U64, b1: U64, xs: LIST[U64])
+    require
+      lead: b0 >= 194 and b0 <= 223
+      cont: b1 >= 128 and b1 <= 191
+      xs_valid: valid_utf8(xs)
+    trigger
+      xs.prepend(b1).prepend(b0)
+    ensure
+      step_valid: valid_utf8(xs.prepend(b1).prepend(b0))
+      step_decode: decode_utf8(xs.prepend(b1).prepend(b0)) =
+        decode_utf8(xs).prepend(CHAR.from_scalar((b0 - 192) * 64 + (b1 - 128)))
+    end
+
+  law utf8_step_3(b0: U64, b1: U64, b2: U64, xs: LIST[U64])
+    require
+      lead: b0 >= 224 and b0 <= 239
+      cont1: if b0 = 224 then (b1 >= 160 and b1 <= 191)
+             else if b0 = 237 then (b1 >= 128 and b1 <= 159)
+             else (b1 >= 128 and b1 <= 191) end end
+      cont2: b2 >= 128 and b2 <= 191
+      xs_valid: valid_utf8(xs)
+    trigger
+      xs.prepend(b2).prepend(b1).prepend(b0)
+    ensure
+      step_valid: valid_utf8(xs.prepend(b2).prepend(b1).prepend(b0))
+      step_decode: decode_utf8(xs.prepend(b2).prepend(b1).prepend(b0)) =
+        decode_utf8(xs).prepend(CHAR.from_scalar((b0 - 224) * 4096 + (b1 - 128) * 64 + (b2 - 128)))
+    end
+
   -- One well-formed 4-byte step (a single unfolding of `valid_utf8` and `decode_utf8`).
   -- `STRING.push_utf8_4` uses it so that its invariant proof does not depend on the
   -- solver unfolding four levels of `tail` on its own (Task C.3: that proof failed for
