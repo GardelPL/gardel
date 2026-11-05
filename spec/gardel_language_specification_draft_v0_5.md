@@ -32,7 +32,7 @@ Gardel is a pure, total, deterministic, statically verified language designed fo
 | Entry points | Nothing may refer to a `program` or `reactive program` (`E0104`, §4). |
 | `EXIT_CODE` | Defined in §3. |
 
-**Implementation status:** the `match` rule, the solver limit and the entry-point rule are implemented. Reactive programs verify and compile; the runtime that runs them is being built in Phase D (§16.5).
+**Implementation status:** the `match` rule, the solver limit and the entry-point rule are implemented. Reactive programs run, with `Print` and `Shutdown`; the other commands and events are being built in Phase D (§16.5).
 
 ---
 
@@ -2175,7 +2175,7 @@ end
 ```eiffel
 module COMMAND
 representation {ANY}
-  | Print(text: STRING)
+  | Print(text: STRING)               -- text and a newline on standard output
   | SetTimer(id: NAT, millis: U64)    -- answered by Tick(id)
   | ReadLine                          -- answered by Line
   | Listen(port: NAT)                 -- answered by Accepted / ListenFailed
@@ -2203,10 +2203,12 @@ Rules:
 2. **Totality.** `init` and `step` are ordinary total routines, with the termination obligation of §12. They are pure: no routine of a reactive program has an `IO` type or a `with IO`, so `IO.exit` cannot appear and `Stop` is the only way out. `init` and `step` have no `require`: the runtime calls them with every input and proves nothing, so a precondition would be an unchecked assumption. A case to refuse is handled in the body, for example with `Stop`.
 3. **Invariants.** Because `S` is a module type, its invariant holds for every value of `S` (§6). The obligations of the state module's routines therefore give "the invariant holds after `init` and after every step", for an unbounded run, with no new kind of verification condition.
 4. **Shutdown must stop.** `step` has the implicit postcondition `e.is_shutdown implies Result.is_stop`, tagged `shutdown_must_stop`. It is always added, so a clause the programmer writes cannot replace it. Constructor queries are used because `EVENT` is not `CANONICAL_EQ` (§9).
-5. **Commands never block.** Commands in one `cmds` list run in order. A command that can fail reports the failure as a later event, never as a crash (§7.2). The commands of a `Stop` run before the process exits. If `init` returns `Stop`, `step` is never called.
+5. **Commands never block.** Commands in one `cmds` list run in order. A command that can fail reports the failure as a later event, never as a crash (§7.2). Output is flushed after each list, before the program waits. The commands of a `Stop` run before the process exits, and its `code` is the exit status. If `init` returns `Stop`, `step` is never called.
 6. **Events are untrusted.** The verifier assumes nothing about a payload beyond its type. Payloads become invariant-carrying values only through `RESULT`-returning boundary routines (§7.2, §11.4).
 7. **Handles.** Each `CONN_ID` comes from exactly one `Accepted` event. After `Close(c)` runs, at most one more event mentions `c`, and it is `Closed(c)`.
 8. **Closed types.** `COMMAND` and `EVENT` are closed, and adding a variant is a prelude change. A program should end a `match` on `EVENT` with `case _` (§5.1).
+
+For tests and replay, `GARDEL_EVENTS` replaces the outside world with a script: event names separated by spaces. An unknown name stops the program with exit status 2. The end of a script is a `Shutdown`, so a scripted run always ends.
 
 Guaranteed, given the proof obligations hold: no crash, out-of-bounds access or overflow in any step; the state invariant after every step; finite handling of each event by Gardel code; every run that receives `Shutdown` ends with the code chosen by `step`; and determinism: the states and commands are a function of `args` and the observed event sequence.
 
@@ -2913,7 +2915,7 @@ Phase D builds the `reactive program` of §11.6. `plan/Roadmap.md` holds its tas
 | D.1 | Spec v0.5 and proposal revision 3 | ✅ Completed |
 | D.2 | Prelude `STEP`, `COMMAND` (`Print`), `EVENT` (`Shutdown`) | ✅ Completed |
 | D.3 | Parser and checker, including `shutdown_must_stop` | ✅ Completed |
-| D.4 | Host loop: the `Print` + `Shutdown` slice | 📋 Planned |
+| D.4 | Host loop: the `Print` + `Shutdown` slice | ✅ Completed |
 | D.5 | `SetTimer`, `Tick` | 📋 Planned |
 | D.6 | `ReadLine`, `Line`, `Key` | 📋 Planned |
 | D.7 | `CONN_ID`, sockets, the echo server | 📋 Planned |

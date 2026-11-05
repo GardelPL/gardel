@@ -118,6 +118,7 @@ end
 ├── examples/              # Standalone Gardel (.gdl) example programs
 │   ├── bounded_stack.gdl
 │   ├── greeter.gdl
+│   ├── reactive_hello.gdl
 │   ├── peano_ord.gdl
 │   └── tree.gdl
 ├── stdlib/                # Standard Prelude sources, one module per file (embedded into gardelc)

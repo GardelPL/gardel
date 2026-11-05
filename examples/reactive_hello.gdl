@@ -1,0 +1,20 @@
+-- The smallest reactive program: it greets, waits until told to stop, and says goodbye.
+-- Run it, then press Ctrl-C.
+reactive program REACTIVE_HELLO
+
+feature {ANY}
+
+  init(args: SEQ[STRING]): STEP[NAT]
+    do
+      Continue(0, LIST.empty.prepend(Print("Hello. Press Ctrl-C to stop.")))
+    end
+
+  step(s: NAT, e: EVENT): STEP[NAT]
+    do
+      match e
+        case Shutdown then Stop(0, LIST.empty.prepend(Print("Goodbye.")))
+        case _ then Continue(s, LIST.empty)
+      end
+    end
+
+end

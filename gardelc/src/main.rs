@@ -16406,7 +16406,7 @@ fn main() {
         }
     }
 
-    let gcc_compiled = if module.kind == ModuleKind::Program {
+    let gcc_compiled = if module.kind.is_entry_point() {
         Command::new("gcc")
             .args(["-O3", "-fopenmp", &primary_c, "-o", &primary_exe])
             .status()
@@ -18975,15 +18975,150 @@ end
         }
     }
 
+    /// C of a verified reactive program with the given library files (the program last).
+    fn d4_c(files: &[(&str, &str)]) -> String {
+        let (diags, c) = d2_project(files);
+        assert!(diags.is_empty(), "{diags:?}");
+        assert!(!c.contains("#error"), "{}", c.lines().nth(1).unwrap_or(""));
+        c
+    }
+
+    /// Runs C with `GARDEL_EVENTS` set: (exit code, stdout, stderr). `None` without gcc.
+    fn d4_run(c: &str, tag: &str, events: &str, args: &[&str]) -> Option<(i32, String, String)> {
+        let (dir, exe) = c3_compile(c, tag)?;
+        let o = Command::new(&exe).args(args).env("GARDEL_EVENTS", events).output().unwrap();
+        let _ = fs::remove_dir_all(&dir);
+        let text = |b: &[u8]| String::from_utf8_lossy(b).replace("\r\n", "\n");
+        Some((o.status.code().unwrap_or(-1), text(&o.stdout), text(&o.stderr)))
+    }
+
+    const D4_HELLO: &str = include_str!("../../examples/reactive_hello.gdl");
+
     #[test]
-    fn test_d3_logic_compiles_to_c_without_a_host_loop_yet() {
-        let mut units = b4_units(&[("tick_state.gdl", D2_STATE), ("tick_reactive.gdl", D3_REACTIVE)]);
-        let checked = check_and_verify_project(&mut units, b4_opts(true, true));
-        assert!(checked.fatal.is_empty());
-        let (root, lib) = (units[1].ast.modules[0].clone(), units[0].ast.modules[0].clone());
-        let (c, errs) = emit_c11_typed(&root, &[&lib]);
-        assert!(errs.is_empty(), "{errs:?}");
-        assert!(c.contains("TICK_REACTIVE__step("), "the step function must be emitted");
+    fn test_d4_hello_runs_and_stops_on_shutdown() {
+        let c = d4_c(&[("reactive_hello.gdl", D4_HELLO)]);
+        if let Some((code, out, err)) = d4_run(&c, "rhello", "Shutdown", &[]) {
+            assert_eq!(code, 0, "{err}");
+            assert_eq!(out, "Hello. Press Ctrl-C to stop.\nGoodbye.\n");
+        }
+        // A script that ends is a shutdown, so a scripted run always ends.
+        if let Some((code, out, _)) = d4_run(&c, "rhelloempty", "", &[]) {
+            assert_eq!(code, 0);
+            assert!(out.ends_with("Goodbye.\n"), "{out}");
+        }
+        // An unknown event is an error, not a silently ignored line.
+        if let Some((code, _, err)) = d4_run(&c, "rhellobad", "Nonsense", &[]) {
+            assert_eq!(code, 2);
+            assert!(err.contains("unknown event `Nonsense`"), "{err}");
+        }
+    }
+
+    #[test]
+    fn test_d4_exit_codes_and_command_order_come_from_the_program() {
+        let src = "reactive program ORDER\n\nfeature {ANY}\n\n  init(args: SEQ[STRING]): STEP[NAT]\n    do\n      Continue(7, LIST.empty.prepend(Print(\"two\")).prepend(Print(\"one\")))\n    end\n\n  step(s: NAT, e: EVENT): STEP[NAT]\n    do\n      Stop(s, LIST.empty.prepend(Print(\"four\")).prepend(Print(\"three\")))\n    end\n\nend\n";
+        let c = d4_c(&[("order.gdl", src)]);
+        if let Some((code, out, err)) = d4_run(&c, "rorder", "Shutdown", &[]) {
+            assert_eq!(code, 7, "{err}");
+            assert_eq!(out, "one\ntwo\nthree\nfour\n");
+        }
+    }
+
+    #[test]
+    fn test_d4_init_can_refuse_to_start() {
+        // `init` returning `Stop` runs its commands and exits: `step` is never called, and
+        // no event is awaited.
+        let src = "reactive program REFUSE\n\nfeature {ANY}\n\n  init(args: SEQ[STRING]): STEP[NAT]\n    do\n      if args.length = 0 then\n        Stop(3, LIST.empty.prepend(Print(\"usage\")))\n      else\n        Continue(0, LIST.empty)\n      end\n    end\n\n  step(s: NAT, e: EVENT): STEP[NAT]\n    do\n      Stop(9, LIST.empty.prepend(Print(\"step ran\")))\n    end\n\nend\n";
+        let c = d4_c(&[("refuse.gdl", src)]);
+        if let Some((code, out, err)) = d4_run(&c, "rrefuse", "Shutdown", &[]) {
+            assert_eq!(code, 3, "{err}");
+            assert_eq!(out, "usage\n");
+        }
+        // With an argument it starts, so `args` reached `init`.
+        if let Some((code, out, _)) = d4_run(&c, "rrefuse2", "Shutdown", &["x"]) {
+            assert_eq!(code, 9);
+            assert_eq!(out, "step ran\n");
+        }
+    }
+
+    #[test]
+    fn test_d4_host_frees_state_commands_and_events() {
+        // A heap state, commands and strings, through the whole loop, many times.
+        let c = d4_c(&[("tick_state.gdl", D2_STATE), ("tick_reactive.gdl", D3_REACTIVE)]);
+        if let Some((code, out, err)) = d4_run(&c, "rtick", "Shutdown", &[]) {
+            assert_eq!((code, out.as_str()), (0, "ready\nbye\n"), "{err}");
+        }
+        let c = c.replace("int main(int argc, char** argv) {", "int gardel_unused_main(int argc, char** argv) {");
+        let harness = format!(
+            "{c}\nint main(void) {{\n    char* argv[] = {{ (char*)\"x\", NULL }};\n    for (int i = 0; i < 50; i++) {{\n        gardel_host_script = \"Shutdown\";\n        gardel_reactive_main(1, argv);\n    }}\n    fprintf(stderr, \"live=%llu\\n\", (unsigned long long)gardel_live_allocations());\n    return 0;\n}}\n"
+        );
+        if let Some((dir, exe)) = c3_compile(&harness, "rleak") {
+            let o = Command::new(&exe).output().unwrap();
+            let _ = fs::remove_dir_all(&dir);
+            let err = String::from_utf8_lossy(&o.stderr).to_string();
+            assert!(err.contains("live=0"), "everything must be freed: {err}");
+        }
+    }
+
+    #[test]
+    fn test_d4_output_is_flushed_before_waiting() {
+        // No script: the program waits for a real signal, and may wait for days. What it
+        // printed must already be out, also through a pipe, where stdout is fully buffered.
+        use std::io::BufRead;
+        let c = d4_c(&[("reactive_hello.gdl", D4_HELLO)]);
+        let Some((dir, exe)) = c3_compile(&c, "rflush") else { return };
+        let mut child = Command::new(&exe)
+            .env_remove("GARDEL_EVENTS")
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let stdout = child.stdout.take().unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let mut line = String::new();
+            let _ = std::io::BufReader::new(stdout).read_line(&mut line);
+            let _ = tx.send(line);
+        });
+        let line = rx.recv_timeout(std::time::Duration::from_secs(20));
+        let still_running = child.try_wait().unwrap().is_none();
+        let _ = child.kill();
+        let _ = child.wait();
+        let _ = fs::remove_dir_all(&dir);
+        assert!(line.is_ok_and(|l| l.starts_with("Hello.")), "the greeting must be out before the wait");
+        assert!(still_running, "with no script, the program must wait for a signal");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_d4_sigint_and_sigterm_stop_the_program() {
+        use std::io::BufRead;
+        let c = d4_c(&[("reactive_hello.gdl", D4_HELLO)]);
+        for sig in ["-INT", "-TERM"] {
+            let Some((dir, exe)) = c3_compile(&c, "rsignal") else { return };
+            let mut child = Command::new(&exe)
+                .env_remove("GARDEL_EVENTS")
+                .stdout(std::process::Stdio::piped())
+                .spawn()
+                .unwrap();
+            let mut out = std::io::BufReader::new(child.stdout.take().unwrap());
+            let mut line = String::new();
+            out.read_line(&mut line).unwrap();
+            let sent = Command::new("kill").arg(sig).arg(child.id().to_string()).status().unwrap();
+            assert!(sent.success());
+            let mut rest = String::new();
+            out.read_line(&mut rest).unwrap();
+            let status = child.wait().unwrap();
+            let _ = fs::remove_dir_all(&dir);
+            assert_eq!(rest.trim_end(), "Goodbye.", "{sig}");
+            assert_eq!(status.code(), Some(0), "{sig}");
+        }
+    }
+
+    #[test]
+    fn test_d4_host_is_exhaustive_over_commands_and_events() {
+        // A variant with no host code must not build, or the runtime would ignore it.
+        let c = d4_c(&[("reactive_hello.gdl", D4_HELLO)]);
+        assert!(c.contains("case TAG_COMMAND_Print:"), "one case per variant");
+        assert!(c.contains("return make_EVENT_Shutdown();"), "one case per variant");
     }
 
     /// Verifies a multi-file project (the program last) and returns its diagnostics and C.

@@ -343,7 +343,7 @@ Applied in spec v0.5, except the rows and clauses about `partial`, which wait fo
 
 | Example | Status | Depends on |
 | --- | --- | --- |
-| §3 `reactive program` form | Compiled (`gardelc/tests/reactive/tick_reactive.gdl`) | D.4 to run it |
+| §3 `reactive program` form | Compiled and run (`examples/reactive_hello.gdl`) | |
 | §3 `STEP`, with `is_stop` | In the prelude (`stdlib/core/step.gdl`) | |
 | §3 `COMMAND`: `Print`, `Listen`, `Send`, `Close` | Compiled | `SetTimer`: D.5. `ReadLine`: D.6 |
 | §6 `EVENT`: `Accepted`, `ListenFailed`, `Received`, `Line`, `Closed`, `Shutdown`, with `is_shutdown` | Compiled | `Tick`: D.5. `Key`: D.6. `SendFailed`: D.7 |
