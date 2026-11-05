@@ -1,0 +1,85 @@
+program SEQ_BENCH
+
+-- Builds the balanced SEQ[U64] of 1..n and sums it, using the stdlib `SEQ` module
+-- compiled from its Gardel source. `n` is read from standard input (one decimal line,
+-- 1 <= n <= 1000000000). Exit code: 0 when the sum equals n(n+1)/2, 1 when it does not,
+-- 2 when the input is not a valid `n`. The two `let`s in `from_range` and in `sum` are
+-- independent, so the C backend runs the halves as parallel tasks (spec §10). `sum`
+-- recurses on SEQ's constructors, structurally (`variant s`).
+
+feature {ANY}
+
+  from_range(lo: U64, hi: U64): SEQ[U64]
+    require
+      valid_range: lo <= hi
+      bounded: hi <= 1000000000
+    variant
+      hi - lo
+    do
+      if lo = hi then
+        SEQ.singleton(lo)
+      else
+        let mid = lo + (hi - lo) / 2
+        let left = from_range(lo, mid)
+        let right = from_range(mid + 1, hi)
+        left.concat(right)
+      end
+    ensure
+      exact_length: Result.length = hi - lo + 1
+    end
+
+  sum(s: SEQ[U64]): U64
+    variant
+      s
+    do
+      match s
+        case Empty then 0
+        case Leaf(v) then v
+        case Concat(l, r, _) then
+          let a = sum(l)
+          let b = sum(r)
+          a +% b
+      end
+    end
+
+  parse_nat(s: STRING, i: U64, acc: U64): U64
+    require
+      in_range: i <= s.code_point_count
+      acc_bounded: acc <= 1000000000
+    variant
+      s.code_point_count - i
+    do
+      if i = s.code_point_count then
+        acc
+      else
+        let c = s.character_at(i).code
+        if c >= 48 and c <= 57 then
+          let next = acc * 10 + (c - 48)
+          if next > 1000000000 then 0 else parse_nat(s, i + 1, next) end
+        else
+          0
+        end
+      end
+    ensure
+      bounded: Result <= 1000000000
+    end
+
+  main(args: SEQ[STRING]): IO[EXIT_CODE]
+    do
+      with IO
+        line_res <- IO.read_line
+        match line_res
+          case Ok(line) then
+            let n = parse_nat(line, 0, 0)
+            if n = 0 then
+              IO.exit(2)
+            else
+              IO.exit(if sum(from_range(1, n)) = n * (n + 1) / 2 then 0 else 1 end)
+            end
+          case Error(_) then
+            IO.exit(2)
+        end
+      end
+    end
+
+end

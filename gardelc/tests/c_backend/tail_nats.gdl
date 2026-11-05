@@ -1,0 +1,29 @@
+module TAIL_NATS
+
+representation {ANY}
+  | Zero
+  | Succ(prev: TAIL_NATS)
+
+feature {ANY}
+
+  plus(other: TAIL_NATS): TAIL_NATS
+    variant
+      Current
+    do
+      match Current
+        case Zero then other
+        case Succ(p) then p.plus(Succ(other))
+      end
+    end
+
+  count(acc: U64): U64
+    variant
+      Current
+    do
+      match Current
+        case Zero then acc
+        case Succ(p) then p.count(acc +% 1)
+      end
+    end
+
+end

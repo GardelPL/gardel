@@ -1,0 +1,109 @@
+program SIGNED
+
+feature {ANY}
+
+  below_zero_let(x: I64): BOOL
+    do
+      let zero = 0
+      x < zero
+    end
+
+  below_zero_chain(x: I64): BOOL
+    do
+      let a = 0
+      let b = a
+      x < b
+    end
+
+  below_derived(x: I64): BOOL
+    do
+      let a = 0
+      let b = a + 1
+      x < b
+    end
+
+  pick(c: BOOL, x: I64): BOOL
+    do
+      let v = if c then 0 else x end
+      v < 0
+    end
+
+  arm(o: OPTION[I64]): BOOL
+    do
+      let v = match o
+        case None then 0
+        case Some(n) then n
+      end
+      v < 0
+    end
+
+  negative_let: BOOL
+    do
+      let m = -1
+      m < 0
+    end
+
+  group(x: I64): BOOL
+    do
+      let a = 0
+      let b = 2
+      x < a and x +% b > a
+    end
+
+  id(x: I64): I64
+    do
+      x
+    end
+
+  through_call: BOOL
+    do
+      let k = 5
+      id(k) -% 7 < 0
+    end
+
+  shift(n: U64): U64
+    require
+      small: n < 8
+    do
+      1 << n
+    end
+
+  unsigned_still_works(u: U64): BOOL
+    do
+      let zero = 0
+      u > zero
+    end
+
+  smallest: BOOL
+    do
+      let m = -9223372036854775808
+      m < 0
+    end
+
+  first_failure: U64
+    do
+      if not below_zero_let(-1) then 1
+      else if below_zero_let(1) then 2
+      else if not below_zero_chain(-1) then 3
+      else if not below_derived(-1) then 4
+      else if not pick(False, -1) then 5
+      else if pick(True, -1) then 6
+      else if not arm(Some(-1)) then 7
+      else if arm(None) then 8
+      else if not negative_let then 9
+      else if not group(-1) then 10
+      else if group(1) then 11
+      else if not through_call then 12
+      else if not unsigned_still_works(1) then 13
+      else if not smallest then 14
+      else if shift(3) != 8 then 15
+      else 0
+      end end end end end end end end end end end end end end end
+    end
+
+  main(args: SEQ[STRING]): IO[EXIT_CODE]
+    do
+      IO.exit(first_failure)
+    end
+
+end

@@ -1,0 +1,47 @@
+program BOX_PROG
+
+feature {ANY}
+
+  to_bool(b: BOX[U64]): BOOL
+    do
+      b.map(fn(x: U64): BOOL do x > 1 end).get
+    end
+
+  to_negative(b: BOX[U64]): I64
+    do
+      b.map(fn(x: U64): I64 do -7 end).get
+    end
+
+  to_text(b: BOX[U64]): U64
+    do
+      b.map(fn(x: U64): STRING do "héllo" end).get.code_point_count
+    end
+
+  to_box(b: BOX[U64]): U64
+    do
+      b.map(fn(x: U64): BOX[U64] do BOX.make(x +% 1) end).get.get
+    end
+
+  twice(b: BOX[I64]): I64
+    do
+      b.twin.twin.get
+    end
+
+  first_failure: U64
+    do
+      let b = BOX.make(5)
+      if not to_bool(b) then 1
+      else if to_negative(b) >= 0 then 2
+      else if to_text(b) != 5 then 3
+      else if to_box(b) != 6 then 4
+      else if twice(BOX.make(-3)) >= 0 then 5
+      else 0
+      end end end end end
+    end
+
+  main(args: SEQ[STRING]): IO[EXIT_CODE]
+    do
+      IO.exit(first_failure)
+    end
+
+end

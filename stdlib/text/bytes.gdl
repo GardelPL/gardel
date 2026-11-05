@@ -244,6 +244,27 @@ specify {ANY}
       same_bytes: xs = ys
     end
 
+  -- One well-formed 4-byte step (a single unfolding of `valid_utf8` and `decode_utf8`).
+  -- `STRING.push_utf8_4` uses it so that its invariant proof does not depend on the
+  -- solver unfolding four levels of `tail` on its own (Task C.3: that proof failed for
+  -- half of the Z3 random seeds once an unrelated axiom was added to the preamble).
+  law utf8_step_4(b0: U64, b1: U64, b2: U64, b3: U64, xs: LIST[U64])
+    require
+      lead: b0 >= 240 and b0 <= 244
+      cont1: if b0 = 240 then (b1 >= 144 and b1 <= 191)
+             else if b0 = 244 then (b1 >= 128 and b1 <= 143)
+             else (b1 >= 128 and b1 <= 191) end end
+      cont2: b2 >= 128 and b2 <= 191
+      cont3: b3 >= 128 and b3 <= 191
+      xs_valid: valid_utf8(xs)
+    trigger
+      xs.prepend(b3).prepend(b2).prepend(b1).prepend(b0)
+    ensure
+      step_valid: valid_utf8(xs.prepend(b3).prepend(b2).prepend(b1).prepend(b0))
+      step_decode: decode_utf8(xs.prepend(b3).prepend(b2).prepend(b1).prepend(b0)) =
+        decode_utf8(xs).prepend(CHAR.from_scalar((b0 - 240) * 262144 + (b1 - 128) * 4096 + (b2 - 128) * 64 + (b3 - 128)))
+    end
+
 feature {ANY}
 
   length: NAT

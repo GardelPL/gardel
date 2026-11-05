@@ -1,0 +1,10 @@
+program ARGS
+
+feature {ANY}
+
+  main(args: SEQ[STRING]): IO[EXIT_CODE]
+    do
+      IO.exit(args.fold_left(fn(acc: U64, s: STRING): U64 do acc +% s.code_point_count end, 0) +% args.length *% 10)
+    end
+
+end

@@ -10,6 +10,133 @@ use std::fs;
 use std::process::Command;
 use std::rc::Rc;
 
+mod c11_typed;
+mod patterns;
+pub use c11_typed::emit_c11_typed;
+
+/// In a `program` or `functions` module (no `Current`), a free name that is a routine of
+/// the module with no parameters is a call of it: `IO.exit(first_failure)` means
+/// `first_failure()`. Rewriting it to `Call(name, [])` lets every later phase (checks,
+/// verification, code generation) treat it as the call it is. Locals, parameters, `match`
+/// binders, lambda parameters and quantified variables shadow routine names.
+fn desugar_nullary_calls(m: &mut ModuleDecl) {
+    if !matches!(m.kind, ModuleKind::Program | ModuleKind::Functions) {
+        return;
+    }
+    let nullary: HashSet<String> = m
+        .create_routines
+        .iter()
+        .chain(&m.feature_routines)
+        .chain(&m.specify_routines)
+        .filter(|(_, r)| r.params.is_empty() && r.type_params.is_empty())
+        .map(|(_, r)| r.name.clone())
+        .collect();
+    if nullary.is_empty() {
+        return;
+    }
+    fn block(stmts: &mut [Stmt], body: &mut Expr, n: &HashSet<String>, bound: &mut Vec<String>) {
+        let mark = bound.len();
+        for st in stmts.iter_mut() {
+            match st {
+                Stmt::Let(v, e) => {
+                    expr(e, n, bound);
+                    bound.push(v.clone());
+                }
+                Stmt::Check(_, e) | Stmt::Assume(_, e) => expr(e, n, bound),
+                Stmt::Reveal(_) => {}
+            }
+        }
+        expr(body, n, bound);
+        bound.truncate(mark);
+    }
+    fn expr(e: &mut Expr, n: &HashSet<String>, bound: &mut Vec<String>) {
+        match e {
+            Expr::Var(v) => {
+                if n.contains(v.as_str()) && !bound.iter().any(|b| b == v) {
+                    *e = Expr::Call(v.clone(), Vec::new());
+                }
+            }
+            Expr::Int(_) | Expr::Float(_) | Expr::Char(_) | Expr::Unit | Expr::Bool(_) | Expr::Str(_) => {}
+            Expr::UnaryNot(x) | Expr::UnaryNeg(x) => expr(x, n, bound),
+            Expr::BinOp(_, l, r) => {
+                expr(l, n, bound);
+                expr(r, n, bound);
+            }
+            Expr::Call(_, args) => args.iter_mut().for_each(|a| expr(a, n, bound)),
+            Expr::MethodCall(recv, _, args) => {
+                // `T.r` with `T` a type name stays as it is (a `Var` receiver that names a
+                // routine is still a value and is rewritten).
+                expr(recv, n, bound);
+                args.iter_mut().for_each(|a| expr(a, n, bound));
+            }
+            Expr::If(c, ts, te, es, ee) => {
+                expr(c, n, bound);
+                block(ts, te, n, bound);
+                block(es, ee, n, bound);
+            }
+            Expr::Match(sc, cases) => {
+                expr(sc, n, bound);
+                for c in cases.iter_mut() {
+                    let mark = bound.len();
+                    bound.extend(c.bindings());
+                    block(&mut c.stmts, &mut c.body, n, bound);
+                    bound.truncate(mark);
+                }
+            }
+            Expr::RecordLit(fs) => fs.iter_mut().for_each(|(_, x)| expr(x, n, bound)),
+            Expr::RecordUpdate(b, fs) => {
+                expr(b, n, bound);
+                fs.iter_mut().for_each(|(_, x)| expr(x, n, bound));
+            }
+            Expr::TupleLit(xs) => xs.iter_mut().for_each(|x| expr(x, n, bound)),
+            Expr::Forall(v, _, b) | Expr::Exists(v, _, b) => {
+                bound.push(v.clone());
+                expr(b, n, bound);
+                bound.pop();
+            }
+            Expr::WithIo(io, fin) => {
+                let mark = bound.len();
+                for st in io.iter_mut() {
+                    match st {
+                        IoStmt::Bind(v, x) => {
+                            expr(x, n, bound);
+                            bound.push(v.clone());
+                        }
+                        IoStmt::Action(x) => expr(x, n, bound),
+                    }
+                }
+                expr(fin, n, bound);
+                bound.truncate(mark);
+            }
+            Expr::Lambda(ps, _, stmts, body) => {
+                let mark = bound.len();
+                bound.extend(ps.iter().map(|(p, _)| p.clone()));
+                block(stmts, body, n, bound);
+                bound.truncate(mark);
+            }
+        }
+    }
+    let all = m
+        .create_routines
+        .iter_mut()
+        .chain(m.feature_routines.iter_mut())
+        .chain(m.specify_routines.iter_mut());
+    for (_, r) in all {
+        let mut bound: Vec<String> = r.params.iter().map(|(p, _)| p.clone()).collect();
+        for (_, e) in r.requires.iter_mut() {
+            expr(e, &nullary, &mut bound);
+        }
+        for e in r.variant.iter_mut() {
+            expr(e, &nullary, &mut bound);
+        }
+        block(&mut r.stmts, &mut r.body, &nullary, &mut bound);
+        bound.push("Result".into());
+        for (_, e) in r.ensures.iter_mut() {
+            expr(e, &nullary, &mut bound);
+        }
+    }
+}
+
 // ============================================================================
 // 1. AST DEFINITIONS (Gardel v0.4 Phase 4: Concepts, Boogie, Fuel, Stdlib & IO)
 // ============================================================================
@@ -1316,7 +1443,7 @@ impl Parser {
         }
         self.expect_kw("end")?;
 
-        Ok(ModuleDecl {
+        let mut m = ModuleDecl {
             kind,
             name,
             type_params,
@@ -1329,7 +1456,10 @@ impl Parser {
             create_routines,
             feature_routines,
             invariants,
-        })
+        };
+        desugar_nullary_calls(&mut m);
+        patterns::desugar_patterns(&mut m);
+        Ok(m)
     }
 
     fn is_section_or_end(&self) -> bool {
@@ -4839,6 +4969,205 @@ thread_local! {
         const { std::cell::RefCell::new(None) };
     static BOOGIE_TYPE_ENV: std::cell::RefCell<HashMap<String, String>> =
         std::cell::RefCell::new(HashMap::new());
+    /// Declarations of lambdas lifted to Boogie functions (`lift_boogie_lambda`), drained
+    /// into the module theory at the end of `emit_boogie_parts`.
+    static BOOGIE_LIFTED_LAMBDAS: std::cell::RefCell<String> =
+        const { std::cell::RefCell::new(String::new()) };
+    static BOOGIE_LAMBDA_COUNTER: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Variables of `e` (and of the statements of nested blocks) that are not bound inside it.
+fn expr_free_vars(e: &Expr, bound: &mut Vec<String>, out: &mut Vec<String>) {
+    fn block(stmts: &[Stmt], body: &Expr, bound: &mut Vec<String>, out: &mut Vec<String>) {
+        let mark = bound.len();
+        for st in stmts {
+            match st {
+                Stmt::Let(v, x) => {
+                    expr_free_vars(x, bound, out);
+                    bound.push(v.clone());
+                }
+                Stmt::Check(_, x) | Stmt::Assume(_, x) => expr_free_vars(x, bound, out),
+                Stmt::Reveal(_) => {}
+            }
+        }
+        expr_free_vars(body, bound, out);
+        bound.truncate(mark);
+    }
+    match e {
+        Expr::Var(v) => {
+            if !bound.contains(v) && !out.contains(v) {
+                out.push(v.clone());
+            }
+        }
+        Expr::Int(_) | Expr::Float(_) | Expr::Char(_) | Expr::Unit | Expr::Bool(_) | Expr::Str(_) => {}
+        Expr::UnaryNot(x) | Expr::UnaryNeg(x) => expr_free_vars(x, bound, out),
+        Expr::BinOp(_, l, r) => {
+            expr_free_vars(l, bound, out);
+            expr_free_vars(r, bound, out);
+        }
+        Expr::Call(f, args) => {
+            if !bound.contains(f) && !out.contains(f) {
+                out.push(f.clone());
+            }
+            for a in args {
+                expr_free_vars(a, bound, out);
+            }
+        }
+        Expr::MethodCall(recv, _, args) => {
+            expr_free_vars(recv, bound, out);
+            for a in args {
+                expr_free_vars(a, bound, out);
+            }
+        }
+        Expr::If(c, ts, te, es, ee) => {
+            expr_free_vars(c, bound, out);
+            block(ts, te, bound, out);
+            block(es, ee, bound, out);
+        }
+        Expr::Match(s, cases) => {
+            expr_free_vars(s, bound, out);
+            for c in cases {
+                let mark = bound.len();
+                bound.extend(c.bindings());
+                block(&c.stmts, &c.body, bound, out);
+                bound.truncate(mark);
+            }
+        }
+        Expr::RecordLit(fs) => {
+            for (_, x) in fs {
+                expr_free_vars(x, bound, out);
+            }
+        }
+        Expr::RecordUpdate(b, fs) => {
+            expr_free_vars(b, bound, out);
+            for (_, x) in fs {
+                expr_free_vars(x, bound, out);
+            }
+        }
+        Expr::TupleLit(xs) => {
+            for x in xs {
+                expr_free_vars(x, bound, out);
+            }
+        }
+        Expr::Forall(v, _, b) | Expr::Exists(v, _, b) => {
+            bound.push(v.clone());
+            expr_free_vars(b, bound, out);
+            bound.pop();
+        }
+        Expr::WithIo(io, fin) => {
+            let mark = bound.len();
+            for st in io {
+                match st {
+                    IoStmt::Bind(v, x) => {
+                        expr_free_vars(x, bound, out);
+                        bound.push(v.clone());
+                    }
+                    IoStmt::Action(x) => expr_free_vars(x, bound, out),
+                }
+            }
+            expr_free_vars(fin, bound, out);
+            bound.truncate(mark);
+        }
+        Expr::Lambda(ps, _, stmts, body) => {
+            let mark = bound.len();
+            bound.extend(ps.iter().map(|(p, _)| p.clone()));
+            block(stmts, body, bound, out);
+            bound.truncate(mark);
+        }
+    }
+}
+
+/// Lifts a lambda of one or two parameters to a fresh Boogie function `lam_M_k(captures)`
+/// returning an `Fn1`/`Fn2` value, defined by the axiom
+/// `FnN_app(lam_M_k(c..), x..) == body`. The function symbol is fresh and has exactly one
+/// defining equation, so the axiom is consistent. Captured locals (variables of the
+/// enclosing routine with a known type) become arguments. Returns `None` for lambdas whose
+/// types mention a type parameter of `m` (they keep the special-cased encodings).
+fn lift_boogie_lambda(
+    params: &[(String, String)],
+    ret_ty: &str,
+    stmts: &[Stmt],
+    body: &Expr,
+    m: &ModuleDecl,
+    implicit_fields: &HashSet<String>,
+    strings: &[String],
+) -> Option<String> {
+    if params.is_empty() || params.len() > 2 {
+        return None;
+    }
+    let mentions_tp = |t: &str| type_tokens(t).iter().any(|tok| m.type_params.iter().any(|p| p == tok));
+    if params.iter().any(|(_, t)| mentions_tp(t)) || mentions_tp(ret_ty) {
+        return None;
+    }
+    let param_names: Vec<String> = params.iter().map(|(p, _)| p.clone()).collect();
+    let mut free = Vec::new();
+    let mut bound = param_names.clone();
+    let blk = Expr::If(
+        Box::new(Expr::Bool(true)),
+        stmts.to_vec(),
+        Box::new(body.clone()),
+        Vec::new(),
+        Box::new(Expr::Unit),
+    );
+    expr_free_vars(&blk, &mut bound, &mut free);
+    let captures: Vec<(String, String)> = free
+        .into_iter()
+        .filter(|v| !implicit_fields.contains(v))
+        .filter_map(|v| boogie_env_type(&v).map(|t| (v, t)))
+        .collect();
+    if captures.iter().any(|(_, t)| mentions_tp(t)) {
+        return None;
+    }
+    // Emit the body with the parameters typed (restoring any shadowed entries afterwards).
+    let saved: Vec<(String, Option<String>)> =
+        params.iter().map(|(p, _)| (p.clone(), boogie_env_type(p))).collect();
+    for (p, t) in params {
+        bind_boogie_env_type(p, t);
+    }
+    let body_bpl = emit_boogie_block_expr(stmts, body, m, implicit_fields, "DefaultFuel", strings);
+    BOOGIE_TYPE_ENV.with(|env| {
+        let mut env = env.borrow_mut();
+        for (p, prev) in saved {
+            match prev {
+                Some(t) => {
+                    env.insert(p, t);
+                }
+                None => {
+                    env.remove(&p);
+                }
+            }
+        }
+    });
+    let k = BOOGIE_LAMBDA_COUNTER.with(|c| {
+        let v = c.get();
+        c.set(v + 1);
+        v
+    });
+    let name = format!("lam_{}_{k}", m.name);
+    let cap_decls: Vec<String> = captures
+        .iter()
+        .map(|(v, t)| format!("{v}: {}", map_boogie_type(t, m)))
+        .collect();
+    let cap_names: Vec<String> = captures.iter().map(|(v, _)| v.clone()).collect();
+    let fn_ty = map_boogie_type(
+        &format!(
+            "({}) -> {ret_ty}",
+            params.iter().map(|(p, t)| format!("{p}: {t}")).collect::<Vec<_>>().join(", ")
+        ),
+        m,
+    );
+    let app = if params.len() == 1 { "Fn1_app" } else { "Fn2_app" };
+    let call = format!("{name}({})", cap_names.join(", "));
+    let mut quant: Vec<String> = cap_decls.clone();
+    quant.extend(params.iter().map(|(p, t)| format!("{p}: {}", map_boogie_type(t, m))));
+    let applied = format!("{app}({call}, {})", param_names.join(", "));
+    let decl = format!(
+        "function {name}({}) returns ({fn_ty});\naxiom (forall {} :: {{ {applied} }} {applied} == {body_bpl});\n",
+        cap_decls.join(", "),
+        quant.join(", ")
+    );
+    BOOGIE_LIFTED_LAMBDAS.with(|l| l.borrow_mut().push_str(&decl));
+    Some(call)
 }
 
 /// Runs `f` with Standard Prelude injection enabled (or disabled) for Boogie emission
@@ -5506,6 +5835,20 @@ fn unify_type(pattern: &str, actual: &str, tps: &[String], map: &mut HashMap<Str
         map.entry(p.to_string()).or_insert_with(|| a.to_string());
         return;
     }
+    // Function types: `(acc: B, x: A) -> B` against `(U64, U64) -> U64`.
+    if split_top_level_arrow(p).is_some() || split_top_level_arrow(a).is_some() {
+        let pf = c11_typed::fn_parts(&c11_typed::norm_type(p));
+        let af = c11_typed::fn_parts(&c11_typed::norm_type(a));
+        if let (Some((pp, pr)), Some((ap, ar))) = (pf, af) {
+            if pp.len() == ap.len() {
+                for (x, y) in pp.iter().zip(ap.iter()) {
+                    unify_type(x, y, tps, map);
+                }
+                unify_type(&pr, &ar, tps, map);
+            }
+        }
+        return;
+    }
     let (ph, pargs) = split_type_app(p);
     let (ah, aargs) = split_type_app(a);
     if ph == ah && pargs.len() == aargs.len() {
@@ -5632,7 +5975,15 @@ fn infer_gardel_type(e: &Expr, m: &ModuleDecl, ctx: &BoogiePreludeCtx) -> Option
                         let (rd, _) = find_module_routine(m, r)?;
                         return instantiate_ret_type(m, rd, None, &arg_tys, &m.type_params);
                     }
-                    if let Some(p) = ctx.module(v) {
+                    // `FUNCTION_OPS`/`LIST_OPS` calls are translated to built-ins, so these
+                    // modules may be absent from the context; their declared signatures
+                    // still give the result type.
+                    let owner = ctx.module(v).or_else(|| {
+                        matches!(v.as_str(), "FUNCTION_OPS" | "LIST_OPS")
+                            .then(|| standard_prelude().module(v))
+                            .flatten()
+                    });
+                    if let Some(p) = owner {
                         let (rd, _) = find_module_routine(p, r)?;
                         return instantiate_ret_type(p, rd, None, &arg_tys, &[]);
                     }
@@ -5648,7 +5999,17 @@ fn infer_gardel_type(e: &Expr, m: &ModuleDecl, ctx: &BoogiePreludeCtx) -> Option
                     }
                 }
             }
-            let rt = infer_gardel_type(recv, m, ctx)?;
+            let rt = match infer_gardel_type(recv, m, ctx) {
+                Some(t) => t,
+                None => {
+                    // `M.make(4).push(10)`: the receiver's type arguments are fixed only
+                    // by this call's arguments; infer the result from the routine of the
+                    // receiver's module.
+                    let p = ctx.module(prelude_result_head(recv, ctx)?)?;
+                    let (rd, _) = find_module_routine(p, r)?;
+                    return instantiate_ret_type(p, rd, None, &arg_tys, &[]);
+                }
+            };
             let head = type_head(&rt).to_string();
             if head == "LIST" || (head == "SEQ" && ctx.module("SEQ").is_none()) {
                 let elem = split_type_app(&rt).1.first().map(|s| s.to_string());
@@ -5688,12 +6049,33 @@ fn infer_gardel_type(e: &Expr, m: &ModuleDecl, ctx: &BoogiePreludeCtx) -> Option
         Expr::If(_, _, t, _, f) => {
             infer_gardel_type(t, m, ctx).or_else(|| infer_gardel_type(f, m, ctx))
         }
+        // A lambda's parameter and result types are annotated.
+        Expr::Lambda(ps, ret, _, _) => Some(c11_typed::norm_type(&format!(
+            "({}) -> {ret}",
+            ps.iter().map(|(_, t)| t.as_str()).collect::<Vec<_>>().join(", ")
+        ))),
         _ => None,
     }
 }
 
 /// Decides whether `recv.mname(..)` in user module `m` targets an injected prelude
 /// module's routine, returning that module's name.
+/// The prelude module whose values `e` produces, when only that is known: `SEQ.empty`
+/// (element type not yet inferable) and call chains on it such as `SEQ.empty.concat(s)`.
+/// Enough to route a method call to the right module.
+fn prelude_result_head<'c>(e: &Expr, ctx: &'c BoogiePreludeCtx) -> Option<&'c str> {
+    let Expr::MethodCall(recv, r, _) = e else {
+        return None;
+    };
+    let owner: &ModuleDecl = match &**recv {
+        Expr::Var(v) if boogie_env_type(v).is_none() && ctx.module(v).is_some() => ctx.module(v)?,
+        inner => ctx.module(prelude_result_head(inner, ctx)?)?,
+    };
+    let (rd, _) = find_module_routine(owner, r)?;
+    let ret = rd.ret_type.trim();
+    (ret == "Current" || type_head(ret) == owner.name).then_some(owner.name.as_str())
+}
+
 fn resolve_prelude_receiver(
     recv: &Expr,
     mname: &str,
@@ -5701,7 +6083,11 @@ fn resolve_prelude_receiver(
     ctx: &BoogiePreludeCtx,
 ) -> Option<String> {
     if let Expr::Var(v) = recv {
-        if v == "LIST" || v == "LIST_OPS" || v == "FUNCTION_OPS" || v == "SEQ" {
+        if v == "LIST"
+            || v == "LIST_OPS"
+            || v == "FUNCTION_OPS"
+            || (v == "SEQ" && ctx.module("SEQ").is_none())
+        {
             return None;
         }
         if v != "Current" && v != "Result" && boogie_env_type(v).is_none() {
@@ -5712,7 +6098,9 @@ fn resolve_prelude_receiver(
     }
     let has_instance_routine =
         |p: &ModuleDecl| find_module_routine(p, mname).is_some_and(|(_, has_cur)| has_cur);
-    if let Some(ty) = infer_gardel_type(recv, m, ctx) {
+    let inferred = infer_gardel_type(recv, m, ctx)
+        .or_else(|| prelude_result_head(recv, ctx).map(|h| h.to_string()));
+    if let Some(ty) = inferred {
         let head = type_head(&ty);
         if head != m.name {
             if let Some(p) = ctx.module(head) {
@@ -5768,7 +6156,11 @@ fn prelude_call_target(
         return None;
     };
     if let Expr::Var(v) = &**recv {
-        if v == "LIST" || v == "LIST_OPS" || v == "FUNCTION_OPS" || v == "SEQ" {
+        if v == "LIST"
+            || v == "LIST_OPS"
+            || v == "FUNCTION_OPS"
+            || (v == "SEQ" && ctx.module("SEQ").is_none())
+        {
             return None;
         }
         if v != &m.name && v != "Current" && boogie_env_type(v).is_none() {
@@ -5822,7 +6214,11 @@ fn emit_boogie_prelude_ref(
         }
         Expr::MethodCall(recv, r, args) => {
             if let Expr::Var(v) = &**recv {
-                if v == "LIST" || v == "LIST_OPS" || v == "FUNCTION_OPS" || v == "SEQ" {
+                if v == "LIST"
+            || v == "LIST_OPS"
+            || v == "FUNCTION_OPS"
+            || (v == "SEQ" && ctx.module("SEQ").is_none())
+        {
                     return None;
                 }
                 if v != &m.name
@@ -6480,6 +6876,10 @@ fn emit_boogie_parts(m: &ModuleDecl, fuel_limit: usize) -> BoogieParts {
         "axiom (forall<T> xs: Seq T, ys: Seq T, zs: Seq T :: { Seq_append(Seq_append(xs, ys), zs) } Seq_append(Seq_append(xs, ys), zs) == Seq_append(xs, Seq_append(ys, zs)));\n",
     );
     out.push_str("axiom (forall<T> x: T :: { Seq_singleton(x) } Seq_singleton(x) == Seq_prepend(x, (Seq_empty() : Seq T)));\n");
+    // The empty list has no members. Without this base case, `has` on any list
+    // built from `empty` (e.g. `LIST.singleton(v).has(x)`) was unconstrained,
+    // which made `forall x. xs.has(x) implies ...` postconditions unprovable.
+    out.push_str("axiom (forall<T> x: T :: { Seq_has((Seq_empty() : Seq T), x) } !Seq_has((Seq_empty() : Seq T), x));\n");
     out.push_str("axiom (forall<T> x: T, xs: Seq T, ys: Seq T :: { Seq_append(Seq_prepend(x, xs), ys) } Seq_append(Seq_prepend(x, xs), ys) == Seq_prepend(x, Seq_append(xs, ys)));\n");
     out.push_str(
         "axiom (forall<T> x: T, y: T, xs: Seq T :: { Seq_has(Seq_prepend(y, xs), x) } Seq_has(Seq_prepend(y, xs), x) <==> (x == y || Seq_has(xs, x)));\n",
@@ -7313,6 +7713,11 @@ fn emit_boogie_parts(m: &ModuleDecl, fuel_limit: usize) -> BoogieParts {
             &collect_module_strings(m),
         ));
     }
+
+    // Lambdas lifted while emitting the theory and the procedures (Boogie declarations are
+    // order-independent, so they can follow their uses).
+    let mut theory = theory;
+    theory.push_str(&BOOGIE_LIFTED_LAMBDAS.with(|l| std::mem::take(&mut *l.borrow_mut())));
 
     BoogieParts {
         preamble,
@@ -8447,15 +8852,11 @@ fn emit_group_call_termination(
     let emit = |e: &Expr| {
         emit_boogie_expr_with_strings(e, m, &HashSet::new(), revealed, "DefaultFuel", strings)
     };
-    let is_adt_ty =
-        |t: &str| t == m.name || t == "Current" || t.starts_with(&format!("{}[", m.name));
-    let structural = |v: &Expr, params: &[(String, String)]| -> bool {
-        match v {
-            Expr::Var(x) => {
-                x == "Current" || params.iter().any(|(pn, pt)| pn == x && is_adt_ty(pt))
-            }
-            _ => false,
+    let size_of = |v: &Expr, rd: &RoutineDecl| -> Option<String> {
+        if matches!(v, Expr::Var(x) if x == "Current") {
+            return Some(format!("{}_adt_size", m.name));
         }
+        structural_variant(v, rd, m)
     };
     let mut substs: Vec<(String, Expr)> = callee
         .params
@@ -8473,24 +8874,22 @@ fn emit_group_call_termination(
     let mut curr = Vec::new();
     let mut next = Vec::new();
     for i in 0..k {
-        let c_struct = structural(&r.variant[i], &r.params);
-        let n_struct = structural(&callee.variant[i], &callee.params);
-        let c = if c_struct {
-            format!("{}_adt_size({})", m.name, emit(&r.variant[i]))
-        } else {
-            emit(&r.variant[i])
+        let c_size = size_of(&r.variant[i], r);
+        let n_size = size_of(&callee.variant[i], callee);
+        let c = match &c_size {
+            Some(f) => format!("{f}({})", emit(&r.variant[i])),
+            None => emit(&r.variant[i]),
         };
-        if !c_struct {
+        if c_size.is_none() {
             s.push_str(&format!(
                 "{pad}assert {{:msg \"{}::variant::variant_non_negative\"}} 0 <= {c};\n",
                 r.name
             ));
         }
         let ne = subst_expr_vars(&callee.variant[i], &substs);
-        let n = if n_struct {
-            format!("{}_adt_size({})", m.name, emit(&ne))
-        } else {
-            emit(&ne)
+        let n = match &n_size {
+            Some(f) => format!("{f}({})", emit(&ne)),
+            None => emit(&ne),
         };
         curr.push(c);
         next.push(n);
@@ -9737,6 +10136,28 @@ fn emit_boogie_expr_obligations(
     s
 }
 
+/// Structural size function measuring a variant component of type `ty`: the module's
+/// own `<M>_adt_size`, or the namespaced `<P>__<P>_adt_size` of a sum type `P` from the
+/// prelude or a linked project module (e.g. a client recursing on `SEQ`'s constructors).
+/// The size axioms (a field is smaller than its value) come with that module's theory.
+fn adt_size_fn(ty: &str, m: &ModuleDecl) -> Option<String> {
+    let t = ty.trim();
+    if t == m.name || t == "Current" || t.starts_with(&format!("{}[", m.name)) {
+        return Some(format!("{}_adt_size", m.name));
+    }
+    let ctx = boogie_prelude_ctx()?;
+    let head = type_head(t);
+    let p = ctx.module(head)?;
+    matches!(p.repr, ReprKind::Sum(_)).then(|| format!("{head}__{head}_adt_size"))
+}
+
+/// The size function of variant component `v` when it is a parameter of `r` of an ADT type.
+fn structural_variant(v: &Expr, r: &RoutineDecl, m: &ModuleDecl) -> Option<String> {
+    let Expr::Var(x) = v else { return None };
+    let (_, t) = r.params.iter().find(|(pn, _)| pn == x)?;
+    adt_size_fn(t, m)
+}
+
 fn emit_boogie_variant_obligations(
     r: &RoutineDecl,
     m: &ModuleDecl,
@@ -9768,14 +10189,18 @@ fn emit_boogie_variant_obligations(
     let mut next_vals = Vec::new();
 
     for v_e in &r.variant {
-        let curr_v =
+        // A structural variant on an ADT parameter is measured by the value's size.
+        let size = structural_variant(v_e, r, m);
+        let mut curr_v =
             emit_boogie_expr_with_strings(v_e, m, &empty_fields, revealed, "DefaultFuel", strings);
-        s.push_str(&format!(
-            "{pad}assert {{:msg \"{}::variant::variant_non_negative\"}} 0 <= {curr_v};\n",
-            r.name
-        ));
+        if size.is_none() {
+            s.push_str(&format!(
+                "{pad}assert {{:msg \"{}::variant::variant_non_negative\"}} 0 <= {curr_v};\n",
+                r.name
+            ));
+        }
         let next_var_e = subst_expr_vars(v_e, substs);
-        let next_v = emit_boogie_expr_with_strings(
+        let mut next_v = emit_boogie_expr_with_strings(
             &next_var_e,
             m,
             &empty_fields,
@@ -9783,6 +10208,10 @@ fn emit_boogie_variant_obligations(
             "DefaultFuel",
             strings,
         );
+        if let Some(f) = size {
+            curr_v = format!("{f}({curr_v})");
+            next_v = format!("{f}({next_v})");
+        }
         curr_vals.push(curr_v);
         next_vals.push(next_v);
     }
@@ -9862,10 +10291,16 @@ pub fn subst_expr_vars(e: &Expr, substs: &[(String, Expr)]) -> Expr {
             Box::new(subst_expr_vars(l, substs)),
             Box::new(subst_expr_vars(r, substs)),
         ),
-        Expr::Call(f, args) => Expr::Call(
-            f.clone(),
-            args.iter().map(|a| subst_expr_vars(a, substs)).collect(),
-        ),
+        Expr::Call(f, args) => {
+            let args: Vec<Expr> = args.iter().map(|a| subst_expr_vars(a, substs)).collect();
+            // A call of a substituted function value `h(x)` (e.g. `let h = compose(..)`)
+            // becomes a call of the replacement: `repl.apply(x)`, or a renamed call.
+            match substs.iter().find(|(target, _)| target == f) {
+                Some((_, Expr::Var(r))) => Expr::Call(r.clone(), args),
+                Some((_, repl)) => Expr::MethodCall(Box::new(repl.clone()), "apply".into(), args),
+                None => Expr::Call(f.clone(), args),
+            }
+        }
         Expr::MethodCall(recv, mname, args) => Expr::MethodCall(
             Box::new(subst_expr_vars(recv, substs)),
             mname.clone(),
@@ -10987,7 +11422,7 @@ fn emit_boogie_expr_with_strings(
         Expr::WithIo(_, final_e) => {
             emit_boogie_expr_with_strings(final_e, m, implicit_fields, revealed, fuel_var, strings)
         }
-        Expr::Lambda(params, _, stmts, body) => {
+        Expr::Lambda(params, ret_ty, stmts, body) => {
             if params.len() == 1 && stmts.is_empty() {
                 let p0 = &params[0].0;
                 if let Expr::Var(v) = &**body {
@@ -11087,6 +11522,11 @@ fn emit_boogie_expr_with_strings(
                         }
                     }
                 }
+            }
+            if let Some(lifted) =
+                lift_boogie_lambda(params, ret_ty, stmts, body, m, implicit_fields, strings)
+            {
+                return lifted;
             }
             emit_boogie_block_expr(stmts, body, m, implicit_fields, fuel_var, strings)
         }
@@ -11401,6 +11841,49 @@ thread_local! {
     /// Routines whose contract axioms are withheld in the current verification pass.
     static UNTRUSTED_CONTRACTS: std::cell::RefCell<HashSet<String>> =
         std::cell::RefCell::new(HashSet::new());
+    /// Z3 random seed override for Boogie verification.
+    static BOOGIE_Z3_SEED: std::cell::RefCell<Option<u32>> = const { std::cell::RefCell::new(None) };
+    /// Z3 resource limit override for Boogie verification.
+    static BOOGIE_Z3_RLIMIT: std::cell::RefCell<Option<u64>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Z3 resources allowed per Boogie procedure. Unlike a time limit it counts solver work, so
+/// the verdict does not depend on machine load. See plan/Roadmap.md for the calibration.
+pub const DEFAULT_Z3_RLIMIT: u64 = 30_000_000;
+
+/// Backstop in seconds for a solver that stops counting resources. `DEFAULT_Z3_RLIMIT` is
+/// what ends a proof attempt; a run that reaches this limit has hung.
+const BOOGIE_TIME_BACKSTOP: u32 = 600;
+
+pub fn with_z3_rlimit<R>(rlimit: Option<u64>, f: impl FnOnce() -> R) -> R {
+    let prev = BOOGIE_Z3_RLIMIT.with(|s| s.replace(rlimit));
+    let res = f();
+    BOOGIE_Z3_RLIMIT.with(|s| *s.borrow_mut() = prev);
+    res
+}
+
+pub fn current_z3_rlimit() -> u64 {
+    BOOGIE_Z3_RLIMIT.with(|s| *s.borrow()).unwrap_or(DEFAULT_Z3_RLIMIT)
+}
+
+pub fn with_z3_seed<R>(seed: Option<u32>, f: impl FnOnce() -> R) -> R {
+    let prev = BOOGIE_Z3_SEED.with(|s| s.replace(seed));
+    let res = f();
+    BOOGIE_Z3_SEED.with(|s| *s.borrow_mut() = prev);
+    res
+}
+
+pub fn current_z3_seed() -> Option<u32> {
+    BOOGIE_Z3_SEED.with(|s| *s.borrow())
+}
+
+/// The Boogie options that give Z3 a fixed random seed. Every Boogie call site uses these,
+/// so a seeded run cannot apply the seed to one path and miss another.
+fn boogie_seed_args(seed: u32) -> [String; 2] {
+    [
+        format!("/proverOpt:O:smt.random_seed={seed}"),
+        format!("/proverOpt:O:sat.random_seed={seed}"),
+    ]
 }
 
 fn run_boogie_verification_once(
@@ -11428,8 +11911,12 @@ fn run_boogie_verification_once(
 
     let mut cmd = Command::new(boogie_path);
     cmd.arg(format!("/proverOpt:PROVER_PATH={z3_path}"));
+    if let Some(seed) = current_z3_seed() {
+        cmd.args(boogie_seed_args(seed));
+    }
     cmd.arg("/typeEncoding:p");
-    cmd.arg("/timeLimit:10");
+    cmd.arg(format!("/rlimit:{}", current_z3_rlimit()));
+    cmd.arg(format!("/timeLimit:{BOOGIE_TIME_BACKSTOP}"));
     cmd.arg("/mv:-");
     cmd.arg("/errorTrace:0");
     cmd.arg(&temp_path);
@@ -11617,15 +12104,17 @@ pub fn parse_boogie_output(
 
         // 1b. A timed-out / inconclusive procedure is *not* verified: report it instead of
         // silently counting it as a success.
-        if line.contains("Verification of '")
+        if line.contains("Verification ")
             && (line.contains("timed out")
                 || line.contains("inconclusive")
                 || line.contains("out of"))
         {
+            // `Verification of 'P' timed out ...` or `Verification inconclusive (P)`.
             let proc_name = line
                 .split("Verification of '")
                 .nth(1)
                 .and_then(|r| r.split('\'').next())
+                .or_else(|| line.rsplit('(').next().and_then(|r| r.split(')').next()))
                 .unwrap_or("");
             let routine = proc_name
                 .strip_prefix("Verify_")
@@ -11661,6 +12150,26 @@ pub fn parse_boogie_output(
                 let sp = locate_span(src, input_path, &tag, &routine);
                 let lemmas = find_relevant_lemmas_for_tag(m, &routine, &tag);
                 let pcs = collect_routine_path_conditions(m, &routine, &tag);
+                // Boogie prints a refutation with its model. An obligation with no model is
+                // one the solver gave up on: it is unproven, not shown false.
+                if !line.contains(": error:") && !line.contains(": Error:") {
+                    diags.push(
+                        Diagnostic::basic(
+                            "error",
+                            "Phase 3 Boogie (Verification Resource Limit)",
+                            routine.clone(),
+                            tag.clone(),
+                            format!(
+                                "`{routine}`: the solver gave up on `{tag}` at {} resources, so it is unproven (not shown false). Simplify the proof with a lemma, or raise the limit with --z3-rlimit",
+                                current_z3_rlimit()
+                            ),
+                        )
+                        .with_module(&m.name)
+                        .with_ai_context(sp, pcs, BTreeMap::new(), lemmas),
+                    );
+                    i += 1;
+                    continue;
+                }
                 let static_rule = match rule_kind.as_str() {
                     "overflow" => "Phase 3 Boogie (Arithmetic Overflow)",
                     "div_by_zero" => "Phase 3 Boogie (Division by Zero)",
@@ -11682,7 +12191,31 @@ pub fn parse_boogie_output(
 
         i += 1;
     }
+    // Passing needs Boogie's own clean summary. A crash, a missing summary or an outcome this
+    // parser does not know must never read as "verified".
+    if diags.is_empty() && !lines.iter().any(|l| is_clean_boogie_summary(l)) {
+        let tail: Vec<&str> = lines.iter().rev().map(|l| l.trim()).filter(|l| !l.is_empty()).take(2).collect();
+        diags.push(
+            Diagnostic::basic(
+                "error",
+                "Phase 3 Boogie (Verification Incomplete)",
+                m.name.clone(),
+                "incomplete".to_string(),
+                format!("Boogie did not report a clean result for `{}`, so nothing is proven: {}", m.name, tail.join(" | ")),
+            )
+            .with_module(&m.name),
+        );
+    }
     diags
+}
+
+/// `Boogie program verifier finished with N verified, 0 errors`, and nothing after it (Boogie
+/// appends `, 1 inconclusive`, `, 1 time out` and so on when something did not finish).
+fn is_clean_boogie_summary(line: &str) -> bool {
+    line.trim()
+        .strip_prefix("Boogie program verifier finished with ")
+        .and_then(|r| r.strip_suffix(" verified, 0 errors"))
+        .is_some_and(|n| n.parse::<u64>().is_ok())
 }
 
 fn parse_msg_tag(msg: &str) -> (String, String, String) {
@@ -13963,513 +14496,9 @@ pub fn analyze_parallel_lets(stmts: &[Stmt]) -> Vec<Vec<(String, Expr)>> {
     groups
 }
 
-/// Checks if a routine's body ends in a self-recursive tail call (§10.3).
-pub fn is_tail_recursive_routine(r: &RoutineDecl) -> bool {
-    fn expr_is_tail_call(e: &Expr, target: &str) -> bool {
-        match e {
-            Expr::Call(f, _) => f == target,
-            Expr::MethodCall(_, m, _) => m == target,
-            Expr::If(_, _, te, _, ee) => {
-                expr_is_tail_call(te, target) || expr_is_tail_call(ee, target)
-            }
-            Expr::Match(_, cases) => cases.iter().any(|c| expr_is_tail_call(&c.body, target)),
-            _ => false,
-        }
-    }
-    expr_is_tail_call(&r.body, &r.name)
-}
-
 // ============================================================================
-// 10. BACKEND 2: C11 RUNTIME EMITTER (.c) (Phase 4 Stdlib: SEQ, BIGNAT, STRING, IO)
+// 10. C11 RUNTIME SUPPORT (Header, UTF-8 validator, IO runtimes for c11_typed)
 // ============================================================================
-
-pub fn emit_c11(m: &ModuleDecl) -> String {
-    let mut out = String::new();
-    match m.name.as_str() {
-        "TREE" => {
-            out.push_str(
-                r#"// Automatically generated by gardelc (Phase 4 -> C11 + OpenMP Parallel Runtime)
-#include <stdint.h>
-#include <stdio.h>
-#include <stdlib.h>
-
-typedef uint64_t U64;
-
-typedef struct TREE {
-    enum { TAG_Leaf, TAG_Node } tag;
-    union {
-        struct { U64 value; } Leaf;
-        struct { struct TREE* left; struct TREE* right; } Node;
-    };
-} TREE;
-
-static inline TREE* make_Leaf(U64 value) {
-    TREE* t = (TREE*)malloc(sizeof(TREE));
-    t->tag = TAG_Leaf;
-    t->Leaf.value = value;
-    return t;
-}
-
-static inline TREE* make_Node(TREE* left, TREE* right) {
-    TREE* t = (TREE*)malloc(sizeof(TREE));
-    t->tag = TAG_Node;
-    t->Node.left = left;
-    t->Node.right = right;
-    return t;
-}
-
-TREE* from_range(U64 lo, U64 hi) {
-    if (lo == hi) {
-        return make_Leaf(lo);
-    } else {
-        U64 mid = lo + (hi - lo) / 2;
-        TREE* left_tree = NULL;
-        TREE* right_tree = NULL;
-        #pragma omp task shared(left_tree) if(hi - lo > 1024)
-        left_tree = from_range(lo, mid);
-        #pragma omp task shared(right_tree) if(hi - lo > 1024)
-        right_tree = from_range(mid + 1, hi);
-        #pragma omp taskwait
-        return make_Node(left_tree, right_tree);
-    }
-}
-
-U64 max_value(TREE* Current) {
-    switch (Current->tag) {
-        case TAG_Leaf:
-            return Current->Leaf.value;
-        case TAG_Node: {
-            U64 ml = 0, mr = 0;
-            #pragma omp task shared(ml)
-            ml = max_value(Current->Node.left);
-            #pragma omp task shared(mr)
-            mr = max_value(Current->Node.right);
-            #pragma omp taskwait
-            return (ml >= mr) ? ml : mr;
-        }
-    }
-    return 0;
-}
-
-int main(void) {
-    TREE* t = NULL;
-    U64 res = 0;
-    #pragma omp parallel
-    #pragma omp single
-    {
-        t = from_range(1, 100000);
-        res = max_value(t);
-    }
-    printf("Verified TREE.from_range(1, 100000).max_value = %llu\n", (unsigned long long)res);
-    return 0;
-}
-"#,
-            );
-        }
-        "BOUNDED_STACK" => {
-            out.push_str(
-                r#"// Automatically generated by gardelc (Phase 4 -> C11 Product & Refinement Runtime)
-#include <stdint.h>
-#include <stdio.h>
-#include <stdlib.h>
-#include <stdbool.h>
-
-typedef uint64_t U64;
-
-typedef struct LIST_Node {
-    U64 head;
-    struct LIST_Node* tail;
-} LIST_Node;
-
-typedef struct BOUNDED_STACK {
-    LIST_Node* items;
-    U64 size;
-    U64 limit;
-} BOUNDED_STACK;
-
-typedef struct TUPLE_U64_BOUNDED_STACK {
-    U64 first;
-    BOUNDED_STACK second;
-} TUPLE_U64_BOUNDED_STACK;
-
-static inline BOUNDED_STACK make(U64 cap) {
-    BOUNDED_STACK s;
-    s.items = NULL;
-    s.size = 0;
-    s.limit = cap;
-    return s;
-}
-
-static inline U64 count(BOUNDED_STACK current) {
-    return current.size;
-}
-
-static inline U64 capacity(BOUNDED_STACK current) {
-    return current.limit;
-}
-
-static inline BOUNDED_STACK push(BOUNDED_STACK current, U64 x) {
-    if (current.size >= current.limit) {
-        fprintf(stderr, "Precondition violation: not_full\n");
-        exit(1);
-    }
-    LIST_Node* node = (LIST_Node*)malloc(sizeof(LIST_Node));
-    node->head = x;
-    node->tail = current.items;
-    BOUNDED_STACK next;
-    next.items = node;
-    next.size = current.size + 1;
-    next.limit = current.limit;
-    return next;
-}
-
-static inline TUPLE_U64_BOUNDED_STACK pop(BOUNDED_STACK current) {
-    if (current.size == 0 || current.items == NULL) {
-        fprintf(stderr, "Precondition violation: not_empty\n");
-        exit(1);
-    }
-    TUPLE_U64_BOUNDED_STACK res;
-    res.first = current.items->head;
-    res.second.items = current.items->tail;
-    res.second.size = current.size - 1;
-    res.second.limit = current.limit;
-    return res;
-}
-
-int main(void) {
-    printf("Initializing BOUNDED_STACK with capacity 5...\n");
-    BOUNDED_STACK s = make(5);
-    printf("Initial count = %llu, capacity = %llu\n", (unsigned long long)count(s), (unsigned long long)capacity(s));
-
-    printf("Pushing 10, 20, 30...\n");
-    s = push(s, 10);
-    s = push(s, 20);
-    s = push(s, 30);
-    printf("Current count = %llu\n", (unsigned long long)count(s));
-
-    TUPLE_U64_BOUNDED_STACK p1 = pop(s);
-    printf("Popped element = %llu, remaining count = %llu\n", (unsigned long long)p1.first, (unsigned long long)count(p1.second));
-    s = p1.second;
-
-    TUPLE_U64_BOUNDED_STACK p2 = pop(s);
-    printf("Popped element = %llu, remaining count = %llu\n", (unsigned long long)p2.first, (unsigned long long)count(p2.second));
-    s = p2.second;
-
-    printf("Verified BOUNDED_STACK operations executed successfully.\n");
-    return 0;
-}
-"#,
-            );
-        }
-        "PEANO" => {
-            out.push_str(
-                r#"// Automatically generated by gardelc (Phase 4 -> Monomorphized Concept Conformance C11 Runtime)
-#include <stdint.h>
-#include <stdio.h>
-#include <stdlib.h>
-#include <stdbool.h>
-
-typedef struct PEANO {
-    enum { TAG_Zero, TAG_Succ } tag;
-    struct PEANO* pred;
-} PEANO;
-
-static inline PEANO* make_Zero(void) {
-    PEANO* p = (PEANO*)malloc(sizeof(PEANO));
-    p->tag = TAG_Zero;
-    p->pred = NULL;
-    return p;
-}
-
-static inline PEANO* make_Succ(PEANO* pred) {
-    PEANO* p = (PEANO*)malloc(sizeof(PEANO));
-    p->tag = TAG_Succ;
-    p->pred = pred;
-    return p;
-}
-
-bool equals(PEANO* current, PEANO* other) {
-    while (current->tag == TAG_Succ && other->tag == TAG_Succ) {
-        current = current->pred;
-        other = other->pred;
-    }
-    return current->tag == TAG_Zero && other->tag == TAG_Zero;
-}
-
-bool less_than(PEANO* current, PEANO* other) {
-    while (current->tag == TAG_Succ && other->tag == TAG_Succ) {
-        current = current->pred;
-        other = other->pred;
-    }
-    return current->tag == TAG_Zero && other->tag == TAG_Succ;
-}
-
-bool less_or_equal(PEANO* current, PEANO* other) {
-    return less_than(current, other) || equals(current, other);
-}
-
-int main(void) {
-    PEANO* zero = make_Zero();
-    PEANO* one = make_Succ(zero);
-    PEANO* two = make_Succ(one);
-
-    printf("Testing monomorphized PEANO (satisfies ORD refines EQ):\n");
-    printf("  one.equals(one)        = %s\n", equals(one, one) ? "True" : "False");
-    printf("  one.less_than(two)     = %s\n", less_than(one, two) ? "True" : "False");
-    printf("  two.less_or_equal(two) = %s (inherited from concept ORD)\n", less_or_equal(two, two) ? "True" : "False");
-    return 0;
-}
-"#,
-            );
-        }
-        "SEQ" => {
-            out.push_str(
-                r#"// Automatically generated by gardelc (Phase 4 Stdlib -> Parallel Balanced Tree SEQ[U64] C11 Runtime)
-#include <stdint.h>
-#include <stdio.h>
-#include <stdlib.h>
-
-typedef uint64_t U64;
-
-typedef struct SEQ {
-    enum { SEQ_Empty, SEQ_Leaf, SEQ_Concat } tag;
-    U64 len;
-    union {
-        struct { U64 value; } Leaf;
-        struct { struct SEQ* left; struct SEQ* right; } Concat;
-    };
-} SEQ;
-
-static inline SEQ* seq_empty(void) {
-    SEQ* s = (SEQ*)malloc(sizeof(SEQ));
-    s->tag = SEQ_Empty;
-    s->len = 0;
-    return s;
-}
-
-static inline SEQ* seq_singleton(U64 x) {
-    SEQ* s = (SEQ*)malloc(sizeof(SEQ));
-    s->tag = SEQ_Leaf;
-    s->len = 1;
-    s->Leaf.value = x;
-    return s;
-}
-
-static inline SEQ* seq_concat(SEQ* l, SEQ* r) {
-    if (l->tag == SEQ_Empty) return r;
-    if (r->tag == SEQ_Empty) return l;
-    SEQ* s = (SEQ*)malloc(sizeof(SEQ));
-    s->tag = SEQ_Concat;
-    s->len = l->len + r->len;
-    s->Concat.left = l;
-    s->Concat.right = r;
-    return s;
-}
-
-SEQ* seq_from_range(U64 lo, U64 hi) {
-    if (lo > hi) return seq_empty();
-    if (lo == hi) return seq_singleton(lo);
-    U64 mid = lo + (hi - lo) / 2;
-    SEQ* left = NULL;
-    SEQ* right = NULL;
-    #pragma omp task shared(left) if(hi - lo > 512)
-    left = seq_from_range(lo, mid);
-    #pragma omp task shared(right) if(hi - lo > 512)
-    right = seq_from_range(mid + 1, hi);
-    #pragma omp taskwait
-    return seq_concat(left, right);
-}
-
-U64 seq_parallel_sum(SEQ* s) {
-    switch (s->tag) {
-        case SEQ_Empty: return 0;
-        case SEQ_Leaf:  return s->Leaf.value;
-        case SEQ_Concat: {
-            U64 sl = 0, sr = 0;
-            #pragma omp task shared(sl) if(s->len > 512)
-            sl = seq_parallel_sum(s->Concat.left);
-            #pragma omp task shared(sr) if(s->len > 512)
-            sr = seq_parallel_sum(s->Concat.right);
-            #pragma omp taskwait
-            return sl + sr;
-        }
-    }
-    return 0;
-}
-
-int main(void) {
-    SEQ* xs = NULL;
-    U64 total = 0;
-    #pragma omp parallel
-    #pragma omp single
-    {
-        xs = seq_from_range(1, 10000);
-        total = seq_parallel_sum(xs);
-    }
-    printf("Verified Phase 4 SEQ[U64]: len = %llu, parallel_sum(1..10000) = %llu\n",
-           (unsigned long long)xs->len, (unsigned long long)total);
-    return 0;
-}
-"#,
-            );
-        }
-        "BIGNAT" => {
-            out.push_str(
-                r#"// Automatically generated by gardelc (Phase 4 Stdlib -> BIGNAT 64-bit Limbs in SEQ[U64] C11 Runtime)
-#include <stdint.h>
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
-
-typedef uint64_t U64;
-
-typedef struct BIGNAT {
-    U64* limbs;
-    U64 size;
-} BIGNAT;
-
-static inline BIGNAT bignat_zero(void) {
-    BIGNAT b = { NULL, 0 };
-    return b;
-}
-
-static inline BIGNAT bignat_from_u64(U64 x) {
-    if (x == 0) return bignat_zero();
-    BIGNAT b;
-    b.limbs = (U64*)malloc(sizeof(U64));
-    b.limbs[0] = x;
-    b.size = 1;
-    return b;
-}
-
-BIGNAT bignat_add(BIGNAT a, BIGNAT b) {
-    U64 max_len = (a.size > b.size) ? a.size : b.size;
-    U64* out = (U64*)calloc(max_len + 1, sizeof(U64));
-    unsigned __int128 carry = 0;
-    for (U64 i = 0; i < max_len; i++) {
-        unsigned __int128 la = (i < a.size) ? a.limbs[i] : 0;
-        unsigned __int128 lb = (i < b.size) ? b.limbs[i] : 0;
-        unsigned __int128 sum = la + lb + carry;
-        out[i] = (U64)sum;
-        carry = sum >> 64;
-    }
-    U64 final_size = max_len;
-    if (carry > 0) {
-        out[max_len] = (U64)carry;
-        final_size = max_len + 1;
-    }
-    BIGNAT res = { out, final_size };
-    return res;
-}
-
-int main(void) {
-    BIGNAT a = bignat_from_u64(0xFFFFFFFFFFFFFFFFULL);
-    BIGNAT b = bignat_from_u64(1ULL);
-    BIGNAT sum = bignat_add(a, b);
-    printf("Verified Phase 4 BIGNAT (SEQ[U64] limbs, ghost MATH_INT): (2^64 - 1) + 1 => limb_count = %llu, high_limb = %llu, low_limb = %llu\n",
-           (unsigned long long)sum.size,
-           (unsigned long long)sum.limbs[1],
-           (unsigned long long)sum.limbs[0]);
-    return 0;
-}
-"#,
-            );
-        }
-        "STRING" => {
-            out.push_str(
-                r#"// Automatically generated by gardelc (Phase 4 Stdlib -> UTF-8 STRING backed by SEQ[U64] C11 Runtime)
-#include <stdint.h>
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
-#include <stdbool.h>
-
-typedef uint64_t U64;
-typedef uint32_t CHAR;
-
-typedef struct STRING {
-    U64* words;
-    U64 word_len;
-    U64 byte_len;
-} STRING;
-
-STRING string_from_utf8(const char* utf8) {
-    size_t blen = strlen(utf8);
-    size_t wlen = (blen + 7) / 8;
-    U64* words = (U64*)calloc(wlen ? wlen : 1, sizeof(U64));
-    memcpy(words, utf8, blen);
-    STRING s = { words, (U64)wlen, (U64)blen };
-    return s;
-}
-
-STRING string_concat(STRING a, STRING b) {
-    U64 total_bytes = a.byte_len + b.byte_len;
-    U64 wlen = (total_bytes + 7) / 8;
-    U64* words = (U64*)calloc(wlen ? wlen : 1, sizeof(U64));
-    memcpy((char*)words, (const char*)a.words, (size_t)a.byte_len);
-    memcpy((char*)words + a.byte_len, (const char*)b.words, (size_t)b.byte_len);
-    STRING s = { words, wlen, total_bytes };
-    return s;
-}
-
-int main(void) {
-    STRING hello = string_from_utf8("Hello, ");
-    STRING world = string_from_utf8("Gardel v0.4 Phase 4!");
-    STRING msg = string_concat(hello, world);
-    printf("Verified Phase 4 UTF-8 STRING (SEQ[U64] words = %llu, byte_len = %llu): %.*s\n",
-           (unsigned long long)msg.word_len,
-           (unsigned long long)msg.byte_len,
-           (int)msg.byte_len,
-           (const char*)msg.words);
-    return 0;
-}
-"#,
-            );
-        }
-        _ => {
-            out.push_str(&emit_c11_general_module(m));
-        }
-    }
-    out
-}
-
-pub fn map_c_type(ty: &str) -> String {
-    match ty {
-        "U64" | "NAT" | "EXIT_CODE" => "uint64_t".to_string(),
-        "I64" | "INT" => "int64_t".to_string(),
-        "F64" => "double".to_string(),
-        "BOOL" => "bool".to_string(),
-        "CHAR" => "uint32_t".to_string(),
-        "UNIT" | "()" => "GARDEL_UNIT".to_string(),
-        "STRING" => "GardelString".to_string(),
-        "BYTES" => "GardelBytes".to_string(),
-        other if other.starts_with("IO[") => "int64_t".to_string(),
-        other => {
-            if let Some(inner) = other
-                .strip_prefix("OPTION[")
-                .and_then(|s| s.strip_suffix(']'))
-            {
-                return format!("{}_ptr", map_c_type(inner));
-            }
-            if let Some(inner) = other
-                .strip_prefix("LIST[")
-                .and_then(|s| s.strip_suffix(']'))
-            {
-                return format!("struct LIST_{}*", map_c_type(inner));
-            }
-            if let Some(inner) = other.strip_prefix("SEQ[").and_then(|s| s.strip_suffix(']')) {
-                return format!("struct SEQ_{}*", map_c_type(inner));
-            }
-            if let Some(idx) = other.find('[') {
-                let base = &other[..idx];
-                let inner = &other[idx + 1..other.len() - 1];
-                let parts: Vec<String> = inner.split(',').map(|p| map_c_type(p.trim())).collect();
-                return format!("struct {}_{}*", base, parts.join("_"));
-            }
-            format!("struct {}*", other)
-        }
-    }
-}
 
 pub fn emit_c11_runtime_header() -> String {
     r#"#pragma STDC FP_CONTRACT OFF
@@ -14515,13 +14544,34 @@ typedef struct {
     const char* data;
     uint64_t len;
     uint64_t chars;
+    void* owner; /* counted buffer holding `data`; NULL for static text (literals, argv) */
 } GardelString;
 
 /* Runtime BYTES (spec 11): a read-only view of raw octets. */
 typedef struct {
     const uint8_t* data;
     uint64_t len;
+    void* owner; /* as for GardelString */
 } GardelBytes;
+
+/* Counted text buffers: the reference count precedes the octets. */
+typedef struct gardel_buf { _Atomic uint64_t rc; } gardel_buf;
+static inline char* gardel_buf_alloc(size_t n, void** owner) {
+    gardel_buf* b = (gardel_buf*)gardel_alloc(sizeof(gardel_buf) + n);
+    atomic_init(&b->rc, 1);
+    *owner = b;
+    return (char*)(b + 1);
+}
+static inline void gardel_owner_dup(void* o) {
+    if (o) atomic_fetch_add_explicit(&((gardel_buf*)o)->rc, 1, memory_order_relaxed);
+}
+static inline void gardel_owner_drop(void* o) {
+    if (o && atomic_fetch_sub_explicit(&((gardel_buf*)o)->rc, 1, memory_order_acq_rel) == 1) gardel_free(o);
+}
+static inline GardelString gardel_string_dup(GardelString s) { gardel_owner_dup(s.owner); return s; }
+static inline void gardel_string_drop(GardelString s) { gardel_owner_drop(s.owner); }
+static inline GardelBytes gardel_bytes_dup(GardelBytes b) { gardel_owner_dup(b.owner); return b; }
+static inline void gardel_bytes_drop(GardelBytes b) { gardel_owner_drop(b.owner); }
 
 /* Number of scalars in well-formed UTF-8: every byte that is not a continuation byte. */
 static inline uint64_t gardel_utf8_count(const uint8_t* bytes, uint64_t len) {
@@ -14536,7 +14586,7 @@ static inline uint64_t gardel_utf8_count(const uint8_t* bytes, uint64_t len) {
    read-only, NUL-terminated UTF-8 byte buffer emitted by the compiler. No copy and no
    decoding: the literal was validated at compile time. */
 static inline GardelString string_from_utf8(const uint8_t* bytes, uint64_t len) {
-    GardelString s = { (const char*)bytes, len, gardel_utf8_count(bytes, len) };
+    GardelString s = { (const char*)bytes, len, gardel_utf8_count(bytes, len), NULL };
     return s;
 }
 
@@ -14564,16 +14614,20 @@ static inline uint32_t gardel_string_character_at(GardelString s, uint64_t index
         i += n;
     }
 }
+/* Borrows `a` and `b`; returns a new counted string. */
 static inline GardelString gardel_string_concat(GardelString a, GardelString b) {
-    char* buf = (char*)gardel_alloc((size_t)(a.len + b.len + 1));
+    void* owner = NULL;
+    char* buf = gardel_buf_alloc((size_t)(a.len + b.len + 1), &owner);
     memcpy(buf, a.data, (size_t)a.len);
     memcpy(buf + a.len, b.data, (size_t)b.len);
     buf[a.len + b.len] = '\0';
-    GardelString s = { buf, a.len + b.len, a.chars + b.chars };
+    GardelString s = { buf, a.len + b.len, a.chars + b.chars, owner };
     return s;
 }
+/* Borrows `s`; the result shares its buffer (a new reference). */
 static inline GardelBytes gardel_string_to_utf8(GardelString s) {
-    GardelBytes b = { (const uint8_t*)s.data, s.len };
+    gardel_owner_dup(s.owner);
+    GardelBytes b = { (const uint8_t*)s.data, s.len, s.owner };
     return b;
 }
 
@@ -14624,53 +14678,8 @@ static inline int64_t gardel_io_exit(uint64_t code) {
     .to_string()
 }
 
-thread_local! {
-    /// String literals of the module being lowered to C11 (index = static buffer number).
-    static C11_STRING_LITERALS: std::cell::RefCell<Vec<String>> =
-        const { std::cell::RefCell::new(Vec::new()) };
-}
-
-/// Static read-only UTF-8 buffers for the string literals of a module (Task B.3, §3.1.4):
-/// `static const uint8_t gardel_str_lit_k[] = { ..., 0 };` with the bytes computed at compile
-/// time (NUL-terminated; the length is passed explicitly, so embedded `\0` is preserved).
-fn emit_c11_string_literal_table(strings: &[String]) -> String {
-    let mut out = String::new();
-    if strings.is_empty() {
-        return out;
-    }
-    out.push_str(
-        "/* String literals (Task B.3): static read-only UTF-8, zero runtime decoding */\n",
-    );
-    for (idx, s) in strings.iter().enumerate() {
-        let bytes: Vec<String> = s
-            .as_bytes()
-            .iter()
-            .map(|b| b.to_string())
-            .chain(std::iter::once("0".to_string()))
-            .collect();
-        out.push_str(&format!(
-            "static const uint8_t gardel_str_lit_{idx}[{}] = {{ {} }}; /* \"{}\" */\n",
-            s.len() + 1,
-            bytes.join(", "),
-            s.escape_debug().to_string().replace("*/", "*\\/")
-        ));
-    }
-    out.push('\n');
-    out
-}
-
-// --- C11 lowering of instantiated prelude sum types (spec §11 IO boundary) -------------
-
-thread_local! {
-    /// Gardel types of locals while lowering one routine to C11: IO-bound values and
-    /// `match` binders whose type is an instantiated prelude sum type.
-    static C11_TYPE_ENV: std::cell::RefCell<HashMap<String, String>> =
-        std::cell::RefCell::new(HashMap::new());
-    static C11_MATCH_COUNTER: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
-}
-
 /// C identifier of an instantiated type: `RESULT[IO_ERROR, STRING]` -> `RESULT_IO_ERROR_STRING`.
-fn c_instance_name(ty: &str) -> String {
+pub(crate) fn c_instance_name(ty: &str) -> String {
     let mut out = String::new();
     for ch in ty.chars() {
         if ch.is_ascii_alphanumeric() || ch == '_' {
@@ -14682,118 +14691,13 @@ fn c_instance_name(ty: &str) -> String {
     out.trim_end_matches('_').to_string()
 }
 
-/// Variants of an instantiated prelude sum type with field types substituted:
-/// `RESULT[IO_ERROR, STRING]` -> `[(Error, [(err, IO_ERROR)]), (Ok, [(val, STRING)])]`.
-fn c_prelude_sum_variants(ty: &str) -> Option<Vec<(String, Vec<(String, String)>)>> {
-    let (head, args) = split_type_app(ty.trim());
-    let p = standard_prelude().module(head)?;
-    let ReprKind::Sum(vs) = &p.repr else {
-        return None;
-    };
-    if p.type_params.len() != args.len() {
-        return None;
-    }
-    let map: HashMap<String, String> = p
-        .type_params
-        .iter()
-        .cloned()
-        .zip(args.iter().map(|a| a.trim().to_string()))
-        .collect();
-    Some(
-        vs.iter()
-            .map(|v| {
-                (
-                    v.name.clone(),
-                    v.fields
-                        .iter()
-                        .map(|(f, t)| (f.clone(), subst_type_idents(t, &map)))
-                        .collect(),
-                )
-            })
-            .collect(),
-    )
-}
-
-fn c_field_type(ty: &str) -> String {
-    if c_prelude_sum_variants(ty).is_some() {
-        format!("struct {}*", c_instance_name(ty))
-    } else {
-        map_c_type(ty)
-    }
-}
-
-/// Struct definitions and constructors for `roots` and every prelude sum type they contain.
-fn emit_c11_prelude_instances(roots: &[&str]) -> String {
-    let mut order: Vec<String> = Vec::new();
-    let mut stack: Vec<String> = roots.iter().map(|r| r.to_string()).collect();
-    while let Some(t) = stack.pop() {
-        let name = c_instance_name(&t);
-        if order.iter().any(|o| c_instance_name(o) == name) {
-            continue;
-        }
-        if let Some(vs) = c_prelude_sum_variants(&t) {
-            order.push(t.clone());
-            for (_, fields) in vs {
-                for (_, ft) in fields {
-                    stack.push(ft);
-                }
-            }
-        }
-    }
-    let mut out = String::from("/* Instantiated prelude sum types (spec 5, 11) */\n");
-    for t in &order {
-        out.push_str(&format!("struct {};\n", c_instance_name(t)));
-    }
-    for t in &order {
-        let cname = c_instance_name(t);
-        let vs = c_prelude_sum_variants(t).unwrap_or_default();
-        out.push_str(&format!("typedef struct {cname} {{\n"));
-        let tags: Vec<String> = vs.iter().map(|(v, _)| format!("TAG_{cname}_{v}")).collect();
-        out.push_str(&format!("    enum {{ {} }} tag;\n", tags.join(", ")));
-        if vs.iter().any(|(_, f)| !f.is_empty()) {
-            out.push_str("    union {\n");
-            for (v, fields) in &vs {
-                if !fields.is_empty() {
-                    out.push_str("        struct {");
-                    for (f, ft) in fields {
-                        out.push_str(&format!(" {} {f};", c_field_type(ft)));
-                    }
-                    out.push_str(&format!(" }} {v};\n"));
-                }
-            }
-            out.push_str("    };\n");
-        }
-        out.push_str(&format!("}} {cname};\n"));
-        for (v, fields) in &vs {
-            let params: Vec<String> = fields
-                .iter()
-                .map(|(f, ft)| format!("{} {f}", c_field_type(ft)))
-                .collect();
-            let params = if params.is_empty() {
-                "void".to_string()
-            } else {
-                params.join(", ")
-            };
-            out.push_str(&format!(
-                "static inline struct {cname}* make_{cname}_{v}({params}) {{\n    struct {cname}* r = (struct {cname}*)gardel_alloc(sizeof(struct {cname}));\n    r->tag = TAG_{cname}_{v};\n"
-            ));
-            for (f, _) in fields {
-                out.push_str(&format!("    r->{v}.{f} = {f};\n"));
-            }
-            out.push_str("    return r;\n}\n");
-        }
-        out.push('\n');
-    }
-    out
-}
-
 /// `IO.read_line` at the C boundary (spec §11): reads one line (shorter than
 /// `GARDEL_MAX_LINE_BYTES`) and returns `RESULT[IO_ERROR, STRING]`. Only well-formed
 /// RFC 3629 UTF-8 becomes `Ok(STRING)`, decoded in the same check order as
 /// `STRING.validate_and_count`; end of input, read failures, over-long lines and malformed
 /// UTF-8 become `Error(..)`. This is the runtime check that justifies the verifier's
 /// boundary assumption (`read_line_result_wf`).
-fn emit_c11_read_line_runtime() -> String {
+pub fn emit_c11_read_line_runtime() -> String {
     let r = c_instance_name(READ_LINE_RESULT_TYPE);
     let max_line = GARDEL_MAX_LINE_BYTES;
     format!(
@@ -14822,8 +14726,12 @@ static struct {r}* gardel_io_read_line_result(void) {{
     uint64_t chars = 0;
     struct STRING_ERROR* derr = gardel_utf8_validate((const uint8_t*)buf, (uint64_t)len, &chars);
     if (derr) {{ free(buf); return make_{r}_Error(make_IO_ERROR_Decode(derr)); }}
-    buf[len] = '\0';
-    GardelString s = {{ buf, (uint64_t)len, chars }};
+    void* owner = NULL;
+    char* data = gardel_buf_alloc(len + 1, &owner);
+    memcpy(data, buf, len);
+    data[len] = '\0';
+    free(buf);
+    GardelString s = {{ data, (uint64_t)len, chars, owner }};
     return make_{r}_Ok(s);
 }}
 
@@ -14831,20 +14739,15 @@ static struct {r}* gardel_io_read_line_result(void) {{
     )
 }
 
-/// The prelude result type of `STRING.from_utf8` (spec 11).
-const FROM_UTF8_RESULT_TYPE: &str = "RESULT[STRING_ERROR, STRING]";
-
-fn is_string_from_utf8(e: &Expr) -> bool {
-    matches!(e, Expr::MethodCall(recv, m, args)
-        if m == "from_utf8" && args.len() == 1 && matches!(&**recv, Expr::Var(v) if v == "STRING"))
-}
+/// The prelude result type of `STRING.from_utf8` (spec §11).
+pub const FROM_UTF8_RESULT_TYPE: &str = "RESULT[STRING_ERROR, STRING]";
 
 /// RFC 3629 validator shared by `IO.read_line` and `STRING.from_utf8`. It reports the first
 /// error in the check order of `STRING.validate_and_count` (stdlib/text/string.gdl): for a
 /// multi-byte lead, (1) each continuation byte present must be 0x80..0xBF, (2) the sequence
 /// must be complete, (3) the lead-specific second-byte range. Returns NULL and the scalar
 /// count on success.
-fn emit_c11_utf8_validator() -> String {
+pub fn emit_c11_utf8_validator() -> String {
     r#"/* RFC 3629 UTF-8 validation (same check order as STRING.validate_and_count) */
 static struct STRING_ERROR* gardel_utf8_validate(const uint8_t* buf, uint64_t len, uint64_t* chars) {
     uint64_t i = 0, n = 0;
@@ -14880,14 +14783,16 @@ static struct STRING_ERROR* gardel_utf8_validate(const uint8_t* buf, uint64_t le
 
 /// `STRING.from_utf8(bytes)` at run time: validates and, on success, wraps the bytes
 /// (the input view is immutable, so no copy is needed).
-fn emit_c11_from_utf8_runtime() -> String {
+pub fn emit_c11_from_utf8_runtime() -> String {
     let r = c_instance_name(FROM_UTF8_RESULT_TYPE);
     format!(
         r#"static struct {r}* gardel_string_from_utf8(GardelBytes b) {{
     uint64_t chars = 0;
     struct STRING_ERROR* err = gardel_utf8_validate(b.data, b.len, &chars);
     if (err) return make_{r}_Error(err);
-    GardelString s = {{ (const char*)b.data, b.len, chars }};
+    /* The string shares the bytes' buffer: a new reference. */
+    gardel_owner_dup(b.owner);
+    GardelString s = {{ (const char*)b.data, b.len, chars, b.owner }};
     return make_{r}_Ok(s);
 }}
 
@@ -14895,583 +14800,16 @@ fn emit_c11_from_utf8_runtime() -> String {
     )
 }
 
-fn c11_record_bind_type(v: &str, e: &Expr) {
-    let ty = if is_io_read_line(e) {
-        READ_LINE_RESULT_TYPE
-    } else if is_string_from_utf8(e) {
-        FROM_UTF8_RESULT_TYPE
-    } else {
-        return;
-    };
-    C11_TYPE_ENV.with(|env| {
-        env.borrow_mut().insert(v.to_string(), ty.to_string());
-    });
-}
 
-/// The instantiated prelude sum type of a `match` scrutinee, when known.
-fn c11_scrutinee_type(scrut: &Expr) -> Option<String> {
-    let ty = match scrut {
-        Expr::Var(v) => C11_TYPE_ENV.with(|env| env.borrow().get(v).cloned())?,
-        e if is_io_read_line(e) => READ_LINE_RESULT_TYPE.to_string(),
-        e if is_string_from_utf8(e) => FROM_UTF8_RESULT_TYPE.to_string(),
-        _ => return None,
-    };
-    c_prelude_sum_variants(&ty).map(|_| ty)
-}
 
-/// `match` on an instantiated prelude sum type: the scrutinee is evaluated once, each case
-/// tests the instance's own tag and binds its pattern variables from the variant fields.
-fn emit_c11_prelude_match(scrut: &Expr, cases: &[MatchCase], mod_name: &str) -> String {
-    let ty = c11_scrutinee_type(scrut).unwrap_or_default();
-    let cname = c_instance_name(&ty);
-    let variants = c_prelude_sum_variants(&ty).unwrap_or_default();
-    let k = C11_MATCH_COUNTER.with(|c| {
-        let v = c.get();
-        c.set(v + 1);
-        v
-    });
-    let sv = format!("_ms{k}");
-    let mut arms: Vec<(Option<String>, String)> = Vec::new();
-    for c in cases {
-        let mut body = String::from("({ ");
-        let mut tag = None;
-        if let Some((vname, fields)) = variants.iter().find(|(v, _)| v == c.ctor()) {
-            tag = Some(format!("TAG_{cname}_{vname}"));
-            for (opt_b, (f, ft)) in c.top_bindings().iter().zip(fields.iter()) {
-                if let Some(b) = opt_b {
-                    if c_prelude_sum_variants(ft).is_some() {
-                        C11_TYPE_ENV.with(|env| env.borrow_mut().insert(b.clone(), ft.clone()));
-                    }
-                    body.push_str(&format!("__auto_type {b} = {sv}->{vname}.{f}; "));
-                }
-            }
-        }
-        for st in &c.stmts {
-            if let Stmt::Let(v, e) = st {
-                body.push_str(&format!(
-                    "__auto_type {v} = {}; ",
-                    emit_c11_expr(e, mod_name)
-                ));
-            }
-        }
-        body.push_str(&format!("{}; }})", emit_c11_expr(&c.body, mod_name)));
-        arms.push((tag, body));
-    }
-    // Nested conditional over the tags; the last arm is the fallback (matches are exhaustive).
-    let mut expr = arms
-        .last()
-        .map(|(_, b)| b.clone())
-        .unwrap_or_else(|| "0".to_string());
-    for (tag, body) in arms.iter().rev().skip(1) {
-        let cond = tag
-            .clone()
-            .map_or("0".to_string(), |t| format!("{sv}->tag == {t}"));
-        expr = format!("({cond} ? {body} : {expr})");
-    }
-    format!(
-        "({{ __auto_type {sv} = {}; {expr}; }})",
-        emit_c11_expr(scrut, mod_name)
-    )
-}
 
-pub fn emit_c11_general_module(m: &ModuleDecl) -> String {
-    let mut out = String::new();
-    out.push_str("// Automatically generated by gardelc (Phase 4 -> General C11 AST Lowering)\n");
-    out.push_str(&emit_c11_runtime_header());
-    out.push('\n');
-    let strings = collect_module_strings(m);
-    out.push_str(&emit_c11_string_literal_table(&strings));
-    C11_STRING_LITERALS.with(|c| *c.borrow_mut() = strings);
-    C11_TYPE_ENV.with(|env| env.borrow_mut().clear());
-    C11_MODULE_ROUTINES.with(|r| {
-        *r.borrow_mut() = m
-            .create_routines
-            .iter()
-            .chain(&m.feature_routines)
-            .chain(&m.specify_routines)
-            .map(|(_, rd)| rd.name.clone())
-            .collect();
-    });
-    let module_dbg = format!("{m:?}");
-    let uses_read_line = module_dbg.contains("\"read_line\"");
-    let uses_from_utf8 = module_dbg.contains("\"from_utf8\"");
-    let mut roots: Vec<&str> = Vec::new();
-    if uses_read_line {
-        roots.push(READ_LINE_RESULT_TYPE);
-    }
-    if uses_from_utf8 {
-        roots.push(FROM_UTF8_RESULT_TYPE);
-    }
-    if !roots.is_empty() {
-        out.push_str(&emit_c11_prelude_instances(&roots));
-        out.push_str(&emit_c11_utf8_validator());
-    }
-    if uses_read_line {
-        out.push_str(&emit_c11_read_line_runtime());
-    }
-    if uses_from_utf8 {
-        out.push_str(&emit_c11_from_utf8_runtime());
-    }
-    if m.kind == ModuleKind::Program {
-        // File-scope forward declarations for opaque struct types in routine signatures
-        // (e.g. `main(args: SEQ[STRING])`), so they are not scoped to a parameter list.
-        let mut fwd: Vec<String> = Vec::new();
-        for (_, r) in &m.feature_routines {
-            for ty in r
-                .params
-                .iter()
-                .map(|(_, t)| t)
-                .chain(std::iter::once(&r.ret_type))
-            {
-                let ct = map_c_type(ty);
-                if let Some(name) = ct.strip_prefix("struct ").and_then(|t| t.strip_suffix('*')) {
-                    let decl = format!("struct {name};\n");
-                    if !fwd.contains(&decl) {
-                        fwd.push(decl);
-                    }
-                }
-            }
-        }
-        out.push_str(&fwd.concat());
-    }
 
-    let mod_name = &m.name;
 
-    // 1. Types & Data Structures (Product / Sum)
-    if m.kind == ModuleKind::Module {
-        match &m.repr {
-            ReprKind::Product(fields) => {
-                out.push_str(&format!("typedef struct {mod_name} {{\n"));
-                out.push_str("    _Atomic uint64_t _rc;\n");
-                for (fnm, fty) in fields {
-                    out.push_str(&format!("    {} {fnm};\n", map_c_type(fty)));
-                }
-                out.push_str(&format!("}} {mod_name};\n\n"));
 
-                let param_decls: Vec<String> = fields
-                    .iter()
-                    .map(|(fnm, fty)| format!("{} {fnm}", map_c_type(fty)))
-                    .collect();
-                out.push_str(&format!(
-                    "static inline {mod_name}* make_{mod_name}({}) {{\n",
-                    param_decls.join(", ")
-                ));
-                out.push_str(&format!(
-                    "    {mod_name}* res = ({mod_name}*)gardel_alloc(sizeof({mod_name}));\n"
-                ));
-                out.push_str("    atomic_init(&res->_rc, 1);\n");
-                for (fnm, _) in fields {
-                    out.push_str(&format!("    res->{fnm} = {fnm};\n"));
-                }
-                out.push_str("    return res;\n}\n\n");
-            }
-            ReprKind::Sum(variants) => {
-                out.push_str(&format!("typedef struct {mod_name} {{\n"));
-                out.push_str("    _Atomic uint64_t _rc;\n");
-                let tag_names: Vec<String> = variants
-                    .iter()
-                    .map(|v| format!("TAG_{mod_name}_{}", v.name))
-                    .collect();
-                out.push_str(&format!("    enum {{ {} }} tag;\n", tag_names.join(", ")));
-                out.push_str("    union {\n");
-                for v in variants {
-                    if !v.fields.is_empty() {
-                        out.push_str(&format!("        struct {{\n"));
-                        for (fnm, fty) in &v.fields {
-                            out.push_str(&format!("            {} {fnm};\n", map_c_type(fty)));
-                        }
-                        out.push_str(&format!("        }} {};\n", v.name));
-                    }
-                }
-                out.push_str("    };\n");
-                out.push_str(&format!("}} {mod_name};\n\n"));
 
-                for v in variants {
-                    let vname = &v.name;
-                    let param_decls: Vec<String> = v
-                        .fields
-                        .iter()
-                        .map(|(fnm, fty)| format!("{} {fnm}", map_c_type(fty)))
-                        .collect();
-                    out.push_str(&format!(
-                        "static inline {mod_name}* make_{mod_name}_{vname}({}) {{\n",
-                        param_decls.join(", ")
-                    ));
-                    out.push_str(&format!(
-                        "    {mod_name}* res = ({mod_name}*)gardel_alloc(sizeof({mod_name}));\n"
-                    ));
-                    out.push_str("    atomic_init(&res->_rc, 1);\n");
-                    out.push_str(&format!("    res->tag = TAG_{mod_name}_{vname};\n"));
-                    for (fnm, _) in &v.fields {
-                        out.push_str(&format!("    res->{vname}.{fnm} = {fnm};\n"));
-                    }
-                    out.push_str("    return res;\n}\n\n");
-                }
-            }
-        }
-    }
 
-    // 2. Closure conversion
-    let (_, combinators) = closure_convert_module(m);
-    for comb in &combinators {
-        if let Some((env_name, env_fields)) = &comb.env_struct {
-            out.push_str(&format!("typedef struct {env_name} {{\n"));
-            out.push_str("    _Atomic uint64_t _rc;\n");
-            for (fnm, fty) in env_fields {
-                out.push_str(&format!("    {} {fnm};\n", map_c_type(fty)));
-            }
-            out.push_str(&format!("}} {env_name};\n\n"));
-        }
-        out.push_str(&emit_c11_routine(&comb.routine, false, mod_name));
-    }
 
-    // 3. Create Routines
-    for (_, r) in &m.create_routines {
-        out.push_str(&emit_c11_routine(r, false, mod_name));
-    }
 
-    // 4. Feature Routines
-    let is_adt = m.kind == ModuleKind::Module;
-    for (_, r) in &m.feature_routines {
-        out.push_str(&emit_c11_routine(r, is_adt, mod_name));
-    }
-
-    // 5. Program Entry Point if Program
-    if m.kind == ModuleKind::Program {
-        out.push_str("int main(void) {\n");
-        if let Some((_, r)) = m.feature_routines.iter().find(|(_, r)| r.name == "main") {
-            // `args: SEQ[STRING]` is not yet marshalled from argv (passed as NULL).
-            let args: Vec<&str> = r.params.iter().map(|_| "NULL").collect();
-            out.push_str(&format!(
-                "    return (int)main_routine({});\n",
-                args.join(", ")
-            ));
-        } else {
-            out.push_str("    return 0;\n");
-        }
-        out.push_str("}\n");
-    } else {
-        out.push_str("int main(void) { return 0; }\n");
-    }
-
-    out
-}
-
-fn emit_c11_routine(r: &RoutineDecl, has_current: bool, mod_name: &str) -> String {
-    let mut s = String::new();
-    let ret_type = map_c_type(&r.ret_type);
-    let mut param_strs = Vec::new();
-    if has_current {
-        param_strs.push(format!("struct {mod_name}* Current"));
-    }
-    for (pname, pty) in &r.params {
-        param_strs.push(format!("{} {pname}", map_c_type(pty)));
-    }
-    let rname = if r.name == "main" {
-        "main_routine"
-    } else {
-        &r.name
-    };
-    s.push_str(&format!(
-        "{ret_type} {rname}({}) {{\n",
-        param_strs.join(", ")
-    ));
-
-    // Check tail recursion
-    let is_tail = is_tail_recursive_routine(r);
-    if is_tail {
-        s.push_str("tail_loop:\n");
-    }
-
-    // The routine body returns its value (`true`: statement position, not an `if` branch).
-    s.push_str(&emit_c11_block(&r.stmts, &r.body, mod_name, true, rname, 4));
-    s.push_str("}\n\n");
-    s
-}
-
-fn emit_c11_block(
-    stmts: &[Stmt],
-    body: &Expr,
-    mod_name: &str,
-    is_tail: bool,
-    _routine_name: &str,
-    indent: usize,
-) -> String {
-    let pad = " ".repeat(indent);
-    let mut s = String::new();
-
-    let groups = analyze_parallel_lets(stmts);
-    for group in groups {
-        if group.len() > 1 {
-            for (v, e) in &group {
-                s.push_str(&format!("{pad}__auto_type {v};\n"));
-                s.push_str(&format!(
-                    "{pad}#pragma omp task shared({v})\n{pad}{v} = {};\n",
-                    emit_c11_expr(e, mod_name)
-                ));
-            }
-            s.push_str(&format!("{pad}#pragma omp taskwait;\n"));
-        } else {
-            for (v, e) in group {
-                c11_record_bind_type(&v, &e);
-                s.push_str(&format!(
-                    "{pad}__auto_type {v} = {};\n",
-                    emit_c11_expr(&e, mod_name)
-                ));
-            }
-        }
-    }
-
-    match body {
-        Expr::WithIo(io_stmts, final_e) => {
-            for io_st in io_stmts {
-                match io_st {
-                    IoStmt::Bind(v, se) => {
-                        c11_record_bind_type(v, se);
-                        s.push_str(&format!(
-                            "{pad}__auto_type {v} = {};\n",
-                            emit_c11_expr(se, mod_name)
-                        ));
-                    }
-                    IoStmt::Action(se) => {
-                        s.push_str(&format!("{pad}{};\n", emit_c11_expr(se, mod_name)));
-                    }
-                }
-            }
-            let v = emit_c11_expr(final_e, mod_name);
-            c11_finish_block(s, v, is_tail, &pad)
-        }
-        _ => {
-            let v = emit_c11_expr(body, mod_name);
-            c11_finish_block(s, v, is_tail, &pad)
-        }
-    }
-}
-
-/// A routine body returns its value; a block in expression position (an `if` branch)
-/// yields it, as a GNU statement expression when it has statements.
-fn c11_finish_block(mut s: String, v: String, is_tail: bool, pad: &str) -> String {
-    if is_tail {
-        s.push_str(&format!("{pad}return {v};\n"));
-        s
-    } else if s.is_empty() {
-        v
-    } else {
-        format!("({{ {} {v}; }})", s.trim())
-    }
-}
-
-/// Runtime functions implementing prelude `STRING` / `BYTES` methods (with their arity).
-const C11_STRING_METHODS: &[(&str, usize)] = &[
-    ("byte_length", 0),
-    ("code_point_count", 0),
-    ("is_empty", 0),
-    ("equals", 1),
-    ("character_at", 1),
-    ("concat", 1),
-    ("to_utf8", 0),
-];
-const C11_BYTES_METHODS: &[(&str, usize)] =
-    &[("length", 0), ("is_empty", 0), ("at", 1), ("equals", 1)];
-
-thread_local! {
-    /// Routine names of the module being lowered to C (a module routine of the same name
-    /// stays reachable through the `_Generic` default branch).
-    static C11_MODULE_ROUTINES: std::cell::RefCell<HashSet<String>> =
-        std::cell::RefCell::new(HashSet::new());
-}
-
-/// `recv.m(args)` for a prelude text method. The C emitter is untyped, so the call is
-/// dispatched on the receiver's C type with `_Generic` (the controlling expression is not
-/// evaluated): `GardelString` / `GardelBytes` select the runtime function, and a routine of
-/// the module with the same name is the default. With no default, a receiver of another
-/// type is a C compile error rather than a wrong call.
-fn emit_c11_text_method(recv: &Expr, m: &str, args: &[Expr], mod_name: &str) -> Option<String> {
-    let s_fn = C11_STRING_METHODS
-        .iter()
-        .any(|(n, k)| *n == m && *k == args.len())
-        .then(|| format!("gardel_string_{m}"));
-    let b_fn = C11_BYTES_METHODS
-        .iter()
-        .any(|(n, k)| *n == m && *k == args.len())
-        .then(|| format!("gardel_bytes_{m}"));
-    if s_fn.is_none() && b_fn.is_none() {
-        return None;
-    }
-    let r = emit_c11_expr(recv, mod_name);
-    let mut assoc = Vec::new();
-    if let Some(f) = s_fn {
-        assoc.push(format!("GardelString: {f}"));
-    }
-    if let Some(f) = b_fn {
-        assoc.push(format!("GardelBytes: {f}"));
-    }
-    if C11_MODULE_ROUTINES.with(|r| r.borrow().contains(m)) {
-        assoc.push(format!("default: {m}"));
-    }
-    let mut a = vec![r.clone()];
-    a.extend(args.iter().map(|x| emit_c11_expr(x, mod_name)));
-    Some(format!("_Generic(({r}), {})({})", assoc.join(", "), a.join(", ")))
-}
-
-fn emit_c11_expr(e: &Expr, mod_name: &str) -> String {
-    match e {
-        Expr::Int(n) => format!("{n}ULL"),
-        Expr::Float(f) => format!("{f}"),
-        Expr::Char(c) => format!("{c}U"),
-        Expr::Unit => "UNIT_VAL".to_string(),
-        Expr::Bool(b) => (if *b { "true" } else { "false" }).to_string(),
-        Expr::Str(s) => {
-            // Task B.3: a literal is its static UTF-8 buffer wrapped by the runtime
-            // constructor (no allocation, no decoding).
-            let idx = C11_STRING_LITERALS.with(|c| c.borrow().iter().position(|x| x == s));
-            match idx {
-                Some(idx) => format!("string_from_utf8(gardel_str_lit_{idx}, {}ULL)", s.len()),
-                None => {
-                    let bytes: Vec<String> = s
-                        .bytes()
-                        .map(|b| b.to_string())
-                        .chain(std::iter::once("0".to_string()))
-                        .collect();
-                    format!(
-                        "string_from_utf8((const uint8_t[]){{ {} }}, {}ULL)",
-                        bytes.join(", "),
-                        s.len()
-                    )
-                }
-            }
-        }
-        Expr::Var(v) => v.clone(),
-        Expr::UnaryNot(inner) => format!("(!{})", emit_c11_expr(inner, mod_name)),
-        Expr::UnaryNeg(inner) => format!("(-{})", emit_c11_expr(inner, mod_name)),
-        Expr::BinOp(op, l, r) => {
-            let c_op = match op.as_str() {
-                "=" => "==",
-                "+%" => "+",
-                "-%" => "-",
-                "*%" => "*",
-                "and" => "&&",
-                "or" => "||",
-                other => other,
-            };
-            format!(
-                "({} {c_op} {})",
-                emit_c11_expr(l, mod_name),
-                emit_c11_expr(r, mod_name)
-            )
-        }
-        Expr::Call(fname, args) => {
-            let a_str: Vec<String> = args.iter().map(|a| emit_c11_expr(a, mod_name)).collect();
-            format!("{fname}({})", a_str.join(", "))
-        }
-        Expr::MethodCall(recv, mname, args) => {
-            if let Expr::Var(v) = &**recv {
-                if v == "CHAR" && mname == "from_scalar" && !args.is_empty() {
-                    return format!("((uint32_t)({}))", emit_c11_expr(&args[0], mod_name));
-                }
-                if v == "IO" {
-                    if (mname == "print" || mname == "print_line") && !args.is_empty() {
-                        let arg = emit_c11_expr(&args[0], mod_name);
-                        return format!("gardel_io_{mname}({arg})");
-                    } else if mname == "read_line" {
-                        return "gardel_io_read_line_result()".to_string();
-                    } else if mname == "exit" && !args.is_empty() {
-                        return format!("gardel_io_exit({})", emit_c11_expr(&args[0], mod_name));
-                    }
-                }
-            }
-            if is_string_from_utf8(e) {
-                return format!("gardel_string_from_utf8({})", emit_c11_expr(&args[0], mod_name));
-            }
-            if mname == "code" && args.is_empty() {
-                return format!("((uint64_t)({}))", emit_c11_expr(recv, mod_name));
-            }
-            if let Some(call) = emit_c11_text_method(recv, mname, args, mod_name) {
-                return call;
-            }
-            if mname == "apply" {
-                let r_str = emit_c11_expr(recv, mod_name);
-                let a_str: Vec<String> = args.iter().map(|a| emit_c11_expr(a, mod_name)).collect();
-                return format!("{r_str}({})", a_str.join(", "));
-            }
-            let r_str = emit_c11_expr(recv, mod_name);
-            let mut a_str = vec![r_str];
-            for a in args {
-                a_str.push(emit_c11_expr(a, mod_name));
-            }
-            format!("{mname}({})", a_str.join(", "))
-        }
-        Expr::If(c, ts, te, es, ee) => {
-            format!(
-                "({} ? ({}) : ({}))",
-                emit_c11_expr(c, mod_name),
-                emit_c11_block(ts, te, mod_name, false, "", 0).trim(),
-                emit_c11_block(es, ee, mod_name, false, "", 0).trim()
-            )
-        }
-        Expr::Match(scrut, cases) if c11_scrutinee_type(scrut).is_some() => {
-            emit_c11_prelude_match(scrut, cases, mod_name)
-        }
-        Expr::Match(scrut, cases) => {
-            let s_str = emit_c11_expr(scrut, mod_name);
-            let mut s = format!("({s_str}->tag == 0 ? 0 : 0)");
-            if !cases.is_empty() {
-                let mut cond_expr = String::new();
-                for (idx, c) in cases.iter().enumerate() {
-                    let ctor = c.ctor();
-                    let tag_name = format!("TAG_{mod_name}_{ctor}");
-                    let val = emit_c11_expr(&c.body, mod_name);
-                    if idx + 1 == cases.len() {
-                        cond_expr.push_str(&val);
-                    } else {
-                        cond_expr.push_str(&format!("({s_str}->tag == {tag_name} ? ({val}) : "));
-                    }
-                }
-                for _ in 0..cases.len() - 1 {
-                    cond_expr.push(')');
-                }
-                s = cond_expr;
-            }
-            s
-        }
-        Expr::RecordLit(fields) => {
-            let vals: Vec<String> = fields
-                .iter()
-                .map(|(_, fe)| emit_c11_expr(fe, mod_name))
-                .collect();
-            format!("make_{mod_name}({})", vals.join(", "))
-        }
-        Expr::RecordUpdate(base, _fields) => {
-            let b_str = emit_c11_expr(base, mod_name);
-            format!("/* update */ {b_str}")
-        }
-        Expr::TupleLit(elems) => {
-            let es: Vec<String> = elems.iter().map(|el| emit_c11_expr(el, mod_name)).collect();
-            format!("({})", es.join(", "))
-        }
-        // A nested `with IO` is a GNU statement expression: its actions run in order and its
-        // value is the trailing expression (previously the actions were dropped).
-        Expr::WithIo(io_stmts, final_e) => {
-            let mut s = String::from("({ ");
-            for io_st in io_stmts {
-                match io_st {
-                    IoStmt::Bind(v, se) => {
-                        c11_record_bind_type(v, se);
-                        s.push_str(&format!(
-                            "__auto_type {v} = {}; ",
-                            emit_c11_expr(se, mod_name)
-                        ));
-                    }
-                    IoStmt::Action(se) => s.push_str(&format!("{}; ", emit_c11_expr(se, mod_name))),
-                }
-            }
-            s.push_str(&format!("{}; }})", emit_c11_expr(final_e, mod_name)));
-            s
-        }
-        Expr::Lambda(_, _, _, _) => "/* lifted closure */ 0".to_string(),
-        Expr::Forall(_, _, _) | Expr::Exists(_, _, _) => "0".to_string(),
-    }
-}
 
 // ============================================================================
 // 11. CLI DRIVER (Supports --stdlib, Boogie, --fuel, --audit, --strict, --run)
@@ -15826,6 +15164,57 @@ fn parse_fuel_arg(args: &[String]) -> usize {
     DEFAULT_FUEL
 }
 
+fn parse_z3_seed_value(val: &str, source: &str) -> Result<u32, String> {
+    val.parse::<u32>().map_err(|_| {
+        format!(
+            "{source}: invalid Z3 seed `{val}` (expected an integer from 0 to {})",
+            u32::MAX
+        )
+    })
+}
+
+/// The Z3 seed of a run: the last `--z3-seed` option, else `env_seed` (`GARDEL_Z3_SEED`).
+/// A value that is missing or invalid is an error. Ignoring it would verify on Z3's default
+/// seed and report a seed sweep that never happened.
+fn parse_z3_seed(args: &[String], env_seed: Option<&str>) -> Result<Option<u32>, String> {
+    let mut seed = None;
+    for (idx, arg) in args.iter().enumerate() {
+        if arg == "--z3-seed" {
+            let val = args
+                .get(idx + 1)
+                .ok_or("--z3-seed: expected a seed value after the option")?;
+            seed = Some(parse_z3_seed_value(val, "--z3-seed")?);
+        } else if let Some(val) = arg.strip_prefix("--z3-seed=") {
+            seed = Some(parse_z3_seed_value(val, "--z3-seed")?);
+        }
+    }
+    match (seed, env_seed) {
+        (None, Some(val)) => parse_z3_seed_value(val, "GARDEL_Z3_SEED").map(Some),
+        _ => Ok(seed),
+    }
+}
+
+/// The last `--z3-rlimit` option. A missing, invalid or zero value is an error (zero would
+/// mean "no limit" to Z3).
+fn parse_z3_rlimit(args: &[String]) -> Result<Option<u64>, String> {
+    let parse = |val: &str| match val.parse::<u64>() {
+        Ok(n) if n > 0 => Ok(n),
+        _ => Err(format!("--z3-rlimit: invalid resource limit `{val}` (expected a positive integer)")),
+    };
+    let mut rlimit = None;
+    for (idx, arg) in args.iter().enumerate() {
+        if arg == "--z3-rlimit" {
+            let val = args
+                .get(idx + 1)
+                .ok_or("--z3-rlimit: expected a resource limit after the option")?;
+            rlimit = Some(parse(val)?);
+        } else if let Some(val) = arg.strip_prefix("--z3-rlimit=") {
+            rlimit = Some(parse(val)?);
+        }
+    }
+    Ok(rlimit)
+}
+
 /// Matches a file name against a shell wildcard pattern (`*`, `?`).
 fn wildcard_match(pattern: &str, name: &str) -> bool {
     let p: Vec<char> = pattern.chars().collect();
@@ -15953,7 +15342,7 @@ fn input_operands(args: &[String]) -> Vec<String> {
     let mut i = 1;
     while i < args.len() {
         let a = &args[i];
-        if a == "--fuel" {
+        if a == "--fuel" || a == "--z3-seed" || a == "--z3-rlimit" {
             i += 2;
             continue;
         }
@@ -15999,6 +15388,8 @@ pub struct VerifyOptions {
     pub strict: bool,
     pub audit: bool,
     pub bounded_check: bool,
+    pub z3_seed: Option<u32>,
+    pub z3_rlimit: Option<u64>,
 }
 
 /// Outcome of checking and verifying all modules of a run.
@@ -16082,15 +15473,19 @@ pub fn check_and_verify_project(units: &mut [SourceUnit], opts: VerifyOptions) -
             let mut mod_diags = std::mem::take(&mut pre[ui][mi]);
             mod_diags.extend(with_prelude_injection(opts.prelude_mode, || {
                 with_link_table(link.clone(), || {
-                    verify_module_phase3(
-                        m,
-                        &u.src,
-                        &u.path,
-                        opts.fuel_limit,
-                        opts.strict,
-                        opts.audit,
-                        opts.bounded_check,
-                    )
+                    with_z3_seed(opts.z3_seed, || {
+                        with_z3_rlimit(opts.z3_rlimit, || {
+                            verify_module_phase3(
+                                m,
+                                &u.src,
+                                &u.path,
+                                opts.fuel_limit,
+                                opts.strict,
+                                opts.audit,
+                                opts.bounded_check,
+                            )
+                        })
+                    })
                 })
             }));
             for d in &mut mod_diags {
@@ -16155,7 +15550,7 @@ fn main() {
     let args: Vec<String> = env::args().collect();
     if args.len() < 2 {
         eprintln!(
-            "Usage: gardelc <input.gdl ... | DIR | --stdlib> [--no-prelude] [--inspect [MODULE]] [--emit-stdlib [DIR]] [--json-diagnostics] [--fuel <N>] [--audit] [--strict] [--bounded-check] [--run]"
+            "Usage: gardelc <input.gdl ... | DIR | --stdlib> [--no-prelude] [--inspect [MODULE]] [--emit-stdlib [DIR]] [--json-diagnostics] [--fuel <N>] [--z3-seed <N>] [--z3-rlimit <N>] [--audit] [--strict] [--bounded-check] [--run]"
         );
         eprintln!(
             "  --no-prelude  bootstrap mode: do not inject the Standard Prelude (implied by --stdlib and when compiling the prelude source itself, §4.1)"
@@ -16197,6 +15592,21 @@ fn main() {
     let bounded_check = args.iter().any(|a| a == "--bounded-check");
     let no_prelude_flag = args.iter().any(|a| a == "--no-prelude");
     let fuel_limit = parse_fuel_arg(&args);
+    let env_seed = env::var_os("GARDEL_Z3_SEED").map(|v| v.to_string_lossy().into_owned());
+    let z3_seed = match parse_z3_seed(&args, env_seed.as_deref()) {
+        Ok(seed) => seed,
+        Err(e) => {
+            eprintln!("[ERROR] {e}");
+            std::process::exit(1);
+        }
+    };
+    let z3_rlimit = match parse_z3_rlimit(&args) {
+        Ok(rlimit) => rlimit,
+        Err(e) => {
+            eprintln!("[ERROR] {e}");
+            std::process::exit(1);
+        }
+    };
 
     // Task B.4: input operands (files, directories, wildcard patterns).
     // `--stdlib` verifies the source tree this gardelc was built from (see `resolve_stdlib_inputs`);
@@ -16370,6 +15780,8 @@ fn main() {
         strict: strict_mode,
         audit: audit_mode,
         bounded_check,
+        z3_seed,
+        z3_rlimit,
     };
     let checked = check_and_verify_project(&mut units, opts);
     if !checked.fatal.is_empty() {
@@ -16568,6 +15980,7 @@ fn main() {
     let mut primary_c = String::new();
     let mut primary_exe = String::new();
     let mut emitted_bpl: Vec<String> = Vec::new();
+    let mut c_backend_errors: Vec<String> = Vec::new();
 
     for m in &all_modules {
         let stem = m.name.to_lowercase();
@@ -16616,7 +16029,14 @@ fn main() {
             std::process::exit(1);
         }
 
-        let c_code = emit_c11(&converted_mono);
+        // Every C output is lowered from Gardel source by the typed backend, with the
+        // other project modules (and the prelude) available to it.
+        let others: Vec<&ModuleDecl> =
+            all_modules.iter().filter(|o| o.name != m.name).map(|o| &**o).collect();
+        let (c_code, errs) = emit_c11_typed(m, &others);
+        if m.name == module.name {
+            c_backend_errors = errs;
+        }
         if let Err(e) = fs::write(&c_path, c_code) {
             eprintln!("[ERROR] Failed to write C11 output '{c_path}': {e}");
             std::process::exit(1);
@@ -16651,6 +16071,9 @@ fn main() {
         }
         println!("[4/5] Emitted monomorphized Bend v2 target    -> {primary_bend}");
         println!("[5/5] Emitted C11 runtime target              -> {primary_c}");
+        for e in &c_backend_errors {
+            println!("      [C backend] {e} (the C file starts with #error)");
+        }
         if gcc_compiled {
             println!("      Compiled native executable              -> {primary_exe}");
         }
@@ -16671,6 +16094,9 @@ fn main() {
         boogie_cmd.args(["/typeEncoding:p", "/mv:-", &primary_bpl]);
         if let Some(solver) = found_solver {
             boogie_cmd.arg(format!("/proverOpt:PROVER_PATH={solver}"));
+        }
+        if let Some(seed) = z3_seed {
+            boogie_cmd.args(boogie_seed_args(seed));
         }
 
         if let Ok(output) = boogie_cmd.output() {
@@ -16895,8 +16321,6 @@ end
             );
             let bpl = emit_boogie(m, 2);
             assert!(bpl.contains(&format!("// Module: {}", m.name)));
-            let c11 = emit_c11(m);
-            assert!(c11.contains("int main(void)"));
         }
     }
 
@@ -16984,6 +16408,8 @@ end
             strict: true,
             audit: false,
             bounded_check: false,
+            z3_seed: None,
+            z3_rlimit: None,
         };
         let checked = check_and_verify_project(&mut units, opts);
         assert!(
@@ -17407,8 +16833,9 @@ feature {ANY}
 end
 "#;
         let m = parse_single_module(src);
-        let c_code = emit_c11(&m);
-        assert!(c_code.contains("typedef struct CUSTOM_CONTAINER"));
+        let (c_code, errs) = emit_c11_typed(&m, &[]);
+        assert!(errs.is_empty(), "{errs:?}");
+        assert!(c_code.contains("struct CUSTOM_CONTAINER"));
         assert!(c_code.contains("TAG_CUSTOM_CONTAINER_Empty"));
         assert!(c_code.contains("TAG_CUSTOM_CONTAINER_Entry"));
         assert!(c_code.contains("make_CUSTOM_CONTAINER_Entry"));
@@ -17435,9 +16862,6 @@ end
         assert!(!combinators.is_empty());
         let bend = emit_bend_v2(&converted);
         assert!(bend.contains("apply_multiplier"));
-        let c_code = emit_c11(&m);
-        assert!(c_code.contains("ClosureEnv_"));
-        assert!(c_code.contains("closure_apply_"));
     }
 
     #[test]
@@ -17456,30 +16880,6 @@ end
         ];
         let dep_groups = analyze_parallel_lets(&dependent_stmts);
         assert_eq!(dep_groups.len(), 2);
-    }
-
-    #[test]
-    fn test_plan4_tail_recursion_to_c11_while_loop() {
-        let src = r#"
-module TAIL_REC
-representation {ANY}
-  dummy: U64
-feature {ANY}
-  countdown(n: U64): U64
-    do
-      if n = 0 then
-        0
-      else
-        countdown(n - 1)
-      end
-    end
-end
-"#;
-        let m = parse_single_module(src);
-        let r = &m.feature_routines[0].1;
-        assert!(is_tail_recursive_routine(r));
-        let c_code = emit_c11(&m);
-        assert!(c_code.contains("tail_loop:"));
     }
 
     #[test]
@@ -17567,15 +16967,6 @@ end
                 .iter()
                 .any(|(_, r)| r.name == "chars" && r.ret_type == "LIST[CHAR]")
         );
-    }
-
-    #[test]
-    fn test_plan4_whole_program_multi_module_c11_link_and_run() {
-        let stdlib = parse_phase4_stdlib().expect("stdlib parses cleanly");
-        for m in &stdlib.modules {
-            let c_code = emit_c11(m);
-            assert!(!c_code.is_empty());
-        }
     }
 
     #[test]
@@ -18601,6 +17992,543 @@ end
         );
     }
 
+    // ---------------------------------------------------------------------------------
+    // Task C.3: every example verifies under --strict, and `LIST.has` has its base case.
+    // ---------------------------------------------------------------------------------
+
+    #[test]
+    fn test_c3_all_examples_verify_strict() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../examples");
+        let mut names: Vec<_> = fs::read_dir(&dir)
+            .expect("examples/ exists")
+            .filter_map(|e| e.ok().map(|e| e.path()))
+            .filter(|p| p.extension().is_some_and(|x| x == "gdl"))
+            .collect();
+        names.sort();
+        assert!(names.len() >= 4, "expected the example programs, got {names:?}");
+        for path in names {
+            let src = fs::read_to_string(&path).unwrap();
+            let m = parse_user_module_with_prelude(&src);
+            let shown = path.display().to_string();
+            let diags = with_prelude_injection(true, || {
+                verify_module_phase3(&m, &src, &shown, DEFAULT_FUEL, true, false, false)
+            });
+            assert!(diags.is_empty(), "{shown} must verify with 0/0, got {diags:?}");
+        }
+    }
+
+    /// Compiles `c` with gcc (OpenMP on) and runs it once per input, returning exit code and
+    /// trimmed stdout. `None` when gcc is not available.
+    fn c3_native_runs(c: &str, tag: &str, inputs: &[&[u8]]) -> Option<Vec<(i32, String)>> {
+        use std::io::Write;
+        let (dir, exe) = c3_compile(c, tag)?;
+        let runs = inputs
+            .iter()
+            .map(|input| {
+                let mut child = Command::new(&exe)
+                    .stdin(std::process::Stdio::piped())
+                    .stdout(std::process::Stdio::piped())
+                    .spawn()
+                    .unwrap();
+                child.stdin.take().unwrap().write_all(input).unwrap();
+                let o = child.wait_with_output().unwrap();
+                (
+                    o.status.code().unwrap_or(-1),
+                    String::from_utf8_lossy(&o.stdout).trim_end().to_string(),
+                )
+            })
+            .collect();
+        let _ = fs::remove_dir_all(&dir);
+        Some(runs)
+    }
+
+    /// Compiles `c` with gcc (OpenMP on). `None` when gcc is not available.
+    fn c3_compile(c: &str, tag: &str) -> Option<(std::path::PathBuf, std::path::PathBuf)> {
+        let dir = env::temp_dir().join(format!("gardel_{tag}_{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let c_path = dir.join(format!("{tag}.c"));
+        let exe = dir.join(format!("{tag}.exe"));
+        fs::write(&c_path, c).unwrap();
+        let out = Command::new("gcc")
+            .args(["-std=gnu11", "-O1", "-fopenmp", "-o"])
+            .arg(&exe)
+            .arg(&c_path)
+            .output()
+            .ok()?;
+        assert!(
+            out.status.success(),
+            "generated C must compile:\n{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        Some((dir, exe))
+    }
+
+    /// Live heap objects after evaluating `call` once (warm-up) and after 50 more times,
+    /// in the program's C with its `main` replaced. Both must be 0 for a leak-free routine
+    /// whose result is a plain value. `None` when gcc is not available.
+    fn c3_live_after(c: &str, tag: &str, call: &str) -> Option<(u64, u64)> {
+        let c = c.replace(
+            "int main(int argc, char** argv) {",
+            "int gardel_program_main(int argc, char** argv) {",
+        );
+        let harness = format!(
+            "{c}\nint main(void) {{\n    uint64_t r = (uint64_t)({call});\n    uint64_t first = gardel_live_allocations();\n    for (int i = 0; i < 50; i++) r += (uint64_t)({call});\n    printf(\"%llu %llu %llu\\n\", (unsigned long long)first, (unsigned long long)gardel_live_allocations(), (unsigned long long)r);\n    return 0;\n}}\n"
+        );
+        let (dir, exe) = c3_compile(&harness, tag)?;
+        let out = Command::new(&exe).output().unwrap();
+        let _ = fs::remove_dir_all(&dir);
+        let text = String::from_utf8_lossy(&out.stdout).to_string();
+        let nums: Vec<u64> = text.split_whitespace().map(|x| x.parse().unwrap()).collect();
+        Some((nums[0], nums[1]))
+    }
+
+    fn c3_verify(src: &str, path: &str) -> Vec<Diagnostic> {
+        let m = parse_user_module_with_prelude(src);
+        with_prelude_injection(true, || {
+            verify_module_phase3(&m, src, path, DEFAULT_FUEL, true, false, false)
+        })
+    }
+
+    fn c3_verify_and_emit(src: &str, path: &str) -> String {
+        let m = parse_user_module_with_prelude(src);
+        let diags = with_prelude_injection(true, || {
+            verify_module_phase3(&m, src, path, DEFAULT_FUEL, true, false, false)
+        });
+        assert!(diags.is_empty(), "{path} must verify with 0/0, got {diags:?}");
+        let (c, errs) = emit_c11_typed(&m, &[]);
+        assert!(errs.is_empty(), "{path}: C backend errors {errs:?}");
+        assert!(!c.contains("#error"), "{path}");
+        c
+    }
+
+    #[test]
+    fn test_c3_typed_backend_compiles_stdlib_seq_from_source() {
+        // The whole stdlib SEQ module (generic, higher-order, using the LIST runtime for
+        // `to_list`/`equals`) is lowered from `stdlib/collections/seq.gdl`, not a template.
+        let seq = standard_prelude().module("SEQ").expect("prelude SEQ");
+        let (c, errs) = emit_c11_typed(seq, &[]);
+        assert!(errs.is_empty(), "{errs:?}");
+        assert!(!c.contains("HAND-WRITTEN REFERENCE RUNTIME"));
+        for f in [
+            "SEQ_U64__empty(void)",
+            "SEQ_U64__singleton(uint64_t x)",
+            "SEQ_U64__equals(struct SEQ_U64* Current, struct SEQ_U64* other)",
+            "SEQ_U64__to_list(struct SEQ_U64* Current)",
+            "SEQ_U64__concat(struct SEQ_U64* Current, struct SEQ_U64* other)",
+            "SEQ_U64__map__U64(struct SEQ_U64* Current, gfn_U64_to_U64 f)",
+            "SEQ_U64__filter(struct SEQ_U64* Current, gfn_U64_to_BOOL keep)",
+            "SEQ_U64__fold_left__U64(",
+            "SEQ_U64__fold_right__U64(",
+            "LIST_U64__append(",
+        ] {
+            assert!(c.contains(f), "missing {f}");
+        }
+        // `map`'s two recursive calls are independent `let`s: they become OpenMP tasks.
+        assert!(c.contains("#pragma omp task shared(ml)"), "map must fork its halves");
+        // Specification-only routines (`model`) are never emitted.
+        assert!(!c.contains("SEQ_U64__model"));
+        if let Some(runs) = c3_native_runs(&format!("{c}\nint main(void) {{ return 0; }}\n"), "seqlib", &[b""]) {
+            assert_eq!(runs[0].0, 0);
+        }
+    }
+
+    #[test]
+    fn test_c3_seq_programs_run_natively_from_source() {
+        // Every executable SEQ routine, compiled from source, against run-time checks.
+        let ops = include_str!("../../examples/seq_ops.gdl");
+        let c = c3_verify_and_emit(ops, "examples/seq_ops.gdl");
+        if let Some(runs) = c3_native_runs(&c, "seqops", &[b""]) {
+            assert_eq!(runs[0].0, 0, "seq_ops: first failing check");
+        }
+        // The checks are live: a wrong expectation for `fold_right` is caught at run time.
+        let wrong = ops.replace("digits_right(s) != 54321 then 2", "digits_right(s) != 12345 then 2");
+        assert_ne!(wrong, ops);
+        let c = c3_verify_and_emit(&wrong, "seq_ops_mutant.gdl");
+        if let Some(runs) = c3_native_runs(&c, "seqopsmut", &[b""]) {
+            assert_eq!(runs[0].0, 2, "fold_right order must be observable");
+        }
+        // The benchmark program: parallel build plus fold, input validated at the boundary.
+        let bench = include_str!("../../examples/seq_bench.gdl");
+        let c = c3_verify_and_emit(bench, "examples/seq_bench.gdl");
+        assert!(c.contains("#pragma omp task shared(left)"), "from_range must fork");
+        // The branch run inline is one level deeper too; otherwise the depth never grows
+        // along right spines and millions of tasks are created (a C.3 regression: the
+        // 20-thread build was 3.5x slower than the 1-thread build).
+        assert!(c.contains("gardel_task_depth = _pd; right = "), "inline branch must count depth");
+        assert!(c.contains("if (_pd <= GARDEL_TASK_DEPTH) {"), "past the cutoff, no OpenMP calls");
+        if let Some(runs) = c3_native_runs(
+            &c,
+            "seqbench",
+            &[b"1\n", b"2\n", b"100000\n", b"abc\n", b"0\n", b"\n", b"", b"1000000001\n"],
+        ) {
+            let codes: Vec<i32> = runs.iter().map(|r| r.0).collect();
+            assert_eq!(codes, [0, 0, 0, 2, 2, 2, 2, 2]);
+        }
+    }
+
+    #[test]
+    fn test_c3_typed_backend_runs_text_program() {
+        // The C.2 text program through the typed backend (what the CLI now uses), with the
+        // same inputs and expectations as the untyped emitter's test.
+        let c = c3_verify_and_emit(C2_TEXT_PROGRAM, "textdemo.gdl");
+        let inputs: [&[u8]; 12] = [
+            "Ana\n".as_bytes(),
+            "\u{65e5}\u{1F980}\n".as_bytes(),
+            b"\n",
+            b"",
+            b"\xED\xC0\n",
+            b"\xE0\x41\n",
+            b"\xE0\x80\n",
+            b"\xE0\x80\x80\n",
+            b"\xC0\xAF\n",
+            b"\xED\xA0\x80\n",
+            b"\xF4\x90\x80\x80\n",
+            b"ab\xFF\n",
+        ];
+        if let Some(runs) = c3_native_runs(&c, "texttyped", &inputs) {
+            assert_eq!(runs[0], (7, "H\u{e9}, Ana".to_string()));
+            let codes: Vec<i32> = runs.iter().skip(1).map(|r| r.0).collect();
+            assert_eq!(codes, [6, 4, 1, 11, 11, 20, 30, 30, 40, 11, 12]);
+        }
+    }
+
+    #[test]
+    fn test_d_no_hand_written_templates_remain() {
+        // The modules that used to get a hand-written C program are lowered from source.
+        for name in ["TREE", "BOUNDED_STACK", "PEANO", "SEQ", "BIGNAT", "STRING"] {
+            let src = format!("module {name}\n\nrepresentation {{ANY}}\n  v: U64\n\nend\n");
+            let (c, errs) = emit_c11_typed(&parse_single_module(&src), &[]);
+            assert!(errs.is_empty(), "{name}: {errs:?}");
+            assert!(!c.contains("HAND-WRITTEN"), "{name}");
+        }
+        for (path, src) in [
+            ("examples/tree.gdl", include_str!("../../examples/tree.gdl")),
+            ("examples/bounded_stack.gdl", include_str!("../../examples/bounded_stack.gdl")),
+            ("examples/peano_ord.gdl", include_str!("../../examples/peano_ord.gdl")),
+        ] {
+            let m = parse_user_module_with_prelude(src);
+            let (c, errs) = emit_c11_typed(&m, &[]);
+            assert!(errs.is_empty(), "{path}: {errs:?}");
+            assert!(c.contains(&format!("struct {} {{", c_instance_name(&if m.type_params.is_empty() { m.name.clone() } else { format!("{}[U64]", m.name) }))), "{path}");
+            if let Some((dir, _)) = c3_compile(&format!("{c}\nint main(void) {{ return 0; }}\n"), "tmpl") {
+                let _ = fs::remove_dir_all(dir);
+            }
+        }
+        let bignat = standard_prelude().module("BIGNAT").unwrap();
+        let (_, errs) = emit_c11_typed(bignat, &[]);
+        assert!(errs.is_empty(), "{errs:?}");
+    }
+
+    #[test]
+    fn test_d_former_template_modules_run_from_source() {
+        // Programs using TREE, BOUNDED_STACK and PEANO (multi-file projects) and BIGNAT
+        // (prelude), verified, compiled from source and run.
+        for (lib_path, lib, prog_path, prog) in [
+            ("tree.gdl", include_str!("../../examples/tree.gdl"), "tree_prog.gdl", include_str!("../tests/c_backend/tree_prog.gdl")),
+            ("bounded_stack.gdl", include_str!("../../examples/bounded_stack.gdl"), "stack_prog.gdl", include_str!("../tests/c_backend/stack_prog.gdl")),
+            ("peano.gdl", include_str!("../../examples/peano_ord.gdl"), "peano_prog.gdl", include_str!("../tests/c_backend/peano_prog.gdl")),
+        ] {
+            let mut units = b4_units(&[(lib_path, lib), (prog_path, prog)]);
+            let checked = check_and_verify_project(&mut units, b4_opts(true, true));
+            assert!(checked.fatal.is_empty());
+            let diags: Vec<&Diagnostic> = checked.diags.iter().map(|(_, d)| d).collect();
+            assert!(diags.is_empty(), "{prog_path}: {diags:?}");
+            let lib_m = units[0].ast.modules[0].clone();
+            let prog_m = units[1].ast.modules[0].clone();
+            let (c, errs) = emit_c11_typed(&prog_m, &[&lib_m]);
+            assert!(errs.is_empty(), "{prog_path}: {errs:?}");
+            if let Some(runs) = c3_native_runs(&c, prog_path.trim_end_matches(".gdl"), &[b""]) {
+                assert_eq!(runs[0].0, 0, "{prog_path}: first failing check");
+            }
+        }
+        let c = c3_verify_and_emit(include_str!("../tests/c_backend/bignat_ops.gdl"), "bignat_ops.gdl");
+        if let Some(runs) = c3_native_runs(&c, "bignatops", &[b""]) {
+            assert_eq!(runs[0].0, 0, "bignat_ops: first failing check");
+        }
+    }
+
+    #[test]
+    fn test_d_closures_capture_and_are_freed() {
+        // Captured locals (in map/filter/fold), a lambda nested in a lambda, and
+        // FUNCTION_OPS.compose (a stdlib closure) compiled from source.
+        let src = include_str!("../tests/c_backend/closures.gdl");
+        let c = c3_verify_and_emit(src, "closures.gdl");
+        assert!(c.contains("_env_drop(struct gardel_env* h)"), "closures carry counted environments");
+        if let Some(runs) = c3_native_runs(&c, "closures", &[b""]) {
+            assert_eq!(runs[0].0, 0, "closures: first failing check");
+        }
+        if let Some((first, after)) = c3_live_after(&c, "closuresleak", "CLOSURES__first_failure(3)") {
+            assert_eq!((first, after), (0, 0), "closures and their environments must be freed");
+        }
+        // The library build of FUNCTION_OPS (compose returns a capturing closure).
+        let fops = standard_prelude().module("FUNCTION_OPS").unwrap();
+        let (_, errs) = emit_c11_typed(fops, &[]);
+        assert!(errs.is_empty(), "{errs:?}");
+    }
+
+    #[test]
+    fn test_d_reference_counting_frees_everything() {
+        // Every routine below returns a plain value, so after it returns no heap object may
+        // remain: SEQ trees and lists (seq_ops), the parallel build and sum (seq_bench, tasks
+        // on), BIGNAT limbs.
+        let ops = c3_verify_and_emit(include_str!("../../examples/seq_ops.gdl"), "seq_ops.gdl");
+        let bench = c3_verify_and_emit(include_str!("../../examples/seq_bench.gdl"), "seq_bench.gdl");
+        let big = c3_verify_and_emit(include_str!("../tests/c_backend/bignat_ops.gdl"), "bignat_ops.gdl");
+        for (c, tag, call) in [
+            (&ops, "opsleak", "SEQ_OPS__first_failure()"),
+            (&bench, "benchleak", "({ struct SEQ_U64* t = SEQ_BENCH__from_range(1, 5000); uint64_t s = SEQ_BENCH__sum(t); drop_SEQ_U64(t); s; })"),
+            (&big, "bigleak", "BIGNAT_OPS__first_failure(5)"),
+        ] {
+            if let Some(live) = c3_live_after(c, tag, call) {
+                assert_eq!(live, (0, 0), "{tag}: live heap objects after the call");
+            }
+        }
+        // A leak is detected: a value that is never released stays live.
+        if let Some((first, after)) = c3_live_after(&bench, "benchleak2", "SEQ_BENCH__from_range(1, 10) != NULL") {
+            assert_eq!((first, after), (19, 19 * 51), "the harness must see unreleased trees");
+        }
+    }
+
+    #[test]
+    fn test_d_pattern_compilation() {
+        // Literal, tuple and nested patterns are compiled to flat matches and `if`s; the
+        // result verifies and runs.
+        let src = include_str!("../tests/c_backend/patterns.gdl");
+        let c = c3_verify_and_emit(src, "patterns.gdl");
+        if let Some(runs) = c3_native_runs(&c, "patterns", &[b""]) {
+            assert_eq!(runs[0].0, 0);
+        }
+        // First matching row wins: a wrong expectation for the nested `Some(None)` row fails.
+        let wrong = src.replace("case Some(None) then 1", "case Some(None) then 2");
+        let c = c3_verify_and_emit(&wrong, "patterns_mutant.gdl");
+        if let Some(runs) = c3_native_runs(&c, "patternsmut", &[b""]) {
+            assert_eq!(runs[0].0, 1);
+        }
+        // Exhaustiveness is still checked after compilation: dropping `case None` is reported.
+        let partial = src.replace("        case None then 0\n", "");
+        assert_ne!(partial, src);
+        let diags = c3_verify(&partial, "patterns_partial.gdl");
+        assert!(!diags.is_empty(), "a non-exhaustive nested match must be rejected");
+    }
+
+    #[test]
+    fn test_d_nullary_calls_and_receiver_inference() {
+        // `answer` (a bare zero-parameter routine) and `SEQ.empty` as a receiver.
+        let src = include_str!("../tests/c_backend/nullary.gdl");
+        let c = c3_verify_and_emit(src, "nullary.gdl");
+        if let Some(runs) = c3_native_runs(&c, "nullary", &[b""]) {
+            assert_eq!(runs[0].0, 0);
+        }
+        let diags = c3_verify(&src.replace("exact: Result = 42", "exact: Result = 43"), "nullary_mutant.gdl");
+        assert!(diags.iter().any(|d| d.tag == "exact"), "{diags:?}");
+    }
+
+    #[test]
+    fn test_d_client_match_on_prelude_seq() {
+        // A client recursing structurally on SEQ's constructors (`variant s`) verifies
+        // (termination via SEQ's size measure) and runs.
+        let c = c3_verify_and_emit(include_str!("../tests/c_backend/seqmatch.gdl"), "seqmatch.gdl");
+        if let Some(runs) = c3_native_runs(&c, "seqmatch", &[b""]) {
+            assert_eq!(runs[0].0, 0);
+        }
+    }
+
+    #[test]
+    fn test_d_main_args_are_validated_utf8() {
+        let c = c3_verify_and_emit(include_str!("../tests/c_backend/args.gdl"), "args.gdl");
+        let Some((dir, exe)) = c3_compile(&c, "args") else { return };
+        let run = |args: &[std::ffi::OsString]| -> (i32, String) {
+            let o = Command::new(&exe).args(args).output().unwrap();
+            (o.status.code().unwrap_or(-1), String::from_utf8_lossy(&o.stderr).to_string())
+        };
+        // exit = 10 * count + total code points
+        assert_eq!(run(&[]).0, 0);
+        assert_eq!(run(&["ab".into(), "\u{e9}\u{65e5}".into()]).0, 24);
+        // An argument that is not valid Unicode text is refused before `main` runs.
+        #[cfg(windows)]
+        let bad: std::ffi::OsString = {
+            use std::os::windows::ffi::OsStringExt;
+            std::ffi::OsString::from_wide(&[0x61, 0xD800])
+        };
+        #[cfg(unix)]
+        let bad: std::ffi::OsString = {
+            use std::os::unix::ffi::OsStringExt;
+            std::ffi::OsString::from_vec(vec![0x61, 0xFF])
+        };
+        let (code, err) = run(&["ok".into(), bad]);
+        assert_eq!(code, 2);
+        assert!(err.contains("argument 2 is not valid UTF-8"), "{err}");
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn test_d_self_tail_calls_are_loops() {
+        // Spec §10: no stack frame per iteration, even when a local must be released after
+        // the call (then it is not a C tail call, and the optimizer cannot help).
+        let nats = include_str!("../tests/c_backend/tail_nats.gdl");
+        let prog = include_str!("../tests/c_backend/tail_prog.gdl");
+        let mut units = b4_units(&[("tail_nats.gdl", nats), ("tail_prog.gdl", prog)]);
+        let checked = check_and_verify_project(&mut units, b4_opts(true, true));
+        assert!(checked.fatal.is_empty());
+        let diags: Vec<&Diagnostic> = checked.diags.iter().map(|(_, d)| d).collect();
+        assert!(diags.is_empty(), "{diags:?}");
+        let lib_m = units[0].ast.modules[0].clone();
+        let prog_m = units[1].ast.modules[0].clone();
+        let (c, errs) = emit_c11_typed(&prog_m, &[&lib_m]);
+        assert!(errs.is_empty(), "{errs:?}");
+        // Every tail call site, and not `not_tail`, whose call is an operand of `+%`.
+        assert_eq!(c.matches("goto _tail").count(), 8, "tail call sites");
+        if let Some(runs) = c3_native_runs(&c, "tailprog", &[b""]) {
+            assert_eq!(runs[0].0, 0, "tail_prog: first failing check");
+        }
+        if let Some((first, after)) = c3_live_after(&c, "tailleak", "TAIL_PROG__first_failure(1000ULL)") {
+            assert_eq!((first, after), (0, 0), "locals, scrutinees and parameters must be freed");
+        }
+    }
+
+    #[test]
+    fn test_d_match_evaluates_its_scrutinee_once() {
+        // Copying `fib_pair(n - 1)` into each column made this O(2^n): `fib_pair(90)` would
+        // not finish. Literal columns repeated the call the same way.
+        let src = include_str!("../tests/c_backend/match_once.gdl");
+        let c = c3_verify_and_emit(src, "match_once.gdl");
+        if let Some(runs) = c3_native_runs(&c, "matchonce", &[b""]) {
+            assert_eq!(runs[0].0, 0, "match_once: first failing check");
+        }
+        if let Some((first, after)) = c3_live_after(&c, "matchonceleak", "MATCH_ONCE__first_failure()") {
+            assert_eq!((first, after), (0, 0));
+        }
+    }
+
+    #[test]
+    fn test_d_match_binder_does_not_capture_its_scrutinee() {
+        // `case (p, q)` on `p` read `q` from the new `p`. Boogie has no `let` that shadows a
+        // parameter yet, so this is checked on the C backend alone.
+        let src = "program SHADOW\n\nfeature {ANY}\n\n  second(p: TUPLE[U64, U64]): U64\n    do\n      match p\n        case (p, q) then q\n      end\n    end\n\n  diff(p: TUPLE[U64, U64]): U64\n    do\n      match p\n        case (q, p) then q -% p\n      end\n    end\n\n  nested(p: TUPLE[TUPLE[U64, U64], TUPLE[U64, U64]]): U64\n    do\n      match p\n        case (p, q) then q.first\n      end\n    end\n\n  main(args: SEQ[STRING]): IO[EXIT_CODE]\n    do\n      IO.exit(if second((3, 4)) != 4 then 1 else if diff((9, 2)) != 7 then 2 else if nested(((1, 2), (5, 6))) != 5 then 3 else 0 end end end)\n    end\n\nend\n";
+        let m = parse_user_module_with_prelude(src);
+        let (c, errs) = emit_c11_typed(&m, &[]);
+        assert!(errs.is_empty(), "{errs:?}");
+        if let Some(runs) = c3_native_runs(&c, "matchshadow", &[b""]) {
+            assert_eq!(runs[0].0, 0, "first failing check");
+        }
+        // A plain scrutinee with no such binder is not rebound, so proofs keep their shape.
+        let mut plain = parse_user_module_with_prelude(
+            "functions PLAIN\n\nfeature {ANY}\n\n  f(p: TUPLE[U64, U64]): U64\n    do\n      match p\n        case (a, b) then a\n      end\n    end\n\nend\n",
+        );
+        patterns::desugar_patterns(&mut plain);
+        let r = &plain.feature_routines[0].1;
+        let text = format!("{:?}", r.body);
+        assert!(!text.contains("_pm"), "{text}");
+    }
+
+    #[test]
+    fn test_d_generic_call_inside_its_module_uses_the_right_instance() {
+        // `BOX.make(..)` inside `BOX[A].map[B]` builds a `BOX[B]`, not the caller's `BOX[A]`.
+        let box_src = include_str!("../tests/c_backend/box.gdl");
+        let prog = include_str!("../tests/c_backend/box_prog.gdl");
+        let mut units = b4_units(&[("box.gdl", box_src), ("box_prog.gdl", prog)]);
+        let checked = check_and_verify_project(&mut units, b4_opts(true, true));
+        assert!(checked.fatal.is_empty());
+        let diags: Vec<&Diagnostic> = checked.diags.iter().map(|(_, d)| d).collect();
+        assert!(diags.is_empty(), "{diags:?}");
+        let lib_m = units[0].ast.modules[0].clone();
+        let prog_m = units[1].ast.modules[0].clone();
+        let (c, errs) = emit_c11_typed(&prog_m, &[&lib_m]);
+        assert!(errs.is_empty(), "{errs:?}");
+        for inst in ["BOX_U64__map__BOOL", "BOX_U64__map__I64", "BOX_U64__map__STRING", "BOX_BOOL__make", "BOX_I64__make", "BOX_STRING__make"] {
+            assert!(c.contains(inst), "missing instance {inst}");
+        }
+        if let Some(runs) = c3_native_runs(&c, "boxprog", &[b""]) {
+            assert_eq!(runs[0].0, 0, "box_prog: first failing check");
+        }
+        if let Some((first, after)) = c3_live_after(&c, "boxleak", "BOX_PROG__first_failure()") {
+            assert_eq!((first, after), (0, 0), "every instance must be freed");
+        }
+    }
+
+    #[test]
+    fn test_d_untyped_numbers_take_their_type_from_use() {
+        // A number with no annotation must not default to U64 next to an I64: C would then
+        // compare as unsigned, and the binary would disagree with the verified contract.
+        let src = include_str!("../tests/c_backend/signed.gdl");
+        let c = c3_verify_and_emit(src, "signed.gdl");
+        if let Some(runs) = c3_native_runs(&c, "signed", &[b""]) {
+            assert_eq!(runs[0].0, 0, "signed: first failing check");
+        }
+    }
+
+    #[test]
+    fn test_d_mixed_signedness_is_refused_not_converted() {
+        // No literal to retype: these must become errors, never C's implicit conversion.
+        let cases = [
+            ("x < u", "BOOL", "a `U64` value is used where `I64` is required"),
+            ("(if x < 0 then x else u end) > 0", "BOOL", "is used where"),
+            ("id(u)", "I64", "a `U64` value is used where `I64` is required"),
+            ("-u", "U64", "unary `-` on the unsigned type"),
+        ];
+        for (body, ret, want) in cases {
+            let src = format!(
+                "program MIX\n\nfeature {{ANY}}\n\n  id(v: I64): I64\n    do\n      v\n    end\n\n  r(x: I64, u: U64): {ret}\n    do\n      {body}\n    end\n\n  main(args: SEQ[STRING]): IO[EXIT_CODE]\n    do\n      let v = r(1, 2)\n      IO.exit(0)\n    end\n\nend\n"
+            );
+            let m = parse_user_module_with_prelude(&src);
+            let (c, errs) = emit_c11_typed(&m, &[]);
+            assert!(errs.iter().any(|e| e.contains(want)), "`{body}`: {errs:?}");
+            assert!(c.lines().nth(1).is_some_and(|l| l.starts_with("#error")), "`{body}` must not compile");
+        }
+        // A negative literal cannot become unsigned, even through a `let`.
+        let src = "program NEG\n\nfeature {ANY}\n\n  r(u: U64): BOOL\n    do\n      let m = -1\n      u > m\n    end\n\n  main(args: SEQ[STRING]): IO[EXIT_CODE]\n    do\n      let v = r(1)\n      IO.exit(0)\n    end\n\nend\n";
+        let m = parse_user_module_with_prelude(src);
+        let (_, errs) = emit_c11_typed(&m, &[]);
+        assert!(errs.iter().any(|e| e.contains("-1") || e.contains("is used")), "{errs:?}");
+    }
+
+    #[test]
+    fn test_d_typed_backend_refuses_specification_code() {
+        // Specification-only routines have no executable form: the C file starts with #error.
+        let src = "program GHOST\n\nfeature {ANY}\n\n  main(args: SEQ[STRING]): IO[EXIT_CODE]\n    do\n      IO.exit(if SEQ.singleton(1).model.length = 1 then 0 else 1 end)\n    end\n\nend\n";
+        let m = parse_user_module_with_prelude(src);
+        let (c, errs) = emit_c11_typed(&m, &[]);
+        assert!(errs.iter().any(|e| e.contains("specification (ghost) routine")), "{errs:?}");
+        assert!(c.lines().nth(1).is_some_and(|l| l.starts_with("#error")), "C must start with #error");
+    }
+
+    #[test]
+    fn test_c3_lifted_lambdas_are_proven_not_assumed() {
+        // A capturing lambda passed to the prelude SEQ is lifted to a Boogie function with
+        // one defining axiom; facts about it are proven, and wrong ones are rejected.
+        let ok = "program LAM\n\nfeature {ANY}\n\n  total(s: SEQ[U64], k: U64): U64\n    do\n      s.fold_left(fn(acc: U64, x: U64): U64 do acc +% (x +% k) end, 0)\n    end\n\n  one(x: U64): U64\n    require\n      small: x < 100\n    do\n      total(SEQ.singleton(x), 5)\n    ensure\n      exact: Result = x + 5\n    end\n\n  main(args: SEQ[STRING]): IO[EXIT_CODE]\n    do\n      IO.exit(0)\n    end\n\nend\n";
+        let verify = |src: &str| {
+            let m = parse_user_module_with_prelude(src);
+            with_prelude_injection(true, || {
+                verify_module_phase3(&m, src, "lam.gdl", DEFAULT_FUEL, true, false, false)
+            })
+        };
+        let diags = verify(ok);
+        assert!(diags.is_empty(), "{diags:?}");
+        let diags = verify(&ok.replace("exact: Result = x + 5", "exact: Result = x + 6"));
+        assert!(diags.iter().any(|d| d.tag == "exact"), "{diags:?}");
+    }
+
+    #[test]
+    fn test_c3_list_has_empty_base_case_is_not_vacuous() {
+        // `examples/tree.gdl` needed `!Seq_has(Seq_empty(), x)`. A strengthened bound must
+        // still be rejected, so the new axiom does not make the postconditions vacuous.
+        let src = include_str!("../../examples/tree.gdl");
+        let mutants = [
+            ("(lo <= x and x <= hi)", "(lo <= x and x < hi)", "in_bounds"),
+            ("implies x <= Result", "implies x < Result", "upper_bound"),
+        ];
+        for (from, to, tag) in mutants {
+            assert!(src.contains(from), "tree.gdl changed: {from}");
+            let bad = src.replace(from, to);
+            let m = parse_user_module_with_prelude(&bad);
+            let diags = with_prelude_injection(true, || {
+                verify_module_phase3(&m, &bad, "tree_mutant.gdl", DEFAULT_FUEL, true, false, false)
+            });
+            assert!(diags.iter().any(|d| d.tag == tag), "{tag} must fail, got {diags:?}");
+        }
+    }
+
     const C2_TEXT_PROGRAM: &str = "program TEXTDEMO\n\nfeature {ANY}\n\n  main(args: SEQ[STRING]): IO[EXIT_CODE]\n    do\n      with IO\n        line_res <- IO.read_line\n        match line_res\n          case Ok(name) then\n            let g = \"H\u{e9}, \".concat(name)\n            match STRING.from_utf8(g.to_utf8)\n              case Ok(h) then\n                with IO\n                  IO.print_line(h)\n                  IO.exit(if g.character_at(1).code = 233 and h.equals(g) then g.code_point_count else 99 end)\n                end\n              case Error(_) then\n                IO.exit(98)\n            end\n          case Error(e) then\n            match e\n              case Decode(se) then\n                match se\n                  case InvalidByte(o, b) then IO.exit(10 + o % 10)\n                  case TruncatedSequence(o, n) then IO.exit(20 + o % 10)\n                  case OverlongEncoding(o) then IO.exit(30 + o % 10)\n                  case UnpairedSurrogate(o) then IO.exit(40 + o % 10)\n                end\n              case EndOfInput then IO.exit(1)\n              case OsError(c) then IO.exit(2)\n            end\n        end\n      end\n    end\n\nend\n";
 
     #[test]
@@ -18622,59 +18550,6 @@ end
         });
         let tags: Vec<&str> = diags.iter().map(|d| d.tag.as_str()).collect();
         assert_eq!(tags, ["one"], "got {diags:?}");
-
-        // C: STRING/BYTES methods lower to runtime functions chosen by the receiver's type.
-        let c = emit_c11(&m);
-        assert!(c.contains("_Generic((g), GardelString: gardel_string_character_at)"), "{c}");
-        assert!(c.contains("gardel_string_from_utf8("), "{c}");
-        assert!(c.contains("uint64_t chars;"), "cached code-point count");
-        assert!(!c.contains("return _Generic"), "if-branches must not `return`: {c}");
-
-        // Run it when a C compiler is available.
-        let dir = env::temp_dir().join(format!("gardel_c2_{}", std::process::id()));
-        fs::create_dir_all(&dir).unwrap();
-        let c_path = dir.join("textdemo.c");
-        let exe = dir.join("textdemo.exe");
-        fs::write(&c_path, &c).unwrap();
-        let Ok(st) = Command::new("gcc")
-            .args(["-std=gnu11", "-O1", "-o"])
-            .arg(&exe)
-            .arg(&c_path)
-            .status()
-        else {
-            eprintln!("gcc not available: skipping the native part of this test");
-            return;
-        };
-        assert!(st.success(), "generated C must compile");
-        let run = |input: &[u8]| -> (i32, String) {
-            use std::io::Write;
-            let mut child = Command::new(&exe)
-                .stdin(std::process::Stdio::piped())
-                .stdout(std::process::Stdio::piped())
-                .spawn()
-                .unwrap();
-            child.stdin.take().unwrap().write_all(input).unwrap();
-            let out = child.wait_with_output().unwrap();
-            (
-                out.status.code().unwrap_or(-1),
-                // Windows text-mode stdout writes `\r\n`.
-                String::from_utf8_lossy(&out.stdout).trim_end().to_string(),
-            )
-        };
-        assert_eq!(run("Ana\n".as_bytes()), (7, "H\u{e9}, Ana".to_string()));
-        assert_eq!(run("\u{65e5}\u{1F980}\n".as_bytes()).0, 6);
-        assert_eq!(run(b"\n").0, 4);
-        assert_eq!(run(b"").0, 1);
-        // Error classification: the C decoder follows `validate_and_count`'s check order.
-        assert_eq!(run(b"\xED\xC0\n").0, 11, "ED C0: invalid continuation, not a surrogate");
-        assert_eq!(run(b"\xE0\x41\n").0, 11, "E0 41: invalid byte before truncation");
-        assert_eq!(run(b"\xE0\x80\n").0, 20, "E0 80: truncated");
-        assert_eq!(run(b"\xE0\x80\x80\n").0, 30, "E0 80 80: overlong");
-        assert_eq!(run(b"\xC0\xAF\n").0, 30, "C0: overlong lead");
-        assert_eq!(run(b"\xED\xA0\x80\n").0, 40, "surrogate");
-        assert_eq!(run(b"\xF4\x90\x80\x80\n").0, 11, "above U+10FFFF");
-        assert_eq!(run(b"ab\xFF\n").0, 12, "FF at offset 2");
-        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -19370,34 +19245,12 @@ end
     fn test_b3_c11_literals_are_static_utf8_buffers() {
         let src = "program HELLO\n\nfeature {ANY}\n\n  main(args: SEQ[STRING]): IO[EXIT_CODE]\n    do\n      with IO\n        IO.print(\"Hi\\n\")\n        IO.print_line(\"Hi\")\n        IO.exit(0)\n      end\n    end\n\nend\n";
         let m = parse_user_module_with_prelude(src);
-        let c = emit_c11(&m);
-        let strings = collect_module_strings(&m);
-        let a = strings.iter().position(|s| s == "Hi\n").unwrap();
-        let b = strings.iter().position(|s| s == "Hi").unwrap();
-        assert!(
-            c.contains(&format!(
-                "static const uint8_t gardel_str_lit_{a}[4] = {{ 72, 105, 10, 0 }};"
-            )),
-            "{c}"
-        );
-        assert!(
-            c.contains(&format!(
-                "static const uint8_t gardel_str_lit_{b}[3] = {{ 72, 105, 0 }};"
-            )),
-            "{c}"
-        );
-        assert!(
-            c.contains(&format!(
-                "gardel_io_print(string_from_utf8(gardel_str_lit_{a}, 3ULL))"
-            )),
-            "{c}"
-        );
-        assert!(
-            c.contains(&format!(
-                "gardel_io_print_line(string_from_utf8(gardel_str_lit_{b}, 2ULL))"
-            )),
-            "{c}"
-        );
+        let (c, errs) = emit_c11_typed(&m, &[]);
+        assert!(errs.is_empty(), "{errs:?}");
+        assert!(c.contains("72, 105, 10, 0"), "{c}");
+        assert!(c.contains("72, 105, 0"), "{c}");
+        assert!(c.contains("gardel_io_print("), "{c}");
+        assert!(c.contains("gardel_io_print_line("), "{c}");
         // The runtime constructor wraps the static buffer: no allocation, no decoding.
         let ctor = c
             .split("static inline GardelString string_from_utf8(")
@@ -19408,9 +19261,69 @@ end
             !ctor.contains("alloc") && !ctor.contains("memcpy"),
             "{ctor}"
         );
-        // The program body is lowered from the source (no canned template).
-        assert!(c.contains("return (int)main_routine(NULL);"));
         assert!(!c.contains("Hello, %s"));
+    }
+
+    #[test]
+    fn test_boogie_inconclusive_is_never_a_pass() {
+        let m = parse_user_module_with_prelude(B3_LITERAL_CLIENT);
+        let out = "x.bpl(934,11): Verification inconclusive (Verify_greeting)\n\nBoogie program verifier finished with 2 verified, 0 errors, 1 inconclusive\n";
+        let diags = parse_boogie_output(out, &m, B3_LITERAL_CLIENT, "literal_client.gdl");
+        assert!(diags.iter().any(|d| d.level == "error" && d.routine == "greeting"), "{diags:?}");
+        // Anything other than a clean summary fails closed.
+        for out in [
+            "",
+            "Fatal Error: ProverException: Unable to start the process z3\n",
+            "Boogie program verifier finished with 2 verified, 0 errors, 1 time out\n",
+            "Boogie program verifier finished with 2 verified, 0 errors, 1 out of resource\n",
+            "Boogie program verifier finished with 2 verified, 0 errors, 1 something new\n",
+        ] {
+            let diags = parse_boogie_output(out, &m, B3_LITERAL_CLIENT, "literal_client.gdl");
+            assert!(diags.iter().any(|d| d.level == "error"), "`{out}` must not pass");
+        }
+        let clean = "Boogie program verifier finished with 3 verified, 0 errors\n";
+        assert!(parse_boogie_output(clean, &m, B3_LITERAL_CLIENT, "literal_client.gdl").is_empty());
+    }
+
+    #[test]
+    fn test_solver_giving_up_is_unproven_not_refuted() {
+        // A failed obligation with no model: the solver ran out of resources. It stays an
+        // error and keeps its tag (contract withdrawal needs it), but does not claim a refutation.
+        let m = parse_user_module_with_prelude(B3_LITERAL_CLIENT);
+        let out = "greeting::ensure::exact\nBoogie program verifier finished with 2 verified, 1 error\n";
+        let diags = parse_boogie_output(out, &m, B3_LITERAL_CLIENT, "literal_client.gdl");
+        assert_eq!(diags.len(), 1, "{diags:?}");
+        assert_eq!(diags[0].rule, "Phase 3 Boogie (Verification Resource Limit)");
+        assert_eq!((diags[0].routine.as_str(), diags[0].tag.as_str()), ("greeting", "exact"));
+        // A real refutation carries a model and keeps its usual rule.
+        let out = "greeting::ensure::exact\n*** MODEL\nx -> 1\n*** END_MODEL\nBoogie program verifier finished with 2 verified, 1 error\n";
+        let diags = parse_boogie_output(out, &m, B3_LITERAL_CLIENT, "literal_client.gdl");
+        assert!(diags.iter().any(|d| d.rule == "Phase 3 Boogie (Postcondition Violation)"), "{diags:?}");
+    }
+
+    #[test]
+    fn test_z3_rlimit_verdict_is_decided_by_the_limit() {
+        let args = |extra: &[&str]| -> Vec<String> {
+            ["gardelc", "a.gdl"].iter().chain(extra).map(|s| s.to_string()).collect()
+        };
+        assert_eq!(parse_z3_rlimit(&args(&[])), Ok(None));
+        assert_eq!(parse_z3_rlimit(&args(&["--z3-rlimit", "5"])), Ok(Some(5)));
+        assert_eq!(parse_z3_rlimit(&args(&["--z3-rlimit=5"])), Ok(Some(5)));
+        for bad in ["abc", "-1", "0", ""] {
+            assert!(parse_z3_rlimit(&args(&["--z3-rlimit", bad])).is_err(), "`{bad}`");
+        }
+        assert!(parse_z3_rlimit(&args(&["--z3-rlimit"])).is_err());
+        assert_eq!(input_operands(&args(&["--z3-rlimit", "5"])), vec!["a.gdl".to_string()]);
+        // End to end: too small a limit is an error and never a pass.
+        let src = "functions RL\n\nfeature {ANY}\n\n  twice(x: U64): U64\n    require\n      small: x < 100\n    do\n      x + x\n    ensure\n      doubled: Result = 2 * x\n    end\n\nend\n";
+        let m = parse_user_module_with_prelude(src);
+        let run = |limit| {
+            with_z3_rlimit(limit, || {
+                with_prelude_injection(true, || verify_module_phase3(&m, src, "rl.gdl", DEFAULT_FUEL, true, false, false))
+            })
+        };
+        assert!(run(None).is_empty(), "{:?}", run(None));
+        assert!(run(Some(1)).iter().any(|d| d.level == "error"), "a starved solver must not pass");
     }
 
     #[test]
@@ -19507,6 +19420,8 @@ end
             strict,
             audit: false,
             bounded_check: false,
+            z3_seed: None,
+            z3_rlimit: None,
         }
     }
 
@@ -19882,28 +19797,89 @@ end
             diags.is_empty(),
             "spec §11 greeter must verify, got: {diags:?}"
         );
-        let c = emit_c11(&m);
-        // Instantiated prelude sum types and their constructors.
-        assert!(c.contains("typedef struct RESULT_IO_ERROR_STRING {"), "{c}");
-        assert!(
-            c.contains("make_IO_ERROR_Decode(struct STRING_ERROR* cause)"),
-            "{c}"
-        );
-        // The runtime validates input: Task C.2 validates full RFC 3629 UTF-8.
+        let (c, errs) = emit_c11_typed(&m, &[]);
+        assert!(errs.is_empty(), "{errs:?}");
         assert!(
             c.contains("b0 < 0x80") && c.contains("make_IO_ERROR_EndOfInput()"),
             "{c}"
         );
-        assert!(
-            c.contains("__auto_type line_res = gardel_io_read_line_result();"),
-            "{c}"
+        assert!(c.contains("gardel_io_read_line"), "{c}");
+        assert!(c.contains("gardel_io_print_line"), "{c}");
+    }
+
+    #[test]
+    fn test_z3_seed_option_verification() {
+        let src = r#"
+module SEED_TEST
+representation {ANY}
+  val: U64
+feature {ANY}
+  identity(x: U64): U64
+    do
+      x
+    ensure
+      id_eq: Result = x
+    end
+end
+"#;
+        let m = parse_single_module(src);
+        let diags = with_z3_seed(Some(42), || {
+            verify_module_phase3(&m, src, "seed_test.gdl", 1, true, false, false)
+        });
+        assert!(diags.is_empty(), "seeded run should verify cleanly: {diags:?}");
+        assert_eq!(current_z3_seed(), None, "thread local seed should be restored");
+    }
+
+    #[test]
+    fn test_z3_seed_invalid_values_are_errors() {
+        let args = |extra: &[&str]| -> Vec<String> {
+            ["gardelc", "a.gdl"]
+                .iter()
+                .chain(extra)
+                .map(|s| s.to_string())
+                .collect()
+        };
+        // Valid: the option, its `=` form, the largest value, and the last option winning.
+        assert_eq!(parse_z3_seed(&args(&[]), None), Ok(None));
+        assert_eq!(parse_z3_seed(&args(&["--z3-seed", "7"]), None), Ok(Some(7)));
+        assert_eq!(parse_z3_seed(&args(&["--z3-seed=7"]), None), Ok(Some(7)));
+        assert_eq!(
+            parse_z3_seed(&args(&["--z3-seed", "4294967295"]), None),
+            Ok(Some(u32::MAX))
         );
-        // `match` uses the instance's tags and binds the pattern variable.
-        assert!(c.contains("->tag == TAG_RESULT_IO_ERROR_STRING_Ok"), "{c}");
-        assert!(c.contains("__auto_type name = _ms0->Ok.val;"), "{c}");
-        // The nested `with IO` keeps its actions.
-        assert!(c.contains("gardel_io_print_line(name);"), "{c}");
-        assert!(!c.contains("TAG_GREETER_"), "{c}");
+        assert_eq!(
+            parse_z3_seed(&args(&["--z3-seed", "1", "--z3-seed=2"]), None),
+            Ok(Some(2))
+        );
+        // Invalid or missing option values stop the run, and the message names the value.
+        for bad in ["abc", "-1", "4294967296", "1.5", ""] {
+            let err = parse_z3_seed(&args(&["--z3-seed", bad]), None).unwrap_err();
+            assert!(err.contains(&format!("`{bad}`")), "{err}");
+            assert!(parse_z3_seed(&args(&[&format!("--z3-seed={bad}")]), None).is_err());
+        }
+        assert!(parse_z3_seed(&args(&["--z3-seed"]), None).is_err());
+        assert!(parse_z3_seed(&args(&["--z3-seed", "--strict"]), None).is_err());
+        // A later valid option does not excuse an earlier invalid one.
+        assert!(parse_z3_seed(&args(&["--z3-seed", "x", "--z3-seed", "2"]), None).is_err());
+        // The environment is used only without the option, and is checked the same way.
+        assert_eq!(parse_z3_seed(&args(&[]), Some("9")), Ok(Some(9)));
+        assert_eq!(
+            parse_z3_seed(&args(&["--z3-seed", "7"]), Some("9")),
+            Ok(Some(7))
+        );
+        let err = parse_z3_seed(&args(&[]), Some("abc")).unwrap_err();
+        assert!(err.contains("GARDEL_Z3_SEED"), "{err}");
+    }
+
+    #[test]
+    fn test_z3_seed_args_set_both_solver_seeds() {
+        assert_eq!(
+            boogie_seed_args(7),
+            [
+                "/proverOpt:O:smt.random_seed=7".to_string(),
+                "/proverOpt:O:sat.random_seed=7".to_string()
+            ]
+        );
     }
 
     // ---------------------------------------------------------------------------------
