@@ -1630,7 +1630,7 @@ Every program automatically sees the **Standard Prelude**:
 | Functions | `FUNCTION_OPS` |
 | Reactive programs | `STEP[S]`, `COMMAND`, `EVENT`, `KEY`, `CONN_ID` |
 
-The prelude is verified once, on its own (`gardelc --stdlib`). In user programs its contracts and laws are trusted facts, and calls into it must still establish its preconditions. Declaring a top-level name that the prelude already uses is an error (`E0101: duplicate_prelude_symbol`). Pass `--no-prelude` only to build a prelude-free program on purpose.
+The prelude is verified once, on its own (`gardelc --stdlib`). In user programs its contracts and laws are trusted facts, and calls into it must still establish its preconditions. You may declare a name the prelude already uses: the bare name then means yours, and `GARDEL::NAME` means the prelude's. Pass `--no-prelude` only to build a prelude-free program on purpose.
 
 ### Multi-File Projects
 
@@ -1672,11 +1672,107 @@ When a manifest is used:
   ```
 - **Package naming rules:** Lowercase ASCII letters, digits, `-`, and `.`. Each segment must start with `a`–`z` and cannot end with `-`. The name cannot start with `gardel.` and cannot produce the default alias `GARDEL` (which is reserved for the Standard Prelude).
 - **Strict TOML 1.0:** The parser enforces a clean, dependency-free subset with 1-based line numbers on syntax or schema errors.
-- **Zero semantic difference:** A manifest changes nothing about how source code behaves or verifies; it establishes project identity and boundaries for tooling and future dependency resolution. Projects without a `Gardel.toml` continue to compile using files and directory paths as usual.
+- **Zero semantic difference:** A manifest with no dependencies changes nothing about how source code behaves or verifies; it establishes project identity and boundaries. Projects without a `Gardel.toml` continue to compile using files and directory paths as usual.
+
+### Dependencies
+
+A package lists the packages it uses in `[dependencies]`, and then uses their modules by their bare names, with no import statement. `examples/hello_api` is an HTTP service built on the `ghttp` package:
+
+```toml
+[project]
+name = "hello-api"
+version = "0.1.0"
+
+[dependencies]
+ghttp = { path = "../../ghttp" }
+"acme.json" = { path = "../json", as = "J" }   # a dotted name is quoted, and `as` sets the alias
+```
+
+```bash
+gardelc examples/hello_api --strict
+```
+
+What you can rely on:
+
+- **Your own names win.** A module in your project is never replaced by one in a dependency, so a dependency adding a module cannot change what your code means. Inside a package, its own names win in the same way.
+- **Two packages can use one name.** Each package keeps its own `PARSER` and its own `Leaf`, with its own proofs. A build fails only if you use such a name bare and two of your dependencies provide it (`E0105` for a module, `E0112` for a constructor). The prelude counts as a provider too.
+- **Only what you list is in scope.** Your dependency's own dependencies give you no names, though their types can reach you through its routines.
+- **You see contracts, not bodies.** A proof in your code can rest only on a dependency's `ensure` clauses. A dependency's body can change inside its contract without re-proving your code.
+- **Nothing is taken on trust.** A dependency is verified from source on first use and cached. If it fails, your build fails. `--strict` refuses an `assume` in any package, and a plain run reports them.
+- **A dependency's `program` is not yours.** It is verified but not built, and you cannot refer to it.
+
+Diagnostics name a dependency's module by its full name, such as `ghttp::HTTP_PARSER`. Aliases have no effect on proofs or generated code.
+
+### Checking a New Version
+
+Before releasing a package, compare it with the version your clients use:
+
+```bash
+git worktree add ../json-1.0 v1.0     # any directory holding the old version
+gardelc --compare-with ../json-1.0
+```
+
+The run builds and verifies the new version as usual, then exits 1 if a public item changed in a way that can break a client:
+
+- a stronger `require`, a weaker `ensure`, or a weaker `invariant`
+- a removed or less visible routine, law or module, or a changed signature
+- a changed public `representation`, even one new constructor, because it breaks a complete `match`
+- a concept the module no longer satisfies, or a renamed package
+- a removed or changed public `concept`, in either direction, as clients both supply and rely on it
+- a new `assume` anywhere in the build, even in a private routine, because `--strict` refuses it in every client
+- a new package among your dependencies, or a dependency at another version, because a build holds one package of a name
+
+A body change that adds no `assume` is not breaking, and neither is a new routine, a new law or a change to a hidden representation. Parameters are compared by position, so renaming one changes nothing, in a concept too.
+
+A new module, concept or public representation is a warning, even under `--strict`. If a client already uses that name bare from another package, it now gets `E0105` or `E0112`, and one qualifier fixes it.
+
+Clauses that differ go to the solver, and a change counts as compatible only if the solver proves it. It sees each routine as an unknown function and uses none of your contracts or laws, so a true implication that needs one of them is reported as breaking.
+
+An `assume` the old version also had is the warning `rests_on_assume`, which lists them, as a proof may lean on one without any contract changing. Add `--strict` to refuse them.
+
+A dependency whose text changed at the same version is the warning `dependency_moved`: give it a new version, and compare it with its old one.
+
+### Qualified Names
+
+Use the alias from your manifest, with `::`, when a bare name is ambiguous. `GARDEL` is the prelude's alias:
+
+```
+first_size(p: JSON::PARSER, q: LIST[XML::PARSER]): U64
+  do
+    p.size
+  end
+
+theirs: GARDEL::COMMAND
+  do
+    GARDEL::COMMAND.ReadLine
+  end
+```
+
+A constructor can be named through its module, which also separates two modules of one project:
+
+```
+let a = TOK_A.Leaf(1)
+let b = JSON::TOK.Leaf(2)
+
+match r
+  case RESULT.Error(e) then e
+  case Ok(v) then v
+end
+```
+
+A bare constructor means the module's own first, then one from its project, and only then one from the prelude or a dependency. If that still leaves several, the type of a `match` scrutinee, or the declared result of a routine that returns the constructor directly, chooses. So a dependency that declares `Error` does not disturb your `RESULT` matches. Anywhere else the compiler stops with `E0112` and shows the spellings. The type only breaks a tie: a module with its own `Stop` writes `STEP.Stop(0, cmds)` for the prelude's.
+
+A qualifier never opens anything. A hidden member stays hidden however it is spelled.
+
+A `let` can state its type, which is checked. This also settles a generic value that nothing else pins down:
+
+```
+let s: STACK[U64] = STACK.empty
+```
 
 ### Name Resolution
 
-There are no import statements. Before anything is verified, `gardelc` resolves every name in the run against the project and the prelude, and reports each failure at its source location:
+There are no import statements. Before anything is verified, `gardelc` resolves every name in the run against the project, its direct dependencies and the prelude, and reports each failure at its source location:
 
 | Rule | Meaning |
 | :--- | :--- |
@@ -1686,8 +1782,12 @@ There are no import statements. Before anything is verified, `gardelc` resolves 
 | `E0109: unknown_constructor` | A constructor no module declares |
 | `E0110: unknown_variable` | A name that is not a parameter, local, field or routine |
 | `E0111: wrong_argument_count` | A call with the wrong number of arguments |
-| `E0112: ambiguous_constructor` | A constructor declared by two other modules. Constructors resolve by name alone, so rename one. A module's own constructor always wins. |
+| `E0105: ambiguous_module_reference` | A bare module, type or concept that two dependencies, or a dependency and the prelude, provide. The message gives the qualified spellings |
+| `E0112: ambiguous_constructor` | A constructor declared by two other modules, or provided by two dependencies, with no known type to choose. The message gives the qualified spellings. A module's own constructor always wins. |
 | `E0113: hidden_member` | A member another module does not export: a private routine, a hidden field, or a constructor of a hidden representation, which can be neither built nor matched |
+| `E0114: export_outside_package` | An export list naming a module outside the package. `{EQ}`, naming a concept, stays allowed |
+| `E0115: reserved_name` | A declared name of the form `PK<n>_...`, which is how a dependency's names are held internally |
+| `E0116: let_type_mismatch` | A `let x: T = e` whose value is known to have another type, or an integer literal that does not fit `T` |
 | `E0199: verifier_translation_failed` | The verifier could not accept what `gardelc` generated. The module is not verified. This is a limit of the compiler, not a fault shown in your program, and `GARDEL_KEEP_BPL=1` keeps the generated file. |
 
 Exporting to a named module across files, as in `feature {OTHER}`, is not usable yet: the export list counts as a dependency, so it forms a cycle (`E0103`).
@@ -1784,9 +1884,17 @@ gardelc <file.gdl> --no-prelude
 # Without this flag, a run with no working Boogie or Z3 is an error.
 gardelc <file.gdl> --bounded-check
 
+# Run the solver on every module and prove the prelude, ignoring the local verification cache (for CI)
+gardelc <file.gdl> --verify-deps
+
 # Compile, verify, and run immediately via the backend
 gardelc <file.gdl> --run
+
+# Report what would break a client of an older version of this package
+gardelc --compare-with <old-dir>
 ```
+
+`gardelc` remembers what this machine has proven, in `GARDEL_CACHE_DIR` or your user cache directory. A module whose verification condition has not changed is not given to the solver again, and the run says how many came from the cache. Changing `gardelc`, Boogie, Z3 or a limit verifies everything again. All other checks run every time, so `--strict` cannot be answered by an earlier run. The cache only saves time: deleting it is always safe.
 
 A normal run reports five steps:
 

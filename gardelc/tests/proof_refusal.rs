@@ -45,7 +45,7 @@ fn project(name: &str, file: &str, src: &str) -> PathBuf {
 
 fn gardelc(dir: &PathBuf) -> Command {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_gardelc"));
-    cmd.current_dir(dir);
+    cmd.current_dir(dir).env("GARDEL_CACHE_DIR", dir.join("cache"));
     cmd
 }
 

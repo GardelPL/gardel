@@ -306,7 +306,7 @@ fn rewrite_block(stmts: &mut [Stmt], body: &mut Expr, c: &mut Compiler) {
     for st in stmts.iter_mut() {
         match st {
             Stmt::Let(_, x) | Stmt::Check(_, x) | Stmt::Assume(_, x) => rewrite_expr(x, c),
-            Stmt::Reveal(_) => {}
+            Stmt::Reveal(_) | Stmt::LetType(_, _) => {}
         }
     }
     rewrite_expr(body, c);
@@ -345,7 +345,7 @@ pub(crate) fn desugar_patterns(m: &mut ModuleDecl) -> Vec<String> {
                         Stmt::Let(_, x) | Stmt::Check(_, x) | Stmt::Assume(_, x) => {
                             rewrite_expr(x, &mut c)
                         }
-                        Stmt::Reveal(_) => {}
+                        Stmt::Reveal(_) | Stmt::LetType(_, _) => {}
                     }
                 }
             }

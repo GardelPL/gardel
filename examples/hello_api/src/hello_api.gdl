@@ -1,0 +1,84 @@
+-- A small HTTP service built on the `ghttp` package.
+--
+--   gardelc examples/hello_api --strict
+--
+-- Everything named `HTTP_...` comes from `ghttp`, and only its contracts reach this module.
+reactive program HELLO_API
+
+feature {ANY}
+
+  -- `GET /` answers from `ghttp`'s default endpoint. Everything else is this service's own.
+  endpoint(id: NAT, req: HTTP_REQUEST): HTTP_RESPONSE
+    do
+      if id = 2 then
+        HTTP_RESPONSE.ok_text("hello from a package", "20")
+      else
+        HTTP_APPLICATION.default_endpoint_handler(id)
+      end
+    end
+
+  routes: HTTP_ROUTER
+    do
+      HTTP_ROUTER.default_server_router.register(HTTP_ROUTE.make(Get, "/hello", 2))
+    ensure
+      two: Result.num_routes = 2
+    end
+
+  answer(s: HTTP_SERVER_STATE, c: CONN_ID, req: HTTP_REQUEST): STEP[HTTP_SERVER_STATE]
+    do
+      let wire = HTTP_SERIALIZER.serialize(HTTP_APPLICATION.dispatch_with(req, s.router, fn(id: NAT, r: HTTP_REQUEST): HTTP_RESPONSE do endpoint(id, r) end))
+      Continue(s.release_connection(c), LIST.empty.prepend(Close(c)).prepend(Send(c, wire)))
+    end
+
+  on_bytes(s: HTTP_SERVER_STATE, c: CONN_ID, data: BYTES): STEP[HTTP_SERVER_STATE]
+    do
+      match s.lookup_connection(c)
+        case None then
+          Continue(s, LIST.empty.prepend(Close(c)))
+        case Some(conn) then
+          if not conn.connection_status.can_accept_bytes then
+            Continue(s.release_connection(c), LIST.empty.prepend(Close(c)))
+          else
+            match HTTP_PARSER.feed(conn.parser_state, data)
+              case NeedMore(next_p) then
+                Continue(s.save_connection(conn.with_parser_state(next_p)), LIST.empty)
+              case Complete(req, _) then
+                answer(s, c, req)
+              case Failed(err) then
+                let wire = HTTP_SERIALIZER.serialize(HTTP_RESPONSE.from_error(err))
+                Continue(s.release_connection(c), LIST.empty.prepend(Close(c)).prepend(Send(c, wire)))
+            end
+          end
+      end
+    end
+
+  init(args: SEQ[STRING]): STEP[HTTP_SERVER_STATE]
+    do
+      Continue(HTTP_SERVER_STATE.make_with_router(64, 8090, routes), LIST.empty.prepend(Listen(8090)))
+    end
+
+  step(s: HTTP_SERVER_STATE, e: EVENT): STEP[HTTP_SERVER_STATE]
+    do
+      match e
+        case Accepted(c) then
+          if s.has_connection_room then
+            Continue(s.admit_connection(c), LIST.empty)
+          else
+            Continue(s, LIST.empty.prepend(Close(c)))
+          end
+        case Received(c, data) then
+          on_bytes(s, c, data)
+        case SendFailed(c, _) then
+          Continue(s.release_connection(c), LIST.empty.prepend(Close(c)))
+        case Closed(c) then
+          Continue(s.release_connection(c), LIST.empty)
+        case ListenFailed(_, _) then
+          Stop(1, LIST.empty.prepend(Print("hello_api: listen failed")))
+        case Shutdown then
+          Stop(0, LIST.empty)
+        case _ then
+          Continue(s, LIST.empty)
+      end
+    end
+
+end

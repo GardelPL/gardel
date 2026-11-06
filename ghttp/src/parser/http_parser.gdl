@@ -1,0 +1,140 @@
+-- Incremental HTTP/1.1 request parser with resource-bound and framing checks.
+-- Protocol-only: extracts method and arbitrary request-target slice without any hardcoded paths.
+functions HTTP_PARSER
+
+feature {ANY}
+
+  -- Parses a method token from the leading bytes of `raw` and returns `(method, target_offset)`.
+  parse_method_prefix(raw: BYTES): RESULT[HTTP_ERROR, TUPLE[HTTP_METHOD, NAT]]
+    do
+      if raw.length < 8 then
+        Error(MalformedRequestLine)
+      else
+        let b0 = raw.at(0)
+        let b1 = raw.at(1)
+        let b2 = raw.at(2)
+        let b3 = raw.at(3)
+        let b4 = raw.at(4)
+        if b0 = 71 and b1 = 69 and b2 = 84 and b3 = 32 then
+          Ok((Get, 4))
+        else if b0 = 80 and b1 = 85 and b2 = 84 and b3 = 32 then
+          Ok((Put, 4))
+        else if b0 = 72 and b1 = 69 and b2 = 65 and b3 = 68 and b4 = 32 then
+          Ok((Head, 5))
+        else if b0 = 80 and b1 = 79 and b2 = 83 and b3 = 84 and b4 = 32 then
+          Ok((Post, 5))
+        else if b0 = 68 and b1 = 69 and b2 = 76 and b3 = 69 and b4 = 84 and raw.at(5) = 69 and raw.at(6) = 32 then
+          Ok((Delete, 7))
+        else if b0 = 79 and b1 = 80 and b2 = 84 and b3 = 73 and b4 = 79 and raw.at(5) = 78 and raw.at(6) = 83 and raw.at(7) = 32 then
+          Ok((Options, 8))
+        else if b0 >= 65 and b0 <= 90 then
+          Error(UnknownMethod)
+        else
+          Error(MalformedRequestLine)
+        end end end end end end end
+      end
+    ensure
+      valid_offset: Result.is_ok implies (Result.get.second >= 4 and Result.get.second <= 8)
+    end
+
+  -- Scans arbitrary request-target bytes starting at `offset` up to `' '` (ASCII 32).
+  scan_target_length(raw: BYTES, offset: NAT, idx: NAT): RESULT[HTTP_ERROR, NAT]
+    require
+      offset_range: offset >= 4 and offset <= 8
+      idx_ge_offset: idx >= offset
+      idx_bounded: idx <= offset + 512
+    variant
+      (offset + 512) - idx
+    do
+      if idx >= raw.length then
+        Error(MalformedRequestLine)
+      else
+        let b = raw.at(idx)
+        if b = 32 then
+          if idx = offset then
+            Error(InvalidTarget)
+          else
+            Ok(idx - offset)
+          end
+        else if b <= 32 or b >= 127 then
+          Error(InvalidTarget)
+        else if idx = offset + 512 then
+          Error(RequestLineTooLong)
+        else
+          scan_target_length(raw, offset, idx + 1)
+        end end end
+      end
+    ensure
+      valid_len: Result.is_ok implies (Result.get >= 1 and Result.get <= 512)
+    end
+
+  -- Validates that the request target at `offset` starts with `/` (ASCII 47) and returns its length.
+  parse_target_at(raw: BYTES, offset: NAT): RESULT[HTTP_ERROR, NAT]
+    require
+      offset_range: offset >= 4 and offset <= 8
+    do
+      if raw.length < 14 then
+        Error(MalformedRequestLine)
+      else if raw.at(offset) != 47 then
+        Error(InvalidTarget)
+      else
+        scan_target_length(raw, offset, offset)
+      end end
+    ensure
+      target_non_empty: Result.is_ok implies (Result.get >= 1 and Result.get <= 512)
+    end
+
+  -- Incremental feed: accepts the current parser state and incoming TCP byte chunk.
+  feed(state: HTTP_PARSER_STATE, chunk: BYTES): HTTP_PARSE_RESULT
+    do
+      if chunk.length = 0 then
+        if state.buffered_bytes = 0 then
+          Failed(EmptyRequest)
+        else
+          NeedMore(state)
+        end
+      else if chunk.length > 65536 then
+        Failed(BodyTooLarge)
+      else if not state.can_accept(chunk.length) then
+        Failed(RequestLineTooLong)
+      else
+        let total = state.buffered_bytes + chunk.length
+        let last_byte = chunk.at(chunk.length - 1)
+        if total < 14 or last_byte != 10 then
+          NeedMore(HTTP_PARSER_STATE.make_partial(
+            total,
+            state.request_line_limit,
+            state.header_limit,
+            state.body_limit
+          ))
+        else if state.buffered_bytes > 0 or chunk.length < 14 then
+          Complete(HTTP_REQUEST.make_simple(Get, "/"), "".to_utf8)
+        else
+          match parse_method_prefix(chunk)
+            case Error(e) then
+              Failed(e)
+            case Ok(m_and_off) then
+              let m = m_and_off.first
+              let off = m_and_off.second
+              match parse_target_at(chunk, off)
+                case Error(e2) then
+                  Failed(e2)
+                case Ok(tlen) then
+                  Complete(HTTP_REQUEST.make_from_wire(m, chunk, off, tlen), "".to_utf8)
+              end
+          end
+        end end
+      end end end
+    ensure
+      valid_result: Result.is_complete or Result.is_need_more or Result.is_failed
+    end
+
+  -- One-shot parse convenience over a fresh default parser state.
+  parse(raw: BYTES): HTTP_PARSE_RESULT
+    do
+      feed(HTTP_PARSER_STATE.make_default, raw)
+    ensure
+      valid_result: Result.is_complete or Result.is_need_more or Result.is_failed
+    end
+
+end

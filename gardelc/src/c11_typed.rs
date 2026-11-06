@@ -1104,6 +1104,14 @@ static bool {inst}__has(struct {inst}* xs, {ce} x) {{\n\
         }
     }
 
+    /// A `let` whose value could not be built at its declared type.
+    fn check_declared(v: &str, want: Option<&str>, got: &str) -> Result<(), String> {
+        match want {
+            Some(t) if t != "Current" && t != got => Err(format!("`{v}` is declared `{t}`, and its value is `{got}`")),
+            _ => Ok(()),
+        }
+    }
+
     fn lower_block_once(
         &mut self,
         cx: &mut Ctx,
@@ -1118,15 +1126,19 @@ static bool {inst}__has(struct {inst}* xs, {ce} x) {{\n\
         let mut code = String::new();
         let mut owned_locals: Vec<(String, String)> = std::mem::take(&mut cx.sink_params);
         let groups = analyze_parallel_lets(stmts);
+        // The declared type of each `let`, in the order `groups` holds them.
+        let mut declared = stmts.iter().enumerate().filter(|(_, s)| matches!(s, Stmt::Let(..))).map(|(i, _)| crate::declared_let_type(stmts, i));
         for (at, group) in groups.iter().enumerate() {
             if group.len() == 1 {
                 let (v, e) = &group[0];
-                let soft = !retyped.contains_key(v) && cx.untyped_num(e);
+                let want = declared.next().flatten();
+                let soft = want.is_none() && !retyped.contains_key(v) && cx.untyped_num(e);
                 cx.moves = Self::unused_after(cx, &owned_locals, &groups[at + 1..], body);
-                let x = self.lower(cx, e, retyped.get(v).map(String::as_str), has_cur);
+                let x = self.lower(cx, e, want.or(retyped.get(v).map(String::as_str)), has_cur);
                 cx.moves.clear();
                 Self::settle_moves(cx, &mut owned_locals);
                 let x = x?;
+                Self::check_declared(v, want, &x.ty)?;
                 let t = x.ty.clone();
                 let c = self.own(x)?;
                 let ct = self.ctype(&t)?;
@@ -1137,8 +1149,10 @@ static bool {inst}__has(struct {inst}* xs, {ce} x) {{\n\
                 let mut lowered = Vec::new();
                 let mut soft = Vec::new();
                 for (v, e) in group {
-                    soft.push(!retyped.contains_key(v) && cx.untyped_num(e));
-                    let x = self.lower(cx, e, retyped.get(v).map(String::as_str), has_cur)?;
+                    let want = declared.next().flatten();
+                    soft.push(want.is_none() && !retyped.contains_key(v) && cx.untyped_num(e));
+                    let x = self.lower(cx, e, want.or(retyped.get(v).map(String::as_str)), has_cur)?;
+                    Self::check_declared(v, want, &x.ty)?;
                     let t = x.ty.clone();
                     let c = self.own(x)?;
                     let ct = self.ctype(&t)?;

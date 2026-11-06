@@ -20,6 +20,22 @@ use std::path::{Path, PathBuf};
 pub struct Manifest {
     /// The `[project]` section.
     pub project: ProjectSection,
+    /// The `[dependencies]` section, in source order.
+    pub dependencies: Vec<Dependency>,
+}
+
+/// One entry of `[dependencies]`: `"acme.json" = { path = "../json", as = "J" }`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Dependency {
+    /// The package's full name, which is its identity (Decision 8).
+    pub name: String,
+    /// How this manifest spells the package. It belongs to this manifest, and never reaches
+    /// a symbol (Decision 11).
+    pub alias: String,
+    /// Directory of the package, relative to this manifest.
+    pub path: String,
+    /// 1-based line of the entry in `Gardel.toml`.
+    pub line: usize,
 }
 
 /// The `[project]` table in `Gardel.toml`.
@@ -105,6 +121,27 @@ pub fn validate_package_name(name: &str) -> Result<(), String> {
         return Err(format!(
             "invalid package name '{name}': 'gardel' and alias 'GARDEL' are reserved for the Standard Prelude"
         ));
+    }
+    Ok(())
+}
+
+/// Validates a dependency alias against Decision 11: an upper-case identifier, and not
+/// `GARDEL`, which names the prelude.
+///
+/// # Errors
+///
+/// Returns a descriptive `Err(String)` if `alias` violates either rule.
+pub fn validate_alias(alias: &str) -> Result<(), String> {
+    let mut chars = alias.chars();
+    let well_formed = chars.next().is_some_and(|c| c.is_ascii_uppercase())
+        && chars.all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_');
+    if !well_formed {
+        return Err(format!(
+            "invalid alias '{alias}': an alias uses upper-case letters, digits and '_', and starts with a letter"
+        ));
+    }
+    if alias == "GARDEL" {
+        return Err("invalid alias 'GARDEL': it is reserved for the Standard Prelude".to_string());
     }
     Ok(())
 }
@@ -205,7 +242,7 @@ pub fn parse_manifest(src: &str) -> Result<Manifest, ManifestError> {
     tables_by_line.sort_by_key(|(_, tbl)| tbl.line);
 
     for (tbl_name, tbl) in tables_by_line {
-        if tbl_name != "project" {
+        if tbl_name != "project" && tbl_name != "dependencies" {
             return Err(ManifestError {
                 line: tbl.line,
                 message: format!("unknown table '[{tbl_name}]' in manifest"),
@@ -287,9 +324,146 @@ pub fn parse_manifest(src: &str) -> Result<Manifest, ManifestError> {
         });
     };
 
+    let dependencies = match raw_tables.get("dependencies") {
+        Some(table) => parse_dependencies(table)?,
+        None => Vec::new(),
+    };
+
     Ok(Manifest {
         project: ProjectSection { name, version },
+        dependencies,
     })
+}
+
+/// Reads `[dependencies]`, applying the rules of Decision 11.
+fn parse_dependencies(table: &RawTable) -> Result<Vec<Dependency>, ManifestError> {
+    let mut entries: Vec<(&String, &(usize, TomlValue))> = table.entries.iter().collect();
+    entries.sort_by_key(|(_, (line, _))| *line);
+
+    let mut dependencies: Vec<Dependency> = Vec::new();
+    for (name, (line, value)) in entries {
+        let line = *line;
+        let fail = |message: String| ManifestError { line, message };
+        validate_package_name(name).map_err(fail)?;
+        let TomlValue::InlineTable(fields) = value else {
+            return Err(fail(format!(
+                "dependency '{name}' must be an inline table such as {{ path = \"../{name}\" }}"
+            )));
+        };
+        if let Some(other) = fields.keys().find(|k| k.as_str() != "path" && k.as_str() != "as") {
+            return Err(fail(format!(
+                "unknown key '{other}' in dependency '{name}': a dependency has 'path' and optionally 'as'"
+            )));
+        }
+        let Some(path) = fields.get("path").filter(|p| !p.is_empty()) else {
+            return Err(fail(format!("dependency '{name}' has no 'path'")));
+        };
+        let alias = fields.get("as").cloned().unwrap_or_else(|| default_alias_for_package(name));
+        validate_alias(&alias).map_err(fail)?;
+        if let Some(other) = dependencies.iter().find(|d| d.alias == alias) {
+            return Err(fail(format!(
+                "dependencies '{}' and '{name}' both have the alias '{alias}': give one of them another with `as`",
+                other.name
+            )));
+        }
+        dependencies.push(Dependency { name: name.clone(), alias, path: path.clone(), line });
+    }
+    Ok(dependencies)
+}
+
+/// A package of a build, with its manifest read and checked.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Package {
+    pub manifest: Manifest,
+    pub src_dir: PathBuf,
+}
+
+/// An error about the entry on `line` of the manifest at `manifest_path`.
+fn dependency_error(manifest_path: &str, line: usize, message: String) -> ProjectResolutionError {
+    ProjectResolutionError {
+        rule: "Manifest",
+        tag: "manifest_error",
+        path: manifest_path.to_string(),
+        line,
+        message: format!("{manifest_path}:{line}: {message}"),
+    }
+}
+
+/// Every package of a build, dependencies before what depends on them and the root last.
+/// A package appears once, however many others depend on it (Decision 5).
+///
+/// # Errors
+///
+/// Returns [`ProjectResolutionError`] for a manifest that cannot be read, a dependency that
+/// is not the package it was declared as, a dependency cycle, or two packages of one name.
+pub fn load_packages(root: &Path) -> Result<Vec<Package>, ProjectResolutionError> {
+    let mut loader = PackageLoader { seen: BTreeMap::new(), active: Vec::new(), done: Vec::new() };
+    let (manifest, src_dir) = resolve_manifest_project_dir(root)?;
+    loader.visit(root, manifest, src_dir)?;
+    Ok(loader.done)
+}
+
+struct PackageLoader {
+    /// Package name -> canonical directory.
+    seen: BTreeMap<String, PathBuf>,
+    /// Names of the packages being visited, outermost first.
+    active: Vec<String>,
+    done: Vec<Package>,
+}
+
+impl PackageLoader {
+    fn visit(
+        &mut self,
+        dir: &Path,
+        manifest: Manifest,
+        src_dir: PathBuf,
+    ) -> Result<(), ProjectResolutionError> {
+        let manifest_path = dir.join("Gardel.toml").to_string_lossy().replace('\\', "/");
+        let canonical = std::fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf());
+        self.seen.insert(manifest.project.name.clone(), canonical);
+        self.active.push(manifest.project.name.clone());
+        for dep in &manifest.dependencies {
+            let fail = |message: String| dependency_error(&manifest_path, dep.line, message);
+            let dep_dir = dir.join(&dep.path);
+            if !dep_dir.join("Gardel.toml").is_file() {
+                return Err(fail(format!(
+                    "dependency '{}': no Gardel.toml in '{}'",
+                    dep.name,
+                    dep_dir.display()
+                )));
+            }
+            let (dep_manifest, dep_src) = resolve_manifest_project_dir(&dep_dir)?;
+            if dep_manifest.project.name != dep.name {
+                return Err(fail(format!(
+                    "dependency '{}': '{}' is the package '{}'",
+                    dep.name,
+                    dep_dir.display(),
+                    dep_manifest.project.name
+                )));
+            }
+            let canonical = std::fs::canonicalize(&dep_dir).unwrap_or_else(|_| dep_dir.clone());
+            if let Some(known) = self.seen.get(&dep.name) {
+                if *known != canonical {
+                    return Err(fail(format!(
+                        "two packages are named '{}', in '{}' and '{}': a build holds one package of a name",
+                        dep.name,
+                        known.display(),
+                        canonical.display()
+                    )));
+                }
+                if let Some(start) = self.active.iter().position(|n| *n == dep.name) {
+                    let mut cycle = self.active[start..].to_vec();
+                    cycle.push(dep.name.clone());
+                    return Err(fail(format!("dependency cycle: {}", cycle.join(" -> "))));
+                }
+                continue;
+            }
+            self.visit(&dep_dir, dep_manifest, dep_src)?;
+        }
+        self.active.pop();
+        self.done.push(Package { manifest, src_dir });
+        Ok(())
+    }
 }
 
 /// Parses the strict TOML subset into a map of table names to [`RawTable`]s.

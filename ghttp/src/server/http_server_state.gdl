@@ -1,0 +1,184 @@
+-- Verified HTTP server state with bounded connection table and configurable `HTTP_ROUTER`.
+module HTTP_SERVER_STATE
+
+representation {NONE}
+  conns: LIST[HTTP_CONNECTION]
+  max_conns: NAT
+  listen_port: NAT
+  app_router: HTTP_ROUTER
+
+invariant
+  within_max_connections: conns.length <= max_conns
+  max_conns_bounded: max_conns >= 1 and max_conns <= 1024
+  port_in_range: listen_port >= 1 and listen_port <= 65535
+
+create {ANY}
+
+  make(cap: NAT): HTTP_SERVER_STATE
+    require
+      valid_cap: cap >= 1 and cap <= 1024
+    do
+      { conns = LIST.empty,
+        max_conns = cap,
+        listen_port = 8080,
+        app_router = HTTP_ROUTER.default_server_router }
+    ensure
+      empty_conns: Result.active_connections = 0
+      cap_set: Result.max_connections = cap
+      port_set: Result.server_port = 8080
+      has_capacity: Result.has_connection_room
+    end
+
+  make_on_port(cap: NAT, p: NAT): HTTP_SERVER_STATE
+    require
+      valid_cap: cap >= 1 and cap <= 1024
+      valid_port: p >= 1 and p <= 65535
+    do
+      { conns = LIST.empty,
+        max_conns = cap,
+        listen_port = p,
+        app_router = HTTP_ROUTER.default_server_router }
+    ensure
+      empty_conns: Result.active_connections = 0
+      cap_set: Result.max_connections = cap
+      port_set: Result.server_port = p
+      has_capacity: Result.has_connection_room
+    end
+
+  make_with_router(cap: NAT, p: NAT, custom_router: HTTP_ROUTER): HTTP_SERVER_STATE
+    require
+      valid_cap: cap >= 1 and cap <= 1024
+      valid_port: p >= 1 and p <= 65535
+    do
+      { conns = LIST.empty,
+        max_conns = cap,
+        listen_port = p,
+        app_router = custom_router }
+    ensure
+      empty_conns: Result.active_connections = 0
+      cap_set: Result.max_connections = cap
+      port_set: Result.server_port = p
+      has_capacity: Result.has_connection_room
+    end
+
+create {NONE}
+
+  find_conn(cs: LIST[HTTP_CONNECTION], c: CONN_ID): OPTION[HTTP_CONNECTION]
+    variant
+      cs.length
+    do
+      if cs.length = 0 then
+        None
+      else
+        if cs.head.connection_id = c then
+          Some(cs.head)
+        else
+          find_conn(cs.tail, c)
+        end
+      end
+    end
+
+  update_conn(cs: LIST[HTTP_CONNECTION], updated: HTTP_CONNECTION): LIST[HTTP_CONNECTION]
+    variant
+      cs.length
+    do
+      if cs.length = 0 then
+        LIST.empty
+      else
+        let rest = update_conn(cs.tail, updated)
+        if cs.head.connection_id = updated.connection_id then
+          rest.prepend(updated)
+        else
+          rest.prepend(cs.head)
+        end
+      end
+    ensure
+      same_len: Result.length = cs.length
+    end
+
+  remove_conn(cs: LIST[HTTP_CONNECTION], c: CONN_ID): LIST[HTTP_CONNECTION]
+    variant
+      cs.length
+    do
+      if cs.length = 0 then
+        LIST.empty
+      else
+        let rest = remove_conn(cs.tail, c)
+        if cs.head.connection_id = c then
+          rest
+        else
+          rest.prepend(cs.head)
+        end
+      end
+    ensure
+      not_longer: Result.length <= cs.length
+    end
+
+feature {ANY}
+
+  active_connections: NAT
+    do
+      Current.conns.length
+    ensure
+      within_max: Result <= Current.max_connections
+      bounded: Result <= 1024
+    end
+
+  max_connections: NAT
+    do
+      Current.max_conns
+    ensure
+      in_range: Result >= 1 and Result <= 1024
+    end
+
+  server_port: NAT
+    do
+      Current.listen_port
+    ensure
+      in_range: Result >= 1 and Result <= 65535
+    end
+
+  router: HTTP_ROUTER
+    do
+      Current.app_router
+    end
+
+  has_connection_room: BOOL
+    do
+      Current.conns.length < Current.max_conns
+    ensure
+      def: Result = (Current.active_connections < Current.max_connections)
+    end
+
+  lookup_connection(c: CONN_ID): OPTION[HTTP_CONNECTION]
+    do
+      find_conn(Current.conns, c)
+    end
+
+  admit_connection(c: CONN_ID): HTTP_SERVER_STATE
+    require
+      room: Current.has_connection_room
+    do
+      { Current with conns = Current.conns.prepend(HTTP_CONNECTION.make_reading(c)) }
+    ensure
+      grew: Result.active_connections = Current.active_connections + 1
+      same_max: Result.max_connections = Current.max_connections
+    end
+
+  save_connection(updated: HTTP_CONNECTION): HTTP_SERVER_STATE
+    do
+      { Current with conns = update_conn(Current.conns, updated) }
+    ensure
+      same_count: Result.active_connections = Current.active_connections
+      same_max: Result.max_connections = Current.max_connections
+    end
+
+  release_connection(c: CONN_ID): HTTP_SERVER_STATE
+    do
+      { Current with conns = remove_conn(Current.conns, c) }
+    ensure
+      not_larger: Result.active_connections <= Current.active_connections
+      same_max: Result.max_connections = Current.max_connections
+    end
+
+end

@@ -9,24 +9,39 @@ All notable changes, theoretical soundess fixes, verification overhauls, front-e
 Spec draft v0.5. [plan/Roadmap.md](plan/Roadmap.md) holds the detail for each task.
 
 ### Language and runtime
+- **Contract compatibility check** (E.7). `gardelc --compare-with <old-dir>` reports what would break a client of an older version: a stronger `require`, a weaker `ensure`, removed or changed public items and concepts, a new `assume`, and a new or changed dependency. A change to a clause counts as compatible only if the solver proves it, and a new public name, a dependency that changed with no new version, or an `assume` the old version also had is a warning.
+- **Qualified names** (E.5). `ALIAS::NAME` in expressions, types and type arguments, with `GARDEL` for the prelude, and `MODULE.Leaf(1)`, `ALIAS::MODULE.Leaf(1)` and `case MODULE.Leaf(x)` for constructors. A type known for certain breaks a tie between constructors. A user module may reuse any prelude name, so `E0101` is gone.
+- **`let x: T = e` keeps `T`.** It was parsed and thrown away. It now settles a generic value, and a value known to have another type is `E0116`.
+- **Packages** (E.4). `[dependencies]` in `Gardel.toml` adds a package by `path`. Two packages may use one module or constructor name, each keeping its own proofs, and a client sees only a dependency's contracts. `examples/hello_api` is an HTTP service built on the `ghttp` package.
 - **Reactive programs** (Phase D): `reactive program`, with `init` and `step` as total routines, `STEP`, `COMMAND`, `EVENT`, `KEY` and `CONN_ID` in the prelude, timers, console input, TCP sockets, and event logs with replay.
 - **Standard library** (Phase C): one module per file under `stdlib/`, verified UTF-8 `STRING` and `BYTES`, `RESULT`, and a law catalogue.
 - **C backend**: every module lowers from source. Reference counting with ownership transfer, a thread-local allocator, and self tail calls as loops.
 - **Dafny removed.** Boogie and Z3 are the only verifier, and a run has five steps. Solver limits count work, not time.
 
 ### Soundness fixes
+- **`x.code` was the identity on every receiver**, which is only true of `CHAR`. In a module with a routine `code` that returns its own type, a false `ensure` such as `x.code = x` verified. `code` is now the identity on a `CHAR` alone, and a module's own routine wins over every built-in name (`first`, `head`, `length`, `append`, `at`, `apply` and the rest), which gave `E0199` before. Bend had the same fault: a run that declares a `code` routine now calls it on every receiver.
 - **Obligations reach every expression** (D.9). Overflow, division by zero, callee preconditions and `check` were skipped in lambdas, in `if` and `match` nested in an expression, in tuples, under `not`, in record fields and in a body `match`'s scrutinee. Such programs verified, then wrapped or crashed at run time.
 - **`I64`** (D.10). `/` and `%` proved Euclidean results while the binary truncated, so `(-7) / 2 = -4` verified and the program computed `-3`. `-x` at `I64.min` and `I64.min / -1` had no check. Wrapping on `I64` was read as unsigned.
 - **Private members** (E.0). Private routines and the constructors of a hidden representation were reachable from other modules, so a client could forge a value of an opaque type.
 - **Laws and private routines across modules** (E.0, E.2). A law with a hidden `require` reached clients with no hypothesis, so `check absurd: False` verified. It is now a Rule 1 error. A private routine reached through a generic result, such as `o.get.secret`, passed `E0113` and was called with its `require` unchecked, so a verified program could crash. Name resolution now follows those receivers, and the verifier refuses a private target and any `require` it cannot state.
 
+- **`assume` under `--strict`** (E.3). An `assume` nested in an expression, such as a `let` value or a call argument, was neither refused by `--strict` nor listed by `--audit`, so a false contract could verify at exit 0. Every expression and contract clause is now covered.
+
 ### Verifier
+- **`--verify-deps` proves the prelude** that `gardelc` carries (E.4), as well as every module of the build.
+- **Local verification cache** (E.3). A module this machine has proven is not given to the solver again, unless something that decides the answer changed: its verification condition, `gardelc`, Boogie, Z3, or the limits. The stdlib goes from 15.2 s to 0.4 s on a second run. The cache is outside the project, in `GARDEL_CACHE_DIR` or the user's cache directory, and an entry from anywhere else, or changed in any byte, is ignored. `--verify-deps` ignores the cache.
+- **Verification conditions are reproducible.** One source could give different axiom order or lambda names from one run to the next.
 - **Matching loops in the fusion axioms.** `LIST_OPS.filter(LIST.empty, p).length` and `LIST_OPS.map(l, identity)` could make Z3 run forever, past both of its limits. Fusion now stops at an empty list, and composing with the identity gives the same function.
 - **`gardelc` enforces the solver's time backstop itself**, on the whole Boogie run and its child processes, and reports the module as unproven (`GARDEL_SOLVER_BACKSTOP`).
 
 ### Behaviour changes that can reject existing code
 - Bitwise operators on `I64` are refused (`bitwise_on_signed`), and `-x` on `U64` needs `x = 0`.
 - Unknown command-line flags are errors.
+- An export list may not name a prelude module (`E0114`), and a declared name may not have the form `PK<n>_...` (`E0115`).
+- A `let x: T = e` that contradicts `T` is refused (`E0116`), where `T` used to be ignored.
+- A project constructor that clashes with a prelude one, such as a `Leaf`, is now a separate identity. A bare use from another module of the project means the project's, as before. Generated symbols for it are named `PK<n>_<PROJECT>_Leaf`, so its `.bpl`, `.c` and `.bend` text changes, though nothing else about them does.
+- Two modules of a project with one constructor name each get a separate identity, so generated symbols change for those constructors as well.
+- `--strict` now refuses a nested `assume`, and `--audit` lists it.
 - A run that cannot start Boogie or Z3 is an error. It used to fall back to sampling and could report success on a false contract. `--bounded-check` still samples, on request.
 - `--inspect` shows no interface when the run has errors, and exits with status 1.
 - `--bounded-check` no longer reports its obligations as satisfied. Each module gets a `not_proven` warning, an error under `--strict`, and `--inspect` shows no interface for it.

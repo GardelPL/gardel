@@ -1,0 +1,246 @@
+-- Verified HTTP/1.1 response domain model with RFC 9112 framing invariants.
+module HTTP_RESPONSE
+
+representation {NONE}
+  resp_version: HTTP_VERSION
+  resp_status: HTTP_STATUS
+  status_num: NAT
+  status_digits: STRING
+  digits_len: NAT
+  body_text: STRING
+  body_len: NAT
+  content_len_str: STRING
+  cl_str_len: NAT
+
+invariant
+  status_num_matches: status_num = resp_status.status_code
+  status_in_range: status_num >= 100 and status_num <= 599
+  digits_len_matches: digits_len = status_digits.byte_length
+  digits_exact_three: digits_len = 3
+  body_len_matches: body_len = body_text.byte_length
+  body_bounded: body_len <= 65536
+  cl_len_matches: cl_str_len = content_len_str.byte_length
+  len_str_non_empty: cl_str_len >= 1
+  len_str_bounded: cl_str_len <= 10
+  no_body_when_forbidden: resp_status.forbids_body implies (body_len = 0)
+
+create {ANY}
+
+  make_text(st: HTTP_STATUS, text_body: STRING, len_decimal: STRING): HTTP_RESPONSE
+    require
+      allows_body: not st.forbids_body
+      body_fits: text_body.byte_length <= 65536
+      len_present: len_decimal.byte_length >= 1
+      len_fits: len_decimal.byte_length <= 10
+    do
+      let d = st.code_digits
+      { resp_version = Http11,
+        resp_status = st,
+        status_num = st.status_code,
+        status_digits = d,
+        digits_len = d.byte_length,
+        body_text = text_body,
+        body_len = text_body.byte_length,
+        content_len_str = len_decimal,
+        cl_str_len = len_decimal.byte_length }
+    ensure
+      status_set: Result.status = st
+      code_set: Result.response_status_code = st.status_code
+      version_http11: Result.version = Http11
+      body_len_set: Result.response_body_length = text_body.byte_length
+    end
+
+  ok_text(text_body: STRING, len_decimal: STRING): HTTP_RESPONSE
+    require
+      body_fits: text_body.byte_length <= 65536
+      len_present: len_decimal.byte_length >= 1
+      len_fits: len_decimal.byte_length <= 10
+    do
+      { resp_version = Http11,
+        resp_status = HTTP_STATUS.ok,
+        status_num = 200,
+        status_digits = "200",
+        digits_len = 3,
+        body_text = text_body,
+        body_len = text_body.byte_length,
+        content_len_str = len_decimal,
+        cl_str_len = len_decimal.byte_length }
+    ensure
+      is_200: Result.response_status_code = 200
+      body_len_set: Result.response_body_length = text_body.byte_length
+    end
+
+  created_text(text_body: STRING, len_decimal: STRING): HTTP_RESPONSE
+    require
+      body_fits: text_body.byte_length <= 65536
+      len_present: len_decimal.byte_length >= 1
+      len_fits: len_decimal.byte_length <= 10
+    do
+      { resp_version = Http11,
+        resp_status = HTTP_STATUS.created,
+        status_num = 201,
+        status_digits = "201",
+        digits_len = 3,
+        body_text = text_body,
+        body_len = text_body.byte_length,
+        content_len_str = len_decimal,
+        cl_str_len = len_decimal.byte_length }
+    ensure
+      is_201: Result.response_status_code = 201
+      body_len_set: Result.response_body_length = text_body.byte_length
+    end
+
+  not_found_empty: HTTP_RESPONSE
+    do
+      { resp_version = Http11,
+        resp_status = HTTP_STATUS.not_found,
+        status_num = 404,
+        status_digits = "404",
+        digits_len = 3,
+        body_text = "",
+        body_len = 0,
+        content_len_str = "0",
+        cl_str_len = 1 }
+    ensure
+      is_404: Result.response_status_code = 404
+      empty_body: Result.response_body_length = 0
+    end
+
+  method_not_allowed_empty: HTTP_RESPONSE
+    do
+      { resp_version = Http11,
+        resp_status = HTTP_STATUS.method_not_allowed,
+        status_num = 405,
+        status_digits = "405",
+        digits_len = 3,
+        body_text = "",
+        body_len = 0,
+        content_len_str = "0",
+        cl_str_len = 1 }
+    ensure
+      is_405: Result.response_status_code = 405
+      empty_body: Result.response_body_length = 0
+    end
+
+  no_content_empty: HTTP_RESPONSE
+    do
+      { resp_version = Http11,
+        resp_status = HTTP_STATUS.no_content,
+        status_num = 204,
+        status_digits = "204",
+        digits_len = 3,
+        body_text = "",
+        body_len = 0,
+        content_len_str = "0",
+        cl_str_len = 1 }
+    ensure
+      is_204: Result.response_status_code = 204
+      empty_body: Result.response_body_length = 0
+    end
+
+  make_empty(st: HTTP_STATUS): HTTP_RESPONSE
+    do
+      let d = st.code_digits
+      { resp_version = Http11,
+        resp_status = st,
+        status_num = st.status_code,
+        status_digits = d,
+        digits_len = d.byte_length,
+        body_text = "",
+        body_len = 0,
+        content_len_str = "0",
+        cl_str_len = 1 }
+    ensure
+      status_set: Result.status = st
+      code_set: Result.response_status_code = st.status_code
+      version_http11: Result.version = Http11
+      empty_body: Result.response_body_length = 0
+    end
+
+  from_error(err: HTTP_ERROR): HTTP_RESPONSE
+    do
+      let st = err.to_status
+      let d = st.code_digits
+      { resp_version = Http11,
+        resp_status = st,
+        status_num = st.status_code,
+        status_digits = d,
+        digits_len = d.byte_length,
+        body_text = "",
+        body_len = 0,
+        content_len_str = "0",
+        cl_str_len = 1 }
+    ensure
+      is_err: Result.status.is_client_error or Result.status.is_server_error
+      empty_body: Result.response_body_length = 0
+    end
+
+feature {ANY}
+
+  version: HTTP_VERSION
+    do
+      Current.resp_version
+    end
+
+  status: HTTP_STATUS
+    do
+      Current.resp_status
+    end
+
+  response_status_code: NAT
+    do
+      Current.status_num
+    ensure
+      matches_status: Result = Current.status.status_code
+      in_range: Result >= 100 and Result <= 599
+    end
+
+  status_digits_string: STRING
+    do
+      Current.status_digits
+    ensure
+      exact_three: Result.byte_length = 3
+    end
+
+  body_string: STRING
+    do
+      Current.body_text
+    ensure
+      exact_len: Result.byte_length = Current.response_body_length
+      bounded: Result.byte_length <= 65536
+      forbidden_implies_zero: Current.status.forbids_body implies (Result.byte_length = 0)
+    end
+
+  body: BYTES
+    do
+      Current.body_text.to_utf8
+    ensure
+      exact_len: Result.length = Current.response_body_length
+      bounded: Result.length <= 65536
+    end
+
+  response_body_length: NAT
+    do
+      Current.body_len
+    ensure
+      bounded: Result <= 65536
+      forbidden_implies_zero: Current.status.forbids_body implies (Result = 0)
+    end
+
+  content_length_header_value: STRING
+    do
+      Current.content_len_str
+    ensure
+      matches_cl_len: Result.byte_length = Current.content_length_digits_len
+      non_empty: Result.byte_length >= 1
+      bounded: Result.byte_length <= 10
+    end
+
+  content_length_digits_len: NAT
+    do
+      Current.cl_str_len
+    ensure
+      in_range: Result >= 1 and Result <= 10
+    end
+
+end

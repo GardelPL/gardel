@@ -1,0 +1,221 @@
+-- Verified HTTP/1.1 request domain model (RFC 9110 / RFC 9112).
+module HTTP_REQUEST
+
+representation {NONE}
+  req_method: HTTP_METHOD
+  req_target: STRING
+  raw_target_bytes: BYTES
+  target_offset: NAT
+  target_len: NAT
+  req_version: HTTP_VERSION
+  req_headers: HTTP_HEADERS
+  hdr_count: NAT
+  req_body: BYTES
+  body_len: NAT
+  max_body: NAT
+
+invariant
+  target_non_empty: target_len >= 1
+  target_bounded: target_len <= 512
+  offset_bounded: target_offset <= 65536
+  hdr_count_matches: hdr_count = req_headers.num_headers
+  hdr_count_bounded: hdr_count <= 64
+  body_within_limit: body_len <= max_body
+  max_body_bounded: max_body <= 65536
+  safe_method_empty_body: req_method.is_safe implies (body_len = 0)
+
+create {ANY}
+
+  make(m: HTTP_METHOD, t: STRING, v: HTTP_VERSION, hs: HTTP_HEADERS, b: BYTES, b_len: NAT, body_limit: NAT): HTTP_REQUEST
+    require
+      target_present: t.byte_length >= 1
+      target_fits: t.byte_length <= 512
+      hdrs_fit: hs.num_headers <= 64
+      limit_ok: body_limit <= 65536
+      body_fits: b_len <= body_limit
+      safe_no_body: m.is_safe implies (b_len = 0)
+    do
+      { req_method = m,
+        req_target = t,
+        raw_target_bytes = t.to_utf8,
+        target_offset = 0,
+        target_len = t.byte_length,
+        req_version = v,
+        req_headers = hs,
+        hdr_count = hs.num_headers,
+        req_body = b,
+        body_len = b_len,
+        max_body = body_limit }
+    ensure
+      method_set: Result.method = m
+      tlen_set: Result.target_byte_length = t.byte_length
+      version_set: Result.version = v
+      hcount_set: Result.request_header_count = hs.num_headers
+      body_len_set: Result.request_body_length = b_len
+      limit_set: Result.request_body_limit = body_limit
+    end
+
+  make_simple(m: HTTP_METHOD, t: STRING): HTTP_REQUEST
+    require
+      target_present: t.byte_length >= 1
+      target_fits: t.byte_length <= 512
+    do
+      { req_method = m,
+        req_target = t,
+        raw_target_bytes = t.to_utf8,
+        target_offset = 0,
+        target_len = t.byte_length,
+        req_version = Http11,
+        req_headers = HTTP_HEADERS.default_empty,
+        hdr_count = 0,
+        req_body = "".to_utf8,
+        body_len = 0,
+        max_body = 4096 }
+    ensure
+      method_set: Result.method = m
+      tlen_set: Result.target_byte_length = t.byte_length
+      is_http11: Result.version = Http11
+      zero_hdrs: Result.request_header_count = 0
+      empty_body: Result.request_body_length = 0
+      limit_4096: Result.request_body_limit = 4096
+    end
+
+  make_from_wire(m: HTTP_METHOD, raw: BYTES, off: NAT, tlen: NAT): HTTP_REQUEST
+    require
+      off_fits: off <= 65536
+      target_present: tlen >= 1
+      target_fits: tlen <= 512
+    do
+      { req_method = m,
+        req_target = "/",
+        raw_target_bytes = raw,
+        target_offset = off,
+        target_len = tlen,
+        req_version = Http11,
+        req_headers = HTTP_HEADERS.default_empty,
+        hdr_count = 0,
+        req_body = "".to_utf8,
+        body_len = 0,
+        max_body = 4096 }
+    ensure
+      method_set: Result.method = m
+      tlen_set: Result.target_byte_length = tlen
+      is_http11: Result.version = Http11
+      zero_hdrs: Result.request_header_count = 0
+      empty_body: Result.request_body_length = 0
+    end
+
+create {NONE}
+
+  compare_slice(raw: BYTES, raw_off: NAT, pat: BYTES, idx: NAT, len: NAT): BOOL
+    require
+      len_bounded: len <= 512
+      off_bounded: raw_off <= 65536
+      idx_le_len: idx <= len
+    variant
+      len - idx
+    do
+      if raw_off + len > raw.length or len > pat.length then
+        False
+      else if idx >= len then
+        True
+      else if raw.at(raw_off + idx) = pat.at(idx) then
+        compare_slice(raw, raw_off, pat, idx + 1, len)
+      else
+        False
+      end end end
+    end
+
+feature {ANY}
+
+  method: HTTP_METHOD
+    do
+      Current.req_method
+    end
+
+  target: STRING
+    do
+      Current.req_target
+    end
+
+  target_byte_length: NAT
+    do
+      Current.target_len
+    ensure
+      in_range: Result >= 1 and Result <= 512
+    end
+
+  -- True iff the parsed request target is byte-for-byte equal to `path`.
+  target_equals(path: STRING): BOOL
+    do
+      if path.byte_length != Current.target_len then
+        False
+      else
+        compare_slice(
+          Current.raw_target_bytes,
+          Current.target_offset,
+          path.to_utf8,
+          0,
+          Current.target_len
+        )
+      end
+    end
+
+  -- True iff the parsed request target starts with `prefix` (for parameterized routes).
+  target_starts_with(prefix: STRING): BOOL
+    do
+      if prefix.byte_length > Current.target_len then
+        False
+      else
+        compare_slice(
+          Current.raw_target_bytes,
+          Current.target_offset,
+          prefix.to_utf8,
+          0,
+          prefix.byte_length
+        )
+      end
+    end
+
+  version: HTTP_VERSION
+    do
+      Current.req_version
+    end
+
+  headers: HTTP_HEADERS
+    do
+      Current.req_headers
+    ensure
+      headers_bounded: Result.num_headers <= 64
+    end
+
+  request_header_count: NAT
+    do
+      Current.hdr_count
+    ensure
+      matches_hdrs: Result = Current.headers.num_headers
+      bounded: Result <= 64
+    end
+
+  body: BYTES
+    do
+      Current.req_body
+    end
+
+  request_body_length: NAT
+    do
+      Current.body_len
+    ensure
+      within_limit: Result <= Current.request_body_limit
+      bounded: Result <= 65536
+      safe_empty: Current.method.is_safe implies (Result = 0)
+    end
+
+  request_body_limit: NAT
+    do
+      Current.max_body
+    ensure
+      bounded: Result <= 65536
+    end
+
+end

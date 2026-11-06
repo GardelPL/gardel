@@ -1,0 +1,100 @@
+-- Declarative HTTP route definition supporting exact and prefix/parameterized matching.
+module HTTP_ROUTE
+
+representation {NONE}
+  r_method: HTTP_METHOD
+  r_path: STRING
+  path_len: NAT
+  is_prefix_match: BOOL
+  handler_id: NAT
+
+invariant
+  path_len_matches: path_len = r_path.byte_length
+  path_non_empty: path_len >= 1
+  path_bounded: path_len <= 128
+  handler_bounded: handler_id <= 64
+
+create {ANY}
+
+  make(m: HTTP_METHOD, p: STRING, hid: NAT): HTTP_ROUTE
+    require
+      p_non_empty: p.byte_length >= 1
+      p_fits: p.byte_length <= 128
+      hid_fits: hid <= 64
+    do
+      { r_method = m,
+        r_path = p,
+        path_len = p.byte_length,
+        is_prefix_match = False,
+        handler_id = hid }
+    ensure
+      method_set: Result.route_method = m
+      path_set: Result.route_path.equals(p)
+      len_set: Result.route_path_length = p.byte_length
+      exact_mode: not Result.is_prefix_route
+      id_set: Result.endpoint_id = hid
+    end
+
+  make_prefix(m: HTTP_METHOD, prefix: STRING, hid: NAT): HTTP_ROUTE
+    require
+      p_non_empty: prefix.byte_length >= 1
+      p_fits: prefix.byte_length <= 128
+      hid_fits: hid <= 64
+    do
+      { r_method = m,
+        r_path = prefix,
+        path_len = prefix.byte_length,
+        is_prefix_match = True,
+        handler_id = hid }
+    ensure
+      method_set: Result.route_method = m
+      path_set: Result.route_path.equals(prefix)
+      len_set: Result.route_path_length = prefix.byte_length
+      prefix_mode: Result.is_prefix_route
+      id_set: Result.endpoint_id = hid
+    end
+
+feature {ANY}
+
+  route_method: HTTP_METHOD
+    do
+      Current.r_method
+    end
+
+  route_path: STRING
+    do
+      Current.r_path
+    ensure
+      non_empty: Result.byte_length >= 1
+      bounded: Result.byte_length <= 128
+    end
+
+  route_path_length: NAT
+    do
+      Current.path_len
+    ensure
+      in_range: Result >= 1 and Result <= 128
+    end
+
+  is_prefix_route: BOOL
+    do
+      Current.is_prefix_match
+    end
+
+  endpoint_id: NAT
+    do
+      Current.handler_id
+    ensure
+      bounded: Result <= 64
+    end
+
+  matches_request_path(req: HTTP_REQUEST): BOOL
+    do
+      if Current.is_prefix_match then
+        req.target_starts_with(Current.r_path)
+      else
+        req.target_equals(Current.r_path)
+      end
+    end
+
+end

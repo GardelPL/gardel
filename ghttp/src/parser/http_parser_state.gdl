@@ -1,0 +1,105 @@
+-- Incremental HTTP parser buffer and resource-limit state.
+module HTTP_PARSER_STATE
+
+representation {NONE}
+  accumulated: NAT
+  max_request_line: NAT
+  max_header_bytes: NAT
+  max_body_bytes: NAT
+  has_partial_line: BOOL
+
+invariant
+  req_line_limit_positive: max_request_line >= 16 and max_request_line <= 2048
+  header_limit_positive: max_header_bytes >= 64 and max_header_bytes <= 8192
+  body_limit_bounded: max_body_bytes <= 65536
+  accumulated_within_bounds: accumulated <= max_request_line + max_header_bytes + max_body_bytes
+
+create {ANY}
+
+  make_default: HTTP_PARSER_STATE
+    do
+      { accumulated = 0,
+        max_request_line = 512,
+        max_header_bytes = 4096,
+        max_body_bytes = 4096,
+        has_partial_line = False }
+    ensure
+      empty_buf: Result.buffered_bytes = 0
+      req_line_512: Result.request_line_limit = 512
+      hdr_4096: Result.header_limit = 4096
+      body_4096: Result.body_limit = 4096
+      not_partial: not Result.is_waiting_for_more
+    end
+
+  make_partial(bytes_so_far: NAT, req_lim: NAT, hdr_lim: NAT, body_lim: NAT): HTTP_PARSER_STATE
+    require
+      req_ok: req_lim >= 16 and req_lim <= 2048
+      hdr_ok: hdr_lim >= 64 and hdr_lim <= 8192
+      body_ok: body_lim <= 65536
+      within_cap: bytes_so_far <= req_lim + hdr_lim + body_lim
+    do
+      { accumulated = bytes_so_far,
+        max_request_line = req_lim,
+        max_header_bytes = hdr_lim,
+        max_body_bytes = body_lim,
+        has_partial_line = True }
+    ensure
+      buffered_set: Result.buffered_bytes = bytes_so_far
+      waiting: Result.is_waiting_for_more
+      within_max: Result.buffered_bytes <= Result.max_total_bytes
+    end
+
+feature {ANY}
+
+  buffered_bytes: NAT
+    do
+      Current.accumulated
+    ensure
+      within_max: Result <= Current.max_total_bytes
+    end
+
+  request_line_limit: NAT
+    do
+      Current.max_request_line
+    ensure
+      in_range: Result >= 16 and Result <= 2048
+    end
+
+  header_limit: NAT
+    do
+      Current.max_header_bytes
+    ensure
+      in_range: Result >= 64 and Result <= 8192
+    end
+
+  body_limit: NAT
+    do
+      Current.max_body_bytes
+    ensure
+      bounded: Result <= 65536
+    end
+
+  max_total_bytes: NAT
+    do
+      Current.max_request_line + Current.max_header_bytes + Current.max_body_bytes
+    ensure
+      def: Result = Current.request_line_limit + Current.header_limit + Current.body_limit
+      bounded: Result <= 75776
+    end
+
+  is_waiting_for_more: BOOL
+    do
+      Current.has_partial_line
+    end
+
+  can_accept(chunk_len: NAT): BOOL
+    require
+      chunk_bounded: chunk_len <= 1048576
+    do
+      Current.accumulated + chunk_len <= Current.max_total_bytes
+    ensure
+      def: Result = (Current.buffered_bytes + chunk_len <= Current.max_total_bytes)
+    end
+
+end
+

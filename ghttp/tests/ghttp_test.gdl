@@ -1,0 +1,122 @@
+-- Executable protocol, parser, router, and REST API extension test suite for Gardel HTTP (`ghttp`).
+-- Exit code 0 means all checks passed; k > 0 identifies the first failing check.
+--
+--   gardelc ghttp/src/core ghttp/src/parser ghttp/src/serializer ghttp/src/routing ghttp/src/application ghttp/tests/ghttp_test.gdl --strict
+program GHTTP_TEST
+
+feature {ANY}
+
+  check_domain_model: EXIT_CODE
+    do
+      if not Get.is_safe then 1
+      else if Post.is_safe then 2
+      else if not Get.is_idempotent then 3
+      else if Post.is_idempotent then 4
+      else if HTTP_STATUS.ok.status_code != 200 then 5
+      else if not HTTP_STATUS.no_content.forbids_body then 6
+      else if HTTP_HEADERS.default_empty.add(HTTP_HEADER.content_type_json).num_headers != 1 then 7
+      else if HTTP_HEADER.content_type_json.wire_byte_length != 32 then 9
+      else 0
+      end end end end end end end end
+    end
+
+  check_parser_and_fragmentation: EXIT_CODE
+    do
+      let step1 = HTTP_PARSER.feed(HTTP_PARSER_STATE.make_default, "GET /ap".to_utf8)
+      if not HTTP_PARSER.parse("GET /any/path HTTP/1.1\r\n\r\n".to_utf8).is_complete then 10
+      else if not step1.is_need_more then 11
+      else
+        match step1
+          case NeedMore(st1) then
+            if not HTTP_PARSER.feed(st1, "i/v1\r\n\r\n".to_utf8).is_complete then 12
+            else if not HTTP_PARSER.parse("GET bad_target\r\n\r\n".to_utf8).is_failed then 13
+            else 0
+            end end
+          case _ then 14
+        end
+      end end
+    end
+
+  -- Example user-defined REST API handler extension (not part of the HTTP server core).
+  rest_api_handler(endpoint_id: NAT, req: HTTP_REQUEST): HTTP_RESPONSE
+    do
+      if endpoint_id = 10 then
+        HTTP_RESPONSE.ok_text("{}", "2")
+      else if endpoint_id = 20 then
+        HTTP_RESPONSE.ok_text("[]", "2")
+      else if endpoint_id = 21 then
+        HTTP_RESPONSE.created_text("{}", "2")
+      else if endpoint_id = 30 then
+        HTTP_RESPONSE.no_content_empty
+      else
+        HTTP_RESPONSE.not_found_empty
+      end end end end
+    end
+
+  dispatch_rest_api(req: HTTP_REQUEST, router: HTTP_ROUTER): HTTP_RESPONSE
+    do
+      HTTP_APPLICATION.dispatch_with(
+        req,
+        router,
+        fn(id: NAT, r: HTTP_REQUEST): HTTP_RESPONSE do rest_api_handler(id, r) end
+      )
+    end
+
+  check_router_and_rest_extension: EXIT_CODE
+    do
+      -- 1. Default minimal server router (only `GET /` is registered):
+      let srv_router = HTTP_ROUTER.default_server_router
+      let resp_root = HTTP_APPLICATION.dispatch(HTTP_REQUEST.make_simple(Get, "/"), srv_router)
+      let resp_unregistered = HTTP_APPLICATION.dispatch(HTTP_REQUEST.make_simple(Get, "/health"), srv_router)
+      let resp_root_405 = HTTP_APPLICATION.dispatch(HTTP_REQUEST.make_simple(Delete, "/"), srv_router)
+
+      -- 2. Custom REST API router + custom handler built as an extension on top of `HTTP_ROUTER`:
+      let r0 = HTTP_ROUTER.empty(16)
+      let r1 = r0.register(HTTP_ROUTE.make(Get, "/health", 10))
+      let r2 = r1.register(HTTP_ROUTE.make(Get, "/users", 20))
+      let r3 = r2.register(HTTP_ROUTE.make(Post, "/users", 21))
+      let api_router = r3.register(HTTP_ROUTE.make_prefix(Delete, "/users/", 30))
+
+      let api_health = dispatch_rest_api(HTTP_REQUEST.make_simple(Get, "/health"), api_router)
+      let api_users = dispatch_rest_api(HTTP_REQUEST.make_simple(Get, "/users"), api_router)
+      let api_create = dispatch_rest_api(HTTP_REQUEST.make_simple(Post, "/users"), api_router)
+      let api_delete = dispatch_rest_api(HTTP_REQUEST.make_simple(Delete, "/users/42"), api_router)
+      let api_405 = dispatch_rest_api(HTTP_REQUEST.make_simple(Delete, "/health"), api_router)
+
+      let wire_root = HTTP_SERIALIZER.serialize(resp_root)
+      let wire_delete = HTTP_SERIALIZER.serialize(api_delete)
+
+      if resp_root.response_status_code != 200 then 20
+      else if resp_unregistered.response_status_code != 404 then 21
+      else if resp_root_405.response_status_code != 405 then 22
+      else if api_health.response_status_code != 200 then 23
+      else if api_users.response_status_code != 200 then 24
+      else if api_create.response_status_code != 201 then 25
+      else if api_delete.response_status_code != 204 then 26
+      else if api_delete.response_body_length != 0 then 27
+      else if api_405.response_status_code != 405 then 28
+      else if wire_root.length <= resp_root.response_body_length then 29
+      else if wire_delete.length < 35 then 30
+      else 0
+      end end end end end end end end end end end
+    end
+
+  first_failure: EXIT_CODE
+    do
+      let c1 = check_domain_model
+      if c1 != 0 then c1
+      else
+        let c2 = check_parser_and_fragmentation
+        if c2 != 0 then c2
+        else
+          check_router_and_rest_extension
+        end
+      end
+    end
+
+  main(args: SEQ[STRING]): IO[EXIT_CODE]
+    do
+      IO.exit(first_failure)
+    end
+
+end
