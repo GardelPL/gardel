@@ -824,7 +824,7 @@ flowchart TD
   - **"0 breaking", and the client no longer built.** Four changes passed: a removed `concept`, a body gaining an `assume`, a new module whose name a client used bare, and a new entry in `[dependencies]`. The first version compared contracts of modules only, and the acceptance line "a body-only change is not breaking" did not allow for decision 6.
   - **A harmless change was reported as breaking** when another clause of the module made Boogie refuse the file, and `--z3-seed` and `--z3-rlimit` did not reach the query.
   - **Two tests shared a temporary directory**, so they failed at random, and the second attempt at the fix moved the clash. In a mutation run, that failure made unrelated mutations look caught. `World::new` now gives each test its own directory whatever its name, and all 23 mutations of the review's rules were run again after it.
-- `cargo test` 206/206, 41/41, 48/48, 4/4, 16/16 and 9/9, with `--stdlib --strict` 0/0, and `ghttp`, `hello_api` and `echo_server` 0/0 under `--strict`. Forty-eight mutations of these rules, each made on a private copy, all turn a test red, seven of them only after their tests were added or sharpened. The first false-contract test never reached the false contract, as Z3 needs a term to apply it to, and a law with no `trigger` gives the solver nothing.
+- `cargo test` 206/206, 47/47, 48/48, 4/4, 16/16 and 9/9, with `--stdlib --strict` 0/0, and `ghttp`, `hello_api` and `echo_server` 0/0 under `--strict`. Sixty-six mutations of these rules, each made on a private copy, all turn a test red, seven of them only after their tests were added or sharpened. A sixty-seventh changes nothing, as a project's units are its packages alone. The first false-contract test never reached the false contract, as Z3 needs a term to apply it to, and a law with no `trigger` gives the solver nothing.
 - **Known limits.**
   - An `assume` the old version already had cannot be checked, only named. The warning `rests_on_assume` lists each one, as a body can start to lean on one with no change to any contract, and `--strict` refuses them.
   - A dependency is compared by name, `version` and text, not by contract: each package checks its own releases. New text at one `version` is the warning `dependency_moved`, even for a change to a comment.
@@ -832,6 +832,7 @@ flowchart TD
   - `new_public_name` is given for every new name, as a package cannot see its clients. Only a client's own build can say whether a name clashes.
   - A renamed type parameter, a weaker bound and a changed `trigger` are not analysed. The first two count as breaking, and a changed `trigger` counts as nothing, although it can stop a client's proof from going through.
   - A proof can also depend on how a contract is written, so a compatible change can still need a client's proof to be adjusted.
+  - `test_e3_a_forged_entry_cannot_prove_a_false_contract` failed once in six full runs of this task, with no answer from `tool_versions`, and the cause was not found. That code is from E.3, and this task did not change it.
 
 ---
 
