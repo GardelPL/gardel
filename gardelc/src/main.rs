@@ -17,6 +17,7 @@ pub mod manifest;
 mod names;
 mod patterns;
 mod proof_cache;
+mod resolve;
 pub use c11_typed::emit_c11_typed;
 
 /// In a `program` or `functions` module (no `Current`), a free name that is a routine of
@@ -890,6 +891,7 @@ pub fn tokenize_with_lines(src: &str) -> Result<(Vec<Token>, Vec<usize>), LexErr
 
 /// Locates a 1-based line and column `Span` for a contract tag, routine, or expression snippet in `src`.
 pub fn locate_span(src: &str, file: &str, primary_needle: &str, fallback_routine: &str) -> Span {
+    let primary_needle = resolve::source_spelling(primary_needle);
     let lines: Vec<&str> = src.lines().collect();
     if !primary_needle.is_empty() {
         let tagged = format!("{primary_needle}:");
@@ -4557,7 +4559,7 @@ pub fn prelude_mode_enabled(stdlib_only: bool, no_prelude: bool) -> bool {
 
 /// Span of the declaration header `<kw> <name>` (e.g. `module STACK`) in `src`.
 fn locate_decl_header(src: &str, input_path: &str, kw: &str, name: &str) -> Span {
-    let header = format!("{kw} {name}");
+    let header = format!("{kw} {}", resolve::source_spelling(name));
     for (idx, line) in src.lines().enumerate() {
         let t = line.trim_start();
         if t.starts_with(&header)
@@ -4700,10 +4702,11 @@ pub fn check_file_module_name(unit: &SourceUnit, strict: bool) -> Vec<Diagnostic
         .file_stem()
         .map(|s| s.to_string_lossy().to_string())
         .unwrap_or_default();
-    if decls.iter().any(|(n, _)| to_snake_case(n) == stem) {
+    let snake = |name: &str| to_snake_case(resolve::source_spelling(name));
+    if decls.iter().any(|(n, _)| snake(n) == stem) {
         return Vec::new();
     }
-    let expected = to_snake_case(primary);
+    let expected = snake(primary);
     let sp = locate_decl_header(&unit.src, &unit.path, kw, primary);
     vec![Diagnostic::basic(
         if strict { "error" } else { "warning" },
@@ -13027,6 +13030,7 @@ const VERIFIER_SOURCES: &[(&str, &str)] = &[
     ("names.rs", include_str!("names.rs")),
     ("patterns.rs", include_str!("patterns.rs")),
     ("proof_cache.rs", include_str!("proof_cache.rs")),
+    ("resolve.rs", include_str!("resolve.rs")),
 ];
 
 fn verifier_id() -> String {
@@ -17509,6 +17513,27 @@ pub fn resolve_project_inputs(
     dir: &std::path::Path,
 ) -> Result<(manifest::Manifest, Vec<String>), manifest::ProjectResolutionError> {
     let (manifest, src_dir) = manifest::resolve_manifest_project_dir(dir)?;
+    let files = package_files(&manifest, &src_dir)?;
+    Ok((manifest, files))
+}
+
+/// Every package of the build rooted at `dir`, each with its sorted source files, dependencies
+/// first and the root last (Task E.4).
+pub fn resolve_package_inputs(
+    dir: &std::path::Path,
+) -> Result<Vec<(manifest::Manifest, Vec<String>)>, manifest::ProjectResolutionError> {
+    let mut out = Vec::new();
+    for package in manifest::load_packages(dir)? {
+        let files = package_files(&package.manifest, &package.src_dir)?;
+        out.push((package.manifest, files));
+    }
+    Ok(out)
+}
+
+fn package_files(
+    manifest: &manifest::Manifest,
+    src_dir: &std::path::Path,
+) -> Result<Vec<String>, manifest::ProjectResolutionError> {
     let src_dir_str = src_dir.to_string_lossy().to_string();
     let files = gdl_files_in_dir(&src_dir_str, None).map_err(|e| {
         manifest::ProjectResolutionError {
@@ -17531,7 +17556,7 @@ pub fn resolve_project_inputs(
             ),
         });
     }
-    Ok((manifest, files))
+    Ok(files)
 }
 
 /// Parses `--project <DIR>` from command-line arguments.
@@ -17657,8 +17682,7 @@ pub struct VerifyOptions {
     pub bounded_check: bool,
     pub z3_seed: Option<u32>,
     pub z3_rlimit: Option<u64>,
-    /// The package of each module. A module not listed belongs to the project. Nothing sets
-    /// this outside tests until `[dependencies]` exists (Task E.4).
+    /// The package of each dependency module. A module not listed belongs to the project.
     pub packages: HashMap<String, String>,
     /// The local verification cache. `None` runs the solver on every module.
     pub cache: Option<Rc<ProofCache>>,
@@ -17804,6 +17828,43 @@ pub fn check_and_verify_project(units: &mut [SourceUnit], opts: VerifyOptions) -
         concept_map,
         link,
     }
+}
+
+/// Proves the prelude this `gardelc` carries, as `--stdlib --strict` proves its source tree.
+/// It ships inside the verifier, so a normal run takes it on the same trust. A check that
+/// trusts nothing still has to prove it (decision 8). Returns what failed.
+fn verify_embedded_prelude(cache: Option<Rc<ProofCache>>) -> Vec<Diagnostic> {
+    let mut units = Vec::new();
+    for (path, src) in STDLIB_SOURCES {
+        let parsed = tokenize(src)
+            .map_err(|e| e.to_string())
+            .and_then(|tokens| Parser::new(tokens).parse_file().map_err(|e| e.to_string()));
+        match parsed {
+            Ok(ast) => units.push(SourceUnit { path: path.to_string(), src: src.to_string(), ast }),
+            Err(message) => {
+                let rule = "Phase 4 (Standard Prelude Does Not Parse)";
+                return vec![Diagnostic::basic("error", rule, path.to_string(), "prelude".to_string(), message)];
+            }
+        }
+    }
+    let checked = check_and_verify_project(
+        &mut units,
+        VerifyOptions {
+            prelude_mode: false,
+            project_mode: true,
+            fuel_limit: DEFAULT_FUEL,
+            strict: true,
+            audit: false,
+            bounded_check: false,
+            z3_seed: None,
+            z3_rlimit: None,
+            packages: HashMap::new(),
+            cache,
+        },
+    );
+    let mut failed = checked.fatal;
+    failed.extend(checked.diags.into_iter().map(|(_, d)| d).filter(|d| d.level == "error"));
+    failed
 }
 
 /// Prints fatal diagnostics (E0101/E0102/E0103) and exits with status 1.
@@ -18034,6 +18095,8 @@ fn main() {
     // `RESULT`, ...), so asking for any of them verifies the whole tree, as `--stdlib` does;
     // mixing them with user files is an error (a user program gets the stdlib as its prelude).
     let mut user_inputs: Option<(Vec<String>, bool)> = None;
+    // The packages of a build with a manifest, with the number of files of each.
+    let mut package_list: Vec<(manifest::Manifest, usize)> = Vec::new();
     if !stdlib_only {
         let project_manifest_dir = if let Some(dir) = project_arg {
             if !ops.is_empty() {
@@ -18054,7 +18117,7 @@ fn main() {
         };
 
         if let Some(pdir) = project_manifest_dir {
-            let (_manifest, files) = match resolve_project_inputs(std::path::Path::new(&pdir)) {
+            let packages = match resolve_package_inputs(std::path::Path::new(&pdir)) {
                 Ok(res) => res,
                 Err(err) => exit_with_frontend_error_at_line(
                     json_mode,
@@ -18066,6 +18129,11 @@ fn main() {
                     err.line,
                 ),
             };
+            let mut files = Vec::new();
+            for (manifest, package_files) in packages {
+                package_list.push((manifest, package_files.len()));
+                files.extend(package_files);
+            }
             user_inputs = Some((files, true));
         } else {
             if ops.is_empty() {
@@ -18196,8 +18264,33 @@ fn main() {
         .iter()
         .all(|_| prelude_mode_enabled(stdlib_only, no_prelude_flag));
 
-    // E0101 (prelude shadowing) and E0102 (cross-file duplicates) are fatal (§4.1, §4.2).
-    let namespace_errors = check_project_namespace(&units, prelude_mode);
+    // E0101 (prelude shadowing) and E0102 (cross-file duplicates) are fatal (§4.1, §4.2), and
+    // so is a name that cannot be resolved in its package (Task E.4).
+    let (packages, namespace_errors) = if package_list.is_empty() {
+        (HashMap::new(), check_project_namespace(&units, prelude_mode))
+    } else {
+        let mut start = 0;
+        let last = package_list.len() - 1;
+        let list: Vec<resolve::PackageUnits> = package_list
+            .iter()
+            .enumerate()
+            .map(|(i, (manifest, count))| {
+                let units = start..start + count;
+                start += count;
+                resolve::PackageUnits {
+                    name: manifest.project.name.clone(),
+                    is_root: i == last,
+                    deps: manifest
+                        .dependencies
+                        .iter()
+                        .map(|d| (d.name.clone(), d.alias.clone()))
+                        .collect(),
+                    units,
+                }
+            })
+            .collect();
+        resolve::resolve_packages(&mut units, &list, prelude_mode)
+    };
     if !namespace_errors.is_empty() {
         exit_with_fatal(&namespace_errors, json_mode, &first_path);
     }
@@ -18218,12 +18311,12 @@ fn main() {
         );
     }
 
+    let verify_deps = args.iter().any(|a| a == "--verify-deps");
     // Sampling proves nothing, so it neither reads the cache nor adds to it.
     let proof_cache = if bounded_check {
         None
     } else {
-        let reads = !args.iter().any(|a| a == "--verify-deps");
-        match ProofCache::open(verifier_id(), reads) {
+        match ProofCache::open(verifier_id(), !verify_deps) {
             Ok(cache) => Some(Rc::new(cache)),
             Err(e) => {
                 // The cache only saves time, so a run without one is still a full check.
@@ -18241,10 +18334,23 @@ fn main() {
         bounded_check,
         z3_seed,
         z3_rlimit,
-        packages: HashMap::new(),
+        packages: packages.clone(),
         cache: proof_cache.clone(),
     };
-    let checked = check_and_verify_project(&mut units, opts);
+    let mut checked = check_and_verify_project(&mut units, opts);
+    if verify_deps && prelude_mode && !bounded_check {
+        let cache = ProofCache::open(verifier_id(), false).ok().map(Rc::new);
+        let failed = verify_embedded_prelude(cache);
+        if !failed.is_empty() {
+            exit_with_fatal(&failed, json_mode, &first_path);
+        }
+        say(&format!(
+            "[verify-deps] Standard Prelude `{}` proven from the source in this gardelc",
+            resolve::PRELUDE_PACKAGE
+        ));
+    }
+    checked.fatal.iter_mut().for_each(resolve::make_readable);
+    checked.diags.iter_mut().for_each(|(_, d)| resolve::make_readable(d));
     if !checked.fatal.is_empty() {
         exit_with_fatal(&checked.fatal, json_mode, &first_path);
     }
@@ -18272,7 +18378,9 @@ fn main() {
             .and_then(|idx| args.get(idx + 1))
             .filter(|val| !val.starts_with("--") && !looks_like_input(val))
             .cloned();
-        for u in &units {
+        // A dependency has its own project to inspect it from.
+        let root_units = package_list.last().map_or(0, |(_, count)| units.len() - count);
+        for u in &units[root_units..] {
             let requested = requested_stdlib_files.is_empty()
                 || filter_mod.is_some()
                 || fs::canonicalize(&u.path).is_ok_and(|p| requested_stdlib_files.contains(&p));
@@ -18284,7 +18392,7 @@ fn main() {
                     .as_ref()
                     .is_none_or(|f| f.eq_ignore_ascii_case(&m.name))
                 {
-                    println!("{}", format_module_interface(m));
+                    println!("{}", resolve::readable(&format_module_interface(m)));
                 }
             }
         }
@@ -18294,9 +18402,10 @@ fn main() {
     // The primary module (outputs reported, gcc, --run): the last module of the file in a
     // single-file run; in a project run the unique `program`, else the last module.
     let all_modules: Vec<&ModuleDecl> = units.iter().flat_map(|u| u.ast.modules.iter()).collect();
+    // A dependency's entry point is not a root of this build (decision 7).
     let programs: Vec<&&ModuleDecl> = all_modules
         .iter()
-        .filter(|m| m.kind.is_entry_point())
+        .filter(|m| m.kind.is_entry_point() && !packages.contains_key(&m.name))
         .collect();
     let module = if project_mode && programs.len() == 1 {
         (*programs[0]).clone()
@@ -18310,9 +18419,8 @@ fn main() {
             .ast
             .modules
             .last()
-            .map(|m| m.name.clone())
-            .unwrap_or_else(|| module.name.clone());
-        (name, u.path.clone())
+            .map_or_else(|| module.name.clone(), |m| m.name.clone());
+        (resolve::readable(&name), u.path.clone())
     };
 
     let has_errors = diags.iter().any(|(_, d)| d.level == "error");
@@ -18361,10 +18469,10 @@ fn main() {
                 all_modules.len(),
                 all_modules
                     .iter()
-                    .map(|m| m.name.as_str())
+                    .map(|m| resolve::readable(&m.name))
                     .collect::<Vec<_>>(),
                 concept_map.len(),
-                concept_map.keys().collect::<Vec<_>>(),
+                concept_map.keys().map(|c| resolve::readable(c)).collect::<Vec<_>>(),
                 fuel_limit
             );
             for u in &units {
@@ -18375,7 +18483,7 @@ fn main() {
                     u.ast
                         .modules
                         .iter()
-                        .map(|m| format!("{:?} {}", m.kind, m.name))
+                        .map(|m| format!("{:?} {}", m.kind, resolve::readable(&m.name)))
                         .collect::<Vec<_>>()
                 );
             }
@@ -22888,7 +22996,10 @@ int main(void) {
                         .into_iter()
                         .map(std::path::PathBuf::from)
                         .collect();
-                if !gdl_files.is_empty() {
+                // A package's names are resolved against its manifest (`tests/packages.rs`).
+                let has_dependencies = manifest::resolve_manifest_project_dir(&p)
+                    .is_ok_and(|(m, _)| !m.dependencies.is_empty());
+                if !gdl_files.is_empty() && !has_dependencies {
                     projects.push(gdl_files);
                 }
             } else if p.extension().and_then(|ext| ext.to_str()) == Some("gdl") {

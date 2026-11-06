@@ -636,7 +636,7 @@ flowchart TD
 
 ### Phase E: Projects and Packages (the "Verified Universe")
 
-**Status:** Tasks E.0, E.1, E.2 & E.3 ✅ Completed (2026-11-06). All design questions are decided (decisions 1 to 11). E.4 onwards waits until a real second package exists.
+**Status:** Tasks E.0, E.1, E.2, E.3 & E.4 ✅ Completed (2026-11-06). All design questions are decided (decisions 1 to 11). `ghttp` is the real second package, used by `examples/hello_api`. E.5 is next.
 
 **Objective:** let a Gardel project depend on other Gardel packages without import statements, and without trusting anything that was not proven on this machine. Source stays declaration-only. A manifest, `Gardel.toml`, states what is in the universe. Modular reasoning stays Hoare's rule for a call: prove the callee's precondition, then use its postcondition.
 
@@ -746,7 +746,7 @@ flowchart TD
   - **A law's proof crossed the boundary.** `contract_only_module` kept law bodies, so a proof naming a module linked that module into every client, against decision 2, and E.3's interface hash would have depended on it. Law bodies are now withheld. Test `test_e2_a_law_proof_stays_out_of_the_interface`.
   - **The boundary could not name two packages.** `external_modules` was one set, so two dependencies saw each other's bodies, and a dependency saw the bodies of a project module: package B proved `Result = 5` from a routine of package A with no `ensure`, against decision 2. `VerifyOptions.packages` now maps each module to its package, and a module sees only the contracts of any other package. Tests `test_e2_only_contracts_cross_between_packages` and `test_e2_a_package_mate_of_a_dependency_stays_behind_the_boundary`.
   - `cargo test` 186/186, 9/9 and 4/4. `--stdlib --strict` 0/0 and the eleven examples 0/0.
-- **Known limits.** A `let` in a law's proof is not bound, and gives `E0199`. A program that states its own fixed point, such as `require LIST_OPS.filter(l, k) = l`, can still loop, and ends at the backstop as unproven. The boundary is reachable only from tests until E.4 sets `packages`, and a module is still identified by its bare name there.
+- **Known limits.** A `let` in a law's proof is not bound, and gives `E0199`. A program that states its own fixed point, such as `require LIST_OPS.filter(l, k) = l`, can still loop, and ends at the backstop as unproven. The boundary was reachable only from tests until E.4 set `packages`.
 
 #### Task E.3: Local Verification Cache [✅ Completed]
 - [x] Cache key and contents as in decision 1 (`gardelc/src/proof_cache.rs`, `verify_unless_cached`). Any change to a key input re-verifies.
@@ -770,19 +770,33 @@ flowchart TD
   - **A VC differed between runs of one source.** `type_bounds` was emitted in a map's order, which differs per process and reaches the solver as axiom order, so a verdict could change with it. It is sorted now. Test `test_e3_type_bounds_are_emitted_in_one_order`.
   - **A VC depended on what was emitted before it.** Lambda numbers ran on across emissions, so a run that hit the cache gave the next module other names, and it missed. Each emission and interface now numbers from zero (`with_fresh_boogie_numbering`), and four test workarounds are gone. Test `test_e3_a_vc_does_not_depend_on_earlier_emissions`.
 - `cargo test` 202/202, 9/9, 4/4 and 16/16. `--stdlib --strict` 0/0 and the eleven examples 0/0. Ten mutations of the defences above, each made on a private copy, all turn a test red.
-- **Known limits.** The prelude is still trusted, not verified on first use, until E.4 makes it a package. `--verify-deps` covers every module, as there are no dependencies yet. A tool is identified by its version string. Entries are never removed. Whoever can read this user's secret can forge an entry, but could equally replace `gardelc`. `--run` still starts its own Boogie, and `GARDEL_KEEP_BPL` bypasses the cache, as a hit writes no VC.
+- **Known limits.** E.4 changed the first two limits this task recorded: see its section on the prelude. A tool is identified by its version string. Entries are never removed. Whoever can read this user's secret can forge an entry, but could equally replace `gardelc`. `--run` still starts its own Boogie, and `GARDEL_KEEP_BPL` bypasses the cache, as a hit writes no VC.
 
-#### Task E.4: Path Dependencies and Package Identity [ ]
-- [ ] `[dependencies]` with `path`, setting `VerifyOptions.packages`. The universe is the prelude, the project and its direct dependencies (decision 5).
-- [ ] Identify modules by (package, name). Mangle Boogie and C symbols by the full package name, never the alias.
-- [ ] Make the prelude a package (decision 8). Move the names `gardelc` builds in from bare strings to identities.
-- [ ] Default aliases, `as`, and the manifest errors of decision 11. Refuse two packages of one name in a build.
-- [ ] Apply decisions 4, 7 and 8. `E0101` stays until E.5 can qualify a prelude name.
-- Acceptance: two packages that both define `PARSER` and `Leaf`, each used inside its own package, verify, link and run, and each keeps its own proofs. Renaming an alias changes no `.bpl` or `.c` symbol.
+#### Task E.4: Path Dependencies and Package Identity [✅ Completed]
+- [x] `[dependencies]` with `path`, setting `VerifyOptions.packages`. The universe is the prelude, the project and its direct dependencies (decision 5). `manifest::load_packages` reads every package, dependencies first, and a package reached twice is one package.
+- [x] Identify modules by (package, name). Mangle Boogie and C symbols by the full package name, never the alias (`gardelc/src/resolve.rs`).
+  - Finding 5 counted 231 uses of `m.name`. Passing a pair through all of them is not needed, as the compiler only requires one string per identity. A resolver runs straight after parsing and gives each module, concept and constructor of a dependency the internal name `PK<n>_<PACKAGE>_<NAME>`, as in `PK9_ACME_JSON_PARSER`. It keeps the shape every later pass relies on (`all_caps`, an upper first letter), and `::` in E.5 is one more input to the same pass.
+  - The length makes the name injective, as `a` + `B__C` and `a-b` + `C` otherwise give one string, and `.` and `-` map differently. A name can be read back, so diagnostics show `acme.json::PARSER` and a source lookup finds `PARSER`, with no table. `E0115: reserved_name` refuses a declaration of that form.
+  - The root project and the prelude keep bare names, so a project with no dependencies compiles to the same text. Checked: all eleven examples and `ghttp` give byte-identical `.bpl`, `.c` and `.bend` from the compilers before and after this task. A package verified as a root and as a dependency therefore has two VCs, and is proven once for each.
+- [x] Make the prelude a package (decision 8). It is `gardel.core` to the resolver. Moving the built-in names to identities needed no change to their strings: an internal `COMMAND` can only be the prelude's, because a dependency's own is `PK..._COMMAND`, and the root is refused by `E0101`. Test `a_dependency_cannot_interfere_with_the_built_in_names`, with a dependency declaring `Shutdown`, `Print` and `Stop`.
+  - **The prelude is not verified on first use**, which E.3 listed as a limit for this task. It ships inside `gardelc`, so a normal run takes it on the same trust as the verifier. Verifying it there would cost 15 s on every new cache. `--verify-deps` now proves the embedded source, under `--strict` settings, so CI trusts nothing.
+- [x] Default aliases, `as`, and the manifest errors of decision 11, each with its line. Refuse two packages of one name in a build, the root included, and a dependency cycle. A dependency must be the package it was declared as.
+- [x] Apply decisions 4, 7 and 8. `E0101` stays until E.5 can qualify a prelude name.
+  - Decision 4: a package's own names win, and a new dependency leaves a client's `.bpl` byte-identical. `E0105: ambiguous_module_reference` and `E0112` land here for a bare name with several providers, as a resolver must choose or refuse. E.5 adds the spelling that fixes them.
+  - Decision 7: `E0114: export_outside_package`. `{M}` is resolved in the package, so a `FRIEND` in another package is not the `FRIEND` of the list. A concept stays allowed, as in `{EQ}`. An entry point of a dependency is verified but is not a root and builds no binary, is `E0104` if used, and cannot make a name ambiguous. This applies to a project with a manifest.
+- [x] Acceptance: `two_packages_with_one_name_verify_link_and_run` runs the binary and checks each package's output. `each_package_keeps_its_own_proofs` makes a contract true of one `PARSER` only. `an_alias_reaches_no_symbol_and_no_proof`: a new alias leaves all ten `.bpl` and `.c` files byte-identical and proves nothing again.
+- **The real second package.** `examples/hello_api` is an HTTP service in its own project. It has its own route and handler on `ghttp`'s parser, router and server state, and sees them only as contracts. `a_service_on_ghttp_verifies_and_answers` verifies it under `--strict` and sends it a real request. Release build: 68 s cold, for 21 modules, and 5.6 s after changing the client, which re-proves that one module. The first run caught a bug in the example: an unbounded `cap` against `HTTP_ROUTER.empty`'s `require`, known only from the contract.
+- `cargo test` 205/205, 28/28, 4/4, 16/16 and 9/9. `--stdlib --strict` 0/0, and the eleven examples and `ghttp` 0/0. Twenty-eight mutations of the defences above, each made on a private copy, all turn a test red. Three first survived, and each showed a missing test: a root with no entry point, a span of a resolved name, and a test skipped to save time.
+- **Known limits.**
+  - Until E.5, a name two dependencies provide cannot be used bare at all. A dependency declaring a constructor such as `Error` takes that bare name from its clients' `RESULT` matches, as `E0112`. `ghttp` declares none that the prelude has.
+  - A dependency cannot reuse a prelude module name, as `E0101` covers every package.
+  - `--inspect` shows only the root's modules.
+  - A dependency's `.c`, `.bend` and `.bpl` are still written to `build/`, though only the root's binary is built.
+- **Limits met on the way, not from packages** (each reproduced with no manifest, and reported by the backstop): `let x: T = e` drops `T`, so `let s: STACK[U64] = STACK.empty` gives `E0199`, and a nullary routine of a sum type used as `Result.code` in its own module's `ensure` gives `E0199`.
 
 #### Task E.5: `PKG::MODULE` and `E0105` [ ]
 - [ ] Add the `::` token, and qualified names in expressions and types, including nested type arguments.
-- [ ] Add `E0105: ambiguous_module_reference`, listing the candidates and the qualified spellings. Allow qualification when it is not needed.
+- [ ] `E0105: ambiguous_module_reference` exists since E.4, listing the candidates. Add the qualified spellings to it. Allow qualification when it is not needed.
 - [ ] Qualified constructors in expressions and patterns (decision 9). Pass the resolved owner to the verifier and C, not the bare name.
 - [ ] Remove `E0101`, so a user module may reuse a prelude name (decision 8). Update spec §4.1, including its statement that there is no qualified constructor syntax.
 - [ ] The type tie-break of decision 9, for `match` scrutinees and directly returned results. This can land after the syntax, as until then such code gets `E0112`.
@@ -818,7 +832,7 @@ flowchart TD
 
 ## 6. Immediate Next Step
 
-**Phase E: Projects and Packages:** Tasks E.0, E.1, E.2 and E.3 are completed and all design questions are decided. The next step is Task E.4 (Path Dependencies and Package Identity), once a real second package exists.
+**Phase E: Projects and Packages:** Tasks E.0, E.1, E.2, E.3 and E.4 are completed and all design questions are decided. The next step is Task E.5 (`PKG::MODULE` and `E0105`).
 
 With **Phase A: Language Specification Harmonization**, **Phase B: Compiler Engine & Prelude Tooling**, **Task C.1: Physical Decomposition of `stdlib/`**, **Task C.2: High-Performance Smart String (`stdlib/text/string.gdl`)**, and **Task C.3: Regression Verification & Performance Benchmarking** completely executed and verified with 0 errors and 0 warnings under `--strict`, Phase C's planned work is done. The verification baseline is clean, and every module compiles from source to C with reference-counted memory (C.3 follow-ups).
 

@@ -1,0 +1,6 @@
+[project]
+name = "hello-api"
+version = "0.1.0"
+
+[dependencies]
+ghttp = { path = "../../ghttp" }

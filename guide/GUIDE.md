@@ -1672,11 +1672,40 @@ When a manifest is used:
   ```
 - **Package naming rules:** Lowercase ASCII letters, digits, `-`, and `.`. Each segment must start with `a`–`z` and cannot end with `-`. The name cannot start with `gardel.` and cannot produce the default alias `GARDEL` (which is reserved for the Standard Prelude).
 - **Strict TOML 1.0:** The parser enforces a clean, dependency-free subset with 1-based line numbers on syntax or schema errors.
-- **Zero semantic difference:** A manifest changes nothing about how source code behaves or verifies; it establishes project identity and boundaries for tooling and future dependency resolution. Projects without a `Gardel.toml` continue to compile using files and directory paths as usual.
+- **Zero semantic difference:** A manifest with no dependencies changes nothing about how source code behaves or verifies; it establishes project identity and boundaries. Projects without a `Gardel.toml` continue to compile using files and directory paths as usual.
+
+### Dependencies
+
+A package lists the packages it uses in `[dependencies]`, and then uses their modules by their bare names, with no import statement. `examples/hello_api` is an HTTP service built on the `ghttp` package:
+
+```toml
+[project]
+name = "hello-api"
+version = "0.1.0"
+
+[dependencies]
+ghttp = { path = "../../ghttp" }
+"acme.json" = { path = "../json", as = "J" }   # a dotted name is quoted, and `as` sets the alias
+```
+
+```bash
+gardelc examples/hello_api --strict
+```
+
+What you can rely on:
+
+- **Your own names win.** A module in your project is never replaced by one in a dependency, so a dependency adding a module cannot change what your code means. Inside a package, its own names win in the same way.
+- **Two packages can use one name.** Each package keeps its own `PARSER` and its own `Leaf`, with its own proofs. A build fails only if you use such a name bare and two of your dependencies provide it (`E0105` for a module, `E0112` for a constructor). The prelude counts as a provider too.
+- **Only what you list is in scope.** Your dependency's own dependencies give you no names, though their types can reach you through its routines.
+- **You see contracts, not bodies.** A proof in your code can rest only on a dependency's `ensure` clauses. A dependency's body can change inside its contract without re-proving your code.
+- **Nothing is taken on trust.** A dependency is verified from source on first use and cached. If it fails, your build fails. `--strict` refuses an `assume` in any package, and a plain run reports them.
+- **A dependency's `program` is not yours.** It is verified but not built, and you cannot refer to it.
+
+Diagnostics name a dependency's module by its full name, such as `ghttp::HTTP_PARSER`. Aliases have no effect on proofs or generated code. Until qualified names arrive, a name two dependencies provide cannot be used bare at all, and a dependency that declares a constructor such as `Error` takes that bare name away from its clients' `RESULT` matches.
 
 ### Name Resolution
 
-There are no import statements. Before anything is verified, `gardelc` resolves every name in the run against the project and the prelude, and reports each failure at its source location:
+There are no import statements. Before anything is verified, `gardelc` resolves every name in the run against the project, its direct dependencies and the prelude, and reports each failure at its source location:
 
 | Rule | Meaning |
 | :--- | :--- |
@@ -1686,8 +1715,11 @@ There are no import statements. Before anything is verified, `gardelc` resolves 
 | `E0109: unknown_constructor` | A constructor no module declares |
 | `E0110: unknown_variable` | A name that is not a parameter, local, field or routine |
 | `E0111: wrong_argument_count` | A call with the wrong number of arguments |
-| `E0112: ambiguous_constructor` | A constructor declared by two other modules. Constructors resolve by name alone, so rename one. A module's own constructor always wins. |
+| `E0105: ambiguous_module_reference` | A bare module, type or concept that two dependencies, or a dependency and the prelude, provide. The message lists them |
+| `E0112: ambiguous_constructor` | A constructor declared by two other modules, or provided by two dependencies. Constructors resolve by name alone, so rename one. A module's own constructor always wins. |
 | `E0113: hidden_member` | A member another module does not export: a private routine, a hidden field, or a constructor of a hidden representation, which can be neither built nor matched |
+| `E0114: export_outside_package` | An export list naming a module outside the package. `{EQ}`, naming a concept, stays allowed |
+| `E0115: reserved_name` | A declared name of the form `PK<n>_...`, which is how a dependency's names are held internally |
 | `E0199: verifier_translation_failed` | The verifier could not accept what `gardelc` generated. The module is not verified. This is a limit of the compiler, not a fault shown in your program, and `GARDEL_KEEP_BPL=1` keeps the generated file. |
 
 Exporting to a named module across files, as in `feature {OTHER}`, is not usable yet: the export list counts as a dependency, so it forms a cycle (`E0103`).
@@ -1784,7 +1816,7 @@ gardelc <file.gdl> --no-prelude
 # Without this flag, a run with no working Boogie or Z3 is an error.
 gardelc <file.gdl> --bounded-check
 
-# Run the solver on every module, ignoring the local verification cache (for CI)
+# Run the solver on every module and prove the prelude, ignoring the local verification cache (for CI)
 gardelc <file.gdl> --verify-deps
 
 # Compile, verify, and run immediately via the backend

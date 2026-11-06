@@ -13,7 +13,7 @@
 
 use super::*;
 
-const BUILTIN_TYPES: &[&str] = &[
+pub(crate) const BUILTIN_TYPES: &[&str] = &[
     "U64", "NAT", "I64", "INT", "F64", "BOOL", "CHAR", "UNIT", "EXIT_CODE", "MATH_INT", "LIST",
     "TUPLE", "IO",
 ];
@@ -231,6 +231,7 @@ impl<'a> Walker<'a, '_> {
 
     /// Where `name` is first used in the current routine, not in the file.
     fn span_of(&self, name: &str) -> Span {
+        let name = resolve::source_spelling(name);
         let lines: Vec<&str> = self.unit.src.lines().collect();
         let is_word = |c: char| c.is_ascii_alphanumeric() || c == '_';
         let header = lines.iter().position(|l| {
