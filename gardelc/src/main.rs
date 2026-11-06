@@ -14164,23 +14164,30 @@ fn verify_module_obligations(
 
     // 2. Formal Boogie / Z3 Verification
     if !bounded_check {
-        let (boogie_opt, z3_opt) = find_solvers();
-        if let (Some(boogie_path), Some(z3_path)) = (boogie_opt, z3_opt) {
-            match run_boogie_verification(m, fuel_limit, &boogie_path, &z3_path, src, input_path) {
-                Ok(boogie_diags) => {
-                    diags.extend(boogie_diags);
-                    return diags;
-                }
-                Err(err) => {
-                    eprintln!(
-                        "[WARN] Boogie verification failed to execute: {err}. Falling back to bounded concrete sampling."
-                    );
-                }
+        let verdict = match find_solvers() {
+            (Some(boogie), Some(z3)) => {
+                run_boogie_verification(m, fuel_limit, &boogie, &z3, src, input_path)
             }
+            (None, _) => Err("Boogie was not found".to_string()),
+            (_, None) => Err("Z3 was not found".to_string()),
+        };
+        match verdict {
+            Ok(boogie_diags) => diags.extend(boogie_diags),
+            Err(err) => diags.push(Diagnostic::basic(
+                "error",
+                "Phase 3 Boogie (Verification Incomplete)",
+                m.name.clone(),
+                "incomplete".to_string(),
+                format!(
+                    "`{}` could not be verified, so nothing is proven: {err}. `BOOGIE_EXE` and `Z3_EXE` name the tools. `--bounded-check` samples instead, and proves nothing",
+                    m.name
+                ),
+            )),
         }
+        return diags;
     }
 
-    // 3. Fallback: Concrete bounded sampling loop
+    // 3. Concrete bounded sampling, only when asked for. It never counts as a proof.
     for (r, has_current) in &all_routines {
         verify_routine_symbolic(r, *has_current, m, src, input_path, fuel_limit, &mut diags);
     }
@@ -18028,6 +18035,15 @@ fn main() {
     } = checked;
 
     if inspect_mode {
+        // An interface states what was proven, so a run with errors has none to show.
+        let errors: Vec<Diagnostic> = diags
+            .iter()
+            .filter(|(_, d)| d.level == "error")
+            .map(|(_, d)| d.clone())
+            .collect();
+        if !errors.is_empty() {
+            exit_with_fatal(&errors, json_mode, &first_path);
+        }
         let filter_mod = args
             .iter()
             .position(|a| a == "--inspect")

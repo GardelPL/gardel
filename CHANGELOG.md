@@ -27,6 +27,8 @@ Spec draft v0.5. [plan/Roadmap.md](plan/Roadmap.md) holds the detail for each ta
 ### Behaviour changes that can reject existing code
 - Bitwise operators on `I64` are refused (`bitwise_on_signed`), and `-x` on `U64` needs `x = 0`.
 - Unknown command-line flags are errors.
+- A run that cannot start Boogie or Z3 is an error. It used to fall back to sampling and could report success on a false contract. `--bounded-check` still samples, on request.
+- `--inspect` shows no interface when the run has errors, and exits with status 1.
 - New rules `E0106` to `E0113` report undefined names and hidden members before verification. `E0199` reports what the verifier cannot accept.
 
 ---

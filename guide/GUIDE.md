@@ -1778,7 +1778,8 @@ gardelc <file.gdl> --fuel <N>
 # Compile without the Standard Prelude (bootstrap mode)
 gardelc <file.gdl> --no-prelude
 
-# Bounded symbolic checking instead of the Boogie/Z3 proof
+# Bounded symbolic checking instead of the Boogie/Z3 proof. It samples, and proves nothing.
+# Without this flag, a run with no working Boogie or Z3 is an error.
 gardelc <file.gdl> --bounded-check
 
 # Compile, verify, and run immediately via the backend
