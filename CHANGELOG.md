@@ -9,6 +9,7 @@ All notable changes, theoretical soundess fixes, verification overhauls, front-e
 Spec draft v0.5. [plan/Roadmap.md](plan/Roadmap.md) holds the detail for each task.
 
 ### Language and runtime
+- **Contract compatibility check** (E.7). `gardelc --compare-with <old-dir>` reports what would break a client of an older version: a stronger `require`, a weaker `ensure`, removed or changed public items and concepts, a new `assume`, and a new or changed dependency. A change to a clause counts as compatible only if the solver proves it, and a new public name is a warning.
 - **Qualified names** (E.5). `ALIAS::NAME` in expressions, types and type arguments, with `GARDEL` for the prelude, and `MODULE.Leaf(1)`, `ALIAS::MODULE.Leaf(1)` and `case MODULE.Leaf(x)` for constructors. A type known for certain breaks a tie between constructors. A user module may reuse any prelude name, so `E0101` is gone.
 - **`let x: T = e` keeps `T`.** It was parsed and thrown away. It now settles a generic value, and a value known to have another type is `E0116`.
 - **Packages** (E.4). `[dependencies]` in `Gardel.toml` adds a package by `path`. Two packages may use one module or constructor name, each keeping its own proofs, and a client sees only a dependency's contracts. `examples/hello_api` is an HTTP service built on the `ghttp` package.

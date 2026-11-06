@@ -13,6 +13,7 @@ use std::rc::Rc;
 use proof_cache::ProofCache;
 
 mod c11_typed;
+mod compat;
 pub mod manifest;
 mod names;
 mod patterns;
@@ -13108,6 +13109,7 @@ fn which_solver(name: &str) -> Option<String> {
 /// proven. Hashing the executable instead would take seconds in a debug build.
 const VERIFIER_SOURCES: &[(&str, &str)] = &[
     ("c11_typed.rs", include_str!("c11_typed.rs")),
+    ("compat.rs", include_str!("compat.rs")),
     ("main.rs", include_str!("main.rs")),
     ("manifest.rs", include_str!("manifest.rs")),
     ("names.rs", include_str!("names.rs")),
@@ -17691,7 +17693,7 @@ fn looks_like_input(s: &str) -> bool {
 }
 
 /// Flags followed by a value.
-const VALUE_FLAGS: &[&str] = &["--fuel", "--z3-seed", "--z3-rlimit", "--project"];
+const VALUE_FLAGS: &[&str] = &["--fuel", "--z3-seed", "--z3-rlimit", "--project", "--compare-with"];
 /// Flags with no value, or with an optional one (`--inspect`, `--emit-stdlib`).
 const PLAIN_FLAGS: &[&str] = &[
     "--stdlib",
@@ -18036,6 +18038,9 @@ fn main() {
         eprintln!(
             "  --verify-deps  ignore the local verification cache and run the solver on every module"
         );
+        eprintln!(
+            "  --compare-with <DIR>  after verifying, report what would break a client of the older version in DIR"
+        );
         std::process::exit(1);
     }
 
@@ -18099,6 +18104,34 @@ fn main() {
             "gardelc",
             "invalid_arguments",
             "cannot combine --project with --stdlib".to_string(),
+            "",
+        );
+    }
+
+    let compare_with = match args.iter().position(|a| a == "--compare-with") {
+        None => None,
+        Some(i) => match args.get(i + 1).filter(|v| !v.starts_with("--")) {
+            Some(dir) => Some(dir.clone()),
+            None => exit_with_frontend_error(
+                json_mode,
+                "Command Line",
+                "gardelc",
+                "invalid_arguments",
+                "--compare-with: expected the directory of the older version".to_string(),
+                "",
+            ),
+        },
+    };
+    let refused = ["--stdlib", "--bounded-check", "--inspect", "--run"]
+        .into_iter()
+        .find(|f| compare_with.is_some() && args.iter().any(|a| a == f));
+    if let Some(flag) = refused {
+        exit_with_frontend_error(
+            json_mode,
+            "Command Line",
+            "gardelc",
+            "invalid_arguments",
+            format!("--compare-with cannot be combined with {flag}"),
             "",
         );
     }
@@ -18203,6 +18236,16 @@ fn main() {
             None
         };
 
+        if compare_with.is_some() && project_manifest_dir.is_none() {
+            exit_with_frontend_error(
+                json_mode,
+                "Command Line",
+                "gardelc",
+                "invalid_arguments",
+                "--compare-with compares two packages, so it needs a project with a Gardel.toml".to_string(),
+                "",
+            );
+        }
         if let Some(pdir) = project_manifest_dir {
             let packages = match resolve_package_inputs(std::path::Path::new(&pdir)) {
                 Ok(res) => res,
@@ -18448,11 +18491,49 @@ fn main() {
         exit_with_fatal(&checked.fatal, json_mode, &first_path);
     }
     let CheckedProject {
-        diags,
+        mut diags,
         concept_map,
         link,
         ..
     } = checked;
+
+    // The new version must hold before its interface means anything.
+    if let Some(old_dir) = compare_with.as_deref().filter(|_| !diags.iter().any(|(_, d)| d.level == "error")) {
+        let package = package_list.last().map_or("", |(m, _)| m.project.name.as_str());
+        let (boogie, z3) = find_solvers();
+        let dependencies: Vec<(String, String)> = package_list
+            .iter()
+            .take(package_list.len().saturating_sub(1))
+            .map(|(m, _)| (m.project.name.clone(), m.project.version.clone()))
+            .collect();
+        let run = compat::Run {
+            package,
+            dependencies: &dependencies,
+            z3_seed,
+            z3_rlimit,
+            units: &units,
+            root_units: units.len() - package_list.last().map_or(units.len(), |(_, count)| *count)..units.len(),
+            packages: &packages,
+            prelude_mode,
+            fuel: fuel_limit,
+            solvers: boogie.zip(z3),
+        };
+        let report = match compat::compare(std::path::Path::new(old_dir), &run) {
+            Ok(report) => report,
+            Err(e) => exit_with_frontend_error(json_mode, "IO", "file", "io_error", format!("--compare-with: {e}"), old_dir),
+        };
+        say(&format!(
+            "[compare] against `{old_dir}`: {} breaking, {} changed clauses still compatible, {} added",
+            report.breaking.len(),
+            report.proved,
+            report.added.len()
+        ));
+        for name in &report.added {
+            say(&format!("[compare] added: {name}"));
+        }
+        diags.extend(report.breaking);
+        diags.extend(report.warnings);
+    }
 
     if inspect_mode {
         // An interface states what was proven, so a run with errors or only samples has none

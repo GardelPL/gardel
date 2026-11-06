@@ -1703,6 +1703,31 @@ What you can rely on:
 
 Diagnostics name a dependency's module by its full name, such as `ghttp::HTTP_PARSER`. Aliases have no effect on proofs or generated code.
 
+### Checking a New Version
+
+Before releasing a package, compare it with the version your clients use:
+
+```bash
+git worktree add ../json-1.0 v1.0     # any directory holding the old version
+gardelc --compare-with ../json-1.0
+```
+
+The run builds and verifies the new version as usual, then exits 1 if a public item changed in a way that can break a client:
+
+- a stronger `require`, a weaker `ensure`, or a weaker `invariant`
+- a removed or less visible routine, law or module, or a changed signature
+- a changed public `representation`, even one new constructor, because it breaks a complete `match`
+- a concept the module no longer satisfies, or a renamed package
+- a removed or changed public `concept`, in either direction, as clients both supply and rely on it
+- a new `assume` anywhere in the build, even in a private routine, because `--strict` refuses it in every client
+- a new package among your dependencies, or a dependency at another version, because a build holds one package of a name
+
+A body change that adds no `assume` is not breaking, and neither is a new routine, a new law or a change to a hidden representation. Parameters are compared by position, so renaming one changes nothing.
+
+A new module, concept or public representation is a warning, even under `--strict`. If a client already uses that name bare from another package, it now gets `E0105` or `E0112`, and one qualifier fixes it.
+
+Clauses that differ go to the solver, and a change counts as compatible only if the solver proves it. It sees each routine as an unknown function and uses none of your contracts or laws, so a true implication that needs one of them is reported as breaking. Add `--strict` if the new version might rest on an `assume`, as an `ensure` that rests on one is taken as stated.
+
 ### Qualified Names
 
 Use the alias from your manifest, with `::`, when a bare name is ambiguous. `GARDEL` is the prelude's alias:
@@ -1860,6 +1885,9 @@ gardelc <file.gdl> --verify-deps
 
 # Compile, verify, and run immediately via the backend
 gardelc <file.gdl> --run
+
+# Report what would break a client of an older version of this package
+gardelc --compare-with <old-dir>
 ```
 
 `gardelc` remembers what this machine has proven, in `GARDEL_CACHE_DIR` or your user cache directory. A module whose verification condition has not changed is not given to the solver again, and the run says how many came from the cache. Changing `gardelc`, Boogie, Z3 or a limit verifies everything again. All other checks run every time, so `--strict` cannot be answered by an earlier run. The cache only saves time: deleting it is always safe.
