@@ -1,0 +1,294 @@
+# Phase F: Verified Libraries and Applications
+
+**Date:** November 6, 2026
+**Status:** Proposed. No task started, and the decisions below are still open.
+**Roadmap entry:** [Phase F in Roadmap.md](../Roadmap.md#phase-f-verified-libraries-and-applications)
+**Probed at:** commit `1349cb6`
+
+---
+
+## 1. Objective
+
+Phases A to E built a verifier, a reactive runtime and a package system. Phase F uses them to build real software, and lets that software decide what the core libraries need.
+
+The phase delivers, in this order:
+
+1. The unexplained test failure resolved, and the compiler gaps closed.
+2. Core text, number and map libraries, each written for a known client.
+3. `gjson`, a verified JSON package.
+4. A correct `ghttp` parser, and `grest`, a small REST library with sync handlers.
+5. Outgoing connections, an HTTP client and async handlers.
+6. A terminal library, `gtui`, and a tool built on it.
+
+**Rule for the phase:** nothing goes into a library without a client in this plan that needs it. A proof that no client uses has not been tested, because contracts only get tested when someone has to prove something with them.
+
+**Not in this phase:** TLS, HTTP/2, WebSockets, chunked transfer encoding, printing `F64` as text, databases, handling events in parallel, full liveness proofs (Phase D excluded these, and decision 8 keeps them out), and terminal display width tables (`gtui` counts one cell per code point).
+
+---
+
+## 2. Findings from probing the plan against `gardelc`
+
+Small programs shaped like the plan were run through the compiler and the built `hello_api`.
+
+| # | Finding | Effect on the plan |
+| :--- | :--- | :--- |
+| 1 | **`ghttp` does not parse a request split across TCP reads.** `HTTP_PARSER_STATE` keeps a byte count and no bytes. `feed` then returns a hard-coded `HTTP_REQUEST.make_simple(Get, "/")`. Over a real socket, `GET /he` + `llo HTTP/1.1...` was answered by `GET /`, and a split `GET /nope` got `200 OK` where a whole one gets `404`. | A real correctness bug in a package the Roadmap calls complete. The parser contracts only say the result is one of three outcomes, so nothing ties it to the bytes received. Task F.5. |
+| 2 | **Headers and bodies are not parsed.** A request is complete when the last byte of a chunk is `\n`. `POST` with `Content-Length: 2` and body `hi` does not end in `\n`, so the server waited and the client timed out. `make_from_wire` keeps only the method and target. | A REST API cannot accept a body today, so `ghttp` is further from REST than it looked. Task F.5. |
+| 3 | **Nested recursion through `LIST[SELF]` cannot be proven.** A type with `| A(items: LIST[J])` declares and builds. A measure over it fails: `variant Current` with a helper's `variant xs.length` gives `variant_decrease` errors in both routines. `variant xs` on a list is `E0199` (`Seq J1 and int` to `<`). | `LIST[JSON]` cannot be used for JSON values today. Decision 1, Task F.1. |
+| 4 | **A flat cell form works.** `Item(value: J, rest: J)` and `Field(key: STRING, value: J, rest: J)` with `variant Current` verify. A `lookup` by key verifies 0/0. `depth + 1` fails only on a real overflow check. | The JSON type needs no compiler change. A bounded depth is required anyway, which also protects the parser. Task F.4. |
+| 5 | **A method from a concept bound does not translate.** In `module SORTED[K: ORD]`, `a.less_than(b)` is `E0199` (undeclared function). A map with no comparison verifies; a sorted one cannot be written. | A generic ordered `MAP` is blocked. Task F.1. |
+| 6 | **`.equals` on a match binder does not translate.** `key.equals(k)` inside `case Field(key, ...)` in a recursive routine is `E0199` (`fn_equals`). The same call through a helper with typed parameters verifies. | Probably the same root as finding 5: a receiver with no known type. Task F.1. |
+| 7 | **`KV_MAP[STRING, NAT]` was accepted with `K: ORD`,** though `STRING` satisfies only `EQ`. That map never compares keys, so this does not yet show a false proof. | Check that bounds are enforced where a type is used. Task F.1. `STRING` also needs `ORD` to be a map key, Task F.2. |
+| 8 | **A record with a function field verifies but does not build.** The C backend stops with `equality on function type`. A closure passed as a parameter works, which is what `hello_api` does. | A route cannot hold its handler today, so `ghttp` uses numeric ids. Task F.1. |
+| 9 | **`BYTES` has no concat, slice or search,** only `at`, `length`, `to_list` and `equals`. `STRING` has no find, split, trim or slice. Nothing in the stdlib turns a number into text or back. | Task F.2 is required by every later task. |
+| 10 | **These core proofs work today.** A `find` over `character_at` with an exact postcondition verified 0/0. Digits least significant first, with `value_of(digits(n)) = n`, verified 0/0. | Tasks F.2 and F.4 are feasible, and the order of digits is settled: most significant first needs an extra lemma. |
+| 11 | **`Print` always adds a newline** (`gardel_io_print_line`). The host does not turn on VT mode on Windows, and has no terminal size. `KEY` has no Home, End, Page keys, Delete or Ctrl chords. | `gtui` cannot draw a screen yet. Task F.9. |
+| 12 | **The host has no outgoing connection, file or process command.** `COMMAND` has `Print`, `SetTimer`, `ReadLine`, `ReadKey`, `Listen`, `Send` and `Close`. Timers cannot be cancelled. | Tasks F.7 and F.11. Each new command also needs the scripted source and the event log (D.8). |
+
+Each finding except 7 is a behaviour seen in a run. The causes given for 5 and 6 are not yet confirmed, and F.1 confirms them.
+
+---
+
+## 3. Task graph
+
+```mermaid
+flowchart TD
+    F0["F.0 Resolve the failing E.3 test"]
+    F1["F.1 Compiler gaps"]
+    F2["F.2 BYTES, STRING and number text"]
+    F3["F.3 MAP"]
+    F4["F.4 gjson"]
+    F5["F.5 ghttp parser"]
+    F6["F.6 grest: sync REST"]
+    F7["F.7 Connect and correlation ids"]
+    F8["F.8 HTTP client and async handlers"]
+    F9["F.9 Terminal host"]
+    F10["F.10 gtui"]
+    F11["F.11 Files, processes and the tool"]
+    F0 --> F1 --> F2
+    F1 --> F3
+    F2 --> F3
+    F2 --> F4
+    F2 --> F5
+    F3 --> F4
+    F3 --> F6
+    F4 --> F6
+    F5 --> F6
+    F6 --> F7 --> F8
+    F2 --> F9 --> F10 --> F11
+    F8 --> F11
+```
+
+`F.5` could ship before `gjson`, as it depends only on F.2. It is the one correctness bug in published code, so do it as soon as F.2 allows.
+
+| Task | Size | Delivers | Main risk |
+| :--- | :--- | :--- | :--- |
+| F.0 | S | A known cause, or a test that says what failed | May not reproduce |
+| F.1 | M | Generic bounds, match binders, function fields in C | Touches the verifier core |
+| F.2 | M | Text and bytes operations, number text | Proof effort on slices |
+| F.3 | M | `MAP[K, V]` | Sorted-order proofs |
+| F.4 | L | `gjson` | The round-trip proof |
+| F.5 | L | A parser that means what the bytes say | Proof over a buffer; a breaking change |
+| F.6 | M | `grest` | Fitting a library around a `reactive program` |
+| F.7 | M | `Connect`, tags | Non-blocking connect on two platforms |
+| F.8 | L | `HTTP_CLIENT`, async handlers | The design of a waiting handler |
+| F.9 | M | Raw output, size, more keys | Console differences on Windows |
+| F.10 | L | Screen, layout, widgets | Redraw performance |
+| F.11 | L | Files, processes, the tool | Keeping replay exact |
+
+---
+
+## 4. Decisions to take
+
+These are proposals. As with E.7, take them one at a time. Each task lists the decisions it needs before starting.
+
+1. **Shape of a JSON value.** Proposed: flat cells behind an opaque module, so clients use `items`, `field` and builders. No compiler change, and the cells stay hidden if nested recursion is added later. The alternative is teaching the termination check to measure through `LIST`, which helps every tree-of-lists type but is a change to the verifier core.
+2. **JSON numbers.** Proposed: `JInt(I64)` for integers, and `JNumber(text: STRING)` holding any other valid literal unchanged. The round trip then holds exactly, and no `F64` printing is needed.
+3. **Order of `STRING`.** Proposed: byte order of the UTF-8 form, which equals code point order. It is a map key order, not a locale collation.
+4. **`MAP` representation.** Proposed: a sorted list, with the laws stated on the abstract model, so a balanced tree can replace it with no contract change. Replace it only if a benchmark calls for it.
+5. **Where REST lives.** Proposed: a new package, `grest`, on `ghttp` and `gjson`. `ghttp` stays usable without JSON, and it tests a package with two dependencies.
+6. **Handlers in routes.** Proposed: a route stores its handler as a function, replacing numeric ids, once F.1 allows it.
+7. **What an async handler returns.** Proposed: a sum type, `Reply(response)` or `Await(state, commands)`. A sync handler is a pure function wrapped in `Reply`. A waiting request lives in a bounded table in the server state, keyed by tag. Hidden continuations are rejected: state must stay visible to the verifier.
+8. **What "every request gets an answer" means.** Proposed: a safety property, not liveness. Every entry in the waiting table has an armed timeout, and proven invariants say each entry leaves the table on its answer or its timeout. The proof assumes the host delivers the timer. This narrows what was first suggested, because Phase D has no liveness proofs.
+9. **Addresses for `Connect`.** Proposed: IPv4 literals and `localhost` first. Name lookup blocks, so it would need a helper thread (Phase D decision 5). Add it when a program needs it.
+10. **What the tool is.** Proposed: a verification browser. It runs `gardelc --json-diagnostics` on a project, lists failed obligations, and shows each one in its source. It suits the project and it needs files, a process, a list view and a text view, so it tests all of `gtui`.
+11. **Reach of file and process commands.** Proposed: a process takes a program and an argument list, never a shell string, and its output arrives as events. A replay reads every result from the log and runs nothing.
+
+---
+
+## 5. Work breakdown
+
+Every task follows the rules of Phase E:
+
+- `--stdlib --strict` stays 0/0, and every example and package stays 0/0 under `--strict`.
+- New rules get tests, and mutations of those rules on a private copy must each turn a test red.
+- `--compare-with` is run on every package change. A breaking change bumps `version`. This is E.7's first real use.
+- A new `COMMAND` or `EVENT` is added only with its host code, its scripted form and its log form, as a closed type must never promise what the host cannot do (Phase D decision 3).
+- The spec, `guide/GUIDE.md`, `CHANGELOG.md` and the Roadmap change with the code.
+
+### Step 1: Foundations
+
+#### Task F.0: Resolve the Failing E.3 Test
+
+`test_e3_a_forged_entry_cannot_prove_a_false_contract` failed once in six full runs, at `gardelc/src/main.rs:23523`, because `tool_versions` returned `None`. That can mean a spawn failure, a 30 second timeout, empty output or a failed exit status, and the code cannot tell them apart.
+
+- [ ] Make `tool_versions` say which tool failed and why.
+- [ ] Run the suite repeatedly under load until it fails, or until enough clean runs are recorded.
+- [ ] Fix the cause. If it only happens under load, cache the versions for one process or raise the limit, and record the measurement.
+- Acceptance: the cause is named in the Roadmap and its known-limit line is removed. If it does not reproduce, the line stays, and a future failure names the tool and reason.
+
+#### Task F.1: Compiler Gaps
+
+Needs decision 1 only if the nested recursion option is chosen.
+
+- [ ] Confirm the root cause of findings 5 and 6, then make a method from a concept bound translate, using the instance chosen at each call. Add a false-contract test: a lie about `less_than` must not verify through a bound.
+- [ ] A bound must be checked at each use. `KV_MAP[STRING, NAT]` with `K: ORD` must be an error while `STRING` is not `ORD`.
+- [ ] Make `.equals` work on a match binder.
+- [ ] Let the C backend build a record with a function field. Such a record has no equality, and `=` on one stays an error.
+- [ ] `variant` on a value with no measure must be a clear error, not `E0199`.
+- Acceptance: the probes of findings 3, 5, 6 and 8 give the right result, each with a test. All output for existing examples stays byte-identical, or the difference is explained.
+
+### Step 2: Core Libraries
+
+#### Task F.2: `BYTES`, `STRING` and Number Text
+
+Client: everything after this task. Needs decision 3.
+
+- [ ] `BYTES`: `concat`, `slice`, `index_of` (a byte or a sequence), `starts_with`, and a builder that does not copy on each append.
+- [ ] `STRING`: `find`, `slice`, `split`, `trim`, `starts_with`, `ends_with`, `satisfies ORD`.
+- [ ] Number text: `NAT` and `I64` to and from decimal, plus hex for `\uXXXX`. State `parse(to_text(n)) = Some(n)`, built on least-significant-first digits (finding 10). Overflow is an `Error`, never a wrap.
+- [ ] Contracts state results on the `chars` or byte model, as with `character_at`.
+- [ ] Measure `concat` and `at` on 64 KB input. Parsers call these per byte, so a linear `at` would make them quadratic.
+- Acceptance: the round trip proven, `--compare-with` shows only additions, and the benchmark recorded.
+
+#### Task F.3: `MAP[K, V]`
+
+Client: `gjson` objects and the waiting table of F.8. Needs decision 4.
+
+- [ ] `module MAP[K: ORD, V]`, with `empty`, `get`, `put`, `remove`, `size`, `keys` and `fold`.
+- [ ] Laws on the abstract model: `get` after `put` of the same key, `get` after `put` of another key, `get` after `remove`, keys sorted and unique.
+- [ ] Runs in C with `STRING` keys, with no leaks in the C.3 leak tests.
+- Acceptance: the laws proven and usable by a client with no body visible. A client test proves a fact through them.
+
+### Step 3: `gjson`
+
+#### Task F.4: The `gjson` Package
+
+Client: `grest`. Needs decisions 1 and 2. A new package at `gjson/`, like `ghttp/`.
+
+- [ ] `JSON` value type, opaque, with builders and queries. Object keys are unique, by the type's invariant.
+- [ ] Serializer to `BYTES` per RFC 8259: escapes, and a canonical key order.
+- [ ] Parser over `BYTES`, total, returning `RESULT[JSON_ERROR, JSON]`. An error carries a byte offset. Input size and nesting depth have proven limits.
+- [ ] Prove `parse(serialize(v))` gives `v` back, in stages: scalars, strings with escapes, arrays and objects. If the last stage does not close, record how far it got, and cover the rest with tests rather than an `assume`.
+- [ ] Test against a table of valid and invalid documents, including deep nesting, bad UTF-8, lone surrogates and duplicate keys.
+- Acceptance: `gjson --strict` 0/0 with no `assume`. Every malformed input gives an `Error`, never a crash, and the round trip is proven at least for scalars and strings, with the final reach recorded.
+
+### Step 4: REST
+
+#### Task F.5: A Parser That Means What the Bytes Say
+
+Client: `grest`. Fixes findings 1 and 2.
+
+- [ ] `HTTP_PARSER_STATE` keeps the bytes it has received, within its limits.
+- [ ] Parse the request line, headers and a `Content-Length` body. A request is complete when its framing says so, not when a chunk ends in `\n`.
+- [ ] Reject what the limits do not allow: conflicting `Content-Length`, a body with a safe method (the current invariant), oversized parts. Chunked encoding is answered `501`.
+- [ ] Return extra bytes as the remainder, for a pipelined request.
+- [ ] Remove the hard-coded `GET /`, and change the test that accepted it.
+- [ ] State the meaning: `Complete(req, rest)` holds a request whose fields match the bytes consumed. Prove that serializing a request and parsing it gives the same request.
+- [ ] Test every request in the suite split at every byte offset, against the unsplit result.
+- [ ] `HELLO_API` over real sockets repeats finding 1's probe and now gets the right answers.
+- Acceptance: all splits agree, a `POST` body arrives, and `--compare-with` reports the breaking change, with `ghttp` moved to a new version.
+
+#### Task F.6: `grest`, Sync REST
+
+Client: `examples/hello_api`, moved to `grest`. Needs decisions 5 and 6.
+
+- [ ] Path patterns such as `/users/:id`, and query parsing with percent decoding. A proven limit on segments.
+- [ ] A route holds its handler. A handler is a pure function from a typed request to a response.
+- [ ] `REST_REQUEST` gives `param`, `query`, `header` and `json_body`, and `REST_RESPONSE` gives `json`, `text` and status helpers.
+- [ ] A bad or missing body is a `400` with a JSON error, by default.
+- [ ] `REST_SERVER` holds the connection loop now written by hand in `hello_api`: `init` and `step` are one line each in a client.
+- [ ] Proven server safety, carried over from `ghttp`: connection limit, one answer per request, and a `Close` after an error.
+- [ ] `examples/todo_api`: create, read, update and delete over JSON, with a proven invariant on its state.
+- Acceptance: `hello_api` is little more than routes and handlers, and `todo_api` passes an end-to-end test over real sockets under `--strict`.
+
+### Step 5: Async
+
+#### Task F.7: `Connect` and Correlation Ids
+
+Needs decision 9.
+
+- [ ] `Connect(tag: NAT, host: STRING, port: NAT)`, with `Connected(tag, conn)` and `ConnectFailed(tag, err)`.
+- [ ] Non-blocking connect on the shared `poll` / `WSAPoll` loop, behind the event source interface.
+- [ ] `CancelTimer(id)`: an async program must be able to clear a timeout it no longer needs, or a stale `Tick` could hit a reused id.
+- [ ] Scripted and log forms, and replay through a connect.
+- [ ] Check prelude name clashes with existing users, as Phase D did for `EVENT` and `KEY`.
+- Acceptance: over real TCP, a refused, timed out and successful connect each give the right event. A replay reproduces the commands exactly.
+
+#### Task F.8: HTTP Client and Async Handlers
+
+Needs decisions 7 and 8.
+
+- [ ] `HTTP_CLIENT`: serialize a request and parse a response incrementally, reusing F.5's framing.
+- [ ] Handlers return `Reply` or `Await`, with a tag and a timeout. A pure handler stays usable unchanged.
+- [ ] A bounded waiting table in `MAP`. A full table is a `503`, never unbounded growth.
+- [ ] Prove: each waiting entry has a timeout armed, the table stays within its limit, a closed client connection frees its entry, and a late answer is dropped.
+- [ ] `examples/api_gateway`: a route that calls another service and returns its data, with one test for a slow upstream and one for a dead one.
+- Acceptance: the gateway serves other requests while one waits, and a test shows it. Removing the timeout from a waiting entry is rejected by the verifier.
+
+### Step 6: TUI
+
+#### Task F.9: Terminal Host
+
+- [ ] `Write(text)`, with no newline, and a flush at the end of a step.
+- [ ] VT mode on Windows, restored on exit, like raw mode today.
+- [ ] `TerminalSize`, answered by `Resized(width, height)`, which also arrives on a resize.
+- [ ] `KEY` gains Home, End, PageUp, PageDown, Delete and Ctrl chords.
+- [ ] Scripted and log forms.
+- Acceptance: the same scripted run gives the same bytes on both platforms, and the terminal is restored after a Ctrl-C.
+
+#### Task F.10: The `gtui` Package
+
+Client: the tool in F.11.
+
+- [ ] `SCREEN`: a grid of cells, and a diff of two screens to the fewest writes. Prove every write stays within the grid.
+- [ ] Layout: rows, columns and fixed or flexible sizes. Prove that children stay inside their parent and do not overlap.
+- [ ] Widgets: text view, list with selection, status bar and input line. Each one is a pure function of its state.
+- [ ] Elm-style loop: `update(state, event)` and `view(state)`, wrapped in a `reactive program`.
+- [ ] `examples/todo_tui`.
+- Acceptance: the layout proofs hold, and no output is written outside the screen in a scripted run. A full redraw of a 200 by 60 screen fits inside one 16 ms frame, measured.
+
+#### Task F.11: Files, Processes and the Tool
+
+Needs decisions 10 and 11.
+
+- [ ] `ReadFile(tag, path)` and `FileRead(tag, RESULT[IO_ERROR, BYTES])`, on a helper thread.
+- [ ] `RunProcess(tag, program, args)`, with output events and an exit event, on a helper thread.
+- [ ] Scripted and log forms, so a replay runs nothing.
+- [ ] Parse `--json-diagnostics` with `gjson`.
+- [ ] The tool, a reactive program using `gtui`, `gjson`, files and a process.
+- Acceptance: the tool, written in Gardel, verifies under `--strict` and browses the failures of a broken project. A replay of a session reproduces its screen with no process run.
+
+---
+
+## 6. Milestones
+
+| Milestone | After | Shows |
+| :--- | :--- | :--- |
+| **Libraries a client can prove with** | F.3 | `STRING`, numbers and `MAP` used through their contracts alone |
+| **JSON** | F.4 | A package proven against its own format |
+| **A real REST service** | F.6 | `todo_api` over real sockets, with split requests and bodies |
+| **Services that call services** | F.8 | Concurrent waiting with proven limits and no thread per request |
+| **A tool written in Gardel** | F.11 | The language used to work on itself |
+
+Each milestone can ship alone, so the phase can stop at any of them with something finished.
+
+---
+
+## 7. Main risks
+
+- **The JSON round trip may not close.** It is the most ambitious proof here, so F.4 proves it in stages, and it falls back to tests, stated as such, rather than an `assume`.
+- **Per-byte access may be too slow.** If `BYTES.at` is linear, F.2's measurement will show it before the parsers rest on it.
+- **`ghttp` clients break.** F.5 changes contracts. The only client today is `hello_api`, which makes this the cheapest time to do it.
+- **Prelude growth.** Each new command adds names that can clash with user code, which is why F.7 and F.9 check for clashes.
+- **Scope.** F.9 to F.11 are a second project. The milestones exist so that REST can finish first.

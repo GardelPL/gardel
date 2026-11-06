@@ -13,6 +13,7 @@
 - [step2_result_and_composable_option.md](step2_result_and_composable_option.md)
 - [step3_verified_functional_core.md](step3_verified_functional_core.md)
 - [step4_algebraic_law_catalogue_and_concept_conformance.md](step4_algebraic_law_catalogue_and_concept_conformance.md)
+- [libraries/verified_libraries.md](libraries/verified_libraries.md)
 **Primary Artifacts Targeted:**
 - `../spec/gardel_language_specification_draft_v0_5.md`
 - `../gardelc/src/main.rs`
@@ -96,6 +97,8 @@ flowchart TD
     end
 
     PhaseA --> PhaseB --> PhaseC --> PhaseD
+    PhaseD --> PhaseE["Phase E: Projects and Packages"]
+    PhaseE --> PhaseF["Phase F: Verified Libraries and Applications"]
 ```
 
 ---
@@ -836,6 +839,39 @@ flowchart TD
 
 ---
 
+### Phase F: Verified Libraries and Applications
+
+**Status:** Proposed (2026-11-06). No task started, and decisions 1 to 11 of the plan are open.
+
+**Objective:** build real software on Phases A to E, and let it decide what the core libraries need: text, number and map libraries, a verified JSON package, a REST library with sync and then async handlers, and a terminal library with a tool built on it. Nothing goes into a library without a client in this plan that needs it.
+
+**The detailed plan is [libraries/verified_libraries.md](libraries/verified_libraries.md):** findings, task graph, decisions, and each task's steps and acceptance criteria.
+
+**Not in this phase:** TLS, HTTP/2, WebSockets, chunked transfer encoding, printing `F64` as text, databases, handling events in parallel, and full liveness proofs.
+
+**What probing found (commit `1349cb6`):**
+
+- **`ghttp` is wrong on a split request.** Its parser keeps a count and no bytes, so a request split across TCP reads is answered as `GET /`, and a split `GET /nope` gets `200 OK`. Headers and bodies are not parsed, so a `POST` with a body hangs. Task F.5 fixes this, and until then Phase E's "`ghttp` is the real second package" holds for its use as a package, not for its HTTP behaviour.
+- **The compiler needs work first.** A method from a concept bound does not translate, so a sorted generic `MAP` cannot be written. Nested recursion through `LIST[SELF]` cannot be proven, though a flat cell form can. A record with a function field does not build in C. Task F.1.
+- **The core proofs look feasible.** A string `find` with an exact postcondition and a digit round trip both verify today.
+
+| Step | Task | Delivers |
+| :--- | :--- | :--- |
+| 1. Foundations | [F.0](libraries/verified_libraries.md#task-f0-resolve-the-failing-e3-test) | The failing E.3 test resolved |
+| | [F.1](libraries/verified_libraries.md#task-f1-compiler-gaps) | Generic bounds, match binders, function fields in C |
+| 2. Core libraries | [F.2](libraries/verified_libraries.md#task-f2-bytes-string-and-number-text) | `BYTES`, `STRING` and number text |
+| | [F.3](libraries/verified_libraries.md#task-f3-mapk-v) | `MAP[K, V]` |
+| 3. JSON | [F.4](libraries/verified_libraries.md#task-f4-the-gjson-package) | The `gjson` package |
+| 4. REST | [F.5](libraries/verified_libraries.md#task-f5-a-parser-that-means-what-the-bytes-say) | A correct `ghttp` parser |
+| | [F.6](libraries/verified_libraries.md#task-f6-grest-sync-rest) | `grest`, sync handlers, `todo_api` |
+| 5. Async | [F.7](libraries/verified_libraries.md#task-f7-connect-and-correlation-ids) | `Connect`, correlation ids, `CancelTimer` |
+| | [F.8](libraries/verified_libraries.md#task-f8-http-client-and-async-handlers) | HTTP client, async handlers, `api_gateway` |
+| 6. TUI | [F.9](libraries/verified_libraries.md#task-f9-terminal-host) | Terminal host commands |
+| | [F.10](libraries/verified_libraries.md#task-f10-the-gtui-package) | The `gtui` package |
+| | [F.11](libraries/verified_libraries.md#task-f11-files-processes-and-the-tool) | Files, processes, and a tool written in Gardel |
+
+---
+
 ## 5. Verification & Acceptance Criteria
 
 | Phase | Milestone | Acceptance Criteria |
@@ -850,10 +886,16 @@ flowchart TD
 | **D** | **Determinism** | Replaying a recorded event log reproduces the run's commands exactly. |
 | **E** | **Nothing Unproven Is Trusted** | A false `.gds` or cache entry cannot make a client verify, `--strict` covers dependencies, and a changed verifier re-verifies them. |
 | **E** | **Two Libraries, One Name** | Two packages defining the same module and constructor names build and run together, with `E0105` on bare use across them. |
+| **F** | **Libraries a Client Can Prove With** | `STRING`, number text and `MAP` are used by a client through their contracts alone, with `--stdlib --strict` at 0/0. |
+| **F** | **A Real REST Service** | `examples/todo_api` verifies under `--strict`. Over real sockets it gives the same answer for a request split at every byte offset, and accepts JSON bodies. `gjson` has no `assume`. |
+| **F** | **Services That Call Services** | `examples/api_gateway` serves other requests while one waits. Removing a waiting entry's timeout is rejected by the verifier. |
+| **F** | **A Tool Written in Gardel** | A tool built on `gtui` verifies under `--strict`, browses a project's failed proofs, and replays a session with no process run. |
 
 ---
 
 ## 6. Immediate Next Step
+
+**Phase F: Verified Libraries and Applications** is next. Take the open decisions in [libraries/verified_libraries.md](libraries/verified_libraries.md) one at a time, starting with those Task F.0 and Task F.1 need, then start Task F.0.
 
 **Phase E: Projects and Packages:** Tasks E.0 to E.5 and E.7 are completed, so Phase E is complete. Fetching dependencies and a lockfile were dropped, as a path dependency on a git submodule already pins a commit.
 
