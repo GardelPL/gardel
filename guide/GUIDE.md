@@ -1630,7 +1630,7 @@ Every program automatically sees the **Standard Prelude**:
 | Functions | `FUNCTION_OPS` |
 | Reactive programs | `STEP[S]`, `COMMAND`, `EVENT`, `KEY`, `CONN_ID` |
 
-The prelude is verified once, on its own (`gardelc --stdlib`). In user programs its contracts and laws are trusted facts, and calls into it must still establish its preconditions. Declaring a top-level name that the prelude already uses is an error (`E0101: duplicate_prelude_symbol`). Pass `--no-prelude` only to build a prelude-free program on purpose.
+The prelude is verified once, on its own (`gardelc --stdlib`). In user programs its contracts and laws are trusted facts, and calls into it must still establish its preconditions. You may declare a name the prelude already uses: the bare name then means yours, and `GARDEL::NAME` means the prelude's. Pass `--no-prelude` only to build a prelude-free program on purpose.
 
 ### Multi-File Projects
 
@@ -1701,7 +1701,45 @@ What you can rely on:
 - **Nothing is taken on trust.** A dependency is verified from source on first use and cached. If it fails, your build fails. `--strict` refuses an `assume` in any package, and a plain run reports them.
 - **A dependency's `program` is not yours.** It is verified but not built, and you cannot refer to it.
 
-Diagnostics name a dependency's module by its full name, such as `ghttp::HTTP_PARSER`. Aliases have no effect on proofs or generated code. Until qualified names arrive, a name two dependencies provide cannot be used bare at all, and a dependency that declares a constructor such as `Error` takes that bare name away from its clients' `RESULT` matches.
+Diagnostics name a dependency's module by its full name, such as `ghttp::HTTP_PARSER`. Aliases have no effect on proofs or generated code.
+
+### Qualified Names
+
+Use the alias from your manifest, with `::`, when a bare name is ambiguous. `GARDEL` is the prelude's alias:
+
+```
+first_size(p: JSON::PARSER, q: LIST[XML::PARSER]): U64
+  do
+    p.size
+  end
+
+theirs: GARDEL::COMMAND
+  do
+    GARDEL::COMMAND.ReadLine
+  end
+```
+
+A constructor can be named through its module, which also separates two modules of one project:
+
+```
+let a = TOK_A.Leaf(1)
+let b = JSON::TOK.Leaf(2)
+
+match r
+  case RESULT.Error(e) then e
+  case Ok(v) then v
+end
+```
+
+A bare constructor means the module's own first, then one from its project, and only then one from the prelude or a dependency. If that still leaves several, the type of a `match` scrutinee, or the declared result of a routine that returns the constructor directly, chooses. So a dependency that declares `Error` does not disturb your `RESULT` matches. Anywhere else the compiler stops with `E0112` and shows the spellings. The type only breaks a tie: a module with its own `Stop` writes `STEP.Stop(0, cmds)` for the prelude's.
+
+A qualifier never opens anything. A hidden member stays hidden however it is spelled.
+
+A `let` can state its type, which is checked. This also settles a generic value that nothing else pins down:
+
+```
+let s: STACK[U64] = STACK.empty
+```
 
 ### Name Resolution
 
@@ -1715,11 +1753,12 @@ There are no import statements. Before anything is verified, `gardelc` resolves 
 | `E0109: unknown_constructor` | A constructor no module declares |
 | `E0110: unknown_variable` | A name that is not a parameter, local, field or routine |
 | `E0111: wrong_argument_count` | A call with the wrong number of arguments |
-| `E0105: ambiguous_module_reference` | A bare module, type or concept that two dependencies, or a dependency and the prelude, provide. The message lists them |
-| `E0112: ambiguous_constructor` | A constructor declared by two other modules, or provided by two dependencies. Constructors resolve by name alone, so rename one. A module's own constructor always wins. |
+| `E0105: ambiguous_module_reference` | A bare module, type or concept that two dependencies, or a dependency and the prelude, provide. The message gives the qualified spellings |
+| `E0112: ambiguous_constructor` | A constructor declared by two other modules, or provided by two dependencies, with no known type to choose. The message gives the qualified spellings. A module's own constructor always wins. |
 | `E0113: hidden_member` | A member another module does not export: a private routine, a hidden field, or a constructor of a hidden representation, which can be neither built nor matched |
 | `E0114: export_outside_package` | An export list naming a module outside the package. `{EQ}`, naming a concept, stays allowed |
 | `E0115: reserved_name` | A declared name of the form `PK<n>_...`, which is how a dependency's names are held internally |
+| `E0116: let_type_mismatch` | A `let x: T = e` whose value is known to have another type, or an integer literal that does not fit `T` |
 | `E0199: verifier_translation_failed` | The verifier could not accept what `gardelc` generated. The module is not verified. This is a limit of the compiler, not a fault shown in your program, and `GARDEL_KEEP_BPL=1` keeps the generated file. |
 
 Exporting to a named module across files, as in `feature {OTHER}`, is not usable yet: the export list counts as a dependency, so it forms a cycle (`E0103`).

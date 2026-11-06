@@ -49,7 +49,7 @@ fn desugar_nullary_calls(m: &mut ModuleDecl) {
                     bound.push(v.clone());
                 }
                 Stmt::Check(_, e) | Stmt::Assume(_, e) => expr(e, n, bound),
-                Stmt::Reveal(_) => {}
+                Stmt::Reveal(_) | Stmt::LetType(_, _) => {}
             }
         }
         expr(body, n, bound);
@@ -311,6 +311,9 @@ pub enum Stmt {
     Check(String, Expr),
     Assume(String, Expr),
     Reveal(String),
+    /// `let x: T = e`: the declared type of the `Let` that follows at once. It has no effect
+    /// of its own and is separate so that a pass over expressions need not know about it.
+    LetType(String, String),
 }
 
 /// Sequenced linear IO action inside a `with IO ... end` block (§11.2, §15).
@@ -456,6 +459,7 @@ impl MatchCase {
                 Stmt::Check(v, e) => Stmt::Check(v.clone(), subst_expr_var(e, b, scrut)),
                 Stmt::Assume(v, e) => Stmt::Assume(v.clone(), subst_expr_var(e, b, scrut)),
                 Stmt::Reveal(v) => Stmt::Reveal(v.clone()),
+                Stmt::LetType(v, t) => Stmt::LetType(v.clone(), t.clone()),
             });
             if matches!(st, Stmt::Let(v, _) if v == b) {
                 shadowed = true;
@@ -519,6 +523,7 @@ pub enum Token {
     LBracket,
     RBracket,
     Colon,
+    ColonColon,
     Semicolon,
     Comma,
     Dot,
@@ -776,6 +781,11 @@ pub fn tokenize_with_lines(src: &str) -> Result<(Vec<Token>, Vec<usize>), LexErr
                     tokens.push(Token::RBracket);
                     lines.push(start_line);
                 }
+                ':' if chars.get(i + 1).copied() == Some(':') => {
+                    i += 1;
+                    tokens.push(Token::ColonColon);
+                    lines.push(start_line);
+                }
                 ':' => {
                     tokens.push(Token::Colon);
                     lines.push(start_line);
@@ -1023,6 +1033,18 @@ impl Parser {
         Ok(id)
     }
 
+    /// An upper name that refers to something: `NAME`, or `ALIAS::NAME`. The resolver is the
+    /// only pass that sees the second form.
+    fn expect_upper_ref(&mut self) -> Result<String, ParseError> {
+        let id = self.expect_upper_ident()?;
+        if *self.peek() != Token::ColonColon {
+            return Ok(id);
+        }
+        self.next();
+        let name = self.expect_upper_ident()?;
+        Ok(format!("{id}::{name}"))
+    }
+
     fn expect_lower_ident(&mut self) -> Result<String, ParseError> {
         let id = self.expect_ident()?;
         if !id.chars().next().is_some_and(|c| c.is_ascii_lowercase()) {
@@ -1105,14 +1127,14 @@ impl Parser {
                 let mut params = Vec::new();
                 let mut is_refined_fn = false;
                 while *self.peek() != Token::RParen {
-                    let pname = self.expect_ident()?;
-                    if *self.peek() == Token::Colon {
+                    if self.tokens.get(self.pos + 1) == Some(&Token::Colon) {
+                        let pname = self.expect_ident()?;
                         is_refined_fn = true;
                         self.next();
                         let pty = self.parse_type()?;
                         params.push(format!("{pname}: {pty}"));
                     } else {
-                        params.push(pname);
+                        params.push(self.parse_type()?);
                     }
                     if *self.peek() == Token::Comma {
                         self.next();
@@ -1128,7 +1150,7 @@ impl Parser {
                 }
             }
         } else {
-            let mut b = self.expect_upper_ident()?;
+            let mut b = self.expect_upper_ref()?;
             if *self.peek() == Token::LBracket {
                 self.next();
                 let mut args = Vec::new();
@@ -1232,7 +1254,7 @@ impl Parser {
                 let tp = self.expect_upper_ident()?;
                 let bound = if *self.peek() == Token::Colon {
                     self.next();
-                    Some(self.expect_upper_ident()?)
+                    Some(self.expect_upper_ref()?)
                 } else {
                     None
                 };
@@ -1354,7 +1376,7 @@ impl Parser {
                 let tp = self.expect_upper_ident()?;
                 if *self.peek() == Token::Colon {
                     self.next();
-                    let bound = self.expect_upper_ident()?;
+                    let bound = self.expect_upper_ref()?;
                     type_bounds.insert(tp.clone(), bound);
                 }
                 type_params.push(tp);
@@ -1368,10 +1390,10 @@ impl Parser {
         let mut satisfies = None;
         if self.is_kw("satisfies") {
             self.next();
-            let mut concepts = vec![self.expect_upper_ident()?];
+            let mut concepts = vec![self.expect_upper_ref()?];
             while *self.peek() == Token::Comma {
                 self.next();
-                concepts.push(self.expect_upper_ident()?);
+                concepts.push(self.expect_upper_ref()?);
             }
             let mut where_constraints = Vec::new();
             if self.is_kw("where") {
@@ -1379,7 +1401,7 @@ impl Parser {
                 loop {
                     let tp = self.expect_upper_ident()?;
                     self.expect_kw("satisfies")?;
-                    let c = self.expect_upper_ident()?;
+                    let c = self.expect_upper_ref()?;
                     where_constraints.push((tp, c));
                     if *self.peek() == Token::Comma {
                         self.next();
@@ -1757,7 +1779,8 @@ impl Parser {
                 let var = self.expect_lower_ident()?;
                 if *self.peek() == Token::Colon {
                     self.next();
-                    let _ = self.parse_type()?;
+                    let ty = self.parse_type()?;
+                    stmts.push(Stmt::LetType(var.clone(), ty));
                 }
                 self.expect(Token::Eq)?;
                 let val = self.parse_expr()?;
@@ -2092,9 +2115,18 @@ impl Parser {
                 }
             }
             Token::Ident(s) => {
-                let name = s.clone();
+                let mut name = s.clone();
                 self.next();
                 if name.chars().next().is_some_and(|c| c.is_ascii_uppercase()) {
+                    // `ALIAS::Leaf`, `MODULE.Leaf` and `ALIAS::MODULE.Leaf`.
+                    if *self.peek() == Token::ColonColon {
+                        self.next();
+                        name = format!("{name}::{}", self.expect_upper_ident()?);
+                    }
+                    if *self.peek() == Token::Dot {
+                        self.next();
+                        name = format!("{name}.{}", self.expect_upper_ident()?);
+                    }
                     let mut subpats = Vec::new();
                     if *self.peek() == Token::LParen {
                         self.next();
@@ -2277,6 +2309,12 @@ impl Parser {
                 } else if name == "False" {
                     return Ok(Expr::Bool(false));
                 }
+                let name = if *self.peek() == Token::ColonColon {
+                    self.next();
+                    format!("{name}::{}", self.expect_upper_ident()?)
+                } else {
+                    name
+                };
                 if *self.peek() == Token::LParen && self.same_line(self.pos - 1, self.pos) {
                     self.next();
                     let mut args = Vec::new();
@@ -2812,7 +2850,7 @@ pub fn check_visibility_and_semantics(m: &ModuleDecl) -> Vec<Diagnostic> {
         let uses_io = expr_uses_io(&r.body)
             || r.stmts.iter().any(|st| match st {
                 Stmt::Let(_, e) | Stmt::Check(_, e) | Stmt::Assume(_, e) => expr_uses_io(e),
-                Stmt::Reveal(_) => false,
+                Stmt::Reveal(_) | Stmt::LetType(_, _) => false,
             });
         if (is_io_ret || uses_io) && m.kind == ModuleKind::ReactiveProgram {
             diags.push(Diagnostic::basic(
@@ -2860,7 +2898,7 @@ pub fn check_visibility_and_semantics(m: &ModuleDecl) -> Vec<Diagnostic> {
                                 Stmt::Let(_, se) | Stmt::Check(_, se) | Stmt::Assume(_, se) => {
                                     count_var_occurrences(se, vname)
                                 }
-                                Stmt::Reveal(_) => 0,
+                                Stmt::Reveal(_) | Stmt::LetType(_, _) => 0,
                             })
                             .sum::<usize>();
                     if count != 1 {
@@ -2992,12 +3030,12 @@ fn expr_uses_io(e: &Expr) -> bool {
             expr_uses_io(c)
                 || ts.iter().any(|s| match s {
                     Stmt::Let(_, se) | Stmt::Check(_, se) | Stmt::Assume(_, se) => expr_uses_io(se),
-                    Stmt::Reveal(_) => false,
+                    Stmt::Reveal(_) | Stmt::LetType(_, _) => false,
                 })
                 || expr_uses_io(te)
                 || es.iter().any(|s| match s {
                     Stmt::Let(_, se) | Stmt::Check(_, se) | Stmt::Assume(_, se) => expr_uses_io(se),
-                    Stmt::Reveal(_) => false,
+                    Stmt::Reveal(_) | Stmt::LetType(_, _) => false,
                 })
                 || expr_uses_io(ee)
         }
@@ -3008,7 +3046,7 @@ fn expr_uses_io(e: &Expr) -> bool {
                         Stmt::Let(_, se) | Stmt::Check(_, se) | Stmt::Assume(_, se) => {
                             expr_uses_io(se)
                         }
-                        Stmt::Reveal(_) => false,
+                        Stmt::Reveal(_) | Stmt::LetType(_, _) => false,
                     }) || expr_uses_io(&c.body)
                 })
         }
@@ -3018,7 +3056,7 @@ fn expr_uses_io(e: &Expr) -> bool {
         Expr::Lambda(_, _, stmts, body) => {
             stmts.iter().any(|s| match s {
                 Stmt::Let(_, se) | Stmt::Check(_, se) | Stmt::Assume(_, se) => expr_uses_io(se),
-                Stmt::Reveal(_) => false,
+                Stmt::Reveal(_) | Stmt::LetType(_, _) => false,
             }) || expr_uses_io(body)
         }
         Expr::Int(_)
@@ -3048,11 +3086,11 @@ fn check_branch_io_linearity(e: &Expr, rname: &str, in_with_io: bool, diags: &mu
             check_branch_io_linearity(c, rname, in_with_io, diags);
             let then_uses = ts.iter().any(|s| match s {
                 Stmt::Let(_, se) | Stmt::Check(_, se) | Stmt::Assume(_, se) => expr_uses_io(se),
-                Stmt::Reveal(_) => false,
+                Stmt::Reveal(_) | Stmt::LetType(_, _) => false,
             }) || expr_uses_io(te);
             let else_uses = es.iter().any(|s| match s {
                 Stmt::Let(_, se) | Stmt::Check(_, se) | Stmt::Assume(_, se) => expr_uses_io(se),
-                Stmt::Reveal(_) => false,
+                Stmt::Reveal(_) | Stmt::LetType(_, _) => false,
             }) || expr_uses_io(ee);
 
             if in_with_io && (then_uses != else_uses) {
@@ -3164,7 +3202,7 @@ fn count_var_occurrences(e: &Expr, target: &str) -> usize {
                         Stmt::Let(_, se) | Stmt::Check(_, se) | Stmt::Assume(_, se) => {
                             count_var_occurrences(se, target)
                         }
-                        Stmt::Reveal(_) => 0,
+                        Stmt::Reveal(_) | Stmt::LetType(_, _) => 0,
                     })
                     .sum::<usize>()
                 + count_var_occurrences(te, target)
@@ -3181,7 +3219,7 @@ fn count_var_occurrences(e: &Expr, target: &str) -> usize {
                                 Stmt::Let(_, se) | Stmt::Check(_, se) | Stmt::Assume(_, se) => {
                                     count_var_occurrences(se, target)
                                 }
-                                Stmt::Reveal(_) => 0,
+                                Stmt::Reveal(_) | Stmt::LetType(_, _) => 0,
                             })
                             .sum::<usize>()
                             + count_var_occurrences(&c.body, target)
@@ -3216,7 +3254,7 @@ fn count_var_occurrences(e: &Expr, target: &str) -> usize {
                     Stmt::Let(_, se) | Stmt::Check(_, se) | Stmt::Assume(_, se) => {
                         count_var_occurrences(se, target)
                     }
-                    Stmt::Reveal(_) => 0,
+                    Stmt::Reveal(_) | Stmt::LetType(_, _) => 0,
                 })
                 .sum::<usize>()
                 + count_var_occurrences(body, target)
@@ -3390,6 +3428,7 @@ pub fn collect_symbols_scoped(e: &Expr, locals: &HashSet<String>) -> HashSet<Str
                     Stmt::Check(_, se) | Stmt::Assume(_, se) => {
                         set.extend(collect_symbols_scoped(se, &t_locals));
                     }
+                    Stmt::LetType(_, _) => {}
                     Stmt::Reveal(r) => {
                         set.insert(r.clone());
                     }
@@ -3407,6 +3446,7 @@ pub fn collect_symbols_scoped(e: &Expr, locals: &HashSet<String>) -> HashSet<Str
                     Stmt::Check(_, se) | Stmt::Assume(_, se) => {
                         set.extend(collect_symbols_scoped(se, &e_locals));
                     }
+                    Stmt::LetType(_, _) => {}
                     Stmt::Reveal(r) => {
                         set.insert(r.clone());
                     }
@@ -3430,6 +3470,7 @@ pub fn collect_symbols_scoped(e: &Expr, locals: &HashSet<String>) -> HashSet<Str
                         Stmt::Check(_, se) | Stmt::Assume(_, se) => {
                             set.extend(collect_symbols_scoped(se, &c_locals));
                         }
+                        Stmt::LetType(_, _) => {}
                         Stmt::Reveal(r) => {
                             set.insert(r.clone());
                         }
@@ -3488,6 +3529,7 @@ pub fn collect_symbols_scoped(e: &Expr, locals: &HashSet<String>) -> HashSet<Str
                     Stmt::Check(_, se) | Stmt::Assume(_, se) => {
                         set.extend(collect_symbols_scoped(se, &l_locals));
                     }
+                    Stmt::LetType(_, _) => {}
                     Stmt::Reveal(r) => {
                         set.insert(r.clone());
                     }
@@ -3635,6 +3677,7 @@ pub fn format_gardel_expr(e: &Expr) -> String {
                     Stmt::Let(v, e) => ss.push(format!("let {v} = {}", format_gardel_expr(e))),
                     Stmt::Check(t, e) => ss.push(format!("check {t}: {}", format_gardel_expr(e))),
                     Stmt::Assume(t, e) => ss.push(format!("assume {t}: {}", format_gardel_expr(e))),
+                    Stmt::LetType(_, _) => {}
                     Stmt::Reveal(t) => ss.push(format!("reveal {t}")),
                 }
             }
@@ -3947,7 +3990,7 @@ pub fn closure_convert_module(m: &ModuleDecl) -> (ModuleDecl, Vec<TopLevelCombin
                 Stmt::Let(_, e) | Stmt::Check(_, e) | Stmt::Assume(_, e) => {
                     *e = convert_expr_lambdas(e, &mut counter, &mut combinators);
                 }
-                Stmt::Reveal(_) => {}
+                Stmt::Reveal(_) | Stmt::LetType(_, _) => {}
             }
         }
         r.body = convert_expr_lambdas(&r.body, &mut counter, &mut combinators);
@@ -3980,7 +4023,7 @@ fn convert_expr_lambdas(
                         let f = collect_symbols_scoped(se, &param_names);
                         free_vars.extend(f);
                     }
-                    Stmt::Reveal(_) => {}
+                    Stmt::Reveal(_) | Stmt::LetType(_, _) => {}
                 }
             }
             free_vars.extend(collect_symbols_scoped(body, &param_names));
@@ -4092,6 +4135,7 @@ fn convert_expr_lambdas(
                         Stmt::Assume(t.clone(), convert_expr_lambdas(e, counter, combinators))
                     }
                     Stmt::Reveal(r) => Stmt::Reveal(r.clone()),
+                    Stmt::LetType(v, t) => Stmt::LetType(v.clone(), t.clone()),
                 })
                 .collect(),
             Box::new(convert_expr_lambdas(te, counter, combinators)),
@@ -4107,6 +4151,7 @@ fn convert_expr_lambdas(
                         Stmt::Assume(t.clone(), convert_expr_lambdas(e, counter, combinators))
                     }
                     Stmt::Reveal(r) => Stmt::Reveal(r.clone()),
+                    Stmt::LetType(v, t) => Stmt::LetType(v.clone(), t.clone()),
                 })
                 .collect(),
             Box::new(convert_expr_lambdas(ee, counter, combinators)),
@@ -4132,6 +4177,7 @@ fn convert_expr_lambdas(
                                 convert_expr_lambdas(e, counter, combinators),
                             ),
                             Stmt::Reveal(r) => Stmt::Reveal(r.clone()),
+                            Stmt::LetType(v, t) => Stmt::LetType(v.clone(), t.clone()),
                         })
                         .collect();
                     let body = convert_expr_lambdas(&c.body, counter, combinators);
@@ -4263,7 +4309,7 @@ fn collect_stmt_strings(st: &Stmt, set: &mut HashSet<String>) {
         Stmt::Let(_, e) | Stmt::Check(_, e) | Stmt::Assume(_, e) => {
             collect_expr_strings(e, set);
         }
-        Stmt::Reveal(_) => {}
+        Stmt::Reveal(_) | Stmt::LetType(_, _) => {}
     }
 }
 
@@ -4598,32 +4644,6 @@ fn top_level_decls(ast: &FileAst) -> Vec<(&str, &'static str)> {
         .collect()
 }
 
-/// `E0101: duplicate_prelude_symbol` (§4.1.3): in prelude mode a user top-level module,
-/// `functions` module, `program` or concept may not redeclare a Standard Prelude identifier.
-pub fn check_prelude_collisions(ast: &FileAst, src: &str, input_path: &str) -> Vec<Diagnostic> {
-    let prelude = standard_prelude();
-    let mut diags = Vec::new();
-    for (name, kw) in top_level_decls(ast) {
-        if !prelude.declares(name) {
-            continue;
-        }
-        let sp = locate_decl_header(src, input_path, kw, name);
-        diags.push(
-            Diagnostic::basic(
-                "error",
-                "E0101: duplicate_prelude_symbol",
-                name.to_string(),
-                "duplicate_prelude_symbol".to_string(),
-                format!(
-                    "E0101: duplicate_prelude_symbol: top-level {kw} `{name}` redeclares a Standard Prelude identifier (§4.1); remove it to use the prelude `{name}`, or compile in `--no-prelude` bootstrap mode"
-                ),
-            )
-            .with_ai_context(sp, Vec::new(), BTreeMap::new(), Vec::new()),
-        );
-    }
-    diags
-}
-
 /// A parsed source file of a compilation run (Task B.4).
 pub struct SourceUnit {
     pub path: String,
@@ -4862,6 +4882,48 @@ fn repr_prelude_deps(m: &ModuleDecl) -> Vec<String> {
         }
     }
     deps
+}
+
+/// The type of `recv` in a Boogie emission, as far as it can be told.
+fn boogie_receiver_type(recv: &Expr, m: &ModuleDecl) -> Option<String> {
+    if let Expr::Var(v) = recv {
+        if module_has_variant(m, v) {
+            return Some(module_self_type(m));
+        }
+        if v == "Result" {
+            return boogie_env_type(v).or_else(boogie_result_type);
+        }
+    }
+    boogie_prelude_ctx().and_then(|ctx| infer_gardel_type(recv, m, &ctx)).or_else(|| match recv {
+        Expr::Var(v) if v == "Current" => Some(module_self_type(m)),
+        // A prelude module's own routines are emitted with no context installed.
+        Expr::Var(v) => elem_env_type(v),
+        Expr::Char(_) => Some("CHAR".to_string()),
+        Expr::MethodCall(owner, r, _)
+            if r == "from_scalar" && matches!(&**owner, Expr::Var(v) if v == "CHAR") =>
+        {
+            Some("CHAR".to_string())
+        }
+        _ => None,
+    })
+}
+
+/// The built-in that `recv.mname` means, or `""` when it is a routine. A name means the
+/// routine of the receiver's own module, whatever preamble theory shares it, and `code` is
+/// the identity on a `CHAR` alone: any other receiver would make `x.code = x` provable.
+fn boogie_builtin_method<'a>(recv: &Expr, mname: &'a str, m: &ModuleDecl) -> &'a str {
+    let ty = boogie_receiver_type(recv, m);
+    if mname == "code" {
+        return if ty.as_deref() == Some("CHAR") { mname } else { "" };
+    }
+    let own = ty.is_some_and(|t| type_head(&t) == m.name)
+        && find_module_routine(m, mname).is_some_and(|(_, has_current)| has_current);
+    // `SEQ` and `BYTES` declare the routines the preamble arms already call.
+    if own && m.name != "SEQ" && m.name != "BYTES" {
+        ""
+    } else {
+        mname
+    }
 }
 
 /// `LIST` / `TUPLE` operations handled by the built-in preamble theories.
@@ -5372,7 +5434,7 @@ fn expr_free_vars(e: &Expr, bound: &mut Vec<String>, out: &mut Vec<String>) {
                     bound.push(v.clone());
                 }
                 Stmt::Check(_, x) | Stmt::Assume(_, x) => expr_free_vars(x, bound, out),
-                Stmt::Reveal(_) => {}
+                Stmt::Reveal(_) | Stmt::LetType(_, _) => {}
             }
         }
         expr_free_vars(body, bound, out);
@@ -5832,7 +5894,7 @@ pub fn check_where_constraints(m: &ModuleDecl, src: &str, input_path: &str) -> V
                         }
                     }
                     Stmt::Check(_, x) | Stmt::Assume(_, x) => walk(x, rn, m, ctx, out),
-                    Stmt::Reveal(_) => {}
+                    Stmt::Reveal(_) | Stmt::LetType(_, _) => {}
                 }
             }
         };
@@ -6141,7 +6203,7 @@ pub fn check_string_semantics(m: &ModuleDecl, src: &str, input_path: &str) -> Ve
                     }
                 }
                 Stmt::Check(_, e) | Stmt::Assume(_, e) => walk(e, &rn.contract(), m, ctx, out),
-                Stmt::Reveal(_) => {}
+                Stmt::Reveal(_) | Stmt::LetType(_, _) => {}
             }
         }
     }
@@ -6424,6 +6486,11 @@ fn infer_gardel_type(e: &Expr, m: &ModuleDecl, ctx: &BoogiePreludeCtx) -> Option
                 }
                 .to_string(),
             )
+        }
+        Expr::MethodCall(recv, r, _)
+            if r == "from_scalar" && matches!(&**recv, Expr::Var(v) if v == "CHAR") =>
+        {
+            Some("CHAR".to_string())
         }
         Expr::Bool(_) | Expr::UnaryNot(_) => Some("BOOL".to_string()),
         Expr::BinOp(op, l, rhs) => {
@@ -6983,6 +7050,7 @@ fn emit_prelude_contract_interface(p: &ModuleDecl) -> (String, HashSet<String>) 
             params.push(format!("{pn}: {t}"));
             tys.push(t);
         }
+        set_boogie_type_env(&cp, &r.params, None);
         for (idx, (_, req)) in r.requires.iter().enumerate() {
             let body = emit(req);
             let Some(tq) = sig_tps(&r.type_params, &tys, &body) else {
@@ -6996,6 +7064,7 @@ fn emit_prelude_contract_interface(p: &ModuleDecl) -> (String, HashSet<String>) 
             names.insert(name);
         }
     }
+    clear_boogie_type_env();
     for (idx, law) in prelude_law_markers(p) {
         let law_vis = &p.specify_laws[idx].0;
         let (law_locals, law_non_self) = law_clause_locals(law, &p.name);
@@ -8628,7 +8697,7 @@ fn stmts_use_current(
         Stmt::Let(_, e) | Stmt::Check(_, e) | Stmt::Assume(_, e) => {
             expr_uses_current(e, field_names, indep)
         }
-        Stmt::Reveal(_) => false,
+        Stmt::Reveal(_) | Stmt::LetType(_, _) => false,
     })
 }
 
@@ -9079,6 +9148,7 @@ fn emit_boogie_verify_law(
                     )
                 ));
             }
+            Stmt::LetType(_, _) => {}
             Stmt::Reveal(target) => {
                 revealed.insert(target.clone());
                 s.push_str(&format!(
@@ -9780,7 +9850,7 @@ impl LawProofCtx<'_> {
                     let e = self.emit(&subst_expr_vars(e, &substs));
                     s.push_str(&format!("{pad}assume {e};\n"));
                 }
-                Stmt::Reveal(_) => {}
+                Stmt::Reveal(_) | Stmt::LetType(_, _) => {}
             }
         }
         s.push_str(&self.stmts(&subst_expr_vars(body, &substs), pad));
@@ -9812,6 +9882,14 @@ fn emit_boogie_canonical_witness_types(m: &ModuleDecl) -> String {
     out
 }
 
+/// The declared type of the `let` at `stmts[at]`, if it has one.
+fn declared_let_type(stmts: &[Stmt], at: usize) -> Option<&str> {
+    match (stmts.get(at.checked_sub(1)?)?, &stmts[at]) {
+        (Stmt::LetType(n, t), Stmt::Let(v, _)) if n == v => Some(t),
+        _ => None,
+    }
+}
+
 fn collect_proc_locals(
     stmts: &[Stmt],
     body: &Expr,
@@ -9819,12 +9897,14 @@ fn collect_proc_locals(
     m: &ModuleDecl,
     out: &mut Vec<(String, String)>,
 ) {
-    for st in stmts {
+    for (at, st) in stmts.iter().enumerate() {
         if let Stmt::Let(v, e) = st {
             if let Some(t) = elem_receiver_type(e, m) {
                 elem_env_bind(v, &t);
             }
-            let gty = boogie_prelude_ctx().and_then(|ctx| infer_gardel_type(e, m, &ctx));
+            let gty = declared_let_type(stmts, at)
+                .map(ToString::to_string)
+                .or_else(|| boogie_prelude_ctx().and_then(|ctx| infer_gardel_type(e, m, &ctx)));
             let bty = match &gty {
                 Some(t) => {
                     bind_boogie_env_type(v, t);
@@ -10062,6 +10142,7 @@ fn emit_boogie_proc_stmts_and_ret(
                     )
                 ));
             }
+            Stmt::LetType(_, _) => {}
             Stmt::Reveal(target) => {
                 revealed.insert(target.clone());
                 s.push_str(&format!(
@@ -10399,7 +10480,7 @@ fn wf_walk_block(k: WfKind<'_>, stmts: &[Stmt], body: &Expr) -> Option<Expr> {
                     substs.push((v.clone(), e_sub));
                 }
             }
-            Stmt::Reveal(_) => {}
+            Stmt::Reveal(_) | Stmt::LetType(_, _) => {}
         }
     }
     and_wf(acc, wf_walk(k, &subst_expr_vars(body, &substs)))
@@ -10816,6 +10897,7 @@ fn emit_block_obligations(
                     s.push_str(&format!("{pad}assume {e_bpl}; // assume:{tag}\n"));
                 }
             }
+            Stmt::LetType(_, _) => {}
             Stmt::Reveal(target) => {
                 revealed.insert(target.clone());
             }
@@ -11637,6 +11719,7 @@ fn subst_block(stmts: &[Stmt], body: &Expr, substs: &[(String, Expr)]) -> (Vec<S
             Stmt::Assume(tag, e) => {
                 new_stmts.push(Stmt::Assume(tag.clone(), subst_expr_vars(e, &cur_substs)));
             }
+            Stmt::LetType(_, _) => {}
             Stmt::Reveal(t) => {
                 new_stmts.push(Stmt::Reveal(t.clone()));
             }
@@ -12337,7 +12420,7 @@ fn emit_boogie_expr_with_strings(
                     return format!("fn_{mname}({})", full_args.join(", "));
                 }
             }
-            if mname == "apply" {
+            if boogie_builtin_method(recv, mname, m) == "apply" {
                 let a_str: Vec<String> = args
                     .iter()
                     .map(|a| {
@@ -12373,7 +12456,7 @@ fn emit_boogie_expr_with_strings(
                 fuel_var,
                 strings,
             );
-            match mname.as_str() {
+            match boogie_builtin_method(recv, mname, m) {
                 "append" => format!(
                     "Seq_append({r_str}, {})",
                     emit_boogie_expr_with_strings(
@@ -13357,6 +13440,7 @@ fn collect_branch_path_conditions_for_tag(
 ) -> bool {
     for st in stmts {
         match st {
+            Stmt::LetType(_, _) => {}
             Stmt::Reveal(t) => {
                 pcs.push(format!("reveal {t}"));
             }
@@ -13770,7 +13854,7 @@ fn find_tagged_expr_in_block<'a>(
                     return Some(found);
                 }
             }
-            Stmt::Reveal(_) => {}
+            Stmt::Reveal(_) | Stmt::LetType(_, _) => {}
         }
     }
     find_tagged_expr_in_expr(body, target_tag)
@@ -14088,6 +14172,7 @@ pub fn find_relevant_lemmas(
                         Stmt::Check(_, se) | Stmt::Assume(_, se) => {
                             called.extend(collect_symbols_scoped(se, &sr_locals));
                         }
+                        Stmt::LetType(_, _) => {}
                         Stmt::Reveal(rev_t) => {
                             called.insert(rev_t.clone());
                         }
@@ -14410,6 +14495,7 @@ impl AssumeWalk<'_> {
                     self.report(tag, e, path_conds);
                     path_conds.push(format!("assume {tag}: {}", format_gardel_expr(e)));
                 }
+                Stmt::LetType(_, _) => {}
                 Stmt::Reveal(target) => {
                     path_conds.push(format!("reveal {target}"));
                 }
@@ -14502,7 +14588,7 @@ fn verify_routine_symbolic(
             Stmt::Let(_, e) | Stmt::Check(_, e) | Stmt::Assume(_, e) => {
                 expr_calls_routine(e, &r.name)
             }
-            Stmt::Reveal(_) => false,
+            Stmt::Reveal(_) | Stmt::LetType(_, _) => false,
         });
     if is_recursive && r.variant.is_empty() {
         let sp = locate_span(src, input_path, &r.name, &r.name);
@@ -14594,6 +14680,7 @@ fn eval_and_verify_block(
     let mut assumed_false = false;
     for st in stmts {
         match st {
+            Stmt::LetType(_, _) => {}
             Stmt::Reveal(target) => {
                 revealed.insert(target.clone());
                 pcs.push(format!("reveal {target}"));
@@ -15089,14 +15176,14 @@ fn expr_calls_routine(e: &Expr, rname: &str) -> bool {
                     Stmt::Let(_, se) | Stmt::Check(_, se) | Stmt::Assume(_, se) => {
                         expr_calls_routine(se, rname)
                     }
-                    Stmt::Reveal(_) => false,
+                    Stmt::Reveal(_) | Stmt::LetType(_, _) => false,
                 })
                 || expr_calls_routine(te, rname)
                 || es.iter().any(|s| match s {
                     Stmt::Let(_, se) | Stmt::Check(_, se) | Stmt::Assume(_, se) => {
                         expr_calls_routine(se, rname)
                     }
-                    Stmt::Reveal(_) => false,
+                    Stmt::Reveal(_) | Stmt::LetType(_, _) => false,
                 })
                 || expr_calls_routine(ee, rname)
         }
@@ -15107,7 +15194,7 @@ fn expr_calls_routine(e: &Expr, rname: &str) -> bool {
                         Stmt::Let(_, se) | Stmt::Check(_, se) | Stmt::Assume(_, se) => {
                             expr_calls_routine(se, rname)
                         }
-                        Stmt::Reveal(_) => false,
+                        Stmt::Reveal(_) | Stmt::LetType(_, _) => false,
                     }) || expr_calls_routine(&c.body, rname)
                 })
         }
@@ -15128,7 +15215,7 @@ fn expr_calls_routine(e: &Expr, rname: &str) -> bool {
                 Stmt::Let(_, se) | Stmt::Check(_, se) | Stmt::Assume(_, se) => {
                     expr_calls_routine(se, rname)
                 }
-                Stmt::Reveal(_) => false,
+                Stmt::Reveal(_) | Stmt::LetType(_, _) => false,
             }) || expr_calls_routine(body, rname)
         }
     }
@@ -15872,6 +15959,13 @@ fn emit_bend_block(stmts: &[Stmt], body: &Expr, mod_name: &str, indent: usize) -
     s
 }
 
+thread_local! {
+    /// Whether a module of this run declares a routine `code`. Bend has no types here, so
+    /// such a run calls `code` on every receiver: a `CHAR` then fails loudly in Bend, and
+    /// no value silently stands for its own `code`.
+    static BEND_USER_CODE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
 fn emit_bend_expr(e: &Expr, mod_name: &str, indent: usize) -> String {
     let pad = " ".repeat(indent);
     match e {
@@ -15912,7 +16006,7 @@ fn emit_bend_expr(e: &Expr, mod_name: &str, indent: usize) -> String {
                     return format!("IO/{mname}({})", a_str.join(", "));
                 }
             }
-            if mname == "code" && args.is_empty() {
+            if mname == "code" && args.is_empty() && !BEND_USER_CODE.with(std::cell::Cell::get) {
                 return emit_bend_expr(recv, mod_name, indent);
             }
             if mname == "apply" {
@@ -16620,6 +16714,7 @@ fn collect_stmts_own_symbols_in(
             Stmt::Check(_, se) | Stmt::Assume(_, se) => {
                 collect_module_own_symbols_in(se, m_name, bound_locals, non_self_locals, out);
             }
+            Stmt::LetType(_, _) => {}
             Stmt::Reveal(name) => {
                 if !bound_locals.contains(name)
                     && name != "Current"
@@ -17657,17 +17752,9 @@ fn input_operands(args: &[String]) -> Vec<String> {
     ops
 }
 
-/// Fatal namespace diagnostics of a run, before any verification: `E0101` (prelude mode)
-/// and `E0102` (cross-file duplicates).
-pub fn check_project_namespace(units: &[SourceUnit], prelude_mode: bool) -> Vec<Diagnostic> {
-    let mut diags = Vec::new();
-    if prelude_mode {
-        for u in units {
-            diags.extend(check_prelude_collisions(&u.ast, &u.src, &u.path));
-        }
-    }
-    diags.extend(check_duplicate_module_names(units));
-    diags
+/// Fatal namespace diagnostics of a package, before any verification: `E0102`.
+pub fn check_project_namespace(units: &[SourceUnit]) -> Vec<Diagnostic> {
+    check_duplicate_module_names(units)
 }
 
 /// Options of a verification run.
@@ -17867,7 +17954,7 @@ fn verify_embedded_prelude(cache: Option<Rc<ProofCache>>) -> Vec<Diagnostic> {
     failed
 }
 
-/// Prints fatal diagnostics (E0101/E0102/E0103) and exits with status 1.
+/// Prints fatal diagnostics (E0102, E0103 and the resolver's) and exits with status 1.
 fn exit_with_fatal(diags: &[Diagnostic], json_mode: bool, default_path: &str) -> ! {
     if json_mode {
         println!("[");
@@ -18264,10 +18351,16 @@ fn main() {
         .iter()
         .all(|_| prelude_mode_enabled(stdlib_only, no_prelude_flag));
 
-    // E0101 (prelude shadowing) and E0102 (cross-file duplicates) are fatal (§4.1, §4.2), and
-    // so is a name that cannot be resolved in its package (Task E.4).
+    // E0102 (cross-file duplicates) is fatal (§4.2), and so is a name that cannot be resolved
+    // in its package (Tasks E.4, E.5). A run with no manifest is one unnamed package.
     let (packages, namespace_errors) = if package_list.is_empty() {
-        (HashMap::new(), check_project_namespace(&units, prelude_mode))
+        let list = [resolve::PackageUnits {
+            name: resolve::LOCAL_PACKAGE.to_string(),
+            is_root: true,
+            deps: Vec::new(),
+            units: 0..units.len(),
+        }];
+        resolve::resolve_packages(&mut units, &list, prelude_mode)
     } else {
         let mut start = 0;
         let last = package_list.len() - 1;
@@ -18574,6 +18667,8 @@ fn main() {
     let mut emitted_bpl: Vec<String> = Vec::new();
     let mut c_backend_errors: Vec<String> = Vec::new();
 
+    let user_code = all_modules.iter().any(|m| find_module_routine(m, "code").is_some());
+    BEND_USER_CODE.with(|c| c.set(user_code));
     for m in &all_modules {
         let stem = m.name.to_lowercase();
         let bpl_path = format!("build/{stem}.bpl");
@@ -22156,10 +22251,41 @@ int main(void) {
         let live = d8_run(&exe, &[("GARDEL_RECORD", log.as_os_str())], b"", &[]);
         assert_eq!(live.0, 0, "{}", live.2);
         assert_eq!(d8_script(&fs::read_to_string(&log).unwrap()), "Tick:1 Tick:1 Tick:1");
-        let start = std::time::Instant::now();
         d8_check_replay(&exe, &log, &live);
-        // The run took two seconds of timers, and this is two runs with none.
-        assert!(start.elapsed() < std::time::Duration::from_millis(1800), "{:?}", start.elapsed());
+        let _ = fs::remove_dir_all(&dir);
+
+        // A timer of an hour, recorded from a script. The limit is a minute so that a busy
+        // machine cannot fail this, and only a run that waits for the timer can reach it.
+        let src = "reactive program LONG_TIMER\n\nfeature {ANY}\n\n  init(args: SEQ[STRING]): STEP[NAT]\n    do\n      Continue(0, LIST.empty.prepend(SetTimer(1, 3600000)))\n    end\n\n  step(s: NAT, e: EVENT): STEP[NAT]\n    do\n      Stop(0, LIST.empty.prepend(Print(\"fired\")))\n    end\n\nend\n";
+        let c = d4_c(&[("long_timer.gdl", src)]);
+        let Some((dir, exe)) = c3_compile(&c, "d8long") else { return };
+        let log = dir.join("run.log");
+        let scripted = d8_run(&exe, &[("GARDEL_EVENTS", "Tick:1".as_ref()), ("GARDEL_RECORD", log.as_os_str())], b"", &[]);
+        assert_eq!((scripted.0, scripted.1.as_str()), (0, "fired\n"), "{}", scripted.2);
+        let mut replay = Command::new(&exe);
+        for name in ["GARDEL_EVENTS", "GARDEL_RECORD", "GARDEL_LISTEN_ADDR"] {
+            replay.env_remove(name);
+        }
+        let mut child = replay
+            .env("GARDEL_REPLAY", &log)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        let start = std::time::Instant::now();
+        let status = loop {
+            if let Some(status) = child.try_wait().unwrap() {
+                break status;
+            }
+            if start.elapsed() > std::time::Duration::from_secs(60) {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("the replay waited for its timer");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        };
+        assert_eq!(status.code(), Some(0));
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -22523,17 +22649,6 @@ int main(void) {
         assert!(diags.is_empty(), "{diags:?}");
         if let Some(runs) = c3_native_runs(&c, "jobprog", &[b""]) {
             assert_eq!(runs[0].0, 7, "JOB's own constructors must run");
-        }
-    }
-
-    #[test]
-    fn test_d2_prelude_step_names_are_reserved() {
-        for name in ["STEP", "COMMAND", "EVENT"] {
-            let src = format!("module {name}\n\nrepresentation {{ANY}}\n  | A\n\nend\n");
-            let m = parse_user_module_with_prelude(&src);
-            let ast = FileAst { group: None, concepts: Vec::new(), modules: vec![m] };
-            let diags = check_prelude_collisions(&ast, &src, "x.gdl");
-            assert!(diags.iter().any(|d| d.rule.starts_with("E0101")), "{name}: {diags:?}");
         }
     }
 
@@ -24725,35 +24840,6 @@ end
     }
 
     #[test]
-    fn test_b1_e0101_duplicate_prelude_symbol() {
-        let src = "module OPTION[A]\n\nrepresentation {ANY}\n  | None\n  | Some(value: A)\n\nend\n\nconcept EQ\n  equals(other: Current): BOOL\nend\n\nmodule MY_BOX\n\nrepresentation {ANY}\n  v: NAT\n\nend\n";
-        let ast = Parser::new(tokenize(src).unwrap()).parse_file().unwrap();
-        let diags = check_prelude_collisions(&ast, src, "dup.gdl");
-        assert_eq!(diags.len(), 2, "got: {diags:?}");
-        assert!(
-            diags
-                .iter()
-                .all(|d| d.level == "error" && d.rule.starts_with("E0101"))
-        );
-        let opt = diags
-            .iter()
-            .find(|d| d.routine == "OPTION")
-            .expect("OPTION collision");
-        assert_eq!(opt.tag, "duplicate_prelude_symbol");
-        assert_eq!(opt.span.as_ref().map(|s| s.line), Some(1));
-        let eq = diags
-            .iter()
-            .find(|d| d.routine == "EQ")
-            .expect("EQ collision");
-        assert_eq!(eq.span.as_ref().map(|s| s.line), Some(9));
-        // A user file without collisions is accepted.
-        let ok = Parser::new(tokenize(B1_PRELUDE_CLIENT).unwrap())
-            .parse_file()
-            .unwrap();
-        assert!(check_prelude_collisions(&ok, B1_PRELUDE_CLIENT, "ok.gdl").is_empty());
-    }
-
-    #[test]
     fn test_b1_stdlib_bootstrap_is_not_double_injected() {
         // `--stdlib` (which files of the stdlib tree switch on) compiles in bootstrap mode.
         assert!(!prelude_mode_enabled(true, false));
@@ -25222,7 +25308,7 @@ end
             [("client.gdl", B4_CLIENT), ("counter.gdl", B4_COUNTER)],
         ] {
             let mut units = b4_units(&files);
-            assert!(check_project_namespace(&units, true).is_empty());
+            assert!(check_project_namespace(&units).is_empty());
             let checked = check_and_verify_project(&mut units, b4_opts(true, true));
             assert!(checked.fatal.is_empty());
             let diags: Vec<&Diagnostic> = checked.diags.iter().map(|(_, d)| d).collect();
@@ -25282,7 +25368,7 @@ end
     fn test_b4_duplicate_module_across_files_is_e0102() {
         let other = "module COUNTER\nrepresentation {ANY}\n  x: NAT\nend\n";
         let units = b4_units(&[("counter.gdl", B4_COUNTER), ("other/counter.gdl", other)]);
-        let diags = check_project_namespace(&units, true);
+        let diags = check_project_namespace(&units);
         assert_eq!(diags.len(), 1, "got {diags:?}");
         assert_eq!(diags[0].rule, "E0102: duplicate_module_name");
         assert_eq!(diags[0].level, "error");
@@ -25295,7 +25381,7 @@ end
         );
         // Distinct names: no E0102.
         let units = b4_units(&[("counter.gdl", B4_COUNTER), ("client.gdl", B4_CLIENT)]);
-        assert!(check_project_namespace(&units, true).is_empty());
+        assert!(check_project_namespace(&units).is_empty());
     }
 
     #[test]

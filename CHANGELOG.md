@@ -9,6 +9,8 @@ All notable changes, theoretical soundess fixes, verification overhauls, front-e
 Spec draft v0.5. [plan/Roadmap.md](plan/Roadmap.md) holds the detail for each task.
 
 ### Language and runtime
+- **Qualified names** (E.5). `ALIAS::NAME` in expressions, types and type arguments, with `GARDEL` for the prelude, and `MODULE.Leaf(1)`, `ALIAS::MODULE.Leaf(1)` and `case MODULE.Leaf(x)` for constructors. A type known for certain breaks a tie between constructors. A user module may reuse any prelude name, so `E0101` is gone.
+- **`let x: T = e` keeps `T`.** It was parsed and thrown away. It now settles a generic value, and a value known to have another type is `E0116`.
 - **Packages** (E.4). `[dependencies]` in `Gardel.toml` adds a package by `path`. Two packages may use one module or constructor name, each keeping its own proofs, and a client sees only a dependency's contracts. `examples/hello_api` is an HTTP service built on the `ghttp` package.
 - **Reactive programs** (Phase D): `reactive program`, with `init` and `step` as total routines, `STEP`, `COMMAND`, `EVENT`, `KEY` and `CONN_ID` in the prelude, timers, console input, TCP sockets, and event logs with replay.
 - **Standard library** (Phase C): one module per file under `stdlib/`, verified UTF-8 `STRING` and `BYTES`, `RESULT`, and a law catalogue.
@@ -16,6 +18,7 @@ Spec draft v0.5. [plan/Roadmap.md](plan/Roadmap.md) holds the detail for each ta
 - **Dafny removed.** Boogie and Z3 are the only verifier, and a run has five steps. Solver limits count work, not time.
 
 ### Soundness fixes
+- **`x.code` was the identity on every receiver**, which is only true of `CHAR`. In a module with a routine `code` that returns its own type, a false `ensure` such as `x.code = x` verified. `code` is now the identity on a `CHAR` alone, and a module's own routine wins over every built-in name (`first`, `head`, `length`, `append`, `at`, `apply` and the rest), which gave `E0199` before. Bend had the same fault: a run that declares a `code` routine now calls it on every receiver.
 - **Obligations reach every expression** (D.9). Overflow, division by zero, callee preconditions and `check` were skipped in lambdas, in `if` and `match` nested in an expression, in tuples, under `not`, in record fields and in a body `match`'s scrutinee. Such programs verified, then wrapped or crashed at run time.
 - **`I64`** (D.10). `/` and `%` proved Euclidean results while the binary truncated, so `(-7) / 2 = -4` verified and the program computed `-3`. `-x` at `I64.min` and `I64.min / -1` had no check. Wrapping on `I64` was read as unsigned.
 - **Private members** (E.0). Private routines and the constructors of a hidden representation were reachable from other modules, so a client could forge a value of an opaque type.
@@ -33,7 +36,10 @@ Spec draft v0.5. [plan/Roadmap.md](plan/Roadmap.md) holds the detail for each ta
 ### Behaviour changes that can reject existing code
 - Bitwise operators on `I64` are refused (`bitwise_on_signed`), and `-x` on `U64` needs `x = 0`.
 - Unknown command-line flags are errors.
-- In a project with a `Gardel.toml`, an export list may not name a prelude module (`E0114`), and a declared name may not have the form `PK<n>_...` (`E0115`).
+- An export list may not name a prelude module (`E0114`), and a declared name may not have the form `PK<n>_...` (`E0115`).
+- A `let x: T = e` that contradicts `T` is refused (`E0116`), where `T` used to be ignored.
+- A project constructor that clashes with a prelude one, such as a `Leaf`, is now a separate identity. A bare use from another module of the project means the project's, as before. Generated symbols for it are named `PK<n>_<PROJECT>_Leaf`, so its `.bpl`, `.c` and `.bend` text changes, though nothing else about them does.
+- Two modules of a project with one constructor name each get a separate identity, so generated symbols change for those constructors as well.
 - `--strict` now refuses a nested `assume`, and `--audit` lists it.
 - A run that cannot start Boogie or Z3 is an error. It used to fall back to sampling and could report success on a false contract. `--bounded-check` still samples, on request.
 - `--inspect` shows no interface when the run has errors, and exits with status 1.

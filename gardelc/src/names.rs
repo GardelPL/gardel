@@ -211,6 +211,8 @@ struct Walker<'a, 'u> {
     type_params: Vec<String>,
     /// Names in scope, innermost last, with their type when it is known.
     scope: Vec<(String, Option<String>)>,
+    /// The declared type of the `let` that comes next.
+    let_type: Option<String>,
     diags: &'u mut Vec<Diagnostic>,
     reported: &'u mut HashSet<(&'static str, String, String)>,
 }
@@ -334,6 +336,36 @@ impl<'a> Walker<'a, '_> {
                 }
             }
             Pattern::Wildcard | Pattern::Bind(_) | Pattern::Lit(_) => {}
+        }
+    }
+
+    /// `let v: declared = e`. A literal has no type of its own, so it is checked against the
+    /// declared one. A type that cannot be told here is left to the back ends, which build
+    /// the value at the declared type or fail.
+    fn check_let_type(&mut self, v: &str, declared: &str, e: &Expr) {
+        let fits = |n: u128| match declared {
+            "U64" => n <= u128::from(u64::MAX),
+            "I64" => n <= i64::MAX.unsigned_abs().into(),
+            _ => matches!(declared, "NAT" | "F64"),
+        };
+        let found = match e {
+            Expr::Int(n) if fits(*n) => return,
+            Expr::UnaryNeg(x) if declared == "I64" && matches!(**x, Expr::Int(_)) => return,
+            Expr::Int(_) | Expr::UnaryNeg(_) => "this number".to_string(),
+            Expr::Bool(_) => "BOOL".to_string(),
+            Expr::Char(_) => "CHAR".to_string(),
+            other => match self.type_of(other) {
+                Some(t) => t,
+                None => return,
+            },
+        };
+        let plain = |t: &str| t.split_whitespace().collect::<String>();
+        if plain(&found) != plain(declared) {
+            self.report(
+                "E0116: let_type_mismatch",
+                v,
+                format!("`{v}` is declared `{declared}`, and its value is `{found}`"),
+            );
         }
     }
 
@@ -522,10 +554,19 @@ impl<'a> Walker<'a, '_> {
         match st {
             Stmt::Let(v, e) => {
                 self.expr(e);
-                let ty = self.type_of(e);
+                let declared = self.let_type.take();
+                if let Some(t) = &declared {
+                    self.check_let_type(v, t, e);
+                }
+                let ty = declared.or_else(|| self.type_of(e));
                 self.scope.push((v.clone(), ty));
             }
             Stmt::Check(_, e) | Stmt::Assume(_, e) => self.expr(e),
+            Stmt::LetType(_, t) => {
+                self.check_type(t);
+                let t = if t == "Current" { module_self_type(self.module) } else { t.clone() };
+                self.let_type = Some(t);
+            }
             Stmt::Reveal(target) => {
                 let known = self.universe.members.values().any(|t| t.contains_key(target.as_str()));
                 if !known {
@@ -820,6 +861,7 @@ pub(crate) fn check_names(
                 routine: String::new(),
                 type_params: Vec::new(),
                 scope: Vec::new(),
+                let_type: None,
                 diags: &mut diags,
                 reported: &mut reported,
             }
