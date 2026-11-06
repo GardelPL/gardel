@@ -1,0 +1,102 @@
+-- Structured HTTP protocol and resource-limit errors (RFC 9110 / RFC 9112).
+module HTTP_ERROR satisfies CANONICAL_EQ
+
+representation {ANY}
+  | EmptyRequest
+  | MalformedRequestLine
+  | UnknownMethod
+  | InvalidTarget
+  | UnsupportedVersion
+  | MalformedHeader
+  | RequestLineTooLong
+  | HeaderTooLarge
+  | TooManyHeaders
+  | ConflictingFraming
+  | UnsupportedTransferEncoding
+  | ContentLengthInvalid
+  | BodyTooLarge
+
+feature {ANY}
+
+  equals(other: HTTP_ERROR): BOOL
+    do
+      Current = other
+    ensure
+      def: Result = (Current = other)
+    end
+
+  -- Maps every protocol or resource-limit violation to its canonical HTTP status code.
+  to_status: HTTP_STATUS
+    do
+      match Current
+        case RequestLineTooLong          then HTTP_STATUS.uri_too_long
+        case HeaderTooLarge              then HTTP_STATUS.request_header_fields_too_large
+        case TooManyHeaders              then HTTP_STATUS.request_header_fields_too_large
+        case BodyTooLarge                then HTTP_STATUS.payload_too_large
+        case UnknownMethod               then HTTP_STATUS.not_implemented
+        case UnsupportedTransferEncoding then HTTP_STATUS.not_implemented
+        case UnsupportedVersion          then HTTP_STATUS.http_version_not_supported
+        case _                           then HTTP_STATUS.bad_request
+      end
+    ensure
+      is_error_status: Result.is_client_error or Result.is_server_error
+      allows_error_body: not Result.forbids_body
+    end
+
+  is_resource_limit_violation: BOOL
+    do
+      match Current
+        case RequestLineTooLong then True
+        case HeaderTooLarge     then True
+        case TooManyHeaders     then True
+        case BodyTooLarge       then True
+        case _                  then False
+      end
+    ensure
+      def: Result = (Current = RequestLineTooLong or Current = HeaderTooLarge or Current = TooManyHeaders or Current = BodyTooLarge)
+    end
+
+  -- Security property (RFC 9112 Section 6.3): conflicting Content-Length / Transfer-Encoding
+  -- framing must always be rejected with 400 Bad Request to prevent request smuggling.
+  is_framing_security_error: BOOL
+    do
+      match Current
+        case ConflictingFraming   then True
+        case ContentLengthInvalid then True
+        case _                    then False
+      end
+    ensure
+      framing_is_400: Result implies (Current.to_status.status_code = 400)
+    end
+
+specify {CANONICAL_EQ}
+
+  law agrees_with_structural(a: HTTP_ERROR, b: HTTP_ERROR)
+    ensure
+      sound: a.equals(b) = (a = b)
+    end
+
+specify {EQ}
+
+  law reflexive(a: HTTP_ERROR)
+    ensure
+      refl: a.equals(a)
+    end
+
+  law symmetric(a: HTTP_ERROR, b: HTTP_ERROR)
+    require
+      ab: a.equals(b)
+    ensure
+      ba: b.equals(a)
+    end
+
+  law transitive(a: HTTP_ERROR, b: HTTP_ERROR, c: HTTP_ERROR)
+    require
+      ab: a.equals(b)
+      bc: b.equals(c)
+    ensure
+      ac: a.equals(c)
+    end
+
+end
+

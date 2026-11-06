@@ -1,0 +1,116 @@
+-- Supported HTTP/1.1 request methods (RFC 9110 Section 9).
+module HTTP_METHOD satisfies CANONICAL_EQ
+
+representation {ANY}
+  | Get
+  | Head
+  | Post
+  | Put
+  | Delete
+  | Options
+
+feature {ANY}
+
+  equals(other: HTTP_METHOD): BOOL
+    do
+      Current = other
+    ensure
+      def: Result = (Current = other)
+    end
+
+  -- RFC 9110 Section 9.2.1: GET, HEAD, and OPTIONS are safe (read-only) methods.
+  is_safe: BOOL
+    do
+      match Current
+        case Get     then True
+        case Head    then True
+        case Options then True
+        case _       then False
+      end
+    ensure
+      def: Result = (Current = Get or Current = Head or Current = Options)
+    end
+
+  -- RFC 9110 Section 9.2.2: GET, HEAD, PUT, DELETE, and OPTIONS are idempotent.
+  is_idempotent: BOOL
+    do
+      match Current
+        case Post then False
+        case _    then True
+      end
+    ensure
+      def: Result = (Current != Post)
+      safe_implies_idempotent: Current.is_safe implies Result
+    end
+
+  allows_request_body: BOOL
+    do
+      match Current
+        case Post then True
+        case Put  then True
+        case _    then False
+      end
+    ensure
+      def: Result = (Current = Post or Current = Put)
+      safe_no_body: Current.is_safe implies not Result
+    end
+
+  to_string: STRING
+    do
+      match Current
+        case Get     then "GET"
+        case Head    then "HEAD"
+        case Post    then "POST"
+        case Put     then "PUT"
+        case Delete  then "DELETE"
+        case Options then "OPTIONS"
+      end
+    ensure
+      non_empty: not Result.is_empty
+      min_len: Result.byte_length >= 3
+      max_len: Result.byte_length <= 7
+    end
+
+specify {CANONICAL_EQ}
+
+  law agrees_with_structural(a: HTTP_METHOD, b: HTTP_METHOD)
+    ensure
+      sound: a.equals(b) = (a = b)
+    end
+
+specify {EQ}
+
+  law reflexive(a: HTTP_METHOD)
+    ensure
+      refl: a.equals(a)
+    end
+
+  law symmetric(a: HTTP_METHOD, b: HTTP_METHOD)
+    require
+      ab: a.equals(b)
+    ensure
+      ba: b.equals(a)
+    end
+
+  law transitive(a: HTTP_METHOD, b: HTTP_METHOD, c: HTTP_METHOD)
+    require
+      ab: a.equals(b)
+      bc: b.equals(c)
+    ensure
+      ac: a.equals(c)
+    end
+
+specify {ANY}
+
+  law safe_methods_are_idempotent(m: HTTP_METHOD)
+    ensure
+      safe_idemp: m.is_safe implies m.is_idempotent
+    end
+
+  law safe_methods_disallow_body(m: HTTP_METHOD)
+    ensure
+      no_body: m.is_safe implies not m.allows_request_body
+    end
+
+end
+

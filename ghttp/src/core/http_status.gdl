@@ -1,0 +1,245 @@
+-- Validated 3-digit HTTP status code (RFC 9110 Section 15: 100..599).
+module HTTP_STATUS satisfies CANONICAL_EQ
+
+representation {NONE}
+  raw_code: NAT
+
+invariant
+  valid_range: raw_code >= 100 and raw_code <= 599
+
+create {ANY}
+
+  make(c: NAT): HTTP_STATUS
+    require
+      in_http_range: c >= 100 and c <= 599
+    do
+      { raw_code = c }
+    ensure
+      code_set: Result.status_code = c
+    end
+
+  ok: HTTP_STATUS
+    do
+      { raw_code = 200 }
+    ensure
+      is_200: Result.status_code = 200
+      success: Result.is_success
+      allows_body: not Result.forbids_body
+    end
+
+  created: HTTP_STATUS
+    do
+      { raw_code = 201 }
+    ensure
+      is_201: Result.status_code = 201
+      success: Result.is_success
+      allows_body: not Result.forbids_body
+    end
+
+  no_content: HTTP_STATUS
+    do
+      { raw_code = 204 }
+    ensure
+      is_204: Result.status_code = 204
+      success: Result.is_success
+      empty_body_required: Result.forbids_body
+    end
+
+  bad_request: HTTP_STATUS
+    do
+      { raw_code = 400 }
+    ensure
+      is_400: Result.status_code = 400
+      client_err: Result.is_client_error
+      allows_body: not Result.forbids_body
+    end
+
+  not_found: HTTP_STATUS
+    do
+      { raw_code = 404 }
+    ensure
+      is_404: Result.status_code = 404
+      client_err: Result.is_client_error
+      allows_body: not Result.forbids_body
+    end
+
+  method_not_allowed: HTTP_STATUS
+    do
+      { raw_code = 405 }
+    ensure
+      is_405: Result.status_code = 405
+      client_err: Result.is_client_error
+      allows_body: not Result.forbids_body
+    end
+
+  payload_too_large: HTTP_STATUS
+    do
+      { raw_code = 413 }
+    ensure
+      is_413: Result.status_code = 413
+      client_err: Result.is_client_error
+      allows_body: not Result.forbids_body
+    end
+
+  uri_too_long: HTTP_STATUS
+    do
+      { raw_code = 414 }
+    ensure
+      is_414: Result.status_code = 414
+      client_err: Result.is_client_error
+      allows_body: not Result.forbids_body
+    end
+
+  request_header_fields_too_large: HTTP_STATUS
+    do
+      { raw_code = 431 }
+    ensure
+      is_431: Result.status_code = 431
+      client_err: Result.is_client_error
+      allows_body: not Result.forbids_body
+    end
+
+  internal_server_error: HTTP_STATUS
+    do
+      { raw_code = 500 }
+    ensure
+      is_500: Result.status_code = 500
+      server_err: Result.is_server_error
+      allows_body: not Result.forbids_body
+    end
+
+  not_implemented: HTTP_STATUS
+    do
+      { raw_code = 501 }
+    ensure
+      is_501: Result.status_code = 501
+      server_err: Result.is_server_error
+      allows_body: not Result.forbids_body
+    end
+
+  http_version_not_supported: HTTP_STATUS
+    do
+      { raw_code = 505 }
+    ensure
+      is_505: Result.status_code = 505
+      server_err: Result.is_server_error
+      allows_body: not Result.forbids_body
+    end
+
+feature {ANY}
+
+  status_code: NAT
+    do
+      Current.raw_code
+    ensure
+      in_range: Result >= 100 and Result <= 599
+    end
+
+  equals(other: HTTP_STATUS): BOOL
+    do
+      Current.raw_code = other.raw_code
+    ensure
+      def: Result = (Current.status_code = other.status_code)
+    end
+
+  is_informational: BOOL
+    do
+      Current.raw_code >= 100 and Current.raw_code < 200
+    ensure
+      def: Result = (Current.status_code >= 100 and Current.status_code < 200)
+    end
+
+  is_success: BOOL
+    do
+      Current.raw_code >= 200 and Current.raw_code < 300
+    ensure
+      def: Result = (Current.status_code >= 200 and Current.status_code < 300)
+    end
+
+  is_redirection: BOOL
+    do
+      Current.raw_code >= 300 and Current.raw_code < 400
+    ensure
+      def: Result = (Current.status_code >= 300 and Current.status_code < 400)
+    end
+
+  is_client_error: BOOL
+    do
+      Current.raw_code >= 400 and Current.raw_code < 500
+    ensure
+      def: Result = (Current.status_code >= 400 and Current.status_code < 500)
+    end
+
+  is_server_error: BOOL
+    do
+      Current.raw_code >= 500 and Current.raw_code <= 599
+    ensure
+      def: Result = (Current.status_code >= 500 and Current.status_code <= 599)
+    end
+
+  -- RFC 9112 Section 6.3: 1xx, 204, and 304 responses MUST NOT include a message body.
+  forbids_body: BOOL
+    do
+      (Current.raw_code >= 100 and Current.raw_code < 200) or Current.raw_code = 204 or Current.raw_code = 304
+    ensure
+      def: Result = ((Current.status_code >= 100 and Current.status_code < 200) or Current.status_code = 204 or Current.status_code = 304)
+    end
+
+  code_digits: STRING
+    do
+      if Current.raw_code = 200 then "200"
+      else if Current.raw_code = 201 then "201"
+      else if Current.raw_code = 204 then "204"
+      else if Current.raw_code = 400 then "400"
+      else if Current.raw_code = 404 then "404"
+      else if Current.raw_code = 405 then "405"
+      else if Current.raw_code = 413 then "413"
+      else if Current.raw_code = 414 then "414"
+      else if Current.raw_code = 431 then "431"
+      else if Current.raw_code = 501 then "501"
+      else if Current.raw_code = 505 then "505"
+      else "500"
+      end end end end end end end end end end end
+    ensure
+      exact_three_bytes: Result.byte_length = 3
+    end
+
+specify {CANONICAL_EQ}
+
+  law agrees_with_structural(a: HTTP_STATUS, b: HTTP_STATUS)
+    do
+      ({ raw_code = a.raw_code } = a) and ({ raw_code = b.raw_code } = b)
+    ensure
+      sound: a.equals(b) = (a = b)
+    end
+
+specify {EQ}
+
+  law reflexive(a: HTTP_STATUS)
+    ensure
+      refl: a.equals(a)
+    end
+
+  law symmetric(a: HTTP_STATUS, b: HTTP_STATUS)
+    require
+      ab: a.equals(b)
+    ensure
+      ba: b.equals(a)
+    end
+
+  law transitive(a: HTTP_STATUS, b: HTTP_STATUS, c: HTTP_STATUS)
+    require
+      ab: a.equals(b)
+      bc: b.equals(c)
+    ensure
+      ac: a.equals(c)
+    end
+
+specify {ANY}
+
+  law status_class_exhaustive(s: HTTP_STATUS)
+    ensure
+      covered: s.is_informational or s.is_success or s.is_redirection or s.is_client_error or s.is_server_error
+    end
+
+end

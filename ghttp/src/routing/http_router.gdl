@@ -1,0 +1,106 @@
+-- Generic, immutable HTTP router over a list of registered `HTTP_ROUTE` entries.
+module HTTP_ROUTER
+
+representation {NONE}
+  routes: LIST[HTTP_ROUTE]
+  route_count: NAT
+  max_routes: NAT
+
+invariant
+  count_matches: route_count = routes.length
+  within_max: route_count <= max_routes
+  max_bounded: max_routes <= 64
+
+create {ANY}
+
+  empty(cap: NAT): HTTP_ROUTER
+    require
+      cap_ok: cap <= 64
+    do
+      { routes = LIST.empty, route_count = 0, max_routes = cap }
+    ensure
+      zero_routes: Result.num_routes = 0
+      cap_set: Result.router_capacity = cap
+    end
+
+  -- Minimal default server router: only `GET /` (endpoint 1) is registered out of the box.
+  default_server_router: HTTP_ROUTER
+    do
+      { routes = LIST.empty.prepend(HTTP_ROUTE.make(Get, "/", 1)),
+        route_count = 1,
+        max_routes = 16 }
+    ensure
+      one_route: Result.num_routes = 1
+      cap_16: Result.router_capacity = 16
+      room: Result.can_register_route
+    end
+
+create {NONE}
+
+  match_routes(rs: LIST[HTTP_ROUTE], req: HTTP_REQUEST, path_seen: BOOL): ROUTE_RESULT
+    variant
+      rs.length
+    do
+      if rs.length = 0 then
+        if path_seen then MethodNotAllowed else NotFound end
+      else
+        let r = rs.head
+        if r.matches_request_path(req) then
+          if r.route_method = req.method or (req.method = Head and r.route_method = Get) then
+            Matched(r.endpoint_id, None)
+          else
+            match_routes(rs.tail, req, True)
+          end
+        else
+          match_routes(rs.tail, req, path_seen)
+        end
+      end
+    ensure
+      valid_outcome: Result.is_matched or Result.is_method_not_allowed or Result.is_not_found
+    end
+
+feature {ANY}
+
+  num_routes: NAT
+    do
+      Current.route_count
+    ensure
+      within_cap: Result <= Current.router_capacity
+      bounded: Result <= 64
+    end
+
+  router_capacity: NAT
+    do
+      Current.max_routes
+    ensure
+      bounded: Result <= 64
+    end
+
+  can_register_route: BOOL
+    do
+      Current.route_count < Current.max_routes
+    ensure
+      def: Result = (Current.num_routes < Current.router_capacity)
+    end
+
+  register(r: HTTP_ROUTE): HTTP_ROUTER
+    require
+      room: Current.can_register_route
+    do
+      { routes = Current.routes.prepend(r),
+        route_count = Current.route_count + 1,
+        max_routes = Current.max_routes }
+    ensure
+      grew: Result.num_routes = Current.num_routes + 1
+      same_cap: Result.router_capacity = Current.router_capacity
+    end
+
+  -- Walks the registered routes in `Current.routes` and matches against `req`.
+  match_request(req: HTTP_REQUEST): ROUTE_RESULT
+    do
+      match_routes(Current.routes, req, False)
+    ensure
+      valid_outcome: Result.is_matched or Result.is_method_not_allowed or Result.is_not_found
+    end
+
+end

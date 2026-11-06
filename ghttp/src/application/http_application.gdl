@@ -1,0 +1,58 @@
+-- Pure HTTP application dispatch layer (`HTTP_REQUEST -> HTTP_RESPONSE`).
+-- Provides the minimal default root handler for `HTTP_SERVER` and `dispatch_with`
+-- so REST APIs and web applications can plug in their own handler functions.
+functions HTTP_APPLICATION
+
+feature {ANY}
+
+  -- Minimal default server handler: endpoint 1 (`GET /`) returns 200 OK; all other IDs return 404.
+  default_endpoint_handler(endpoint_id: NAT): HTTP_RESPONSE
+    do
+      if endpoint_id = 1 then
+        HTTP_RESPONSE.ok_text("OK", "2")
+      else
+        HTTP_RESPONSE.not_found_empty
+      end
+    ensure
+      valid_len: Result.response_body_length <= 65536
+      root_200: (endpoint_id = 1) implies (Result.response_status_code = 200 and Result.response_body_length = 2)
+    end
+
+  -- Dispatches `req` through `router` using the default server handler.
+  dispatch(req: HTTP_REQUEST, router: HTTP_ROUTER): HTTP_RESPONSE
+    do
+      match router.match_request(req)
+        case Matched(eid, _) then
+          if eid = 1 then
+            HTTP_RESPONSE.ok_text("OK", "2")
+          else
+            HTTP_RESPONSE.not_found_empty
+          end
+        case MethodNotAllowed then
+          HTTP_RESPONSE.method_not_allowed_empty
+        case NotFound then
+          HTTP_RESPONSE.not_found_empty
+      end
+    ensure
+      valid_len: Result.response_body_length <= 65536
+    end
+
+  -- Extensible dispatcher: routes `req` through `router` and invokes a caller-supplied
+  -- pure handler function `handler(endpoint_id, req) -> HTTP_RESPONSE`.
+  dispatch_with(
+    req: HTTP_REQUEST,
+    router: HTTP_ROUTER,
+    handler: (id: NAT, r: HTTP_REQUEST) -> HTTP_RESPONSE
+  ): HTTP_RESPONSE
+    do
+      match router.match_request(req)
+        case Matched(eid, _) then
+          handler(eid, req)
+        case MethodNotAllowed then
+          HTTP_RESPONSE.method_not_allowed_empty
+        case NotFound then
+          HTTP_RESPONSE.not_found_empty
+      end
+    end
+
+end

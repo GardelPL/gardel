@@ -1,0 +1,40 @@
+-- Pure HTTP/1.1 wire serializer with verified framing guarantees (RFC 9112).
+functions HTTP_SERIALIZER
+
+feature {ANY}
+
+  serialize_headers_string(resp: HTTP_RESPONSE): STRING
+    do
+      let status_line = "HTTP/1.1 ".concat(resp.status_digits_string).concat("\r\n")
+      let cl_hdr = "Content-Length: ".concat(resp.content_length_header_value).concat("\r\n\r\n")
+      status_line.concat(cl_hdr)
+    ensure
+      exact_hdr_len: Result.byte_length = 14 + resp.content_length_digits_len + 20
+      min_hdr_len: Result.byte_length >= 35
+      bounded_hdr: Result.byte_length <= 44
+    end
+
+  serialize_to_string(resp: HTTP_RESPONSE): STRING
+    do
+      let hdr_str = serialize_headers_string(resp)
+      if resp.response_body_length = 0 then
+        hdr_str
+      else
+        hdr_str.concat(resp.body_string)
+      end
+    ensure
+      min_wire_len: Result.byte_length >= 35
+      at_least_body: Result.byte_length > resp.response_body_length
+      bounded_wire: Result.byte_length <= 65580
+    end
+
+  serialize(resp: HTTP_RESPONSE): BYTES
+    do
+      serialize_to_string(resp).to_utf8
+    ensure
+      min_wire_len: Result.length >= 35
+      at_least_body: Result.length > resp.response_body_length
+      bounded_wire: Result.length <= 65580
+    end
+
+end

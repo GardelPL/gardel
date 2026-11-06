@@ -52,6 +52,7 @@ fn project(name: &str, manifest: Option<&str>) -> PathBuf {
 fn gardelc(dir: &Path, args: &[&str]) -> Output {
     Command::new(env!("CARGO_BIN_EXE_gardelc"))
         .current_dir(dir)
+        .env("GARDEL_CACHE_DIR", dir.join("cache"))
         .args(args)
         .output()
         .expect("gardelc runs")

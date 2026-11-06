@@ -20,13 +20,18 @@ Spec draft v0.5. [plan/Roadmap.md](plan/Roadmap.md) holds the detail for each ta
 - **Private members** (E.0). Private routines and the constructors of a hidden representation were reachable from other modules, so a client could forge a value of an opaque type.
 - **Laws and private routines across modules** (E.0, E.2). A law with a hidden `require` reached clients with no hypothesis, so `check absurd: False` verified. It is now a Rule 1 error. A private routine reached through a generic result, such as `o.get.secret`, passed `E0113` and was called with its `require` unchecked, so a verified program could crash. Name resolution now follows those receivers, and the verifier refuses a private target and any `require` it cannot state.
 
+- **`assume` under `--strict`** (E.3). An `assume` nested in an expression, such as a `let` value or a call argument, was neither refused by `--strict` nor listed by `--audit`, so a false contract could verify at exit 0. Every expression and contract clause is now covered.
+
 ### Verifier
+- **Local verification cache** (E.3). A module this machine has proven is not given to the solver again, unless something that decides the answer changed: its verification condition, `gardelc`, Boogie, Z3, or the limits. The stdlib goes from 15.2 s to 0.4 s on a second run. The cache is outside the project, in `GARDEL_CACHE_DIR` or the user's cache directory, and an entry from anywhere else, or changed in any byte, is ignored. `--verify-deps` ignores the cache.
+- **Verification conditions are reproducible.** One source could give different axiom order or lambda names from one run to the next.
 - **Matching loops in the fusion axioms.** `LIST_OPS.filter(LIST.empty, p).length` and `LIST_OPS.map(l, identity)` could make Z3 run forever, past both of its limits. Fusion now stops at an empty list, and composing with the identity gives the same function.
 - **`gardelc` enforces the solver's time backstop itself**, on the whole Boogie run and its child processes, and reports the module as unproven (`GARDEL_SOLVER_BACKSTOP`).
 
 ### Behaviour changes that can reject existing code
 - Bitwise operators on `I64` are refused (`bitwise_on_signed`), and `-x` on `U64` needs `x = 0`.
 - Unknown command-line flags are errors.
+- `--strict` now refuses a nested `assume`, and `--audit` lists it.
 - A run that cannot start Boogie or Z3 is an error. It used to fall back to sampling and could report success on a false contract. `--bounded-check` still samples, on request.
 - `--inspect` shows no interface when the run has errors, and exits with status 1.
 - `--bounded-check` no longer reports its obligations as satisfied. Each module gets a `not_proven` warning, an error under `--strict`, and `--inspect` shows no interface for it.

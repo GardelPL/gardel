@@ -1,0 +1,59 @@
+-- Per-connection lifecycle state (M4).
+module CONNECTION_STATUS satisfies CANONICAL_EQ
+
+representation {ANY}
+  | ConnReading
+  | ConnWriting
+  | ConnClosing
+  | ConnClosed
+
+feature {ANY}
+
+  equals(other: CONNECTION_STATUS): BOOL
+    do
+      Current = other
+    ensure
+      def: Result = (Current = other)
+    end
+
+  can_accept_bytes: BOOL
+    do
+      match Current
+        case ConnReading then True
+        case _           then False
+      end
+    ensure
+      def: Result = (Current = ConnReading)
+      closing_rejects: (Current = ConnClosing or Current = ConnClosed) implies not Result
+    end
+
+specify {CANONICAL_EQ}
+
+  law agrees_with_structural(a: CONNECTION_STATUS, b: CONNECTION_STATUS)
+    ensure
+      sound: a.equals(b) = (a = b)
+    end
+
+specify {EQ}
+
+  law reflexive(a: CONNECTION_STATUS)
+    ensure
+      refl: a.equals(a)
+    end
+
+  law symmetric(a: CONNECTION_STATUS, b: CONNECTION_STATUS)
+    require
+      ab: a.equals(b)
+    ensure
+      ba: b.equals(a)
+    end
+
+  law transitive(a: CONNECTION_STATUS, b: CONNECTION_STATUS, c: CONNECTION_STATUS)
+    require
+      ab: a.equals(b)
+      bc: b.equals(c)
+    ensure
+      ac: a.equals(c)
+    end
+
+end

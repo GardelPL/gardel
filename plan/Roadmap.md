@@ -636,7 +636,7 @@ flowchart TD
 
 ### Phase E: Projects and Packages (the "Verified Universe")
 
-**Status:** Tasks E.0, E.1 & E.2 ✅ Completed (2026-11-05). All design questions are decided (decisions 1 to 11). E.3 can follow, using the stdlib to measure. E.4 onwards waits until a real second package exists.
+**Status:** Tasks E.0, E.1, E.2 & E.3 ✅ Completed (2026-11-06). All design questions are decided (decisions 1 to 11). E.4 onwards waits until a real second package exists.
 
 **Objective:** let a Gardel project depend on other Gardel packages without import statements, and without trusting anything that was not proven on this machine. Source stays declaration-only. A manifest, `Gardel.toml`, states what is in the universe. Modular reasoning stays Hoare's rule for a call: prove the callee's precondition, then use its postcondition.
 
@@ -746,14 +746,31 @@ flowchart TD
   - **A law's proof crossed the boundary.** `contract_only_module` kept law bodies, so a proof naming a module linked that module into every client, against decision 2, and E.3's interface hash would have depended on it. Law bodies are now withheld. Test `test_e2_a_law_proof_stays_out_of_the_interface`.
   - **The boundary could not name two packages.** `external_modules` was one set, so two dependencies saw each other's bodies, and a dependency saw the bodies of a project module: package B proved `Result = 5` from a routine of package A with no `ensure`, against decision 2. `VerifyOptions.packages` now maps each module to its package, and a module sees only the contracts of any other package. Tests `test_e2_only_contracts_cross_between_packages` and `test_e2_a_package_mate_of_a_dependency_stays_behind_the_boundary`.
   - `cargo test` 186/186, 9/9 and 4/4. `--stdlib --strict` 0/0 and the eleven examples 0/0.
-- **Known limits.** A program that states its own fixed point, such as `require LIST_OPS.filter(l, k) = l`, can still loop, and ends at the backstop as unproven. The boundary is reachable only from tests until E.4 sets `packages`, and a module is still identified by its bare name there.
+- **Known limits.** A `let` in a law's proof is not bound, and gives `E0199`. A program that states its own fixed point, such as `require LIST_OPS.filter(l, k) = l`, can still loop, and ends at the backstop as unproven. The boundary is reachable only from tests until E.4 sets `packages`, and a module is still identified by its bare name there.
 
-#### Task E.3: Local Verification Cache [ ]
-- [ ] Cache key and contents as in decision 1. Any change to a key input re-verifies.
-- [ ] Record `assume`s, and make `--strict` transitive (decision 6).
-- [ ] Add `--verify-deps`, which ignores the cache, for CI.
-- [ ] Measure the time saved on the stdlib before and after.
-- Acceptance: a mutated cache entry or a false `.gds` cannot make a client verify (finding 1 is the test). Changing the verifier version re-verifies everything.
+#### Task E.3: Local Verification Cache [✅ Completed]
+- [x] Cache key and contents as in decision 1 (`gardelc/src/proof_cache.rs`, `verify_unless_cached`). Any change to a key input re-verifies.
+  - The key is a SHA-256 of the exact VC text, the verifier id, the Boogie and Z3 versions, `--z3-rlimit`, the seed and `--fuel`. Decision 1 says "source and interfaces". The VC is the same input made exact: the solver's whole input is in the key, so a hit is the answer a run would give. It also gives decision 2 by construction: a dependency's body change inside its contract leaves a client's VC unchanged, so the client's entry stands. Within a project a client sees bodies, and is verified again.
+  - The verifier id hashes `gardelc`'s own sources, embedded with `include_str!`. `CARGO_PKG_VERSION` stayed `0.1.0` through the soundness fixes of D.9 and D.10. A test fails if a new source file is left out.
+  - The cache replaces the solver and nothing else. Every other check runs in every run, so `--strict` is not in the key and a proof from a weaker run cannot answer it. Only a clean result is stored, and `--bounded-check` neither reads nor writes.
+  - An entry counts only if it is byte for byte what this machine would write, including an HMAC-SHA-256 under a random secret kept with the cache. The cache lives in `GARDEL_CACHE_DIR`, or the user's cache directory, never in a project, so nothing that arrives with a package is read. If the tool versions cannot be found out, the cache is not used, so a warm cache does not excuse a broken solver. A cache that cannot be opened or written only costs time.
+- [x] Record `assume`s, and make `--strict` transitive (decision 6). An entry lists the `assume`s it rests on and must match the source. A dependency's `assume`s are reported in every run and named by package, and `--strict` refuses them, from the cache too. Tests `test_e3_strict_covers_a_dependency_and_its_assumes_are_reported`, `strict_is_not_answered_by_a_proof_from_a_weaker_run`.
+- [x] Add `--verify-deps`, which ignores the cache, for CI. It still stores its results.
+- [x] Measure the time saved on the stdlib before and after. Release build, median of three, cold then warm:
+
+  | Target | Modules | Cold | Warm |
+  | :--- | :---: | ---: | ---: |
+  | `--stdlib --strict` | 15 | 15.16 s | 0.42 s |
+  | All eleven examples, `--strict` | 14 | 24.78 s | 8.40 s |
+
+  Every module hits on a warm run. What is left in the examples is emission and, for a program, `gcc`. One case of each kind on `reactive_game`: a comment re-verifies nothing (1.35 s), and a routine added to the program re-verifies that module only (5.25 s of 6.43 s, as it is the slow one).
+- [x] Acceptance: `test_e3_a_forged_entry_cannot_prove_a_false_contract` is finding 1. A false `LIB` with a forged entry, correct but for the secret, still fails, and the same entry under the real secret does make the client verify, so the secret is what holds. `a_false_interface_file_is_never_read`: nothing reads a `.gds`. `test_e3_a_changed_verifier_verifies_everything_again`. Each byte of an entry is flipped in turn in `only_the_entry_this_machine_wrote_counts`.
+- **Found while building it** (each reproduced first, with a test):
+  - **A nested `assume` passed `--strict`.** The walk went only through `if` and `match` at the top of a body, so `let y = if x > 0 then assume hole: False end 1 else 7 end` verified a false contract at exit 0, under `--strict`, and `--audit` did not list it. The walk now reaches every expression and contract clause (`assume_diagnostics`). Test `test_e3_every_assume_is_found`.
+  - **A VC differed between runs of one source.** `type_bounds` was emitted in a map's order, which differs per process and reaches the solver as axiom order, so a verdict could change with it. It is sorted now. Test `test_e3_type_bounds_are_emitted_in_one_order`.
+  - **A VC depended on what was emitted before it.** Lambda numbers ran on across emissions, so a run that hit the cache gave the next module other names, and it missed. Each emission and interface now numbers from zero (`with_fresh_boogie_numbering`), and four test workarounds are gone. Test `test_e3_a_vc_does_not_depend_on_earlier_emissions`.
+- `cargo test` 202/202, 9/9, 4/4 and 16/16. `--stdlib --strict` 0/0 and the eleven examples 0/0. Ten mutations of the defences above, each made on a private copy, all turn a test red.
+- **Known limits.** The prelude is still trusted, not verified on first use, until E.4 makes it a package. `--verify-deps` covers every module, as there are no dependencies yet. A tool is identified by its version string. Entries are never removed. Whoever can read this user's secret can forge an entry, but could equally replace `gardelc`. `--run` still starts its own Boogie, and `GARDEL_KEEP_BPL` bypasses the cache, as a hit writes no VC.
 
 #### Task E.4: Path Dependencies and Package Identity [ ]
 - [ ] `[dependencies]` with `path`, setting `VerifyOptions.packages`. The universe is the prelude, the project and its direct dependencies (decision 5).
@@ -801,7 +818,7 @@ flowchart TD
 
 ## 6. Immediate Next Step
 
-**Phase E: Projects and Packages:** Tasks E.0, E.1, and E.2 are completed and all design questions are decided. The next step is Task E.3 (Local Verification Cache).
+**Phase E: Projects and Packages:** Tasks E.0, E.1, E.2 and E.3 are completed and all design questions are decided. The next step is Task E.4 (Path Dependencies and Package Identity), once a real second package exists.
 
 With **Phase A: Language Specification Harmonization**, **Phase B: Compiler Engine & Prelude Tooling**, **Task C.1: Physical Decomposition of `stdlib/`**, **Task C.2: High-Performance Smart String (`stdlib/text/string.gdl`)**, and **Task C.3: Regression Verification & Performance Benchmarking** completely executed and verified with 0 errors and 0 warnings under `--strict`, Phase C's planned work is done. The verification baseline is clean, and every module compiles from source to C with reference-counted memory (C.3 follow-ups).
 

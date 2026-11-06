@@ -1,0 +1,75 @@
+-- Supported HTTP protocol versions (RFC 9112 Section 2.3).
+module HTTP_VERSION satisfies CANONICAL_EQ
+
+representation {ANY}
+  | Http10
+  | Http11
+
+feature {ANY}
+
+  equals(other: HTTP_VERSION): BOOL
+    do
+      Current = other
+    ensure
+      def: Result = (Current = other)
+    end
+
+  is_http11: BOOL
+    do
+      match Current
+        case Http11 then True
+        case Http10 then False
+      end
+    ensure
+      def: Result = (Current = Http11)
+    end
+
+  supports_keep_alive_by_default: BOOL
+    do
+      Current.is_http11
+    ensure
+      def: Result = (Current = Http11)
+    end
+
+  to_string: STRING
+    do
+      match Current
+        case Http10 then "HTTP/1.0"
+        case Http11 then "HTTP/1.1"
+      end
+    ensure
+      non_empty: not Result.is_empty
+      exact_len: Result.byte_length = 8
+    end
+
+specify {CANONICAL_EQ}
+
+  law agrees_with_structural(a: HTTP_VERSION, b: HTTP_VERSION)
+    ensure
+      sound: a.equals(b) = (a = b)
+    end
+
+specify {EQ}
+
+  law reflexive(a: HTTP_VERSION)
+    ensure
+      refl: a.equals(a)
+    end
+
+  law symmetric(a: HTTP_VERSION, b: HTTP_VERSION)
+    require
+      ab: a.equals(b)
+    ensure
+      ba: b.equals(a)
+    end
+
+  law transitive(a: HTTP_VERSION, b: HTTP_VERSION, c: HTTP_VERSION)
+    require
+      ab: a.equals(b)
+      bc: b.equals(c)
+    ensure
+      ac: a.equals(c)
+    end
+
+end
+

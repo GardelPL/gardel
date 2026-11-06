@@ -1,0 +1,72 @@
+-- Per-connection parser and lifecycle state (M4).
+module HTTP_CONNECTION
+
+representation {NONE}
+  conn_handle: CONN_ID
+  p_state: HTTP_PARSER_STATE
+  req_count: NAT
+  lifecycle: CONNECTION_STATUS
+
+invariant
+  bounded_requests: req_count <= 1000000
+  closing_no_more_reads: (lifecycle = ConnClosing or lifecycle = ConnClosed) implies not lifecycle.can_accept_bytes
+
+create {ANY}
+
+  make_reading(c: CONN_ID): HTTP_CONNECTION
+    do
+      { conn_handle = c,
+        p_state = HTTP_PARSER_STATE.make_default,
+        req_count = 0,
+        lifecycle = ConnReading }
+    ensure
+      conn_set: Result.connection_id = c
+      zero_reqs: Result.completed_requests = 0
+      is_reading: Result.connection_status = ConnReading
+      can_read: Result.connection_status.can_accept_bytes
+    end
+
+feature {ANY}
+
+  connection_id: CONN_ID
+    do
+      Current.conn_handle
+    end
+
+  parser_state: HTTP_PARSER_STATE
+    do
+      Current.p_state
+    end
+
+  completed_requests: NAT
+    do
+      Current.req_count
+    ensure
+      bounded: Result <= 1000000
+    end
+
+  connection_status: CONNECTION_STATUS
+    do
+      Current.lifecycle
+    end
+
+  with_parser_state(next_p: HTTP_PARSER_STATE): HTTP_CONNECTION
+    require
+      reading: Current.connection_status.can_accept_bytes
+    do
+      { Current with p_state = next_p }
+    ensure
+      same_conn: Result.connection_id = Current.connection_id
+      same_status: Result.connection_status = Current.connection_status
+    end
+
+  mark_closing: HTTP_CONNECTION
+    do
+      { Current with lifecycle = ConnClosing }
+    ensure
+      same_conn: Result.connection_id = Current.connection_id
+      is_closing: Result.connection_status = ConnClosing
+      cannot_read: not Result.connection_status.can_accept_bytes
+    end
+
+end

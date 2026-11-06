@@ -1784,9 +1784,14 @@ gardelc <file.gdl> --no-prelude
 # Without this flag, a run with no working Boogie or Z3 is an error.
 gardelc <file.gdl> --bounded-check
 
+# Run the solver on every module, ignoring the local verification cache (for CI)
+gardelc <file.gdl> --verify-deps
+
 # Compile, verify, and run immediately via the backend
 gardelc <file.gdl> --run
 ```
+
+`gardelc` remembers what this machine has proven, in `GARDEL_CACHE_DIR` or your user cache directory. A module whose verification condition has not changed is not given to the solver again, and the run says how many came from the cache. Changing `gardelc`, Boogie, Z3 or a limit verifies everything again. All other checks run every time, so `--strict` cannot be answered by an earlier run. The cache only saves time: deleting it is always safe.
 
 A normal run reports five steps:
 

@@ -10,10 +10,13 @@ use std::fs;
 use std::process::Command;
 use std::rc::Rc;
 
+use proof_cache::ProofCache;
+
 mod c11_typed;
 pub mod manifest;
 mod names;
 mod patterns;
+mod proof_cache;
 pub use c11_typed::emit_c11_typed;
 
 /// In a `program` or `functions` module (no `Current`), a free name that is a routine of
@@ -5245,6 +5248,18 @@ fn linked_user_modules_for(m: &ModuleDecl) -> Vec<ModuleDecl> {
 
 /// Runs `f` with module `n`'s own Boogie context installed (its prelude and linked
 /// dependencies), restoring the caller's context and type environment afterwards.
+/// Runs `f` with lambdas and obligation binders numbered from zero. A text's names must not
+/// depend on what was emitted before it: the cache keys on that text, and an interface is
+/// shared by every client.
+fn with_fresh_boogie_numbering<T>(f: impl FnOnce() -> T) -> T {
+    let saved_lambda = BOOGIE_LAMBDA_COUNTER.with(|c| c.replace(0));
+    let saved_obligation = BOOGIE_OBLIGATION_COUNTER.with(|c| c.replace(0));
+    let out = f();
+    BOOGIE_LAMBDA_COUNTER.with(|c| c.set(saved_lambda));
+    BOOGIE_OBLIGATION_COUNTER.with(|c| c.set(saved_obligation));
+    out
+}
+
 fn in_own_boogie_ctx<T>(n: &ModuleDecl, f: impl FnOnce() -> T) -> T {
     let ctx = Rc::new(BoogiePreludeCtx::for_module(n));
     let own = if ctx.modules.is_empty() {
@@ -5254,7 +5269,7 @@ fn in_own_boogie_ctx<T>(n: &ModuleDecl, f: impl FnOnce() -> T) -> T {
     };
     let saved_ctx = BOOGIE_PRELUDE_CTX.with(|c| c.replace(own));
     let saved_env = BOOGIE_TYPE_ENV.with(|e| std::mem::take(&mut *e.borrow_mut()));
-    let out = f();
+    let out = with_fresh_boogie_numbering(f);
     BOOGIE_PRELUDE_CTX.with(|c| *c.borrow_mut() = saved_ctx);
     BOOGIE_TYPE_ENV.with(|e| *e.borrow_mut() = saved_env);
     out
@@ -6885,7 +6900,7 @@ fn prelude_contract_interface(p: &ModuleDecl) -> Rc<(String, HashSet<String>)> {
     let own_ctx = Rc::new(BoogiePreludeCtx::for_module(p));
     let saved_ctx = BOOGIE_PRELUDE_CTX.with(|c| c.replace(Some(own_ctx)));
     let saved_env = BOOGIE_TYPE_ENV.with(|e| std::mem::take(&mut *e.borrow_mut()));
-    let result = Rc::new(emit_prelude_contract_interface(p));
+    let result = Rc::new(with_fresh_boogie_numbering(|| emit_prelude_contract_interface(p)));
     BOOGIE_PRELUDE_CTX.with(|c| *c.borrow_mut() = saved_ctx);
     BOOGIE_TYPE_ENV.with(|e| *e.borrow_mut() = saved_env);
     CACHE.with(|c| c.borrow_mut().insert(p.name.clone(), result.clone()));
@@ -7140,6 +7155,10 @@ enum BoogieEmitScope {
 }
 
 pub fn emit_boogie(m: &ModuleDecl, fuel_limit: usize) -> String {
+    with_fresh_boogie_numbering(|| emit_boogie_numbered(m, fuel_limit))
+}
+
+fn emit_boogie_numbered(m: &ModuleDecl, fuel_limit: usize) -> String {
     let ctx = Rc::new(BoogiePreludeCtx::for_module(m));
     if ctx.modules.is_empty() {
         // No prelude ADT or linked project module referenced (or bootstrap mode): the
@@ -7262,7 +7281,10 @@ fn emit_boogie_parts_with_options(
     // A conditional `where tp satisfies CANONICAL_EQ` bound does not make `tp_eq` structural
     // module-wide; see `canonical_where_guard`.
     let conditional_tps = conditional_canonical_tps(m);
-    for (tp, bound) in &m.type_bounds {
+    // Sorted, as a map's order differs between runs and the order of axioms reaches the solver.
+    let mut bounds: Vec<(&String, &String)> = m.type_bounds.iter().collect();
+    bounds.sort();
+    for (tp, bound) in bounds {
         // Module type parameters are the holes of `type M A ...;` and are quantified (`<A>`) in every
         // module function, so they must not also be declared as global types.
         let is_adt_tp = m.type_params.contains(tp);
@@ -12995,6 +13017,101 @@ fn which_solver(name: &str) -> Option<String> {
     None
 }
 
+/// The source of `gardelc`, so a verifier id changes with any change to the compiler. The
+/// crate's version does not: it stayed `0.1.0` through soundness fixes that changed what is
+/// proven. Hashing the executable instead would take seconds in a debug build.
+const VERIFIER_SOURCES: &[(&str, &str)] = &[
+    ("c11_typed.rs", include_str!("c11_typed.rs")),
+    ("main.rs", include_str!("main.rs")),
+    ("manifest.rs", include_str!("manifest.rs")),
+    ("names.rs", include_str!("names.rs")),
+    ("patterns.rs", include_str!("patterns.rs")),
+    ("proof_cache.rs", include_str!("proof_cache.rs")),
+];
+
+fn verifier_id() -> String {
+    let mut text = String::new();
+    for (name, source) in VERIFIER_SOURCES {
+        text.push_str(&format!("{name}:{}:{source}", source.len()));
+    }
+    proof_cache::hex(&proof_cache::sha256(text.as_bytes()))
+}
+
+/// The versions of Boogie and Z3, or `None` if either cannot say.
+fn tool_versions(boogie: &str, z3: &str) -> Option<String> {
+    let version = |path: &str, flag: &str| {
+        let limit = std::time::Duration::from_secs(TOOL_VERSION_LIMIT);
+        let output = output_within(Command::new(path).arg(flag), limit).ok()??;
+        let text = String::from_utf8_lossy(&output.stdout);
+        let line = text.lines().map(str::trim).find(|l| !l.is_empty())?.to_string();
+        output.status.success().then_some(line)
+    };
+    Some(format!("{}\n{}", version(boogie, "/version")?, version(z3, "--version")?))
+}
+
+/// Asking a tool for its version is fast, so a tool that takes this long is not working.
+const TOOL_VERSION_LIMIT: u64 = 30;
+
+thread_local! {
+    /// The cache of this verification run, if it has one.
+    static PROOF_CACHE: std::cell::RefCell<Option<Rc<ProofCache>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+fn with_proof_cache<R>(cache: Option<Rc<ProofCache>>, f: impl FnOnce() -> R) -> R {
+    let prev = PROOF_CACHE.with(|c| c.replace(cache));
+    let res = f();
+    PROOF_CACHE.with(|c| *c.borrow_mut() = prev);
+    res
+}
+
+/// `run_boogie_verification`, skipped when this machine has proven the same query. The cache
+/// replaces the solver and nothing else, as the checks around this call run in every run.
+fn verify_unless_cached(
+    m: &ModuleDecl,
+    fuel_limit: usize,
+    boogie_path: &str,
+    z3_path: &str,
+    src: &str,
+    input_path: &str,
+) -> Result<Vec<Diagnostic>, String> {
+    let run = || run_boogie_verification(m, fuel_limit, boogie_path, z3_path, src, input_path);
+    let Some(cache) = PROOF_CACHE.with(|c| c.borrow().clone()) else {
+        return run();
+    };
+    // Someone keeping the VC file is debugging, and a hit would write none.
+    let debugging = env::var_os("GARDEL_KEEP_BPL").is_some();
+    let tools = cache.tools(|| tool_versions(boogie_path, z3_path)).filter(|_| !debugging);
+    let Some(tools) = tools else {
+        cache.count_run();
+        return run();
+    };
+    let key = proof_key(&cache, tools, m, fuel_limit);
+    let assumes = module_assumes(m, src, input_path);
+    if cache.holds(&key, &m.name, &assumes) {
+        return Ok(Vec::new());
+    }
+    cache.count_run();
+    let diags = run()?;
+    if diags.is_empty() {
+        cache.store(&key, &m.name, &assumes);
+    }
+    Ok(diags)
+}
+
+fn proof_key(cache: &ProofCache, tools: &str, m: &ModuleDecl, fuel_limit: usize) -> String {
+    let bpl = emit_boogie(m, fuel_limit);
+    cache.key(
+        tools,
+        &proof_cache::Query {
+            bpl: &bpl,
+            rlimit: current_z3_rlimit(),
+            seed: current_z3_seed(),
+            fuel: fuel_limit,
+        },
+    )
+}
+
 fn run_boogie_verification(
     m: &ModuleDecl,
     fuel_limit: usize,
@@ -14100,6 +14217,8 @@ fn source_line_of(src: &str, input_path: &str, prefix: &str) -> Option<Span> {
 
 /// Marks the report of a module that ran under `--bounded-check`.
 const NOT_PROVEN_TAG: &str = "not_proven";
+const ASSUME_AUDIT_RULE: &str = "Phase 3 (--audit Assume Report)";
+const ASSUME_STRICT_RULE: &str = "Phase 3 (--strict Assume Disallowed)";
 
 fn verify_module_obligations(
     m: &ModuleDecl,
@@ -14122,36 +14241,7 @@ fn verify_module_obligations(
         .collect();
 
     // 1. Audit / Strict check on `assume` statements (§7)
-    for (r, _) in &all_routines {
-        collect_assume_diagnostics(
-            &r.name,
-            &r.stmts,
-            &r.body,
-            &mut Vec::new(),
-            m,
-            src,
-            input_path,
-            strict_mode,
-            audit_mode,
-            &mut diags,
-        );
-    }
-    for (_, law) in &m.specify_laws {
-        if let Some(body) = &law.body {
-            collect_assume_diagnostics(
-                &law.name,
-                &law.stmts,
-                body,
-                &mut Vec::new(),
-                m,
-                src,
-                input_path,
-                strict_mode,
-                audit_mode,
-                &mut diags,
-            );
-        }
-    }
+    diags.extend(assume_diagnostics(m, src, input_path, strict_mode, audit_mode));
 
     // 1b. Task B.3 / §9: STRING values are not CANONICAL_EQ and have no `+` (prelude mode).
     let mut string_diags = check_string_semantics(m, src, input_path);
@@ -14168,7 +14258,7 @@ fn verify_module_obligations(
     if !bounded_check {
         let verdict = match find_solvers() {
             (Some(boogie), Some(z3)) => {
-                run_boogie_verification(m, fuel_limit, &boogie, &z3, src, input_path)
+                verify_unless_cached(m, fuel_limit, &boogie, &z3, src, input_path)
             }
             (None, _) => Err("Boogie was not found".to_string()),
             (_, None) => Err("Z3 was not found".to_string()),
@@ -14207,139 +14297,189 @@ fn verify_module_obligations(
     diags
 }
 
-#[expect(
-    clippy::too_many_arguments,
-    reason = "Recursive statement traversal threads source span and CLI flags"
-)]
-fn collect_assume_diagnostics(
-    routine_name: &str,
-    stmts: &[Stmt],
-    body: &Expr,
-    path_conds: &mut Vec<String>,
+/// Every `assume` of `m`, wherever it is: a body, a branch nested in an expression, a lambda or
+/// a contract clause. `--strict` rests on this walk, so it must not skip any expression.
+fn assume_diagnostics(
     m: &ModuleDecl,
     src: &str,
     input_path: &str,
     strict_mode: bool,
     audit_mode: bool,
-    out: &mut Vec<Diagnostic>,
-) {
-    for st in stmts {
-        match st {
-            Stmt::Let(v, e) => {
-                path_conds.push(format!("let {v} = {}", format_gardel_expr(e)));
-            }
-            Stmt::Check(tag, e) => {
-                path_conds.push(format!("check {tag}: {}", format_gardel_expr(e)));
-            }
-            Stmt::Assume(tag, e) => {
-                let sp = locate_span(src, input_path, tag, routine_name);
-                let lemmas = find_relevant_lemmas(m, routine_name, e);
-                if strict_mode {
-                    out.push(
-                        Diagnostic::basic(
-                            "error",
-                            "Phase 3 (--strict Assume Disallowed)",
-                            routine_name.to_string(),
-                            tag.clone(),
-                            format!(
-                                "Unproven `assume {}: {}` is rejected under `--strict`",
-                                tag,
-                                format_gardel_expr(e)
-                            ),
-                        )
-                        .with_ai_context(
-                            sp.clone(),
-                            path_conds.clone(),
-                            BTreeMap::new(),
-                            lemmas.clone(),
-                        ),
-                    );
-                } else if audit_mode {
-                    out.push(
-                        Diagnostic::basic(
-                            "audit",
-                            "Phase 3 (--audit Assume Report)",
-                            routine_name.to_string(),
-                            tag.clone(),
-                            format!(
-                                "Audited `assume {}: {}` in `{}`",
-                                tag,
-                                format_gardel_expr(e),
-                                routine_name
-                            ),
-                        )
-                        .with_ai_context(
-                            sp,
-                            path_conds.clone(),
-                            BTreeMap::new(),
-                            lemmas,
-                        ),
-                    );
-                }
-                path_conds.push(format!("assume {tag}: {}", format_gardel_expr(e)));
-            }
-            Stmt::Reveal(target) => {
-                path_conds.push(format!("reveal {target}"));
-            }
+) -> Vec<Diagnostic> {
+    let mut walk = AssumeWalk {
+        routine: "",
+        m,
+        src,
+        input_path,
+        strict_mode,
+        audit_mode,
+        out: Vec::new(),
+    };
+    let routines = m.create_routines.iter().chain(&m.feature_routines).chain(&m.specify_routines);
+    for (_, r) in routines {
+        walk.routine = &r.name;
+        walk.clauses(&r.requires);
+        r.variant.iter().for_each(|e| walk.expr(e, &mut Vec::new()));
+        walk.block(&r.stmts, &r.body, &mut Vec::new());
+        walk.clauses(&r.ensures);
+    }
+    for (_, law) in &m.specify_laws {
+        walk.routine = &law.name;
+        walk.clauses(&law.requires);
+        law.variant.iter().for_each(|e| walk.expr(e, &mut Vec::new()));
+        walk.block(&law.stmts, law.body.as_ref().unwrap_or(&Expr::Unit), &mut Vec::new());
+        walk.clauses(&law.ensures);
+    }
+    walk.routine = "invariant";
+    walk.clauses(&m.invariants);
+    // Pattern lowering can copy an arm, and with it an `assume`.
+    let mut seen = HashSet::new();
+    walk.out.retain(|d| seen.insert((d.routine.clone(), d.tag.clone())));
+    walk.out
+}
+
+/// The `assume`s of `m` a proof rests on, as `routine tag`, in a fixed order.
+fn module_assumes(m: &ModuleDecl, src: &str, input_path: &str) -> Vec<String> {
+    let mut assumes: Vec<String> = assume_diagnostics(m, src, input_path, false, true)
+        .iter()
+        .map(|d| format!("{} {}", d.routine, d.tag))
+        .collect();
+    assumes.sort();
+    assumes
+}
+
+struct AssumeWalk<'a> {
+    routine: &'a str,
+    m: &'a ModuleDecl,
+    src: &'a str,
+    input_path: &'a str,
+    strict_mode: bool,
+    audit_mode: bool,
+    out: Vec<Diagnostic>,
+}
+
+impl AssumeWalk<'_> {
+    fn clauses(&mut self, clauses: &[(String, Expr)]) {
+        for (_, e) in clauses {
+            self.expr(e, &mut Vec::new());
         }
     }
 
-    match body {
-        Expr::If(c, ts, te, es, ee) => {
-            let mut t_pcs = path_conds.clone();
-            t_pcs.push(format_gardel_expr(c));
-            collect_assume_diagnostics(
-                routine_name,
-                ts,
-                te,
-                &mut t_pcs,
-                m,
-                src,
-                input_path,
-                strict_mode,
-                audit_mode,
-                out,
-            );
-            let mut e_pcs = path_conds.clone();
-            e_pcs.push(format!("not {}", format_gardel_expr(c)));
-            collect_assume_diagnostics(
-                routine_name,
-                es,
-                ee,
-                &mut e_pcs,
-                m,
-                src,
-                input_path,
-                strict_mode,
-                audit_mode,
-                out,
-            );
-        }
-        Expr::Match(scrut, cases) => {
-            let scrut_s = format_gardel_expr(scrut);
-            for c in cases {
-                let mut c_pcs = path_conds.clone();
-                let pat = if c.bindings().is_empty() {
-                    c.ctor().to_string()
-                } else {
-                    format!("{}({})", c.ctor(), c.bindings().join(", "))
-                };
-                c_pcs.push(format!("{scrut_s} is {pat}"));
-                collect_assume_diagnostics(
-                    routine_name,
-                    &c.stmts,
-                    &c.body,
-                    &mut c_pcs,
-                    m,
-                    src,
-                    input_path,
-                    strict_mode,
-                    audit_mode,
-                    out,
-                );
+    fn report(&mut self, tag: &str, e: &Expr, path_conds: &[String]) {
+        let text = format_gardel_expr(e);
+        let (level, rule, message) = if self.strict_mode {
+            (
+                "error",
+                ASSUME_STRICT_RULE,
+                format!("Unproven `assume {tag}: {text}` is rejected under `--strict`"),
+            )
+        } else if self.audit_mode {
+            (
+                "audit",
+                ASSUME_AUDIT_RULE,
+                format!("Audited `assume {tag}: {text}` in `{}`", self.routine),
+            )
+        } else {
+            return;
+        };
+        let sp = locate_span(self.src, self.input_path, tag, self.routine);
+        let lemmas = find_relevant_lemmas(self.m, self.routine, e);
+        self.out.push(
+            Diagnostic::basic(level, rule, self.routine.to_string(), tag.to_string(), message)
+                .with_ai_context(sp, path_conds.to_vec(), BTreeMap::new(), lemmas),
+        );
+    }
+
+    fn block(&mut self, stmts: &[Stmt], body: &Expr, path_conds: &mut Vec<String>) {
+        for st in stmts {
+            match st {
+                Stmt::Let(v, e) => {
+                    self.expr(e, path_conds);
+                    path_conds.push(format!("let {v} = {}", format_gardel_expr(e)));
+                }
+                Stmt::Check(tag, e) => {
+                    self.expr(e, path_conds);
+                    path_conds.push(format!("check {tag}: {}", format_gardel_expr(e)));
+                }
+                Stmt::Assume(tag, e) => {
+                    self.expr(e, path_conds);
+                    self.report(tag, e, path_conds);
+                    path_conds.push(format!("assume {tag}: {}", format_gardel_expr(e)));
+                }
+                Stmt::Reveal(target) => {
+                    path_conds.push(format!("reveal {target}"));
+                }
             }
         }
-        _ => {}
+        self.expr(body, path_conds);
+    }
+
+    fn expr(&mut self, e: &Expr, path_conds: &mut Vec<String>) {
+        match e {
+            Expr::Int(_)
+            | Expr::Float(_)
+            | Expr::Char(_)
+            | Expr::Unit
+            | Expr::Bool(_)
+            | Expr::Str(_)
+            | Expr::Var(_) => {}
+            Expr::UnaryNot(x)
+            | Expr::UnaryNeg(x)
+            | Expr::Forall(_, _, x)
+            | Expr::Exists(_, _, x) => self.expr(x, path_conds),
+            Expr::BinOp(_, l, r) => {
+                self.expr(l, path_conds);
+                self.expr(r, path_conds);
+            }
+            Expr::Call(_, xs) | Expr::TupleLit(xs) => {
+                xs.iter().for_each(|x| self.expr(x, path_conds));
+            }
+            Expr::MethodCall(recv, _, xs) => {
+                self.expr(recv, path_conds);
+                xs.iter().for_each(|x| self.expr(x, path_conds));
+            }
+            Expr::RecordLit(fields) => {
+                fields.iter().for_each(|(_, x)| self.expr(x, path_conds));
+            }
+            Expr::RecordUpdate(base, fields) => {
+                self.expr(base, path_conds);
+                fields.iter().for_each(|(_, x)| self.expr(x, path_conds));
+            }
+            Expr::If(c, ts, te, es, ee) => {
+                self.expr(c, path_conds);
+                let mut t_pcs = path_conds.clone();
+                t_pcs.push(format_gardel_expr(c));
+                self.block(ts, te, &mut t_pcs);
+                let mut e_pcs = path_conds.clone();
+                e_pcs.push(format!("not {}", format_gardel_expr(c)));
+                self.block(es, ee, &mut e_pcs);
+            }
+            Expr::Match(scrut, cases) => {
+                self.expr(scrut, path_conds);
+                let scrut_s = format_gardel_expr(scrut);
+                for c in cases {
+                    let mut c_pcs = path_conds.clone();
+                    let pat = if c.bindings().is_empty() {
+                        c.ctor().to_string()
+                    } else {
+                        format!("{}({})", c.ctor(), c.bindings().join(", "))
+                    };
+                    c_pcs.push(format!("{scrut_s} is {pat}"));
+                    self.block(&c.stmts, &c.body, &mut c_pcs);
+                }
+            }
+            Expr::WithIo(io, last) => {
+                for st in io {
+                    match st {
+                        IoStmt::Bind(_, x) | IoStmt::Action(x) => self.expr(x, path_conds),
+                    }
+                }
+                self.expr(last, path_conds);
+            }
+            Expr::Lambda(_, _, stmts, body) => {
+                self.block(stmts, body, &mut path_conds.clone());
+            }
+        }
     }
 }
 
@@ -17442,6 +17582,7 @@ const PLAIN_FLAGS: &[&str] = &[
     "--audit",
     "--strict",
     "--bounded-check",
+    "--verify-deps",
     "--run",
 ];
 
@@ -17519,6 +17660,8 @@ pub struct VerifyOptions {
     /// The package of each module. A module not listed belongs to the project. Nothing sets
     /// this outside tests until `[dependencies]` exists (Task E.4).
     pub packages: HashMap<String, String>,
+    /// The local verification cache. `None` runs the solver on every module.
+    pub cache: Option<Rc<ProofCache>>,
 }
 
 /// Outcome of checking and verifying all modules of a run.
@@ -17572,7 +17715,7 @@ pub fn check_and_verify_project(units: &mut [SourceUnit], opts: VerifyOptions) -
             .enumerate()
             .flat_map(|(ui, u)| u.ast.modules.iter().map(move |m| (m.clone(), ui)))
             .collect();
-        Some(Rc::new(LinkTable::with_packages(all, opts.packages)))
+        Some(Rc::new(LinkTable::with_packages(all, opts.packages.clone())))
     } else {
         None
     };
@@ -17619,23 +17762,34 @@ pub fn check_and_verify_project(units: &mut [SourceUnit], opts: VerifyOptions) -
         }
         for (mi, m) in u.ast.modules.iter().enumerate() {
             let mut mod_diags = std::mem::take(&mut pre[ui][mi]);
+            // A client is always told what a dependency rests on (decision 6).
+            let package = opts.packages.get(&m.name);
             mod_diags.extend(with_prelude_injection(opts.prelude_mode, || {
                 with_link_table(link.clone(), || {
-                    with_z3_seed(opts.z3_seed, || {
-                        with_z3_rlimit(opts.z3_rlimit, || {
-                            verify_module_phase3(
-                                m,
-                                &u.src,
-                                &u.path,
-                                opts.fuel_limit,
-                                opts.strict,
-                                opts.audit,
-                                opts.bounded_check,
-                            )
+                    with_proof_cache(opts.cache.clone(), || {
+                        with_z3_seed(opts.z3_seed, || {
+                            with_z3_rlimit(opts.z3_rlimit, || {
+                                verify_module_phase3(
+                                    m,
+                                    &u.src,
+                                    &u.path,
+                                    opts.fuel_limit,
+                                    opts.strict,
+                                    opts.audit || package.is_some(),
+                                    opts.bounded_check,
+                                )
+                            })
                         })
                     })
                 })
             }));
+            if let Some(package) = package {
+                for d in &mut mod_diags {
+                    if d.rule == ASSUME_AUDIT_RULE || d.rule == ASSUME_STRICT_RULE {
+                        d.message = format!("Dependency `{package}`: {}", d.message);
+                    }
+                }
+            }
             for d in &mut mod_diags {
                 if d.module_name.is_empty() {
                     d.module_name = m.name.clone();
@@ -17720,7 +17874,7 @@ fn main() {
     let args: Vec<String> = env::args().collect();
     if args.len() < 2 && !std::path::Path::new("Gardel.toml").is_file() {
         eprintln!(
-            "Usage: gardelc <input.gdl ... | DIR | --project <DIR> | --stdlib> [--no-prelude] [--inspect [MODULE]] [--emit-stdlib [DIR]] [--json-diagnostics] [--fuel <N>] [--z3-seed <N>] [--z3-rlimit <N>] [--audit] [--strict] [--bounded-check] [--run]"
+            "Usage: gardelc <input.gdl ... | DIR | --project <DIR> | --stdlib> [--no-prelude] [--inspect [MODULE]] [--emit-stdlib [DIR]] [--json-diagnostics] [--fuel <N>] [--z3-seed <N>] [--z3-rlimit <N>] [--audit] [--strict] [--bounded-check] [--verify-deps] [--run]"
         );
         eprintln!(
             "  --no-prelude  bootstrap mode: do not inject the Standard Prelude (implied by --stdlib and when compiling the prelude source itself, §4.1)"
@@ -17730,6 +17884,9 @@ fn main() {
         );
         eprintln!(
             "  --project <DIR>  compile project defined by Gardel.toml in DIR using src/ (or run `gardelc` with no input when ./Gardel.toml is present, §4.2)"
+        );
+        eprintln!(
+            "  --verify-deps  ignore the local verification cache and run the solver on every module"
         );
         std::process::exit(1);
     }
@@ -18061,6 +18218,20 @@ fn main() {
         );
     }
 
+    // Sampling proves nothing, so it neither reads the cache nor adds to it.
+    let proof_cache = if bounded_check {
+        None
+    } else {
+        let reads = !args.iter().any(|a| a == "--verify-deps");
+        match ProofCache::open(verifier_id(), reads) {
+            Ok(cache) => Some(Rc::new(cache)),
+            Err(e) => {
+                // The cache only saves time, so a run without one is still a full check.
+                say(&format!("[cache] off: {e}"));
+                None
+            }
+        }
+    };
     let opts = VerifyOptions {
         prelude_mode,
         project_mode,
@@ -18071,6 +18242,7 @@ fn main() {
         z3_seed,
         z3_rlimit,
         packages: HashMap::new(),
+        cache: proof_cache.clone(),
     };
     let checked = check_and_verify_project(&mut units, opts);
     if !checked.fatal.is_empty() {
@@ -18144,8 +18316,18 @@ fn main() {
     };
 
     let has_errors = diags.iter().any(|(_, d)| d.level == "error");
+    let cache_line = proof_cache.as_ref().map(|cache| {
+        let tally = cache.tally();
+        format!(
+            "[cache] {} modules verified now, {} proven earlier on this machine",
+            tally.verified, tally.from_cache
+        )
+    });
 
     if json_mode {
+        if let Some(line) = &cache_line {
+            eprintln!("{line}");
+        }
         println!("[");
         for (i, (ui, d)) in diags.iter().enumerate() {
             let comma = if i + 1 < diags.len() { "," } else { "" };
@@ -18214,6 +18396,9 @@ fn main() {
         println!(
             "[2/5] Checked §4 Visibility, §9 Concept Laws, §11 IO Boundary & §12 Direct Verification:"
         );
+        if let Some(line) = &cache_line {
+            println!("      {line}");
+        }
         if diags.is_empty() {
             println!(
                 "      0 errors, 0 warnings — all visibility, concept laws, IO linearity, overflow, and contract obligations satisfied."
@@ -18711,6 +18896,7 @@ end
             z3_seed: None,
             z3_rlimit: None,
             packages: HashMap::new(),
+            cache: None,
         };
         let checked = check_and_verify_project(&mut units, opts);
         assert!(
@@ -22991,6 +23177,226 @@ int main(void) {
         assert!(checked.fatal.is_empty() && errs.is_empty(), "{errs:?}");
     }
 
+    const E3_FALSE_LIB: &str = "functions LIB\n\nfeature {ANY}\n\n  f(x: U64): U64\n    do\n      1\n    ensure\n      lie: Result = 2\n    end\n\nend\n";
+    const E3_CLIENT: &str = "functions CLIENT\n\nfeature {ANY}\n\n  g(x: U64): U64\n    do\n      LIB.f(x)\n    ensure\n      believes: Result = 2\n    end\n\nend\n";
+
+    fn e3_cache(name: &str, verifier: &str) -> (std::path::PathBuf, Rc<ProofCache>) {
+        let dir = std::env::temp_dir().join(format!("gardelc_e3_{}_{name}", std::process::id()));
+        let cache = ProofCache::open_at(&dir, verifier.to_string(), true).expect("cache");
+        (dir, Rc::new(cache))
+    }
+
+    fn e3_run(files: &[(&str, &str)], cache: &Rc<ProofCache>, deps: &[&str]) -> CheckedProject {
+        let mut units = b4_units(files);
+        let mut opts = b4_opts(true, true);
+        opts.cache = Some(Rc::clone(cache));
+        for dep in deps {
+            opts.packages.insert((*dep).to_string(), "dep".to_string());
+        }
+        check_and_verify_project(&mut units, opts)
+    }
+
+    fn e3_errors(checked: &CheckedProject) -> Vec<String> {
+        checked
+            .diags
+            .iter()
+            .filter(|(_, d)| d.level == "error")
+            .map(|(_, d)| d.tag.clone())
+            .chain(checked.fatal.iter().map(|d| d.tag.clone()))
+            .collect()
+    }
+
+    /// The key a run gives `LIB`, for a test that must forge its entry.
+    fn e3_key_of_lib(checked: &CheckedProject, cache: &ProofCache) -> String {
+        let (Some(boogie), Some(z3)) = find_solvers() else { panic!("no solver") };
+        let tools = tool_versions(&boogie, &z3).expect("tool versions");
+        let units = b4_units(&[("lib.gdl", E3_FALSE_LIB)]);
+        let m = &units[0].ast.modules[0];
+        with_prelude_injection(true, || {
+            with_link_table(checked.link.clone(), || proof_key(cache, &tools, m, DEFAULT_FUEL))
+        })
+    }
+
+    /// Acceptance of Task E.3, on finding 1 of the Roadmap.
+    #[test]
+    fn test_e3_a_forged_entry_cannot_prove_a_false_contract() {
+        let files = [("lib.gdl", E3_FALSE_LIB), ("client.gdl", E3_CLIENT)];
+        let (dir, cache) = e3_cache("forged", "v1");
+        let cold = e3_run(&files, &cache, &["LIB"]);
+        assert_eq!(e3_errors(&cold), ["lie"]);
+
+        // Correct in every field a forger can see, but written with another machine's secret.
+        let key = e3_key_of_lib(&cold, &cache);
+        let (forger_dir, forger) = e3_cache("forger", "v1");
+        forger.store(&key, "LIB", &[]);
+        let name = format!("{key}.proof");
+        fs::copy(forger_dir.join(&name), dir.join(&name)).expect("forged entry");
+        let forged = e3_run(&files, &cache, &["LIB"]);
+        assert_eq!(e3_errors(&forged), ["lie"], "a forged entry was believed");
+
+        // What the secret protects: with it, the same entry does make the client verify.
+        cache.store(&key, "LIB", &[]);
+        assert!(e3_errors(&e3_run(&files, &cache, &["LIB"])).is_empty());
+        drop(fs::remove_dir_all(&dir));
+        drop(fs::remove_dir_all(&forger_dir));
+    }
+
+    #[test]
+    fn test_e3_a_changed_verifier_verifies_everything_again() {
+        let files = [("fine.gdl", "functions FINE\n\nfeature {ANY}\n\n  f(x: U64): U64\n    do\n      1\n    end\n\nend\n")];
+        let (dir, old) = e3_cache("verifier", "old");
+        e3_run(&files, &old, &[]);
+        assert_eq!(old.tally(), proof_cache::Tally { from_cache: 0, verified: 1 });
+        e3_run(&files, &old, &[]);
+        assert_eq!(old.tally(), proof_cache::Tally { from_cache: 1, verified: 1 });
+
+        let new = Rc::new(ProofCache::open_at(&dir, "new".to_string(), true).expect("cache"));
+        e3_run(&files, &new, &[]);
+        assert_eq!(new.tally(), proof_cache::Tally { from_cache: 0, verified: 1 });
+        drop(fs::remove_dir_all(&dir));
+    }
+
+    /// Decision 2 is what the key rests on: the client's query cannot see the body.
+    #[test]
+    fn test_e3_a_body_change_inside_a_contract_keeps_the_clients_proof() {
+        let dep = "functions DEP\n\nfeature {ANY}\n\n  f(x: U64): U64\n    do\n      1\n    ensure\n      small: Result <= 2\n    end\n\nend\n";
+        let client = "functions USER\n\nfeature {ANY}\n\n  g(x: U64): U64\n    do\n      DEP.f(x)\n    ensure\n      small: Result <= 2\n    end\n\nend\n";
+        let (dir, cache) = e3_cache("body", "v1");
+        let files = [("dep.gdl", dep), ("user.gdl", client)];
+        assert_eq!(e3_errors(&e3_run(&files, &cache, &["DEP"])), Vec::<String>::new());
+        assert_eq!(cache.tally(), proof_cache::Tally { from_cache: 0, verified: 2 });
+
+        // The dependency itself is verified again, and only it.
+        let changed = dep.replace("      1\n", "      2\n");
+        let files = [("dep.gdl", changed.as_str()), ("user.gdl", client)];
+        assert_eq!(e3_errors(&e3_run(&files, &cache, &["DEP"])), Vec::<String>::new());
+        assert_eq!(cache.tally(), proof_cache::Tally { from_cache: 1, verified: 3 });
+        drop(fs::remove_dir_all(&dir));
+    }
+
+    /// Within a project a client sees bodies, so its proof can rest on one.
+    #[test]
+    fn test_e3_a_body_change_in_the_project_verifies_its_clients_again() {
+        let mate = "functions MATE\n\nfeature {ANY}\n\n  f(x: U64): U64\n    do\n      1\n    end\n\nend\n";
+        let client = "functions USER\n\nfeature {ANY}\n\n  g(x: U64): U64\n    do\n      MATE.f(x)\n    ensure\n      one: Result = 1\n    end\n\nend\n";
+        let (dir, cache) = e3_cache("project", "v1");
+        let files = [("mate.gdl", mate), ("user.gdl", client)];
+        assert_eq!(e3_errors(&e3_run(&files, &cache, &[])), Vec::<String>::new());
+
+        let changed = mate.replace("      1\n", "      2\n");
+        let files = [("mate.gdl", changed.as_str()), ("user.gdl", client)];
+        assert_eq!(e3_errors(&e3_run(&files, &cache, &[])), ["one"]);
+        drop(fs::remove_dir_all(&dir));
+    }
+
+    #[test]
+    fn test_e3_the_verifier_id_covers_every_source_file() {
+        let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut on_disk: Vec<String> = fs::read_dir(src)
+            .expect("source directory")
+            .map(|e| e.expect("entry").file_name().to_string_lossy().into_owned())
+            .filter(|n| n.ends_with(".rs"))
+            .collect();
+        on_disk.sort();
+        let listed: Vec<&str> = VERIFIER_SOURCES.iter().map(|(n, _)| *n).collect();
+        assert_eq!(on_disk, listed);
+    }
+
+    /// `--strict` rests on finding every `assume`. All but the first of these were skipped,
+    /// and a nested `assume hole: False` verified a false contract at exit 0.
+    #[test]
+    fn test_e3_every_assume_is_found() {
+        let hole = "if x > 0 then\n assume hole: False end\n True\n else True end";
+        let bodies = [
+            format!("do\n if {hole} then 1 else 1 end\n end"),
+            format!("do\n let y = {hole}\n 1\n end"),
+            format!("do\n g({hole})\n end"),
+            format!("do\n g(not {hole})\n end"),
+            format!("do\n check c: {hole} end\n 1\n end"),
+            format!("do\n let k = fn(v: U64): BOOL do {hole} end\n 1\n end"),
+            format!("do\n match x = 0\n case True then 1\n case False then g({hole})\n end\n end"),
+            format!("require\n r: {hole}\n do\n 1\n end"),
+            format!("do\n 1\n ensure\n e: {hole}\n end"),
+        ];
+        for body in &bodies {
+            let src = format!("functions PROBE\n\nfeature {{ANY}}\n\n  g(b: BOOL): U64\n    do\n      1\n    end\n\n  f(x: U64): U64\n {body}\n\nend\n");
+            let units = b4_units(&[("probe.gdl", &src)]);
+            let m = &units[0].ast.modules[0];
+            let found = assume_diagnostics(m, &src, "probe.gdl", true, false);
+            assert!(found.len() == 1 && found[0].tag == "hole", "{body}: {found:?}");
+            assert_eq!(module_assumes(m, &src, "probe.gdl"), ["f hole"], "{body}");
+        }
+
+        let law = format!("functions PROBE\n\nspecify {{ANY}}\n\n  law l(x: U64)\n    ensure\n      e: {hole}\n    end\n\nend\n");
+        let units = b4_units(&[("probe.gdl", &law)]);
+        assert_eq!(module_assumes(&units[0].ast.modules[0], &law, "probe.gdl"), ["l hole"]);
+    }
+
+    /// Decision 6: a dependency's `assume`s reach its client, and `--strict` refuses them.
+    #[test]
+    fn test_e3_strict_covers_a_dependency_and_its_assumes_are_reported() {
+        let dep = "functions DEP\n\nfeature {ANY}\n\n  f(x: U64): U64\n    do\n      let y = if x > 0 then\n        assume hole: x > 1 end\n        1\n      else 1 end\n      y\n    end\n\nend\n";
+        let client = "functions USER\n\nfeature {ANY}\n\n  g(x: U64): U64\n    do\n      DEP.f(x)\n    end\n\nend\n";
+        let files = [("dep.gdl", dep), ("user.gdl", client)];
+        let (dir, cache) = e3_cache("assume", "v1");
+
+        let mut units = b4_units(&files);
+        let mut opts = b4_opts(true, false);
+        opts.cache = Some(Rc::clone(&cache));
+        opts.packages.insert("DEP".to_string(), "acme.dep".to_string());
+        let checked = check_and_verify_project(&mut units, opts);
+        assert!(e3_errors(&checked).is_empty());
+        let reported: Vec<_> = checked.diags.iter().filter(|(_, d)| d.tag == "hole").collect();
+        assert!(
+            reported.len() == 1
+                && reported[0].1.level == "audit"
+                && reported[0].1.message.contains("`acme.dep`"),
+            "{reported:?}"
+        );
+
+        // From the cache, under `--strict`. The project's own `assume` is not a dependency's.
+        let checked = e3_run(&files, &cache, &["DEP"]);
+        assert_eq!(cache.tally().from_cache, 2);
+        assert_eq!(e3_errors(&checked), ["hole"]);
+        let refused = checked.diags.iter().find(|(_, d)| d.tag == "hole").expect("refusal");
+        assert!(refused.1.message.contains("Dependency `dep`"), "{refused:?}");
+
+        let mut units = b4_units(&files);
+        let checked = check_and_verify_project(&mut units, b4_opts(true, false));
+        assert!(checked.diags.iter().all(|(_, d)| d.tag != "hole"), "{:?}", checked.diags);
+        drop(fs::remove_dir_all(&dir));
+    }
+
+    /// Nor on what was emitted before it: a run that hits the cache emits less than one that
+    /// does not, and a lambda's number would differ, so the next module would miss.
+    #[test]
+    fn test_e3_a_vc_does_not_depend_on_earlier_emissions() {
+        let first = "functions FIRST\n\nfeature {ANY}\n\n  f(l: LIST[U64], c: U64): LIST[U64]\n    do\n      LIST_OPS.filter(l, fn(x: U64): BOOL do x != c end)\n    end\n\nend\n";
+        let second = "functions SECOND\n\nfeature {ANY}\n\n  g(l: LIST[U64], c: U64): LIST[U64]\n    do\n      LIST_OPS.filter(l, fn(x: U64): BOOL do x != c end)\n    end\n\nend\n";
+        let units = b4_units(&[("first.gdl", first), ("second.gdl", second)]);
+        let (a, b) = (&units[0].ast.modules[0], &units[1].ast.modules[0]);
+        with_prelude_injection(true, || {
+            let alone = emit_boogie(b, DEFAULT_FUEL);
+            assert!(alone.contains("lam_SECOND_"), "{alone}");
+            emit_boogie(a, DEFAULT_FUEL);
+            assert_eq!(alone, emit_boogie(b, DEFAULT_FUEL));
+        });
+    }
+
+    /// The solver's input must not depend on a map's order: a run's verdict could change with
+    /// it, and the cache would miss.
+    #[test]
+    fn test_e3_type_bounds_are_emitted_in_one_order() {
+        let src = "module PACK[A: EQ, B: EQ, C: EQ, D: EQ]\n\nrepresentation {ANY}\n  | Pack(a: A, b: B, c: C, d: D)\n\nend\n";
+        let units = b4_units(&[("pack.gdl", src)]);
+        let bpl = with_prelude_injection(true, || emit_boogie(&units[0].ast.modules[0], DEFAULT_FUEL));
+        let positions: Vec<usize> = ["function A_eq<", "function B_eq<", "function C_eq<", "function D_eq<"]
+            .iter()
+            .map(|name| bpl.find(name).unwrap_or_else(|| panic!("{name}: {bpl}")))
+            .collect();
+        assert!(positions.is_sorted(), "{positions:?}");
+    }
+
     /// A command that outlives any test, through a child, as Boogie runs Z3.
     fn slow_process_tree() -> Command {
         #[cfg(windows)]
@@ -23199,7 +23605,6 @@ int main(void) {
         assert_eq!(dir_files, manifest_files, "both modes must resolve the exact same source files");
 
         // Now compile and verify both, comparing emitted .bpl and .c
-        BOOGIE_LAMBDA_COUNTER.with(|c| c.set(0));
         let dir_file_tuples: Vec<(String, String)> = dir_files
             .iter()
             .map(|p| (p.clone(), fs::read_to_string(p).unwrap()))
@@ -23220,13 +23625,13 @@ int main(void) {
             z3_seed: Some(1),
             z3_rlimit: Some(DEFAULT_Z3_RLIMIT),
             packages: HashMap::new(),
+            cache: None,
         };
 
         let dir_res = check_and_verify_project(&mut dir_units, opts.clone());
         assert!(dir_res.fatal.is_empty(), "dir fatal: {:?}", dir_res.fatal);
         assert!(dir_res.diags.is_empty(), "dir diags: {:?}", dir_res.diags);
 
-        BOOGIE_LAMBDA_COUNTER.with(|c| c.set(0));
         let manifest_file_tuples: Vec<(String, String)> = manifest_files
             .iter()
             .map(|p| (p.clone(), fs::read_to_string(p).unwrap()))
@@ -23244,11 +23649,9 @@ int main(void) {
         // Compare emitted Boogie for each module
         for (u_dir, u_man) in dir_units.iter().zip(manifest_units.iter()) {
             for (m_dir, m_man) in u_dir.ast.modules.iter().zip(u_man.ast.modules.iter()) {
-                BOOGIE_LAMBDA_COUNTER.with(|c| c.set(0));
                 let bpl_dir = with_prelude_injection(true, || {
                     with_link_table(dir_res.link.clone(), || emit_boogie(m_dir, 1))
                 });
-                BOOGIE_LAMBDA_COUNTER.with(|c| c.set(0));
                 let bpl_man = with_prelude_injection(true, || {
                     with_link_table(manifest_res.link.clone(), || emit_boogie(m_man, 1))
                 });
@@ -24695,6 +25098,7 @@ end
             z3_seed: None,
             z3_rlimit: None,
             packages: HashMap::new(),
+            cache: None,
         }
     }
 

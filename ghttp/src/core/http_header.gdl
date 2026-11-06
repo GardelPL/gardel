@@ -1,0 +1,148 @@
+-- Single HTTP header field with bounded name and value lengths (RFC 9110 Section 5).
+module HTTP_HEADER satisfies EQ
+
+representation {NONE}
+  field_name: STRING
+  field_value: STRING
+  name_len: NAT
+  value_len: NAT
+
+invariant
+  name_len_matches: name_len = field_name.byte_length
+  value_len_matches: value_len = field_value.byte_length
+  name_non_empty: name_len >= 1
+  name_bounded: name_len <= 128
+  value_bounded: value_len <= 1024
+
+create {ANY}
+
+  make(n: STRING, v: STRING): HTTP_HEADER
+    require
+      name_present: n.byte_length >= 1
+      name_fits: n.byte_length <= 128
+      val_fits: v.byte_length <= 1024
+    do
+      { field_name = n,
+        field_value = v,
+        name_len = n.byte_length,
+        value_len = v.byte_length }
+    ensure
+      name_set: Result.name.equals(n)
+      value_set: Result.value.equals(v)
+      nlen_set: Result.name_byte_length = n.byte_length
+      vlen_set: Result.value_byte_length = v.byte_length
+    end
+
+  content_type_json: HTTP_HEADER
+    do
+      { field_name = "Content-Type",
+        field_value = "application/json",
+        name_len = 12,
+        value_len = 16 }
+    ensure
+      nlen_12: Result.name_byte_length = 12
+      vlen_16: Result.value_byte_length = 16
+    end
+
+  content_type_text: HTTP_HEADER
+    do
+      { field_name = "Content-Type",
+        field_value = "text/plain",
+        name_len = 12,
+        value_len = 10 }
+    ensure
+      nlen_12: Result.name_byte_length = 12
+      vlen_10: Result.value_byte_length = 10
+    end
+
+  connection_close: HTTP_HEADER
+    do
+      { field_name = "Connection",
+        field_value = "close",
+        name_len = 10,
+        value_len = 5 }
+    ensure
+      nlen_10: Result.name_byte_length = 10
+      vlen_5: Result.value_byte_length = 5
+    end
+
+feature {ANY}
+
+  name: STRING
+    do
+      Current.field_name
+    ensure
+      non_empty: Result.byte_length >= 1
+      bounded: Result.byte_length <= 128
+    end
+
+  value: STRING
+    do
+      Current.field_value
+    ensure
+      bounded: Result.byte_length <= 1024
+    end
+
+  name_byte_length: NAT
+    do
+      Current.name_len
+    ensure
+      matches_str: Result = Current.name.byte_length
+      in_range: Result >= 1 and Result <= 128
+    end
+
+  value_byte_length: NAT
+    do
+      Current.value_len
+    ensure
+      matches_str: Result = Current.value.byte_length
+      bounded: Result <= 1024
+    end
+
+  wire_byte_length: NAT
+    do
+      Current.name_len + 2 + Current.value_len + 2
+    ensure
+      def: Result = Current.name_byte_length + Current.value_byte_length + 4
+      at_least_five: Result >= 5
+      bounded: Result <= 1156
+    end
+
+  serialize_line: STRING
+    do
+      Current.field_name.concat(": ").concat(Current.field_value).concat("\r\n")
+    ensure
+      exact_wire_len: Result.byte_length = Current.wire_byte_length
+      at_least_five: Result.byte_length >= 5
+    end
+
+  equals(other: HTTP_HEADER): BOOL
+    do
+      Current.field_name.equals(other.field_name) and Current.field_value.equals(other.field_value)
+    ensure
+      def: Result = (Current.name.equals(other.name) and Current.value.equals(other.value))
+    end
+
+specify {EQ}
+
+  law reflexive(a: HTTP_HEADER)
+    ensure
+      refl: a.equals(a)
+    end
+
+  law symmetric(a: HTTP_HEADER, b: HTTP_HEADER)
+    require
+      ab: a.equals(b)
+    ensure
+      ba: b.equals(a)
+    end
+
+  law transitive(a: HTTP_HEADER, b: HTTP_HEADER, c: HTTP_HEADER)
+    require
+      ab: a.equals(b)
+      bc: b.equals(c)
+    ensure
+      ac: a.equals(c)
+    end
+
+end

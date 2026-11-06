@@ -1,0 +1,102 @@
+-- Bounded collection of HTTP headers (enforces MAX_HEADERS resource safety invariant).
+module HTTP_HEADERS
+
+representation {NONE}
+  items: LIST[HTTP_HEADER]
+  count: NAT
+  max_count: NAT
+
+invariant
+  count_matches: count = items.length
+  within_limit: count <= max_count
+  cap_bounded: max_count <= 64
+
+create {ANY}
+
+  empty_with_limit(cap: NAT): HTTP_HEADERS
+    require
+      valid_cap: cap <= 64
+    do
+      { items = LIST.empty, count = 0, max_count = cap }
+    ensure
+      zero_count: Result.num_headers = 0
+      cap_set: Result.max_headers = cap
+      empty_flag: Result.has_no_headers
+    end
+
+  default_empty: HTTP_HEADERS
+    do
+      { items = LIST.empty, count = 0, max_count = 32 }
+    ensure
+      zero_count: Result.num_headers = 0
+      cap_32: Result.max_headers = 32
+      room_available: Result.has_header_room
+    end
+
+create {NONE}
+
+  find_in_list(hs: LIST[HTTP_HEADER], key: STRING): OPTION[STRING]
+    variant
+      hs.length
+    do
+      if hs.length = 0 then
+        None
+      else
+        if hs.head.name.equals(key) then
+          Some(hs.head.value)
+        else
+          find_in_list(hs.tail, key)
+        end
+      end
+    end
+
+feature {ANY}
+
+  num_headers: NAT
+    do
+      Current.count
+    ensure
+      within_cap: Result <= Current.max_headers
+      bounded: Result <= 64
+    end
+
+  max_headers: NAT
+    do
+      Current.max_count
+    ensure
+      bounded: Result <= 64
+    end
+
+  has_no_headers: BOOL
+    do
+      Current.count = 0
+    ensure
+      def: Result = (Current.num_headers = 0)
+    end
+
+  has_header_room: BOOL
+    do
+      Current.count < Current.max_count
+    ensure
+      def: Result = (Current.num_headers < Current.max_headers)
+    end
+
+  add(h: HTTP_HEADER): HTTP_HEADERS
+    require
+      room: Current.has_header_room
+    do
+      { items = Current.items.prepend(h),
+        count = Current.count + 1,
+        max_count = Current.max_count }
+    ensure
+      grew: Result.num_headers = Current.num_headers + 1
+      same_cap: Result.max_headers = Current.max_headers
+      not_empty: not Result.has_no_headers
+    end
+
+  lookup_header(key: STRING): OPTION[STRING]
+    do
+      find_in_list(Current.items, key)
+    end
+
+end

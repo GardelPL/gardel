@@ -1,0 +1,52 @@
+-- Algebraic outcome of an incremental HTTP/1.1 parse step.
+module HTTP_PARSE_RESULT
+
+representation {ANY}
+  | NeedMore(state: HTTP_PARSER_STATE)
+  | Complete(request: HTTP_REQUEST, remaining: BYTES)
+  | Failed(err: HTTP_ERROR)
+
+feature {ANY}
+
+  is_complete: BOOL
+    do
+      match Current
+        case Complete(_, _) then True
+        case _              then False
+      end
+    ensure
+      def: Result = (match Current case Complete(_, _) then True case _ then False end)
+    end
+
+  is_need_more: BOOL
+    do
+      match Current
+        case NeedMore(_) then True
+        case _           then False
+      end
+    ensure
+      def: Result = (match Current case NeedMore(_) then True case _ then False end)
+    end
+
+  is_failed: BOOL
+    do
+      match Current
+        case Failed(_) then True
+        case _         then False
+      end
+    ensure
+      def: Result = (match Current case Failed(_) then True case _ then False end)
+    end
+
+specify {ANY}
+
+  law outcome_partition(r: HTTP_PARSE_RESULT)
+    ensure
+      trichotomy: r.is_complete or r.is_need_more or r.is_failed
+      disjoint_complete_need: not (r.is_complete and r.is_need_more)
+      disjoint_complete_fail: not (r.is_complete and r.is_failed)
+      disjoint_need_fail: not (r.is_need_more and r.is_failed)
+    end
+
+end
+
