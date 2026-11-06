@@ -18,6 +18,11 @@ Spec draft v0.5. [plan/Roadmap.md](plan/Roadmap.md) holds the detail for each ta
 - **Obligations reach every expression** (D.9). Overflow, division by zero, callee preconditions and `check` were skipped in lambdas, in `if` and `match` nested in an expression, in tuples, under `not`, in record fields and in a body `match`'s scrutinee. Such programs verified, then wrapped or crashed at run time.
 - **`I64`** (D.10). `/` and `%` proved Euclidean results while the binary truncated, so `(-7) / 2 = -4` verified and the program computed `-3`. `-x` at `I64.min` and `I64.min / -1` had no check. Wrapping on `I64` was read as unsigned.
 - **Private members** (E.0). Private routines and the constructors of a hidden representation were reachable from other modules, so a client could forge a value of an opaque type.
+- **Laws and private routines across modules** (E.0, E.2). A law with a hidden `require` reached clients with no hypothesis, so `check absurd: False` verified. It is now a Rule 1 error. A private routine reached through a generic result, such as `o.get.secret`, passed `E0113` and was called with its `require` unchecked, so a verified program could crash. Name resolution now follows those receivers, and the verifier refuses a private target and any `require` it cannot state.
+
+### Verifier
+- **Matching loops in the fusion axioms.** `LIST_OPS.filter(LIST.empty, p).length` and `LIST_OPS.map(l, identity)` could make Z3 run forever, past both of its limits. Fusion now stops at an empty list, and composing with the identity gives the same function.
+- **`gardelc` enforces the solver's time backstop itself**, on the whole Boogie run and its child processes, and reports the module as unproven (`GARDEL_SOLVER_BACKSTOP`).
 
 ### Behaviour changes that can reject existing code
 - Bitwise operators on `I64` are refused (`bitwise_on_signed`), and `-x` on `U64` needs `x = 0`.

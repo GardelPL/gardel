@@ -5,9 +5,11 @@
 //! temporary file. A private member of another module is refused here too (`E0113`), since
 //! the visibility rules of `check_visibility_and_semantics` see one module at a time.
 //!
-//! A receiver's type is followed only as far as parameters, `let`s and routine results go.
-//! A member on a receiver of unknown type is left alone, and a failure there is reported by
-//! the `E0199` backstop in `parse_boogie_output`.
+//! A receiver's type is followed through parameters, `let`s, routine results with their type
+//! arguments, `if`, `match`, pattern bindings and constructor calls. A member on a receiver of
+//! unknown type is refused only when every module declaring it hides it from here. Otherwise
+//! the verifier, which knows the target, refuses a private one, and a failure there is reported
+//! by the `E0199` backstop in `parse_boogie_output`.
 
 use super::*;
 

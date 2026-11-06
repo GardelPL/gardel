@@ -636,7 +636,7 @@ flowchart TD
 
 ### Phase E: Projects and Packages (the "Verified Universe")
 
-**Status:** Tasks E.0 & E.1 ✅ Completed (2026-11-05). All design questions are decided (decisions 1 to 11). E.1 completed. E.2 and E.3 can follow, using the stdlib to measure. E.4 onwards waits until a real second package exists.
+**Status:** Tasks E.0, E.1 & E.2 ✅ Completed (2026-11-05). All design questions are decided (decisions 1 to 11). E.3 can follow, using the stdlib to measure. E.4 onwards waits until a real second package exists.
 
 **Objective:** let a Gardel project depend on other Gardel packages without import statements, and without trusting anything that was not proven on this machine. Source stays declaration-only. A manifest, `Gardel.toml`, states what is in the universe. Modular reasoning stays Hoare's rule for a call: prove the callee's precondition, then use its postcondition.
 
@@ -707,7 +707,8 @@ flowchart TD
 - [x] An unknown flag is an error. A mistyped `--stric` used to run the weaker check and report success. `--boogie`, used by the old tutorial, was one such flag.
 - [x] Spec §4.2 corrected: directories are recursive. The guide's table of contents linked to a section that did not exist.
 - Tests `test_e0_every_undefined_name_has_a_rule_and_a_location` (rule and line), `test_e0_all_repository_sources_resolve` (every example and the stdlib, so a false rejection fails here), `test_e0_private_members_stay_private`, `test_e0_constructors_of_one_name`, `test_e0_what_boogie_refuses_is_not_shown_as_boogie_text`, `test_e0_flags_are_known_or_refused`. `cargo test` 164/164. `--stdlib --strict` 0/0 and the eleven examples 0/0.
-- **Known limits.** A member on a receiver of unknown type is not resolved here, and reaches `E0199` or the verifier. `feature {OTHER}` across files is not usable, as the export list forms a cycle (`E0103`), so `E0113` is tested only for `{NONE}` and for a module outside the list.
+- **Found in review.** `E0113` missed a receiver whose type comes from a generic, `if`, `match` or a pattern, so `o.get.secret` passed. These are followed now, and a name hidden by every module declaring it is refused on any receiver. The verifier refuses a `{NONE}` target itself (`routine_is_private`), since it knows the target when the name does not. Test `test_e0_hidden_members_behind_inferred_receivers`, `test_e0_inferred_receivers_refuse_nothing_that_is_visible`, `test_e0_a_call_of_a_private_routine_never_skips_its_require`.
+- **Known limits.** A member on a receiver of unknown type whose name another module exports reaches the verifier, which refuses a `{NONE}` target but not one outside a `{FRIEND}` list. `feature {OTHER}` across files is not usable, as the export list forms a cycle (`E0103`), so `E0113` is tested only for `{NONE}` and for a module outside the list.
 
 #### Task E.1: `Gardel.toml` Without Dependencies [✅ Completed]
 - [x] `[project]` with `name` and `version`, read by the strict TOML 1.0 subset parser of decision 10 (`gardelc/src/manifest.rs`). `gardelc` with no input, or `--project DIR`, reads it and uses `src/`.
@@ -732,6 +733,14 @@ flowchart TD
   - Adding the contract postcondition to the dependency allows the client's proof to succeed.
   - A body change inside the contract (including adding `Current` references, lambdas, or string literals) leaves the client's proof and result unchanged and emits byte-identical Boogie background theories for the client.
   - Ghost queries, triggers, and hidden representation in `.gds` / `--inspect` are canonically formatted and withhold private invariants, `{NONE}` members, and `do` bodies.
+- **Found in review** (all reproduced first, each with a test):
+  - **`False` was provable.** `e6c402e` removed a hidden `require` from a law but kept its conclusion, so a client got the law with no hypothesis. A `require` of an exported law is now under Rule 1, and the emitter drops a law whose hypothesis it would withhold. Withholding an `ensure` stays allowed, as that only weakens a law. Test `test_e2_a_law_cannot_hide_its_require`.
+  - **A `require` with no predicate was skipped.** E.2 stopped declaring `pre_*` for private routines, and the call site skipped what was not declared, so a private `safe_div(0)` verified and the binary crashed. It now fails.
+  - **The acceptance test had never passed.** Its `COUNTER_DEP` fixture sent Z3 into a matching loop (below), and past that its check for `str_lit_` matched the preamble's `str_lit_empty`.
+  - **Matching loops in the preamble.** `Seq_filter(empty, k) == empty` and `Seq_map(xs, id) == xs` make a list look like a filtered or mapped one, so fusion matched its own result forever. This predates E.2 and reached plain code such as `LIST_OPS.map(l, identity)`. Fusion now needs `Seq_length(xs) > 0`, and `Fn1_compose` has identity laws, so fusion's result is a term that already exists. Test `test_fusion_axioms_end_on_their_fixed_points`.
+  - **`/timeLimit` did not stop Z3.** A matching loop never reaches Z3's checks of its limits. `gardelc` now kills the Boogie run and its children at `BOOGIE_TIME_BACKSTOP` (`output_within`) and reports the module as unproven. Test `test_output_within_stops_a_process_tree_at_its_limit`, Windows only so far.
+  - `cargo test` 181/181. `--stdlib --strict` 0/0 and the eleven examples 0/0.
+- **Known limits.** A program that states its own fixed point, such as `require LIST_OPS.filter(l, k) = l`, can still loop, and ends at the backstop as unproven. The boundary is reachable only from tests until E.4 sets `external_modules`, and two external packages see each other's bodies until then. A law's proof body stays in `contract_only_module`, so it can change a client's linked modules (for E.3's cache key).
 
 #### Task E.3: Local Verification Cache [ ]
 - [ ] Cache key and contents as in decision 1. Any change to a key input re-verifies.

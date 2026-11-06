@@ -596,7 +596,7 @@ end
 
 To prevent information leaks, circular dependencies, and unsound proofs across module boundaries:
 
-1. **Contract Visibility**: Every symbol in a routine's `require` clause must be at least as visible as the routine itself. Callers cannot be asked to satisfy conditions they cannot see.
+1. **Contract Visibility**: Every symbol in a routine's `require` clause must be at least as visible as the routine itself. Callers cannot be asked to satisfy conditions they cannot see. The same holds for the `require` of an exported law: keep a law with a private hypothesis in `specify {NONE}`.
 2. **Visible Ensures**: A client only sees `ensure` clauses containing symbols it has permission to see.
 3. **Ghost Stays Ghost**: Symbols in `specify` can be used in contracts (`require`, `ensure`, `invariant`, `check`), but **never** in executable runtime code.
 4. **Runtime-Checkable Preconditions**: Public preconditions should be expressible using public runtime queries so callers can write `if` statements before calling.

@@ -373,9 +373,9 @@ A project may declare its identity and boundaries via a `Gardel.toml` file in it
 | `E0110: unknown_variable` | A name that is not a parameter, local, field or routine |
 | `E0111: wrong_argument_count` | A call to a known routine with the wrong number of arguments |
 | `E0112: ambiguous_constructor` | A constructor declared by two other user modules. A module's own constructor always wins, as it does over the prelude's (§4.1) |
-| `E0113: hidden_member` | A private routine or hidden field of another module, or a constructor of a representation not exported to the module. A hidden representation can be neither built nor matched |
+| `E0113: hidden_member` | A private routine or hidden field of another module, or a constructor of a representation not exported to the module. A hidden representation can be neither built nor matched. The verifier reports a private target that name resolution could not type under the same rule |
 
-`E0105` is reserved for `ambiguous_module_reference` (Roadmap, Phase E). A receiver's type is followed through parameters, `let`s and routine results. Beyond that, what the verifier cannot translate is `E0199: verifier_translation_failed`: the module is not verified, and the fault is reported as a limit of `gardelc`, not of the program. An unknown command-line flag is an error.
+`E0105` is reserved for `ambiguous_module_reference` (Roadmap, Phase E). A receiver's type is followed through parameters, `let`s, routine results with their type arguments, `if`, `match`, pattern bindings and constructor calls. A `require` of an exported law may not mention what the law's clients cannot see, as for a routine: a client given the conclusion without the hypothesis could prove `False`. Beyond that, what the verifier cannot translate is `E0199: verifier_translation_failed`: the module is not verified, and the fault is reported as a limit of `gardelc`, not of the program. An unknown command-line flag is an error.
 
 ---
 
@@ -1502,7 +1502,7 @@ When Boogie/Z3 returns `unknown` or fails to prove an obligation:
    - Adjust function unfolding with `reveal f` or increase routine `fuel`.
    - Formulate ghost lemmas in `specify` blocks proving inductive sub-goals.
    - In rare exploratory phases, mark an unproven assumption with `assume tag: predicate end`. `gardelc --audit` lists all ambient assumptions, and production compilation (`--strict`) strictly rejects any remaining `assume` blocks.
-4. **Solver Limit.** Each Boogie procedure has a budget of Z3 resources (`--z3-rlimit <N>` overrides the default). The budget counts solver work, not time, so a verdict does not depend on machine load. An obligation that exhausts it is *unproven*, not refuted: it is reported as `Phase 3 Boogie (Verification Resource Limit)`, without a counterexample. Prefer a lemma to a higher limit. `--z3-seed <N>` (or `GARDEL_Z3_SEED`) fixes Z3's random seed for proof stability checks; an invalid value in either option is an error.
+4. **Solver Limit.** Each Boogie procedure has a budget of Z3 resources (`--z3-rlimit <N>` overrides the default). The budget counts solver work, not time, so a verdict does not depend on machine load. An obligation that exhausts it is *unproven*, not refuted: it is reported as `Phase 3 Boogie (Verification Resource Limit)`, without a counterexample. Prefer a lemma to a higher limit. A matching loop can outrun the solver's own checks of this budget, so `gardelc` also stops a Boogie run after 600 seconds (`GARDEL_SOLVER_BACKSTOP` overrides it, in seconds). That is a hang, not a verdict, and the module is reported as unproven. `--z3-seed <N>` (or `GARDEL_Z3_SEED`) fixes Z3's random seed for proof stability checks; an invalid value in either option is an error.
 
 ---
 
