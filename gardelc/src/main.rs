@@ -5046,19 +5046,23 @@ fn prelude_modules_wanted(m: &ModuleDecl) -> HashSet<&'static str> {
 pub struct LinkTable {
     modules: Vec<ModuleDecl>,
     file_of: HashMap<String, usize>,
-    external_modules: HashSet<String>,
+    /// The package of each module. A module not listed belongs to the project.
+    package_of: HashMap<String, String>,
     iface_cache: std::cell::RefCell<HashMap<String, Rc<(String, HashSet<String>)>>>,
 }
 
 impl LinkTable {
     /// `modules`: every (concept-expanded) user module of the run with its file index.
     pub fn new(modules: Vec<(ModuleDecl, usize)>) -> Self {
-        Self::with_external(modules, HashSet::new())
+        Self::with_packages(modules, HashMap::new())
     }
 
-    /// `modules` with a set of `external_modules` that represent dependencies across a package
-    /// boundary (Task E.2: contract-only interfaces whose bodies are withheld).
-    pub fn with_external(modules: Vec<(ModuleDecl, usize)>, external_modules: HashSet<String>) -> Self {
+    /// `modules` split into packages by `package_of`. Only contracts cross between two
+    /// packages (Task E.2), and the project is a package like any other.
+    pub fn with_packages(
+        modules: Vec<(ModuleDecl, usize)>,
+        package_of: HashMap<String, String>,
+    ) -> Self {
         let mut file_of = HashMap::new();
         let mut ms = Vec::new();
         for (m, f) in modules {
@@ -5068,20 +5072,15 @@ impl LinkTable {
         LinkTable {
             modules: ms,
             file_of,
-            external_modules,
+            package_of,
             iface_cache: std::cell::RefCell::new(HashMap::new()),
         }
     }
 
-    /// True if `name` is marked as an external dependency across a package boundary.
-    pub fn is_external(&self, name: &str) -> bool {
-        self.external_modules.contains(name)
-    }
-
-    /// True when `callee` is an external dependency from `caller`'s perspective
-    /// (i.e., `callee` is in `external_modules`, while `caller` is in the local package).
+    /// True when `caller` and `callee` are in different packages, so `caller` sees only the
+    /// contracts of `callee`.
     pub fn is_external_for(&self, caller: &str, callee: &str) -> bool {
-        self.is_external(callee) && !self.is_external(caller)
+        self.package_of.get(caller) != self.package_of.get(callee)
     }
 
     fn module(&self, name: &str) -> Option<&ModuleDecl> {
@@ -17184,21 +17183,21 @@ pub fn check_group_packaging(ast: &FileAst, src: &str, input_path: &str) -> Vec<
     diags
 }
 
-fn parse_fuel_arg(args: &[String]) -> usize {
+fn parse_fuel_arg(args: &[String]) -> Result<usize, String> {
+    let parse = |val: &str| {
+        val.parse::<usize>()
+            .map_err(|_| format!("--fuel: invalid fuel `{val}` (expected a non-negative integer)"))
+    };
+    let mut fuel = DEFAULT_FUEL;
     for (idx, arg) in args.iter().enumerate() {
         if arg == "--fuel" {
-            if let Some(val) = args.get(idx + 1) {
-                if let Ok(parsed) = val.parse::<usize>() {
-                    return parsed;
-                }
-            }
+            let val = args.get(idx + 1).ok_or("--fuel: expected a value after the option")?;
+            fuel = parse(val)?;
         } else if let Some(val) = arg.strip_prefix("--fuel=") {
-            if let Ok(parsed) = val.parse::<usize>() {
-                return parsed;
-            }
+            fuel = parse(val)?;
         }
     }
-    DEFAULT_FUEL
+    Ok(fuel)
 }
 
 fn parse_z3_seed_value(val: &str, source: &str) -> Result<u32, String> {
@@ -17517,7 +17516,9 @@ pub struct VerifyOptions {
     pub bounded_check: bool,
     pub z3_seed: Option<u32>,
     pub z3_rlimit: Option<u64>,
-    pub external_modules: HashSet<String>,
+    /// The package of each module. A module not listed belongs to the project. Nothing sets
+    /// this outside tests until `[dependencies]` exists (Task E.4).
+    pub packages: HashMap<String, String>,
 }
 
 /// Outcome of checking and verifying all modules of a run.
@@ -17571,7 +17572,7 @@ pub fn check_and_verify_project(units: &mut [SourceUnit], opts: VerifyOptions) -
             .enumerate()
             .flat_map(|(ui, u)| u.ast.modules.iter().map(move |m| (m.clone(), ui)))
             .collect();
-        Some(Rc::new(LinkTable::with_external(all, opts.external_modules)))
+        Some(Rc::new(LinkTable::with_packages(all, opts.packages)))
     } else {
         None
     };
@@ -17835,7 +17836,17 @@ fn main() {
     let strict_mode = args.iter().any(|a| a == "--strict");
     let bounded_check = args.iter().any(|a| a == "--bounded-check");
     let no_prelude_flag = args.iter().any(|a| a == "--no-prelude");
-    let fuel_limit = parse_fuel_arg(&args);
+    let fuel_limit = match parse_fuel_arg(&args) {
+        Ok(fuel) => fuel,
+        Err(e) => exit_with_frontend_error(
+            json_mode,
+            "Command Line",
+            "gardelc",
+            "invalid_arguments",
+            e,
+            "",
+        ),
+    };
     let env_seed = env::var_os("GARDEL_Z3_SEED").map(|v| v.to_string_lossy().into_owned());
     let z3_seed = match parse_z3_seed(&args, env_seed.as_deref()) {
         Ok(seed) => seed,
@@ -18059,7 +18070,7 @@ fn main() {
         bounded_check,
         z3_seed,
         z3_rlimit,
-        external_modules: HashSet::new(),
+        packages: HashMap::new(),
     };
     let checked = check_and_verify_project(&mut units, opts);
     if !checked.fatal.is_empty() {
@@ -18699,7 +18710,7 @@ end
             bounded_check: false,
             z3_seed: None,
             z3_rlimit: None,
-            external_modules: HashSet::new(),
+            packages: HashMap::new(),
         };
         let checked = check_and_verify_project(&mut units, opts);
         assert!(
@@ -22853,6 +22864,66 @@ int main(void) {
     }
 
     #[test]
+    fn test_e2_only_contracts_cross_between_packages() {
+        const A: &str = "functions A_DEP\n\nfeature {ANY}\n\n  five: U64\n    do\n      5\n    end\n\nend\n";
+        const B: &str = "functions B_DEP\n\nfeature {ANY}\n\n  uses: U64\n    do\n      A_DEP.five\n    ensure\n      five: Result = 5\n    end\n\nend\n";
+        let verify = |packages: &[(&str, &str)]| -> Vec<Diagnostic> {
+            let mut units = b4_units(&[("a_dep.gdl", A), ("b_dep.gdl", B)]);
+            let mut opts = b4_opts(true, true);
+            for (module, package) in packages {
+                opts.packages.insert((*module).to_string(), (*package).to_string());
+            }
+            let checked = check_and_verify_project(&mut units, opts);
+            assert!(checked.fatal.is_empty(), "fatal: {:?}", checked.fatal);
+            checked.diags.into_iter().map(|(_, d)| d).collect()
+        };
+        let refused = |diags: &[Diagnostic]| {
+            diags.iter().any(|d| d.level == "error" && d.tag == "five")
+        };
+
+        // `A_DEP` states nothing about `five`, so a proof from another package has no fact.
+        assert!(refused(&verify(&[("A_DEP", "acme.a"), ("B_DEP", "acme.b")])), "two dependencies");
+        assert!(refused(&verify(&[("A_DEP", "acme.a")])), "the project and a dependency");
+        assert!(refused(&verify(&[("B_DEP", "acme.b")])), "a dependency and the project");
+
+        // Within one package linking stays as it is (decision 2).
+        for packages in [&[][..], &[("A_DEP", "acme.a"), ("B_DEP", "acme.a")][..]] {
+            let diags = verify(packages);
+            assert!(diags.is_empty(), "{packages:?}: {diags:?}");
+        }
+    }
+
+    #[test]
+    fn test_e2_a_package_mate_of_a_dependency_stays_behind_the_boundary() {
+        let helper = |body: &str| {
+            format!("functions A_HELPER\n\nfeature {{ANY}}\n\n  tag: U64\n    do\n      {body}\n    ensure\n      pos: Result > 0\n    end\n\nend\n")
+        };
+        let dep = "functions A_DEP\n\nfeature {ANY}\n\n  wrap: U64\n    do\n      A_HELPER.tag\n    ensure\n      same: Result = A_HELPER.tag\n    end\n\nend\n";
+        let client = "functions CLIENT\n\nfeature {ANY}\n\n  use_it: U64\n    do\n      A_DEP.wrap\n    ensure\n      pos: Result > 0\n    end\n\nend\n";
+        let emit_client = |helper_src: &str| -> String {
+            let mut units = b4_units(&[
+                ("a_helper.gdl", helper_src),
+                ("a_dep.gdl", dep),
+                ("client.gdl", client),
+            ]);
+            let mut opts = b4_opts(true, true);
+            opts.packages.insert("A_HELPER".to_string(), "acme.a".to_string());
+            opts.packages.insert("A_DEP".to_string(), "acme.a".to_string());
+            let checked = check_and_verify_project(&mut units, opts);
+            assert!(checked.fatal.is_empty(), "fatal: {:?}", checked.fatal);
+            assert!(checked.diags.is_empty(), "{:?}", checked.diags);
+            with_prelude_injection(true, || {
+                with_link_table(checked.link.clone(), || {
+                    emit_boogie(&units[2].ast.modules[0], DEFAULT_FUEL)
+                })
+            })
+        };
+        let one = emit_client(&helper("1"));
+        let two = emit_client(&helper("let f = fn(x: NAT): NAT do x end\n      2"));
+        assert_eq!(one, two, "a package-mate's body must not reach a client of that package");
+    }
+
+    #[test]
     fn test_e2_a_law_proof_stays_out_of_the_interface() {
         let dep = |proof: &str| {
             format!("functions DEP\n\nfeature {{ANY}}\n\n  one: U64\n    do\n      1\n    ensure\n      is_one: Result = 1\n    end\n\nspecify {{ANY}}\n\n  law one_is_positive(x: U64)\n{proof}    ensure\n      pos: DEP.one > 0\n    end\n\nend\n")
@@ -22864,7 +22935,7 @@ int main(void) {
             let mut units =
                 b4_units(&[("dep.gdl", dep_src), ("helper.gdl", helper), ("client.gdl", client)]);
             let mut opts = b4_opts(true, true);
-            opts.external_modules.insert("DEP".to_string());
+            opts.packages.insert("DEP".to_string(), "dep".to_string());
             let checked = check_and_verify_project(&mut units, opts);
             assert!(checked.fatal.is_empty(), "fatal: {:?}", checked.fatal);
             let errs: Vec<_> = checked.diags.iter().filter(|(_, d)| d.level == "error").collect();
@@ -22994,6 +23065,20 @@ int main(void) {
             assert!(!d.message.contains(".bpl"), "{}", d.message);
         }
         assert_eq!(diags.len(), 1, "one report per module: {diags:?}");
+    }
+
+    #[test]
+    fn test_fuel_is_a_number_or_refused() {
+        let args = |list: &[&str]| -> Vec<String> {
+            std::iter::once("gardelc").chain(list.iter().copied()).map(String::from).collect()
+        };
+        assert_eq!(parse_fuel_arg(&args(&["a.gdl"])), Ok(DEFAULT_FUEL));
+        assert_eq!(parse_fuel_arg(&args(&["--fuel", "0"])), Ok(0));
+        assert_eq!(parse_fuel_arg(&args(&["--fuel=3"])), Ok(3));
+        assert_eq!(parse_fuel_arg(&args(&["--fuel", "1", "--fuel", "2"])), Ok(2));
+        for bad in [&["--fuel", "abc"][..], &["--fuel=abc"], &["--fuel=-1"], &["--fuel"], &["--fuel", "--strict"]] {
+            assert!(parse_fuel_arg(&args(bad)).is_err(), "{bad:?}");
+        }
     }
 
     #[test]
@@ -23134,7 +23219,7 @@ int main(void) {
             bounded_check: false,
             z3_seed: Some(1),
             z3_rlimit: Some(DEFAULT_Z3_RLIMIT),
-            external_modules: HashSet::new(),
+            packages: HashMap::new(),
         };
 
         let dir_res = check_and_verify_project(&mut dir_units, opts.clone());
@@ -23289,7 +23374,7 @@ end
         {
             let mut units = b4_units(&[("math_dep.gdl", math_dep_v1), ("client.gdl", client_src)]);
             let mut opts = b4_opts(true, true);
-            opts.external_modules.insert("MATH_DEP".to_string());
+            opts.packages.insert("MATH_DEP".to_string(), "dep".to_string());
             let checked = check_and_verify_project(&mut units, opts);
             assert!(checked.fatal.is_empty());
             let client_errs: Vec<&Diagnostic> = checked
@@ -23331,7 +23416,7 @@ end
         let bpl_client_v2 = {
             let mut units = b4_units(&[("math_dep.gdl", math_dep_v2), ("client.gdl", client_src)]);
             let mut opts = b4_opts(true, true);
-            opts.external_modules.insert("MATH_DEP".to_string());
+            opts.packages.insert("MATH_DEP".to_string(), "dep".to_string());
             let checked = check_and_verify_project(&mut units, opts);
             assert!(checked.fatal.is_empty());
             let client_errs: Vec<&Diagnostic> = checked
@@ -23373,7 +23458,7 @@ end
         let bpl_client_v3 = {
             let mut units = b4_units(&[("math_dep.gdl", math_dep_v3), ("client.gdl", client_src)]);
             let mut opts = b4_opts(true, true);
-            opts.external_modules.insert("MATH_DEP".to_string());
+            opts.packages.insert("MATH_DEP".to_string(), "dep".to_string());
             let checked = check_and_verify_project(&mut units, opts);
             assert!(checked.fatal.is_empty());
             let client_errs: Vec<&Diagnostic> = checked
@@ -23579,7 +23664,7 @@ end
                 ("counter_client.gdl", adt_client),
             ]);
             let mut opts = b4_opts(true, true);
-            opts.external_modules.insert("COUNTER_DEP".to_string());
+            opts.packages.insert("COUNTER_DEP".to_string(), "dep".to_string());
             let checked = check_and_verify_project(&mut units, opts);
             assert!(checked.fatal.is_empty(), "fatal: {:?}", checked.fatal);
             let client_errs: Vec<&Diagnostic> = checked
@@ -23616,7 +23701,7 @@ end
             let mut units = b4_units(files);
             let mut opts = b4_opts(true, true);
             for ext in external {
-                opts.external_modules.insert((*ext).to_string());
+                opts.packages.insert((*ext).to_string(), "dep".to_string());
             }
             let checked = check_and_verify_project(&mut units, opts);
             assert!(checked.fatal.is_empty(), "fatal: {:?}", checked.fatal);
@@ -24609,7 +24694,7 @@ end
             bounded_check: false,
             z3_seed: None,
             z3_rlimit: None,
-            external_modules: HashSet::new(),
+            packages: HashMap::new(),
         }
     }
 

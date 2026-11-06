@@ -102,6 +102,15 @@ fn bounded_checking_needs_no_verifier_when_it_is_asked_for() {
 }
 
 #[test]
+fn a_mistyped_fuel_is_refused() {
+    let dir = project("fuel", "fine.gdl", TRUE);
+    let out = gardelc(&dir).args(["fine.gdl", "--fuel", "abc"]).output().expect("gardelc runs");
+    assert!(!out.status.success(), "{}", text(&out));
+    assert!(text(&out).contains("invalid fuel"), "{}", text(&out));
+    drop(fs::remove_dir_all(&dir));
+}
+
+#[test]
 fn bounded_checking_never_reports_a_proof() {
     let dir = project("bounded_report", "fine.gdl", TRUE);
     let run = |flags: &[&str]| {

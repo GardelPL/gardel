@@ -305,7 +305,7 @@ pub fn parse_toml_subset(src: &str) -> Result<BTreeMap<String, RawTable>, Manife
     for (zero_line, line_raw) in src.lines().enumerate() {
         let line_num = zero_line + 1;
         check_comment_control_chars(line_raw, line_num)?;
-        let line = line_raw.trim();
+        let line = toml_trim(line_raw);
 
         if line.is_empty() || line.starts_with('#') {
             continue;
@@ -392,6 +392,12 @@ fn check_comment_control_chars(line: &str, line_num: usize) -> Result<(), Manife
     Ok(())
 }
 
+/// Strips what TOML calls whitespace, space and tab. `str::trim` also strips Unicode spaces and
+/// control characters such as a form feed, which TOML refuses outside a string.
+fn toml_trim(s: &str) -> &str {
+    s.trim_matches([' ', '\t'])
+}
+
 /// Parses a `[table]` header line.
 fn parse_table_header(line: &str, line_num: usize) -> Result<String, ManifestError> {
     if line.starts_with("[[") {
@@ -407,7 +413,7 @@ fn parse_table_header(line: &str, line_num: usize) -> Result<String, ManifestErr
         });
     };
 
-    let raw_name = line[1..end_idx].trim();
+    let raw_name = toml_trim(&line[1..end_idx]);
     if raw_name.is_empty() {
         return Err(ManifestError {
             line: line_num,
@@ -415,7 +421,7 @@ fn parse_table_header(line: &str, line_num: usize) -> Result<String, ManifestErr
         });
     }
 
-    let trailing = line[end_idx + 1..].trim();
+    let trailing = toml_trim(&line[end_idx + 1..]);
     if !trailing.is_empty() && !trailing.starts_with('#') {
         return Err(ManifestError {
             line: line_num,
@@ -435,8 +441,8 @@ fn parse_key_value(line: &str, line_num: usize) -> Result<(String, TomlValue), M
         });
     };
 
-    let key_part = line[..eq_pos].trim();
-    let val_part = line[eq_pos + 1..].trim();
+    let key_part = toml_trim(&line[..eq_pos]);
+    let val_part = toml_trim(&line[eq_pos + 1..]);
 
     if key_part.is_empty() {
         return Err(ManifestError {
@@ -455,7 +461,7 @@ fn parse_key_value(line: &str, line_num: usize) -> Result<(String, TomlValue), M
 fn parse_key(key_str: &str, line_num: usize) -> Result<String, ManifestError> {
     if key_str.starts_with('"') {
         let (parsed, trailing) = extract_string_literal(key_str, line_num)?;
-        if !trailing.trim().is_empty() {
+        if !toml_trim(trailing).is_empty() {
             return Err(ManifestError {
                 line: line_num,
                 message: format!("unexpected trailing characters '{trailing}' in quoted key"),
@@ -491,7 +497,7 @@ fn parse_value(val_str: &str, line_num: usize) -> Result<TomlValue, ManifestErro
     }
     if val_str.starts_with('"') {
         let (s, trailing) = extract_string_literal(val_str, line_num)?;
-        let trailing = trailing.trim();
+        let trailing = toml_trim(trailing);
         if !trailing.is_empty() && !trailing.starts_with('#') {
             return Err(ManifestError {
                 line: line_num,
@@ -501,7 +507,7 @@ fn parse_value(val_str: &str, line_num: usize) -> Result<TomlValue, ManifestErro
         Ok(TomlValue::String(s))
     } else if val_str.starts_with('{') {
         let (tbl, trailing) = parse_inline_table(val_str, line_num)?;
-        let trailing = trailing.trim();
+        let trailing = toml_trim(trailing);
         if !trailing.is_empty() && !trailing.starts_with('#') {
             return Err(ManifestError {
                 line: line_num,
@@ -511,7 +517,7 @@ fn parse_value(val_str: &str, line_num: usize) -> Result<TomlValue, ManifestErro
         Ok(TomlValue::InlineTable(tbl))
     } else {
         let clean = match find_unquoted_char(val_str, '#') {
-            Some(idx) => val_str[..idx].trim(),
+            Some(idx) => toml_trim(&val_str[..idx]),
             None => val_str,
         };
         Err(ManifestError {
@@ -677,7 +683,7 @@ fn parse_inline_table(
         });
     };
 
-    let inner = src[1..end_idx].trim();
+    let inner = toml_trim(&src[1..end_idx]);
     let remaining = &src[end_idx + 1..];
 
     let mut table = BTreeMap::new();
@@ -687,7 +693,7 @@ fn parse_inline_table(
 
     let items = split_unquoted(inner, ',');
     for item in items {
-        let item = item.trim();
+        let item = toml_trim(item);
         if item.is_empty() {
             return Err(ManifestError {
                 line: line_num,
@@ -703,8 +709,8 @@ fn parse_inline_table(
             });
         };
 
-        let k_str = item[..eq_idx].trim();
-        let v_str = item[eq_idx + 1..].trim();
+        let k_str = toml_trim(&item[..eq_idx]);
+        let v_str = toml_trim(&item[eq_idx + 1..]);
 
         let key = parse_key(k_str, line_num)?;
         if !v_str.starts_with('"') || v_str.starts_with("\"\"\"") {
@@ -715,7 +721,7 @@ fn parse_inline_table(
         }
 
         let (val, trailing) = extract_string_literal(v_str, line_num)?;
-        if !trailing.trim().is_empty() {
+        if !toml_trim(trailing).is_empty() {
             return Err(ManifestError {
                 line: line_num,
                 message: format!("unexpected trailing content '{trailing}' in inline table entry"),
@@ -918,6 +924,31 @@ mod tests {
         let empty_manifest = "# empty\n";
         let err = parse_manifest(empty_manifest).expect_err("missing [project] should fail");
         assert_eq!(err.line, 1);
+    }
+
+    #[test]
+    fn test_only_space_and_tab_are_toml_whitespace() {
+        let name = "name = \"echo-server\"";
+        let version = "version = \"0.1.0\"";
+        let good = format!("\t[project] \t\r\n \t{name}\t# note\r\n \t\r\n{version} \r\n");
+        parse_manifest(&good).expect("space, tab and CRLF are TOML");
+
+        for (bad, line) in [
+            (format!("\u{a0}[project]\n{name}\n{version}\n"), 1),
+            (format!("[project]\u{a0}\n{name}\n{version}\n"), 1),
+            (format!("[project]\n{name}\u{a0}\n{version}\n"), 2),
+            (format!("[project]\n\u{3000}{name}\n{version}\n"), 2),
+            (format!("[project]\nname\u{c} = \"echo-server\"\n{version}\n"), 2),
+            (format!("[project]\nname =\u{b} \"echo-server\"\n{version}\n"), 2),
+            (format!("[project]\n\u{a0}\n{name}\n{version}\n"), 2),
+            (format!("[project]\n\u{c}\n{name}\n{version}\n"), 2),
+            (format!("[project]\n{name}\r\r\n{version}\n"), 2),
+        ] {
+            let err = parse_manifest(&bad).expect_err(&format!("{bad:?} must be refused"));
+            assert_eq!(err.line, line, "{bad:?}");
+        }
+        assert!(parse_key_value("a = {\u{a0}path = \"x\" }", 1).is_err());
+        assert!(parse_key_value("a = { path\u{c} = \"x\" }", 1).is_err());
     }
 
     #[test]
