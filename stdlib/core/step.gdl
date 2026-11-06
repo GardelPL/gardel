@@ -12,6 +12,8 @@ feature {ANY}
         case Stop(_, _) then True
         case _ then False
       end
+    ensure
+      def: Result = (match Current case Stop(_, _) then True case _ then False end)
     end
 
 end

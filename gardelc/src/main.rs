@@ -11,6 +11,7 @@ use std::process::Command;
 use std::rc::Rc;
 
 mod c11_typed;
+pub mod manifest;
 mod names;
 mod patterns;
 pub use c11_typed::emit_c11_typed;
@@ -185,6 +186,16 @@ impl Visibility {
             (Visibility::Modules(sym_mods), Visibility::Modules(ctx_mods)) => {
                 ctx_mods.iter().all(|m| sym_mods.contains(m))
             }
+        }
+    }
+}
+
+impl std::fmt::Display for Visibility {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Visibility::Any => write!(f, "{{ANY}}"),
+            Visibility::None => write!(f, "{{NONE}}"),
+            Visibility::Modules(ms) => write!(f, "{{{}}}", ms.join(", ")),
         }
     }
 }
@@ -2890,6 +2901,29 @@ pub fn check_visibility_and_semantics(m: &ModuleDecl) -> Vec<Diagnostic> {
         }
     }
 
+    // Rule 1 for laws. A law states a fact only under its `require`, so a client that cannot
+    // see the hypothesis cannot be given the conclusion. The law could also be vacuous.
+    for (vis, law) in &m.specify_laws {
+        if *vis == Visibility::None {
+            continue;
+        }
+        let (bound, non_self) = law_clause_locals(law, &m.name);
+        for (tag, req) in &law.requires {
+            if !clause_is_visible_in_interface(req, &m.name, &symbol_vis, vis, &bound, &non_self) {
+                diags.push(Diagnostic::basic(
+                    "error",
+                    "Rule 1 (Contract Visibility)",
+                    law.name.clone(),
+                    tag.clone(),
+                    format!(
+                        "Precondition `{tag}` of law `{}` references a symbol less visible than the law ({vis}). Export the symbol, or make the law `specify {{NONE}}`",
+                        law.name
+                    ),
+                ));
+            }
+        }
+    }
+
     // Rule 5: Invariant visibility to representation friends
     for (tag, inv_expr) in &m.invariants {
         for sym in collect_symbols(inv_expr) {
@@ -4845,7 +4879,11 @@ impl BoogiePreludeCtx {
         let linked = linked_user_modules_for(m);
         let mut wanted = prelude_modules_wanted(m);
         for n in &linked {
-            wanted.extend(prelude_modules_wanted(n));
+            if is_external_dependency(&m.name, &n.name) {
+                wanted.extend(prelude_modules_wanted(&contract_only_module(n)));
+            } else {
+                wanted.extend(prelude_modules_wanted(n));
+            }
         }
         // RESULT.to_option is stated over OPTION: inject the real OPTION theory alongside.
         if wanted.contains("RESULT") || m.name == "RESULT" {
@@ -4893,6 +4931,9 @@ impl BoogiePreludeCtx {
         // new variants, and that must not change what existing user code means.
         let mut user_ctors = HashSet::new();
         for n in &linked {
+            if is_external_dependency(&m.name, &n.name) && n.repr_vis == Visibility::None {
+                continue;
+            }
             if let ReprKind::Sum(vs) = &n.repr {
                 for v in vs {
                     if user_ctors.insert(v.name.clone()) {
@@ -5005,12 +5046,19 @@ fn prelude_modules_wanted(m: &ModuleDecl) -> HashSet<&'static str> {
 pub struct LinkTable {
     modules: Vec<ModuleDecl>,
     file_of: HashMap<String, usize>,
+    external_modules: HashSet<String>,
     iface_cache: std::cell::RefCell<HashMap<String, Rc<(String, HashSet<String>)>>>,
 }
 
 impl LinkTable {
     /// `modules`: every (concept-expanded) user module of the run with its file index.
     pub fn new(modules: Vec<(ModuleDecl, usize)>) -> Self {
+        Self::with_external(modules, HashSet::new())
+    }
+
+    /// `modules` with a set of `external_modules` that represent dependencies across a package
+    /// boundary (Task E.2: contract-only interfaces whose bodies are withheld).
+    pub fn with_external(modules: Vec<(ModuleDecl, usize)>, external_modules: HashSet<String>) -> Self {
         let mut file_of = HashMap::new();
         let mut ms = Vec::new();
         for (m, f) in modules {
@@ -5020,8 +5068,20 @@ impl LinkTable {
         LinkTable {
             modules: ms,
             file_of,
+            external_modules,
             iface_cache: std::cell::RefCell::new(HashMap::new()),
         }
+    }
+
+    /// True if `name` is marked as an external dependency across a package boundary.
+    pub fn is_external(&self, name: &str) -> bool {
+        self.external_modules.contains(name)
+    }
+
+    /// True when `callee` is an external dependency from `caller`'s perspective
+    /// (i.e., `callee` is in `external_modules`, while `caller` is in the local package).
+    pub fn is_external_for(&self, caller: &str, callee: &str) -> bool {
+        self.is_external(callee) && !self.is_external(caller)
     }
 
     fn module(&self, name: &str) -> Option<&ModuleDecl> {
@@ -5031,19 +5091,33 @@ impl LinkTable {
     /// User modules declared in another file than `m` and referenced directly by `m`
     /// (by name, or through one of their constructors), in declaration order.
     pub fn direct_links(&self, m: &ModuleDecl) -> Vec<&ModuleDecl> {
+        self.direct_links_for(m, &m.name)
+    }
+
+    /// Direct cross-file links of `m` as seen when building the context of `root_caller`.
+    /// When `m` is an external dependency for `root_caller`, only `m`'s contract-only
+    /// interface is inspected so private `do` bodies do not pull in hidden dependencies.
+    pub fn direct_links_for(&self, m: &ModuleDecl, root_caller: &str) -> Vec<&ModuleDecl> {
         let Some(&mf) = self.file_of.get(&m.name) else {
             return Vec::new();
         };
-        let idents = module_referenced_idents(m);
+        let idents = if self.is_external_for(root_caller, &m.name) {
+            module_referenced_idents(&contract_only_module(m))
+        } else {
+            module_referenced_idents(m)
+        };
         self.modules
             .iter()
             .filter(|n| n.name != m.name && self.file_of.get(&n.name) != Some(&mf))
             .filter(|n| n.name != "LIST_OPS" && n.name != "FUNCTION_OPS")
             .filter(|n| {
+                let ctors_visible =
+                    !(self.is_external_for(root_caller, &n.name) && n.repr_vis == Visibility::None);
                 idents.contains(&n.name)
-                    || matches!(&n.repr, ReprKind::Sum(vs) if vs.iter().any(|v| {
-                        idents.contains(&v.name) && !module_has_variant(m, &v.name)
-                    }))
+                    || (ctors_visible
+                        && matches!(&n.repr, ReprKind::Sum(vs) if vs.iter().any(|v| {
+                            idents.contains(&v.name) && !module_has_variant(m, &v.name)
+                        })))
             })
             .collect()
     }
@@ -5151,13 +5225,16 @@ fn linked_user_modules_for(m: &ModuleDecl) -> Vec<ModuleDecl> {
     let mut out: Vec<ModuleDecl> = Vec::new();
     let mut seen: HashSet<String> = HashSet::new();
     seen.insert(m.name.clone());
-    let mut queue: std::collections::VecDeque<ModuleDecl> =
-        table.direct_links(m).into_iter().cloned().collect();
+    let mut queue: std::collections::VecDeque<ModuleDecl> = table
+        .direct_links_for(m, &m.name)
+        .into_iter()
+        .cloned()
+        .collect();
     while let Some(n) = queue.pop_front() {
         if !seen.insert(n.name.clone()) {
             continue;
         }
-        for d in table.direct_links(&n) {
+        for d in table.direct_links_for(&n, &m.name) {
             if !seen.contains(&d.name) {
                 queue.push_back(d.clone());
             }
@@ -5194,7 +5271,8 @@ fn linked_contract_interface(n: &ModuleDecl) -> Rc<(String, HashSet<String>)> {
     {
         return hit;
     }
-    let result = Rc::new(in_own_boogie_ctx(n, || emit_prelude_contract_interface(n)));
+    let cn = contract_only_module(n);
+    let result = Rc::new(in_own_boogie_ctx(&cn, || emit_prelude_contract_interface(n)));
     if let Some(t) = table {
         t.iface_cache
             .borrow_mut()
@@ -5203,10 +5281,29 @@ fn linked_contract_interface(n: &ModuleDecl) -> Rc<(String, HashSet<String>)> {
     result
 }
 
+fn is_external_dependency(caller: &str, callee: &str) -> bool {
+    link_table().is_some_and(|t| t.is_external_for(caller, callee))
+}
+
 /// The namespaced background theory of linked user module `n` (no `Verify_*` procedures:
-/// `n`'s obligations are verified in its own Boogie file of the same run).
-fn emit_linked_background_theory(n: &ModuleDecl, fuel_limit: usize) -> String {
-    let parts = in_own_boogie_ctx(n, || emit_boogie_parts(n, fuel_limit));
+/// `n`'s obligations are verified in its own Boogie file of the same run). When `scope` is
+/// `BoogieEmitScope::ContractOnly` (Task E.2: across a package boundary), routine `do`
+/// bodies, hidden representations, private invariants, and `{NONE}` declarations are withheld.
+fn emit_linked_background_theory(
+    n: &ModuleDecl,
+    fuel_limit: usize,
+    scope: BoogieEmitScope,
+) -> String {
+    let contract_n;
+    let ctx_target = if scope == BoogieEmitScope::ContractOnly {
+        contract_n = contract_only_module(n);
+        &contract_n
+    } else {
+        n
+    };
+    let parts = in_own_boogie_ctx(ctx_target, || {
+        emit_boogie_parts_with_options(n, fuel_limit, scope)
+    });
     let mut text = parts.theory;
     text.push_str(&parts.client_axioms);
     text.push_str(&linked_contract_interface(n).0);
@@ -5219,8 +5316,12 @@ fn emit_linked_background_theory(n: &ModuleDecl, fuel_limit: usize) -> String {
         })
         .collect();
     format!(
-        "// --- Linked project module: {} (background theory; its own obligations are verified in its own file of this run) ---\n{}\n",
+        "// --- Linked module: {} ({}; obligations verified separately) ---\n{}\n",
         n.name,
+        match scope {
+            BoogieEmitScope::ContractOnly => "contract-only interface",
+            BoogieEmitScope::Full => "background theory",
+        },
         rename_boogie_idents(&text, &map)
     )
 }
@@ -6179,6 +6280,16 @@ fn find_module_routine<'a>(m: &'a ModuleDecl, name: &str) -> Option<(&'a Routine
         })
 }
 
+/// True when routine `name` of `m` is `{NONE}`, so no other module may call it.
+fn routine_is_private(m: &ModuleDecl, name: &str) -> bool {
+    m.feature_routines
+        .iter()
+        .chain(&m.specify_routines)
+        .chain(&m.create_routines)
+        .find(|(_, r)| r.name == name)
+        .is_some_and(|(vis, _)| *vis == Visibility::None)
+}
+
 fn type_head(ty: &str) -> &str {
     ty.trim().split('[').next().unwrap_or("").trim()
 }
@@ -6517,8 +6628,9 @@ fn prelude_law_markers(p: &ModuleDecl) -> Vec<(usize, &LawDecl)> {
     p.specify_laws
         .iter()
         .enumerate()
-        .filter(|(_, (_, law))| {
-            !law.params.is_empty()
+        .filter(|(_, (vis, law))| {
+            *vis != Visibility::None
+                && !law.params.is_empty()
                 && !law.ensures.is_empty()
                 && !format!("{:?}{:?}", law.requires, law.ensures).contains("Lambda(")
         })
@@ -6781,14 +6893,23 @@ fn prelude_contract_interface(p: &ModuleDecl) -> Rc<(String, HashSet<String>)> {
     result
 }
 
+/// Contract-only interface for any module (prelude, linked dependency, or external package):
+/// routine preconditions, postcondition frame axioms, and law markers without `do` bodies
+/// (generalizing `prelude_contract_interface` per Task E.2).
+pub fn emit_contract_interface(m: &ModuleDecl) -> (String, HashSet<String>) {
+    emit_prelude_contract_interface(m)
+}
+
 fn emit_prelude_contract_interface(p: &ModuleDecl) -> (String, HashSet<String>) {
-    let strings = collect_module_strings(p);
+    let cp = contract_only_module(p);
+    let symbol_vis = module_symbol_visibilities(p);
+    let strings = collect_module_strings(&cp);
     let empty_fields = HashSet::new();
     let empty_revealed = HashSet::new();
     let emit = |e: &Expr| {
         emit_boogie_expr_with_strings(
             e,
-            p,
+            &cp,
             &empty_fields,
             &empty_revealed,
             "DefaultFuel",
@@ -6798,7 +6919,7 @@ fn emit_prelude_contract_interface(p: &ModuleDecl) -> (String, HashSet<String>) 
     // Boogie type parameters must occur in the signature; a declaration whose body
     // mentions a type parameter absent from its signature is not emitted.
     let sig_tps = |extra: &[String], param_tys: &[String], body: &str| -> Option<String> {
-        let all: Vec<&String> = p.type_params.iter().chain(extra.iter()).collect();
+        let all: Vec<&String> = cp.type_params.iter().chain(extra.iter()).collect();
         let mut tps: Vec<String> = Vec::new();
         for tp in &all {
             let used = param_tys
@@ -6824,24 +6945,24 @@ fn emit_prelude_contract_interface(p: &ModuleDecl) -> (String, HashSet<String>) 
     let mut out = String::new();
     out.push_str(&format!(
         "// --- {}: routine preconditions (definitions) & trusted law markers ---\n",
-        p.name
+        cp.name
     ));
-    let routines = p.create_routines.iter().map(|(_, r)| (r, false)).chain(
-        p.feature_routines
+    let routines = cp.create_routines.iter().map(|(_, r)| (r, false)).chain(
+        cp.feature_routines
             .iter()
-            .chain(p.specify_routines.iter())
-            .map(|(_, r)| (r, p.kind == ModuleKind::Module)),
+            .chain(cp.specify_routines.iter())
+            .map(|(_, r)| (r, cp.kind == ModuleKind::Module)),
     );
     for (r, has_current) in routines {
         let mut params = Vec::new();
         let mut tys = Vec::new();
         if has_current {
-            let t = map_boogie_type("Current", p);
+            let t = map_boogie_type("Current", &cp);
             params.push(format!("Current: {t}"));
             tys.push(t);
         }
         for (pn, pt) in &r.params {
-            let t = map_boogie_type(pt, p);
+            let t = map_boogie_type(pt, &cp);
             params.push(format!("{pn}: {t}"));
             tys.push(t);
         }
@@ -6859,22 +6980,36 @@ fn emit_prelude_contract_interface(p: &ModuleDecl) -> (String, HashSet<String>) 
         }
     }
     for (idx, law) in prelude_law_markers(p) {
+        let law_vis = &p.specify_laws[idx].0;
+        let (law_locals, law_non_self) = law_clause_locals(law, &p.name);
+        let visible = |e: &Expr| {
+            clause_is_visible_in_interface(e, &p.name, &symbol_vis, law_vis, &law_locals, &law_non_self)
+        };
+        // Withholding a conclusion only weakens the law. Withholding a hypothesis would state
+        // the law for arguments it was not proven for, so such a law is no fact at all.
+        if !law.requires.iter().all(|(_, e)| visible(e)) {
+            continue;
+        }
         let params: Vec<String> = law
             .params
             .iter()
-            .map(|(pn, pt)| format!("{pn}: {}", map_boogie_type(pt, p)))
+            .map(|(pn, pt)| format!("{pn}: {}", map_boogie_type(pt, &cp)))
             .collect();
         let tys: Vec<String> = law
             .params
             .iter()
-            .map(|(_, pt)| map_boogie_type(pt, p))
+            .map(|(_, pt)| map_boogie_type(pt, &cp))
             .collect();
         let args: Vec<String> = law.params.iter().map(|(pn, _)| pn.clone()).collect();
         let ens: Vec<String> = law
             .ensures
             .iter()
+            .filter(|(_, e)| visible(e))
             .map(|(_, e)| format!("({})", emit(e)))
             .collect();
+        if ens.is_empty() {
+            continue;
+        }
         let reqs: Vec<String> = law
             .requires
             .iter()
@@ -6891,7 +7026,7 @@ fn emit_prelude_contract_interface(p: &ModuleDecl) -> (String, HashSet<String>) 
         let call = format!("{marker}({})", args.join(", "));
         let mut hyps = reqs.clone();
         // A conditional CANONICAL_EQ law is trusted only under its `where` hypothesis.
-        if let Some(guard) = canonical_where_guard(p, &p.specify_laws[idx].0) {
+        if let Some(guard) = canonical_where_guard(p, law_vis) {
             hyps.insert(0, format!("({guard})"));
         }
         let req = if hyps.is_empty() {
@@ -6922,8 +7057,12 @@ fn emit_prelude_contract_interface(p: &ModuleDecl) -> (String, HashSet<String>) 
 
 /// The namespaced background theory of prelude module `p` for injection into a user
 /// module's Boogie file: no `Verify_*` procedures, so no prelude obligation is re-proven.
-fn emit_prelude_background_theory(p: &ModuleDecl, fuel_limit: usize) -> String {
-    let parts = emit_boogie_parts(p, fuel_limit);
+fn emit_prelude_background_theory(
+    p: &ModuleDecl,
+    fuel_limit: usize,
+    scope: BoogieEmitScope,
+) -> String {
+    let parts = emit_boogie_parts_with_options(p, fuel_limit, scope);
     // Opaque stand-ins for other prelude sorts are dropped: the real theories are injected.
     let mut text: String = parts
         .theory
@@ -6993,6 +7132,14 @@ impl BoogieParts {
     }
 }
 
+/// Whether Boogie emission includes full implementation bodies or only the contract boundary
+/// (Task E.2: signatures, `require`, `ensure`, public ghost signatures, and laws).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BoogieEmitScope {
+    Full,
+    ContractOnly,
+}
+
 pub fn emit_boogie(m: &ModuleDecl, fuel_limit: usize) -> String {
     let ctx = Rc::new(BoogiePreludeCtx::for_module(m));
     if ctx.modules.is_empty() {
@@ -7004,12 +7151,22 @@ pub fn emit_boogie(m: &ModuleDecl, fuel_limit: usize) -> String {
     // then namespaced; none of their verification procedures are included. Linked user
     // modules of other files (Task B.4) are emitted in their own context, then namespaced.
     let prev = BOOGIE_PRELUDE_CTX.with(|c| c.replace(Some(ctx.clone())));
+    let prelude_scope = if standard_prelude().declares(&m.name) {
+        BoogieEmitScope::Full
+    } else {
+        BoogieEmitScope::ContractOnly
+    };
     let mut injected = String::new();
     for p in &ctx.modules {
         if is_linked_user_module(&p.name) {
-            injected.push_str(&emit_linked_background_theory(p, fuel_limit));
+            let scope = if is_external_dependency(&m.name, &p.name) {
+                BoogieEmitScope::ContractOnly
+            } else {
+                BoogieEmitScope::Full
+            };
+            injected.push_str(&emit_linked_background_theory(p, fuel_limit, scope));
         } else {
-            injected.push_str(&emit_prelude_background_theory(p, fuel_limit));
+            injected.push_str(&emit_prelude_background_theory(p, fuel_limit, prelude_scope));
         }
     }
     let parts = emit_boogie_parts(m, fuel_limit);
@@ -7026,6 +7183,21 @@ pub fn emit_boogie(m: &ModuleDecl, fuel_limit: usize) -> String {
 }
 
 fn emit_boogie_parts(m: &ModuleDecl, fuel_limit: usize) -> BoogieParts {
+    emit_boogie_parts_with_options(m, fuel_limit, BoogieEmitScope::Full)
+}
+
+fn emit_boogie_parts_with_options(
+    m: &ModuleDecl,
+    fuel_limit: usize,
+    scope: BoogieEmitScope,
+) -> BoogieParts {
+    let contract_m;
+    let m = if scope == BoogieEmitScope::ContractOnly {
+        contract_m = contract_only_module(m);
+        &contract_m
+    } else {
+        m
+    };
     let mut out = String::new();
     let mut theory = String::new();
     out.push_str(&format!(
@@ -7303,6 +7475,10 @@ fn emit_boogie_parts(m: &ModuleDecl, fuel_limit: usize) -> BoogieParts {
     out.push_str("function Fn1_id<A>() returns (Fn1 A A);\n");
     out.push_str("axiom (forall<A> x: A :: { Fn1_app(Fn1_id(), x) } Fn1_app(Fn1_id(), x) == x);\n");
     out.push_str("function Fn1_compose<A, B, C>(f: Fn1 B C, g: Fn1 A B) returns (Fn1 A C);\n");
+    // `map(xs, id) == xs` makes every `map(xs, h)` a fusion redex. These send the fusion's
+    // result back to `map(xs, h)`, so no new term appears and the matching loop ends.
+    out.push_str("axiom (forall<A, B> f: Fn1 A B :: { Fn1_compose(f, Fn1_id() : Fn1 A A) } Fn1_compose(f, Fn1_id() : Fn1 A A) == f);\n");
+    out.push_str("axiom (forall<A, B> f: Fn1 A B :: { Fn1_compose(Fn1_id() : Fn1 B B, f) } Fn1_compose(Fn1_id() : Fn1 B B, f) == f);\n");
     out.push_str("axiom (forall<A, B, C> f: Fn1 B C, g: Fn1 A B, x: A :: { Fn1_app(Fn1_compose(f, g), x) } Fn1_app(Fn1_compose(f, g), x) == Fn1_app(f, Fn1_app(g, x)));\n\n");
 
     out.push_str("function Seq_map<A, B>(xs: Seq A, f: Fn1 A B) returns (Seq B);\n");
@@ -7313,7 +7489,9 @@ fn emit_boogie_parts(m: &ModuleDecl, fuel_limit: usize) -> BoogieParts {
     out.push_str(
         "axiom (forall<A> xs: Seq A :: { Seq_map(xs, Fn1_id()) } Seq_map(xs, Fn1_id()) == xs);\n",
     );
-    out.push_str("axiom (forall<A, B, C> xs: Seq A, f: Fn1 B C, g: Fn1 A B :: { Seq_map(Seq_map(xs, g), f) } Seq_map(Seq_map(xs, g), f) == Seq_map(xs, Fn1_compose(f, g)));\n\n");
+    // Fusion stops at an empty list. `map(empty, f) == empty` makes `empty` a `map`, so an
+    // unguarded fusion matches its own result forever, and Z3 never reaches a limit check.
+    out.push_str("axiom (forall<A, B, C> xs: Seq A, f: Fn1 B C, g: Fn1 A B :: { Seq_map(Seq_map(xs, g), f) } Seq_length(xs) > 0 ==> Seq_map(Seq_map(xs, g), f) == Seq_map(xs, Fn1_compose(f, g)));\n\n");
 
     out.push_str("function Seq_filter<A>(xs: Seq A, keep: Fn1 A bool) returns (Seq A);\n");
     out.push_str("axiom (forall<A> xs: Seq A, keep: Fn1 A bool :: { Seq_length(Seq_filter(xs, keep)) } 0 <= Seq_length(Seq_filter(xs, keep)) && Seq_length(Seq_filter(xs, keep)) <= Seq_length(xs));\n");
@@ -7333,7 +7511,8 @@ fn emit_boogie_parts(m: &ModuleDecl, fuel_limit: usize) -> BoogieParts {
 
     out.push_str("function Fn1_and<A>(p: Fn1 A bool, q: Fn1 A bool) returns (Fn1 A bool);\n");
     out.push_str("axiom (forall<A> p: Fn1 A bool, q: Fn1 A bool, x: A :: { Fn1_app(Fn1_and(p, q), x) } Fn1_app(Fn1_and(p, q), x) == (Fn1_app(p, x) && Fn1_app(q, x)));\n");
-    out.push_str("axiom (forall<A> xs: Seq A, p: Fn1 A bool, q: Fn1 A bool :: { Seq_filter(Seq_filter(xs, p), q) } Seq_filter(Seq_filter(xs, p), q) == Seq_filter(xs, Fn1_and(p, q)));\n\n");
+    // Fusion stops at an empty list, as for `Seq_map`.
+    out.push_str("axiom (forall<A> xs: Seq A, p: Fn1 A bool, q: Fn1 A bool :: { Seq_filter(Seq_filter(xs, p), q) } Seq_length(xs) > 0 ==> Seq_filter(Seq_filter(xs, p), q) == Seq_filter(xs, Fn1_and(p, q)));\n\n");
 
     out.push_str("function Fn2_map_arg<A, B, C>(f: Fn2 C B C, g: Fn1 A B) returns (Fn2 C A C);\n");
     out.push_str("axiom (forall<A, B, C> f: Fn2 C B C, g: Fn1 A B, acc: C, x: A :: { Fn2_app(Fn2_map_arg(f, g), acc, x) } Fn2_app(Fn2_map_arg(f, g), acc, x) == Fn2_app(f, acc, Fn1_app(g, x)));\n");
@@ -7404,7 +7583,9 @@ fn emit_boogie_parts(m: &ModuleDecl, fuel_limit: usize) -> BoogieParts {
     ));
 
     let mut implicit_fields = HashSet::new();
-    match &m.repr {
+    let hide_repr = scope == BoogieEmitScope::ContractOnly && m.repr_vis == Visibility::None;
+    if !hide_repr {
+        match &m.repr {
         ReprKind::Sum(variants) => {
             for v in variants {
                 let params: Vec<String> = v
@@ -7615,10 +7796,11 @@ fn emit_boogie_parts(m: &ModuleDecl, fuel_limit: usize) -> BoogieParts {
                 ));
             }
         }
+        }
     }
     out.push('\n');
 
-    if m.name == "SEQ" {
+    if m.name == "SEQ" && !hide_repr {
         out.push_str("axiom (forall<A> Current: (SEQ A) :: { Concat_left(Current) } is_Concat(Current) ==> fn_length(DefaultFuel, Current) == fn_length(DefaultFuel, Concat_left(Current)) + fn_length(DefaultFuel, Concat_right(Current)));\n");
         out.push_str("axiom (forall<A> s: (SEQ A), p: (Fn1 A bool), q: (Fn1 A bool) :: { fn_filter(DefaultFuel, fn_filter(DefaultFuel, s, p), q) } SEQ_Invariant(s) ==> fn_equals(DefaultFuel, fn_filter(DefaultFuel, fn_filter(DefaultFuel, s, p), q), fn_filter(DefaultFuel, s, Fn1_and(p, q))));\n\n");
     }
@@ -7637,14 +7819,16 @@ fn emit_boogie_parts(m: &ModuleDecl, fuel_limit: usize) -> BoogieParts {
         out.push_str("  true\n");
     } else {
         let mut clauses = Vec::new();
-        if let ReprKind::Product(fields) = &m.repr {
-            for (fnm, fty) in fields {
-                if fty == "NAT" || fty == "U64" {
-                    clauses.push(format!("  in_u64({}_{}(Current))", m.name, fnm));
-                } else if fty == "INT" || fty == "I64" {
-                    clauses.push(format!("  in_i64({}_{}(Current))", m.name, fnm));
-                } else if fty == "CHAR" {
-                    clauses.push(format!("  in_char({}_{}(Current))", m.name, fnm));
+        if !hide_repr {
+            if let ReprKind::Product(fields) = &m.repr {
+                for (fnm, fty) in fields {
+                    if fty == "NAT" || fty == "U64" {
+                        clauses.push(format!("  in_u64({}_{}(Current))", m.name, fnm));
+                    } else if fty == "INT" || fty == "I64" {
+                        clauses.push(format!("  in_i64({}_{}(Current))", m.name, fnm));
+                    } else if fty == "CHAR" {
+                        clauses.push(format!("  in_char({}_{}(Current))", m.name, fnm));
+                    }
                 }
             }
         }
@@ -7684,22 +7868,28 @@ fn emit_boogie_parts(m: &ModuleDecl, fuel_limit: usize) -> BoogieParts {
     // nor its body mentions `Current`/a field, except through calls to other
     // receiver-independent routines (or itself). Such routines get a
     // Current-independence axiom and no receiver-invariant guard.
-    let mut current_indep: HashSet<String> =
-        all_routines.iter().map(|(r, _)| r.name.clone()).collect();
-    loop {
-        let dependent: Vec<String> = all_routines
-            .iter()
-            .filter(|(r, _)| {
-                current_indep.contains(&r.name)
-                    && routine_uses_current(r, &implicit_fields, &current_indep)
-            })
-            .map(|(r, _)| r.name.clone())
-            .collect();
-        if dependent.is_empty() {
-            break;
-        }
-        for n in dependent {
-            current_indep.remove(&n);
+    // In ContractOnly scope, bodies are hidden, so receiver-independence is never
+    // inferred from bodies.
+    let mut current_indep: HashSet<String> = match scope {
+        BoogieEmitScope::Full => all_routines.iter().map(|(r, _)| r.name.clone()).collect(),
+        BoogieEmitScope::ContractOnly => HashSet::new(),
+    };
+    if scope == BoogieEmitScope::Full {
+        loop {
+            let dependent: Vec<String> = all_routines
+                .iter()
+                .filter(|(r, _)| {
+                    current_indep.contains(&r.name)
+                        && routine_uses_current(r, &implicit_fields, &current_indep)
+                })
+                .map(|(r, _)| r.name.clone())
+                .collect();
+            if dependent.is_empty() {
+                break;
+            }
+            for n in dependent {
+                current_indep.remove(&n);
+            }
         }
     }
 
@@ -7774,8 +7964,12 @@ fn emit_boogie_parts(m: &ModuleDecl, fuel_limit: usize) -> BoogieParts {
         let fn_step_two_app = format!("fn_{}({})", r.name, call_args_step_two.join(", "));
         let fn_succ_app = format!("fn_{}({})", r.name, call_args_succ.join(", "));
         let fn_f_app = format!("fn_{}({})", r.name, call_args_f.join(", "));
-        let body_expr =
-            emit_boogie_block_expr(&r.stmts, &r.body, m, &empty_fields, "_fuel", &strings);
+        let body_expr = match scope {
+            BoogieEmitScope::Full => {
+                emit_boogie_block_expr(&r.stmts, &r.body, m, &empty_fields, "_fuel", &strings)
+            }
+            BoogieEmitScope::ContractOnly => String::new(),
+        };
         let guard_str = if pre_guards.is_empty() {
             String::new()
         } else {
@@ -7802,21 +7996,27 @@ fn emit_boogie_parts(m: &ModuleDecl, fuel_limit: usize) -> BoogieParts {
         };
         // A routine that binds values from the outside world (`x <- IO.read_line`) is not a
         // function of its arguments: it gets no definitional axiom (it stays opaque).
-        let binds_io = r
-            .stmts
-            .iter()
-            .any(|st| matches!(st, Stmt::Let(_, e) if expr_has_io_bind(e)))
-            || expr_has_io_bind(&r.body);
-        if !binds_io {
+        let binds_io = match scope {
+            BoogieEmitScope::Full => {
+                r.stmts
+                    .iter()
+                    .any(|st| matches!(st, Stmt::Let(_, e) if expr_has_io_bind(e)))
+                    || expr_has_io_bind(&r.body)
+            }
+            BoogieEmitScope::ContractOnly => r.ret_type.starts_with("IO[") || r.ret_type == "IO",
+        };
+        if !binds_io && scope == BoogieEmitScope::Full {
             out.push_str(&format!(
                 "axiom (forall{r_tp_quant} {} :: {fn_succ_trigger} {guard_str}{fn_succ_app} == {body_expr});\n",
                 q_params.join(", ")
             ));
         }
-        out.push_str(&format!(
-            "axiom (forall{r_tp_quant} {} :: {fn_step_two_trigger} {guard_str}{fn_step_two_app} == {fn_succ_app});\n",
-            q_params.join(", ")
-        ));
+        if !binds_io {
+            out.push_str(&format!(
+                "axiom (forall{r_tp_quant} {} :: {fn_step_two_trigger} {guard_str}{fn_step_two_app} == {fn_succ_app});\n",
+                q_params.join(", ")
+            ));
+        }
         if *has_current && !uses_curr {
             let mut ri_q_params = vec![
                 "_fuel: Fuel".to_string(),
@@ -8044,73 +8244,77 @@ fn emit_boogie_parts(m: &ModuleDecl, fuel_limit: usize) -> BoogieParts {
     let client_axioms = std::mem::take(&mut out);
 
     // 7. Verification Condition Procedures (`Verify_<routine>` & `Verify_law_<law>`) (§12)
-    out.push_str("// --- 7. Verification Condition Procedures (§12) ---\n");
-    // Recursive call groups (direct and mutual recursion) for the termination checks.
-    let groups = compute_recursive_groups(m);
-    let prev_groups = RECURSIVE_GROUPS.with(|g| g.replace(groups));
-    for (r, has_current) in &all_routines {
-        set_boogie_type_env(m, &r.params, Some(&r.ret_type));
-        out.push_str(&emit_boogie_verify_routine(r, *has_current, m, &strings));
-    }
-    RECURSIVE_GROUPS.with(|g| *g.borrow_mut() = prev_groups);
-    out.push_str(&emit_boogie_canonical_witness_types(m));
-    for (vis, law) in &m.specify_laws {
-        set_boogie_type_env(m, &law.params, None);
-        out.push_str(&emit_boogie_verify_law(vis, law, m, &strings));
-    }
-    clear_boogie_type_env();
+    if scope == BoogieEmitScope::Full {
+        out.push_str("// --- 7. Verification Condition Procedures (§12) ---\n");
+        // Recursive call groups (direct and mutual recursion) for the termination checks.
+        let groups = compute_recursive_groups(m);
+        let prev_groups = RECURSIVE_GROUPS.with(|g| g.replace(groups));
+        for (r, has_current) in &all_routines {
+            set_boogie_type_env(m, &r.params, Some(&r.ret_type));
+            out.push_str(&emit_boogie_verify_routine(r, *has_current, m, &strings));
+        }
+        RECURSIVE_GROUPS.with(|g| *g.borrow_mut() = prev_groups);
+        out.push_str(&emit_boogie_canonical_witness_types(m));
+        for (vis, law) in &m.specify_laws {
+            set_boogie_type_env(m, &law.params, None);
+            out.push_str(&emit_boogie_verify_law(vis, law, m, &strings));
+        }
+        clear_boogie_type_env();
 
-    // Sum-Type Hereditary Invariant Verification (§5, Plan 3 §2)
-    if let ReprKind::Sum(variants) = &m.repr {
-        if !m.invariants.is_empty() {
-            let has_recursive_fields = variants.iter().any(|v| {
-                v.fields.iter().any(|(_, fty)| {
-                    fty == &m.name || fty == "Current" || fty.starts_with(&format!("{}[", m.name))
-                })
-            });
-            if has_recursive_fields {
-                let tp_quant = if m.type_params.is_empty() {
-                    String::new()
-                } else {
-                    format!("<{}>", m.type_params.join(", "))
-                };
-                let cur_ty = map_boogie_type("Current", m);
-                out.push_str(&format!(
-                    "procedure Verify_Hereditary_Invariant_{}{tp_quant}(Current: {cur_ty})\n",
-                    m.name
-                ));
-                out.push_str(&format!("  requires {}_Invariant(Current);\n{{\n", m.name));
-                for v in variants {
-                    let rec_fields: Vec<&(String, String)> = v
-                        .fields
-                        .iter()
-                        .filter(|(_, fty)| {
-                            fty == &m.name
-                                || fty == "Current"
-                                || fty.starts_with(&format!("{}[", m.name))
-                        })
-                        .collect();
-                    if !rec_fields.is_empty() {
-                        out.push_str(&format!("  if (is_{}(Current)) {{\n", v.name));
-                        for (fname, _) in rec_fields {
-                            let proj = format!("{}_{}(Current)", v.name, fname);
-                            out.push_str(&format!(
-                                "    assert {{:msg \"{}::hereditary_invariant::{}_{}\"}} {}_Invariant({proj});\n",
-                                m.name, v.name, fname, m.name
-                            ));
+        // Sum-Type Hereditary Invariant Verification (§5, Plan 3 §2)
+        if let ReprKind::Sum(variants) = &m.repr {
+            if !m.invariants.is_empty() {
+                let has_recursive_fields = variants.iter().any(|v| {
+                    v.fields.iter().any(|(_, fty)| {
+                        fty == &m.name
+                            || fty == "Current"
+                            || fty.starts_with(&format!("{}[", m.name))
+                    })
+                });
+                if has_recursive_fields {
+                    let tp_quant = if m.type_params.is_empty() {
+                        String::new()
+                    } else {
+                        format!("<{}>", m.type_params.join(", "))
+                    };
+                    let cur_ty = map_boogie_type("Current", m);
+                    out.push_str(&format!(
+                        "procedure Verify_Hereditary_Invariant_{}{tp_quant}(Current: {cur_ty})\n",
+                        m.name
+                    ));
+                    out.push_str(&format!("  requires {}_Invariant(Current);\n{{\n", m.name));
+                    for v in variants {
+                        let rec_fields: Vec<&(String, String)> = v
+                            .fields
+                            .iter()
+                            .filter(|(_, fty)| {
+                                fty == &m.name
+                                    || fty == "Current"
+                                    || fty.starts_with(&format!("{}[", m.name))
+                            })
+                            .collect();
+                        if !rec_fields.is_empty() {
+                            out.push_str(&format!("  if (is_{}(Current)) {{\n", v.name));
+                            for (fname, _) in rec_fields {
+                                let proj = format!("{}_{}(Current)", v.name, fname);
+                                out.push_str(&format!(
+                                    "    assert {{:msg \"{}::hereditary_invariant::{}_{}\"}} {}_Invariant({proj});\n",
+                                    m.name, v.name, fname, m.name
+                                ));
+                            }
+                            out.push_str("  }\n");
                         }
-                        out.push_str("  }\n");
                     }
+                    out.push_str("}\n\n");
                 }
-                out.push_str("}\n\n");
             }
         }
-    }
 
-    if prelude_string_mode() {
-        out.push_str(&emit_boogie_string_literal_procedures(
-            &collect_module_strings(m),
-        ));
+        if prelude_string_mode() {
+            out.push_str(&emit_boogie_string_literal_procedures(
+                &collect_module_strings(m),
+            ));
+        }
     }
 
     // Lambdas lifted while emitting the theory and the procedures (Boogie declarations are
@@ -10814,6 +11018,14 @@ fn emit_boogie_expr_obligations(
                         ),
                         None => (Vec::new(), Rc::new((String::new(), HashSet::new()))),
                     };
+                    // `names.rs` refuses what it can type. Only the verifier knows the target
+                    // of the rest, so a private target is refused here too.
+                    if ctx.module(&pname).is_some_and(|p| routine_is_private(p, &rname)) {
+                        s.push_str(&format!(
+                            "{pad}assert {{:msg \"{}::hidden::{rname}\"}} false;\n",
+                            r.name
+                        ));
+                    }
                     let mut call_args = Vec::new();
                     if has_cur {
                         call_args.push(emit_boogie_expr_with_strings(
@@ -10836,13 +11048,15 @@ fn emit_boogie_expr_obligations(
                         ));
                     }
                     for (idx, (tag, _)) in callee.iter().enumerate() {
-                        if !declared.1.contains(&format!("pre_{rname}_{idx}")) {
-                            continue;
-                        }
+                        // A `require` with no predicate cannot be established, not ignored.
+                        let holds = if declared.1.contains(&format!("pre_{rname}_{idx}")) {
+                            format!("{pname}__pre_{rname}_{idx}({})", call_args.join(", "))
+                        } else {
+                            "false".to_string()
+                        };
                         s.push_str(&format!(
-                            "{pad}assert {{:msg \"{}::require::{tag}\"}} {pname}__pre_{rname}_{idx}({});\n",
-                            r.name,
-                            call_args.join(", ")
+                            "{pad}assert {{:msg \"{}::require::{tag}\"}} {holds};\n",
+                            r.name
                         ));
                     }
                 }
@@ -12857,8 +13071,75 @@ thread_local! {
 pub const DEFAULT_Z3_RLIMIT: u64 = 30_000_000;
 
 /// Backstop in seconds for a solver that stops counting resources. `DEFAULT_Z3_RLIMIT` is
-/// what ends a proof attempt; a run that reaches this limit has hung.
+/// what ends a proof attempt; a run that reaches this limit has hung. A matching loop can
+/// outrun Z3's own checks of both limits, so `gardelc` enforces this one itself, on the whole
+/// Boogie run (`output_within`). `GARDEL_SOLVER_BACKSTOP` overrides it, in seconds.
 const BOOGIE_TIME_BACKSTOP: u32 = 600;
+
+fn solver_backstop_secs() -> u32 {
+    env::var("GARDEL_SOLVER_BACKSTOP")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(BOOGIE_TIME_BACKSTOP)
+}
+
+/// Stops `child` and everything it started: killing Boogie alone would leave Z3 running.
+fn kill_process_tree(child: &mut std::process::Child) {
+    let pid = child.id().to_string();
+    #[cfg(windows)]
+    let tree = Command::new("taskkill").args(["/F", "/T", "/PID", &pid]).output();
+    #[cfg(not(windows))]
+    let tree = Command::new("pkill").args(["-KILL", "-P", &pid]).output();
+    drop(tree);
+    // Already gone if the tree was killed above, and then this has nothing to do.
+    drop(child.kill());
+    drop(child.wait());
+}
+
+/// Runs `cmd` as `Command::output` does, or returns `None` once it has run for `limit`, with
+/// all of its processes stopped.
+fn output_within(
+    cmd: &mut Command,
+    limit: std::time::Duration,
+) -> std::io::Result<Option<std::process::Output>> {
+    use std::io::Read;
+    use std::process::Stdio;
+
+    fn drain(pipe: Option<impl Read + Send + 'static>) -> std::thread::JoinHandle<Vec<u8>> {
+        std::thread::spawn(move || {
+            let mut bytes = Vec::new();
+            if let Some(mut pipe) = pipe {
+                // What was read before a failure is still the process's output.
+                drop(pipe.read_to_end(&mut bytes));
+            }
+            bytes
+        })
+    }
+
+    let mut child = cmd
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    // Read as it runs, or a process that fills a pipe would never exit.
+    let stdout = drain(child.stdout.take());
+    let stderr = drain(child.stderr.take());
+    let start = std::time::Instant::now();
+    loop {
+        if let Some(status) = child.try_wait()? {
+            return Ok(Some(std::process::Output {
+                status,
+                stdout: stdout.join().unwrap_or_default(),
+                stderr: stderr.join().unwrap_or_default(),
+            }));
+        }
+        if start.elapsed() >= limit {
+            kill_process_tree(&mut child);
+            return Ok(None);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+}
 
 pub fn with_z3_rlimit<R>(rlimit: Option<u64>, f: impl FnOnce() -> R) -> R {
     let prev = BOOGIE_Z3_RLIMIT.with(|s| s.replace(rlimit));
@@ -12921,22 +13202,29 @@ fn run_boogie_verification_once(
     }
     cmd.arg("/typeEncoding:p");
     cmd.arg(format!("/rlimit:{}", current_z3_rlimit()));
-    cmd.arg(format!("/timeLimit:{BOOGIE_TIME_BACKSTOP}"));
+    let backstop = solver_backstop_secs();
+    cmd.arg(format!("/timeLimit:{backstop}"));
     cmd.arg("/mv:-");
     cmd.arg("/errorTrace:0");
     cmd.arg(&temp_path);
 
-    let output = cmd
-        .output()
+    let output = output_within(&mut cmd, std::time::Duration::from_secs(backstop.into()))
         .map_err(|e| format!("Failed to spawn Boogie process: {e}"))?;
     // `GARDEL_KEEP_BPL=1` keeps the VC file for debugging the Boogie translation.
     if env::var_os("GARDEL_KEEP_BPL").is_none() {
         let _ = fs::remove_file(&temp_path);
     }
 
-    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
-    let full_out = format!("{stdout}\n{stderr}");
+    let full_out = match output {
+        Some(output) => {
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            format!("{stdout}\n{stderr}")
+        }
+        None => format!(
+            "Fatal Error: the solver was stopped after {backstop} s, likely in a matching loop"
+        ),
+    };
 
     Ok(parse_boogie_output(&full_out, m, src, input_path))
 }
@@ -13092,14 +13380,20 @@ pub fn parse_boogie_output(
                 "check" => "Phase 3 Boogie (Check Assertion Failed)",
                 "match" => "Phase 3 Boogie (Non-Exhaustive Match)",
                 "require" => "Phase 3 Boogie (Precondition Violation)",
+                "hidden" => "E0113: hidden_member",
                 _ => "Phase 3 Boogie (Verification Condition Failed)",
+            };
+            let message = if rule_kind == "hidden" {
+                format!("E0113: hidden_member: `{routine}` calls `{tag}`, which is private to its module. Use a routine that module exports")
+            } else {
+                format!("Formal verification condition `{tag}` failed in `{routine}`")
             };
             let diag = Diagnostic::basic(
                 "error",
                 static_rule,
                 routine.clone(),
                 tag.clone(),
-                format!("Formal verification condition `{tag}` failed in `{routine}`"),
+                message,
             )
             .with_module(&m.name)
             .with_ai_context(sp, pcs, cex, lemmas);
@@ -13184,6 +13478,7 @@ pub fn parse_boogie_output(
                     "check" => "Phase 3 Boogie (Check Assertion Failed)",
                     "match" => "Phase 3 Boogie (Non-Exhaustive Match)",
                     "require" => "Phase 3 Boogie (Precondition Violation)",
+                    "hidden" => "E0113: hidden_member",
                     _ => "Phase 3 Boogie (Verification Condition Failed)",
                 };
                 // A line with no tag is not a proof failure. Boogie refused the generated
@@ -13804,6 +14099,9 @@ fn source_line_of(src: &str, input_path: &str, prefix: &str) -> Option<Span> {
     })
 }
 
+/// Marks the report of a module that ran under `--bounded-check`.
+const NOT_PROVEN_TAG: &str = "not_proven";
+
 fn verify_module_obligations(
     m: &ModuleDecl,
     src: &str,
@@ -13869,26 +14167,43 @@ fn verify_module_obligations(
 
     // 2. Formal Boogie / Z3 Verification
     if !bounded_check {
-        let (boogie_opt, z3_opt) = find_solvers();
-        if let (Some(boogie_path), Some(z3_path)) = (boogie_opt, z3_opt) {
-            match run_boogie_verification(m, fuel_limit, &boogie_path, &z3_path, src, input_path) {
-                Ok(boogie_diags) => {
-                    diags.extend(boogie_diags);
-                    return diags;
-                }
-                Err(err) => {
-                    eprintln!(
-                        "[WARN] Boogie verification failed to execute: {err}. Falling back to bounded concrete sampling."
-                    );
-                }
+        let verdict = match find_solvers() {
+            (Some(boogie), Some(z3)) => {
+                run_boogie_verification(m, fuel_limit, &boogie, &z3, src, input_path)
             }
+            (None, _) => Err("Boogie was not found".to_string()),
+            (_, None) => Err("Z3 was not found".to_string()),
+        };
+        match verdict {
+            Ok(boogie_diags) => diags.extend(boogie_diags),
+            Err(err) => diags.push(Diagnostic::basic(
+                "error",
+                "Phase 3 Boogie (Verification Incomplete)",
+                m.name.clone(),
+                "incomplete".to_string(),
+                format!(
+                    "`{}` could not be verified, so nothing is proven: {err}. `BOOGIE_EXE` and `Z3_EXE` name the tools. `--bounded-check` samples instead, and proves nothing",
+                    m.name
+                ),
+            )),
         }
+        return diags;
     }
 
-    // 3. Fallback: Concrete bounded sampling loop
+    // 3. Concrete bounded sampling, only when asked for. It never counts as a proof.
     for (r, has_current) in &all_routines {
         verify_routine_symbolic(r, *has_current, m, src, input_path, fuel_limit, &mut diags);
     }
+    diags.push(Diagnostic::basic(
+        if strict_mode { "error" } else { "warning" },
+        "Phase 3 (Bounded Check, Not Proven)",
+        m.name.clone(),
+        NOT_PROVEN_TAG.to_string(),
+        format!(
+            "`{}` was sampled by `--bounded-check`, which proves nothing, so it does not count under `--strict` or as an interface",
+            m.name
+        ),
+    ));
 
     diags
 }
@@ -16097,10 +16412,434 @@ pub fn emit_c11_from_utf8_runtime() -> String {
 // 11. CLI DRIVER (Supports --stdlib, Boogie, --fuel, --audit, --strict, --run)
 // ============================================================================
 
+/// Builds a map from every member declared by `m` (product fields, sum constructors,
+/// `create`, `feature`, and `specify` routines) to its declared [`Visibility`].
+fn module_symbol_visibilities(m: &ModuleDecl) -> HashMap<String, Visibility> {
+    let mut vis = HashMap::new();
+    match &m.repr {
+        ReprKind::Product(fields) => {
+            for (fname, _) in fields {
+                vis.insert(fname.clone(), m.repr_vis.clone());
+            }
+        }
+        ReprKind::Sum(variants) => {
+            for v in variants {
+                vis.insert(v.name.clone(), m.repr_vis.clone());
+            }
+        }
+    }
+    for (v, r) in &m.specify_routines {
+        vis.insert(r.name.clone(), v.clone());
+    }
+    for (v, r) in &m.create_routines {
+        vis.insert(r.name.clone(), v.clone());
+    }
+    for (v, r) in &m.feature_routines {
+        vis.insert(r.name.clone(), v.clone());
+    }
+    vis
+}
+
+fn type_is_self(ty: &str, m_name: &str) -> bool {
+    ty == "Current" || ty == m_name || ty.starts_with(&format!("{m_name}["))
+}
+
+fn collect_pattern_variant_symbols(pat: &Pattern, out: &mut HashSet<String>) {
+    match pat {
+        Pattern::Variant(vname, subpats) => {
+            out.insert(vname.clone());
+            for sp in subpats {
+                collect_pattern_variant_symbols(sp, out);
+            }
+        }
+        Pattern::Tuple(subpats) => {
+            for sp in subpats {
+                collect_pattern_variant_symbols(sp, out);
+            }
+        }
+        Pattern::Wildcard | Pattern::Bind(_) | Pattern::Lit(_) => {}
+    }
+}
+
+fn collect_stmts_own_symbols_in(
+    stmts: &[Stmt],
+    m_name: &str,
+    bound_locals: &mut HashSet<String>,
+    non_self_locals: &HashSet<String>,
+    out: &mut HashSet<String>,
+) {
+    for st in stmts {
+        match st {
+            Stmt::Let(n, se) => {
+                collect_module_own_symbols_in(se, m_name, bound_locals, non_self_locals, out);
+                bound_locals.insert(n.clone());
+            }
+            Stmt::Check(_, se) | Stmt::Assume(_, se) => {
+                collect_module_own_symbols_in(se, m_name, bound_locals, non_self_locals, out);
+            }
+            Stmt::Reveal(name) => {
+                if !bound_locals.contains(name)
+                    && name != "Current"
+                    && name != "Result"
+                    && name != m_name
+                {
+                    out.insert(name.clone());
+                }
+            }
+        }
+    }
+}
+
+fn collect_module_own_symbols_in(
+    e: &Expr,
+    m_name: &str,
+    bound_locals: &HashSet<String>,
+    non_self_locals: &HashSet<String>,
+    out: &mut HashSet<String>,
+) {
+    match e {
+        Expr::Int(_)
+        | Expr::Float(_)
+        | Expr::Char(_)
+        | Expr::Unit
+        | Expr::Bool(_)
+        | Expr::Str(_) => {}
+        Expr::Var(v) => {
+            if !bound_locals.contains(v) && v != "Current" && v != "Result" && v != m_name {
+                out.insert(v.clone());
+            }
+        }
+        Expr::BinOp(_, l, r) => {
+            collect_module_own_symbols_in(l, m_name, bound_locals, non_self_locals, out);
+            collect_module_own_symbols_in(r, m_name, bound_locals, non_self_locals, out);
+        }
+        Expr::UnaryNot(sub) | Expr::UnaryNeg(sub) => {
+            collect_module_own_symbols_in(sub, m_name, bound_locals, non_self_locals, out);
+        }
+        Expr::Call(f, args) => {
+            if !bound_locals.contains(f) && f != "Current" && f != "Result" && f != m_name {
+                out.insert(f.clone());
+            }
+            for a in args {
+                collect_module_own_symbols_in(a, m_name, bound_locals, non_self_locals, out);
+            }
+        }
+        Expr::MethodCall(recv, mname, args) => {
+            collect_module_own_symbols_in(recv, m_name, bound_locals, non_self_locals, out);
+            let is_other_receiver = matches!(
+                recv.as_ref(),
+                Expr::Var(v)
+                    if non_self_locals.contains(v)
+                        || (v != "Current"
+                            && v != "Result"
+                            && v != m_name
+                            && v.chars().next().is_some_and(|c| c.is_ascii_uppercase()))
+            );
+            if !is_other_receiver {
+                out.insert(mname.clone());
+            }
+            for a in args {
+                collect_module_own_symbols_in(a, m_name, bound_locals, non_self_locals, out);
+            }
+        }
+        Expr::If(c, t_stmts, t, e_stmts, el) => {
+            collect_module_own_symbols_in(c, m_name, bound_locals, non_self_locals, out);
+            let mut t_locals = bound_locals.clone();
+            collect_stmts_own_symbols_in(t_stmts, m_name, &mut t_locals, non_self_locals, out);
+            collect_module_own_symbols_in(t, m_name, &t_locals, non_self_locals, out);
+            let mut e_locals = bound_locals.clone();
+            collect_stmts_own_symbols_in(e_stmts, m_name, &mut e_locals, non_self_locals, out);
+            collect_module_own_symbols_in(el, m_name, &e_locals, non_self_locals, out);
+        }
+        Expr::Match(scrut, arms) => {
+            collect_module_own_symbols_in(scrut, m_name, bound_locals, non_self_locals, out);
+            for case in arms {
+                collect_pattern_variant_symbols(&case.pattern, out);
+                let mut arm_locals = bound_locals.clone();
+                for b in case.pattern.collect_bindings() {
+                    arm_locals.insert(b);
+                }
+                collect_stmts_own_symbols_in(
+                    &case.stmts,
+                    m_name,
+                    &mut arm_locals,
+                    non_self_locals,
+                    out,
+                );
+                collect_module_own_symbols_in(
+                    &case.body,
+                    m_name,
+                    &arm_locals,
+                    non_self_locals,
+                    out,
+                );
+            }
+        }
+        Expr::RecordLit(fields) => {
+            for (fname, fe) in fields {
+                out.insert(fname.clone());
+                collect_module_own_symbols_in(fe, m_name, bound_locals, non_self_locals, out);
+            }
+        }
+        Expr::RecordUpdate(base, fields) => {
+            collect_module_own_symbols_in(base, m_name, bound_locals, non_self_locals, out);
+            for (fname, fe) in fields {
+                out.insert(fname.clone());
+                collect_module_own_symbols_in(fe, m_name, bound_locals, non_self_locals, out);
+            }
+        }
+        Expr::TupleLit(items) => {
+            for it in items {
+                collect_module_own_symbols_in(it, m_name, bound_locals, non_self_locals, out);
+            }
+        }
+        Expr::Forall(pn, pt, body) | Expr::Exists(pn, pt, body) => {
+            let mut next_locals = bound_locals.clone();
+            let mut next_non_self = non_self_locals.clone();
+            next_locals.insert(pn.clone());
+            if !type_is_self(pt, m_name) {
+                next_non_self.insert(pn.clone());
+            } else {
+                next_non_self.remove(pn);
+            }
+            collect_module_own_symbols_in(body, m_name, &next_locals, &next_non_self, out);
+        }
+        Expr::WithIo(io_stmts, body) => {
+            let mut next_locals = bound_locals.clone();
+            for st in io_stmts {
+                match st {
+                    IoStmt::Bind(n, e) => {
+                        collect_module_own_symbols_in(
+                            e,
+                            m_name,
+                            &next_locals,
+                            non_self_locals,
+                            out,
+                        );
+                        next_locals.insert(n.clone());
+                    }
+                    IoStmt::Action(e) => {
+                        collect_module_own_symbols_in(
+                            e,
+                            m_name,
+                            &next_locals,
+                            non_self_locals,
+                            out,
+                        );
+                    }
+                }
+            }
+            collect_module_own_symbols_in(body, m_name, &next_locals, non_self_locals, out);
+        }
+        Expr::Lambda(params, _, stmts, body) => {
+            let mut next_locals = bound_locals.clone();
+            let mut next_non_self = non_self_locals.clone();
+            for (pn, pt) in params {
+                next_locals.insert(pn.clone());
+                if !type_is_self(pt, m_name) {
+                    next_non_self.insert(pn.clone());
+                } else {
+                    next_non_self.remove(pn);
+                }
+            }
+            collect_stmts_own_symbols_in(stmts, m_name, &mut next_locals, &next_non_self, out);
+            collect_module_own_symbols_in(body, m_name, &next_locals, &next_non_self, out);
+        }
+    }
+}
+
+/// The names bound in a clause of `law`, and those of them that are not of module `m_name`'s
+/// own type, as `clause_is_visible_in_interface` takes them.
+fn law_clause_locals(law: &LawDecl, m_name: &str) -> (HashSet<String>, HashSet<String>) {
+    let mut bound = HashSet::from(["Current".to_string()]);
+    let mut non_self = HashSet::new();
+    for (pn, pt) in &law.params {
+        bound.insert(pn.clone());
+        if !type_is_self(pt, m_name) {
+            non_self.insert(pn.clone());
+        }
+    }
+    (bound, non_self)
+}
+
+/// Checks whether a contract/law/invariant expression `expr` in module `m_name` is visible
+/// at `target_vis`: every member of `m_name` referenced in `expr` must be exported at least
+/// as widely as `target_vis` (and never `{NONE}`).
+fn clause_is_visible_in_interface(
+    expr: &Expr,
+    m_name: &str,
+    symbol_vis: &HashMap<String, Visibility>,
+    target_vis: &Visibility,
+    bound_locals: &HashSet<String>,
+    non_self_locals: &HashSet<String>,
+) -> bool {
+    let mut syms = HashSet::new();
+    collect_module_own_symbols_in(expr, m_name, bound_locals, non_self_locals, &mut syms);
+    syms.iter().all(|sym| match symbol_vis.get(sym) {
+        Some(sv) => *sv != Visibility::None && sv.is_at_least_as_visible_as(target_vis),
+        None => true,
+    })
+}
+
+/// Projects a [`ModuleDecl`] down to its public contract-only interface (`.gds`),
+/// withholding private routines/laws/invariants, contract clauses that mention hidden
+/// representation or private routines, and every `do` body, of a routine or a law.
+pub fn contract_only_module(m: &ModuleDecl) -> ModuleDecl {
+    let symbol_vis = module_symbol_visibilities(m);
+
+    let filter_routine = |(vis, r): &(Visibility, RoutineDecl)| -> Option<(Visibility, RoutineDecl)> {
+        if *vis == Visibility::None {
+            return None;
+        }
+        let mut bound_locals = HashSet::from(["Current".to_string(), "Result".to_string()]);
+        let mut non_self_locals = HashSet::new();
+        for (pn, pt) in &r.params {
+            bound_locals.insert(pn.clone());
+            if !type_is_self(pt, &m.name) {
+                non_self_locals.insert(pn.clone());
+            }
+        }
+        if !type_is_self(&r.ret_type, &m.name) {
+            non_self_locals.insert("Result".to_string());
+        }
+        let requires = r
+            .requires
+            .iter()
+            .filter(|(_, req)| {
+                clause_is_visible_in_interface(
+                    req,
+                    &m.name,
+                    &symbol_vis,
+                    vis,
+                    &bound_locals,
+                    &non_self_locals,
+                )
+            })
+            .cloned()
+            .collect();
+        let ensures = r
+            .ensures
+            .iter()
+            .filter(|(_, ens)| {
+                clause_is_visible_in_interface(
+                    ens,
+                    &m.name,
+                    &symbol_vis,
+                    vis,
+                    &bound_locals,
+                    &non_self_locals,
+                )
+            })
+            .cloned()
+            .collect();
+        Some((
+            vis.clone(),
+            RoutineDecl {
+                name: r.name.clone(),
+                type_params: r.type_params.clone(),
+                params: r.params.clone(),
+                ret_type: r.ret_type.clone(),
+                requires,
+                variant: Vec::new(),
+                stmts: Vec::new(),
+                body: Expr::Int(0),
+                ensures,
+            },
+        ))
+    };
+
+    let specify_routines = m
+        .specify_routines
+        .iter()
+        .filter_map(filter_routine)
+        .collect();
+    let create_routines = m
+        .create_routines
+        .iter()
+        .filter_map(filter_routine)
+        .collect();
+    let feature_routines = m
+        .feature_routines
+        .iter()
+        .filter_map(filter_routine)
+        .collect();
+
+    let specify_laws = m
+        .specify_laws
+        .iter()
+        .filter_map(|(vis, law)| {
+            if *vis == Visibility::None {
+                return None;
+            }
+            let (bound_locals, non_self_locals) = law_clause_locals(law, &m.name);
+            let all_visible = law
+                .requires
+                .iter()
+                .map(|(_, e)| e)
+                .chain(law.ensures.iter().map(|(_, e)| e))
+                .chain(law.triggers.iter())
+                .all(|e| {
+                    clause_is_visible_in_interface(
+                        e,
+                        &m.name,
+                        &symbol_vis,
+                        vis,
+                        &bound_locals,
+                        &non_self_locals,
+                    )
+                });
+            all_visible.then(|| {
+                let contract = LawDecl {
+                    variant: Vec::new(),
+                    stmts: Vec::new(),
+                    body: None,
+                    ..law.clone()
+                };
+                (vis.clone(), contract)
+            })
+        })
+        .collect();
+
+    let inv_locals = HashSet::from(["Current".to_string()]);
+    let inv_non_self = HashSet::new();
+    let invariants = m
+        .invariants
+        .iter()
+        .filter(|(_, inv)| {
+            clause_is_visible_in_interface(
+                inv,
+                &m.name,
+                &symbol_vis,
+                &Visibility::Any,
+                &inv_locals,
+                &inv_non_self,
+            )
+        })
+        .cloned()
+        .collect();
+
+    ModuleDecl {
+        kind: m.kind.clone(),
+        name: m.name.clone(),
+        type_params: m.type_params.clone(),
+        type_bounds: m.type_bounds.clone(),
+        satisfies: m.satisfies.clone(),
+        repr_vis: m.repr_vis.clone(),
+        repr: m.repr.clone(),
+        specify_routines,
+        specify_laws,
+        create_routines,
+        feature_routines,
+        invariants,
+    }
+}
+
 /// Formats the public contract interface of a module (Eiffel-style `short` view, §4 & §7.5),
 /// showing exported `representation`, `create`, `feature`, `specify`, and `invariant` signatures
 /// and contracts (`require` / `ensure`) while omitting private implementation `do` bodies.
-pub fn format_module_interface(m: &ModuleDecl) -> String {
+pub fn format_module_interface(raw_m: &ModuleDecl) -> String {
+    let cm = contract_only_module(raw_m);
+    let m = &cm;
     let mut out = String::new();
     let kw = match m.kind {
         ModuleKind::Module => "module",
@@ -16108,15 +16847,41 @@ pub fn format_module_interface(m: &ModuleDecl) -> String {
         ModuleKind::Program => "program",
         ModuleKind::ReactiveProgram => "reactive program",
     };
+    let where_tps: HashSet<&String> = m
+        .satisfies
+        .as_ref()
+        .map(|s| s.where_constraints.iter().map(|(tp, _)| tp).collect())
+        .unwrap_or_default();
     let tp = if m.type_params.is_empty() {
         String::new()
     } else {
-        format!("[{}]", m.type_params.join(", "))
+        let formatted_tps: Vec<String> = m
+            .type_params
+            .iter()
+            .map(|t| match m.type_bounds.get(t) {
+                Some(bound) if !where_tps.contains(t) => format!("{t}: {bound}"),
+                _ => t.clone(),
+            })
+            .collect();
+        format!("[{}]", formatted_tps.join(", "))
     };
     out.push_str(&format!("{kw} {}{tp}\n", m.name));
 
     if let Some(sat) = &m.satisfies {
-        out.push_str(&format!("  satisfies {}\n", sat.concepts.join(", ")));
+        if sat.where_constraints.is_empty() {
+            out.push_str(&format!("  satisfies {}\n", sat.concepts.join(", ")));
+        } else {
+            let wc: Vec<String> = sat
+                .where_constraints
+                .iter()
+                .map(|(tp, c)| format!("{tp} satisfies {c}"))
+                .collect();
+            out.push_str(&format!(
+                "  satisfies {} where {}\n",
+                sat.concepts.join(", "),
+                wc.join(", ")
+            ));
+        }
     }
 
     if m.kind == ModuleKind::Module {
@@ -16125,7 +16890,7 @@ pub fn format_module_interface(m: &ModuleDecl) -> String {
                 out.push_str("  representation {NONE} -- opaque ADT layout\n");
             }
             vis => {
-                out.push_str(&format!("  representation {:?}\n", vis));
+                out.push_str(&format!("  representation {vis}\n"));
                 match &m.repr {
                     ReprKind::Sum(vars) => {
                         for v in vars {
@@ -16162,8 +16927,8 @@ pub fn format_module_interface(m: &ModuleDecl) -> String {
             format!("({})", p_list.join(", "))
         };
         s.push_str(&format!(
-            "    {:?} {}{}{}: {}\n",
-            vis, r.name, rtp, ps, r.ret_type
+            "    {vis} {}{}{}: {}\n",
+            r.name, rtp, ps, r.ret_type
         ));
         for (tag, req) in &r.requires {
             s.push_str(&format!(
@@ -16172,12 +16937,10 @@ pub fn format_module_interface(m: &ModuleDecl) -> String {
             ));
         }
         for (tag, ens) in &r.ensures {
-            if ens_is_visible(ens, m, vis) {
-                s.push_str(&format!(
-                    "      ensure  {tag}: {}\n",
-                    format_gardel_expr(ens)
-                ));
-            }
+            s.push_str(&format!(
+                "      ensure  {tag}: {}\n",
+                format_gardel_expr(ens)
+            ));
         }
         s
     };
@@ -16211,8 +16974,7 @@ pub fn format_module_interface(m: &ModuleDecl) -> String {
                 format!("[{}]", law.type_params.join(", "))
             };
             out.push_str(&format!(
-                "    {:?} law {}{ltp}({})\n",
-                vis,
+                "    {vis} law {}{ltp}({})\n",
                 law.name,
                 ps.join(", ")
             ));
@@ -16221,6 +16983,10 @@ pub fn format_module_interface(m: &ModuleDecl) -> String {
                     "      require {tag}: {}\n",
                     format_gardel_expr(req)
                 ));
+            }
+            if !law.triggers.is_empty() {
+                let trigs: Vec<String> = law.triggers.iter().map(format_gardel_expr).collect();
+                out.push_str(&format!("      trigger {}\n", trigs.join(", ")));
             }
             for (tag, ens) in &law.ensures {
                 out.push_str(&format!(
@@ -16238,18 +17004,6 @@ pub fn format_module_interface(m: &ModuleDecl) -> String {
     }
     out.push_str("end\n");
     out
-}
-
-fn ens_is_visible(ens: &Expr, m: &ModuleDecl, routine_vis: &Visibility) -> bool {
-    let syms = collect_symbols(ens);
-    if let ReprKind::Product(fields) = &m.repr {
-        for (fnm, _) in fields {
-            if syms.contains(fnm) && !m.repr_vis.is_at_least_as_visible_as(routine_vis) {
-                return false;
-            }
-        }
-    }
-    true
 }
 
 /// Default output directory of `gardelc --emit-stdlib` (inside `build/`, which directory
@@ -16563,7 +17317,7 @@ fn collect_gdl_files(
 }
 
 /// Resolves the CLI input operands (Task B.4) into source file paths. A directory stands for
-/// its top-level `*.gdl` files (not recursive); an operand with `*`/`?` wildcards in its file
+/// its `*.gdl` files, searched recursively; an operand with `*`/`?` wildcards in its file
 /// name that is not an existing file is expanded by `gardelc` itself (shells such as
 /// PowerShell/cmd do not expand globs for native programs). Duplicates are dropped. The flag
 /// is true for a *project* run: several files, a directory, or a wildcard operand.
@@ -16610,6 +17364,63 @@ pub fn resolve_input_operands(operands: &[String]) -> Result<(Vec<String>, bool)
     Ok((files, project || operands.len() > 1))
 }
 
+/// Resolves a project directory `dir` containing `Gardel.toml` and `src/` (Task E.1).
+/// Returns `(Manifest, sorted_gdl_files)` or `ProjectResolutionError`.
+pub fn resolve_project_inputs(
+    dir: &std::path::Path,
+) -> Result<(manifest::Manifest, Vec<String>), manifest::ProjectResolutionError> {
+    let (manifest, src_dir) = manifest::resolve_manifest_project_dir(dir)?;
+    let src_dir_str = src_dir.to_string_lossy().to_string();
+    let files = gdl_files_in_dir(&src_dir_str, None).map_err(|e| {
+        manifest::ProjectResolutionError {
+            rule: "IO",
+            tag: "io_error",
+            path: src_dir_str.clone(),
+            line: 1,
+            message: e,
+        }
+    })?;
+    if files.is_empty() {
+        return Err(manifest::ProjectResolutionError {
+            rule: "IO",
+            tag: "io_error",
+            path: src_dir_str.clone(),
+            line: 1,
+            message: format!(
+                "No .gdl source files found in project '{}' ('{}')",
+                manifest.project.name, src_dir_str
+            ),
+        });
+    }
+    Ok((manifest, files))
+}
+
+/// Parses `--project <DIR>` from command-line arguments.
+/// Rejects `--project` without a directory argument or repeated `--project` flags.
+fn parse_project_arg(args: &[String]) -> Result<Option<String>, String> {
+    let mut project_dir = None;
+    let mut i = 1;
+    while i < args.len() {
+        let arg = &args[i];
+        if arg == "--project" {
+            let val = args
+                .get(i + 1)
+                .filter(|v| !v.starts_with("--") && !v.is_empty())
+                .ok_or_else(|| {
+                    "--project: expected a directory path after `--project`".to_string()
+                })?;
+            if project_dir.is_some() {
+                return Err("--project: option specified more than once".to_string());
+            }
+            project_dir = Some(val.clone());
+            i += 2;
+            continue;
+        }
+        i += 1;
+    }
+    Ok(project_dir)
+}
+
 /// Splits the command line into input operands (files, directories, wildcard patterns).
 /// The values of `--fuel <N>` and `--inspect [MODULE]` are not operands.
 /// Whether a command-line word names an input (file, directory or wildcard) rather than a
@@ -16621,7 +17432,7 @@ fn looks_like_input(s: &str) -> bool {
 }
 
 /// Flags followed by a value.
-const VALUE_FLAGS: &[&str] = &["--fuel", "--z3-seed", "--z3-rlimit"];
+const VALUE_FLAGS: &[&str] = &["--fuel", "--z3-seed", "--z3-rlimit", "--project"];
 /// Flags with no value, or with an optional one (`--inspect`, `--emit-stdlib`).
 const PLAIN_FLAGS: &[&str] = &[
     "--stdlib",
@@ -16695,7 +17506,7 @@ pub fn check_project_namespace(units: &[SourceUnit], prelude_mode: bool) -> Vec<
 }
 
 /// Options of a verification run.
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub struct VerifyOptions {
     pub prelude_mode: bool,
     /// Several files / a directory: enables `W0201` and cross-file linking.
@@ -16706,6 +17517,7 @@ pub struct VerifyOptions {
     pub bounded_check: bool,
     pub z3_seed: Option<u32>,
     pub z3_rlimit: Option<u64>,
+    pub external_modules: HashSet<String>,
 }
 
 /// Outcome of checking and verifying all modules of a run.
@@ -16759,7 +17571,7 @@ pub fn check_and_verify_project(units: &mut [SourceUnit], opts: VerifyOptions) -
             .enumerate()
             .flat_map(|(ui, u)| u.ast.modules.iter().map(move |m| (m.clone(), ui)))
             .collect();
-        Some(Rc::new(LinkTable::new(all)))
+        Some(Rc::new(LinkTable::with_external(all, opts.external_modules)))
     } else {
         None
     };
@@ -16872,8 +17684,30 @@ fn exit_with_frontend_error(
     message: String,
     path: &str,
 ) -> ! {
+    exit_with_frontend_error_at_line(json_mode, rule, routine, tag, message, path, 1)
+}
+
+/// Reports a fatal front-end error at a 1-based line number `line` in `path`.
+fn exit_with_frontend_error_at_line(
+    json_mode: bool,
+    rule: &'static str,
+    routine: &str,
+    tag: &str,
+    message: String,
+    path: &str,
+    line: usize,
+) -> ! {
     if json_mode {
-        let diag = Diagnostic::basic("error", rule, routine.to_string(), tag.to_string(), message);
+        let mut diag =
+            Diagnostic::basic("error", rule, routine.to_string(), tag.to_string(), message);
+        let line = line.max(1);
+        diag.span = Some(Span {
+            file: path.to_string(),
+            line,
+            column: 1,
+            end_line: line,
+            end_column: 1,
+        });
         println!("[\n{}\n]", diag.to_json("UNKNOWN", path));
     } else {
         eprintln!("[ERROR] {message}");
@@ -16883,9 +17717,9 @@ fn exit_with_frontend_error(
 
 fn main() {
     let args: Vec<String> = env::args().collect();
-    if args.len() < 2 {
+    if args.len() < 2 && !std::path::Path::new("Gardel.toml").is_file() {
         eprintln!(
-            "Usage: gardelc <input.gdl ... | DIR | --stdlib> [--no-prelude] [--inspect [MODULE]] [--emit-stdlib [DIR]] [--json-diagnostics] [--fuel <N>] [--z3-seed <N>] [--z3-rlimit <N>] [--audit] [--strict] [--bounded-check] [--run]"
+            "Usage: gardelc <input.gdl ... | DIR | --project <DIR> | --stdlib> [--no-prelude] [--inspect [MODULE]] [--emit-stdlib [DIR]] [--json-diagnostics] [--fuel <N>] [--z3-seed <N>] [--z3-rlimit <N>] [--audit] [--strict] [--bounded-check] [--run]"
         );
         eprintln!(
             "  --no-prelude  bootstrap mode: do not inject the Standard Prelude (implied by --stdlib and when compiling the prelude source itself, §4.1)"
@@ -16893,12 +17727,17 @@ fn main() {
         eprintln!(
             "  several files, a directory (its *.gdl files, searched recursively, skipping build/ and target/) or a wildcard pattern such as src/*.gdl form one project with a flat module namespace (§4.2)"
         );
+        eprintln!(
+            "  --project <DIR>  compile project defined by Gardel.toml in DIR using src/ (or run `gardelc` with no input when ./Gardel.toml is present, §4.2)"
+        );
         std::process::exit(1);
     }
 
+    let json_mode = args.iter().any(|a| a == "--json-diagnostics");
+
     if let Some(flag) = first_unknown_flag(&args) {
         exit_with_frontend_error(
-            args.iter().any(|a| a == "--json-diagnostics"),
+            json_mode,
             "Command Line",
             "gardelc",
             "unknown_flag",
@@ -16907,7 +17746,29 @@ fn main() {
         );
     }
 
+    let project_arg = match parse_project_arg(&args) {
+        Ok(dir) => dir,
+        Err(e) => exit_with_frontend_error(
+            json_mode,
+            "Command Line",
+            "gardelc",
+            "invalid_arguments",
+            e,
+            "",
+        ),
+    };
+
     if let Some(i) = args.iter().position(|a| a == "--emit-stdlib") {
+        if project_arg.is_some() {
+            exit_with_frontend_error(
+                json_mode,
+                "Command Line",
+                "gardelc",
+                "invalid_arguments",
+                "cannot combine --project with --emit-stdlib".to_string(),
+                "",
+            );
+        }
         let out_dir = args
             .get(i + 1)
             .filter(|a| !a.starts_with("--"))
@@ -16925,14 +17786,51 @@ fn main() {
         }
     }
 
+    if project_arg.is_some() && args.iter().any(|a| a == "--stdlib") {
+        exit_with_frontend_error(
+            json_mode,
+            "Command Line",
+            "gardelc",
+            "invalid_arguments",
+            "cannot combine --project with --stdlib".to_string(),
+            "",
+        );
+    }
+
+    let mut ops = input_operands(&args);
+    let mut project_arg = project_arg;
+    // A directory with a manifest is that project, however it is named: read as a plain
+    // directory, it would skip the manifest and link files outside `src/`.
+    if project_arg.is_none() && !args.iter().any(|a| a == "--stdlib") {
+        let manifest_dir =
+            ops.iter().find(|op| std::path::Path::new(op).join("Gardel.toml").is_file());
+        if let Some(dir) = manifest_dir {
+            if ops.len() > 1 {
+                exit_with_frontend_error(
+                    json_mode,
+                    "Command Line",
+                    "gardelc",
+                    "invalid_arguments",
+                    format!("`{dir}` has a Gardel.toml, so it is a project, and a project cannot be combined with other inputs"),
+                    dir,
+                );
+            }
+            project_arg = Some(dir.clone());
+            ops.clear();
+        }
+    }
+    let has_implicit_project = ops.is_empty()
+        && project_arg.is_none()
+        && !args.iter().any(|a| a == "--stdlib")
+        && std::path::Path::new("Gardel.toml").is_file();
+
     let inspect_mode = args.iter().any(|a| a == "--inspect");
     let mut stdlib_only = args.iter().any(|a| a == "--stdlib")
-        || (inspect_mode && input_operands(&args).is_empty());
+        || (inspect_mode && ops.is_empty() && project_arg.is_none() && !has_implicit_project);
     // Stdlib files named explicitly (e.g. `gardelc --inspect option.gdl`): the whole tree is
     // verified, but `--inspect` shows only these files' modules.
     let mut requested_stdlib_files: Vec<std::path::PathBuf> = Vec::new();
 
-    let json_mode = args.iter().any(|a| a == "--json-diagnostics");
     let audit_mode = args.iter().any(|a| a == "--audit");
     let strict_mode = args.iter().any(|a| a == "--strict");
     let bounded_check = args.iter().any(|a| a == "--bounded-check");
@@ -16969,48 +17867,81 @@ fn main() {
     // mixing them with user files is an error (a user program gets the stdlib as its prelude).
     let mut user_inputs: Option<(Vec<String>, bool)> = None;
     if !stdlib_only {
-        let ops = input_operands(&args);
-        if ops.is_empty() {
-            exit_with_frontend_error(
-                json_mode,
-                "IO",
-                "file",
-                "io_error",
-                "No input file given (expected <input.gdl ...>, a directory, or --stdlib)"
-                    .to_string(),
-                "<none>",
-            );
-        }
-        let (paths, project) = match resolve_input_operands(&ops) {
-            Ok(r) => r,
-            Err(e) => exit_with_frontend_error(json_mode, "IO", "file", "io_error", e, &ops[0]),
-        };
-        let inside: Vec<&String> = paths.iter().filter(|p| path_in_stdlib_tree(p)).collect();
-        if inside.is_empty() {
-            user_inputs = Some((paths, project));
-        } else if inside.len() < paths.len() {
-            exit_with_frontend_error(
-                json_mode,
-                "IO",
-                "file",
-                "io_error",
-                format!(
-                    "Standard Prelude files ({}) cannot be compiled together with user files: user programs receive the stdlib as their prelude. Verify the stdlib with `gardelc --stdlib`",
-                    inside.iter().map(|p| format!("`{p}`")).collect::<Vec<_>>().join(", ")
-                ),
-                inside[0],
-            );
+        let project_manifest_dir = if let Some(dir) = project_arg {
+            if !ops.is_empty() {
+                exit_with_frontend_error(
+                    json_mode,
+                    "Command Line",
+                    "gardelc",
+                    "invalid_arguments",
+                    "cannot combine --project with explicit input file operands".to_string(),
+                    &ops[0],
+                );
+            }
+            Some(dir)
+        } else if has_implicit_project {
+            Some(".".to_string())
         } else {
-            let which = if inside.len() <= 3 {
-                inside.iter().map(|p| format!("`{p}`")).collect::<Vec<_>>().join(", ")
-            } else {
-                format!("{} files", inside.len())
+            None
+        };
+
+        if let Some(pdir) = project_manifest_dir {
+            let (_manifest, files) = match resolve_project_inputs(std::path::Path::new(&pdir)) {
+                Ok(res) => res,
+                Err(err) => exit_with_frontend_error_at_line(
+                    json_mode,
+                    err.rule,
+                    "Gardel.toml",
+                    err.tag,
+                    err.message,
+                    &err.path,
+                    err.line,
+                ),
             };
-            say(&format!(
-                "[stdlib] {which} belong(s) to the Standard Prelude, whose modules depend on each other: verifying the whole stdlib tree (as `--stdlib`)."
-            ));
-            requested_stdlib_files = inside.iter().filter_map(|p| fs::canonicalize(p).ok()).collect();
-            stdlib_only = true;
+            user_inputs = Some((files, true));
+        } else {
+            if ops.is_empty() {
+                exit_with_frontend_error(
+                    json_mode,
+                    "IO",
+                    "file",
+                    "io_error",
+                    "No input file given (expected <input.gdl ...>, a directory, --project <DIR>, or --stdlib)"
+                        .to_string(),
+                    "<none>",
+                );
+            }
+            let (paths, project) = match resolve_input_operands(&ops) {
+                Ok(r) => r,
+                Err(e) => exit_with_frontend_error(json_mode, "IO", "file", "io_error", e, &ops[0]),
+            };
+            let inside: Vec<&String> = paths.iter().filter(|p| path_in_stdlib_tree(p)).collect();
+            if inside.is_empty() {
+                user_inputs = Some((paths, project));
+            } else if inside.len() < paths.len() {
+                exit_with_frontend_error(
+                    json_mode,
+                    "IO",
+                    "file",
+                    "io_error",
+                    format!(
+                        "Standard Prelude files ({}) cannot be compiled together with user files: user programs receive the stdlib as their prelude. Verify the stdlib with `gardelc --stdlib`",
+                        inside.iter().map(|p| format!("`{p}`")).collect::<Vec<_>>().join(", ")
+                    ),
+                    inside[0],
+                );
+            } else {
+                let which = if inside.len() <= 3 {
+                    inside.iter().map(|p| format!("`{p}`")).collect::<Vec<_>>().join(", ")
+                } else {
+                    format!("{} files", inside.len())
+                };
+                say(&format!(
+                    "[stdlib] {which} belong(s) to the Standard Prelude, whose modules depend on each other: verifying the whole stdlib tree (as `--stdlib`)."
+                ));
+                requested_stdlib_files = inside.iter().filter_map(|p| fs::canonicalize(p).ok()).collect();
+                stdlib_only = true;
+            }
         }
     }
 
@@ -17128,6 +18059,7 @@ fn main() {
         bounded_check,
         z3_seed,
         z3_rlimit,
+        external_modules: HashSet::new(),
     };
     let checked = check_and_verify_project(&mut units, opts);
     if !checked.fatal.is_empty() {
@@ -17141,6 +18073,16 @@ fn main() {
     } = checked;
 
     if inspect_mode {
+        // An interface states what was proven, so a run with errors or only samples has none
+        // to show.
+        let errors: Vec<Diagnostic> = diags
+            .iter()
+            .filter(|(_, d)| d.level == "error" || d.tag == NOT_PROVEN_TAG)
+            .map(|(_, d)| d.clone())
+            .collect();
+        if !errors.is_empty() {
+            exit_with_fatal(&errors, json_mode, &first_path);
+        }
         let filter_mod = args
             .iter()
             .position(|a| a == "--inspect")
@@ -17757,6 +18699,7 @@ end
             bounded_check: false,
             z3_seed: None,
             z3_rlimit: None,
+            external_modules: HashSet::new(),
         };
         let checked = check_and_verify_project(&mut units, opts);
         assert!(
@@ -20371,8 +21314,8 @@ int main(void) {
         assert!(diags.iter().any(|d| d.tag == "on_board"), "{diags:?}");
     }
 
-    const D7_STATE: &str = include_str!("../../examples/echo_server/server_state.gdl");
-    const D7_ECHO: &str = include_str!("../../examples/echo_server/echo_server.gdl");
+    const D7_STATE: &str = include_str!("../../examples/echo_server/src/server_state.gdl");
+    const D7_ECHO: &str = include_str!("../../examples/echo_server/src/echo_server.gdl");
     const D7_RULES: &str = include_str!("../tests/reactive/net_rules.gdl");
     const D7_FLOOD: &str = include_str!("../tests/reactive/net_flood.gdl");
 
@@ -21371,12 +22314,11 @@ int main(void) {
 
     #[test]
     fn test_d0_bounded_evaluator_takes_catch_all_arms() {
-        // The fallback evaluator agrees with Boogie on `case _`, so a verdict does not depend
-        // on whether the solvers are installed.
+        // The bounded evaluator agrees with Boogie on `case _`.
         let src = include_str!("../tests/boogie/wild_own.gdl");
         let m = parse_user_module_with_prelude(src);
         let diags = with_prelude_injection(true, || {
-            verify_module_phase3(&m, src, "wild_own.gdl", DEFAULT_FUEL, true, false, true)
+            verify_module_phase3(&m, src, "wild_own.gdl", DEFAULT_FUEL, false, false, true)
         });
         assert!(diags.iter().all(|d| d.level != "error"), "{diags:?}");
     }
@@ -21743,8 +22685,16 @@ int main(void) {
         for entry in fs::read_dir(&root).unwrap() {
             let p = entry.unwrap().path();
             if p.is_dir() {
-                projects.push(fs::read_dir(&p).unwrap().map(|e| e.unwrap().path()).collect());
-            } else {
+                let gdl_files: Vec<std::path::PathBuf> =
+                    gdl_files_in_dir(&p.to_string_lossy(), None)
+                        .unwrap()
+                        .into_iter()
+                        .map(std::path::PathBuf::from)
+                        .collect();
+                if !gdl_files.is_empty() {
+                    projects.push(gdl_files);
+                }
+            } else if p.extension().and_then(|ext| ext.to_str()) == Some("gdl") {
                 projects.push(vec![p]);
             }
         }
@@ -21798,6 +22748,221 @@ int main(void) {
         }
     }
 
+    /// `SECRET.make` with a public `open_one`, and a private `hidden` and `v` (Task E.0).
+    const HIDDEN_SECRET: &str = "module SECRET\n\nrepresentation {NONE}\n  v: U64\n\ncreate {ANY}\n\n  make: SECRET\n    do\n      { v = 1 }\n    end\n\nfeature {ANY}\n\n  open_one: U64\n    do\n      Current.v\n    end\n\nfeature {NONE}\n\n  hidden: U64\n    do\n      Current.v\n    end\n\nend\n";
+
+    #[test]
+    fn test_e0_hidden_members_behind_inferred_receivers() {
+        let client = |body: &str| {
+            format!("functions PEEK\n\nfeature {{ANY}}\n\n  t(o: OPTION[SECRET], l: LIST[SECRET], b: BOOL): U64\n    do\n      {body}\n    end\n\nend\n")
+        };
+        let arm = "match o\n        case Some(x) then x.MEMBER\n        case None then 0\n      end";
+        for receiver in [
+            "o.get.MEMBER",
+            "o.unwrap_or(SECRET.make).MEMBER",
+            "l.head.MEMBER",
+            "(if b then SECRET.make else SECRET.make end).MEMBER",
+            "(if b then o.get else o.get end).MEMBER",
+            "(match o case Some(x) then x case None then SECRET.make end).MEMBER",
+            "let p = Some(SECRET.make)\n      p.unwrap_or(SECRET.make).MEMBER",
+            arm,
+            // No type reaches this receiver: `map` has a type parameter of its own.
+            "o.map(fn(s: SECRET): SECRET do s end).get.MEMBER",
+        ] {
+            for member in ["hidden", "v"] {
+                let src = client(&receiver.replace("MEMBER", member));
+                let fatal = e0_fatal(&[("secret.gdl", HIDDEN_SECRET), ("peek.gdl", &src)]);
+                assert!(
+                    fatal.iter().any(|(r, _)| r == "E0113: hidden_member"),
+                    "{receiver} with {member}: {fatal:?}"
+                );
+            }
+            // The exported member passes through the same receivers.
+            let src = client(&receiver.replace("MEMBER", "open_one"));
+            let fatal = e0_fatal(&[("secret.gdl", HIDDEN_SECRET), ("peek.gdl", &src)]);
+            assert_eq!(fatal, Vec::new(), "{receiver}");
+        }
+    }
+
+    #[test]
+    fn test_e0_inferred_receivers_refuse_nothing_that_is_visible() {
+        // A private `head` does not hide the built-in `head` of a LIST, and a private name
+        // is fine when another module exports it.
+        let lib = "module LIB\n\nrepresentation {NONE}\n  v: U64\n\ncreate {ANY}\n\n  make: LIB\n    do\n      { v = 1 }\n    end\n\nfeature {NONE}\n\n  head: U64\n    do\n      Current.v\n    end\n\n  shared: U64\n    do\n      Current.v\n    end\n\nend\n";
+        let open = "module OPEN\n\nrepresentation {NONE}\n  v: U64\n\ncreate {ANY}\n\n  make: OPEN\n    do\n      { v = 1 }\n    end\n\nfeature {ANY}\n\n  shared: U64\n    do\n      Current.v\n    end\n\nend\n";
+        // A module named like a routine's type parameter is not what that parameter means.
+        let b = "module B\n\nrepresentation {NONE}\n  v: U64\n\ncreate {ANY}\n\n  make: B\n    do\n      { v = 1 }\n    end\n\nend\n";
+        let user = "functions USE_LIB\n\nfeature {ANY}\n\n  one(l: LIST[U64]): U64\n    require\n      n: l.length > 0\n    do\n      l.head\n    end\n\n  two(o: OPTION[OPEN]): U64\n    do\n      o.map(fn(s: OPEN): OPEN do s end).unwrap_or(OPEN.make).shared\n    end\n\n  three(o: OPTION[U64]): BOOL\n    do\n      o.map(fn(s: U64): U64 do s end).is_some\n    end\n\nend\n";
+        let fatal = e0_fatal(&[("lib.gdl", lib), ("open.gdl", open), ("b.gdl", b), ("use_lib.gdl", user)]);
+        assert_eq!(fatal, Vec::new());
+    }
+
+    #[test]
+    fn test_e0_a_call_of_a_private_routine_never_skips_its_require() {
+        // `OTHER` exports a `safe_div`, so the name alone does not say this call is private.
+        let lib = "module LIB\n\nrepresentation {NONE}\n  v: U64\n\ncreate {ANY}\n\n  make: LIB\n    do\n      { v = 7 }\n    end\n\nfeature {NONE}\n\n  safe_div(d: U64): U64\n    require\n      nz: d > 0\n    do\n      100 / d\n    end\n\nend\n";
+        let other = "module OTHER\n\nrepresentation {NONE}\n  v: U64\n\nfeature {ANY}\n\n  safe_div(d: U64): U64\n    do\n      d\n    end\n\nend\n";
+        let client = "functions CLIENT\n\nfeature {ANY}\n\n  t(o: OPTION[LIB]): U64\n    do\n      o.map(fn(s: LIB): LIB do s end).unwrap_or(LIB.make).safe_div(0)\n    end\n\nend\n";
+        let mut units = b4_units(&[("lib.gdl", lib), ("other.gdl", other), ("client.gdl", client)]);
+        let checked = check_and_verify_project(&mut units, b4_opts(true, true));
+        assert!(checked.fatal.is_empty(), "the name alone cannot decide this: {:?}", checked.fatal);
+        assert!(
+            checked.diags.iter().any(|(ui, d)| {
+                *ui == 2 && d.rule == "E0113: hidden_member" && d.tag == "safe_div"
+            }),
+            "a private routine was called with no check: {:?}",
+            checked.diags
+        );
+    }
+
+    #[test]
+    fn test_e2_a_law_cannot_hide_its_require() {
+        // Its hypothesis cannot hold, so the law proves anything. Clients would see no
+        // hypothesis, and with it `False`.
+        let lib = |vis: &str| {
+            format!("module LIB\n\nrepresentation {{NONE}}\n  v: U64\n\ncreate {{ANY}}\n\n  make(x: U64): LIB\n    do\n      {{ v = x }}\n    end\n\nfeature {{ANY}}\n\n  get: U64\n    do\n      Current.v\n    end\n\nspecify {vis}\n\n  law bad(a: LIB)\n    require\n      h: a.v > 5 and a.v < 3\n    do\n      True\n    ensure\n      c: a.get = 12345\n    end\n\nend\n")
+        };
+        let client = "functions CLIENT\n\nfeature {ANY}\n\n  boom: U64\n    do\n      let a = LIB.make(0)\n      check\n        k: LIB.bad(a)\n        absurd: False\n      end\n      1\n    end\n\nend\n";
+
+        let source = lib("{ANY}");
+        let mut units = b4_units(&[("lib.gdl", &source), ("client.gdl", client)]);
+        let checked = check_and_verify_project(&mut units, b4_opts(true, true));
+        assert!(
+            checked.diags.iter().any(|(_, d)| {
+                d.level == "error" && d.rule == "Rule 1 (Contract Visibility)" && d.routine == "bad"
+            }),
+            "{:?}",
+            checked.diags
+        );
+
+        // Whatever reaches the emitter, a law with a withheld hypothesis is not a fact.
+        let tokens = tokenize(&source).expect("lexing should succeed");
+        let ast = Parser::new(tokens).parse_file().expect("parsing should succeed");
+        let (text, names) = emit_contract_interface(&ast.modules[0]);
+        assert!(!names.iter().any(|n| n.contains("law_")), "{text}");
+
+        // A private law is a proof step of its module, and stays allowed.
+        let private = lib("{NONE}");
+        let mut units = b4_units(&[("lib.gdl", &private)]);
+        let checked = check_and_verify_project(&mut units, b4_opts(true, true));
+        assert!(
+            !checked.diags.iter().any(|(_, d)| d.rule == "Rule 1 (Contract Visibility)"),
+            "{:?}",
+            checked.diags
+        );
+    }
+
+    #[test]
+    fn test_e2_a_law_proof_stays_out_of_the_interface() {
+        let dep = |proof: &str| {
+            format!("functions DEP\n\nfeature {{ANY}}\n\n  one: U64\n    do\n      1\n    ensure\n      is_one: Result = 1\n    end\n\nspecify {{ANY}}\n\n  law one_is_positive(x: U64)\n{proof}    ensure\n      pos: DEP.one > 0\n    end\n\nend\n")
+        };
+        let helper = "functions HELPER\n\nfeature {ANY}\n\n  tag: U64\n    do\n      7\n    end\n\nend\n";
+        let client = "functions CLIENT\n\nfeature {ANY}\n\n  use_it(l: LIST[NAT]): U64\n    do\n      let m = LIST_OPS.map(l, fn(x: NAT): NAT do x end)\n      DEP.one\n    ensure\n      is_one: Result = 1\n    end\n\nend\n";
+
+        let emit_client = |dep_src: &str| -> (String, String) {
+            let mut units =
+                b4_units(&[("dep.gdl", dep_src), ("helper.gdl", helper), ("client.gdl", client)]);
+            let mut opts = b4_opts(true, true);
+            opts.external_modules.insert("DEP".to_string());
+            let checked = check_and_verify_project(&mut units, opts);
+            assert!(checked.fatal.is_empty(), "fatal: {:?}", checked.fatal);
+            let errs: Vec<_> = checked.diags.iter().filter(|(_, d)| d.level == "error").collect();
+            assert!(errs.is_empty(), "{errs:?}");
+            let bpl = with_prelude_injection(true, || {
+                with_link_table(checked.link.clone(), || {
+                    emit_boogie(&units[2].ast.modules[0], DEFAULT_FUEL)
+                })
+            });
+            (bpl, format_module_interface(&units[0].ast.modules[0]))
+        };
+
+        let (bare, bare_interface) = emit_client(&dep(""));
+        // The proof reaches a literal, a lambda, a linked module and a prelude module.
+        let (proven, proven_interface) = emit_client(&dep(
+            "    do\n      let s = \"only in the proof\"\n      let f = fn(y: NAT): NAT do y end\n      check\n        k: HELPER.tag = HELPER.tag\n        o: BYTES.empty.length = 0\n      end\n      True\n",
+        ));
+        assert_eq!(bare_interface, proven_interface);
+        assert!(!proven.contains("HELPER"));
+        assert_eq!(bare, proven, "a law's proof must not change a client's Boogie");
+
+        // The proof is still checked in its own module.
+        let mut units = b4_units(&[(
+            "dep.gdl",
+            &dep("    do\n      check\n        k: 1 = 2\n      end\n      True\n"),
+        )]);
+        let checked = check_and_verify_project(&mut units, b4_opts(true, true));
+        assert!(checked.diags.iter().any(|(_, d)| d.level == "error"), "{:?}", checked.diags);
+    }
+
+    #[test]
+    fn test_fusion_axioms_end_on_their_fixed_points() {
+        // Each of these made the verifier run forever, on proofs it can finish in a second.
+        let id = "fn(x: NAT): NAT do x end";
+        let keep = "fn(x: NAT): BOOL do x = 0 end";
+        for body in [
+            format!("LIST_OPS.filter(LIST.empty, {keep}).length"),
+            format!("LIST_OPS.map(LIST.empty, {id}).length"),
+            format!("LIST_OPS.map(l, {id}).length"),
+            format!("LIST_OPS.map(LIST_OPS.map(l, {id}), {id}).length"),
+            format!("LIST_OPS.map(LIST_OPS.map(LIST.empty, {id}), {id}).length"),
+        ] {
+            let src = format!("functions PROBE\n\nfeature {{ANY}}\n\n  t(l: LIST[NAT]): NAT\n    require\n      some: l.length > 0 and l.length < 100\n    do\n      1 + {body}\n    end\n\nend\n");
+            let mut units = b4_units(&[("probe.gdl", &src)]);
+            let checked = check_and_verify_project(&mut units, b4_opts(false, true));
+            let errs: Vec<_> = checked.diags.iter().filter(|(_, d)| d.level == "error").collect();
+            assert!(checked.fatal.is_empty() && errs.is_empty(), "{body}: {errs:?}");
+        }
+        let src = format!("functions PROBE\n\nfeature {{ANY}}\n\n  t(s: SEQ[NAT]): SEQ[NAT]\n    do\n      s.map({id}).map({id})\n    end\n\nend\n");
+        let mut units = b4_units(&[("probe.gdl", &src)]);
+        let checked = check_and_verify_project(&mut units, b4_opts(false, true));
+        let errs: Vec<_> = checked.diags.iter().filter(|(_, d)| d.level == "error").collect();
+        assert!(checked.fatal.is_empty() && errs.is_empty(), "{errs:?}");
+    }
+
+    /// A command that outlives any test, through a child, as Boogie runs Z3.
+    fn slow_process_tree() -> Command {
+        #[cfg(windows)]
+        {
+            let mut cmd = Command::new("cmd");
+            cmd.args(["/C", "ping -n 30 127.0.0.1 >NUL & echo done"]);
+            cmd
+        }
+        #[cfg(not(windows))]
+        {
+            let mut cmd = Command::new("sh");
+            cmd.args(["-c", "sleep 30; echo done"]);
+            cmd
+        }
+    }
+
+    #[test]
+    fn test_output_within_stops_a_process_tree_at_its_limit() {
+        let limit = std::time::Duration::from_secs(1);
+        let start = std::time::Instant::now();
+        let out = output_within(&mut slow_process_tree(), limit).expect("the command starts");
+        assert!(out.is_none(), "{out:?}");
+        assert!(start.elapsed() < std::time::Duration::from_secs(15), "{:?}", start.elapsed());
+
+        // A process that ends in time is reported as `Command::output` would.
+        #[cfg(windows)]
+        let mut quick = {
+            let mut cmd = Command::new("cmd");
+            cmd.args(["/C", "echo hello"]);
+            cmd
+        };
+        #[cfg(not(windows))]
+        let mut quick = {
+            let mut cmd = Command::new("sh");
+            cmd.args(["-c", "echo hello"]);
+            cmd
+        };
+        let long = std::time::Duration::from_secs(60);
+        let out = output_within(&mut quick, long).expect("the command starts").expect("it ends");
+        assert!(out.status.success());
+        assert!(String::from_utf8_lossy(&out.stdout).contains("hello"));
+    }
+
     #[test]
     fn test_e0_constructors_of_one_name() {
         let a = "module TOK_A\n\nrepresentation {ANY}\n  | Leaf(v: U64)\n  | End_a\n\nend\n";
@@ -21838,16 +23003,697 @@ int main(void) {
         };
         let unknown = |list: &[&str]| first_unknown_flag(&args(list)).cloned();
         assert_eq!(unknown(&["a.gdl", "--stric"]), Some("--stric".to_string()));
-        assert_eq!(unknown(&["--project", "."]), Some("--project".to_string()));
+        assert_eq!(unknown(&["--projct", "."]), Some("--projct".to_string()));
         assert_eq!(unknown(&["--boogie", "a.gdl"]), Some("--boogie".to_string()));
         for good in [
             &["a.gdl", "--strict", "--audit", "--run"][..],
             &["--stdlib", "--inspect", "SEQ", "--json-diagnostics"],
             &["a.gdl", "--fuel", "3", "--z3-seed", "1", "--z3-rlimit", "9"],
             &["--emit-stdlib", "out", "--no-prelude", "--bounded-check"],
+            &["--project", "examples/echo_server", "--strict"],
         ] {
             assert_eq!(unknown(good), None, "{good:?}");
         }
+    }
+
+    #[test]
+    fn test_e1_manifest_parser_and_package_name_validation() {
+        use crate::manifest::*;
+
+        // Valid manifest
+        let valid_src = r#"
+            # Project manifest
+            [project]
+            name = "echo-server"
+            version = "0.1.0"
+        "#;
+        let m = parse_manifest(valid_src).expect("valid manifest must parse");
+        assert_eq!(m.project.name, "echo-server");
+        assert_eq!(m.project.version, "0.1.0");
+        assert_eq!(default_alias_for_package(&m.project.name), "ECHO_SERVER");
+
+        // Package names (Decision 11)
+        assert!(validate_package_name("my-pkg").is_ok());
+        assert!(validate_package_name("acme.json").is_ok());
+        assert_eq!(default_alias_for_package("acme.json"), "JSON");
+        assert!(validate_package_name("acme.http-client").is_ok());
+        assert_eq!(default_alias_for_package("acme.http-client"), "HTTP_CLIENT");
+
+        // Rejected package names
+        assert!(validate_package_name("").is_err());
+        assert!(validate_package_name("EchoServer").is_err());
+        assert!(validate_package_name("echo_server").is_err());
+        assert!(validate_package_name("foo..bar").is_err());
+        assert!(validate_package_name("-foo").is_err());
+        assert!(validate_package_name("foo-").is_err());
+        assert!(validate_package_name("foo.-bar").is_err());
+        assert!(validate_package_name("123pkg").is_err());
+        assert!(validate_package_name("acme.2json").is_err());
+        assert!(validate_package_name("gardel").is_err());
+        assert!(validate_package_name("gardel.core").is_err());
+        assert!(validate_package_name("core.gardel").is_err());
+
+        // Line-numbered syntax and structure errors
+        let bad_escape = "[project]\nname = \"echo-server\"\nversion = \"0.1.\\k\"\n";
+        let err = parse_manifest(bad_escape).expect_err("bad escape should fail");
+        assert_eq!(err.line, 3);
+        assert!(err.message.contains("bad escape '\\k'"));
+
+        let bad_null_escape = "[project]\nname = \"echo-server\"\nversion = \"0.1.\\0\"\n";
+        let err = parse_manifest(bad_null_escape).expect_err("\\0 escape should fail in TOML 1.0");
+        assert_eq!(err.line, 3);
+        assert!(err.message.contains("bad escape '\\0'"));
+
+        let dup_key = "[project]\nname = \"echo-server\"\nname = \"other\"\nversion = \"0.1.0\"\n";
+        let err = parse_manifest(dup_key).expect_err("dup key should fail");
+        assert_eq!(err.line, 3);
+        assert!(err.message.contains("duplicate key 'name'"));
+
+        let dup_table = "[project]\nname = \"echo-server\"\nversion = \"0.1.0\"\n[project]\nname = \"other\"\n";
+        let err = parse_manifest(dup_table).expect_err("dup table should fail");
+        assert_eq!(err.line, 4);
+        assert!(err.message.contains("duplicate table '[project]'"));
+
+        let unknown_table = "[package]\nname = \"foo\"\nversion = \"1.0\"\n";
+        let err = parse_manifest(unknown_table).expect_err("unknown table should fail");
+        assert_eq!(err.line, 1);
+        assert!(err.message.contains("unknown table '[package]'"));
+
+        let unknown_key = "[project]\nname = \"echo-server\"\nversion = \"0.1.0\"\nauthor = \"me\"\n";
+        let err = parse_manifest(unknown_key).expect_err("unknown key should fail");
+        assert_eq!(err.line, 4);
+        assert!(err.message.contains("unknown key 'author'"));
+
+        let non_string = "[project]\nname = \"echo-server\"\nversion = 1\n";
+        let err = parse_manifest(non_string).expect_err("non-string should fail");
+        assert_eq!(err.line, 3);
+        assert!(err.message.contains("unsupported value"));
+
+        let missing_version = "\n\n[project]\nname = \"echo-server\"\n";
+        let err = parse_manifest(missing_version).expect_err("missing version should fail");
+        assert_eq!(err.line, 3);
+        assert!(err.message.contains("missing required key 'version'"));
+    }
+
+    #[test]
+    fn test_e1_echo_server_with_manifest_gives_same_bpl_and_c() {
+        let echo_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../examples/echo_server");
+        let manifest_path = echo_dir.join("Gardel.toml");
+        assert!(manifest_path.is_file(), "examples/echo_server/Gardel.toml must exist");
+        assert!(echo_dir.join("src").is_dir(), "examples/echo_server/src must exist");
+
+        // 1. Resolve as direct directory operand (as in `gardelc examples/echo_server`)
+        let (dir_files, dir_project) = resolve_input_operands(&[echo_dir.to_string_lossy().to_string()]).unwrap();
+        assert!(dir_project);
+
+        // 2. Resolve via manifest logic (as in `gardelc --project examples/echo_server`)
+        let (manifest, manifest_files) = resolve_project_inputs(&echo_dir).expect("echo_server manifest project should resolve");
+        assert_eq!(manifest.project.name, "echo-server");
+        assert_eq!(manifest.project.version, "0.1.0");
+
+        assert_eq!(dir_files, manifest_files, "both modes must resolve the exact same source files");
+
+        // Now compile and verify both, comparing emitted .bpl and .c
+        BOOGIE_LAMBDA_COUNTER.with(|c| c.set(0));
+        let dir_file_tuples: Vec<(String, String)> = dir_files
+            .iter()
+            .map(|p| (p.clone(), fs::read_to_string(p).unwrap()))
+            .collect();
+        let dir_tuples_ref: Vec<(&str, &str)> = dir_file_tuples
+            .iter()
+            .map(|(p, s)| (p.as_str(), s.as_str()))
+            .collect();
+        let mut dir_units = b4_units(&dir_tuples_ref);
+
+        let opts = VerifyOptions {
+            prelude_mode: true,
+            project_mode: true,
+            fuel_limit: 1,
+            strict: true,
+            audit: false,
+            bounded_check: false,
+            z3_seed: Some(1),
+            z3_rlimit: Some(DEFAULT_Z3_RLIMIT),
+            external_modules: HashSet::new(),
+        };
+
+        let dir_res = check_and_verify_project(&mut dir_units, opts.clone());
+        assert!(dir_res.fatal.is_empty(), "dir fatal: {:?}", dir_res.fatal);
+        assert!(dir_res.diags.is_empty(), "dir diags: {:?}", dir_res.diags);
+
+        BOOGIE_LAMBDA_COUNTER.with(|c| c.set(0));
+        let manifest_file_tuples: Vec<(String, String)> = manifest_files
+            .iter()
+            .map(|p| (p.clone(), fs::read_to_string(p).unwrap()))
+            .collect();
+        let manifest_tuples_ref: Vec<(&str, &str)> = manifest_file_tuples
+            .iter()
+            .map(|(p, s)| (p.as_str(), s.as_str()))
+            .collect();
+        let mut manifest_units = b4_units(&manifest_tuples_ref);
+
+        let manifest_res = check_and_verify_project(&mut manifest_units, opts);
+        assert!(manifest_res.fatal.is_empty(), "manifest fatal: {:?}", manifest_res.fatal);
+        assert!(manifest_res.diags.is_empty(), "manifest diags: {:?}", manifest_res.diags);
+
+        // Compare emitted Boogie for each module
+        for (u_dir, u_man) in dir_units.iter().zip(manifest_units.iter()) {
+            for (m_dir, m_man) in u_dir.ast.modules.iter().zip(u_man.ast.modules.iter()) {
+                BOOGIE_LAMBDA_COUNTER.with(|c| c.set(0));
+                let bpl_dir = with_prelude_injection(true, || {
+                    with_link_table(dir_res.link.clone(), || emit_boogie(m_dir, 1))
+                });
+                BOOGIE_LAMBDA_COUNTER.with(|c| c.set(0));
+                let bpl_man = with_prelude_injection(true, || {
+                    with_link_table(manifest_res.link.clone(), || emit_boogie(m_man, 1))
+                });
+                assert_eq!(bpl_dir, bpl_man, "emitted .bpl for module {} must be identical", m_dir.name);
+            }
+        }
+
+        // Compare emitted C for the program
+        let dir_mods: Vec<ModuleDecl> = dir_units.iter().map(|u| u.ast.modules[0].clone()).collect();
+        let (dir_root, dir_libs) = dir_mods.split_last().expect("a program");
+        let dir_libs: Vec<&ModuleDecl> = dir_libs.iter().collect();
+        let (c_dir, _) = emit_c11_typed(dir_root, &dir_libs);
+
+        let man_mods: Vec<ModuleDecl> = manifest_units.iter().map(|u| u.ast.modules[0].clone()).collect();
+        let (man_root, man_libs) = man_mods.split_last().expect("a program");
+        let man_libs: Vec<&ModuleDecl> = man_libs.iter().collect();
+        let (c_man, _) = emit_c11_typed(man_root, &man_libs);
+        assert_eq!(c_dir, c_man, "emitted .c for echo_server project must be identical between directory and manifest mode");
+    }
+
+    #[test]
+    fn test_e1_cli_project_argument_handling() {
+        let args = |list: &[&str]| -> Vec<String> {
+            std::iter::once("gardelc").chain(list.iter().copied()).map(String::from).collect()
+        };
+
+        // Valid `--project <DIR>`
+        assert_eq!(
+            parse_project_arg(&args(&["--project", "examples/echo_server", "--strict"])).unwrap(),
+            Some("examples/echo_server".to_string())
+        );
+        let ops = input_operands(&args(&["--project", "examples/echo_server", "--strict"]));
+        assert!(ops.is_empty(), "operands should be empty when --project consumes DIR: {ops:?}");
+
+        // Missing DIR after `--project` is rejected
+        assert!(parse_project_arg(&args(&["--project"])).is_err());
+        assert!(parse_project_arg(&args(&["--project", "--strict"])).is_err());
+
+        // Duplicate `--project` is rejected
+        assert!(parse_project_arg(&args(&["--project", "a", "--project", "b"])).is_err());
+
+        // If extra operands are passed alongside `--project DIR`, input_operands gathers them
+        // so `main()` can reject mixing `--project` with explicit operands.
+        let ops_mixed = input_operands(&args(&["foo.gdl", "--project", "examples/echo_server"]));
+        assert_eq!(ops_mixed, vec!["foo.gdl"]);
+
+        // Missing `src/` directory in a manifest project is rejected (no silent fallback)
+        let tmp = std::env::temp_dir().join(format!("gardel_e1_test_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&tmp);
+        fs::create_dir_all(&tmp).unwrap();
+        fs::write(
+            tmp.join("Gardel.toml"),
+            "[project]\nname = \"my-app\"\nversion = \"0.1.0\"\n",
+        )
+        .unwrap();
+        let err = resolve_project_inputs(&tmp).expect_err("missing src/ must be an error");
+        assert!(err.message.contains("src"), "expected error mentioning src/: {err:?}");
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn test_e2_contract_only_interfaces_body_change_and_missing_fact() {
+        // Acceptance criteria for Task E.2:
+        // 1. A client relying on an external dependency's body fails with the missing fact named.
+        // 2. Adding the contract postcondition allows the client's proof to succeed.
+        // 3. A body change inside the contract leaves the client's proof and result unchanged.
+        // 4. Ghost queries and representation in .gds / --inspect withholds bodies and exposes
+        //    signatures, contracts, public ghost signatures and laws.
+
+        let math_dep_v1 = r#"
+functions MATH_DEP
+
+feature {ANY}
+
+  calc(x: INT): INT
+    require
+      fits: x >= 0 and x <= 1000
+    do
+      x + x
+    ensure
+      pos: Result >= x
+    end
+
+end
+"#;
+
+        let client_src = r#"
+functions CLIENT
+
+feature {ANY}
+
+  run_calc(n: INT): INT
+    require
+      bound: n >= 0 and n <= 500
+    do
+      MATH_DEP.calc(n)
+    ensure
+      exact: Result = n * 2
+    end
+
+end
+"#;
+
+        // Part A: Intra-project linking (same package, bodies visible):
+        // CLIENT sees `x + x` which equals `n * 2`, so `exact` succeeds.
+        {
+            let mut units = b4_units(&[("math_dep.gdl", math_dep_v1), ("client.gdl", client_src)]);
+            let opts = b4_opts(true, true);
+            let checked = check_and_verify_project(&mut units, opts);
+            assert!(checked.fatal.is_empty());
+            let errs: Vec<&Diagnostic> = checked
+                .diags
+                .iter()
+                .map(|(_, d)| d)
+                .filter(|d| d.level == "error")
+                .collect();
+            assert!(errs.is_empty(), "intra-project linking retains bodies, got {errs:?}");
+        }
+
+        // Part B: Cross-package boundary (MATH_DEP is an external dependency):
+        // MATH_DEP's body `x + x` is withheld. CLIENT only sees `pos: Result >= x`.
+        // Verification fails with the missing fact named (`exact`).
+        {
+            let mut units = b4_units(&[("math_dep.gdl", math_dep_v1), ("client.gdl", client_src)]);
+            let mut opts = b4_opts(true, true);
+            opts.external_modules.insert("MATH_DEP".to_string());
+            let checked = check_and_verify_project(&mut units, opts);
+            assert!(checked.fatal.is_empty());
+            let client_errs: Vec<&Diagnostic> = checked
+                .diags
+                .iter()
+                .filter(|(ui, _)| *ui == 1) // client.gdl
+                .map(|(_, d)| d)
+                .filter(|d| d.level == "error")
+                .collect();
+            assert!(
+                !client_errs.is_empty(),
+                "client relying on external dependency's body must fail"
+            );
+            assert!(
+                client_errs.iter().any(|d| d.tag == "exact"),
+                "missing fact `exact` must be named, got {client_errs:?}"
+            );
+        }
+
+        // Part C: Add the required ensure clause to MATH_DEP:
+        let math_dep_v2 = r#"
+functions MATH_DEP
+
+feature {ANY}
+
+  calc(x: INT): INT
+    require
+      fits: x >= 0 and x <= 1000
+    do
+      x + x
+    ensure
+      pos: Result >= x
+      exact_double: Result = x * 2
+    end
+
+end
+"#;
+
+        let bpl_client_v2 = {
+            let mut units = b4_units(&[("math_dep.gdl", math_dep_v2), ("client.gdl", client_src)]);
+            let mut opts = b4_opts(true, true);
+            opts.external_modules.insert("MATH_DEP".to_string());
+            let checked = check_and_verify_project(&mut units, opts);
+            assert!(checked.fatal.is_empty());
+            let client_errs: Vec<&Diagnostic> = checked
+                .diags
+                .iter()
+                .filter(|(ui, _)| *ui == 1)
+                .map(|(_, d)| d)
+                .filter(|d| d.level == "error")
+                .collect();
+            assert!(
+                client_errs.is_empty(),
+                "with exact contract, external client must succeed, got {client_errs:?}"
+            );
+            let client_mod = &units[1].ast.modules[0];
+            with_prelude_injection(true, || {
+                with_link_table(checked.link.clone(), || emit_boogie(client_mod, DEFAULT_FUEL))
+            })
+        };
+
+        // Part D: Change MATH_DEP's body inside its contract (e.g., from `x + x` to `x * 2`):
+        let math_dep_v3 = r#"
+functions MATH_DEP
+
+feature {ANY}
+
+  calc(x: INT): INT
+    require
+      fits: x >= 0 and x <= 1000
+    do
+      x * 2
+    ensure
+      pos: Result >= x
+      exact_double: Result = x * 2
+    end
+
+end
+"#;
+
+        let bpl_client_v3 = {
+            let mut units = b4_units(&[("math_dep.gdl", math_dep_v3), ("client.gdl", client_src)]);
+            let mut opts = b4_opts(true, true);
+            opts.external_modules.insert("MATH_DEP".to_string());
+            let checked = check_and_verify_project(&mut units, opts);
+            assert!(checked.fatal.is_empty());
+            let client_errs: Vec<&Diagnostic> = checked
+                .diags
+                .iter()
+                .filter(|(ui, _)| *ui == 1)
+                .map(|(_, d)| d)
+                .filter(|d| d.level == "error")
+                .collect();
+            assert!(
+                client_errs.is_empty(),
+                "body change inside contract leaves client proof passing, got {client_errs:?}"
+            );
+            let client_mod = &units[1].ast.modules[0];
+            with_prelude_injection(true, || {
+                with_link_table(checked.link.clone(), || emit_boogie(client_mod, DEFAULT_FUEL))
+            })
+        };
+
+        // Emitted Boogie for CLIENT across the package boundary is identical:
+        // the body implementation change never leaks into the client theory!
+        assert_eq!(
+            bpl_client_v2, bpl_client_v3,
+            "emitted Boogie for client must be identical when dependency body changes inside contract"
+        );
+
+        // Part E: Inspect formatting (.gds content) withholds private representation invariants,
+        // `{NONE}` routines/laws, and `do` bodies, while preserving public ghost queries/laws/triggers.
+        let inspect_src = r#"
+module HIDDEN_BOX
+
+representation {NONE}
+  val: INT
+
+create {ANY}
+
+  make(v: INT): HIDDEN_BOX
+    require
+      pos: v > 0
+    do
+      { val = v }
+    ensure
+      model_matches: Result.model = v
+      private_field_ens: Result.val = v
+    end
+
+feature {ANY}
+
+  read_val: INT
+    do
+      Current.val
+    ensure
+      same_model: Result = Current.model
+    end
+
+feature {NONE}
+
+  secret_helper: INT
+    do
+      Current.val + 1
+    end
+
+specify {ANY}
+
+  model: INT
+    do
+      Current.val
+    end
+
+  law model_positive(b: HIDDEN_BOX)
+    trigger b.model
+    ensure
+      pos: b.model > 0
+    end
+
+specify {NONE}
+
+  private_ghost: INT
+    do
+      Current.val
+    end
+
+invariant
+  box_pos: val > 0
+  public_model_pos: Current.model > 0
+
+end
+"#;
+
+        let m = parse_user_module_with_prelude(inspect_src);
+        let iface = format_module_interface(&m);
+        assert!(iface.contains("module HIDDEN_BOX\n"));
+        assert!(iface.contains("representation {NONE} -- opaque ADT layout\n"));
+        assert!(iface.contains("{ANY} make(v: INT): HIDDEN_BOX\n"));
+        assert!(iface.contains("require pos: (v > 0)\n"));
+        assert!(iface.contains("ensure  model_matches: (Result.model = v)\n"));
+        assert!(!iface.contains("private_field_ens"));
+        assert!(iface.contains("{ANY} read_val: INT\n"));
+        assert!(iface.contains("ensure  same_model: (Result = Current.model)\n"));
+        assert!(!iface.contains("secret_helper"));
+        assert!(!iface.contains("private_ghost"));
+        assert!(iface.contains("specify\n"));
+        assert!(iface.contains("{ANY} model: INT\n"));
+        assert!(iface.contains("{ANY} law model_positive(b: HIDDEN_BOX)\n"));
+        assert!(iface.contains("trigger b.model\n"));
+        assert!(iface.contains("invariant\n"));
+        assert!(iface.contains("public_model_pos: (Current.model > 0)\n"));
+        // Private invariant over hidden field `val` is withheld from the public `.gds`!
+        assert!(!iface.contains("box_pos"));
+        // Interface contains no do bodies!
+        assert!(!iface.contains("do\n"));
+        assert!(!iface.contains("{ val = v }"));
+        assert!(!iface.contains("Current.val"));
+
+        // Part F: Body changes that introduce `Current` references, lifted lambdas, and string
+        // literals inside an ADT dependency's `do` body leave the client's emitted Boogie identical.
+        let adt_dep_v1 = r#"
+module COUNTER_DEP
+
+representation {NONE}
+  n: NAT
+
+create {ANY}
+
+  make(v: NAT): COUNTER_DEP
+    do
+      { n = v }
+    ensure
+      is_v: Result.count = v
+    end
+
+feature {ANY}
+
+  constant_tag: NAT
+    do
+      42
+    ensure
+      is_forty_two: Result = 42
+    end
+
+specify {ANY}
+
+  count: NAT
+    do
+      Current.n
+    end
+
+end
+"#;
+        let adt_dep_v2 = r#"
+module COUNTER_DEP
+
+representation {NONE}
+  n: NAT
+
+create {ANY}
+
+  make(v: NAT): COUNTER_DEP
+    do
+      let msg = "x"
+      let xs = LIST_OPS.filter(LIST.empty, fn(x: NAT): BOOL do x = 0 end)
+      { n = v + xs.length + (if msg.byte_length = 1 then 0 else 1 end) }
+    ensure
+      is_v: Result.count = v
+    end
+
+feature {ANY}
+
+  constant_tag: NAT
+    do
+      Current.n - Current.n + 42
+    ensure
+      is_forty_two: Result = 42
+    end
+
+specify {ANY}
+
+  count: NAT
+    do
+      Current.n
+    end
+
+end
+"#;
+        let adt_client = r#"
+functions COUNTER_CLIENT
+
+feature {ANY}
+
+  use_counter: NAT
+    do
+      let c = COUNTER_DEP.make(0)
+      c.constant_tag
+    ensure
+      is_forty_two: Result = 42
+    end
+
+end
+"#;
+        let emit_adt_client = |dep_src: &str| -> String {
+            let mut units = b4_units(&[
+                ("counter_dep.gdl", dep_src),
+                ("counter_client.gdl", adt_client),
+            ]);
+            let mut opts = b4_opts(true, true);
+            opts.external_modules.insert("COUNTER_DEP".to_string());
+            let checked = check_and_verify_project(&mut units, opts);
+            assert!(checked.fatal.is_empty(), "fatal: {:?}", checked.fatal);
+            let client_errs: Vec<&Diagnostic> = checked
+                .diags
+                .iter()
+                .filter(|(ui, _)| *ui == 1)
+                .map(|(_, d)| d)
+                .filter(|d| d.level == "error")
+                .collect();
+            assert!(
+                client_errs.is_empty(),
+                "COUNTER_CLIENT must verify against contract-only COUNTER_DEP, got {client_errs:?}"
+            );
+            let client_mod = &units[1].ast.modules[0];
+            with_prelude_injection(true, || {
+                with_link_table(checked.link.clone(), || emit_boogie(client_mod, DEFAULT_FUEL))
+            })
+        };
+        let bpl_adt_v1 = emit_adt_client(adt_dep_v1);
+        let bpl_adt_v2 = emit_adt_client(adt_dep_v2);
+        assert!(!bpl_adt_v2.contains("COUNTER_DEP_Ctor"));
+        assert!(!bpl_adt_v2.contains("COUNTER_DEP_n"));
+        assert!(!bpl_adt_v2.contains("_lam_"));
+        // `str_lit_empty` is a constant of every preamble. Literals of a body are numbered.
+        assert!(!bpl_adt_v2.contains("str_lit_0"));
+        assert_eq!(
+            bpl_adt_v1, bpl_adt_v2,
+            "client Boogie must be identical even when dependency body adds Current, lambdas, or string literals"
+        );
+
+        // Part G: Multi-file examples (`reactive_clock`, `reactive_game`, `echo_server`) verify
+        // when their support modules are linked across a contract-only boundary.
+        let verify_multi_file_example = |files: &[(&str, &str)], external: &[&str]| -> CheckedProject {
+            let mut units = b4_units(files);
+            let mut opts = b4_opts(true, true);
+            for ext in external {
+                opts.external_modules.insert((*ext).to_string());
+            }
+            let checked = check_and_verify_project(&mut units, opts);
+            assert!(checked.fatal.is_empty(), "fatal: {:?}", checked.fatal);
+            let errs: Vec<&Diagnostic> = checked
+                .diags
+                .iter()
+                .map(|(_, d)| d)
+                .filter(|d| d.level == "error")
+                .collect();
+            assert!(
+                errs.is_empty(),
+                "multi-file example with external {external:?} must verify, got {errs:?}"
+            );
+            checked
+        };
+        verify_multi_file_example(
+            &[
+                (
+                    "clock_state.gdl",
+                    include_str!("../../examples/reactive_clock/clock_state.gdl"),
+                ),
+                (
+                    "reactive_clock.gdl",
+                    include_str!("../../examples/reactive_clock/reactive_clock.gdl"),
+                ),
+            ],
+            &["CLOCK_STATE"],
+        );
+        verify_multi_file_example(
+            &[
+                (
+                    "track_board.gdl",
+                    include_str!("../../examples/reactive_game/track_board.gdl"),
+                ),
+                (
+                    "reactive_game.gdl",
+                    include_str!("../../examples/reactive_game/reactive_game.gdl"),
+                ),
+            ],
+            &["TRACK_BOARD"],
+        );
+        let echo_checked = verify_multi_file_example(
+            &[
+                (
+                    "server_state.gdl",
+                    include_str!("../../examples/echo_server/src/server_state.gdl"),
+                ),
+                (
+                    "echo_server.gdl",
+                    include_str!("../../examples/echo_server/src/echo_server.gdl"),
+                ),
+            ],
+            &["SERVER_STATE"],
+        );
+        let echo_units = b4_units(&[
+            (
+                "server_state.gdl",
+                include_str!("../../examples/echo_server/src/server_state.gdl"),
+            ),
+            (
+                "echo_server.gdl",
+                include_str!("../../examples/echo_server/src/echo_server.gdl"),
+            ),
+        ]);
+        let echo_bpl = with_prelude_injection(true, || {
+            with_link_table(echo_checked.link.clone(), || {
+                emit_boogie(&echo_units[1].ast.modules[0], DEFAULT_FUEL)
+            })
+        });
+        assert!(
+            !echo_bpl.contains("SERVER_STATE___lam_0"),
+            "private body lambda from SERVER_STATE must not leak into ECHO_SERVER Boogie"
+        );
+        assert!(
+            !echo_bpl.contains("SERVER_STATE_Ctor"),
+            "hidden representation constructor of SERVER_STATE must not leak into ECHO_SERVER Boogie"
+        );
     }
 
     #[test]
@@ -22763,6 +24609,7 @@ end
             bounded_check: false,
             z3_seed: None,
             z3_rlimit: None,
+            external_modules: HashSet::new(),
         }
     }
 

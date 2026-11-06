@@ -636,7 +636,7 @@ flowchart TD
 
 ### Phase E: Projects and Packages (the "Verified Universe")
 
-**Status:** Task E.0 ✅ Completed (2026-11-05). E.1 onwards 📋 proposed, and waits until a real second package exists, or until the decisions below are taken.
+**Status:** Tasks E.0, E.1 & E.2 ✅ Completed (2026-11-05). All design questions are decided (decisions 1 to 11). E.3 can follow, using the stdlib to measure. E.4 onwards waits until a real second package exists.
 
 **Objective:** let a Gardel project depend on other Gardel packages without import statements, and without trusting anything that was not proven on this machine. Source stays declaration-only. A manifest, `Gardel.toml`, states what is in the universe. Modular reasoning stays Hoare's rule for a call: prove the callee's precondition, then use its postcondition.
 
@@ -655,28 +655,32 @@ Small projects shaped like the proposal were run through the compiler at `58fcc8
 | 3 | **Bodies are needed for code.** The C backend monomorphizes from source (Task C.3), so a generic module cannot be built from contracts. | A `.gds` cannot be the distributed form. A package ships source, and the interface is a derived cache for the verifier. Decision 3. |
 | 4 | **Constructors collide too.** `Leaf` in two modules of one project fails with a raw Boogie type error. Constructors resolve by name alone and have no qualified syntax (§4.1). | `JSON::PARSER` alone does not solve collisions: two libraries both defining `Leaf` or `Error` is more likely than two defining `PARSER`. Task E.0. |
 | 5 | **A unique name is assumed throughout.** Modules are found by bare name (`ctx.module` at 35 sites, 231 uses of `m.name` in `main.rs`, 15 in `c11_typed.rs`), and bare names form Boogie and C symbols (`PARSER__fn_x`, `struct PARSER`). | Most of the work. Two packages with one module name need identity by (package, name) and mangled symbols in Boogie and C. The `::` token is the small part. Task E.4. |
-| 6 | **"Bare by default" is fragile.** Under the proposal, a dependency adding a module `PARSER` in a minor release breaks every client using another `PARSER` bare. The prelude already has this shape: Phase D added `EVENT`, `KEY` and `COMMAND`, so a user module with one of those names now fails with `E0101`. | Decision 4 for local names, and a lockfile so nothing changes without an action. The prelude case is an open question. |
+| 6 | **"Bare by default" is fragile.** Under the proposal, a dependency adding a module `PARSER` in a minor release breaks every client using another `PARSER` bare. The prelude already has this shape: Phase D added `EVENT`, `KEY` and `COMMAND`, so a user module with one of those names now fails with `E0101`. | Decision 4 for local names, and a lockfile so nothing changes without an action. Decision 8 covers the prelude. |
 | 7 | **Undefined and unknown things are reported badly.** An undefined module gives raw Boogie errors with a temp-file path (`Unknown`, `invalid type`). An unknown flag is ignored: `--project` and `--no-such-flag` both exit 0. | Must be real errors before a manifest adds paths and flags that can be mistyped. Task E.0. |
 | 8 | Directories are already recursive: `gardelc nested` linked `nested/sub/b_mod.gdl`. Spec §4.2 says they are not. | `src/**/*.gdl` already works. Fix the spec in Task E.0. |
 | 9 | The prelude is the proposal's interface model in a special case: its contracts are injected as trusted theory, proven by `--stdlib`. Cost today: 0.8 s for `bounded_stack.gdl`, 14.6 s for all 18 stdlib files under `--strict`. | The mechanism exists, so E.2 generalizes it. No claim about "hours" or "instant" can be made yet, and the "80% of trivial build errors" figure has no source. Measure in E.3. |
-| 10 | `[dependencies]` in `gardelc/Cargo.toml` is empty. `E0105` is unused. | Parsing `Gardel.toml` needs a dependency or a small TOML subset. Open question. |
+| 10 | `[dependencies]` in `gardelc/Cargo.toml` is empty. `E0105` is unused. | Parsing `Gardel.toml` needs a dependency or a small TOML subset. Decision 10. |
 
 #### Decisions
 
 1. **Proofs are checked locally. A certificate is a cache, not evidence.** A dependency is verified from source on first use, and the result is cached under a hash of its source, the interfaces it depends on, the verifier version, the Boogie and Z3 versions, the solver limit and the flags. Nothing downloaded can mark a package as proven. The hash includes the verifier because soundness fixes change what is proven: Tasks D.9 and D.10 invalidated proofs from earlier compilers.
 2. **Contracts only across a package boundary.** A client of another package sees signatures, contracts, public ghost models and laws, never a `do` body. Within a project, linking stays as it is. Changing a body inside its contract then cannot change a client's proof.
 3. **Packages ship source.** The interface file is derived, for the verifier, and code generation reads source. Private routines stay hidden from clients by visibility.
-4. **Names resolve nearest first.** A project's own module wins over a dependency's, so a new module in a dependency never changes what local code means, the rule §4.1 already uses for constructors. Two direct dependencies with one name, used bare, are `E0105: ambiguous_module_reference`, fixed by qualifying.
+4. **Names resolve nearest first.** A project's own module wins, so a new module in a dependency or the prelude never changes what local code means, the rule §4.1 already uses for constructors. Everything else is on one level, the prelude included (decision 8). Two of them providing one name, used bare, are `E0105: ambiguous_module_reference`, fixed by qualifying. There is no order between a dependency and the prelude, because either order lets one silently replace the other: a dependency adding `OPTION` would take over the bare `OPTION`, and a new prelude name would replace a dependency's module.
 5. **Only direct dependencies are in the universe.** A package resolves its own names against its own manifest, so a transitive dependency adds no names. One version of a package per build, and a conflict is an error.
 6. **`--strict` is transitive.** A package's `assume`s are recorded in its cached result and reported to clients. `--strict` refuses them in any dependency, and `--bounded-check` results never count as proven.
 7. **Export lists stop at the package.** `{FRIENDS}` and `{M}` name modules of the same package. A `group` cannot cross packages, and an entry point is never exported (`E0104`).
-
-#### Open questions
-
-- **Prelude growth (finding 6):** let user modules shadow a prelude name added after a stated language edition, or keep `E0101` and accept that a new prelude name can break projects.
-- **Qualified constructors:** `TOK_A.Leaf(1)` or resolution from the expected type, or both. The C backend already uses the expected type.
-- **Manifest parser:** a TOML subset in `gardelc`, keeping it dependency-free, or the `toml` crate.
-- **Package aliases:** the proposal writes `package = "json"` and `JSON::PARSER`. The rule proposed here is the uppercased package name, unless `as` overrides it.
+8. **Every module has a full name, and the prelude is a package.** Identity is (package, module), as in `acme.json::PARSER` and `gardel.core::COMMAND`. The package name comes from the manifest, so a source file has no `package` line, and a file with no manifest is an unnamed local project. Bare names stay the normal spelling, resolved by decision 4. A user module may then reuse any prelude name, so `E0101` goes away once E.4 and E.5 are in. `gardelc` refers to the names it builds in (`EVENT`, `COMMAND`, `RESULT`) by identity, so a user's module of that name cannot interfere. This fixes finding 6 for the project's own names. A new prelude name can still clash with a dependency's name used bare, which is `E0105`: loud, and fixed by one qualifier, not a rename. With no registry a name has no owner, so two different packages with one name in a build are refused.
+9. **Qualified constructors, with a known type as a tie-break.** `TOK_A.Leaf(1)`, `JSON::TOK.Leaf(1)` and `case RESULT.Error(e)` always work. A bare constructor resolves as module names do: the module's own, then the project's, then everything else on one level. If that leaves several candidates, a type known for certain chooses: the scrutinee of a `match`, or the declared result of a routine that returns the constructor directly. Otherwise it is `E0112`, showing the qualified spelling. A type only breaks a tie, so it can turn an error into a success and can never change what code means. A module with its own `Stop` therefore still writes `COMMAND.Stop` to match a `COMMAND`.
+10. **The manifest parser is a strict TOML subset in `gardelc`, which stays dependency-free.** Tables, quoted and bare keys, strings, inline tables of strings, and comments. Every manifest is real TOML, and anything outside the subset is an error with its line number. Moving to the `toml` crate later would break no manifest, and the other direction could. `Gardel.lock` uses the same subset, written in a fixed order.
+11. **Aliases are a spelling, defaulting to the last segment of the package name.** `acme.json` is `JSON`, `acme.http-client` is `HTTP_CLIENT`, and `as` overrides it. Source uses the alias (`JSON::PARSER`), and the prelude is `GARDEL`. The dotted name appears in manifests and diagnostics, and `::` is used because `.` is already member access. Rules:
+    - Package names use lowercase letters, digits, `-` and `.`.
+    - Two dependencies with one alias are an error in the manifest, never first-wins.
+    - `GARDEL` is reserved.
+    - An alias belongs to one manifest, so it says nothing about a dependency's own aliases.
+    - Identity stays the full name, so renaming an alias changes no proof or symbol.
+    - `::` takes only an alias, so a local module `JSON` can coexist with an alias `JSON`.
+    - A project has no alias for itself, as its own names always win bare.
 
 #### Dependency graph
 
@@ -703,18 +707,45 @@ flowchart TD
 - [x] An unknown flag is an error. A mistyped `--stric` used to run the weaker check and report success. `--boogie`, used by the old tutorial, was one such flag.
 - [x] Spec §4.2 corrected: directories are recursive. The guide's table of contents linked to a section that did not exist.
 - Tests `test_e0_every_undefined_name_has_a_rule_and_a_location` (rule and line), `test_e0_all_repository_sources_resolve` (every example and the stdlib, so a false rejection fails here), `test_e0_private_members_stay_private`, `test_e0_constructors_of_one_name`, `test_e0_what_boogie_refuses_is_not_shown_as_boogie_text`, `test_e0_flags_are_known_or_refused`. `cargo test` 164/164. `--stdlib --strict` 0/0 and the eleven examples 0/0.
-- **Known limits.** A member on a receiver of unknown type is not resolved here, and reaches `E0199` or the verifier. `feature {OTHER}` across files is not usable, as the export list forms a cycle (`E0103`), so `E0113` is tested only for `{NONE}` and for a module outside the list.
+- **Found in review.** `E0113` missed a receiver whose type comes from a generic, `if`, `match` or a pattern, so `o.get.secret` passed. These are followed now, and a name hidden by every module declaring it is refused on any receiver. The verifier refuses a `{NONE}` target itself (`routine_is_private`), since it knows the target when the name does not. Test `test_e0_hidden_members_behind_inferred_receivers`, `test_e0_inferred_receivers_refuse_nothing_that_is_visible`, `test_e0_a_call_of_a_private_routine_never_skips_its_require`.
+- **Known limits.** A member on a receiver of unknown type whose name another module exports reaches the verifier, which refuses a `{NONE}` target but not one outside a `{FRIEND}` list. `feature {OTHER}` across files is not usable, as the export list forms a cycle (`E0103`), so `E0113` is tested only for `{NONE}` and for a module outside the list.
 
-#### Task E.1: `Gardel.toml` Without Dependencies [ ]
-- [ ] `[project]` with `name` and `version`. `gardelc` with no input, or `--project DIR`, reads it and uses `src/`.
-- [ ] Spec §4.2 and §13: the manifest, and that it never changes what a source file means.
-- Acceptance: `examples/echo_server` with a manifest gives the same `.bpl` and `.c` as `gardelc examples/echo_server`.
+#### Task E.1: `Gardel.toml` Without Dependencies [✅ Completed]
+- [x] `[project]` with `name` and `version`, read by the strict TOML 1.0 subset parser of decision 10 (`gardelc/src/manifest.rs`). `gardelc` with no input, or `--project DIR`, reads it and uses `src/`.
+- [x] Check package names against decision 11 (lowercase, digits, `-`, `.`, segments starting with a lowercase letter and not ending with `-`, no reserved `gardel` prefix or `GARDEL` alias). TOML outside the subset, unknown table/keys, a duplicate key/table, or a bad escape is an error with its 1-based line number.
+- [x] Spec §4.2 and §13: documented the manifest model, naming rules, and CLI resolution. A manifest without dependencies changes nothing about what a source file means, and dependencies change it only through the names and aliases they add.
+- [x] Acceptance: `examples/echo_server/Gardel.toml` added and sources placed in `examples/echo_server/src/`; `gardelc --project examples/echo_server` and `gardelc examples/echo_server` give the exact same `.bpl` and `.c` files. Unit tests: `test_e1_manifest_parser_and_package_name_validation`, `test_e1_echo_server_with_manifest_gives_same_bpl_and_c`, `test_e1_cli_project_argument_handling`, plus strictness unit tests in `manifest.rs`.
+- **Found in review.** The acceptance above held only because the example has no `.gdl` file outside `src/`. `gardelc DIR` ignored the manifest, so it accepted an invalid one and linked every file below `DIR`, and a false contract in an unrelated directory failed the project. A directory with a `Gardel.toml` is now that project, and mixing it with other inputs is an error. Tests in `gardelc/tests/project_operand.rs`.
+- **Known limit.** `gardelc DIR` on a directory with no manifest still walks into a subdirectory that has one.
 
-#### Task E.2: Contract-Only Interfaces [ ]
-- [ ] Define the `.gds` content from `--inspect`: signatures, `require`, `ensure`, public ghost signatures and laws. A ghost query over a hidden representation stays uninterpreted for a client.
-- [ ] Add a boundary to linking that withholds bodies, generalizing `prelude_contract_interface`.
-- [ ] **Measure first:** run `examples/` with bodies withheld, and record which proofs need new `ensure` clauses.
-- Acceptance: a client relying on a dependency's body fails with the missing fact named, and a body change inside the contract leaves the client's proof and result unchanged.
+#### Task E.2: Contract-Only Interfaces [✅ Completed]
+- [x] Define the `.gds` content from `--inspect`: signatures, `require`, `ensure`, public ghost signatures and laws (`contract_only_module`, `format_module_interface`). A ghost query over a hidden representation stays uninterpreted for a client. Private `{NONE}` routines/laws, invariants or contract clauses referencing hidden representation or private routines, and all routine `do` bodies are withheld; type parameter bounds, `satisfies ... where ...` clauses, and law `trigger` clauses are preserved.
+- [x] Add a boundary to linking that withholds bodies, generalizing `prelude_contract_interface` across package boundaries (`BoogieEmitScope`, `LinkTable::with_external`, `LinkTable::is_external_for`, `linked_contract_interface`). Intra-project linking retains definitional axioms; cross-package/prelude linking withholds `do` bodies, hidden representations (`representation {NONE}`), body-derived receiver-independence axioms, body-lifted lambdas, and body string literals while keeping fuel-stabilization axioms (`SuccFuel(SuccFuel(_fuel)) == SuccFuel(_fuel)`) and precondition/trust-guarded return-type frame axioms.
+- [x] **Measure first:** run `examples/` with bodies withheld, and record which proofs need new `ensure` clauses:
+  - Measured all 11 repository examples (`bounded_stack.gdl`, `greeter.gdl`, `peano_ord.gdl`, `seq_bench.gdl`, `seq_churn.gdl`, `seq_ops.gdl`, `tree.gdl`, `reactive_hello.gdl`, `reactive_clock`, `reactive_game`, `echo_server`), including multi-file projects with their support modules (`CLOCK_STATE`, `TRACK_BOARD`, `SERVER_STATE`) linked across the contract-only boundary.
+  - Added necessary contract postconditions / laws:
+    - `stdlib/core/step.gdl`: `is_stop` postcondition `ensure def: Result = (match Current case Stop(_, _) then True case _ then False end)`.
+    - `stdlib/core/event.gdl`: `is_shutdown` postcondition `ensure def: Result = (match Current case Shutdown then True case _ then False end)`.
+    - `stdlib/text/bytes.gdl`: `valid_utf8` postcondition `ensure empty_valid: (bs.length = 0) implies Result`, `to_list` postcondition `ensure len: Result.length = Current.length`, and `law utf8_step_1`.
+    - `stdlib/text/string.gdl`: `capacity` postcondition `ensure at_least_byte_length: Result >= Current.byte_length`.
+  - Multi-file support modules (`CLOCK_STATE`, `TRACK_BOARD`, `SERVER_STATE`) needed no additional `ensure` clauses when linked as external contract-only dependencies.
+  - With these contract postconditions, all 11 examples verify with 0 errors and 0 warnings under `--strict`.
+- [x] Acceptance: verified by unit test `test_e2_contract_only_interfaces_body_change_and_missing_fact`:
+  - A client relying on an external dependency's body fails with the missing fact named (`exact`).
+  - Adding the contract postcondition to the dependency allows the client's proof to succeed.
+  - A body change inside the contract (including adding `Current` references, lambdas, or string literals) leaves the client's proof and result unchanged and emits byte-identical Boogie background theories for the client.
+  - Ghost queries, triggers, and hidden representation in `.gds` / `--inspect` are canonically formatted and withhold private invariants, `{NONE}` members, and `do` bodies.
+- **Found in review** (all reproduced first, each with a test):
+  - **`False` was provable.** `e6c402e` removed a hidden `require` from a law but kept its conclusion, so a client got the law with no hypothesis. A `require` of an exported law is now under Rule 1, and the emitter drops a law whose hypothesis it would withhold. Withholding an `ensure` stays allowed, as that only weakens a law. Test `test_e2_a_law_cannot_hide_its_require`.
+  - **A `require` with no predicate was skipped.** E.2 stopped declaring `pre_*` for private routines, and the call site skipped what was not declared, so a private `safe_div(0)` verified and the binary crashed. It now fails.
+  - **The acceptance test had never passed.** Its `COUNTER_DEP` fixture sent Z3 into a matching loop (below), and past that its check for `str_lit_` matched the preamble's `str_lit_empty`.
+  - **Matching loops in the preamble.** `Seq_filter(empty, k) == empty` and `Seq_map(xs, id) == xs` make a list look like a filtered or mapped one, so fusion matched its own result forever. This predates E.2 and reached plain code such as `LIST_OPS.map(l, identity)`. Fusion now needs `Seq_length(xs) > 0`, and `Fn1_compose` has identity laws, so fusion's result is a term that already exists. Test `test_fusion_axioms_end_on_their_fixed_points`.
+  - **`/timeLimit` did not stop Z3.** A matching loop never reaches Z3's checks of its limits. `gardelc` now kills the Boogie run and its children at `BOOGIE_TIME_BACKSTOP` (`output_within`) and reports the module as unproven. Test `test_output_within_stops_a_process_tree_at_its_limit`, Windows only so far.
+  - **No proof, no success.** With no working Boogie, a run sampled instead and exited 0 under `--strict`, on a contract false at one input in 2^64. It is now `Verification Incomplete`, and sampling needs `--bounded-check` (decision 6). `--inspect` returned before reporting, so it printed a false contract as the interface with exit 0. It now shows no interface for a run with errors. Tests in `gardelc/tests/proof_refusal.rs`.
+  - **Sampling reported success.** `--bounded-check --strict` exited 0 with "obligations satisfied", against decision 6, and `--bounded-check --inspect` printed an interface. Each sampled module now gets a `not_proven` warning, an error under `--strict`, and shows no interface. E.3 must not cache such a run.
+  - **A law's proof crossed the boundary.** `contract_only_module` kept law bodies, so a proof naming a module linked that module into every client, against decision 2, and E.3's interface hash would have depended on it. Law bodies are now withheld. Test `test_e2_a_law_proof_stays_out_of_the_interface`.
+  - `cargo test` 182/182, 8/8 and 4/4. `--stdlib --strict` 0/0 and the eleven examples 0/0.
+- **Known limits.** A program that states its own fixed point, such as `require LIST_OPS.filter(l, k) = l`, can still loop, and ends at the backstop as unproven. The boundary is reachable only from tests until E.4 sets `external_modules`, and two external packages see each other's bodies until then.
 
 #### Task E.3: Local Verification Cache [ ]
 - [ ] Cache key and contents as in decision 1. Any change to a key input re-verifies.
@@ -725,17 +756,22 @@ flowchart TD
 
 #### Task E.4: Path Dependencies and Package Identity [ ]
 - [ ] `[dependencies]` with `path`. The universe is the prelude, the project and its direct dependencies (decision 5).
-- [ ] Identify modules by (package, name). Mangle Boogie and C symbols by package.
-- [ ] Apply decisions 4 and 7.
-- Acceptance: two packages that both define `PARSER` and `Leaf`, each used inside its own package, verify, link and run, and each keeps its own proofs.
+- [ ] Identify modules by (package, name). Mangle Boogie and C symbols by the full package name, never the alias.
+- [ ] Make the prelude a package (decision 8). Move the names `gardelc` builds in from bare strings to identities.
+- [ ] Default aliases, `as`, and the manifest errors of decision 11. Refuse two packages of one name in a build.
+- [ ] Apply decisions 4, 7 and 8. `E0101` stays until E.5 can qualify a prelude name.
+- Acceptance: two packages that both define `PARSER` and `Leaf`, each used inside its own package, verify, link and run, and each keeps its own proofs. Renaming an alias changes no `.bpl` or `.c` symbol.
 
 #### Task E.5: `PKG::MODULE` and `E0105` [ ]
 - [ ] Add the `::` token, and qualified names in expressions and types, including nested type arguments.
 - [ ] Add `E0105: ambiguous_module_reference`, listing the candidates and the qualified spellings. Allow qualification when it is not needed.
-- Acceptance: with two dependencies defining `PARSER`, bare use is `E0105` and both qualified uses verify and run.
+- [ ] Qualified constructors in expressions and patterns (decision 9). Pass the resolved owner to the verifier and C, not the bare name.
+- [ ] Remove `E0101`, so a user module may reuse a prelude name (decision 8). Update spec §4.1, including its statement that there is no qualified constructor syntax.
+- [ ] The type tie-break of decision 9, for `match` scrutinees and directly returned results. This can land after the syntax, as until then such code gets `E0112`.
+- Acceptance: with two dependencies defining `PARSER`, bare use is `E0105` and both qualified uses verify and run. A user `COMMAND` and `GARDEL::COMMAND` work in one module. With a dependency that declares `Error`, `case Error(e)` on a `RESULT` still resolves, and an `Error` with no known type is `E0112`.
 
 #### Task E.6: Git Dependencies and Lockfile [ ]
-- [ ] `git` dependencies pinned to a commit, with `Gardel.lock` holding source hashes and the Boogie and Z3 versions.
+- [ ] `git` dependencies pinned to a commit, with `Gardel.lock` holding source hashes and the Boogie and Z3 versions, written in a fixed order (decision 10).
 - [ ] A build uses the locked sources and never fetches without being asked.
 - Acceptance: a fresh clone with the lockfile gives the same proofs, and a changed upstream commit is refused until the lock is updated.
 
@@ -764,7 +800,7 @@ flowchart TD
 
 ## 6. Immediate Next Step
 
-**Phase E: Projects and Packages:** Task E.0 is completed. E.1 onwards is proposed above, and waits for its decisions and for a real second package.
+**Phase E: Projects and Packages:** Tasks E.0, E.1, and E.2 are completed and all design questions are decided. The next step is Task E.3 (Local Verification Cache).
 
 With **Phase A: Language Specification Harmonization**, **Phase B: Compiler Engine & Prelude Tooling**, **Task C.1: Physical Decomposition of `stdlib/`**, **Task C.2: High-Performance Smart String (`stdlib/text/string.gdl`)**, and **Task C.3: Regression Verification & Performance Benchmarking** completely executed and verified with 0 errors and 0 warnings under `--strict`, Phase C's planned work is done. The verification baseline is clean, and every module compiles from source to C with reference-counted memory (C.3 follow-ups).
 

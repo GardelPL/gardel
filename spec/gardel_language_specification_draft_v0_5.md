@@ -336,10 +336,29 @@ The multi-file compilation pipeline proceeds through five deterministic stages:
 5. **Modular Verification Condition Generation (VCG):** For each module (or mutual `group`), the verifier constructs Boogie proof obligations using the public contracts, ghost models, and visible invariants of referenced dependencies, verifying units independently or in parallel.
 
 **CLI input rules (`gardelc`, Task B.4):**
-- Input operands may be any number of `.gdl` files, directories, and wildcard patterns. A directory stands for its `*.gdl` files, searched recursively, skipping `build/` and `target/`. A wildcard in the file-name part of an operand (`src/*.gdl`) is expanded by `gardelc` itself when the shell has not expanded it (e.g. PowerShell, `cmd`). Files named twice are compiled once.
+- Input operands may be any number of `.gdl` files, directories, and wildcard patterns. A directory without a `Gardel.toml` stands for its `*.gdl` files, searched recursively, skipping `build/` and `target/`. A wildcard in the file-name part of an operand (`src/*.gdl`) is expanded by `gardelc` itself when the shell has not expanded it (e.g. PowerShell, `cmd`). Files named twice are compiled once.
 - A run with more than one file, a directory, or a wildcard operand is a *project run*: the files share one flat namespace (`E0102`), each file is checked for `W0201`, and each module is verified once, in a context that holds the background theories (contracts, invariants, laws) of the other-file modules it references, transitively. Those contracts are trusted only because the referenced modules are verified in the same run; calls assert the callee's `require` clauses.
 - A single-file run is unchanged and does not apply `W0201`.
 - **Acyclic cross-file dependencies:** user modules in different files that reference each other in a cycle are rejected with fatal error `E0103: cyclic_module_dependency`, because each module's proof would trust the other's contracts. Mutually dependent modules must be co-declared in one file under `group` (§4.3). Modules in the same file are not linked to each other by `gardelc` yet; simultaneous `group` verification is not yet implemented.
+
+#### 4. Project Manifest (`Gardel.toml`, Task E.1)
+A project may declare its identity and boundaries via a `Gardel.toml` file in its root directory.
+- **`[project]` table:** Declares project metadata:
+  ```toml
+  [project]
+  name = "echo-server"
+  version = "0.1.0"
+  ```
+- **Package naming rules:**
+  - Package names contain only ASCII lowercase letters, digits, `-`, and `.`.
+  - Segments separated by `.` cannot be empty, must start with an ASCII lowercase letter (`a`–`z`), and cannot end with `-`.
+  - The package name cannot start with `gardel.` or derive the default alias `GARDEL`, which is reserved for the Standard Prelude.
+  - The default alias of a package is the uppercase form of its last segment with `-` replaced by `_` (e.g. `acme.http-client` $\longrightarrow$ `HTTP_CLIENT`, `echo-server` $\longrightarrow$ `ECHO_SERVER`).
+- **TOML subset:** Manifest parsing enforces a strict, dependency-free TOML 1.0 subset (tables, quoted and bare keys, basic strings, inline tables of strings, and comments). Constructs outside this subset, duplicate keys, duplicate tables, or bad escape sequences fail statically with 1-based line numbers.
+- **Project layout & CLI invocation:**
+  - Standard source code resides in `src/`.
+  - Invoking `gardelc --project <DIR>`, `gardelc <DIR>` on a directory containing `Gardel.toml`, or `gardelc` without input operands in such a directory reads the manifest, resolves sources under `src/`, and compiles in project mode. Files outside `src/` are not part of the project, and a project cannot be combined with other input operands.
+  - A manifest without dependencies changes nothing about what a source file means: constituent modules share the flat project namespace with the prelude in scope.
 
 ---
 
@@ -354,9 +373,9 @@ The multi-file compilation pipeline proceeds through five deterministic stages:
 | `E0110: unknown_variable` | A name that is not a parameter, local, field or routine |
 | `E0111: wrong_argument_count` | A call to a known routine with the wrong number of arguments |
 | `E0112: ambiguous_constructor` | A constructor declared by two other user modules. A module's own constructor always wins, as it does over the prelude's (§4.1) |
-| `E0113: hidden_member` | A private routine or hidden field of another module, or a constructor of a representation not exported to the module. A hidden representation can be neither built nor matched |
+| `E0113: hidden_member` | A private routine or hidden field of another module, or a constructor of a representation not exported to the module. A hidden representation can be neither built nor matched. The verifier reports a private target that name resolution could not type under the same rule |
 
-`E0105` is reserved for `ambiguous_module_reference` (Roadmap, Phase E). A receiver's type is followed through parameters, `let`s and routine results. Beyond that, what the verifier cannot translate is `E0199: verifier_translation_failed`: the module is not verified, and the fault is reported as a limit of `gardelc`, not of the program. An unknown command-line flag is an error.
+`E0105` is reserved for `ambiguous_module_reference` (Roadmap, Phase E). A receiver's type is followed through parameters, `let`s, routine results with their type arguments, `if`, `match`, pattern bindings and constructor calls. A `require` of an exported law may not mention what the law's clients cannot see, as for a routine: a client given the conclusion without the hypothesis could prove `False`. Beyond that, what the verifier cannot translate is `E0199: verifier_translation_failed`: the module is not verified, and the fault is reported as a limit of `gardelc`, not of the program. An unknown command-line flag is an error.
 
 ---
 
@@ -1483,7 +1502,7 @@ When Boogie/Z3 returns `unknown` or fails to prove an obligation:
    - Adjust function unfolding with `reveal f` or increase routine `fuel`.
    - Formulate ghost lemmas in `specify` blocks proving inductive sub-goals.
    - In rare exploratory phases, mark an unproven assumption with `assume tag: predicate end`. `gardelc --audit` lists all ambient assumptions, and production compilation (`--strict`) strictly rejects any remaining `assume` blocks.
-4. **Solver Limit.** Each Boogie procedure has a budget of Z3 resources (`--z3-rlimit <N>` overrides the default). The budget counts solver work, not time, so a verdict does not depend on machine load. An obligation that exhausts it is *unproven*, not refuted: it is reported as `Phase 3 Boogie (Verification Resource Limit)`, without a counterexample. Prefer a lemma to a higher limit. `--z3-seed <N>` (or `GARDEL_Z3_SEED`) fixes Z3's random seed for proof stability checks; an invalid value in either option is an error.
+4. **Solver Limit.** Each Boogie procedure has a budget of Z3 resources (`--z3-rlimit <N>` overrides the default). The budget counts solver work, not time, so a verdict does not depend on machine load. An obligation that exhausts it is *unproven*, not refuted: it is reported as `Phase 3 Boogie (Verification Resource Limit)`, without a counterexample. Prefer a lemma to a higher limit. A matching loop can outrun the solver's own checks of this budget, so `gardelc` also stops a Boogie run after 600 seconds (`GARDEL_SOLVER_BACKSTOP` overrides it, in seconds). That is a hang, not a verdict, and the module is reported as unproven. `--z3-seed <N>` (or `GARDEL_Z3_SEED`) fixes Z3's random seed for proof stability checks; an invalid value in either option is an error.
 
 ---
 
@@ -2594,6 +2613,7 @@ Because each transformation step corresponds directly to a verified catalogue la
 
 The compiler `gardelc` verifies first and erases second, so everything that reaches the backend is total, memory-safe, pure code.
 
+0. **Project manifest & workspace resolution.** When invoked with `--project <DIR>` or with no input operands in a directory containing `Gardel.toml`, `gardelc` parses the manifest via its strict TOML 1.0 subset parser, validates package identity, and collects source files from `src/` into the multi-file project pipeline (§4.2.4).
 1. **Parse and resolve names.** Enforce selective export and all five visibility rules (§4).
 2. **Check types and concepts.** Resolve `Current`, uniform-access dot calls, and `satisfies` obligations.
 3. **Generate verification conditions.** Translate representations, ghost code, `let` blocks, contracts, variants, and 64-bit numerics to Boogie, then query Z3.

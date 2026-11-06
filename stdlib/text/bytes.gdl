@@ -66,9 +66,9 @@ create {ANY}
           end
         end
       end
+    ensure
+      empty_valid: (bs.length = 0) implies Result
     end
-
-  -- The exact UTF-8 decoder: the Unicode scalar values a well-formed sequence encodes.
   decode_utf8(bs: LIST[U64]): LIST[CHAR]
     require
       valid: valid_utf8(bs)
@@ -244,9 +244,21 @@ specify {ANY}
       same_bytes: xs = ys
     end
 
-  -- One well-formed 2-byte and 3-byte step, for `STRING.push_utf8_2` and `push_utf8_3`. See
+  -- One well-formed 1-byte, 2-byte and 3-byte step, for `STRING.push_ascii`, `push_utf8_2` and `push_utf8_3`. See
   -- `utf8_step_4`: their invariant proofs failed the same way, on some Z3 seeds, once overflow
-  -- checks on record fields joined those routines.
+  -- checks on record fields joined those routines, or when bodies are withheld across modules.
+  law utf8_step_1(b0: U64, xs: LIST[U64])
+    require
+      lead: b0 < 128
+      xs_valid: valid_utf8(xs)
+    trigger
+      xs.prepend(b0)
+    ensure
+      step_valid: valid_utf8(xs.prepend(b0))
+      step_decode: decode_utf8(xs.prepend(b0)) =
+        decode_utf8(xs).prepend(CHAR.from_scalar(b0))
+    end
+
   law utf8_step_2(b0: U64, b1: U64, xs: LIST[U64])
     require
       lead: b0 >= 194 and b0 <= 223
@@ -318,6 +330,7 @@ feature {ANY}
       Current.items
     ensure
       is_model: Result = Current.model
+      len: Result.length = Current.length
     end
 
   at(i: NAT): U64

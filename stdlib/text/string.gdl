@@ -250,6 +250,8 @@ feature {ANY}
   capacity: NAT
     do
       Current.limit
+    ensure
+      at_least_byte_length: Result >= Current.byte_length
     end
 
   is_empty: BOOL
