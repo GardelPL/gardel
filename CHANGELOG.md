@@ -32,6 +32,9 @@ Spec draft v0.5. [plan/Roadmap.md](plan/Roadmap.md) holds the detail for each ta
 - `--bounded-check` no longer reports its obligations as satisfied. Each module gets a `not_proven` warning, an error under `--strict`, and `--inspect` shows no interface for it.
 - `gardelc DIR` on a directory with a `Gardel.toml` now reads the manifest and uses `src/`, as `--project DIR` does. It used to ignore the manifest and link every `.gdl` file below the directory. Combining such a directory with other inputs is an error.
 - A law's proof no longer reaches its clients across a package boundary. It could link other modules into a client's verification.
+- The package boundary now separates any two packages. It used to have one set of external modules, so two dependencies could prove facts from each other's bodies. Only tests can set it until path dependencies arrive.
+- A bad or missing `--fuel` value is an error, where it used to run at the default fuel. A repeated `--fuel` takes the last value.
+- `Gardel.toml` accepts only space and tab as whitespace. A no-break space or a form feed outside a string is an error, as in TOML.
 - New rules `E0106` to `E0113` report undefined names and hidden members before verification. `E0199` reports what the verifier cannot accept.
 
 ---
