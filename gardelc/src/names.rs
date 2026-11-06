@@ -24,6 +24,8 @@ struct Member<'a> {
     /// declared twice, or a routine returning a function.
     arity: Option<usize>,
     ret: Option<&'a str>,
+    /// The routine's own type parameters, which a receiver's type says nothing about.
+    type_params: &'a [String],
     /// Laws state facts, and may be invoked as lemmas from anywhere.
     is_law: bool,
 }
@@ -53,6 +55,11 @@ fn ctor_names(m: &ModuleDecl) -> Vec<&str> {
     }
 }
 
+/// A module's type parameters mapped to the arguments of a use of its type.
+fn type_arg_map(params: &[String], args: &[&str]) -> HashMap<String, String> {
+    params.iter().cloned().zip(args.iter().map(ToString::to_string)).collect()
+}
+
 fn add_member<'a>(table: &mut HashMap<&'a str, Member<'a>>, name: &'a str, member: Member<'a>) {
     table
         .entry(name)
@@ -70,6 +77,7 @@ fn routine_member<'a>(vis: &'a Visibility, r: &'a RoutineDecl) -> Member<'a> {
         vis,
         arity: (!returns_function).then_some(r.params.len()),
         ret: Some(&r.ret_type),
+        type_params: &r.type_params,
         is_law: false,
     }
 }
@@ -89,6 +97,7 @@ fn add_concept_members<'a>(
             vis: &ANY_VISIBILITY,
             arity: None,
             ret: Some(&s.ret_type),
+            type_params: &[],
             is_law: false,
         });
     }
@@ -97,6 +106,7 @@ fn add_concept_members<'a>(
             vis: &ANY_VISIBILITY,
             arity: None,
             ret: Some(&r.ret_type),
+            type_params: &r.type_params,
             is_law: false,
         });
     }
@@ -105,6 +115,7 @@ fn add_concept_members<'a>(
             vis: &ANY_VISIBILITY,
             arity: None,
             ret: None,
+            type_params: &[],
             is_law: true,
         });
     }
@@ -123,7 +134,7 @@ fn members_of<'a>(
             add_member(
                 &mut table,
                 f,
-                Member { vis: &m.repr_vis, arity: None, ret: Some(t), is_law: false },
+                Member { vis: &m.repr_vis, arity: None, ret: Some(t), type_params: &[], is_law: false },
             );
         }
     }
@@ -139,7 +150,7 @@ fn members_of<'a>(
         add_member(
             &mut table,
             &l.name,
-            Member { vis, arity: Some(l.params.len()), ret: None, is_law: true },
+            Member { vis, arity: Some(l.params.len()), ret: None, type_params: &[], is_law: true },
         );
     }
     if let Some(sat) = &m.satisfies {
@@ -331,21 +342,117 @@ impl<'a> Walker<'a, '_> {
             }
             Expr::Var(v) => self.scope.iter().rev().find(|(n, _)| n == v).and_then(|(_, t)| t.clone()),
             Expr::Str(_) => Some("STRING".to_string()),
-            Expr::Call(f, _) if !self.in_scope(f) => self.result_type(&self.module.name, f),
+            Expr::Call(f, args) if !self.in_scope(f) && starts_upper(f) => self.ctor_type(f, args),
+            Expr::Call(f, _) if !self.in_scope(f) => {
+                self.result_type(&module_self_type(self.module), f)
+            }
             Expr::MethodCall(recv, name, _) => {
                 let owner = match &**recv {
                     Expr::Var(v) if self.is_static_receiver(v) => v.clone(),
-                    other => type_head(&self.type_of(other)?).to_string(),
+                    other => self.type_of(other)?,
                 };
                 self.result_type(&owner, name)
             }
+            Expr::If(_, _, then_e, _, else_e) => {
+                self.type_of(then_e).or_else(|| self.type_of(else_e))
+            }
+            Expr::Match(_, cases) => cases.iter().find_map(|c| self.type_of(&c.body)),
             _ => None,
         }
     }
 
-    fn result_type(&self, owner: &str, name: &str) -> Option<String> {
-        let ret = self.universe.member(owner, name)?.ret?;
-        Some(if ret == "Current" { owner.to_string() } else { ret.to_string() })
+    /// The type of member `name` on a receiver of type `recv`, or `None` when `recv` leaves
+    /// a type parameter of the result open.
+    fn result_type(&self, recv: &str, name: &str) -> Option<String> {
+        let (owner, args) = split_type_app(recv);
+        if owner == "LIST" {
+            return match name {
+                "head" => args.first().map(ToString::to_string),
+                "tail" | "append" | "prepend" => Some(recv.to_string()),
+                _ => None,
+            };
+        }
+        let member = self.universe.member(owner, name)?;
+        let ret = member.ret?;
+        if ret == "Current" {
+            return Some(recv.to_string());
+        }
+        let params = &self.universe.modules.get(owner)?.type_params;
+        let map = type_arg_map(params, &args);
+        let open = |t: &str| {
+            member.type_params.iter().any(|p| p == t)
+                || params.iter().any(|p| p == t && !map.contains_key(t))
+        };
+        (!type_tokens(ret).into_iter().any(open)).then(|| subst_type_idents(ret, &map))
+    }
+
+    /// The type a constructor call builds, when its arguments settle the type parameters.
+    fn ctor_type(&self, name: &str, args: &[Expr]) -> Option<String> {
+        let owners = self.universe.user_ctors.get(name).cloned().unwrap_or_default();
+        let owner = if ctor_names(self.module).contains(&name) {
+            self.module
+        } else {
+            self.ctor_owner(name, &owners)?
+        };
+        let ReprKind::Sum(variants) = &owner.repr else { return None };
+        let variant = variants.iter().find(|v| v.name == name)?;
+        let mut map = HashMap::new();
+        for ((_, field), arg) in variant.fields.iter().zip(args) {
+            if let Some(actual) = self.type_of(arg) {
+                unify_type(field, &actual, &owner.type_params, &mut map);
+            }
+        }
+        let args: Option<Vec<&str>> =
+            owner.type_params.iter().map(|p| map.get(p).map(String::as_str)).collect();
+        match args?.join(", ") {
+            joined if joined.is_empty() => Some(owner.name.clone()),
+            joined => Some(format!("{}[{joined}]", owner.name)),
+        }
+    }
+
+    /// The types of constructor `name`'s fields on a value of type `ty`, or, with `ty`
+    /// unknown, those that do not depend on it.
+    fn variant_field_types(&self, name: &str, ty: Option<&str>) -> Vec<Option<String>> {
+        let owner = match ty {
+            Some(t) => self.universe.modules.get(type_head(t)).copied(),
+            None => {
+                let owners = self.universe.user_ctors.get(name).cloned().unwrap_or_default();
+                self.ctor_owner(name, &owners)
+            }
+        };
+        let Some(owner) = owner else { return Vec::new() };
+        let ReprKind::Sum(variants) = &owner.repr else { return Vec::new() };
+        let Some(variant) = variants.iter().find(|v| v.name == name) else { return Vec::new() };
+        let args = ty.map_or_else(Vec::new, |t| split_type_app(t).1);
+        let map = type_arg_map(&owner.type_params, &args);
+        let open = |t: &str| owner.type_params.iter().any(|p| p == t && !map.contains_key(t));
+        variant
+            .fields
+            .iter()
+            .map(|(_, f)| {
+                (!type_tokens(f).into_iter().any(open)).then(|| subst_type_idents(f, &map))
+            })
+            .collect()
+    }
+
+    /// The names `p` binds on a value of type `ty`, with their types where those are known.
+    fn bind_pattern(&mut self, p: &Pattern, ty: Option<&str>) {
+        match p {
+            Pattern::Bind(name) => self.scope.push((name.clone(), ty.map(ToString::to_string))),
+            Pattern::Variant(c, subs) => {
+                let fields = self.variant_field_types(c, ty);
+                for (i, sub) in subs.iter().enumerate() {
+                    self.bind_pattern(sub, fields.get(i).and_then(Option::as_deref));
+                }
+            }
+            Pattern::Tuple(subs) => {
+                let args = ty.map_or_else(Vec::new, |t| split_type_app(t).1);
+                for (i, sub) in subs.iter().enumerate() {
+                    self.bind_pattern(sub, args.get(i).copied());
+                }
+            }
+            Pattern::Wildcard | Pattern::Lit(_) => {}
+        }
     }
 
     fn is_static_receiver(&self, v: &str) -> bool {
@@ -457,10 +564,11 @@ impl<'a> Walker<'a, '_> {
             }
             Expr::Match(scrut, cases) => {
                 self.expr(scrut);
+                let ty = self.type_of(scrut);
                 for c in cases {
                     self.check_pattern(&c.pattern);
                     let mark = self.scope.len();
-                    self.scope.extend(c.bindings().into_iter().map(|b| (b, None)));
+                    self.bind_pattern(&c.pattern, ty.as_deref());
                     self.block(&c.stmts, &c.body);
                     self.scope.truncate(mark);
                 }
@@ -572,9 +680,41 @@ impl<'a> Walker<'a, '_> {
         self.expr(recv);
         if let Some(t) = self.type_of(recv) {
             let owner = type_head(&t).to_string();
+            if self.type_params.contains(&owner) {
+                return;
+            }
             let argc = self.universe.member(&owner, name).and_then(|m| m.arity).map(|_| argc);
             self.check_member(&owner, name, argc);
+        } else {
+            self.check_untyped_member(name);
         }
+    }
+
+    /// `name` on a receiver of unknown type. If every module declaring it hides it from here,
+    /// no target is left, whatever the receiver is. Built-in members exist on values no module
+    /// declares, so they say nothing.
+    fn check_untyped_member(&mut self, name: &str) {
+        if BOOGIE_BUILTIN_METHODS.contains(&name) {
+            return;
+        }
+        let mut owners: Vec<&str> = Vec::new();
+        for (owner, members) in &self.universe.members {
+            let Some(member) = members.get(name) else { continue };
+            if *owner == self.module.name || member.is_law || !self.is_hidden(member.vis) {
+                return;
+            }
+            owners.push(owner);
+        }
+        if owners.is_empty() {
+            return;
+        }
+        owners.sort_unstable();
+        let message = format!(
+            "`{name}` is declared in `{}`, which does not export it to `{}`",
+            owners.join("`, `"),
+            self.module.name
+        );
+        self.report("E0113: hidden_member", name, message);
     }
 
     fn routine(&mut self, r: &RoutineDecl) {

@@ -2901,6 +2901,29 @@ pub fn check_visibility_and_semantics(m: &ModuleDecl) -> Vec<Diagnostic> {
         }
     }
 
+    // Rule 1 for laws. A law states a fact only under its `require`, so a client that cannot
+    // see the hypothesis cannot be given the conclusion. The law could also be vacuous.
+    for (vis, law) in &m.specify_laws {
+        if *vis == Visibility::None {
+            continue;
+        }
+        let (bound, non_self) = law_clause_locals(law, &m.name);
+        for (tag, req) in &law.requires {
+            if !clause_is_visible_in_interface(req, &m.name, &symbol_vis, vis, &bound, &non_self) {
+                diags.push(Diagnostic::basic(
+                    "error",
+                    "Rule 1 (Contract Visibility)",
+                    law.name.clone(),
+                    tag.clone(),
+                    format!(
+                        "Precondition `{tag}` of law `{}` references a symbol less visible than the law ({vis}). Export the symbol, or make the law `specify {{NONE}}`",
+                        law.name
+                    ),
+                ));
+            }
+        }
+    }
+
     // Rule 5: Invariant visibility to representation friends
     for (tag, inv_expr) in &m.invariants {
         for sym in collect_symbols(inv_expr) {
@@ -6257,6 +6280,16 @@ fn find_module_routine<'a>(m: &'a ModuleDecl, name: &str) -> Option<(&'a Routine
         })
 }
 
+/// True when routine `name` of `m` is `{NONE}`, so no other module may call it.
+fn routine_is_private(m: &ModuleDecl, name: &str) -> bool {
+    m.feature_routines
+        .iter()
+        .chain(&m.specify_routines)
+        .chain(&m.create_routines)
+        .find(|(_, r)| r.name == name)
+        .is_some_and(|(vis, _)| *vis == Visibility::None)
+}
+
 fn type_head(ty: &str) -> &str {
     ty.trim().split('[').next().unwrap_or("").trim()
 }
@@ -6948,14 +6981,15 @@ fn emit_prelude_contract_interface(p: &ModuleDecl) -> (String, HashSet<String>) 
     }
     for (idx, law) in prelude_law_markers(p) {
         let law_vis = &p.specify_laws[idx].0;
-        let mut law_locals: HashSet<String> = law.params.iter().map(|(pn, _)| pn.clone()).collect();
-        law_locals.insert("Current".to_string());
-        let law_non_self: HashSet<String> = law
-            .params
-            .iter()
-            .filter(|(_, pt)| !type_is_self(pt, &p.name))
-            .map(|(pn, _)| pn.clone())
-            .collect();
+        let (law_locals, law_non_self) = law_clause_locals(law, &p.name);
+        let visible = |e: &Expr| {
+            clause_is_visible_in_interface(e, &p.name, &symbol_vis, law_vis, &law_locals, &law_non_self)
+        };
+        // Withholding a conclusion only weakens the law. Withholding a hypothesis would state
+        // the law for arguments it was not proven for, so such a law is no fact at all.
+        if !law.requires.iter().all(|(_, e)| visible(e)) {
+            continue;
+        }
         let params: Vec<String> = law
             .params
             .iter()
@@ -6970,16 +7004,7 @@ fn emit_prelude_contract_interface(p: &ModuleDecl) -> (String, HashSet<String>) 
         let ens: Vec<String> = law
             .ensures
             .iter()
-            .filter(|(_, e)| {
-                clause_is_visible_in_interface(
-                    e,
-                    &p.name,
-                    &symbol_vis,
-                    law_vis,
-                    &law_locals,
-                    &law_non_self,
-                )
-            })
+            .filter(|(_, e)| visible(e))
             .map(|(_, e)| format!("({})", emit(e)))
             .collect();
         if ens.is_empty() {
@@ -6988,16 +7013,6 @@ fn emit_prelude_contract_interface(p: &ModuleDecl) -> (String, HashSet<String>) 
         let reqs: Vec<String> = law
             .requires
             .iter()
-            .filter(|(_, e)| {
-                clause_is_visible_in_interface(
-                    e,
-                    &p.name,
-                    &symbol_vis,
-                    law_vis,
-                    &law_locals,
-                    &law_non_self,
-                )
-            })
             .map(|(_, e)| format!("({})", emit(e)))
             .collect();
         let body = format!("{} {}", ens.join(" && "), reqs.join(" "));
@@ -7460,6 +7475,10 @@ fn emit_boogie_parts_with_options(
     out.push_str("function Fn1_id<A>() returns (Fn1 A A);\n");
     out.push_str("axiom (forall<A> x: A :: { Fn1_app(Fn1_id(), x) } Fn1_app(Fn1_id(), x) == x);\n");
     out.push_str("function Fn1_compose<A, B, C>(f: Fn1 B C, g: Fn1 A B) returns (Fn1 A C);\n");
+    // `map(xs, id) == xs` makes every `map(xs, h)` a fusion redex. These send the fusion's
+    // result back to `map(xs, h)`, so no new term appears and the matching loop ends.
+    out.push_str("axiom (forall<A, B> f: Fn1 A B :: { Fn1_compose(f, Fn1_id() : Fn1 A A) } Fn1_compose(f, Fn1_id() : Fn1 A A) == f);\n");
+    out.push_str("axiom (forall<A, B> f: Fn1 A B :: { Fn1_compose(Fn1_id() : Fn1 B B, f) } Fn1_compose(Fn1_id() : Fn1 B B, f) == f);\n");
     out.push_str("axiom (forall<A, B, C> f: Fn1 B C, g: Fn1 A B, x: A :: { Fn1_app(Fn1_compose(f, g), x) } Fn1_app(Fn1_compose(f, g), x) == Fn1_app(f, Fn1_app(g, x)));\n\n");
 
     out.push_str("function Seq_map<A, B>(xs: Seq A, f: Fn1 A B) returns (Seq B);\n");
@@ -7470,7 +7489,9 @@ fn emit_boogie_parts_with_options(
     out.push_str(
         "axiom (forall<A> xs: Seq A :: { Seq_map(xs, Fn1_id()) } Seq_map(xs, Fn1_id()) == xs);\n",
     );
-    out.push_str("axiom (forall<A, B, C> xs: Seq A, f: Fn1 B C, g: Fn1 A B :: { Seq_map(Seq_map(xs, g), f) } Seq_map(Seq_map(xs, g), f) == Seq_map(xs, Fn1_compose(f, g)));\n\n");
+    // Fusion stops at an empty list. `map(empty, f) == empty` makes `empty` a `map`, so an
+    // unguarded fusion matches its own result forever, and Z3 never reaches a limit check.
+    out.push_str("axiom (forall<A, B, C> xs: Seq A, f: Fn1 B C, g: Fn1 A B :: { Seq_map(Seq_map(xs, g), f) } Seq_length(xs) > 0 ==> Seq_map(Seq_map(xs, g), f) == Seq_map(xs, Fn1_compose(f, g)));\n\n");
 
     out.push_str("function Seq_filter<A>(xs: Seq A, keep: Fn1 A bool) returns (Seq A);\n");
     out.push_str("axiom (forall<A> xs: Seq A, keep: Fn1 A bool :: { Seq_length(Seq_filter(xs, keep)) } 0 <= Seq_length(Seq_filter(xs, keep)) && Seq_length(Seq_filter(xs, keep)) <= Seq_length(xs));\n");
@@ -7490,7 +7511,8 @@ fn emit_boogie_parts_with_options(
 
     out.push_str("function Fn1_and<A>(p: Fn1 A bool, q: Fn1 A bool) returns (Fn1 A bool);\n");
     out.push_str("axiom (forall<A> p: Fn1 A bool, q: Fn1 A bool, x: A :: { Fn1_app(Fn1_and(p, q), x) } Fn1_app(Fn1_and(p, q), x) == (Fn1_app(p, x) && Fn1_app(q, x)));\n");
-    out.push_str("axiom (forall<A> xs: Seq A, p: Fn1 A bool, q: Fn1 A bool :: { Seq_filter(Seq_filter(xs, p), q) } Seq_filter(Seq_filter(xs, p), q) == Seq_filter(xs, Fn1_and(p, q)));\n\n");
+    // Fusion stops at an empty list, as for `Seq_map`.
+    out.push_str("axiom (forall<A> xs: Seq A, p: Fn1 A bool, q: Fn1 A bool :: { Seq_filter(Seq_filter(xs, p), q) } Seq_length(xs) > 0 ==> Seq_filter(Seq_filter(xs, p), q) == Seq_filter(xs, Fn1_and(p, q)));\n\n");
 
     out.push_str("function Fn2_map_arg<A, B, C>(f: Fn2 C B C, g: Fn1 A B) returns (Fn2 C A C);\n");
     out.push_str("axiom (forall<A, B, C> f: Fn2 C B C, g: Fn1 A B, acc: C, x: A :: { Fn2_app(Fn2_map_arg(f, g), acc, x) } Fn2_app(Fn2_map_arg(f, g), acc, x) == Fn2_app(f, acc, Fn1_app(g, x)));\n");
@@ -10996,6 +11018,14 @@ fn emit_boogie_expr_obligations(
                         ),
                         None => (Vec::new(), Rc::new((String::new(), HashSet::new()))),
                     };
+                    // `names.rs` refuses what it can type. Only the verifier knows the target
+                    // of the rest, so a private target is refused here too.
+                    if ctx.module(&pname).is_some_and(|p| routine_is_private(p, &rname)) {
+                        s.push_str(&format!(
+                            "{pad}assert {{:msg \"{}::hidden::{rname}\"}} false;\n",
+                            r.name
+                        ));
+                    }
                     let mut call_args = Vec::new();
                     if has_cur {
                         call_args.push(emit_boogie_expr_with_strings(
@@ -11018,13 +11048,15 @@ fn emit_boogie_expr_obligations(
                         ));
                     }
                     for (idx, (tag, _)) in callee.iter().enumerate() {
-                        if !declared.1.contains(&format!("pre_{rname}_{idx}")) {
-                            continue;
-                        }
+                        // A `require` with no predicate cannot be established, not ignored.
+                        let holds = if declared.1.contains(&format!("pre_{rname}_{idx}")) {
+                            format!("{pname}__pre_{rname}_{idx}({})", call_args.join(", "))
+                        } else {
+                            "false".to_string()
+                        };
                         s.push_str(&format!(
-                            "{pad}assert {{:msg \"{}::require::{tag}\"}} {pname}__pre_{rname}_{idx}({});\n",
-                            r.name,
-                            call_args.join(", ")
+                            "{pad}assert {{:msg \"{}::require::{tag}\"}} {holds};\n",
+                            r.name
                         ));
                     }
                 }
@@ -13039,8 +13071,75 @@ thread_local! {
 pub const DEFAULT_Z3_RLIMIT: u64 = 30_000_000;
 
 /// Backstop in seconds for a solver that stops counting resources. `DEFAULT_Z3_RLIMIT` is
-/// what ends a proof attempt; a run that reaches this limit has hung.
+/// what ends a proof attempt; a run that reaches this limit has hung. A matching loop can
+/// outrun Z3's own checks of both limits, so `gardelc` enforces this one itself, on the whole
+/// Boogie run (`output_within`). `GARDEL_SOLVER_BACKSTOP` overrides it, in seconds.
 const BOOGIE_TIME_BACKSTOP: u32 = 600;
+
+fn solver_backstop_secs() -> u32 {
+    env::var("GARDEL_SOLVER_BACKSTOP")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(BOOGIE_TIME_BACKSTOP)
+}
+
+/// Stops `child` and everything it started: killing Boogie alone would leave Z3 running.
+fn kill_process_tree(child: &mut std::process::Child) {
+    let pid = child.id().to_string();
+    #[cfg(windows)]
+    let tree = Command::new("taskkill").args(["/F", "/T", "/PID", &pid]).output();
+    #[cfg(not(windows))]
+    let tree = Command::new("pkill").args(["-KILL", "-P", &pid]).output();
+    drop(tree);
+    // Already gone if the tree was killed above, and then this has nothing to do.
+    drop(child.kill());
+    drop(child.wait());
+}
+
+/// Runs `cmd` as `Command::output` does, or returns `None` once it has run for `limit`, with
+/// all of its processes stopped.
+fn output_within(
+    cmd: &mut Command,
+    limit: std::time::Duration,
+) -> std::io::Result<Option<std::process::Output>> {
+    use std::io::Read;
+    use std::process::Stdio;
+
+    fn drain(pipe: Option<impl Read + Send + 'static>) -> std::thread::JoinHandle<Vec<u8>> {
+        std::thread::spawn(move || {
+            let mut bytes = Vec::new();
+            if let Some(mut pipe) = pipe {
+                // What was read before a failure is still the process's output.
+                drop(pipe.read_to_end(&mut bytes));
+            }
+            bytes
+        })
+    }
+
+    let mut child = cmd
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    // Read as it runs, or a process that fills a pipe would never exit.
+    let stdout = drain(child.stdout.take());
+    let stderr = drain(child.stderr.take());
+    let start = std::time::Instant::now();
+    loop {
+        if let Some(status) = child.try_wait()? {
+            return Ok(Some(std::process::Output {
+                status,
+                stdout: stdout.join().unwrap_or_default(),
+                stderr: stderr.join().unwrap_or_default(),
+            }));
+        }
+        if start.elapsed() >= limit {
+            kill_process_tree(&mut child);
+            return Ok(None);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+}
 
 pub fn with_z3_rlimit<R>(rlimit: Option<u64>, f: impl FnOnce() -> R) -> R {
     let prev = BOOGIE_Z3_RLIMIT.with(|s| s.replace(rlimit));
@@ -13103,22 +13202,29 @@ fn run_boogie_verification_once(
     }
     cmd.arg("/typeEncoding:p");
     cmd.arg(format!("/rlimit:{}", current_z3_rlimit()));
-    cmd.arg(format!("/timeLimit:{BOOGIE_TIME_BACKSTOP}"));
+    let backstop = solver_backstop_secs();
+    cmd.arg(format!("/timeLimit:{backstop}"));
     cmd.arg("/mv:-");
     cmd.arg("/errorTrace:0");
     cmd.arg(&temp_path);
 
-    let output = cmd
-        .output()
+    let output = output_within(&mut cmd, std::time::Duration::from_secs(backstop.into()))
         .map_err(|e| format!("Failed to spawn Boogie process: {e}"))?;
     // `GARDEL_KEEP_BPL=1` keeps the VC file for debugging the Boogie translation.
     if env::var_os("GARDEL_KEEP_BPL").is_none() {
         let _ = fs::remove_file(&temp_path);
     }
 
-    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
-    let full_out = format!("{stdout}\n{stderr}");
+    let full_out = match output {
+        Some(output) => {
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            format!("{stdout}\n{stderr}")
+        }
+        None => format!(
+            "Fatal Error: the solver was stopped after {backstop} s, likely in a matching loop"
+        ),
+    };
 
     Ok(parse_boogie_output(&full_out, m, src, input_path))
 }
@@ -13274,14 +13380,20 @@ pub fn parse_boogie_output(
                 "check" => "Phase 3 Boogie (Check Assertion Failed)",
                 "match" => "Phase 3 Boogie (Non-Exhaustive Match)",
                 "require" => "Phase 3 Boogie (Precondition Violation)",
+                "hidden" => "E0113: hidden_member",
                 _ => "Phase 3 Boogie (Verification Condition Failed)",
+            };
+            let message = if rule_kind == "hidden" {
+                format!("E0113: hidden_member: `{routine}` calls `{tag}`, which is private to its module. Use a routine that module exports")
+            } else {
+                format!("Formal verification condition `{tag}` failed in `{routine}`")
             };
             let diag = Diagnostic::basic(
                 "error",
                 static_rule,
                 routine.clone(),
                 tag.clone(),
-                format!("Formal verification condition `{tag}` failed in `{routine}`"),
+                message,
             )
             .with_module(&m.name)
             .with_ai_context(sp, pcs, cex, lemmas);
@@ -13366,6 +13478,7 @@ pub fn parse_boogie_output(
                     "check" => "Phase 3 Boogie (Check Assertion Failed)",
                     "match" => "Phase 3 Boogie (Non-Exhaustive Match)",
                     "require" => "Phase 3 Boogie (Precondition Violation)",
+                    "hidden" => "E0113: hidden_member",
                     _ => "Phase 3 Boogie (Verification Condition Failed)",
                 };
                 // A line with no tag is not a proof failure. Boogie refused the generated
@@ -16515,6 +16628,20 @@ fn collect_module_own_symbols_in(
     }
 }
 
+/// The names bound in a clause of `law`, and those of them that are not of module `m_name`'s
+/// own type, as `clause_is_visible_in_interface` takes them.
+fn law_clause_locals(law: &LawDecl, m_name: &str) -> (HashSet<String>, HashSet<String>) {
+    let mut bound = HashSet::from(["Current".to_string()]);
+    let mut non_self = HashSet::new();
+    for (pn, pt) in &law.params {
+        bound.insert(pn.clone());
+        if !type_is_self(pt, m_name) {
+            non_self.insert(pn.clone());
+        }
+    }
+    (bound, non_self)
+}
+
 /// Checks whether a contract/law/invariant expression `expr` in module `m_name` is visible
 /// at `target_vis`: every member of `m_name` referenced in `expr` must be exported at least
 /// as widely as `target_vis` (and never `{NONE}`).
@@ -16624,14 +16751,7 @@ pub fn contract_only_module(m: &ModuleDecl) -> ModuleDecl {
             if *vis == Visibility::None {
                 return None;
             }
-            let mut bound_locals = HashSet::from(["Current".to_string()]);
-            let mut non_self_locals = HashSet::new();
-            for (pn, pt) in &law.params {
-                bound_locals.insert(pn.clone());
-                if !type_is_self(pt, &m.name) {
-                    non_self_locals.insert(pn.clone());
-                }
-            }
+            let (bound_locals, non_self_locals) = law_clause_locals(law, &m.name);
             let all_visible = law
                 .requires
                 .iter()
@@ -22574,6 +22694,178 @@ int main(void) {
         }
     }
 
+    /// `SECRET.make` with a public `open_one`, and a private `hidden` and `v` (Task E.0).
+    const HIDDEN_SECRET: &str = "module SECRET\n\nrepresentation {NONE}\n  v: U64\n\ncreate {ANY}\n\n  make: SECRET\n    do\n      { v = 1 }\n    end\n\nfeature {ANY}\n\n  open_one: U64\n    do\n      Current.v\n    end\n\nfeature {NONE}\n\n  hidden: U64\n    do\n      Current.v\n    end\n\nend\n";
+
+    #[test]
+    fn test_e0_hidden_members_behind_inferred_receivers() {
+        let client = |body: &str| {
+            format!("functions PEEK\n\nfeature {{ANY}}\n\n  t(o: OPTION[SECRET], l: LIST[SECRET], b: BOOL): U64\n    do\n      {body}\n    end\n\nend\n")
+        };
+        let arm = "match o\n        case Some(x) then x.MEMBER\n        case None then 0\n      end";
+        for receiver in [
+            "o.get.MEMBER",
+            "o.unwrap_or(SECRET.make).MEMBER",
+            "l.head.MEMBER",
+            "(if b then SECRET.make else SECRET.make end).MEMBER",
+            "(if b then o.get else o.get end).MEMBER",
+            "(match o case Some(x) then x case None then SECRET.make end).MEMBER",
+            "let p = Some(SECRET.make)\n      p.unwrap_or(SECRET.make).MEMBER",
+            arm,
+            // No type reaches this receiver: `map` has a type parameter of its own.
+            "o.map(fn(s: SECRET): SECRET do s end).get.MEMBER",
+        ] {
+            for member in ["hidden", "v"] {
+                let src = client(&receiver.replace("MEMBER", member));
+                let fatal = e0_fatal(&[("secret.gdl", HIDDEN_SECRET), ("peek.gdl", &src)]);
+                assert!(
+                    fatal.iter().any(|(r, _)| r == "E0113: hidden_member"),
+                    "{receiver} with {member}: {fatal:?}"
+                );
+            }
+            // The exported member passes through the same receivers.
+            let src = client(&receiver.replace("MEMBER", "open_one"));
+            let fatal = e0_fatal(&[("secret.gdl", HIDDEN_SECRET), ("peek.gdl", &src)]);
+            assert_eq!(fatal, Vec::new(), "{receiver}");
+        }
+    }
+
+    #[test]
+    fn test_e0_inferred_receivers_refuse_nothing_that_is_visible() {
+        // A private `head` does not hide the built-in `head` of a LIST, and a private name
+        // is fine when another module exports it.
+        let lib = "module LIB\n\nrepresentation {NONE}\n  v: U64\n\ncreate {ANY}\n\n  make: LIB\n    do\n      { v = 1 }\n    end\n\nfeature {NONE}\n\n  head: U64\n    do\n      Current.v\n    end\n\n  shared: U64\n    do\n      Current.v\n    end\n\nend\n";
+        let open = "module OPEN\n\nrepresentation {NONE}\n  v: U64\n\ncreate {ANY}\n\n  make: OPEN\n    do\n      { v = 1 }\n    end\n\nfeature {ANY}\n\n  shared: U64\n    do\n      Current.v\n    end\n\nend\n";
+        // A module named like a routine's type parameter is not what that parameter means.
+        let b = "module B\n\nrepresentation {NONE}\n  v: U64\n\ncreate {ANY}\n\n  make: B\n    do\n      { v = 1 }\n    end\n\nend\n";
+        let user = "functions USE_LIB\n\nfeature {ANY}\n\n  one(l: LIST[U64]): U64\n    require\n      n: l.length > 0\n    do\n      l.head\n    end\n\n  two(o: OPTION[OPEN]): U64\n    do\n      o.map(fn(s: OPEN): OPEN do s end).unwrap_or(OPEN.make).shared\n    end\n\n  three(o: OPTION[U64]): BOOL\n    do\n      o.map(fn(s: U64): U64 do s end).is_some\n    end\n\nend\n";
+        let fatal = e0_fatal(&[("lib.gdl", lib), ("open.gdl", open), ("b.gdl", b), ("use_lib.gdl", user)]);
+        assert_eq!(fatal, Vec::new());
+    }
+
+    #[test]
+    fn test_e0_a_call_of_a_private_routine_never_skips_its_require() {
+        // `OTHER` exports a `safe_div`, so the name alone does not say this call is private.
+        let lib = "module LIB\n\nrepresentation {NONE}\n  v: U64\n\ncreate {ANY}\n\n  make: LIB\n    do\n      { v = 7 }\n    end\n\nfeature {NONE}\n\n  safe_div(d: U64): U64\n    require\n      nz: d > 0\n    do\n      100 / d\n    end\n\nend\n";
+        let other = "module OTHER\n\nrepresentation {NONE}\n  v: U64\n\nfeature {ANY}\n\n  safe_div(d: U64): U64\n    do\n      d\n    end\n\nend\n";
+        let client = "functions CLIENT\n\nfeature {ANY}\n\n  t(o: OPTION[LIB]): U64\n    do\n      o.map(fn(s: LIB): LIB do s end).unwrap_or(LIB.make).safe_div(0)\n    end\n\nend\n";
+        let mut units = b4_units(&[("lib.gdl", lib), ("other.gdl", other), ("client.gdl", client)]);
+        let checked = check_and_verify_project(&mut units, b4_opts(true, true));
+        assert!(checked.fatal.is_empty(), "the name alone cannot decide this: {:?}", checked.fatal);
+        assert!(
+            checked.diags.iter().any(|(ui, d)| {
+                *ui == 2 && d.rule == "E0113: hidden_member" && d.tag == "safe_div"
+            }),
+            "a private routine was called with no check: {:?}",
+            checked.diags
+        );
+    }
+
+    #[test]
+    fn test_e2_a_law_cannot_hide_its_require() {
+        // Its hypothesis cannot hold, so the law proves anything. Clients would see no
+        // hypothesis, and with it `False`.
+        let lib = |vis: &str| {
+            format!("module LIB\n\nrepresentation {{NONE}}\n  v: U64\n\ncreate {{ANY}}\n\n  make(x: U64): LIB\n    do\n      {{ v = x }}\n    end\n\nfeature {{ANY}}\n\n  get: U64\n    do\n      Current.v\n    end\n\nspecify {vis}\n\n  law bad(a: LIB)\n    require\n      h: a.v > 5 and a.v < 3\n    do\n      True\n    ensure\n      c: a.get = 12345\n    end\n\nend\n")
+        };
+        let client = "functions CLIENT\n\nfeature {ANY}\n\n  boom: U64\n    do\n      let a = LIB.make(0)\n      check\n        k: LIB.bad(a)\n        absurd: False\n      end\n      1\n    end\n\nend\n";
+
+        let source = lib("{ANY}");
+        let mut units = b4_units(&[("lib.gdl", &source), ("client.gdl", client)]);
+        let checked = check_and_verify_project(&mut units, b4_opts(true, true));
+        assert!(
+            checked.diags.iter().any(|(_, d)| {
+                d.level == "error" && d.rule == "Rule 1 (Contract Visibility)" && d.routine == "bad"
+            }),
+            "{:?}",
+            checked.diags
+        );
+
+        // Whatever reaches the emitter, a law with a withheld hypothesis is not a fact.
+        let tokens = tokenize(&source).expect("lexing should succeed");
+        let ast = Parser::new(tokens).parse_file().expect("parsing should succeed");
+        let (text, names) = emit_contract_interface(&ast.modules[0]);
+        assert!(!names.iter().any(|n| n.contains("law_")), "{text}");
+
+        // A private law is a proof step of its module, and stays allowed.
+        let private = lib("{NONE}");
+        let mut units = b4_units(&[("lib.gdl", &private)]);
+        let checked = check_and_verify_project(&mut units, b4_opts(true, true));
+        assert!(
+            !checked.diags.iter().any(|(_, d)| d.rule == "Rule 1 (Contract Visibility)"),
+            "{:?}",
+            checked.diags
+        );
+    }
+
+    #[test]
+    fn test_fusion_axioms_end_on_their_fixed_points() {
+        // Each of these made the verifier run forever, on proofs it can finish in a second.
+        let id = "fn(x: NAT): NAT do x end";
+        let keep = "fn(x: NAT): BOOL do x = 0 end";
+        for body in [
+            format!("LIST_OPS.filter(LIST.empty, {keep}).length"),
+            format!("LIST_OPS.map(LIST.empty, {id}).length"),
+            format!("LIST_OPS.map(l, {id}).length"),
+            format!("LIST_OPS.map(LIST_OPS.map(l, {id}), {id}).length"),
+            format!("LIST_OPS.map(LIST_OPS.map(LIST.empty, {id}), {id}).length"),
+        ] {
+            let src = format!("functions PROBE\n\nfeature {{ANY}}\n\n  t(l: LIST[NAT]): NAT\n    require\n      some: l.length > 0 and l.length < 100\n    do\n      1 + {body}\n    end\n\nend\n");
+            let mut units = b4_units(&[("probe.gdl", &src)]);
+            let checked = check_and_verify_project(&mut units, b4_opts(false, true));
+            let errs: Vec<_> = checked.diags.iter().filter(|(_, d)| d.level == "error").collect();
+            assert!(checked.fatal.is_empty() && errs.is_empty(), "{body}: {errs:?}");
+        }
+        let src = format!("functions PROBE\n\nfeature {{ANY}}\n\n  t(s: SEQ[NAT]): SEQ[NAT]\n    do\n      s.map({id}).map({id})\n    end\n\nend\n");
+        let mut units = b4_units(&[("probe.gdl", &src)]);
+        let checked = check_and_verify_project(&mut units, b4_opts(false, true));
+        let errs: Vec<_> = checked.diags.iter().filter(|(_, d)| d.level == "error").collect();
+        assert!(checked.fatal.is_empty() && errs.is_empty(), "{errs:?}");
+    }
+
+    /// A command that outlives any test, through a child, as Boogie runs Z3.
+    fn slow_process_tree() -> Command {
+        #[cfg(windows)]
+        {
+            let mut cmd = Command::new("cmd");
+            cmd.args(["/C", "ping -n 30 127.0.0.1 >NUL & echo done"]);
+            cmd
+        }
+        #[cfg(not(windows))]
+        {
+            let mut cmd = Command::new("sh");
+            cmd.args(["-c", "sleep 30; echo done"]);
+            cmd
+        }
+    }
+
+    #[test]
+    fn test_output_within_stops_a_process_tree_at_its_limit() {
+        let limit = std::time::Duration::from_secs(1);
+        let start = std::time::Instant::now();
+        let out = output_within(&mut slow_process_tree(), limit).expect("the command starts");
+        assert!(out.is_none(), "{out:?}");
+        assert!(start.elapsed() < std::time::Duration::from_secs(15), "{:?}", start.elapsed());
+
+        // A process that ends in time is reported as `Command::output` would.
+        #[cfg(windows)]
+        let mut quick = {
+            let mut cmd = Command::new("cmd");
+            cmd.args(["/C", "echo hello"]);
+            cmd
+        };
+        #[cfg(not(windows))]
+        let mut quick = {
+            let mut cmd = Command::new("sh");
+            cmd.args(["-c", "echo hello"]);
+            cmd
+        };
+        let long = std::time::Duration::from_secs(60);
+        let out = output_within(&mut quick, long).expect("the command starts").expect("it ends");
+        assert!(out.status.success());
+        assert!(String::from_utf8_lossy(&out.stdout).contains("hello"));
+    }
+
     #[test]
     fn test_e0_constructors_of_one_name() {
         let a = "module TOK_A\n\nrepresentation {ANY}\n  | Leaf(v: U64)\n  | End_a\n\nend\n";
@@ -23214,7 +23506,8 @@ end
         assert!(!bpl_adt_v2.contains("COUNTER_DEP_Ctor"));
         assert!(!bpl_adt_v2.contains("COUNTER_DEP_n"));
         assert!(!bpl_adt_v2.contains("_lam_"));
-        assert!(!bpl_adt_v2.contains("str_lit_"));
+        // `str_lit_empty` is a constant of every preamble. Literals of a body are numbered.
+        assert!(!bpl_adt_v2.contains("str_lit_0"));
         assert_eq!(
             bpl_adt_v1, bpl_adt_v2,
             "client Boogie must be identical even when dependency body adds Current, lambdas, or string literals"
