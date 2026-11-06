@@ -336,7 +336,7 @@ The multi-file compilation pipeline proceeds through five deterministic stages:
 5. **Modular Verification Condition Generation (VCG):** For each module (or mutual `group`), the verifier constructs Boogie proof obligations using the public contracts, ghost models, and visible invariants of referenced dependencies, verifying units independently or in parallel.
 
 **CLI input rules (`gardelc`, Task B.4):**
-- Input operands may be any number of `.gdl` files, directories, and wildcard patterns. A directory stands for its `*.gdl` files, searched recursively, skipping `build/` and `target/`. A wildcard in the file-name part of an operand (`src/*.gdl`) is expanded by `gardelc` itself when the shell has not expanded it (e.g. PowerShell, `cmd`). Files named twice are compiled once.
+- Input operands may be any number of `.gdl` files, directories, and wildcard patterns. A directory without a `Gardel.toml` stands for its `*.gdl` files, searched recursively, skipping `build/` and `target/`. A wildcard in the file-name part of an operand (`src/*.gdl`) is expanded by `gardelc` itself when the shell has not expanded it (e.g. PowerShell, `cmd`). Files named twice are compiled once.
 - A run with more than one file, a directory, or a wildcard operand is a *project run*: the files share one flat namespace (`E0102`), each file is checked for `W0201`, and each module is verified once, in a context that holds the background theories (contracts, invariants, laws) of the other-file modules it references, transitively. Those contracts are trusted only because the referenced modules are verified in the same run; calls assert the callee's `require` clauses.
 - A single-file run is unchanged and does not apply `W0201`.
 - **Acyclic cross-file dependencies:** user modules in different files that reference each other in a cycle are rejected with fatal error `E0103: cyclic_module_dependency`, because each module's proof would trust the other's contracts. Mutually dependent modules must be co-declared in one file under `group` (§4.3). Modules in the same file are not linked to each other by `gardelc` yet; simultaneous `group` verification is not yet implemented.
@@ -357,7 +357,7 @@ A project may declare its identity and boundaries via a `Gardel.toml` file in it
 - **TOML subset:** Manifest parsing enforces a strict, dependency-free TOML 1.0 subset (tables, quoted and bare keys, basic strings, inline tables of strings, and comments). Constructs outside this subset, duplicate keys, duplicate tables, or bad escape sequences fail statically with 1-based line numbers.
 - **Project layout & CLI invocation:**
   - Standard source code resides in `src/`.
-  - Invoking `gardelc --project <DIR>` or running `gardelc` without input operands in a directory containing `Gardel.toml` reads the manifest, resolves sources under `src/`, and compiles in project mode.
+  - Invoking `gardelc --project <DIR>`, `gardelc <DIR>` on a directory containing `Gardel.toml`, or `gardelc` without input operands in such a directory reads the manifest, resolves sources under `src/`, and compiles in project mode. Files outside `src/` are not part of the project, and a project cannot be combined with other input operands.
   - A manifest without dependencies changes nothing about what a source file means: constituent modules share the flat project namespace with the prelude in scope.
 
 ---

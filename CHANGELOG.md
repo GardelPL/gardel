@@ -29,6 +29,9 @@ Spec draft v0.5. [plan/Roadmap.md](plan/Roadmap.md) holds the detail for each ta
 - Unknown command-line flags are errors.
 - A run that cannot start Boogie or Z3 is an error. It used to fall back to sampling and could report success on a false contract. `--bounded-check` still samples, on request.
 - `--inspect` shows no interface when the run has errors, and exits with status 1.
+- `--bounded-check` no longer reports its obligations as satisfied. Each module gets a `not_proven` warning, an error under `--strict`, and `--inspect` shows no interface for it.
+- `gardelc DIR` on a directory with a `Gardel.toml` now reads the manifest and uses `src/`, as `--project DIR` does. It used to ignore the manifest and link every `.gdl` file below the directory. Combining such a directory with other inputs is an error.
+- A law's proof no longer reaches its clients across a package boundary. It could link other modules into a client's verification.
 - New rules `E0106` to `E0113` report undefined names and hidden members before verification. `E0199` reports what the verifier cannot accept.
 
 ---

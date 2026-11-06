@@ -14099,6 +14099,9 @@ fn source_line_of(src: &str, input_path: &str, prefix: &str) -> Option<Span> {
     })
 }
 
+/// Marks the report of a module that ran under `--bounded-check`.
+const NOT_PROVEN_TAG: &str = "not_proven";
+
 fn verify_module_obligations(
     m: &ModuleDecl,
     src: &str,
@@ -14191,6 +14194,16 @@ fn verify_module_obligations(
     for (r, has_current) in &all_routines {
         verify_routine_symbolic(r, *has_current, m, src, input_path, fuel_limit, &mut diags);
     }
+    diags.push(Diagnostic::basic(
+        if strict_mode { "error" } else { "warning" },
+        "Phase 3 (Bounded Check, Not Proven)",
+        m.name.clone(),
+        NOT_PROVEN_TAG.to_string(),
+        format!(
+            "`{}` was sampled by `--bounded-check`, which proves nothing, so it does not count under `--strict` or as an interface",
+            m.name
+        ),
+    ));
 
     diags
 }
@@ -16670,7 +16683,7 @@ fn clause_is_visible_in_interface(
 
 /// Projects a [`ModuleDecl`] down to its public contract-only interface (`.gds`),
 /// withholding private routines/laws/invariants, contract clauses that mention hidden
-/// representation or private routines, and all routine `do` bodies.
+/// representation or private routines, and every `do` body, of a routine or a law.
 pub fn contract_only_module(m: &ModuleDecl) -> ModuleDecl {
     let symbol_vis = module_symbol_visibilities(m);
 
@@ -16775,11 +16788,15 @@ pub fn contract_only_module(m: &ModuleDecl) -> ModuleDecl {
                         &non_self_locals,
                     )
                 });
-            if all_visible {
-                Some((vis.clone(), law.clone()))
-            } else {
-                None
-            }
+            all_visible.then(|| {
+                let contract = LawDecl {
+                    variant: Vec::new(),
+                    stmts: Vec::new(),
+                    body: None,
+                    ..law.clone()
+                };
+                (vis.clone(), contract)
+            })
         })
         .collect();
 
@@ -17300,7 +17317,7 @@ fn collect_gdl_files(
 }
 
 /// Resolves the CLI input operands (Task B.4) into source file paths. A directory stands for
-/// its top-level `*.gdl` files (not recursive); an operand with `*`/`?` wildcards in its file
+/// its `*.gdl` files, searched recursively; an operand with `*`/`?` wildcards in its file
 /// name that is not an existing file is expanded by `gardelc` itself (shells such as
 /// PowerShell/cmd do not expand globs for native programs). Duplicates are dropped. The flag
 /// is true for a *project* run: several files, a directory, or a wildcard operand.
@@ -17780,7 +17797,28 @@ fn main() {
         );
     }
 
-    let ops = input_operands(&args);
+    let mut ops = input_operands(&args);
+    let mut project_arg = project_arg;
+    // A directory with a manifest is that project, however it is named: read as a plain
+    // directory, it would skip the manifest and link files outside `src/`.
+    if project_arg.is_none() && !args.iter().any(|a| a == "--stdlib") {
+        let manifest_dir =
+            ops.iter().find(|op| std::path::Path::new(op).join("Gardel.toml").is_file());
+        if let Some(dir) = manifest_dir {
+            if ops.len() > 1 {
+                exit_with_frontend_error(
+                    json_mode,
+                    "Command Line",
+                    "gardelc",
+                    "invalid_arguments",
+                    format!("`{dir}` has a Gardel.toml, so it is a project, and a project cannot be combined with other inputs"),
+                    dir,
+                );
+            }
+            project_arg = Some(dir.clone());
+            ops.clear();
+        }
+    }
     let has_implicit_project = ops.is_empty()
         && project_arg.is_none()
         && !args.iter().any(|a| a == "--stdlib")
@@ -18035,10 +18073,11 @@ fn main() {
     } = checked;
 
     if inspect_mode {
-        // An interface states what was proven, so a run with errors has none to show.
+        // An interface states what was proven, so a run with errors or only samples has none
+        // to show.
         let errors: Vec<Diagnostic> = diags
             .iter()
-            .filter(|(_, d)| d.level == "error")
+            .filter(|(_, d)| d.level == "error" || d.tag == NOT_PROVEN_TAG)
             .map(|(_, d)| d.clone())
             .collect();
         if !errors.is_empty() {
@@ -22275,12 +22314,11 @@ int main(void) {
 
     #[test]
     fn test_d0_bounded_evaluator_takes_catch_all_arms() {
-        // The fallback evaluator agrees with Boogie on `case _`, so a verdict does not depend
-        // on whether the solvers are installed.
+        // The bounded evaluator agrees with Boogie on `case _`.
         let src = include_str!("../tests/boogie/wild_own.gdl");
         let m = parse_user_module_with_prelude(src);
         let diags = with_prelude_injection(true, || {
-            verify_module_phase3(&m, src, "wild_own.gdl", DEFAULT_FUEL, true, false, true)
+            verify_module_phase3(&m, src, "wild_own.gdl", DEFAULT_FUEL, false, false, true)
         });
         assert!(diags.iter().all(|d| d.level != "error"), "{diags:?}");
     }
@@ -22812,6 +22850,49 @@ int main(void) {
             "{:?}",
             checked.diags
         );
+    }
+
+    #[test]
+    fn test_e2_a_law_proof_stays_out_of_the_interface() {
+        let dep = |proof: &str| {
+            format!("functions DEP\n\nfeature {{ANY}}\n\n  one: U64\n    do\n      1\n    ensure\n      is_one: Result = 1\n    end\n\nspecify {{ANY}}\n\n  law one_is_positive(x: U64)\n{proof}    ensure\n      pos: DEP.one > 0\n    end\n\nend\n")
+        };
+        let helper = "functions HELPER\n\nfeature {ANY}\n\n  tag: U64\n    do\n      7\n    end\n\nend\n";
+        let client = "functions CLIENT\n\nfeature {ANY}\n\n  use_it(l: LIST[NAT]): U64\n    do\n      let m = LIST_OPS.map(l, fn(x: NAT): NAT do x end)\n      DEP.one\n    ensure\n      is_one: Result = 1\n    end\n\nend\n";
+
+        let emit_client = |dep_src: &str| -> (String, String) {
+            let mut units =
+                b4_units(&[("dep.gdl", dep_src), ("helper.gdl", helper), ("client.gdl", client)]);
+            let mut opts = b4_opts(true, true);
+            opts.external_modules.insert("DEP".to_string());
+            let checked = check_and_verify_project(&mut units, opts);
+            assert!(checked.fatal.is_empty(), "fatal: {:?}", checked.fatal);
+            let errs: Vec<_> = checked.diags.iter().filter(|(_, d)| d.level == "error").collect();
+            assert!(errs.is_empty(), "{errs:?}");
+            let bpl = with_prelude_injection(true, || {
+                with_link_table(checked.link.clone(), || {
+                    emit_boogie(&units[2].ast.modules[0], DEFAULT_FUEL)
+                })
+            });
+            (bpl, format_module_interface(&units[0].ast.modules[0]))
+        };
+
+        let (bare, bare_interface) = emit_client(&dep(""));
+        // The proof reaches a literal, a lambda, a linked module and a prelude module.
+        let (proven, proven_interface) = emit_client(&dep(
+            "    do\n      let s = \"only in the proof\"\n      let f = fn(y: NAT): NAT do y end\n      check\n        k: HELPER.tag = HELPER.tag\n        o: BYTES.empty.length = 0\n      end\n      True\n",
+        ));
+        assert_eq!(bare_interface, proven_interface);
+        assert!(!proven.contains("HELPER"));
+        assert_eq!(bare, proven, "a law's proof must not change a client's Boogie");
+
+        // The proof is still checked in its own module.
+        let mut units = b4_units(&[(
+            "dep.gdl",
+            &dep("    do\n      check\n        k: 1 = 2\n      end\n      True\n"),
+        )]);
+        let checked = check_and_verify_project(&mut units, b4_opts(true, true));
+        assert!(checked.diags.iter().any(|(_, d)| d.level == "error"), "{:?}", checked.diags);
     }
 
     #[test]

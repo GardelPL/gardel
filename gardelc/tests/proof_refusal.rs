@@ -102,6 +102,53 @@ fn bounded_checking_needs_no_verifier_when_it_is_asked_for() {
 }
 
 #[test]
+fn bounded_checking_never_reports_a_proof() {
+    let dir = project("bounded_report", "fine.gdl", TRUE);
+    let run = |flags: &[&str]| {
+        gardelc(&dir).arg("fine.gdl").args(flags).output().expect("gardelc runs")
+    };
+
+    let out = run(&["--bounded-check"]);
+    assert!(out.status.success(), "{}", text(&out));
+    assert!(text(&out).contains("Not Proven"), "{}", text(&out));
+    assert!(!text(&out).contains("obligations satisfied"), "{}", text(&out));
+
+    let out = run(&["--bounded-check", "--json-diagnostics"]);
+    assert!(out.status.success(), "{}", text(&out));
+    assert!(text(&out).contains("not_proven"), "{}", text(&out));
+
+    drop(fs::remove_dir_all(&dir));
+}
+
+#[test]
+fn strict_refuses_a_module_that_was_only_sampled() {
+    for (name, src, file) in
+        [("strict_false", FALSE_AT_ONE_POINT, "hide.gdl"), ("strict_true", TRUE, "fine.gdl")]
+    {
+        let dir = project(name, file, src);
+        let out = gardelc(&dir)
+            .args([file, "--bounded-check", "--strict"])
+            .output()
+            .expect("gardelc runs");
+        assert!(!out.status.success(), "reported success with no proof: {}", text(&out));
+        assert!(text(&out).contains("Not Proven"), "{}", text(&out));
+        drop(fs::remove_dir_all(&dir));
+    }
+}
+
+#[test]
+fn inspect_gives_no_interface_for_a_module_that_was_only_sampled() {
+    let dir = project("inspect_sampled", "fine.gdl", TRUE);
+    let out = gardelc(&dir)
+        .args(["fine.gdl", "--inspect", "--bounded-check"])
+        .output()
+        .expect("gardelc runs");
+    assert!(!out.status.success(), "{}", text(&out));
+    assert!(!text(&out).contains("functions FINE"), "{}", text(&out));
+    drop(fs::remove_dir_all(&dir));
+}
+
+#[test]
 fn inspect_gives_no_interface_for_a_module_that_did_not_verify() {
     for (name, flags) in [("text", &[][..]), ("json", &["--json-diagnostics"][..])] {
         let dir = project(&format!("inspect_{name}"), "hide.gdl", FALSE_AT_ONE_POINT);
