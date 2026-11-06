@@ -4,6 +4,7 @@
 use std::fs;
 use std::path::PathBuf;
 use std::process::{Command, Output};
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 const CALC: &str = "functions CALC
 
@@ -73,13 +74,17 @@ end
 
 const STACK: &str = include_str!("../../examples/bounded_stack.gdl");
 
+/// Tests run in parallel, so a directory is never chosen by its name alone.
+static NEXT_WORLD: AtomicUsize = AtomicUsize::new(0);
+
 struct World {
     dir: PathBuf,
 }
 
 impl World {
     fn new(name: &str) -> Self {
-        let dir = std::env::temp_dir().join(format!("gardelc_compat_{}_{name}", std::process::id()));
+        let n = NEXT_WORLD.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!("gardelc_compat_{}_{n}_{name}", std::process::id()));
         drop(fs::remove_dir_all(&dir));
         fs::create_dir_all(&dir).expect("temporary directory");
         Self { dir }
@@ -144,6 +149,12 @@ fn changed(name: &str, old: &str, new: &str) -> (World, Output) {
     world.version("new", &[("calc.gdl", new)]);
     let out = world.compare();
     (world, out)
+}
+
+/// Two tests with one name once failed at random, and made broken code look caught.
+#[test]
+fn worlds_of_one_name_do_not_share_a_directory() {
+    assert_ne!(World::new("same").dir, World::new("same").dir);
 }
 
 fn calc_with(from: &str, to: &str) -> String {
@@ -536,6 +547,40 @@ fn dropping_a_dependency_or_keeping_one_is_not_breaking() {
     assert_compatible(&world.compare());
 }
 
+/// The same `version` with other text: nothing can say whether a client cares, so the report
+/// says that it happened and the run still passes.
+#[test]
+fn a_dependency_that_moves_without_a_new_version_is_a_warning() {
+    let world = World::new("dep_moved");
+    world.named("acme.base", "base", &[("base.gdl", FN_BASE)]);
+    world.named("acme.base", "base2", &[("base.gdl", &FN_BASE.replace("      1\n", "      1 + 0\n"))]);
+    world.version("old", &[("lib.gdl", FN_LIB)]);
+    world.version("new", &[("lib.gdl", FN_LIB)]);
+    depend_on(&world, "old", "\"acme.base\" = { path = \"../base\" }");
+    depend_on(&world, "new", "\"acme.base\" = { path = \"../base2\" }");
+    let out = world.compare();
+    assert_compatible(&out);
+    let t = text(&out);
+    assert!(t.contains("dependency_moved") && t.contains("`acme.base` changed"), "{t}");
+    assert!(world.compare_env(&["--strict"], &[]).status.success(), "{t}");
+}
+
+/// A copy is the same dependency whatever its line endings or the name of its file.
+#[test]
+fn a_copy_of_a_dependency_has_not_moved() {
+    let world = World::new("dep_copy");
+    let other = FN_BASE.replace("BASE", "ZED");
+    world.named("acme.base", "base", &[("a.gdl", FN_BASE), ("b.gdl", &other)]);
+    world.named("acme.base", "base2", &[("a.gdl", &other.replace('\n', "\r\n")), ("b.gdl", FN_BASE)]);
+    world.version("old", &[("lib.gdl", FN_LIB)]);
+    world.version("new", &[("lib.gdl", FN_LIB)]);
+    depend_on(&world, "old", "\"acme.base\" = { path = \"../base\" }");
+    depend_on(&world, "new", "\"acme.base\" = { path = \"../base2\" }");
+    let out = world.compare();
+    assert_compatible(&out);
+    assert!(!text(&out).contains("dependency_moved"), "{}", text(&out));
+}
+
 /// A clause Boogie cannot read, as its constructor is gone, says nothing about the others.
 #[test]
 fn an_unreadable_clause_does_not_answer_for_the_others() {
@@ -566,6 +611,24 @@ fn a_new_assume_is_breaking() {
     // One that was already there has already been seen by every client.
     let (_w, out) = changed("assume_old", &holed, &holed.replace("x / 2\n", "(x / 2) + 0\n"));
     assert_compatible(&out);
+}
+
+/// A body can start to lean on an `assume` that was already there, which changes no contract
+/// and adds no `assume`, so the report must say what it took on trust.
+#[test]
+fn an_assume_kept_from_the_old_version_is_a_warning() {
+    let holed = calc_with("      x / 2\n", "      assume hole: x > 0 end\n      x / 2\n");
+    let (world, out) = changed("assume_kept", &holed, &holed.replace("x / 2\n", "(x / 2) + 0\n"));
+    assert_compatible(&out);
+    let t = text(&out);
+    assert!(t.contains("rests_on_assume") && t.contains("`assume hole` in CALC.half"), "{t}");
+
+    let strict = world.compare_env(&["--strict"], &[]);
+    assert_eq!(strict.status.code(), Some(1), "{}", text(&strict));
+    assert!(!text(&strict).contains("[compare]"), "{}", text(&strict));
+
+    let (_w, out) = changed("assume_none", CALC, &calc_with("x / 2\n", "(x / 2) + 0\n"));
+    assert!(!text(&out).contains("rests_on_assume"), "{}", text(&out));
 }
 
 /// `--strict` covers the whole build, so an `assume` can arrive through a dependency.
@@ -638,6 +701,49 @@ fn a_changed_concept_is_breaking_in_either_direction() {
         assert_ne!(new, SIZED, "{name}");
         let (_w, out) = concept_changed(name, new);
         assert_breaking(&out, needle);
+    }
+}
+
+/// A caller passes parameters by position, so their names are not part of a concept.
+#[test]
+fn a_renamed_parameter_does_not_change_a_concept() {
+    let law = |p: &str| {
+        SIZED
+            .replace("sane(a: Current)\n", &format!("sane({p}: Current)\n    require\n      ok: {p}.size > 0\n"))
+            .replace("fine: a.size", &format!("fine: {p}.size"))
+    };
+    let world = World::new("concept_renamed");
+    world.version("old", &[("sized.gdl", &law("a")), ("calc.gdl", CALC)]);
+    world.version("new", &[("sized.gdl", &law("b")), ("calc.gdl", CALC)]);
+    assert_compatible(&world.compare());
+
+    let default = |p: &str| {
+        SIZED
+            .replace("  doubled: U64\n", &format!("  doubled({p}: U64): U64\n    require\n      big: {p} > 0\n"))
+            .replace("same: Result = Current.size", &format!("same: Result >= {p}"))
+            .replace("      Current.size\n    ensure", &format!("      {p}\n    ensure"))
+    };
+    let world = World::new("concept_default");
+    world.version("old", &[("sized.gdl", &default("x")), ("calc.gdl", CALC)]);
+    world.version("new", &[("sized.gdl", &default("y")), ("calc.gdl", CALC)]);
+    assert_compatible(&world.compare());
+}
+
+/// What a name refers to still counts: these two laws differ, as a swap or a binder shows.
+#[test]
+fn a_parameter_is_not_confused_with_another_name() {
+    let two = |head: &str, clause: &str| {
+        SIZED.replace("sane(a: Current)", head).replace("fine: a.size >= 0", clause)
+    };
+    let cases = [
+        ("swap", "sane(a: Current, b: Current)", "fine: a.size >= b.size", "sane(b: Current, a: Current)", "fine: a.size >= b.size"),
+        ("binder", "sane(a: U64)", "fine: forall a: U64. a >= 0", "sane(b: U64)", "fine: forall a: U64. b >= 0"),
+    ];
+    for (name, old_head, old_clause, new_head, new_clause) in cases {
+        let world = World::new(&format!("concept_{name}"));
+        world.version("old", &[("sized.gdl", &two(old_head, old_clause)), ("calc.gdl", CALC)]);
+        world.version("new", &[("sized.gdl", &two(new_head, new_clause)), ("calc.gdl", CALC)]);
+        assert_breaking(&world.compare(), "law `sane` changed");
     }
 }
 

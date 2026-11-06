@@ -36,6 +36,8 @@ use std::rc::Rc;
 
 pub(crate) const BREAKING_TAG: &str = "breaking_change";
 const NEW_NAME_TAG: &str = "new_public_name";
+const RESTS_ON_ASSUME_TAG: &str = "rests_on_assume";
+const DEPENDENCY_MOVED_TAG: &str = "dependency_moved";
 const RULE: &str = "Contract Compatibility";
 
 /// What the comparison found.
@@ -50,14 +52,31 @@ pub(crate) struct Report {
     pub proved: usize,
 }
 
+/// Another package of a build.
+pub(crate) struct Dependency {
+    pub name: String,
+    pub version: String,
+    /// Its text, which tells two copies of one `version` apart. Sorted, as the name of a file
+    /// means nothing to a client, and with one line ending, as a checkout can change those.
+    sources: Vec<String>,
+}
+
+impl Dependency {
+    pub(crate) fn of(name: &str, version: &str, units: &[SourceUnit]) -> Self {
+        let mut sources: Vec<String> = units.iter().map(|u| u.src.replace("\r\n", "\n")).collect();
+        sources.sort();
+        Self { name: name.to_string(), version: version.to_string(), sources }
+    }
+}
+
 /// The public modules of an old version, after the same front end as a build.
 struct OldVersion {
     package: String,
     modules: Vec<ModuleDecl>,
     concepts: Vec<ConceptDecl>,
     assumes: HashSet<(String, String)>,
-    /// Every other package of the build, with its version.
-    dependencies: BTreeMap<String, String>,
+    /// Every other package of the build.
+    dependencies: Vec<Dependency>,
 }
 
 /// Reads the package in `dir` as far as its interface: it is not verified, as what matters
@@ -117,8 +136,9 @@ fn load_old_version(dir: &std::path::Path, prelude_mode: bool) -> Result<OldVers
     let assumes = assumes_of(&units).into_iter().collect();
     let dependencies = packages
         .iter()
+        .zip(&list)
         .take(last)
-        .map(|(m, _)| (m.project.name.clone(), m.project.version.clone()))
+        .map(|((m, _), p)| Dependency::of(&m.project.name, &m.project.version, &units[p.units.clone()]))
         .collect();
     Ok(OldVersion { package, modules, concepts, assumes, dependencies })
 }
@@ -137,8 +157,15 @@ fn assumes_of(units: &[SourceUnit]) -> Vec<(String, String)> {
     found
 }
 
-fn exprs(clauses: &[(String, Expr)]) -> Vec<&Expr> {
-    clauses.iter().map(|(_, e)| e).collect()
+/// Clauses as a caller reads them. A parameter is known by its position, so its name means
+/// nothing, and a name in neither version avoids capture.
+fn by_position(clauses: &[(String, Expr)], params: &[(String, String)]) -> Vec<Expr> {
+    let args: Vec<(String, Expr)> = params
+        .iter()
+        .enumerate()
+        .map(|(i, (p, _))| (p.clone(), Expr::Var(format!("gdl_arg{i}"))))
+        .collect();
+    clauses.iter().map(|(_, e)| subst_expr_vars(e, &args)).collect()
 }
 
 fn type_list(params: &[(String, String)]) -> Vec<&str> {
@@ -181,8 +208,8 @@ fn compare_concept(old: &ConceptDecl, new: &ConceptDecl) -> Vec<String> {
             r.type_params,
             type_list(&r.params),
             r.ret_type,
-            exprs(&r.requires),
-            exprs(&r.ensures)
+            by_position(&r.requires, &r.params),
+            by_position(&r.ensures, &r.params)
         )
     };
     for r in &old.default_routines {
@@ -199,8 +226,8 @@ fn compare_concept(old: &ConceptDecl, new: &ConceptDecl) -> Vec<String> {
             "{:?} {:?} {:?} {:?}",
             l.type_params,
             type_list(&l.params),
-            exprs(&l.requires),
-            exprs(&l.ensures)
+            by_position(&l.requires, &l.params),
+            by_position(&l.ensures, &l.params)
         )
     };
     for l in &old.laws {
@@ -745,8 +772,8 @@ pub(crate) struct Run<'a> {
     pub units: &'a [SourceUnit],
     /// The units of the package being compared, as a build lists its dependencies first.
     pub root_units: std::ops::Range<usize>,
-    /// Every other package of the build, with its version.
-    pub dependencies: &'a [(String, String)],
+    /// Every other package of the build.
+    pub dependencies: &'a [Dependency],
     /// The package of each dependency module, as the build found them.
     pub packages: &'a HashMap<String, String>,
     pub prelude_mode: bool,
@@ -780,23 +807,21 @@ pub(crate) fn compare(old_dir: &std::path::Path, run: &Run<'_>) -> Result<Report
         d.span = Some(locate_span(&u.src, &u.path, &routine, module));
         report.breaking.push((ui, d));
     };
+    let warn = |module: &str, tag: &str, message: String, report: &mut Report| {
+        let ui = unit_of(module);
+        let u = &run.units[ui];
+        let readable = resolve::readable(module);
+        let mut d = Diagnostic::basic("warning", RULE, readable.clone(), tag.to_string(), message)
+            .with_module(&readable);
+        d.span = Some(locate_span(&u.src, &u.path, module, module));
+        report.warnings.push((ui, d));
+    };
     // A name that is new here may be one a client already uses bare from another package,
     // which is then `E0105`, or `E0112` for a constructor. This cannot be seen from here, and
     // one qualifier fixes it, so it is a warning.
     let new_name = |name: &str, what: String, report: &mut Report| {
-        let ui = unit_of(name);
-        let u = &run.units[ui];
-        let readable = resolve::readable(name);
-        let mut d = Diagnostic::basic(
-            "warning",
-            RULE,
-            readable.clone(),
-            NEW_NAME_TAG.to_string(),
-            format!("{what} A client that uses the same name bare from another package must now qualify it."),
-        )
-        .with_module(&readable);
-        d.span = Some(locate_span(&u.src, &u.path, name, name));
-        report.warnings.push((ui, d));
+        let message = format!("{what} A client that uses the same name bare from another package must now qualify it.");
+        warn(name, NEW_NAME_TAG, message, report);
     };
     if old.package != run.package {
         record(
@@ -809,18 +834,26 @@ pub(crate) fn compare(old_dir: &std::path::Path, run: &Run<'_>) -> Result<Report
 
     // A build holds one package of a name (decision 5), and transitive packages count, so a
     // client with its own copy of one of these is refused.
-    for (name, version) in run.dependencies {
-        match old.dependencies.get(name) {
+    for dep in run.dependencies {
+        let name = &dep.name;
+        match old.dependencies.iter().find(|d| d.name == *name) {
             None => record(
                 "",
                 run.package.to_string(),
                 format!("it now depends on `{name}`, and a client with another copy of that package is refused"),
                 &mut report,
             ),
-            Some(was) if was != version => record(
+            Some(was) if was.version != dep.version => record(
                 "",
                 run.package.to_string(),
-                format!("its dependency `{name}` went from {was} to {version}, and a client with the old copy is refused"),
+                format!("its dependency `{name}` went from {} to {}, and a client with the old copy is refused", was.version, dep.version),
+                &mut report,
+            ),
+            // Two copies of one version: nothing says what changed, or that it matters.
+            Some(was) if was.sources != dep.sources => warn(
+                run.package,
+                DEPENDENCY_MOVED_TAG,
+                format!("Dependency `{name}` changed but is still {}. Give it a new version, and compare it with its old one.", dep.version),
                 &mut report,
             ),
             Some(_) => {}
@@ -828,16 +861,21 @@ pub(crate) fn compare(old_dir: &std::path::Path, run: &Run<'_>) -> Result<Report
     }
 
     // No contract shows this, and a body-only change can bring it in.
+    let mut kept = Vec::new();
     for (module, assume) in assumes_of(run.units) {
-        if !old.assumes.contains(&(module.clone(), assume.clone())) {
-            let (routine, tag) = assume.split_once(' ').unwrap_or((&assume, ""));
-            record(
-                &module,
-                format!("{module}.{routine}"),
-                format!("`assume {tag}` is new, and `--strict` refuses it in every client"),
-                &mut report,
-            );
+        let (routine, tag) = assume.split_once(' ').unwrap_or((&assume, ""));
+        let item = format!("{module}.{routine}");
+        if old.assumes.contains(&(module.clone(), assume.clone())) {
+            kept.push(format!("`assume {tag}` in {}", resolve::readable(&item)));
+        } else {
+            record(&module, item, format!("`assume {tag}` is new, and `--strict` refuses it in every client"), &mut report);
         }
+    }
+    // A proof that newly rests on an old `assume` looks like any other, as its contract need
+    // not change. `--strict` never gets here, as it refuses them first.
+    if !kept.is_empty() {
+        let message = format!("Taken as stated: {}. A proof of this version may rest on these, and `--strict` refuses them.", kept.join(", "));
+        warn(run.package, RESTS_ON_ASSUME_TAG, message, &mut report);
     }
 
     let new_concepts: Vec<&ConceptDecl> =

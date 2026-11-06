@@ -18501,10 +18501,14 @@ fn main() {
     if let Some(old_dir) = compare_with.as_deref().filter(|_| !diags.iter().any(|(_, d)| d.level == "error")) {
         let package = package_list.last().map_or("", |(m, _)| m.project.name.as_str());
         let (boogie, z3) = find_solvers();
-        let dependencies: Vec<(String, String)> = package_list
+        let mut next = units.len() - package_list.iter().map(|(_, count)| count).sum::<usize>();
+        let dependencies: Vec<compat::Dependency> = package_list
             .iter()
             .take(package_list.len().saturating_sub(1))
-            .map(|(m, _)| (m.project.name.clone(), m.project.version.clone()))
+            .map(|(m, count)| {
+                next += count;
+                compat::Dependency::of(&m.project.name, &m.project.version, &units[next - count..next])
+            })
             .collect();
         let run = compat::Run {
             package,

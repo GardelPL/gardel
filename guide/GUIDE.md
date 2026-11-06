@@ -1722,11 +1722,15 @@ The run builds and verifies the new version as usual, then exits 1 if a public i
 - a new `assume` anywhere in the build, even in a private routine, because `--strict` refuses it in every client
 - a new package among your dependencies, or a dependency at another version, because a build holds one package of a name
 
-A body change that adds no `assume` is not breaking, and neither is a new routine, a new law or a change to a hidden representation. Parameters are compared by position, so renaming one changes nothing.
+A body change that adds no `assume` is not breaking, and neither is a new routine, a new law or a change to a hidden representation. Parameters are compared by position, so renaming one changes nothing, in a concept too.
 
 A new module, concept or public representation is a warning, even under `--strict`. If a client already uses that name bare from another package, it now gets `E0105` or `E0112`, and one qualifier fixes it.
 
-Clauses that differ go to the solver, and a change counts as compatible only if the solver proves it. It sees each routine as an unknown function and uses none of your contracts or laws, so a true implication that needs one of them is reported as breaking. Add `--strict` if the new version might rest on an `assume`, as an `ensure` that rests on one is taken as stated.
+Clauses that differ go to the solver, and a change counts as compatible only if the solver proves it. It sees each routine as an unknown function and uses none of your contracts or laws, so a true implication that needs one of them is reported as breaking.
+
+An `assume` the old version also had is the warning `rests_on_assume`, which lists them, as a proof may lean on one without any contract changing. Add `--strict` to refuse them.
+
+A dependency whose text changed at the same version is the warning `dependency_moved`: give it a new version, and compare it with its old one.
 
 ### Qualified Names
 
