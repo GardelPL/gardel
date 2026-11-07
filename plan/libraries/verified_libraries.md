@@ -1,7 +1,7 @@
 # Phase F: Verified Libraries and Applications
 
 **Date:** November 6, 2026
-**Status:** In progress. Task F.0 is completed, and the decisions below are still open.
+**Status:** In progress. Tasks F.0 and F.1 are completed, and the decisions below are taken.
 **Roadmap entry:** [Phase F in Roadmap.md](../Roadmap.md#phase-f-verified-libraries-and-applications)
 **Probed at:** commit `1349cb6`
 
@@ -74,6 +74,7 @@ flowchart TD
     F3 --> F6
     F4 --> F6
     F5 --> F6
+    F1 --> F12["F.12 Refined function types"] --> F6
     F6 --> F7 --> F8
     F2 --> F9 --> F10 --> F11
     F8 --> F11
@@ -89,6 +90,7 @@ flowchart TD
 | F.3 | M | `MAP[K, V]` | Sorted-order proofs |
 | F.4 | L | `gjson` | The round-trip proof |
 | F.5 | L | A parser that means what the bytes say | Proof over a buffer; a breaking change |
+| F.12 | Not sized | `require` and `ensure` on function types enforced | Checking a lambda against a contract where it is passed |
 | F.6 | M | `grest` | Fitting a library around a `reactive program` |
 | F.7 | M | `Connect`, tags | Non-blocking connect on two platforms |
 | F.8 | L | `HTTP_CLIENT`, async handlers | The design of a waiting handler |
@@ -100,19 +102,20 @@ flowchart TD
 
 ## 4. Decisions to take
 
-These are proposals. As with E.7, take them one at a time. Each task lists the decisions it needs before starting.
+All twelve were taken on 2026-11-07, each as proposed here. Each task lists the decisions it needs.
 
-1. **Shape of a JSON value.** Proposed: flat cells behind an opaque module, so clients use `items`, `field` and builders. No compiler change, and the cells stay hidden if nested recursion is added later. The alternative is teaching the termination check to measure through `LIST`, which helps every tree-of-lists type but is a change to the verifier core.
-2. **JSON numbers.** Proposed: `JInt(I64)` for integers, and `JNumber(text: STRING)` holding any other valid literal unchanged. The round trip then holds exactly, and no `F64` printing is needed.
-3. **Order of `STRING`.** Proposed: byte order of the UTF-8 form, which equals code point order. It is a map key order, not a locale collation.
-4. **`MAP` representation.** Proposed: a sorted list, with the laws stated on the abstract model, so a balanced tree can replace it with no contract change. Replace it only if a benchmark calls for it.
-5. **Where REST lives.** Proposed: a new package, `grest`, on `ghttp` and `gjson`. `ghttp` stays usable without JSON, and it tests a package with two dependencies.
-6. **Handlers in routes.** Proposed: a route stores its handler as a function, replacing numeric ids, once F.1 allows it.
-7. **What an async handler returns.** Proposed: a sum type, `Reply(response)` or `Await(state, commands)`. A sync handler is a pure function wrapped in `Reply`. A waiting request lives in a bounded table in the server state, keyed by tag. Hidden continuations are rejected: state must stay visible to the verifier.
-8. **What "every request gets an answer" means.** Proposed: a safety property, not liveness. Every entry in the waiting table has an armed timeout, and proven invariants say each entry leaves the table on its answer or its timeout. The proof assumes the host delivers the timer. This narrows what was first suggested, because Phase D has no liveness proofs.
-9. **Addresses for `Connect`.** Proposed: IPv4 literals and `localhost` first. Name lookup blocks, so it would need a helper thread (Phase D decision 5). Add it when a program needs it.
-10. **What the tool is.** Proposed: a verification browser. It runs `gardelc --json-diagnostics` on a project, lists failed obligations, and shows each one in its source. It suits the project and it needs files, a process, a list view and a text view, so it tests all of `gtui`.
-11. **Reach of file and process commands.** Proposed: a process takes a program and an argument list, never a shell string, and its output arrives as events. A replay reads every result from the log and runs nothing.
+1. **Shape of a JSON value.** Taken: flat cells behind an opaque module, so clients use `items`, `field` and builders. No compiler change, and the cells stay hidden if nested recursion is added later. The alternative was teaching the termination check to measure through `LIST`, which helps every tree-of-lists type but is a change to the verifier core.
+2. **JSON numbers.** Taken: `JInt(I64)` for integers, and `JNumber(text: STRING)` holding any other valid literal unchanged. The round trip then holds exactly, and no `F64` printing is needed.
+3. **Order of `STRING`.** Taken: byte order of the UTF-8 form, which equals code point order. It is a map key order, not a locale collation.
+4. **`MAP` representation.** Taken: a sorted list, with the laws stated on the abstract model, so a balanced tree can replace it with no contract change. Replace it only if a benchmark calls for it.
+5. **Where REST lives.** Taken: a new package, `grest`, on `ghttp` and `gjson`. `ghttp` stays usable without JSON, and it tests a package with two dependencies.
+6. **Handlers in routes.** Taken: a route stores its handler as a function, replacing numeric ids. F.1 allows it.
+7. **What an async handler returns.** Taken: a sum type, `Reply(response)` or `Await(state, commands)`. A sync handler is a pure function wrapped in `Reply`. A waiting request lives in a bounded table in the server state, keyed by tag. Hidden continuations are rejected: state must stay visible to the verifier.
+8. **What "every request gets an answer" means.** Taken: a safety property, not liveness. Every entry in the waiting table has an armed timeout, and proven invariants say each entry leaves the table on its answer or its timeout. The proof assumes the host delivers the timer. This narrows what was first suggested, because Phase D has no liveness proofs.
+9. **Addresses for `Connect`.** Taken: IPv4 literals and `localhost` first. Name lookup blocks, so it would need a helper thread (Phase D decision 5). Add it when a program needs it.
+10. **What the tool is.** Taken: a verification browser. It runs `gardelc --json-diagnostics` on a project, lists failed obligations, and shows each one in its source. It suits the project and it needs files, a process, a list view and a text view, so it tests all of `gtui`.
+11. **Reach of file and process commands.** Taken: a process takes a program and an argument list, never a shell string, and its output arrives as events. A replay reads every result from the log and runs nothing.
+12. **Clauses on a refined function type.** Taken: enforce them, as §8 of the spec already promises, in a task of their own before F.6 (Task F.12). If that proves too large, remove the syntax instead. Leaving them inert is rejected: a reader would trust clauses that do nothing.
 
 ---
 
@@ -154,18 +157,49 @@ Every task follows the rules of Phase E:
 
 Needs decision 1 only if the nested recursion option is chosen.
 
-- [ ] Confirm the root cause of findings 5 and 6, then make a method from a concept bound translate, using the instance chosen at each call. Add a false-contract test: a lie about `less_than` must not verify through a bound.
-- [ ] A bound must be checked at each use. `KV_MAP[STRING, NAT]` with `K: ORD` must be an error while `STRING` is not `ORD`.
-- [ ] Make `.equals` work on a match binder.
-- [ ] Let the C backend build a record with a function field. Such a record has no equality, and `=` on one stays an error.
-- [ ] `variant` on a value with no measure must be a clear error, not `E0199`.
+**Status:** ✅ Completed. Decision 1 stays open. This task followed its proposal, flat cells, so it adds no nested recursion, and finding 3's probe now gives `E0319`.
+
+- [x] Confirm the root cause of findings 5 and 6, then make a method from a concept bound translate, using the instance chosen at each call. Add a false-contract test: a lie about `less_than` must not verify through a bound.
+- [x] A bound must be checked at each use. `KV_MAP[STRING, NAT]` with `K: ORD` must be an error while `STRING` is not `ORD`.
+- [x] Make `.equals` work on a match binder.
+- [x] Let the C backend build a record with a function field. Such a record has no equality, and `=` on one stays an error.
+- [x] `variant` on a value with no measure must be a clear error, not `E0199`.
 - Acceptance: the probes of findings 3, 5, 6 and 8 give the right result, each with a test. All output for existing examples stays byte-identical, or the difference is explained.
+- **Causes.** The plan guessed that findings 5 and 6 had one root, a receiver with no known type. They have two. Finding 5: `K_less` and its laws were already in the module's theory, but only `equals` was routed to it, so `less_than` fell through to a routine named `fn_less_than`. Finding 6: a match binder got its type where a procedure declares locals, and not on the path that builds a function's axiom. Finding 8 was not the record: `LIST[T]` always generated `__eq` and `__has`, so any list of such records failed, and a lone record built.
+- **Fix: instances.** On a type parameter, `less_than`, `less_or_equal` and `equals` are relations carrying the laws of the bound. A walk of each module collects every use of a bounded generic, written or inferred from a call, a constructor, a binder, a quantifier or a lambda. A use that does not satisfy the bound is `E0317`. A use that does gets one link, for example `SORTED__K_less(x, y) <==> LEVEL__fn_less_than(DefaultFuel, x, y)`, so a client can use a generic's contract as a fact about its type. `NAT`, `I64`, `U64`, `CHAR` and `BOOL` gained the three methods, in the proof and in C.
+- **Soundness of a link.** A link assumes the type keeps the laws of the bound. Assumed inside the type's own file, it would prove those laws for any order: this is the lie the task asked about, and `an_order_cannot_prove_its_laws_through_its_own_use` is a false `total` that it would pass. So a link is skipped in any module that the type's proofs could rest on, and it is written beside the procedures rather than in the theory, so no client inherits it. The C backend checks each instance again, as it sees every one, including what inference cannot.
+- **Beyond the checklist.** `r.handler(x)` applied nothing: it parsed as a routine call, so a record could hold a function and never call it. It now applies the field in the proof, in type inference and in C. A field of another module's record was also `E0199`, and a route is used from another module, so it now translates. `E0318` is a method a bound does not give, and `E0320` a bound with no theory.
+- **Result.** `cargo test` 223/223, 17/17, 47/47, 48/48, 4/4, 17/17 and 9/9, with `tests/bounds.rs` new. `--stdlib --strict`, every example, `ghttp` and `hello_api` stay 0/0. All 66 `.bpl` and 66 `.c` files that they generate are byte-identical to those of the previous commit, as no existing code has a declared bound. 24 of 24 mutations, each on a private copy, turn a test red. A closure held by a record in a list is freed: 0 live allocations after 51 runs.
+- **Known limits.**
+  - A bound is `EQ`, `CANONICAL_EQ` or `ORD`, as only those have a theory. Any other is `E0320`, and that includes a user's own concept.
+  - A `LIST` or `TUPLE` satisfies no concept, so it is not a type argument for a bound.
+  - Stdlib modules skip this walk, as they did for `E0314`. A prelude module that uses `MAP` at a wrong type is caught by the C check only, so F.3 should check this.
+  - `[A: ORD]` together with `where A satisfies C` keeps only the `where`, and the bound is not checked.
+  - A link does not reach a client's client. A contract that mentions the order must be restated on the concrete type to pass through.
+  - `Current.handler(x)` needs `Current.`: a bare `handler(x)` is `E0199`, as a bare field already was in a contract.
+  - Clauses on a refined function type have no effect in a proof. `require` is not checked at an application and `ensure` is not assumed, for a field and a parameter alike, on this commit and the one before. Nothing false follows, as a lambda body is proven for every argument, but the clauses are not what they appear to be. The spec needs a decision before F.6 stores handlers.
 
 ### Step 2: Core Libraries
 
 #### Task F.2: `BYTES`, `STRING` and Number Text
 
-Client: everything after this task. Needs decision 3.
+Client: everything after this task. Needs decision 3.
+
+**Status:** In progress. The work below is in place and verifies. Still to do before it is completed:
+
+- Finish the mutation run. Twelve mutations are listed, and so far only the first has run ("quantifier range dropped", red).
+- Run `compare.sh` over the examples, `echo_server`, `hello_api` and `ghttp` again on the final code.
+- Write the spec, GUIDE and CHANGELOG text for the new operations, conversions and fixes.
+
+Done so far:
+
+- `BYTES`: `concat`, `slice`, `matches_at`, `starts_with`, `index_of_byte`, `index_of`, `list_less`, `utf8_offset` and the split laws. `BYTES_BUILDER` joins its parts once, in `to_bytes`.
+- `STRING`: `satisfies ORD`, by the byte order of its UTF-8 form, and `slice`, `matches_at`, `starts_with`, `ends_with`, `find`, `find_char`, `trim`, `count_char`, `split`.
+- `NUMBER_TEXT` and `NUMBER_ERROR`: `nat_to_text`, `parse_nat`, `i64_to_text`, `parse_i64`, `hex4_text` and `parse_hex4`, with the laws `nat_round_trip`, `i64_round_trip` and `hex4_round_trip`.
+- `NAT.from_i64` and `I64.from_nat`, each with an `in_range` obligation.
+- Soundness fixes: `forall` and `exists` over a machine type now carry its range. `--compare-with` no longer calls `EQ` to `ORD` a break.
+- Benchmark on 64 KB: building with the builder and summing with `at`, and `find`, stay within start-up noise (55 to 65 ms). Building with per-byte `concat` costs about 35 ms more, as it is quadratic.
+- Known limits: elements of a `LIST[U64]` have no lower bound in the model. The axiom that every value of a prelude type satisfies its invariant is an assumption, the same as the existing one on parameters. Stdlib modules skip the `E0317` walk.
 
 - [ ] `BYTES`: `concat`, `slice`, `index_of` (a byte or a sequence), `starts_with`, and a builder that does not copy on each append.
 - [ ] `STRING`: `find`, `slice`, `split`, `trim`, `starts_with`, `ends_with`, `satisfies ORD`.
@@ -212,9 +246,19 @@ Client: `grest`. Fixes findings 1 and 2.
 - [ ] `HELLO_API` over real sockets repeats finding 1's probe and now gets the right answers.
 - Acceptance: all splits agree, a `POST` body arrives, and `--compare-with` reports the breaking change, with `ghttp` moved to a new version.
 
+#### Task F.12: Refined Function Types
+
+Needs decision 12. Found during F.1, and numbered last because it was added last. It runs before F.6.
+
+- [ ] A `require` on a function type is checked at each application, for a parameter and a field.
+- [ ] A lambda or routine passed where such a type is expected is checked against its clauses there.
+- [ ] An `ensure` on a function type is assumed at an application, and only once the check above exists.
+- [ ] If this proves too large, make the syntax an error instead, and say so in the spec.
+- Acceptance: a call outside a stated `require` is refused, a lambda that breaks a stated `ensure` is refused, and a false contract through one is a test.
+
 #### Task F.6: `grest`, Sync REST
 
-Client: `examples/hello_api`, moved to `grest`. Needs decisions 5 and 6.
+Client: `examples/hello_api`, moved to `grest`. Needs decisions 5 and 6, and Task F.12.
 
 - [ ] Path patterns such as `/users/:id`, and query parsing with percent decoding. A proven limit on segments.
 - [ ] A route holds its handler. A handler is a pure function from a typed request to a response.

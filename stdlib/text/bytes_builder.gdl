@@ -1,0 +1,111 @@
+-- Bytes built by appending (Task F.2). An append keeps the part, and `to_bytes` copies every
+-- part once, so building is linear where repeated `concat` would be quadratic.
+module BYTES_BUILDER
+
+representation {NONE}
+  parts: LIST[BYTES]
+  total: NAT
+
+create {ANY}
+
+  empty: BYTES_BUILDER
+    do
+      { parts = LIST.empty, total = 0 }
+    ensure
+      empty_model: Result.model = LIST.empty
+      none: Result.length = 0
+    end
+
+feature {ANY}
+
+  length: NAT
+    do
+      Current.total
+    ensure
+      def: Result = Current.model.length
+    end
+
+  add(b: BYTES): BYTES_BUILDER
+    require
+      fits: Current.length <= 18446744073709551615 - b.length
+    do
+      { parts = Current.parts.prepend(b), total = Current.total + b.length }
+    ensure
+      added: Result.model = Current.model.append(b.model)
+      len: Result.length = Current.length + b.length
+    end
+
+  add_text(s: STRING): BYTES_BUILDER
+    require
+      fits: Current.length <= 18446744073709551615 - s.byte_length
+    do
+      Current.add(s.to_utf8)
+    ensure
+      added: Result.model = Current.model.append(s.byte_model)
+      len: Result.length = Current.length + s.byte_length
+    end
+
+  add_byte(x: U64): BYTES_BUILDER
+    require
+      octet: x < 256
+      fits: Current.length < 18446744073709551615
+    do
+      let one: LIST[U64] = LIST.singleton(x)
+      Current.add(BYTES.from_list(one))
+    ensure
+      added: Result.model = Current.model.append(LIST.singleton(x))
+      len: Result.length = Current.length + 1
+    end
+
+  to_bytes: BYTES
+    do
+      BYTES_BUILDER.join_reversed(Current.parts)
+    ensure
+      model_same: Result.model = Current.model
+    end
+
+create {ANY}
+
+  -- The bytes of `parts`, the last part first.
+  flatten_reversed(parts: LIST[BYTES]): LIST[U64]
+    variant
+      parts.length
+    do
+      if parts.length = 0 then
+        LIST.empty
+      else
+        BYTES_BUILDER.flatten_reversed(parts.tail).append(parts.head.to_list)
+      end
+    ensure
+      len: parts.length > 0 implies Result.length =
+        BYTES_BUILDER.flatten_reversed(parts.tail).length + parts.head.length
+    end
+
+  -- `flatten_reversed` as one value. C uses a primitive that sizes the result first and
+  -- copies each part once.
+  join_reversed(parts: LIST[BYTES]): BYTES
+    require
+      fits: BYTES_BUILDER.flatten_reversed(parts).length <= 18446744073709551615
+    variant
+      parts.length
+    do
+      if parts.length = 0 then
+        BYTES.empty
+      else
+        BYTES_BUILDER.join_reversed(parts.tail).concat(parts.head)
+      end
+    ensure
+      model_joined: Result.model = BYTES_BUILDER.flatten_reversed(parts)
+    end
+
+specify {ANY}
+
+  model: LIST[U64]
+    do
+      BYTES_BUILDER.flatten_reversed(Current.parts)
+    end
+
+invariant
+  counted: total = BYTES_BUILDER.flatten_reversed(parts).length
+
+end

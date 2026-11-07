@@ -271,6 +271,8 @@ struct Contract<'a> {
 struct Comparison<'a> {
     old: &'a ModuleDecl,
     new: &'a ModuleDecl,
+    /// Concept -> the concepts it refines, directly, for the new version.
+    refines: &'a HashMap<String, Vec<String>>,
     /// Public names of the old version that the new one lacks or changed.
     gone: HashSet<String>,
     claims: Vec<Claim>,
@@ -515,7 +517,18 @@ impl Comparison<'_> {
         let concepts = |m: &ModuleDecl| {
             m.satisfies.as_ref().map(|s| s.concepts.clone()).unwrap_or_default()
         };
-        for c in concepts(old).iter().filter(|c| !concepts(new).contains(c)) {
+        // A concept the new version lists, or one those refine: `satisfies ORD` keeps `EQ`.
+        let mut kept = concepts(new);
+        let mut i = 0;
+        while i < kept.len() {
+            for r in self.refines.get(&kept[i]).into_iter().flatten() {
+                if !kept.contains(r) {
+                    kept.push(r.clone());
+                }
+            }
+            i += 1;
+        }
+        for c in concepts(old).iter().filter(|c| !kept.contains(c)) {
             self.is_breaking(&item, format!("it no longer satisfies `{c}`"));
         }
         if wheres(old) != wheres(new) {
@@ -900,6 +913,12 @@ pub(crate) fn compare(old_dir: &std::path::Path, run: &Run<'_>) -> Result<Report
         .flat_map(|u| &u.ast.modules)
         .filter(|m| !run.packages.contains_key(&m.name) && !m.kind.is_entry_point())
         .collect();
+    let refines: HashMap<String, Vec<String>> = standard_prelude()
+        .concepts
+        .iter()
+        .chain(run.units.iter().flat_map(|u| &u.ast.concepts))
+        .map(|c| (c.name.clone(), c.refines.clone()))
+        .collect();
     let mut claims: Vec<Claim> = Vec::new();
     for raw_old in &old.modules {
         let Some(raw_new) = new_modules.iter().find(|m| m.name == raw_old.name) else {
@@ -916,7 +935,7 @@ pub(crate) fn compare(old_dir: &std::path::Path, run: &Run<'_>) -> Result<Report
             .filter(|(k, v)| new_names.get(k) != Some(v))
             .map(|(k, _)| k)
             .collect();
-        let mut c = Comparison { old: &o, new: &n, gone, claims: Vec::new(), breaking: Vec::new(), added: Vec::new() };
+        let mut c = Comparison { old: &o, new: &n, refines: &refines, gone, claims: Vec::new(), breaking: Vec::new(), added: Vec::new() };
         c.shape();
         let self_routines = n.kind == ModuleKind::Module;
         c.routines("create", false, &o.create_routines, &n.create_routines);

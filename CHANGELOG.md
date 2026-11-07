@@ -9,6 +9,9 @@ All notable changes, theoretical soundess fixes, verification overhauls, front-e
 Spec draft v0.5. [plan/Roadmap.md](plan/Roadmap.md) holds the detail for each task.
 
 ### Language and runtime
+- **Concept bounds** (F.1). `a.less_than(b)`, `a.less_or_equal(b)` and `a.equals(b)` on a `K: ORD` translate, and mean the instance chosen at each use, in the proof and in C. A client may use a generic's contract as a fact about its type argument. `NAT`, `I64`, `U64`, `CHAR` and `BOOL` have these methods. `E0318` is a method that the bound does not give, and `E0320` a bound with no theory.
+- **Functions in records and lists** (F.1). `r.handler(x)` applies a field of function type, in the proof and in C. A `LIST` of records holding functions builds, and has no `=` or `has`.
+- **Fields of another module's record** (F.1) translate in the proof. `r.rank` from another module was `E0199`.
 - **Contract compatibility check** (E.7). `gardelc --compare-with <old-dir>` reports what would break a client of an older version: a stronger `require`, a weaker `ensure`, removed or changed public items and concepts, a new `assume`, and a new or changed dependency. A change to a clause counts as compatible only if the solver proves it, and a new public name, a dependency that changed with no new version, or an `assume` the old version also had is a warning.
 - **Qualified names** (E.5). `ALIAS::NAME` in expressions, types and type arguments, with `GARDEL` for the prelude, and `MODULE.Leaf(1)`, `ALIAS::MODULE.Leaf(1)` and `case MODULE.Leaf(x)` for constructors. A type known for certain breaks a tie between constructors. A user module may reuse any prelude name, so `E0101` is gone.
 - **`let x: T = e` keeps `T`.** It was parsed and thrown away. It now settles a generic value, and a value known to have another type is `E0116`.
@@ -19,6 +22,7 @@ Spec draft v0.5. [plan/Roadmap.md](plan/Roadmap.md) holds the detail for each ta
 - **Dafny removed.** Boogie and Z3 are the only verifier, and a run has five steps. Solver limits count work, not time.
 
 ### Soundness fixes
+- **A bound was not checked where a type was used** (F.1). `KV_MAP[STRING, NAT]` with `K: ORD` was accepted, and a generic body is proven only for what satisfies its bound. A written or inferred use is now `E0317`, and the C backend checks every instance again.
 - **`x.code` was the identity on every receiver**, which is only true of `CHAR`. In a module with a routine `code` that returns its own type, a false `ensure` such as `x.code = x` verified. `code` is now the identity on a `CHAR` alone, and a module's own routine wins over every built-in name (`first`, `head`, `length`, `append`, `at`, `apply` and the rest), which gave `E0199` before. Bend had the same fault: a run that declares a `code` routine now calls it on every receiver.
 - **Obligations reach every expression** (D.9). Overflow, division by zero, callee preconditions and `check` were skipped in lambdas, in `if` and `match` nested in an expression, in tuples, under `not`, in record fields and in a body `match`'s scrutinee. Such programs verified, then wrapped or crashed at run time.
 - **`I64`** (D.10). `/` and `%` proved Euclidean results while the binary truncated, so `(-7) / 2 = -4` verified and the program computed `-3`. `-x` at `I64.min` and `I64.min / -1` had no check. Wrapping on `I64` was read as unsigned.
@@ -28,6 +32,8 @@ Spec draft v0.5. [plan/Roadmap.md](plan/Roadmap.md) holds the detail for each ta
 - **`assume` under `--strict`** (E.3). An `assume` nested in an expression, such as a `let` value or a call argument, was neither refused by `--strict` nor listed by `--audit`, so a false contract could verify at exit 0. Every expression and contract clause is now covered.
 
 ### Verifier
+- **`.equals` on a match binder and on a quantified variable** (F.1) translate. `key.equals(k)` inside `case Field(key, ...)` in a function was `E0199`.
+- **`variant` with no measure** (F.1) is `E0319`, not `E0199`.
 - **Boogie 3.4.3 is pinned** in place of 3.1.6, which removes the shutdown hang (fixed in 3.2.4). 3.5.x is not used, as it fails `SEQ.filter` in about 1 of 7 runs. No verdict changed.
 - **Continuous integration.** Every push to `main` or `libraries`, and every pull request, builds `gardelc`, verifies the stdlib and examples under `--strict` with no proof cache, and runs `cargo test`.
 - **A hung `boogie /version` no longer turns the cache off** (F.0). Boogie 3.1.6 hangs for good in about 1 of 275 of these calls, as it shuts down, which made proof cache tests fail at random. Each call now gets 10 s and up to three tries, and only a hang is tried again. If a tool gives no version, a `[cache] off` line names it and the reason.

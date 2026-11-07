@@ -1045,6 +1045,45 @@ This is the prelude's own `stdlib/concepts/ord.gdl`; `EQ`, `CANONICAL_EQ` and `O
 
 Generic modules like `SORTED_LIST[A: ORD]` can safely assume these laws as axioms during sorting and lookup proofs.
 
+### Bounds on Type Parameters
+
+A bound gives a type parameter the methods of its concept, and the proof their laws:
+
+```gardel
+module SORTED[K: ORD]
+
+representation {ANY}
+  item: K
+
+create {ANY}
+
+  smaller(a: K, b: K): K
+    do
+      if a.less_than(b) then a else b end
+    ensure
+      least: not b.less_than(Result) and not a.less_than(Result)
+    end
+
+end
+```
+
+`K` is `EQ`, `CANONICAL_EQ` or `ORD`. Only those have a theory, so another concept is `E0320`. `a = b` on a `K` needs `CANONICAL_EQ`, because `equals` is not the identity under `EQ` or `ORD`.
+
+The type is checked at every use, written or inferred. `SORTED.smaller(s, s)` on a `STRING` is `E0317`, because `STRING` is `EQ` and not `ORD`. So is `SORTED[F64]`. A method the bound does not give is `E0318`.
+
+A client's call means the instance it chose, so `SORTED`'s contract is a fact about that type:
+
+```gardel
+nat_min(a: NAT, b: NAT): NAT
+  do
+    SORTED.smaller(a, b)
+  ensure
+    low: Result <= a and Result <= b     -- `less_than` on `NAT` is `<`
+  end
+```
+
+Using a contract this way assumes the type keeps the laws of the bound, so it needs them proven elsewhere. A module that uses `SORTED` at its own type gets no such link: inside `LEVEL`, the contract of `SORTED.smaller(x, y)` says nothing about `LEVEL`'s order, or `LEVEL` could prove its own `ORD` laws with them.
+
 > [!NOTE]
 > A module's laws are axioms only for its **clients**. While the module itself is verified, its laws are proof obligations, never assumptions, so a law cannot be used to prove itself.
 
@@ -1341,6 +1380,10 @@ When repairing failing Gardel code:
 | Precondition Violation / callee's `require` tag | Callee requires a condition the caller does not establish | Wrap the call in `if precondition_test then ... else ... end` |
 | Postcondition Violation / `ensure` tag | Result does not match the claim | Inspect counterexample values to spot omitted field updates |
 | `E0314: unsatisfied_where_constraint` | `equals` on e.g. `SEQ[STRING]` | Compare models (`a.model = b.model`) or use canonical elements |
+| `E0317: unsatisfied_bound` | `SORTED[STRING]` with `K: ORD`, written or inferred | Use a type that satisfies the bound, or weaken the bound |
+| `E0318: method_not_in_bound` | `a.less_than(b)` on `K: EQ`, or `a.equals(b)` on a bare `K` | Add or strengthen the bound |
+| `E0319: variant_no_measure` | `variant xs` on a `LIST` or a `STRING` | Use a number (`xs.length`), or a parameter of a sum type |
+| `E0320: unsupported_bound` | `[K: MY_CONCEPT]` | Bound by `EQ`, `CANONICAL_EQ` or `ORD` |
 
 ---
 

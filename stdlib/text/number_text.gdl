@@ -1,0 +1,420 @@
+-- Numbers as decimal text, and back (Task F.2). A value too large for its type is an
+-- `OutOfRange` error, never a wrapped number.
+module NUMBER_TEXT
+
+create {ANY}
+
+  -- The decimal digits of `n`, most significant first, in front of `rest`, as ASCII codes.
+  digits(n: NAT, rest: LIST[U64]): LIST[U64]
+    variant
+      n
+    do
+      if n < 10 then
+        rest.prepend(48 + n)
+      else
+        NUMBER_TEXT.digits(n / 10, rest.prepend(48 + n % 10))
+      end
+    ensure
+      len: Result.length = rest.length + NUMBER_TEXT.digit_count(n)
+    end
+
+  -- `n` in decimal, with no leading zero.
+  nat_to_text(n: NAT): STRING
+    do
+      let d = NUMBER_TEXT.digits(n, LIST.empty)
+      check
+        digits_ascii: NUMBER_TEXT.digits_ascii(n, LIST.empty)
+        text: NUMBER_TEXT.ascii_text(d)
+      end
+      match STRING.from_utf8(BYTES.from_list(d))
+        case Ok(s) then
+          check
+            valid_s: BYTES.valid_utf8(s.to_utf8.model)
+            same: BYTES.decode_injective(s.to_utf8.model, d)
+          end
+          s
+        case Error(_) then ""
+      end
+    ensure
+      bytes: Result.byte_model = NUMBER_TEXT.digits(n, LIST.empty)
+    end
+
+  -- Decimal digits only: no sign, no space, leading zeros allowed.
+  parse_nat(s: STRING): RESULT[NUMBER_ERROR, NAT]
+    do
+      let bs = s.to_utf8.to_list
+      if bs.length = 0 then
+        Error(NoDigits)
+      else
+        NUMBER_TEXT.parse_digits(bs, 0, 0)
+      end
+    ensure
+      empty: s.byte_model.length = 0 implies Result = Error(NoDigits)
+      digits: s.byte_model.length > 0 implies
+        Result = NUMBER_TEXT.parse_digits(s.byte_model, 0, 0)
+    end
+
+  -- Reads `bs` onto `acc`. `offset` is where `bs` starts, for the error.
+  parse_digits(bs: LIST[U64], acc: NAT, offset: NAT): RESULT[NUMBER_ERROR, NAT]
+    require
+      fits: offset <= 18446744073709551615 - bs.length
+    variant
+      bs.length
+    do
+      if bs.length = 0 then
+        Ok(acc)
+      else
+        if bs.head < 48 or bs.head > 57 then
+          Error(NotADigit(offset))
+        else
+          if acc > (18446744073709551615 - (bs.head - 48)) / 10 then
+            Error(OutOfRange)
+          else
+            NUMBER_TEXT.parse_digits(bs.tail, acc * 10 + (bs.head - 48), offset + 1)
+          end
+        end
+      end
+    end
+
+  -- `i` in decimal, with a `-` before a negative number.
+  i64_to_text(i: I64): STRING
+    do
+      if i >= 0 then
+        NUMBER_TEXT.nat_to_text(NAT.from_i64(i))
+      else
+        let d = NUMBER_TEXT.digits(NUMBER_TEXT.magnitude(i), LIST.empty)
+        let signed = d.prepend(45)
+        check
+          head: NUMBER_TEXT.digits_ascii(NUMBER_TEXT.magnitude(i), LIST.empty)
+          text: NUMBER_TEXT.ascii_text(signed)
+        end
+        match STRING.from_utf8(BYTES.from_list(signed))
+          case Ok(s) then
+            check
+              valid_s: BYTES.valid_utf8(s.to_utf8.model)
+              same: BYTES.decode_injective(s.to_utf8.model, signed)
+            end
+            s
+          case Error(_) then ""
+        end
+      end
+    ensure
+      natural: i >= 0 implies Result.byte_model = NUMBER_TEXT.digits(NAT.from_i64(i), LIST.empty)
+      negative: i < 0 implies
+        Result.byte_model = NUMBER_TEXT.digits(NUMBER_TEXT.magnitude(i), LIST.empty).prepend(45)
+    end
+
+  -- An optional `-`, then decimal digits.
+  parse_i64(s: STRING): RESULT[NUMBER_ERROR, I64]
+    do
+      NUMBER_TEXT.parse_signed(s.to_utf8.to_list)
+    ensure
+      bytes: Result = NUMBER_TEXT.parse_signed(s.byte_model)
+    end
+
+  parse_signed(bs: LIST[U64]): RESULT[NUMBER_ERROR, I64]
+    require
+      fits: bs.length <= 18446744073709551615
+    do
+      if bs.length = 0 then
+        Error(NoDigits)
+      else
+        if bs.head = 45 then
+          if bs.length = 1 then
+            Error(NoDigits)
+          else
+            match NUMBER_TEXT.parse_digits(bs.tail, 0, 1)
+              case Ok(v) then
+                if v <= 9223372036854775807 + 1 then Ok(NUMBER_TEXT.negate(v)) else Error(OutOfRange) end
+              case Error(e) then Error(e)
+            end
+          end
+        else
+          match NUMBER_TEXT.parse_digits(bs, 0, 0)
+            case Ok(v) then
+              if v <= 9223372036854775807 then Ok(I64.from_nat(v)) else Error(OutOfRange) end
+            case Error(e) then Error(e)
+          end
+        end
+      end
+    end
+
+  -- `-v`, including `I64.min`, whose magnitude is not an `I64`.
+  negate(v: NAT): I64
+    require
+      fits: v <= 9223372036854775807 + 1
+    do
+      if v = 0 then 0 else 0 - I64.from_nat(v - 1) - 1 end
+    ensure
+      negated: Result = 0 - v
+    end
+
+  -- The magnitude of a negative `i`, which `I64` cannot hold for `I64.min`.
+  magnitude(i: I64): NAT
+    require
+      negative: i < 0
+    do
+      NAT.from_i64(0 - (i + 1)) + 1
+    ensure
+      def: Result = 0 - i
+    end
+
+  -- The lowercase hex digit of `v`.
+  hex_digit(v: NAT): U64
+    require
+      digit: v < 16
+    do
+      if v < 10 then 48 + v else 87 + v end
+    ensure
+      ascii: Result < 128
+      reads_back: NUMBER_TEXT.hex_value(Result) = v
+    end
+
+  -- The value of a hex digit, either case, or 16 for anything else.
+  hex_value(b: U64): NAT
+    do
+      if b >= 48 and b <= 57 then
+        b - 48
+      else
+        if b >= 97 and b <= 102 then
+          b - 87
+        else
+          if b >= 65 and b <= 70 then b - 55 else 16 end
+        end
+      end
+    ensure
+      bounded: Result <= 16
+    end
+
+  -- Four lowercase hex digits, as in a JSON `\uXXXX` escape.
+  hex4_text(n: NAT): BYTES
+    require
+      small: n < 65536
+    do
+      let d: LIST[U64] = LIST.empty
+        .prepend(NUMBER_TEXT.hex_digit(n % 16))
+        .prepend(NUMBER_TEXT.hex_digit(n / 16 % 16))
+        .prepend(NUMBER_TEXT.hex_digit(n / 256 % 16))
+        .prepend(NUMBER_TEXT.hex_digit(n / 4096))
+      BYTES.from_list(d)
+    ensure
+      four: Result.length = 4
+      first: Result.at(0) = NUMBER_TEXT.hex_digit(n / 4096)
+      second: Result.at(1) = NUMBER_TEXT.hex_digit(n / 256 % 16)
+      third: Result.at(2) = NUMBER_TEXT.hex_digit(n / 16 % 16)
+      fourth: Result.at(3) = NUMBER_TEXT.hex_digit(n % 16)
+    end
+
+  -- Four hex digits at `at`, either case.
+  parse_hex4(bs: BYTES, at: NAT): OPTION[NAT]
+    require
+      in_bounds: at <= bs.length and bs.length - at >= 4
+    do
+      let a = NUMBER_TEXT.hex_value(bs.at(at))
+      let b = NUMBER_TEXT.hex_value(bs.at(at + 1))
+      let c = NUMBER_TEXT.hex_value(bs.at(at + 2))
+      let d = NUMBER_TEXT.hex_value(bs.at(at + 3))
+      if a < 16 and b < 16 and c < 16 and d < 16 then
+        Some(a * 4096 + b * 256 + c * 16 + d)
+      else
+        None
+      end
+    ensure
+      bounded: Result.is_some implies Result.get < 65536
+      def: (NUMBER_TEXT.hex_value(bs.at(at)) < 16 and NUMBER_TEXT.hex_value(bs.at(at + 1)) < 16 and
+            NUMBER_TEXT.hex_value(bs.at(at + 2)) < 16 and NUMBER_TEXT.hex_value(bs.at(at + 3)) < 16)
+        implies Result = Some(NUMBER_TEXT.hex_value(bs.at(at)) * 4096 +
+          NUMBER_TEXT.hex_value(bs.at(at + 1)) * 256 + NUMBER_TEXT.hex_value(bs.at(at + 2)) * 16 +
+          NUMBER_TEXT.hex_value(bs.at(at + 3)))
+    end
+
+create {ANY}
+
+  -- Proof helpers. They are public because the contracts above mention them.
+
+  -- How many decimal digits `n` has.
+  digit_count(n: NAT): NAT
+    variant
+      n
+    do
+      if n < 10 then 1 else NUMBER_TEXT.digit_count(n / 10) + 1 end
+    ensure
+      positive: Result >= 1
+      one: n < 10 implies Result = 1
+      small: n > 0 implies Result <= n
+    end
+
+  -- The number `k` followed by the digits of `n`.
+  absorb(n: NAT, k: MATH_INT): MATH_INT
+    variant
+      n
+    do
+      if n < 10 then k * 10 + n else NUMBER_TEXT.absorb(n / 10, k) * 10 + n % 10 end
+    ensure
+      grows: k >= 0 implies Result >= k
+    end
+
+  -- Every element is an ASCII code.
+  ascii(xs: LIST[U64]): BOOL
+    variant
+      xs.length
+    do
+      if xs.length = 0 then True else xs.head < 128 and NUMBER_TEXT.ascii(xs.tail) end
+    end
+
+  -- Lemmas. Each is a routine whose contract is the fact: a module's own laws are not
+  -- axioms inside it, while a routine's contract is.
+  digits_ascii(n: NAT, rest: LIST[U64]): BOOL
+    require
+      rest_ascii: NUMBER_TEXT.ascii(rest)
+    variant
+      n
+    do
+      if n < 10 then True else NUMBER_TEXT.digits_ascii(n / 10, rest.prepend(48 + n % 10)) end
+    ensure
+      holds: Result
+      ascii: NUMBER_TEXT.ascii(NUMBER_TEXT.digits(n, rest))
+    end
+
+  -- ASCII text is well-formed UTF-8 that decodes to itself, one scalar per byte.
+  ascii_text(xs: LIST[U64]): BOOL
+    require
+      xs_ascii: NUMBER_TEXT.ascii(xs)
+    variant
+      xs.length
+    do
+      if xs.length = 0 then
+        True
+      else
+        check whole: xs.tail.prepend(xs.head) = xs end
+        NUMBER_TEXT.ascii_text(xs.tail)
+      end
+    ensure
+      holds: Result
+      octets: BYTES.all_octets(xs)
+      valid: BYTES.valid_utf8(xs)
+    end
+
+  -- The first digit is a decimal digit, so never a `-`.
+  digits_head(n: NAT, rest: LIST[U64]): BOOL
+    variant
+      n
+    do
+      if n < 10 then True else NUMBER_TEXT.digits_head(n / 10, rest.prepend(48 + n % 10)) end
+    ensure
+      holds: Result
+      is_digit: NUMBER_TEXT.digits(n, rest).head >= 48 and NUMBER_TEXT.digits(n, rest).head <= 57
+    end
+
+  -- A `-` before digits that read as `m`. Over a plain list, as the solver does not find
+  -- the head of a `prepend` on the digits of a number it cannot unfold.
+  signed_step(d: LIST[U64], m: NAT): BOOL
+    require
+      some: d.length >= 1
+      fits: d.length < 18446744073709551615
+      read: NUMBER_TEXT.parse_digits(d, 0, 1) = Ok(m)
+      small: m <= 9223372036854775808
+    do
+      True
+    ensure
+      holds: Result
+      signed: NUMBER_TEXT.parse_signed(d.prepend(45)) = Ok(NUMBER_TEXT.negate(m))
+    end
+
+  -- The negative half of `i64_round_trip`. A routine, so that each `let` is a local of the
+  -- proof: as a term repeated inside a law, the solver loses track of the digits.
+  negative_round_trip(i: I64): BOOL
+    require
+      negative: i < 0
+    do
+      let m = NUMBER_TEXT.magnitude(i)
+      let d = NUMBER_TEXT.digits(m, LIST.empty)
+      check
+        zero: NUMBER_TEXT.absorb_zero(m)
+        step: NUMBER_TEXT.parse_digits_step(m, LIST.empty, 0, 1)
+        read: NUMBER_TEXT.parse_digits(d, 0, 1) = Ok(m)
+        some: d.length >= 1 and d.length <= m
+        signed: NUMBER_TEXT.signed_step(d, m)
+        text: NUMBER_TEXT.i64_to_text(i).byte_model = d.prepend(45)
+        back: NUMBER_TEXT.negate(m) = i
+      end
+      True
+    ensure
+      holds: Result
+      round_trip: NUMBER_TEXT.parse_i64(NUMBER_TEXT.i64_to_text(i)) = Ok(i)
+    end
+
+  absorb_zero(n: NAT): BOOL
+    variant
+      n
+    do
+      if n < 10 then True else NUMBER_TEXT.absorb_zero(n / 10) end
+    ensure
+      holds: Result
+      is_n: NUMBER_TEXT.absorb(n, 0) = n
+    end
+
+  -- Parsing the digits of `n` adds them to the number read so far.
+  parse_digits_step(n: NAT, rest: LIST[U64], k: NAT, offset: NAT): BOOL
+    require
+      small: NUMBER_TEXT.absorb(n, k) <= 18446744073709551615
+      fits: offset <= 18446744073709551615 - NUMBER_TEXT.digits(n, rest).length
+    variant
+      n
+    do
+      if n < 10 then
+        True
+      else
+        NUMBER_TEXT.parse_digits_step(n / 10, rest.prepend(48 + n % 10), k, offset)
+      end
+    ensure
+      holds: Result
+      parsed: NUMBER_TEXT.parse_digits(NUMBER_TEXT.digits(n, rest), k, offset) =
+        NUMBER_TEXT.parse_digits(rest, NUMBER_TEXT.absorb(n, k), offset + NUMBER_TEXT.digit_count(n))
+    end
+
+specify {ANY}
+
+  -- The decimal text of a number reads back as that number.
+  law nat_round_trip(n: NAT)
+    trigger
+      NUMBER_TEXT.parse_nat(NUMBER_TEXT.nat_to_text(n))
+    do
+      NUMBER_TEXT.absorb_zero(n) and
+      NUMBER_TEXT.parse_digits_step(n, LIST.empty, 0, 0) and
+      NUMBER_TEXT.nat_to_text(n).byte_model.length > 0
+    ensure
+      round_trip: NUMBER_TEXT.parse_nat(NUMBER_TEXT.nat_to_text(n)) = Ok(n)
+    end
+
+  law i64_round_trip(i: I64)
+    trigger
+      NUMBER_TEXT.parse_i64(NUMBER_TEXT.i64_to_text(i))
+    do
+      if i >= 0 then
+        NUMBER_TEXT.absorb_zero(NAT.from_i64(i)) and
+        NUMBER_TEXT.parse_digits_step(NAT.from_i64(i), LIST.empty, 0, 0) and
+        NUMBER_TEXT.digits_head(NAT.from_i64(i), LIST.empty)
+      else
+        NUMBER_TEXT.negative_round_trip(i)
+      end
+    ensure
+      round_trip: NUMBER_TEXT.parse_i64(NUMBER_TEXT.i64_to_text(i)) = Ok(i)
+    end
+
+  law hex4_round_trip(n: NAT)
+    require
+      small: n < 65536
+    trigger
+      NUMBER_TEXT.parse_hex4(NUMBER_TEXT.hex4_text(n), 0)
+    do
+      n / 4096 * 4096 + n / 256 % 16 * 256 + n / 16 % 16 * 16 + n % 16 = n and
+      NUMBER_TEXT.hex_value(NUMBER_TEXT.hex4_text(n).at(0)) = n / 4096 and
+      NUMBER_TEXT.hex_value(NUMBER_TEXT.hex4_text(n).at(1)) = n / 256 % 16 and
+      NUMBER_TEXT.hex_value(NUMBER_TEXT.hex4_text(n).at(2)) = n / 16 % 16 and
+      NUMBER_TEXT.hex_value(NUMBER_TEXT.hex4_text(n).at(3)) = n % 16
+    ensure
+      round_trip: NUMBER_TEXT.parse_hex4(NUMBER_TEXT.hex4_text(n), 0) = Some(n)
+    end
+
+end

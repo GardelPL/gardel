@@ -567,6 +567,8 @@ impl<'a> TypedC<'a> {
         if md.type_params.len() != args.len() {
             return Err(format!("type `{ty}` has the wrong number of type arguments"));
         }
+        let targs: Vec<String> = args.iter().map(|a| cnorm(a)).collect();
+        self.check_bounds(md, &targs)?;
         self.done_types.insert(inst.clone());
         self.struct_fwd.push(format!("struct {inst};\n"));
         let self_ty = cnorm(ty);
@@ -757,8 +759,14 @@ impl<'a> TypedC<'a> {
             "struct {inst} {{ _Atomic uint64_t _rc; {ce} head; struct {inst}* tail; }};\n\
              static inline struct {inst}* dup_{inst}(struct {inst}* p) {{\n    if (p) atomic_fetch_add_explicit(&p->_rc, 1, memory_order_relaxed);\n    return p;\n}}\n\n"
         ));
-        let eq = self.eq_code(elem, "a->head", "b->head")?;
-        let eqx = self.eq_code(elem, "xs->head", "x")?;
+        // Elements holding a function have no equality, so their list has no `=` or `has`.
+        let eq_helpers = if self.has_equality(elem) {
+            let eq = self.eq_code(elem, "a->head", "b->head")?;
+            let eqx = self.eq_code(elem, "xs->head", "x")?;
+            Some((eq, eqx))
+        } else {
+            None
+        };
         let dup_x = self.dup(elem, "x")?;
         let dup_h = self.dup(elem, "xs->head")?;
         let drop_h = self.drop_stmt(elem, "p->head")?;
@@ -766,10 +774,14 @@ impl<'a> TypedC<'a> {
         self.protos.push(format!(
             "static struct {inst}* {inst}__prepend(struct {inst}* xs, {ce} x);\n\
              static struct {inst}* {inst}__append(struct {inst}* xs, struct {inst}* ys);\n\
-             static uint64_t {inst}__length(struct {inst}* xs);\n\
-             static bool {inst}__eq(struct {inst}* a, struct {inst}* b);\n\
-             static bool {inst}__has(struct {inst}* xs, {ce} x);\n"
+             static uint64_t {inst}__length(struct {inst}* xs);\n"
         ));
+        if eq_helpers.is_some() {
+            self.protos.push(format!(
+                "static bool {inst}__eq(struct {inst}* a, struct {inst}* b);\n\
+                 static bool {inst}__has(struct {inst}* xs, {ce} x);\n"
+            ));
+        }
         self.bodies.push(format!(
             "/* LIST[{elem}] runtime: immutable counted cons list, NULL is the empty list */\n\
 static void drop_{inst}(struct {inst}* p) {{\n\
@@ -785,14 +797,118 @@ static struct {inst}* {inst}__append(struct {inst}* xs, struct {inst}* ys) {{\n\
         atomic_init(&c->_rc, 1);\n        c->head = {dup_h};\n        c->tail = NULL;\n        *at = c;\n        at = &c->tail;\n    }}\n\
     *at = dup_{inst}(ys);\n    return out;\n}}\n\
 static uint64_t {inst}__length(struct {inst}* xs) {{\n\
-    uint64_t n = 0;\n    for (; xs; xs = xs->tail) n++;\n    return n;\n}}\n\
-static bool {inst}__eq(struct {inst}* a, struct {inst}* b) {{\n\
+    uint64_t n = 0;\n    for (; xs; xs = xs->tail) n++;\n    return n;\n}}\n"
+        ));
+        if let Some((eq, eqx)) = eq_helpers {
+            self.bodies.push(format!(
+                "static bool {inst}__eq(struct {inst}* a, struct {inst}* b) {{\n\
     for (; a && b; a = a->tail, b = b->tail)\n        if (!({eq})) return false;\n\
     return a == NULL && b == NULL;\n}}\n\
 static bool {inst}__has(struct {inst}* xs, {ce} x) {{\n\
-    for (; xs; xs = xs->tail)\n        if ({eqx}) return true;\n    return false;\n}}\n\n"
-        ));
+    for (; xs; xs = xs->tail)\n        if ({eqx}) return true;\n    return false;\n}}\n"
+            ));
+        }
+        self.bodies.push("\n".to_string());
         Ok(())
+    }
+
+    /// `BYTES.to_list` and `BYTES.from_list`, which need the `LIST[U64]` runtime. Both borrow
+    /// their argument and return a new value.
+    fn list_bytes_helper(&mut self, which: &str) -> Result<String, String> {
+        self.ctype("LIST[U64]")?;
+        let inst = c_instance_name("LIST[U64]");
+        let name = format!("gardel_bytes_{which}");
+        if self.done_helpers.insert(name.clone()) {
+            let body = if which == "to_list" {
+                format!(
+                    "static struct {inst}* {name}(GardelBytes b) {{\n\
+    struct {inst}* xs = NULL;\n\
+    for (uint64_t i = b.len; i > 0; i--) {{\n\
+        struct {inst}* c = {inst}__prepend(xs, (uint64_t)b.data[i - 1]);\n\
+        drop_{inst}(xs);\n\
+        xs = c;\n\
+    }}\n\
+    return xs;\n}}\n\n"
+                )
+            } else {
+                format!(
+                    "static GardelBytes {name}(struct {inst}* xs) {{\n\
+    uint64_t n = {inst}__length(xs);\n\
+    void* owner = NULL;\n\
+    char* buf = gardel_buf_alloc((size_t)(n + 1), &owner);\n\
+    for (uint64_t i = 0; xs; xs = xs->tail, i++) buf[i] = (char)(uint8_t)xs->head;\n\
+    buf[n] = '\\0';\n\
+    GardelBytes b = {{ (const uint8_t*)buf, n, owner }};\n\
+    return b;\n}}\n\n"
+                )
+            };
+            let proto = body.lines().next().unwrap_or_default().trim_end_matches(" {").to_string();
+            self.protos.push(format!("{proto};\n"));
+            self.bodies.push(body);
+        }
+        Ok(name)
+    }
+
+    /// `BYTES_BUILDER.join_reversed`: sizes the result, then copies each part once, from the
+    /// end. Borrows the list.
+    fn join_reversed_helper(&mut self) -> Result<String, String> {
+        self.ctype("LIST[BYTES]")?;
+        let inst = c_instance_name("LIST[BYTES]");
+        let name = "gardel_bytes_join_reversed".to_string();
+        if self.done_helpers.insert(name.clone()) {
+            let body = format!(
+                "static GardelBytes {name}(struct {inst}* parts) {{\n\
+    uint64_t n = 0;\n\
+    for (struct {inst}* p = parts; p; p = p->tail) n += p->head.len;\n\
+    void* owner = NULL;\n\
+    char* buf = gardel_buf_alloc((size_t)(n + 1), &owner);\n\
+    uint64_t at = n;\n\
+    for (struct {inst}* p = parts; p; p = p->tail) {{\n\
+        at -= p->head.len;\n\
+        if (p->head.len) memcpy(buf + at, p->head.data, (size_t)p->head.len);\n\
+    }}\n\
+    buf[n] = '\\0';\n\
+    GardelBytes b = {{ (const uint8_t*)buf, n, owner }};\n\
+    return b;\n}}\n\n"
+            );
+            let proto = body.lines().next().unwrap_or_default().trim_end_matches(" {").to_string();
+            self.protos.push(format!("{proto};\n"));
+            self.bodies.push(body);
+        }
+        Ok(name)
+    }
+
+    /// Whether values of `ty` can be compared with `=`: a function can not, and neither can
+    /// anything that holds one.
+    fn has_equality(&self, ty: &str) -> bool {
+        fn walk(c: &TypedC<'_>, ty: &str, seen: &mut HashSet<String>) -> bool {
+            let ty = cnorm(ty);
+            if cfn_parts(&ty).is_some() {
+                return false;
+            }
+            if !seen.insert(ty.clone()) {
+                return true;
+            }
+            let (head, args) = split_type_app(&ty);
+            if head == "LIST" {
+                return args.iter().all(|a| walk(c, a, seen));
+            }
+            if let Some((a, b)) = TypedC::tuple_parts(&ty) {
+                return walk(c, &a, seen) && walk(c, &b, seen);
+            }
+            let Some(md) = c.module(head) else {
+                return true;
+            };
+            let shapes: Vec<Option<String>> = match &md.repr {
+                ReprKind::Product(_) => vec![None],
+                ReprKind::Sum(vs) => vs.iter().map(|v| Some(v.name.clone())).collect(),
+            };
+            shapes.iter().all(|v| {
+                c.variant_fields(&ty, v.as_deref())
+                    .is_none_or(|fs| fs.iter().all(|(_, t)| walk(c, t, seen)))
+            })
+        }
+        walk(self, ty, &mut HashSet::new())
     }
 
     /// C expression testing `a = b` at type `ty` (structural, Leibniz equality) on two
@@ -809,6 +925,9 @@ static bool {inst}__has(struct {inst}* xs, {ce} x) {{\n\
         }
         if cfn_parts(&ty).is_some() {
             return Err(format!("equality on function type `{ty}` cannot be executed"));
+        }
+        if !self.has_equality(&ty) {
+            return Err(format!("equality on `{ty}` cannot be executed: it holds a function"));
         }
         if type_head(&ty) == "LIST" {
             self.ctype(&ty)?;
@@ -864,6 +983,22 @@ static bool {inst}__has(struct {inst}* xs, {ce} x) {{\n\
     }
 
     // --------------------------------------------------------------- routines
+
+    /// Every instance is concrete here, so this sees the ones that `E0317` can only reach
+    /// through type inference: a generic body is proven for what satisfies its bound.
+    fn check_bounds(&self, md: &ModuleDecl, targs: &[String]) -> Result<(), String> {
+        for (tp, arg) in md.type_params.iter().zip(targs) {
+            if let Some(bound) = declared_bound(md, tp) {
+                if !satisfies_concept(arg, bound, &|_| None, &|h| self.module(h)) {
+                    return Err(format!(
+                        "`{}[{tp}: {bound}]` is used at `{arg}`, which does not satisfy {bound}",
+                        md.name
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
 
     fn find_routine(md: &'a ModuleDecl, r: &str) -> Option<(&'a RoutineDecl, &'static str)> {
         if let Some((_, rd)) = md.create_routines.iter().find(|(_, x)| x.name == r) {
@@ -1516,6 +1651,7 @@ static bool {inst}__has(struct {inst}* xs, {ce} x) {{\n\
         }
         let mod_targs: Vec<String> = md.type_params.iter().map(|t| map[t].clone()).collect();
         let rtargs: Vec<String> = rd.type_params.iter().map(|t| map[t].clone()).collect();
+        self.check_bounds(md, &mod_targs)?;
         let cname = self.request_fn(&md.name, &mod_targs, r, &rtargs);
         if tail_site && cname == cx.fn_cname {
             let self_ty = Self::self_type(md, &mod_targs);
@@ -1599,18 +1735,32 @@ static bool {inst}__has(struct {inst}* xs, {ce} x) {{\n\
             ("STRING", "character_at", 1, "CHAR"),
             ("STRING", "concat", 1, "STRING"),
             ("STRING", "to_utf8", 0, "BYTES"),
+            ("STRING", "slice", 2, "STRING"),
+            ("STRING", "less_than", 1, "BOOL"),
             ("BYTES", "length", 0, "NAT"),
             ("BYTES", "is_empty", 0, "BOOL"),
             ("BYTES", "at", 1, "U64"),
             ("BYTES", "equals", 1, "BOOL"),
+            ("BYTES", "concat", 1, "BYTES"),
+            ("BYTES", "slice", 2, "BYTES"),
         ];
+        if rt == "BYTES" && m == "to_list" && args.is_empty() {
+            let f = self.list_bytes_helper("to_list")?;
+            return self.runtime_call(&f, vec![rv], "LIST[U64]", true);
+        }
         let Some((_, _, _, ret)) = table.iter().find(|(t, n, k, _)| *t == rt && *n == m && *k == args.len()) else {
-            return Err(format!("`{rt}.{m}` has no C runtime implementation"));
+            // Not a primitive: it compiles from its verified source, over the primitives.
+            return match self.module(&rt) {
+                Some(md) if Self::find_routine(md, m).is_some() => {
+                    self.lower_call(cx, md, m, Some(rv), args, None, hc)
+                }
+                _ => Err(format!("`{rt}.{m}` has no C runtime implementation")),
+            };
         };
         let mut vals = vec![rv];
         for x in args {
             let exp = match m {
-                "character_at" | "at" => "NAT",
+                "character_at" | "at" | "slice" => "NAT",
                 _ => rt.as_str(),
             };
             vals.push(self.lower(cx, x, Some(exp), hc)?);
@@ -1635,6 +1785,9 @@ static bool {inst}__has(struct {inst}* xs, {ce} x) {{\n\
             }
             ("has", 1) => {
                 let x = self.lower(cx, &args[0], Some(&elem), hc)?;
+                if !self.has_equality(&elem) {
+                    return Err(format!("`has` on `{rt}` cannot be executed: its elements hold a function"));
+                }
                 self.runtime_call(&format!("{inst}__has"), vec![rv, x], "BOOL", true)
             }
             ("length", 0) => self.runtime_call(&format!("{inst}__length"), vec![rv], "NAT", true),
@@ -2077,6 +2230,12 @@ static bool {inst}__has(struct {inst}* xs, {ce} x) {{\n\
                     let e = self.eq_code(&rt, &ac, &bc)?;
                     return Ok(owned(self.with_temps(t, e, "BOOL")?, "BOOL"));
                 }
+                // `less_than` from a concept bound, at a scalar instance: no module holds it.
+                if matches!(m.as_str(), "less_than" | "less_or_equal") && args.len() == 1 && rt != "F64" && is_scalar(&cnorm(&rt)) {
+                    let b = self.lower(cx, &args[0], Some(&rt), hc)?;
+                    let op = if m == "less_than" { "<" } else { "<=" };
+                    return Ok(owned(format!("({} {op} {})", rv.code, b.code), "BOOL"));
+                }
                 if rt == "CHAR" && m == "code" && args.is_empty() {
                     return Ok(owned(format!("((uint64_t)({}))", rv.code), "NAT"));
                 }
@@ -2102,6 +2261,15 @@ static bool {inst}__has(struct {inst}* xs, {ce} x) {{\n\
                             self.ctype(&rt)?;
                             return self.project(rv, &format!("->{m}"), ft);
                         }
+                    }
+                }
+                // `r.handler(x)`: a field of function type is applied, not called as a routine.
+                if !args.is_empty() && Self::find_routine(md, m).is_none() {
+                    let field = self.variant_fields(&rt, None).and_then(|fs| fs.into_iter().find(|(f, _)| f == m));
+                    if let Some((_, ft)) = field.filter(|(_, ft)| cfn_parts(ft).is_some()) {
+                        self.ctype(&rt)?;
+                        let f = self.project(rv, &format!("->{m}"), &ft)?;
+                        return self.call_value(cx, f, args, hc);
                     }
                 }
                 cx.tail_site = tail;
@@ -2343,8 +2511,34 @@ static bool {inst}__has(struct {inst}* xs, {ce} x) {{\n\
                 let a = self.lower(cx, &args[0], Some("BYTES"), hc)?;
                 return self.runtime_call("gardel_string_from_utf8", vec![a], &cnorm(FROM_UTF8_RESULT_TYPE), true);
             }
+            ("BYTES_BUILDER", "join_reversed", 1) => {
+                let a = self.lower(cx, &args[0], Some("LIST[BYTES]"), hc)?;
+                let f = self.join_reversed_helper()?;
+                return self.runtime_call(&f, vec![a], "BYTES", true);
+            }
+            ("BYTES", "from_list", 1) => {
+                let a = self.lower(cx, &args[0], Some("LIST[U64]"), hc)?;
+                let f = self.list_bytes_helper("from_list")?;
+                return self.runtime_call(&f, vec![a], "BYTES", true);
+            }
+            ("BYTES", "empty", 0) => {
+                return Ok(owned("((GardelBytes){ NULL, 0, NULL })".to_string(), "BYTES"));
+            }
             ("STRING", _, _) | ("BYTES", _, _) => {
-                return Err(format!("`{v}.{m}` has no C runtime implementation"));
+                // Not a primitive: a routine with no `Current` compiles from its verified source.
+                let md = self.module(v).ok_or_else(|| format!("unknown name `{v}`"))?;
+                return match Self::find_routine(md, m) {
+                    Some((_, kind)) if kind == "create" => self.lower_call(cx, md, m, None, args, expect, hc),
+                    _ => Err(format!("`{v}.{m}` has no C runtime implementation")),
+                };
+            }
+            ("NAT", "from_i64", 1) => {
+                let a = self.lower(cx, &args[0], Some("I64"), hc)?;
+                return Ok(owned(format!("((uint64_t)({}))", a.code), "NAT"));
+            }
+            ("I64", "from_nat", 1) => {
+                let a = self.lower(cx, &args[0], Some("NAT"), hc)?;
+                return Ok(owned(format!("((int64_t)({}))", a.code), "I64"));
             }
             ("CHAR", "from_scalar", 1) => {
                 let a = self.lower(cx, &args[0], Some("NAT"), hc)?;

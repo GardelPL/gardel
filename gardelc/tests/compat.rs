@@ -443,6 +443,23 @@ fn a_public_invariant_is_compared() {
 }
 
 #[test]
+/// `STRING` went from `satisfies EQ` to `satisfies ORD` (Task F.2). `ORD` refines `EQ`, so a
+/// client that needs `EQ` still has it.
+#[test]
+fn a_concept_kept_through_a_refinement_is_not_breaking() {
+    let eq_laws = "specify {EQ}\n\n  law reflexive(a: TAG)\n    ensure\n      refl: a.equals(a)\n    end\n\n  law symmetric(a: TAG, b: TAG)\n    require\n      ab: a.equals(b)\n    ensure\n      ba: b.equals(a)\n    end\n\n  law transitive(a: TAG, b: TAG, c: TAG)\n    require\n      ab: a.equals(b)\n      bc: b.equals(c)\n    ensure\n      ac: a.equals(c)\n    end\n\n";
+    let old = format!(
+        "module TAG satisfies EQ\n\nrepresentation {{ANY}}\n  | One\n  | Two\n\nfeature {{ANY}}\n\n  equals(other: TAG): BOOL\n    do\n      Current = other\n    end\n\n{eq_laws}end\n"
+    );
+    let new = old.replace("module TAG satisfies EQ", "module TAG satisfies CANONICAL_EQ").replace(
+        "\nend\n",
+        "\nspecify {CANONICAL_EQ}\n\n  law agrees_with_structural(a: TAG, b: TAG)\n    ensure\n      sound: a.equals(b) = (a = b)\n    end\n\nend\n",
+    );
+    let (_w, out) = changed("refined_concept", &old, &new);
+    assert_compatible(&out);
+}
+
+#[test]
 fn a_concept_that_is_dropped_is_breaking() {
     let plain = "module TAG\n\nrepresentation {ANY}\n  | One\n  | Two\n\nend\n";
     let old = plain.replace("module TAG", "module TAG satisfies CANONICAL_EQ");
