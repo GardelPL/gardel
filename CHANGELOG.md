@@ -28,6 +28,8 @@ Spec draft v0.5. [plan/Roadmap.md](plan/Roadmap.md) holds the detail for each ta
 - **`assume` under `--strict`** (E.3). An `assume` nested in an expression, such as a `let` value or a call argument, was neither refused by `--strict` nor listed by `--audit`, so a false contract could verify at exit 0. Every expression and contract clause is now covered.
 
 ### Verifier
+- **Boogie 3.4.3 is pinned** in place of 3.1.6, which removes the shutdown hang (fixed in 3.2.4). 3.5.x is not used, as it fails `SEQ.filter` in about 1 of 7 runs. No verdict changed.
+- **Continuous integration.** Every push to `main` or `libraries`, and every pull request, builds `gardelc`, verifies the stdlib and examples under `--strict` with no proof cache, and runs `cargo test`.
 - **A hung `boogie /version` no longer turns the cache off** (F.0). Boogie 3.1.6 hangs for good in about 1 of 275 of these calls, as it shuts down, which made proof cache tests fail at random. Each call now gets 10 s and up to three tries, and only a hang is tried again. If a tool gives no version, a `[cache] off` line names it and the reason.
 - **`--verify-deps` proves the prelude** that `gardelc` carries (E.4), as well as every module of the build.
 - **Local verification cache** (E.3). A module this machine has proven is not given to the solver again, unless something that decides the answer changed: its verification condition, `gardelc`, Boogie, Z3, or the limits. The stdlib goes from 15.2 s to 0.4 s on a second run. The cache is outside the project, in `GARDEL_CACHE_DIR` or the user's cache directory, and an entry from anywhere else, or changed in any byte, is ignored. `--verify-deps` ignores the cache.

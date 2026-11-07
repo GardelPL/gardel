@@ -13219,10 +13219,11 @@ fn tool_versions(boogie: &str, z3: &str) -> Result<String, ToolFailure> {
 /// long is stuck. Waiting longer would not help: see `TOOL_VERSION_TRIES`.
 const TOOL_VERSION_LIMIT: u64 = 10;
 
-/// Boogie 3.1.6 hangs for good in about 1 of 275 `/version` calls, as it shuts down: a worker
-/// thread that has not yet reached its queue misses the cancellation, and `Dispose` joins it
-/// (`CustomStackSizePoolTaskScheduler`). A new run does not inherit that. If all three tries
-/// hang, that run has no cache, which costs time and nothing else.
+/// Boogie before 3.2.4 hangs for good in about 1 of 275 `/version` calls, as it shuts down: a
+/// worker thread that has not yet reached its queue misses the cancellation, and `Dispose`
+/// joins it (`CustomStackSizePoolTaskScheduler`). A new run does not inherit that. Boogie is
+/// now pinned past this, and the tries stay for an older Boogie on the path. If all three
+/// tries hang, that run has no cache, which costs time and nothing else.
 const TOOL_VERSION_TRIES: u32 = 3;
 
 thread_local! {

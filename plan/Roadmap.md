@@ -848,6 +848,8 @@ flowchart TD
 
 **Not in this phase:** TLS, HTTP/2, WebSockets, chunked transfer encoding, printing `F64` as text, databases, handling events in parallel, and full liveness proofs.
 
+**Boogie is pinned to 3.4.3 (2026-11-07),** which has the fix below. See [the plan](libraries/verified_libraries.md#task-f0-resolve-the-failing-e3-test) for why 3.5.x was rejected.
+
 **Cause of the failing E.3 test (Task F.0):** a deadlock in Boogie 3.1.6, not load and not the 30 second limit. `boogie /version` hangs for good in about 1 of 275 calls: a worker thread between its loop check and `queue.Dequeue()` misses the cancellation in `CustomStackSizePoolTaskScheduler.Dispose`, which then joins that thread forever. `tool_versions` now names the tool and the reason, and gives each call 10 s and up to three tries, with only a hang tried again. The steps and measurements are in [the plan](libraries/verified_libraries.md#task-f0-resolve-the-failing-e3-test).
 
 **What probing found (commit `1349cb6`):**

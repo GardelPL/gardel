@@ -167,7 +167,7 @@ Automated setup scripts are provided in `scripts/` to install Boogie and Z3 (via
 * **Windows** (via `winget` and `dotnet`):
   ```powershell
   winget install Microsoft.Dafny
-  dotnet tool install --global Boogie
+  dotnet tool install --global Boogie --version 3.4.3
   ```
 * **macOS** (via Homebrew):
   ```bash
@@ -176,7 +176,7 @@ Automated setup scripts are provided in `scripts/` to install Boogie and Z3 (via
 * **Linux** (via `apt` and `dotnet`):
   ```bash
   sudo apt install z3
-  dotnet tool install --global Boogie
+  dotnet tool install --global Boogie --version 3.4.3
   # Download Dafny from https://github.com/dafny-lang/dafny/releases
   ```
 
