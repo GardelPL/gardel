@@ -1,7 +1,7 @@
 # Phase F: Verified Libraries and Applications
 
 **Date:** November 6, 2026
-**Status:** Proposed. No task started, and the decisions below are still open.
+**Status:** In progress. Task F.0 is completed, and the decisions below are still open.
 **Roadmap entry:** [Phase F in Roadmap.md](../Roadmap.md#phase-f-verified-libraries-and-applications)
 **Probed at:** commit `1349cb6`
 
@@ -132,10 +132,20 @@ Every task follows the rules of Phase E:
 
 `test_e3_a_forged_entry_cannot_prove_a_false_contract` failed once in six full runs, at `gardelc/src/main.rs:23523`, because `tool_versions` returned `None`. That can mean a spawn failure, a 30 second timeout, empty output or a failed exit status, and the code cannot tell them apart.
 
-- [ ] Make `tool_versions` say which tool failed and why.
-- [ ] Run the suite repeatedly under load until it fails, or until enough clean runs are recorded.
-- [ ] Fix the cause. If it only happens under load, cache the versions for one process or raise the limit, and record the measurement.
-- Acceptance: the cause is named in the Roadmap and its known-limit line is removed. If it does not reproduce, the line stays, and a future failure names the tool and reason.
+**Status:** ✅ Completed.
+
+- [x] Make `tool_versions` say which tool failed and why.
+- [x] Run the suite repeatedly under load until it fails, or until enough clean runs are recorded.
+- [x] Fix the cause. If it only happens under load, cache the versions for one process or raise the limit, and record the measurement.
+- [x] Acceptance: the cause is named in the Roadmap and its known-limit line is removed. If it does not reproduce, the line stays, and a future failure names the tool and reason.
+- **Cause.** With the reason reported, a failure read `boogie.exe /version gave no answer in 30 s`. Stacks of a stuck process show `Main` in `ExecutionEngine.Dispose`, joining a worker in `CustomStackSizePoolTaskScheduler.RunItem` that waits on `Task.Result`. In Boogie 3.1.6, a worker past its `IsCancellationRequested` check that calls `queue.Dequeue()` after `Dispose` has run `Cancel` and `queue.Clear` adds a wait that nothing ends. Boogie's `master` adds `thread.Interrupt()` before the join.
+- **Why neither proposed fix was used.** Raising the limit cannot help, as a stuck process was still stuck after 270 s. Caching the versions for one process is already done (`ProofCache::tools`), and each run of `gardelc` is a new process.
+- **Fix.** A limit of 10 s, and up to three tries. Only a hang is tried again. A failed status or empty output is reported at once, and a version counts only from a run that ended well, so the cache keys do not change. Accepting the line a stuck process had already printed was rejected, as it would drop that rule.
+- **Measured under load, with the test suite running.** Hangs: 4 in 1,500 `/version` calls, 4 in another 694, and 4 in 1,500 with `/vcsCores:1`, which does not help. Runs that ended took at most 2.3 s. Hangs can come in groups: the 4 in 694 came within seconds of each other. A real proof of a small file: 0 in 1,500.
+- **Result.** Before: `proof_cache` failed 3 of 23 runs. After: 30 of 30 passed, with 12 of 12 unit test runs beside them. `cargo test` 216/216, 47/47, 48/48, 4/4, 17/17 and 9/9. Four mutations, each on a private copy, turn a test red: no retry, one try too many, retrying every failure, and ignoring a failed status.
+- **Known limits.**
+  - The race is in code that every Boogie run reaches, so a real proof could hang too, and it would then stop at the 600 s backstop. None was seen, but 0 in 1,500 does not rule it out. Only a Boogie with the fix removes it, and moving Boogie means recalibrating the rlimit.
+  - All three tries can hang. That run has no cache and says why, and a test that counts cache hits then fails, naming the tool.
 
 #### Task F.1: Compiler Gaps
 

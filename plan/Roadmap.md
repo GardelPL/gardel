@@ -835,19 +835,20 @@ flowchart TD
   - `new_public_name` is given for every new name, as a package cannot see its clients. Only a client's own build can say whether a name clashes.
   - A renamed type parameter, a weaker bound and a changed `trigger` are not analysed. The first two count as breaking, and a changed `trigger` counts as nothing, although it can stop a client's proof from going through.
   - A proof can also depend on how a contract is written, so a compatible change can still need a client's proof to be adjusted.
-  - `test_e3_a_forged_entry_cannot_prove_a_false_contract` failed once in six full runs of this task, with no answer from `tool_versions`, and the cause was not found. That code is from E.3, and this task did not change it.
 
 ---
 
 ### Phase F: Verified Libraries and Applications
 
-**Status:** Proposed (2026-11-06). No task started, and decisions 1 to 11 of the plan are open.
+**Status:** In progress. Task F.0 is completed, and decisions 1 to 11 of the plan are open.
 
 **Objective:** build real software on Phases A to E, and let it decide what the core libraries need: text, number and map libraries, a verified JSON package, a REST library with sync and then async handlers, and a terminal library with a tool built on it. Nothing goes into a library without a client in this plan that needs it.
 
 **The detailed plan is [libraries/verified_libraries.md](libraries/verified_libraries.md):** findings, task graph, decisions, and each task's steps and acceptance criteria.
 
 **Not in this phase:** TLS, HTTP/2, WebSockets, chunked transfer encoding, printing `F64` as text, databases, handling events in parallel, and full liveness proofs.
+
+**Cause of the failing E.3 test (Task F.0):** a deadlock in Boogie 3.1.6, not load and not the 30 second limit. `boogie /version` hangs for good in about 1 of 275 calls: a worker thread between its loop check and `queue.Dequeue()` misses the cancellation in `CustomStackSizePoolTaskScheduler.Dispose`, which then joins that thread forever. `tool_versions` now names the tool and the reason, and gives each call 10 s and up to three tries, with only a hang tried again. The steps and measurements are in [the plan](libraries/verified_libraries.md#task-f0-resolve-the-failing-e3-test).
 
 **What probing found (commit `1349cb6`):**
 
@@ -857,7 +858,7 @@ flowchart TD
 
 | Step | Task | Delivers |
 | :--- | :--- | :--- |
-| 1. Foundations | [F.0](libraries/verified_libraries.md#task-f0-resolve-the-failing-e3-test) | The failing E.3 test resolved |
+| 1. Foundations | [F.0](libraries/verified_libraries.md#task-f0-resolve-the-failing-e3-test) | The failing E.3 test resolved ✅ |
 | | [F.1](libraries/verified_libraries.md#task-f1-compiler-gaps) | Generic bounds, match binders, function fields in C |
 | 2. Core libraries | [F.2](libraries/verified_libraries.md#task-f2-bytes-string-and-number-text) | `BYTES`, `STRING` and number text |
 | | [F.3](libraries/verified_libraries.md#task-f3-mapk-v) | `MAP[K, V]` |
@@ -895,7 +896,7 @@ flowchart TD
 
 ## 6. Immediate Next Step
 
-**Phase F: Verified Libraries and Applications** is next. Take the open decisions in [libraries/verified_libraries.md](libraries/verified_libraries.md) one at a time, starting with those Task F.0 and Task F.1 need, then start Task F.0.
+**Phase F: Verified Libraries and Applications** is in progress, and Task F.0 is completed. Task F.1 is next. It needs decision 1 of [libraries/verified_libraries.md](libraries/verified_libraries.md) only if the nested recursion option is chosen, so take that decision first.
 
 **Phase E: Projects and Packages:** Tasks E.0 to E.5 and E.7 are completed, so Phase E is complete. Fetching dependencies and a lockfile were dropped, as a path dependency on a git submodule already pins a commit.
 

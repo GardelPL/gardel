@@ -84,7 +84,9 @@ fn assert_refused(out: &Output, text: &str) {
 
 fn tally(out: &Output) -> (usize, usize) {
     let text = all(out);
-    let line = text.lines().find(|l| l.contains("[cache]")).expect("a cache line");
+    // Shown if the test then fails: a tool with no version makes every proof run again.
+    text.lines().filter(|l| l.contains("[cache] off")).for_each(|l| println!("{l}"));
+    let line = text.lines().find(|l| l.contains("verified now")).expect("a cache line");
     let numbers: Vec<usize> = line.split_whitespace().filter_map(|w| w.parse().ok()).collect();
     (numbers[0], numbers[1])
 }
