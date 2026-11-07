@@ -44,13 +44,8 @@ if (Get-Command "boogie" -ErrorAction SilentlyContinue) {
     Write-Host "[OK] Boogie is already available in PATH" -ForegroundColor Green
 } elseif (Get-Command "dotnet" -ErrorAction SilentlyContinue) {
     Write-Host "[*] Installing Boogie via dotnet tool..." -ForegroundColor Yellow
-    try {
-        & dotnet tool install --global Boogie
-    } catch {
-        # Fall back to net7.0-compatible Boogie 3.1.6 if dotnet is v7
-        Write-Host "[*] Retrying with .NET 7 compatible version (Boogie 3.1.6)..." -ForegroundColor Yellow
-        & dotnet tool install --global Boogie --version 3.1.6
-    }
+    # 3.4.3 is pinned: 3.1.6 hangs at shutdown, and 3.5.x fails SEQ.filter in some runs.
+    & dotnet tool install --global Boogie --version 3.4.3
     Write-Host "[OK] Boogie installed via dotnet" -ForegroundColor Green
 } else {
     Write-Warning ".NET SDK (dotnet) not found. Boogie requires .NET SDK: https://dotnet.microsoft.com/download"

@@ -6,6 +6,7 @@
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::env;
+use std::fmt;
 use std::fs;
 use std::process::Command;
 use std::rc::Rc;
@@ -13126,20 +13127,104 @@ fn verifier_id() -> String {
     proof_cache::hex(&proof_cache::sha256(text.as_bytes()))
 }
 
-/// The versions of Boogie and Z3, or `None` if either cannot say.
-fn tool_versions(boogie: &str, z3: &str) -> Option<String> {
-    let version = |path: &str, flag: &str| {
-        let limit = std::time::Duration::from_secs(TOOL_VERSION_LIMIT);
-        let output = output_within(Command::new(path).arg(flag), limit).ok()??;
-        let text = String::from_utf8_lossy(&output.stdout);
-        let line = text.lines().map(str::trim).find(|l| !l.is_empty())?.to_string();
-        output.status.success().then_some(line)
-    };
-    Some(format!("{}\n{}", version(boogie, "/version")?, version(z3, "--version")?))
+/// Why a tool gave no version.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum VersionFailure {
+    /// It could not be started, or waiting for it failed.
+    CannotRun(String),
+    /// It had not ended after `secs` seconds, and was stopped, in each of `tries` runs.
+    Timeout { secs: u64, tries: u32 },
+    /// It ended with a failed status, given here with the first line of its error output.
+    Failed(String),
+    /// It ended well with nothing on standard output. Holds its first line of error output.
+    NoOutput(String),
 }
 
-/// Asking a tool for its version is fast, so a tool that takes this long is not working.
-const TOOL_VERSION_LIMIT: u64 = 30;
+/// Which tool gave no version, and why.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ToolFailure {
+    tool: String,
+    flag: &'static str,
+    why: VersionFailure,
+}
+
+impl fmt::Display for ToolFailure {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let Self { tool, flag, why } = self;
+        write!(f, "`{tool} {flag}` ")?;
+        match why {
+            VersionFailure::CannotRun(e) => write!(f, "could not run: {e}"),
+            VersionFailure::Timeout { secs, tries } => {
+                write!(f, "gave no answer in {tries} tries of {secs} s")
+            }
+            VersionFailure::Failed(status) => write!(f, "failed: {status}"),
+            VersionFailure::NoOutput(stderr) => write!(f, "printed no version: {stderr}"),
+        }
+    }
+}
+
+fn first_line(bytes: &[u8]) -> Option<String> {
+    let text = String::from_utf8_lossy(bytes);
+    text.lines().map(str::trim).find(|l| !l.is_empty()).map(str::to_string)
+}
+
+/// The first line `make` prints, or why it gave none. Only a hang is tried again, and the
+/// answer that counts is always that of a run that ended well.
+fn ask_version(
+    make: impl Fn() -> Command,
+    limit: std::time::Duration,
+    tries: u32,
+) -> Result<String, VersionFailure> {
+    let hang = VersionFailure::Timeout { secs: limit.as_secs(), tries };
+    for _ in 1..tries {
+        match ask_version_once(&mut make(), limit, &hang) {
+            Err(e) if e == hang => {}
+            answer => return answer,
+        }
+    }
+    ask_version_once(&mut make(), limit, &hang)
+}
+
+fn ask_version_once(
+    cmd: &mut Command,
+    limit: std::time::Duration,
+    hang: &VersionFailure,
+) -> Result<String, VersionFailure> {
+    let output = output_within(cmd, limit)
+        .map_err(|e| VersionFailure::CannotRun(e.to_string()))?
+        .ok_or_else(|| hang.clone())?;
+    let stderr = first_line(&output.stderr).unwrap_or_default();
+    if !output.status.success() {
+        return Err(VersionFailure::Failed(format!("{}: {stderr}", output.status)));
+    }
+    first_line(&output.stdout).ok_or(VersionFailure::NoOutput(stderr))
+}
+
+/// The versions of Boogie and Z3, or the first of them that cannot say and why.
+fn tool_versions(boogie: &str, z3: &str) -> Result<String, ToolFailure> {
+    let version = |tool: &str, flag| {
+        let limit = std::time::Duration::from_secs(TOOL_VERSION_LIMIT);
+        let make = || {
+            let mut cmd = Command::new(tool);
+            cmd.arg(flag);
+            cmd
+        };
+        ask_version(make, limit, TOOL_VERSION_TRIES)
+            .map_err(|why| ToolFailure { tool: tool.to_string(), flag, why })
+    };
+    Ok(format!("{}\n{}", version(boogie, "/version")?, version(z3, "--version")?))
+}
+
+/// Asking a tool for its version took at most 2.3 s under load, so a tool that takes this
+/// long is stuck. Waiting longer would not help: see `TOOL_VERSION_TRIES`.
+const TOOL_VERSION_LIMIT: u64 = 10;
+
+/// Boogie before 3.2.4 hangs for good in about 1 of 275 `/version` calls, as it shuts down: a
+/// worker thread that has not yet reached its queue misses the cancellation, and `Dispose`
+/// joins it (`CustomStackSizePoolTaskScheduler`). A new run does not inherit that. Boogie is
+/// now pinned past this, and the tries stay for an older Boogie on the path. If all three
+/// tries hang, that run has no cache, which costs time and nothing else.
+const TOOL_VERSION_TRIES: u32 = 3;
 
 thread_local! {
     /// The cache of this verification run, if it has one.
@@ -13170,7 +13255,13 @@ fn verify_unless_cached(
     };
     // Someone keeping the VC file is debugging, and a hit would write none.
     let debugging = env::var_os("GARDEL_KEEP_BPL").is_some();
-    let tools = cache.tools(|| tool_versions(boogie_path, z3_path)).filter(|_| !debugging);
+    // With no versions there is no key, so nothing can be looked up or stored.
+    let find_tools = || {
+        tool_versions(boogie_path, z3_path)
+            .map_err(|e| eprintln!("[cache] off: {e}"))
+            .ok()
+    };
+    let tools = cache.tools(find_tools).filter(|_| !debugging);
     let Some(tools) = tools else {
         cache.count_run();
         return run();
@@ -23520,7 +23611,7 @@ int main(void) {
     /// The key a run gives `LIB`, for a test that must forge its entry.
     fn e3_key_of_lib(checked: &CheckedProject, cache: &ProofCache) -> String {
         let (Some(boogie), Some(z3)) = find_solvers() else { panic!("no solver") };
-        let tools = tool_versions(&boogie, &z3).expect("tool versions");
+        let tools = tool_versions(&boogie, &z3).unwrap_or_else(|e| panic!("tool versions: {e}"));
         let units = b4_units(&[("lib.gdl", E3_FALSE_LIB)]);
         let m = &units[0].ast.modules[0];
         with_prelude_injection(true, || {
@@ -23749,6 +23840,153 @@ int main(void) {
         let out = output_within(&mut quick, long).expect("the command starts").expect("it ends");
         assert!(out.status.success());
         assert!(String::from_utf8_lossy(&out.stdout).contains("hello"));
+    }
+
+    /// `script` for `cmd` on Windows, or the same for `sh`.
+    fn f0_shell(windows: &str, unix: &str) -> Command {
+        let (shell, flag, script) =
+            if cfg!(windows) { ("cmd", "/C", windows) } else { ("sh", "-c", unix) };
+        let mut cmd = Command::new(shell);
+        cmd.args([flag, script]);
+        cmd
+    }
+
+    fn f0_ask(windows: &str, unix: &str) -> Result<String, VersionFailure> {
+        ask_version(|| f0_shell(windows, unix), std::time::Duration::from_secs(60), 1)
+    }
+
+    /// A folder for a test whose stand-in tool leaves a mark in its working directory.
+    fn f0_folder(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("gardelc_f0_{}_{name}", std::process::id()));
+        drop(fs::remove_dir_all(&dir));
+        fs::create_dir_all(&dir).expect("a temporary folder");
+        dir
+    }
+
+    fn f0_tool(dir: &std::path::Path, windows: &str, unix: &str) -> Command {
+        let mut cmd = f0_shell(windows, unix);
+        cmd.current_dir(dir);
+        cmd
+    }
+
+    /// How many times the stand-in tool in `dir` was started.
+    fn f0_starts(dir: &std::path::Path) -> usize {
+        fs::read_to_string(dir.join("starts")).expect("it started").lines().count()
+    }
+
+    #[test]
+    fn test_f0_a_tool_that_cannot_start_is_named() {
+        let err = tool_versions("no_such_boogie", "no_such_z3").expect_err("no such tool");
+        assert_eq!((err.tool.as_str(), err.flag), ("no_such_boogie", "/version"));
+        assert!(matches!(err.why, VersionFailure::CannotRun(_)), "{err}");
+        assert!(err.to_string().starts_with("`no_such_boogie /version` could not run: "), "{err}");
+    }
+
+    #[test]
+    fn test_f0_the_tool_that_failed_is_the_one_named() {
+        let (Some(boogie), Some(z3)) = find_solvers() else { panic!("no solver") };
+        let err = tool_versions(&boogie, "no_such_z3").expect_err("no such tool");
+        assert_eq!((err.tool.as_str(), err.flag), ("no_such_z3", "--version"));
+        assert!(tool_versions("no_such_boogie", &z3).is_err());
+        assert_eq!(tool_versions(&boogie, &z3).expect("both answer").lines().count(), 2);
+    }
+
+    #[test]
+    fn test_f0_a_tool_that_hangs_is_stopped_and_reported() {
+        let limit = std::time::Duration::from_secs(1);
+        let out = ask_version(slow_process_tree, limit, 1);
+        assert_eq!(out, Err(VersionFailure::Timeout { secs: 1, tries: 1 }));
+    }
+
+    /// What Boogie does in about 1 of 275 calls: one run never ends, and the next one is fine.
+    #[test]
+    fn test_f0_a_run_that_hangs_is_tried_again() {
+        let dir = f0_folder("hangs_once");
+        let make = || {
+            f0_tool(
+                &dir,
+                "if exist tried (echo 1.0) else (echo.>tried & ping -n 30 127.0.0.1 >NUL)",
+                "if [ -e tried ]; then echo 1.0; else : > tried; sleep 30; fi",
+            )
+        };
+        let out = ask_version(make, std::time::Duration::from_secs(5), TOOL_VERSION_TRIES);
+        assert_eq!(out.as_deref(), Ok("1.0"));
+        drop(fs::remove_dir_all(&dir));
+    }
+
+    #[test]
+    fn test_f0_a_tool_that_always_hangs_is_given_its_tries_and_no_more() {
+        let dir = f0_folder("hangs_always");
+        let make = || {
+            f0_tool(&dir, "echo x>>starts & ping -n 30 127.0.0.1 >NUL", "echo x >> starts; sleep 30")
+        };
+        let why = ask_version(make, std::time::Duration::from_secs(3), 2).expect_err("it hangs");
+        assert_eq!(why, VersionFailure::Timeout { secs: 3, tries: 2 });
+        assert_eq!(f0_starts(&dir), 2);
+        let shown = ToolFailure { tool: "z3".to_string(), flag: "--version", why };
+        assert_eq!(shown.to_string(), "`z3 --version` gave no answer in 2 tries of 3 s");
+        drop(fs::remove_dir_all(&dir));
+    }
+
+    /// A hang says nothing about the tool. A failure does, and it is reported at once.
+    #[test]
+    fn test_f0_only_a_hang_is_tried_again() {
+        let dir = f0_folder("fails");
+        let make = || f0_tool(&dir, "echo x>>starts & exit 3", "echo x >> starts; exit 3");
+        let out = ask_version(make, std::time::Duration::from_secs(60), TOOL_VERSION_TRIES);
+        assert!(matches!(out, Err(VersionFailure::Failed(_))), "{out:?}");
+        assert_eq!(f0_starts(&dir), 1);
+
+        let quiet = f0_folder("quiet");
+        let make = || f0_tool(&quiet, "echo x>>starts", "echo x >> starts");
+        let out = ask_version(make, std::time::Duration::from_secs(60), TOOL_VERSION_TRIES);
+        assert_eq!(out, Err(VersionFailure::NoOutput(String::new())));
+        assert_eq!(f0_starts(&quiet), 1);
+        drop(fs::remove_dir_all(&dir));
+        drop(fs::remove_dir_all(&quiet));
+    }
+
+    #[test]
+    fn test_f0_a_failed_exit_is_a_failure_even_with_a_version() {
+        let err = f0_ask("echo 1.0 & echo broken 1>&2 & exit 3", "echo 1.0; echo broken >&2; exit 3")
+            .expect_err("a failed status");
+        let VersionFailure::Failed(status) = &err else { panic!("{err:?}") };
+        assert!(status.contains('3') && status.ends_with(": broken"), "{status}");
+        let shown = ToolFailure { tool: "z3".to_string(), flag: "--version", why: err.clone() };
+        assert_eq!(shown.to_string(), format!("`z3 --version` failed: {status}"));
+    }
+
+    #[test]
+    fn test_f0_empty_output_is_not_a_version() {
+        assert_eq!(f0_ask("exit 0", "exit 0"), Err(VersionFailure::NoOutput(String::new())));
+        assert_eq!(f0_ask("echo.", "echo"), Err(VersionFailure::NoOutput(String::new())));
+        let err = f0_ask("echo why 1>&2", "echo why >&2").expect_err("nothing on stdout");
+        assert_eq!(err, VersionFailure::NoOutput("why".to_string()));
+        let shown = ToolFailure { tool: "z3".to_string(), flag: "--version", why: err };
+        assert_eq!(shown.to_string(), "`z3 --version` printed no version: why");
+    }
+
+    /// This text is part of every cache key, so it must not change with the reporting.
+    #[test]
+    fn test_f0_the_version_is_the_first_line_with_text() {
+        let out = f0_ask("echo. & echo   Boogie 3.5  & echo more", "echo; echo '  Boogie 3.5  '; echo more");
+        assert_eq!(out.as_deref(), Ok("Boogie 3.5"));
+    }
+
+    /// With no versions there is no key: the same proof is run again, and nothing is stored.
+    #[test]
+    fn test_f0_a_tool_with_no_version_gets_nothing_from_the_cache() {
+        let files = [("fine.gdl", "functions FINE\n\nfeature {ANY}\n\n  f(x: U64): U64\n    do\n      1\n    end\n\nend\n")];
+        let (dir, warm) = e3_cache("no_versions", "v1");
+        e3_run(&files, &warm, &[]);
+        e3_run(&files, &warm, &[]);
+        assert_eq!(warm.tally(), proof_cache::Tally { from_cache: 1, verified: 1 });
+
+        let blind = Rc::new(ProofCache::open_at(&dir, "v1".to_string(), true).expect("cache"));
+        assert_eq!(blind.tools(|| None), None);
+        e3_run(&files, &blind, &[]);
+        assert_eq!(blind.tally(), proof_cache::Tally { from_cache: 0, verified: 1 });
+        drop(fs::remove_dir_all(&dir));
     }
 
     #[test]

@@ -52,9 +52,10 @@ fi
 # 3. Boogie via dotnet
 if command -v dotnet >/dev/null 2>&1; then
     echo "[*] Installing/updating Boogie via dotnet..."
-    dotnet tool install --global Boogie || dotnet tool update --global Boogie || true
+    # 3.4.3 is pinned: 3.1.6 hangs at shutdown, and 3.5.x fails SEQ.filter in some runs.
+    dotnet tool install --global Boogie --version 3.4.3 || dotnet tool update --global Boogie --version 3.4.3 || true
 else
-    echo "[!] .NET SDK not detected. To install Boogie, install .NET SDK (https://dotnet.microsoft.com/download) and run: dotnet tool install -g Boogie"
+    echo "[!] .NET SDK not detected. To install Boogie, install .NET SDK (https://dotnet.microsoft.com/download) and run: dotnet tool install -g Boogie --version 3.4.3"
 fi
 
 echo ""

@@ -172,7 +172,9 @@ fn text(out: &Output) -> String {
 /// (modules verified now, modules from the cache).
 fn tally(out: &Output) -> (usize, usize) {
     let text = text(out);
-    let line = text.lines().find_map(|l| l.trim().strip_prefix("[cache] ")).unwrap_or_else(|| panic!("{text}"));
+    // Shown if the test then fails: a tool with no version makes every proof run again.
+    text.lines().filter(|l| l.contains("[cache] off")).for_each(|l| println!("{l}"));
+    let line = text.lines().find(|l| l.contains("verified now")).unwrap_or_else(|| panic!("{text}"));
     let mut numbers = line.split_whitespace().filter_map(|w| w.parse().ok());
     (numbers.next().expect("verified"), numbers.next().expect("cached"))
 }
@@ -293,9 +295,10 @@ fn strict_is_not_answered_by_a_proof_from_a_weaker_run() {
 #[test]
 fn the_entry_records_the_assumes_it_rests_on() {
     let p = Project::new("recorded", &[("hole.gdl", ASSUMES)]);
-    assert!(p.run(&["hole.gdl"]).status.success());
+    let out = p.run(&["hole.gdl"]);
+    assert!(out.status.success(), "{}", text(&out));
     let entries = p.entries();
-    assert_eq!(entries.len(), 1);
+    assert_eq!(entries.len(), 1, "{}", text(&out));
     let entry = fs::read_to_string(&entries[0]).expect("entry");
     assert!(entry.contains("\nmodule HOLE\n"), "{entry}");
     assert!(entry.contains("\nassume f hole\n"), "{entry}");
@@ -322,6 +325,43 @@ fn a_warm_cache_does_not_excuse_a_verifier_that_cannot_run() {
         .expect("gardelc runs");
     assert!(!out.status.success(), "{}", text(&out));
     assert!(text(&out).contains("nothing is proven"), "{}", text(&out));
+}
+
+/// A Boogie that does verify, and cannot say what version it is. No entry can be found or
+/// stored, and the run says why.
+#[test]
+fn a_tool_with_no_version_is_named_and_uses_no_cache() {
+    let p = Project::new("no_version", &[("fine.gdl", TRUE)]);
+    let boogie = std::env::var("BOOGIE_EXE").unwrap_or_else(|_| {
+        let home = std::env::var("USERPROFILE").or_else(|_| std::env::var("HOME")).expect("home");
+        let exe = if cfg!(windows) { "boogie.exe" } else { "boogie" };
+        Path::new(&home).join(".dotnet").join("tools").join(exe).display().to_string()
+    });
+    #[cfg(windows)]
+    let (path, script) = (
+        p.dir.join("boogie.cmd"),
+        format!("@echo off\r\nif \"%~1\"==\"/version\" exit /b 7\r\n\"{boogie}\" %*\r\n"),
+    );
+    #[cfg(not(windows))]
+    let (path, script) = (
+        p.dir.join("boogie.sh"),
+        format!("#!/bin/sh\nif [ \"$1\" = /version ]; then exit 7; fi\nexec '{boogie}' \"$@\"\n"),
+    );
+    fs::write(&path, script).expect("the stand-in");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).expect("executable");
+    }
+
+    for _ in 0..2 {
+        let out = p.command().arg("fine.gdl").env("BOOGIE_EXE", &path).output().expect("gardelc runs");
+        assert!(out.status.success(), "{}", text(&out));
+        assert_eq!(tally(&out), (1, 0), "{}", text(&out));
+        let reason = format!("[cache] off: `{} /version` failed: ", path.display());
+        assert!(text(&out).contains(&reason), "{}", text(&out));
+    }
+    assert!(p.entries().is_empty());
 }
 
 #[test]
