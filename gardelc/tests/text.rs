@@ -92,6 +92,11 @@ fn a_lie_about_text_does_not_verify() {
         ("slice", "f(s: STRING): BOOL\n    require\n      long: s.code_point_count >= 2\n    do\n      True\n    ensure\n      claim: s.slice(0, 1).code_point_count = 2\n    end\n"),
         ("find", "f(s: STRING, t: STRING): BOOL\n    do\n      True\n    ensure\n      claim: s.find(t, 0).is_some\n    end\n"),
         ("builder", "f(x: NAT): BOOL\n    do\n      True\n    ensure\n      claim: BYTES_BUILDER.empty.add_text(\"ab\").to_bytes.length = 3\n    end\n"),
+        // A machine type is a range of Boogie's `int`: a witness outside it must not count. The
+        // solver proves an `exists` only from a term that matches its body, so the witness is a
+        // call in the `require`. `exists k: NAT. k < 0` or `k = i` fails even with no range.
+        ("exists_nat", "neg(k: MATH_INT): BOOL\n    do\n      k < 0\n    end\n\n  f(i: MATH_INT): BOOL\n    require\n      witness: CLIENT.neg(i)\n    do\n      True\n    ensure\n      claim: exists k: NAT. CLIENT.neg(k)\n    end\n"),
+        ("exists_i64", "big(k: MATH_INT): BOOL\n    do\n      k > 9223372036854775807\n    end\n\n  f(i: MATH_INT): BOOL\n    require\n      witness: CLIENT.big(i)\n    do\n      True\n    ensure\n      claim: exists k: I64. CLIENT.big(k)\n    end\n"),
     ];
     for (name, routine) in lies {
         let p = Project::new(&format!("lie_{name}"), &[("client.gdl", &client(&format!("  {routine}")))]);
@@ -187,6 +192,9 @@ fn a_number_conversion_needs_its_range() {
     let unguarded = [
         ("to_nat", "f(i: I64): NAT\n    do\n      NAT.from_i64(i)\n    end\n"),
         ("to_i64", "f(n: NAT): I64\n    do\n      I64.from_nat(n)\n    end\n"),
+        // One past each edge: the range is exact, not merely present.
+        ("to_nat_edge", "f(i: I64): NAT\n    require\n      edge: i >= 0 - 1\n    do\n      NAT.from_i64(i)\n    end\n"),
+        ("to_i64_edge", "f(n: NAT): I64\n    require\n      edge: n <= 9223372036854775808\n    do\n      I64.from_nat(n)\n    end\n"),
     ];
     for (name, routine) in unguarded {
         let p = Project::new(&format!("conv_{name}"), &[("client.gdl", &client(&format!("  {routine}")))]);

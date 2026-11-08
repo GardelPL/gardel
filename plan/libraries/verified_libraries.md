@@ -183,11 +183,10 @@ Needs decision 1 only if the nested recursion option is chosen.
 
 #### Task F.2: `BYTES`, `STRING` and Number Text
 
-Client: everything after this task. Needs decision 3.
-
+Client: everything after this task. Needs decision 3.
+
 **Status:** In progress. The work below is in place and verifies. Still to do before it is completed:
 
-- Finish the mutation run. Twelve mutations are listed, and so far only the first has run ("quantifier range dropped", red).
 - Run `compare.sh` over the examples, `echo_server`, `hello_api` and `ghttp` again on the final code.
 - Write the spec, GUIDE and CHANGELOG text for the new operations, conversions and fixes.
 
@@ -199,6 +198,13 @@ Done so far:
 - `NAT.from_i64` and `I64.from_nat`, each with an `in_range` obligation.
 - Soundness fixes: `forall` and `exists` over a machine type now carry its range. `--compare-with` no longer calls `EQ` to `ORD` a break.
 - Benchmark on 64 KB: building with the builder and summing with `at`, and `find`, stay within start-up noise (55 to 65 ms). Building with per-byte `concat` costs about 35 ms more, as it is quadratic.
+- Mutations (2026-11-08), each on a private worktree, checked by `--stdlib --strict` and `tests/text.rs` (and `tests/compat.rs` for M6): 12 of 12 red.
+  - Compiler: M1 `forall` over a machine type loses its range; M2 `exists` loses it; M3 `NAT.from_i64` loses `>= 0`; M4 `I64.from_nat` bound off by one; M5 the every-value invariant axiom dropped; M6 `--compare-with` loses the refinement closure.
+  - C runtime: M7 `STRING.less_than` puts a longer prefix first; M8 `STRING.slice` takes an index as a byte offset; M9 the builder joins its parts reversed.
+  - Stdlib: M10 `parse_digits` loses its overflow guard; M11 `list_less` says empty < empty; M12 `STRING.find` never finds.
+  - M2 and M4 first survived, and new tests now catch them: two `exists` lies and one-past-the-edge conversions. `exists k: NAT. k < 0` was no test, as it fails even with no range: Z3 proves an `exists` only from a term matching its body, so the lie needs a call in the `require` as its witness.
+  - Caught by the stdlib run alone: M5 (in `BYTES_BUILDER`, so no client test rests on that axiom) and M11 (`less_irreflexive`).
+  - Caught by the runtime test alone: M12. `find` states only that a match it returns is real, not that it finds one, and the stdlib failure in that run was a timeout in the unrelated `law_hex4_round_trip`.
 - Known limits: elements of a `LIST[U64]` have no lower bound in the model. The axiom that every value of a prelude type satisfies its invariant is an assumption, the same as the existing one on parameters. Stdlib modules skip the `E0317` walk.
 
 - [ ] `BYTES`: `concat`, `slice`, `index_of` (a byte or a sequence), `starts_with`, and a builder that does not copy on each append.

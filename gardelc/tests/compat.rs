@@ -442,7 +442,6 @@ fn a_public_invariant_is_compared() {
     assert_breaking(&out, "`invariant positive`");
 }
 
-#[test]
 /// `STRING` went from `satisfies EQ` to `satisfies ORD` (Task F.2). `ORD` refines `EQ`, so a
 /// client that needs `EQ` still has it.
 #[test]
