@@ -232,7 +232,7 @@ create {ANY}
 
   -- Proof helpers. They are public because the contracts above mention them.
 
-  -- How many decimal digits `n` has.
+  -- How many decimal digits `n` has. Each bound below follows from the one before it.
   digit_count(n: NAT): NAT
     variant
       n
@@ -242,6 +242,15 @@ create {ANY}
       positive: Result >= 1
       one: n < 10 implies Result = 1
       small: n > 0 implies Result <= n
+      two: n < 100 implies Result <= 2
+      three: n < 1000 implies Result <= 3
+      four: n < 10000 implies Result <= 4
+      five: n < 100000 implies Result <= 5
+      six: n < 1000000 implies Result <= 6
+      seven: n < 10000000 implies Result <= 7
+      eight: n < 100000000 implies Result <= 8
+      nine: n < 1000000000 implies Result <= 9
+      ten: n < 10000000000 implies Result <= 10
     end
 
   -- The number `k` followed by the digits of `n`.

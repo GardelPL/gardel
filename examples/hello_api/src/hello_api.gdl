@@ -11,7 +11,7 @@ feature {ANY}
   endpoint(id: NAT, req: HTTP_REQUEST): HTTP_RESPONSE
     do
       if id = 2 then
-        HTTP_RESPONSE.ok_text("hello from a package", "20")
+        HTTP_RESPONSE.ok_text("hello from a package")
       else if id = 3 then
         echo(req)
       else
@@ -26,9 +26,8 @@ feature {ANY}
         case Error(_) then
           HTTP_RESPONSE.from_error(MalformedHeader)
         case Ok(text) then
-          let digits = NUMBER_TEXT.nat_to_text(text.byte_length)
-          if text.byte_length <= 65536 and digits.byte_length >= 1 and digits.byte_length <= 10 then
-            HTTP_RESPONSE.ok_text(text, digits)
+          if text.byte_length <= 65536 then
+            HTTP_RESPONSE.ok_text(text)
           else
             HTTP_RESPONSE.from_error(BodyTooLarge)
           end

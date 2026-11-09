@@ -16,20 +16,22 @@ feature {ANY}
       else if HTTP_STATUS.ok.status_code != 200 then 5
       else if not HTTP_STATUS.no_content.forbids_body then 6
       else if HTTP_HEADERS.default_empty.add(HTTP_HEADER.content_type_json).num_headers != 1 then 7
+      else if not HTTP_HEADERS.default_empty.add(HTTP_HEADER.content_type_json).lookup_header("content-type").is_some then 8
       else if HTTP_HEADER.content_type_json.wire_byte_length != 32 then 9
+      else if not HTTP_RESPONSE.ok_text("hello").content_length_header_value.equals("5") then 10
       else 0
-      end end end end end end end end
+      end end end end end end end end end end
     end
 
   -- Example user-defined REST API handler extension (not part of the HTTP server core).
   rest_api_handler(endpoint_id: NAT, req: HTTP_REQUEST): HTTP_RESPONSE
     do
       if endpoint_id = 10 then
-        HTTP_RESPONSE.ok_text("{}", "2")
+        HTTP_RESPONSE.ok_text("{}")
       else if endpoint_id = 20 then
-        HTTP_RESPONSE.ok_text("[]", "2")
+        HTTP_RESPONSE.ok_text("[]")
       else if endpoint_id = 21 then
-        HTTP_RESPONSE.created_text("{}", "2")
+        HTTP_RESPONSE.created_text("{}")
       else if endpoint_id = 30 then
         HTTP_RESPONSE.no_content_empty
       else
