@@ -1,0 +1,515 @@
+-- A JSON value (RFC 8259): null, a boolean, a number, a string, an array or an object.
+--
+-- The value is opaque: it is read with queries, built with builders, and read from and
+-- written to bytes. Its invariant says it is well-formed: text is well-formed UTF-8, object
+-- keys are unique, and nothing nests deeper than `max_depth` levels. The value is its cells
+-- and nothing else, so two values that read and write the same are equal (`=`).
+--
+-- Numbers (decision 2): an integer in the range of `I64`, written without a fraction or an
+-- exponent, is an `I64`. Any other number keeps its literal text, exactly as read, so writing
+-- it gives the same text back and no precision is lost.
+--
+-- An object keeps its fields in ascending byte order of their keys, and writing a value
+-- gives no white space, so two equal values are written as the same bytes.
+module JSON satisfies CANONICAL_EQ
+
+representation {NONE}
+  cell: JSON_CELL
+
+create {ANY}
+
+  -- The most bytes `parse` reads, and how deeply arrays and objects may nest.
+  max_input: NAT
+    do
+      4194304
+    end
+
+  max_depth: NAT
+    do
+      64
+    end
+
+  -- The scalar builders say how long the value's text is, which `scalar_round_trip` needs.
+  null: JSON
+    do
+      check
+        len: JSON_ROUND_TRIP.scalar_len(JNull)
+      end
+      { cell = JNull }
+    ensure
+      scalar: not Result.is_array and not Result.is_object
+      short: Result.text_length <= 4
+    end
+
+  bool(b: BOOL): JSON
+    do
+      check
+        len: JSON_ROUND_TRIP.scalar_len(JBool(b))
+      end
+      { cell = JBool(b) }
+    ensure
+      scalar: not Result.is_array and not Result.is_object
+      short: Result.text_length <= 5
+    end
+
+  int(i: I64): JSON
+    do
+      check
+        len: JSON_ROUND_TRIP.scalar_len(JInt(i))
+      end
+      { cell = JInt(i) }
+    ensure
+      scalar: not Result.is_array and not Result.is_object
+      short: Result.text_length <= 20
+    end
+
+  -- The string `s`. Its text is well-formed UTF-8, so the test cannot fail.
+  string(s: STRING): JSON
+    do
+      let t = s.to_utf8.to_list
+      if JSON_READER.valid_text(t) then
+        check
+          len: JSON_ROUND_TRIP.scalar_len(JString(t))
+          bytes: t.length = s.byte_length
+        end
+        { cell = JString(t) }
+      else
+        check
+          len: JSON_ROUND_TRIP.scalar_len(JNull)
+        end
+        { cell = JNull }
+      end
+    ensure
+      scalar: not Result.is_array and not Result.is_object
+      short: Result.text_length <= 6 * s.byte_length + 4
+    end
+
+  -- The number `text` is written as, if it is a JSON number: `-`, digits, and an optional
+  -- fraction and exponent.
+  number(text: STRING): OPTION[JSON]
+    do
+      let bs = text.to_utf8.to_list
+      if bs.length > 0 and JSON_CELL.number_next(0, JSON_BYTES.first(bs)) != 9 then
+        match JSON_READER.number(bs)
+          case Ok(s) then
+            if JSON_BYTES.is_empty(s.rest) then
+              check
+                up: JSON_CELL.ok_up(s.cell, 0, 64)
+              end
+              Some({ cell = s.cell })
+            else
+              None
+            end
+          case Error(_) then None
+        end
+      else
+        None
+      end
+    end
+
+  empty_array: JSON
+    do
+      { cell = JArray(JEnd) }
+    end
+
+  empty_object: JSON
+    do
+      { cell = JObject(JEnd) }
+    end
+
+  -- The value the bytes `b` hold: one JSON value, with only white space around it.
+  parse(b: BYTES): RESULT[JSON_ERROR, JSON]
+    do
+      if b.length > 4194304 then
+        Error(TooLarge(4194304))
+      else
+        let bs = b.to_list
+        match JSON_READER.document(bs, 64)
+          case Error(e) then Error(e.from_end(b.length))
+          case Ok(s) then
+            check
+              up: JSON_CELL.ok_up(s.cell, s.levels, 64)
+            end
+            Ok({ cell = s.cell })
+        end
+      end
+    ensure
+      bounded: match Result
+        case Error(e) then e.offset <= b.length or b.length > 4194304
+        case Ok(_) then True
+      end
+    end
+
+  parse_text(s: STRING): RESULT[JSON_ERROR, JSON]
+    do
+      JSON.parse(s.to_utf8)
+    end
+
+feature {ANY}
+
+  equals(other: JSON): BOOL
+    do
+      Current = other
+    ensure
+      def: Result = (Current = other)
+    end
+
+  -- How deeply arrays and objects nest in this value: 0 for a scalar, 1 for an array or
+  -- object of scalars.
+  depth: NAT
+    do
+      Current.cell.levels
+    end
+
+  is_null: BOOL
+    do
+      match Current.cell
+        case JNull then True
+        case _ then False
+      end
+    end
+
+  is_array: BOOL
+    do
+      match Current.cell
+        case JArray(_) then True
+        case _ then False
+      end
+    end
+
+  is_object: BOOL
+    do
+      match Current.cell
+        case JObject(_) then True
+        case _ then False
+      end
+    end
+
+  as_bool: OPTION[BOOL]
+    do
+      match Current.cell
+        case JBool(b) then Some(b)
+        case _ then None
+      end
+    end
+
+  -- The integer, if this is a number that is one.
+  as_int: OPTION[I64]
+    do
+      match Current.cell
+        case JInt(i) then Some(i)
+        case _ then None
+      end
+    end
+
+  -- The text of a number as written: digits for an integer, the literal for any other.
+  number_text: OPTION[STRING]
+    do
+      match Current.cell
+        case JInt(i) then Some(NUMBER_TEXT.i64_to_text(i))
+        case JNumber(t) then
+          match JSON.text_of(t)
+            case Some(s) then Some(s)
+            case None then None
+          end
+        case _ then None
+      end
+    end
+
+  as_string: OPTION[STRING]
+    do
+      match Current.cell
+        case JString(t) then JSON.text_of(t)
+        case _ then None
+      end
+    end
+
+  -- The number of items of an array or fields of an object, and 0 for anything else.
+  count: NAT
+    do
+      match Current.cell
+        case JArray(its) then JSON.chain_count(its, 0)
+        case JObject(fs) then JSON.chain_count(fs, 0)
+        case _ then 0
+      end
+    end
+
+  -- The item at index `i` of an array.
+  item(i: NAT): OPTION[JSON]
+    do
+      match Current.cell
+        case JArray(its) then
+          match JSON.nth_item(its, i, 63)
+            case Some(c) then
+              check
+                up: JSON_CELL.ok_up(c, 63, 64)
+              end
+              Some({ cell = c })
+            case None then None
+          end
+        case _ then None
+      end
+    end
+
+  -- The value under `key` in an object.
+  field(key: STRING): OPTION[JSON]
+    do
+      match Current.cell
+        case JObject(fs) then
+          match JSON.find_field(fs, key.to_utf8.to_list, 63)
+            case Some(c) then
+              check
+                up: JSON_CELL.ok_up(c, 63, 64)
+              end
+              Some({ cell = c })
+            case None then None
+          end
+        case _ then None
+      end
+    end
+
+  -- The array with `v` after its last item, if this is an array and the result is not
+  -- nested deeper than `max_depth`.
+  with_item(v: JSON): OPTION[JSON]
+    do
+      match Current.cell
+        case JArray(its) then
+          if v.cell.fits(63) then
+            check
+              v_fits: JSON_CELL.fits_ok(v.cell, 64, 63)
+              reversed: JSON_CELL.reverse_items_ok(its, JEnd, 63)
+              added: JSON_CELL.reverse_items_ok(JItem(v.cell, JSON_CELL.reverse_items(its, JEnd)), JEnd, 63)
+            end
+            Some({ cell = JArray(JSON_CELL.reverse_items(JItem(v.cell, JSON_CELL.reverse_items(its, JEnd)), JEnd)) })
+          else
+            None
+          end
+        case _ then None
+      end
+    end
+
+  -- The object with `key` set to `v`, replacing any value it had, if this is an object and
+  -- the result is not nested deeper than `max_depth`.
+  with_field(key: STRING, v: JSON): OPTION[JSON]
+    do
+      match Current.cell
+        case JObject(fs) then
+          let k = key.to_utf8.to_list
+          if v.cell.fits(63) and JSON_READER.valid_text(k) then
+            check
+              v_fits: JSON_CELL.fits_ok(v.cell, 64, 63)
+            end
+            Some({ cell = JObject(JSON.put_field(fs, k, v.cell, JEnd, 63)) })
+          else
+            None
+          end
+        case _ then None
+      end
+    end
+
+  -- The value as JSON text.
+  to_bytes: BYTES
+    do
+      JSON_BYTES.as_bytes(JSON_WRITER.write(Current.cell))
+    end
+
+  to_text: STRING
+    do
+      match STRING.from_utf8(Current.to_bytes)
+        case Ok(s) then s
+        case Error(_) then ""
+      end
+    end
+
+create {NONE}
+
+  -- Text bytes as a `STRING`.
+  text_of(t: LIST[U64]): OPTION[STRING]
+    do
+      if t.length <= 18446744073709551615 and JSON_BYTES.octets(t) then
+        match STRING.from_utf8(JSON_BYTES.as_bytes(t))
+          case Ok(s) then Some(s)
+          case Error(_) then None
+        end
+      else
+        None
+      end
+    end
+
+  -- How many links the chain `c` has, added to `n`.
+  chain_count(c: JSON_CELL, n: NAT): NAT
+    variant
+      c
+    do
+      match c
+        case JItem(_, rest) then
+          if n < 18446744073709551615 then JSON.chain_count(rest, n + 1) else n end
+        case JField(_, _, more) then
+          if n < 18446744073709551615 then JSON.chain_count(more, n + 1) else n end
+        case _ then n
+      end
+    end
+
+  nth_item(c: JSON_CELL, i: NAT, d: NAT): OPTION[JSON_CELL]
+    require
+      valid: c.ok_items(d)
+    variant
+      c
+    do
+      match c
+        case JItem(v, n) then
+          if i = 0 then Some(v) else JSON.nth_item(n, i - 1, d) end
+        case _ then None
+      end
+    ensure
+      found: match Result
+        case Some(v) then v.ok(d)
+        case None then True
+      end
+    end
+
+  find_field(c: JSON_CELL, k: LIST[U64], d: NAT): OPTION[JSON_CELL]
+    require
+      valid: c.ok_fields(d)
+    variant
+      c
+    do
+      match c
+        case JField(k2, v, n) then
+          if k2 = k then Some(v) else JSON.find_field(n, k, d) end
+        case _ then None
+      end
+    ensure
+      found: match Result
+        case Some(v) then v.ok(d)
+        case None then True
+      end
+    end
+
+  -- The ascending chain `c` with `k: v` in its place, replacing an equal key. `prefix` holds
+  -- the fields passed over, which are below `k`, last first.
+  put_field(c: JSON_CELL, k: LIST[U64], v: JSON_CELL, prefix: JSON_CELL, d: NAT): JSON_CELL
+    require
+      c_ok: c.ok_fields(d)
+      key_ok: JSON_BYTES.octets(k) and BYTES.valid_utf8(k)
+      value_ok: v.ok(d)
+      prefix_ok: prefix.ok_fields_down(d)
+      prefix_below_k: prefix.below(k)
+      prefix_below_c: match c
+        case JField(top, _, _) then prefix.below(top)
+        case _ then True
+      end
+    variant
+      c
+    do
+      match c
+        case JField(k2, v2, n) then
+          if JSON_CELL.key_less(k2, k) then
+            JSON.put_field(n, k, v, JField(k2, v2, prefix), d)
+          else if k2 = k then
+            check
+              n_above: n.above(k)
+              placed: JSON_CELL.reverse_down_ok(prefix, JField(k, v, n), d)
+            end
+            JSON_CELL.reverse_fields(prefix, JField(k, v, n))
+          else
+            check
+              total: JSON_CELL.key_total(k2, k)
+              c_above: c.above(k)
+              placed: JSON_CELL.reverse_down_ok(prefix, JField(k, v, c), d)
+            end
+            JSON_CELL.reverse_fields(prefix, JField(k, v, c))
+          end end
+        case _ then
+          check
+            placed: JSON_CELL.reverse_down_ok(prefix, JField(k, v, c), d)
+          end
+          JSON_CELL.reverse_fields(prefix, JField(k, v, c))
+      end
+    ensure
+      kept: Result.ok_fields(d)
+    end
+
+specify {ANY}
+
+  -- How many bytes the value's text has.
+  text_length: MATH_INT
+    do
+      JSON_WRITER.write(Current.cell).length
+    end
+
+  -- The round trip, stage 1 (Task F.4): a scalar's text reads back as the scalar. Arrays and
+  -- objects are covered by tests (`gjson/tests`), not yet by a proof.
+  law scalar_round_trip(v: JSON)
+    require
+      scalar: not v.is_array and not v.is_object
+      fits: v.text_length <= 4194304
+    trigger
+      JSON.parse(v.to_bytes)
+    do
+      JSON.scalar_read_back(v)
+    ensure
+      read_back: JSON.parse(v.to_bytes) = Ok(v)
+    end
+
+create {NONE}
+
+  -- The proof of `scalar_round_trip`.
+  scalar_read_back(v: JSON): BOOL
+    require
+      scalar: not v.is_array and not v.is_object
+      fits: v.text_length <= 4194304
+    do
+      let c = v.cell
+      let w = JSON_WRITER.write(c)
+      let b = JSON_BYTES.as_bytes(w)
+      check
+        scal: JSON_WIRE.is_scalar(c)
+        ok0: c.ok(0)
+        doc: JSON_ROUND_TRIP.read_scalar_document(c)
+        exact: b.model = w
+        bytes: v.to_bytes.model = w
+        len: v.to_bytes.length = w.length
+        list: v.to_bytes.to_list = w
+        parsed: JSON.parse(v.to_bytes) = Ok({ cell = c })
+        same: { cell = c } = v
+      end
+      True
+    ensure
+      holds: Result
+      read_back: JSON.parse(v.to_bytes) = Ok(v)
+    end
+
+specify {CANONICAL_EQ}
+
+  law agrees_with_structural(a: JSON, b: JSON)
+    ensure
+      sound: a.equals(b) = (a = b)
+    end
+
+specify {EQ}
+
+  law reflexive(a: JSON)
+    ensure
+      refl: a.equals(a)
+    end
+
+  law symmetric(a: JSON, b: JSON)
+    require
+      ab: a.equals(b)
+    ensure
+      ba: b.equals(a)
+    end
+
+  law transitive(a: JSON, b: JSON, c: JSON)
+    require
+      ab: a.equals(b)
+      bc: b.equals(c)
+    ensure
+      ac: a.equals(c)
+    end
+
+invariant
+  valid: cell.ok(64)
+
+end

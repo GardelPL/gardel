@@ -1,0 +1,572 @@
+-- A JSON text (RFC 8259) read from its bytes, as a list.
+--
+-- Each routine takes the bytes not yet read, `bs`, and gives back what follows the part it
+-- read. An error records how many bytes were left when it was found; `JSON.parse` turns that
+-- into an offset from the start. `d` is how many more levels an array or object may open.
+--
+-- Arrays, objects, strings and numbers are each read by one routine that calls itself last,
+-- which C runs as a loop. Only nesting recurses, and it is at most `d` deep.
+--
+-- The routines that read bytes have no `require`. A `require` that calls a function stops
+-- the solver from unfolding a routine more than once (Task F.13), and the round-trip proof
+-- unfolds them many times. So a byte is read through `JSON_BYTES.first`, which is in range whatever
+-- the list holds, and an error offset through `left`.
+functions JSON_READER
+
+feature {ANY}
+
+  -- How many bytes `bs` has, up to the most a document may have.
+  left(bs: LIST[U64]): NAT
+    do
+      if bs.length <= 4194304 then bs.length else 4194304 end
+    ensure
+      bounded: Result <= 4194304
+    end
+
+  is_space(b: U64): BOOL
+    do
+      b = 32 or b = 9 or b = 10 or b = 13
+    end
+
+  skip_space(bs: LIST[U64]): LIST[U64]
+    variant
+      bs.length
+    do
+      if bs = LIST.empty then
+        bs
+      else if is_space(JSON_BYTES.first(bs)) then
+        skip_space(bs.tail)
+      else
+        bs
+      end end
+    ensure
+      shorter: Result.length <= bs.length
+    end
+
+  -- What follows `word` at the start of `bs`, if it is there.
+  after_word(bs: LIST[U64], word: LIST[U64]): OPTION[LIST[U64]]
+    variant
+      word.length
+    do
+      if word = LIST.empty then
+        Some(bs)
+      else if bs = LIST.empty then
+        None
+      else if bs.head = word.head then
+        after_word(bs.tail, word.tail)
+      else
+        None
+      end end end
+    ensure
+      shorter: match Result
+        case Some(r) then r.length + word.length = bs.length
+        case None then True
+      end
+    end
+
+  -- `bs` without its first byte, or empty.
+  drop_one(bs: LIST[U64]): LIST[U64]
+    do
+      if bs = LIST.empty then bs else bs.tail end
+    ensure
+      shorter: Result.length <= bs.length
+      one: bs.length > 0 implies Result.length + 1 = bs.length
+    end
+
+  -- The value of the hex digit at the start of `bs`, or 16.
+  hex_at(bs: LIST[U64]): NAT
+    do
+      if bs = LIST.empty then 16 else NUMBER_TEXT.hex_value(JSON_BYTES.first(bs)) end
+    ensure
+      bounded: Result <= 16
+      there: Result < 16 implies bs.length > 0
+    end
+
+  -- The UTF-8 bytes of the scalar `cp`, last first, in front of `racc`.
+  push_scalar(racc: LIST[U64], cp: NAT): LIST[U64]
+    require
+      scalar: cp < 1114112
+    do
+      if cp < 128 then
+        racc.prepend(cp)
+      else if cp < 2048 then
+        racc.prepend(192 + cp / 64).prepend(128 + cp % 64)
+      else if cp < 65536 then
+        racc.prepend(224 + cp / 4096).prepend(128 + cp / 64 % 64).prepend(128 + cp % 64)
+      else
+        racc.prepend(240 + cp / 262144).prepend(128 + cp / 4096 % 64).prepend(128 + cp / 64 % 64).prepend(128 + cp % 64)
+      end end end
+    end
+
+  -- The value of four hex digits, or 65536 if one of them is not a hex digit.
+  four(a: NAT, b: NAT, c: NAT, d: NAT): NAT
+    require
+      digits: a <= 16 and b <= 16 and c <= 16 and d <= 16
+    do
+      if a = 16 or b = 16 or c = 16 or d = 16 then 65536 else a * 4096 + b * 256 + c * 16 + d end
+    ensure
+      bounded: Result <= 65536
+    end
+
+  -- The four hex digits that start `bs`, as a number, or 65536. Each `let` needs the one
+  -- before it, so C runs them in order: independent `let`s would run as parallel tasks,
+  -- which cost far more than these steps.
+  hex4(bs: LIST[U64]): NAT
+    do
+      let r1 = drop_one(bs)
+      let r2 = drop_one(r1)
+      let r3 = drop_one(r2)
+      four(hex_at(bs), hex_at(r1), hex_at(r2), hex_at(r3))
+    ensure
+      bounded: Result <= 65536
+    end
+
+  -- `bs` without its first four bytes.
+  drop4(bs: LIST[U64]): LIST[U64]
+    do
+      drop_one(drop_one(drop_one(drop_one(bs))))
+    end
+
+  -- After `\u`: four hex digits, and for a high surrogate, `\u` and the low one after it.
+  -- `at` is what remained at the backslash, counted only for an error.
+  unicode(bs: LIST[U64], racc: LIST[U64], at: LIST[U64]): RESULT[JSON_ERROR, JSON_SCAN]
+    do
+      let cp = hex4(bs)
+      if cp = 65536 then
+        Error(BadEscape(left(at)))
+      else if cp < 55296 or cp > 57343 then
+        Ok(JSON_SCAN.make(push_scalar(racc, cp), drop4(bs)))
+      else if cp > 56319 then
+        Error(LoneSurrogate(left(at)))
+      else
+        match after_word(drop4(bs), LIST.empty.prepend(117).prepend(92))
+          case None then
+            Error(LoneSurrogate(left(at)))
+          case Some(r5) then
+            let low = hex4(r5)
+            if low = 65536 then
+              Error(BadEscape(left(at)))
+            else if low < 56320 or low > 57343 then
+              Error(LoneSurrogate(left(at)))
+            else
+              Ok(JSON_SCAN.make(push_scalar(racc, 65536 + (cp - 55296) * 1024 + (low - 56320)), drop4(r5)))
+            end end
+        end
+      end end end
+    ensure
+      shorter: match Result
+        case Ok(s) then s.rest.length < bs.length
+        case Error(_) then True
+      end
+    end
+
+  -- After a backslash. `at` is what remained at the backslash.
+  escape(bs: LIST[U64], racc: LIST[U64], at: LIST[U64]): RESULT[JSON_ERROR, JSON_SCAN]
+    do
+      if bs = LIST.empty then
+        Error(UnexpectedEnd(0))
+      else
+        let e = bs.head
+        if e = 34 or e = 92 or e = 47 then
+          Ok(JSON_SCAN.make(racc.prepend(e), bs.tail))
+        else if e = 98 then
+          Ok(JSON_SCAN.make(racc.prepend(8), bs.tail))
+        else if e = 102 then
+          Ok(JSON_SCAN.make(racc.prepend(12), bs.tail))
+        else if e = 110 then
+          Ok(JSON_SCAN.make(racc.prepend(10), bs.tail))
+        else if e = 114 then
+          Ok(JSON_SCAN.make(racc.prepend(13), bs.tail))
+        else if e = 116 then
+          Ok(JSON_SCAN.make(racc.prepend(9), bs.tail))
+        else if e = 117 then
+          unicode(bs.tail, racc, at)
+        else
+          Error(BadEscape(left(at)))
+        end end end end end end end
+      end
+    ensure
+      shorter: match Result
+        case Ok(s) then s.rest.length < bs.length
+        case Error(_) then True
+      end
+    end
+
+  -- The bytes of a string up to its closing quote, decoded, last first, onto `racc`.
+  text(bs: LIST[U64], racc: LIST[U64]): RESULT[JSON_ERROR, JSON_SCAN]
+    variant
+      bs.length
+    do
+      if bs = LIST.empty then
+        Error(UnexpectedEnd(0))
+      else
+        let b = JSON_BYTES.first(bs)
+        if b = 34 then
+          Ok(JSON_SCAN.make(racc, bs.tail))
+        else if b = 92 then
+          match escape(bs.tail, racc, bs)
+            case Error(e) then Error(e)
+            case Ok(s) then text(s.rest, s.taken)
+          end
+        else if b < 32 then
+          Error(ControlInString(left(bs)))
+        else if b > 255 then
+          Error(UnexpectedByte(left(bs)))
+        else
+          text(bs.tail, racc.prepend(b))
+        end end end end
+      end
+    ensure
+      shorter: match Result
+        case Ok(s) then s.rest.length < bs.length
+        case Error(_) then True
+      end
+    end
+
+  -- Whether `t` is well-formed UTF-8, checked on its bytes.
+  valid_text(t: LIST[U64]): BOOL
+    do
+      if t.length <= 18446744073709551615 and JSON_BYTES.octets(t) then
+        STRING.from_utf8(JSON_BYTES.as_bytes(t)).is_ok
+      else
+        False
+      end
+    ensure
+      valid: Result implies (JSON_BYTES.octets(t) and BYTES.valid_utf8(t))
+    end
+
+  -- The bytes of a number, last first, onto `racc`, from grammar state `s`.
+  number_bytes(bs: LIST[U64], s: NAT, racc: LIST[U64]): RESULT[JSON_ERROR, JSON_SCAN]
+    variant
+      bs.length
+    do
+      if bs = LIST.empty then
+        if JSON_CELL.number_end(s) then Ok(JSON_SCAN.make(racc, bs)) else Error(BadNumber(0)) end
+      else if JSON_CELL.number_next(s, JSON_BYTES.first(bs)) = 9 then
+        if JSON_CELL.number_end(s) then Ok(JSON_SCAN.make(racc, bs)) else Error(BadNumber(left(bs))) end
+      else
+        number_bytes(bs.tail, JSON_CELL.number_next(s, JSON_BYTES.first(bs)), racc.prepend(bs.head))
+      end end
+    ensure
+      no_longer: match Result
+        case Ok(r) then r.rest.length <= bs.length
+        case Error(_) then True
+      end
+      took_one: (bs.length > 0 and JSON_CELL.number_next(s, JSON_BYTES.first(bs)) != 9) implies
+        match Result
+          case Ok(r) then r.rest.length < bs.length
+          case Error(_) then True
+        end
+    end
+
+  -- A number, which `bs` starts with.
+  number(bs: LIST[U64]): RESULT[JSON_ERROR, JSON_STEP]
+    require
+      starts: bs.length > 0 and JSON_CELL.number_next(0, JSON_BYTES.first(bs)) != 9
+    do
+      match number_bytes(bs, 0, LIST.empty)
+        case Error(e) then Error(e)
+        case Ok(s) then
+          let t = JSON_BYTES.reverse(s.taken, LIST.empty)
+          if JSON_CELL.number_end(JSON_CELL.number_state(t, 0)) then
+            Ok(JSON_STEP.make(JSON_CELL.number_cell(t), s.rest, 0))
+          else
+            Error(BadNumber(left(bs)))
+          end
+      end
+    ensure
+      shorter: match Result
+        case Ok(r) then r.rest.length < bs.length and r.cell.ok(0) and r.levels = 0
+        case Error(_) then True
+      end
+    end
+
+  -- `true`, `false` or `null`: the byte at the start of `bs` and `word` after it.
+  literal(bs: LIST[U64], word: LIST[U64], c: JSON_CELL): RESULT[JSON_ERROR, JSON_STEP]
+    require
+      some: bs.length > 0
+    do
+      match after_word(bs.tail, word)
+        case Some(r) then Ok(JSON_STEP.make(c, r, 0))
+        case None then Error(UnexpectedByte(left(bs)))
+      end
+    ensure
+      shorter: match Result
+        case Ok(r) then r.rest.length < bs.length and r.cell = c and r.levels = 0
+        case Error(_) then True
+      end
+    end
+
+  -- A string, after its opening quote.
+  string(bs: LIST[U64]): RESULT[JSON_ERROR, JSON_STEP]
+    do
+      match text(bs, LIST.empty)
+        case Error(e) then Error(e)
+        case Ok(s) then
+          let t = JSON_BYTES.reverse(s.taken, LIST.empty)
+          if valid_text(t) then Ok(JSON_STEP.make(JString(t), s.rest, 0)) else Error(BadString(left(bs) + 1)) end
+      end
+    ensure
+      shorter: match Result
+        case Ok(r) then r.rest.length < bs.length and r.cell.ok(0) and r.levels = 0
+        case Error(_) then True
+      end
+    end
+
+  -- A value, which starts at the start of `bs`.
+  value(bs: LIST[U64], d: NAT): RESULT[JSON_ERROR, JSON_STEP]
+    require
+      small: d < 1000
+    variant
+      bs.length, 0
+    do
+      if bs = LIST.empty then
+        Error(UnexpectedEnd(0))
+      else
+        let b = JSON_BYTES.first(bs)
+        if b = 110 then
+          literal(bs, LIST.empty.prepend(108).prepend(108).prepend(117), JNull)
+        else if b = 116 then
+          literal(bs, LIST.empty.prepend(101).prepend(117).prepend(114), JBool(True))
+        else if b = 102 then
+          literal(bs, LIST.empty.prepend(101).prepend(115).prepend(108).prepend(97), JBool(False))
+        else if b = 34 then
+          string(bs.tail)
+        else if JSON_CELL.number_next(0, b) != 9 then
+          number(bs)
+        else if b = 91 or b = 123 then
+          if d = 0 then
+            Error(TooDeep(left(bs)))
+          else
+            let inner = skip_space(bs.tail)
+            if b = 91 then array(inner, d - 1) else object(inner, d - 1) end
+          end
+        else
+          Error(UnexpectedByte(left(bs)))
+        end end end end end end
+      end
+    ensure
+      read: match Result
+        case Ok(r) then r.rest.length < bs.length and r.levels <= d and r.levels >= 0 and r.cell.ok(r.levels)
+        case Error(_) then True
+      end
+    end
+
+  larger(a: NAT, b: NAT): NAT
+    do
+      if a > b then a else b end
+    ensure
+      above_a: Result >= a
+      above_b: Result >= b
+      one_of: Result = a or Result = b
+    end
+
+  -- An array, after `[` and any white space.
+  array(bs: LIST[U64], d: NAT): RESULT[JSON_ERROR, JSON_STEP]
+    require
+      small: d < 1000
+    variant
+      bs.length, 2
+    do
+      if bs = LIST.empty then
+        Error(UnexpectedEnd(0))
+      else if bs.head = 93 then
+        Ok(JSON_STEP.make(JArray(JEnd), bs.tail, 1))
+      else
+        items(bs, d, JEnd, 0)
+      end end
+    ensure
+      read: match Result
+        case Ok(r) then r.rest.length < bs.length and r.levels <= d + 1 and r.levels >= 0 and r.cell.ok(r.levels)
+        case Error(_) then True
+      end
+    end
+
+  -- The items of an array from one that starts `bs`. `acc` holds those read so far, last
+  -- first, each within `m` levels.
+  items(bs: LIST[U64], d: NAT, acc: JSON_CELL, m: NAT): RESULT[JSON_ERROR, JSON_STEP]
+    require
+      small: d < 1000
+      acc_ok: acc.ok_items(m)
+      within: m <= d
+    variant
+      bs.length, 1
+    do
+      match value(bs, d)
+        case Error(e) then Error(e)
+        case Ok(s) then
+          -- One `let`: see `hex4`.
+          let r = skip_space(s.rest)
+          check
+            acc_up: JSON_CELL.items_up(acc, m, larger(s.levels, m))
+            item_up: JSON_CELL.ok_up(s.cell, s.levels, larger(s.levels, m))
+          end
+          if r = LIST.empty then
+            Error(UnexpectedEnd(0))
+          else if r.head = 93 then
+            check
+              reversed: JSON_CELL.reverse_items_ok(JItem(s.cell, acc), JEnd, larger(s.levels, m))
+            end
+            Ok(JSON_STEP.make(JArray(JSON_CELL.reverse_items(JItem(s.cell, acc), JEnd)), r.tail, larger(s.levels, m) + 1))
+          else if r.head = 44 then
+            items(skip_space(r.tail), d, JItem(s.cell, acc), larger(s.levels, m))
+          else
+            Error(UnexpectedByte(left(r)))
+          end end end
+      end
+    ensure
+      read: match Result
+        case Ok(r) then r.rest.length < bs.length and r.levels <= d + 1 and r.levels >= 0 and r.cell.ok(r.levels)
+        case Error(_) then True
+      end
+    end
+
+  -- An object, after `{` and any white space.
+  object(bs: LIST[U64], d: NAT): RESULT[JSON_ERROR, JSON_STEP]
+    require
+      small: d < 1000
+    variant
+      bs.length, 2
+    do
+      if bs = LIST.empty then
+        Error(UnexpectedEnd(0))
+      else if bs.head = 125 then
+        Ok(JSON_STEP.make(JObject(JEnd), bs.tail, 1))
+      else
+        fields(bs, d, JEnd, 0)
+      end end
+    ensure
+      read: match Result
+        case Ok(r) then r.rest.length < bs.length and r.levels <= d + 1 and r.levels >= 0 and r.cell.ok(r.levels)
+        case Error(_) then True
+      end
+    end
+
+  -- A key and the colon after it, from the quote that starts `bs`: the key's bytes, and
+  -- what follows the colon and any white space.
+  key(bs: LIST[U64]): RESULT[JSON_ERROR, JSON_SCAN]
+    do
+      if bs = LIST.empty then
+        Error(UnexpectedEnd(0))
+      else if bs.head != 34 then
+        Error(UnexpectedByte(left(bs)))
+      else
+        match text(bs.tail, LIST.empty)
+          case Error(e) then Error(e)
+          case Ok(ks) then
+            let k = JSON_BYTES.reverse(ks.taken, LIST.empty)
+            if not valid_text(k) then
+              Error(BadString(left(bs)))
+            else
+              let colon = skip_space(ks.rest)
+              if colon = LIST.empty then
+                Error(UnexpectedEnd(0))
+              else if colon.head != 58 then
+                Error(UnexpectedByte(left(colon)))
+              else
+                Ok(JSON_SCAN.make(k, skip_space(colon.tail)))
+              end end
+            end
+        end
+      end end
+    ensure
+      read: match Result
+        case Ok(r) then r.rest.length < bs.length and JSON_BYTES.octets(r.taken) and BYTES.valid_utf8(r.taken)
+        case Error(_) then True
+      end
+    end
+
+  -- The field `k: v`, `v` within `lv` levels, added to `acc`, descending and within `m`
+  -- levels, or `None` if `acc` has `k`. The result is within the larger of the two.
+  add_field(k: LIST[U64], v: JSON_CELL, lv: NAT, acc: JSON_CELL, m: NAT): OPTION[JSON_CELL]
+    require
+      key_ok: JSON_BYTES.octets(k) and BYTES.valid_utf8(k)
+      value_ok: v.ok(lv)
+      acc_ok: acc.ok_fields_down(m)
+    do
+      let m2 = larger(lv, m)
+      check
+        acc_up: JSON_CELL.fields_down_up(acc, m, m2)
+        item_up: JSON_CELL.ok_up(v, lv, m2)
+      end
+      JSON_CELL.insert_field(k, v, acc, JEnd, m2)
+    ensure
+      kept: match Result
+        case Some(r) then r.ok_fields_down(larger(lv, m))
+        case None then True
+      end
+    end
+
+  -- The object of the descending fields `acc`, within `m` levels, followed by `rest`.
+  close_object(acc: JSON_CELL, m: NAT, rest: LIST[U64]): JSON_STEP
+    require
+      acc_ok: acc.ok_fields_down(m)
+      small: m < 1000
+    do
+      check
+        reversed: JSON_CELL.reverse_down_ok(acc, JEnd, m)
+      end
+      JSON_STEP.make(JObject(JSON_CELL.reverse_fields(acc, JEnd)), rest, m + 1)
+    ensure
+      read: Result.rest = rest and Result.levels = m + 1 and Result.cell.ok(Result.levels)
+    end
+
+  -- The fields of an object from one that starts `bs`. `acc` holds those read so far in
+  -- descending key order, each within `m` levels.
+  fields(bs: LIST[U64], d: NAT, acc: JSON_CELL, m: NAT): RESULT[JSON_ERROR, JSON_STEP]
+    require
+      small: d < 1000
+      acc_ok: acc.ok_fields_down(m)
+      within: m <= d
+    variant
+      bs.length, 1
+    do
+      match key(bs)
+        case Error(e) then Error(e)
+        case Ok(ks) then
+          match value(ks.rest, d)
+            case Error(e) then Error(e)
+            case Ok(s) then
+              match add_field(ks.taken, s.cell, s.levels, acc, m)
+                case None then
+                  Error(DuplicateKey(left(bs)))
+                case Some(acc2) then
+                  let r = skip_space(s.rest)
+                  if r = LIST.empty then
+                    Error(UnexpectedEnd(0))
+                  else if r.head = 125 then
+                    Ok(close_object(acc2, larger(s.levels, m), r.tail))
+                  else if r.head = 44 then
+                    fields(skip_space(r.tail), d, acc2, larger(s.levels, m))
+                  else
+                    Error(UnexpectedByte(left(r)))
+                  end end end
+              end
+          end
+      end
+    ensure
+      read: match Result
+        case Ok(r) then r.rest.length < bs.length and r.levels <= d + 1 and r.levels >= 0 and r.cell.ok(r.levels)
+        case Error(_) then True
+      end
+    end
+
+  -- A whole document: one value, with only white space around it.
+  document(bs: LIST[U64], d: NAT): RESULT[JSON_ERROR, JSON_STEP]
+    require
+      small: d < 1000
+    do
+      match value(skip_space(bs), d)
+        case Error(e) then Error(e)
+        case Ok(s) then
+          let r = skip_space(s.rest)
+          if r = LIST.empty then Ok(s) else Error(TrailingBytes(left(r))) end
+      end
+    ensure
+      read: match Result
+        case Ok(r) then r.levels <= d and r.levels >= 0 and r.cell.ok(r.levels)
+        case Error(_) then True
+      end
+    end
+
+end

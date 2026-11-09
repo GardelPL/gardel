@@ -1,0 +1,138 @@
+-- Byte lists for the reader and the writer: reversal, and the way back to `BYTES`.
+--
+-- `BYTES.from_list` needs `BYTES.all_octets`, whose body a package does not see. So the
+-- octets of a list are stated here, by `octets`, and `build` builds the `BYTES` one byte
+-- at a time, which needs only that each byte is below 256.
+module JSON_BYTES
+
+create {ANY}
+
+  -- Every element is below 256.
+  octets(xs: LIST[U64]): BOOL
+    variant
+      xs.length
+    do
+      if xs = LIST.empty then True else xs.head >= 0 and xs.head < 256 and JSON_BYTES.octets(xs.tail) end
+    ensure
+      step: xs.length > 0 implies Result = (xs.head >= 0 and xs.head < 256 and JSON_BYTES.octets(xs.tail))
+      empty: xs.length = 0 implies Result
+    end
+
+  -- The first byte of `bs`, or 256 if it is empty or holds something that is not a byte.
+  first(bs: LIST[U64]): U64
+    do
+      if bs = LIST.empty then
+        256
+      else if bs.head >= 0 and bs.head < 256 then
+        bs.head
+      else
+        256
+      end end
+    ensure
+      bounded: Result <= 256
+      byte: (bs.length > 0 and bs.head >= 0 and bs.head < 256) implies Result = bs.head
+      octet: Result < 256 implies (bs.length > 0 and Result = bs.head)
+    end
+
+  is_empty(xs: LIST[U64]): BOOL
+    do
+      xs = LIST.empty
+    ensure
+      def: Result = (xs.length = 0)
+    end
+
+  -- `xs` reversed, in front of `acc`.
+  reverse(xs: LIST[U64], acc: LIST[U64]): LIST[U64]
+    variant
+      xs.length
+    do
+      if xs = LIST.empty then acc else JSON_BYTES.reverse(xs.tail, acc.prepend(xs.head)) end
+    ensure
+      len: Result.length = xs.length + acc.length
+    end
+
+  -- The bytes of `xs` after those of `b`. A byte of 256 or more, or a list too long to
+  -- count, is left out; `octets` and `fits` say when neither happens.
+  build(xs: LIST[U64], b: BYTES_BUILDER): BYTES_BUILDER
+    variant
+      xs.length
+    do
+      if xs = LIST.empty then
+        b
+      else if xs.head >= 0 and xs.head < 256 and b.length < 18446744073709551615 then
+        let next = b.add_byte(xs.head)
+        check
+          one: LIST.singleton(xs.head).append(xs.tail) = xs
+          added: next.model = b.model.append(LIST.singleton(xs.head))
+          assoc: b.model.append(LIST.singleton(xs.head)).append(xs.tail) = b.model.append(LIST.singleton(xs.head).append(xs.tail))
+          grown: next.model.append(xs.tail) = b.model.append(xs)
+        end
+        JSON_BYTES.build(xs.tail, next)
+      else
+        JSON_BYTES.build(xs.tail, b)
+      end end
+    ensure
+      exact: (JSON_BYTES.octets(xs) and b.length + xs.length <= 18446744073709551615) implies
+        Result.model = b.model.append(xs)
+    end
+
+  -- The bytes of `xs` as `BYTES`.
+  as_bytes(xs: LIST[U64]): BYTES
+    do
+      JSON_BYTES.build(xs, BYTES_BUILDER.empty).to_bytes
+    ensure
+      exact: (JSON_BYTES.octets(xs) and xs.length <= 18446744073709551615) implies Result.model = xs
+    end
+
+  -- Lemmas.
+
+  -- Reversing `xs` then `ys` onto `acc` is reversing `xs` onto `acc`, then `ys` onto that.
+  reverse_append(xs: LIST[U64], ys: LIST[U64], acc: LIST[U64]): BOOL
+    variant
+      xs.length
+    do
+      if xs = LIST.empty then
+        True
+      else
+        check
+          whole: xs.tail.prepend(xs.head) = xs
+          joined: xs.append(ys) = xs.tail.append(ys).prepend(xs.head)
+        end
+        JSON_BYTES.reverse_append(xs.tail, ys, acc.prepend(xs.head))
+      end
+    ensure
+      holds: Result
+      split: JSON_BYTES.reverse(xs.append(ys), acc) = JSON_BYTES.reverse(ys, JSON_BYTES.reverse(xs, acc))
+    end
+
+  reverse_octets(xs: LIST[U64], acc: LIST[U64]): BOOL
+    require
+      xs_octets: JSON_BYTES.octets(xs)
+      acc_octets: JSON_BYTES.octets(acc)
+    variant
+      xs.length
+    do
+      if xs = LIST.empty then True else JSON_BYTES.reverse_octets(xs.tail, acc.prepend(xs.head)) end
+    ensure
+      holds: Result
+      octets: JSON_BYTES.octets(JSON_BYTES.reverse(xs, acc))
+    end
+
+  -- Reversing twice gives the list back: `reverse(reverse(xs, ys), zs)` is `ys` reversed in
+  -- front of `xs` and `zs`.
+  reverse_twice(xs: LIST[U64], ys: LIST[U64], zs: LIST[U64]): BOOL
+    variant
+      xs.length
+    do
+      if xs = LIST.empty then
+        True
+      else
+        check whole: xs.tail.prepend(xs.head) = xs end
+        JSON_BYTES.reverse_twice(xs.tail, ys.prepend(xs.head), zs)
+      end
+    ensure
+      holds: Result
+      twice: JSON_BYTES.reverse(JSON_BYTES.reverse(xs, ys), zs) = JSON_BYTES.reverse(ys, xs.append(zs))
+    end
+
+end

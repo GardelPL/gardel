@@ -1,7 +1,7 @@
 # Phase F: Verified Libraries and Applications
 
 **Date:** November 6, 2026
-**Status:** In progress. Tasks F.0 and F.1 are completed, and the decisions below are taken.
+**Status:** In progress. Tasks F.0 to F.5 are completed, and the decisions below are taken.
 **Roadmap entry:** [Phase F in Roadmap.md](../Roadmap.md#phase-f-verified-libraries-and-applications)
 **Probed at:** commit `1349cb6`
 
@@ -76,6 +76,7 @@ flowchart TD
     F5 --> F6
     F1 --> F12["F.12 Refined function types"] --> F6
     F1 --> F13["F.13 Fuel guards on recursive functions"]
+    F4 --> F14["F.14 Cost model for parallel lets"]
     F6 --> F7 --> F8
     F2 --> F9 --> F10 --> F11
     F8 --> F11
@@ -93,6 +94,7 @@ flowchart TD
 | F.5 | L | A parser that means what the bytes say | Proof over a buffer; a breaking change |
 | F.12 | Not sized | `require` and `ensure` on function types enforced | Checking a lambda against a contract where it is passed |
 | F.13 | S | Fuel guards that hold when a function is applied within its `require` | Changing every routine axiom; proof time |
+| F.14 | S | Parallel `let`s only where they pay | Keeping `seq_bench`'s speedup |
 | F.6 | M | `grest` | Fitting a library around a `reactive program` |
 | F.7 | M | `Connect`, tags | Non-blocking connect on two platforms |
 | F.8 | L | `HTTP_CLIENT`, async handlers | The design of a waiting handler |
@@ -230,6 +232,17 @@ Cause: `gardelc` (`main.rs`, the routine axioms) emits each `require` of a routi
 - [ ] Put the `require` back on `HTTP_HEADER.same_ci`, and remove the limit from the GUIDE (section 9).
 - [ ] Check that no example, `ghttp` or the prelude gets slower or loses a proof, as F.2's benchmark did.
 - Acceptance: the regression test verifies, and nothing that verified before stops verifying.
+- **Tried in F.4.** Both obvious fixes cost proofs. A guard at `DefaultFuel` on every axiom made `NUMBER_TEXT`'s round-trip laws run out of resources. A guard at the fuel of the application on the defining and step axioms made `STRING.find` run out. A fix must keep the extra unfolding to the routines that need it. `gjson` avoids the limit by keeping its reader total.
+
+#### Task F.14: A Cost Model for Parallel `let`s
+
+Found in F.4, and numbered last because it was added last. It blocks nothing.
+
+The C backend runs each group of independent `let`s as OpenMP tasks, whatever they cost. In `gjson`, a `let` of `larger(a, b)` beside a `let` of a constructor, in a loop over 200,000 items, took 36 s against 0.65 s without OpenMP.
+
+- [ ] Run a group in parallel only when at least two of its `let`s may be costly, for example a call into a recursive group, or above a size threshold such as `GARDEL_PAR_THRESHOLD`.
+- [ ] A benchmark: a loop with small independent `let`s costs no more with OpenMP than without, and `seq_bench` keeps its parallel speedup.
+- Acceptance: both measurements recorded, and `gjson` can use independent `let`s in its loops again.
 
 #### Task F.3: `MAP[K, V]`
 
@@ -269,12 +282,37 @@ What was done:
 
 Client: `grest`. Needs decisions 1 and 2. A new package at `gjson/`, like `ghttp/`.
 
-- [ ] `JSON` value type, opaque, with builders and queries. Object keys are unique, by the type's invariant.
-- [ ] Serializer to `BYTES` per RFC 8259: escapes, and a canonical key order.
-- [ ] Parser over `BYTES`, total, returning `RESULT[JSON_ERROR, JSON]`. An error carries a byte offset. Input size and nesting depth have proven limits.
-- [ ] Prove `parse(serialize(v))` gives `v` back, in stages: scalars, strings with escapes, arrays and objects. If the last stage does not close, record how far it got, and cover the rest with tests rather than an `assume`.
-- [ ] Test against a table of valid and invalid documents, including deep nesting, bad UTF-8, lone surrogates and duplicate keys.
-- Acceptance: `gjson --strict` 0/0 with no `assume`. Every malformed input gives an `Error`, never a crash, and the round trip is proven at least for scalars and strings, with the final reach recorded.
+**Status:** ✅ Completed (2026-11-09), with the round trip proven for scalars and strings. Arrays and objects are covered by tests, as the task allowed. `gjson/README.md` describes the package.
+
+- [x] `JSON` value type, opaque, with builders and queries. Object keys are unique, by the type's invariant.
+- [x] Serializer to `BYTES` per RFC 8259: escapes, and a canonical key order.
+- [x] Parser over `BYTES`, total, returning `RESULT[JSON_ERROR, JSON]`. An error carries a byte offset. Input size and nesting depth have proven limits.
+- [x] Prove `parse(serialize(v))` gives `v` back, in stages: scalars, strings with escapes, arrays and objects. Stages 1 and 2 are proven. Stage 3, arrays and objects, is not: it is covered by tests.
+- [x] Test against a table of valid and invalid documents, including deep nesting, bad UTF-8, lone surrogates and duplicate keys.
+- Acceptance: met. `gjson --strict` is 0/0 with no `assume`. Every malformed case gives an `Error`, and the round trip is proven for scalars and strings.
+
+What was done:
+
+- **The value.** Decision 1: flat cells (`JSON_CELL`): scalars, `JArray(items)` and `JObject(fields)`, with chains of `JItem` and `JField` ending in `JEnd`. Text is kept as its UTF-8 bytes, so `=` on a value is its equality and `JSON` is `CANONICAL_EQ`. `JSON` holds one cell, with the invariant `cell.ok(64)`: text is valid UTF-8, keys strictly ascend in byte order, so none repeats, and nesting is at most 64 levels. Decision 2: an integer in the range of `I64` is `JInt`, and any other number keeps its literal. `-0` keeps its sign, as a `JNumber`.
+- **The reader** (`JSON_READER`) works on the document as a byte list. Each array, object, string and number is read by a routine that calls itself last, which C runs as a loop, so only nesting uses the stack. Its routines have no `require` on a function call (F.13): a byte is read through `JSON_BYTES.first` and an error offset through `left`, so a proof can unfold them as deep as it needs. An object's fields are collected in descending order and inserted in place, so keys in ascending order cost one comparison each. Every result is proven valid.
+- **The writer** (`JSON_WRITER`) pushes bytes in order onto a list it reverses once. It adds no white space and writes keys in order, so equal values give equal bytes.
+- **The round trip.** `JSON_WIRE` states the writer's text head first. `JSON_ROUND_TRIP` proves the reader finds each scalar in it. The law `JSON.scalar_round_trip` gives `parse(v.to_bytes) = Ok(v)` for every scalar whose text fits `max_input`. The scalar builders state their text length, so a client proves `parse(JSON.int(i).to_bytes) = Ok(JSON.int(i))` for every `i`, and the same for booleans, `null` and strings of up to 100,000 bytes.
+- **Why stage 3 stops.** Stated head first, the writer's text of a chain is the reverse of what it builds. The proof needs the reverse lemmas for chains, already proven for validity, tied to both the reader's and the writer's chains. The reader's `items` and `fields` have a `require` on the chain they collect, which F.13 stops the solver from unfolding twice. They would have to be made total first, as the scalar readers were.
+- **Changes outside `gjson`.**
+  - `NUMBER_TEXT.digits_step`, a law with no trigger that gives one step of `digits`. A client cannot see a prelude body, and the integer proof needs to.
+  - gardelc: a field of a machine number type (`NAT`, `U64`, `I64`, `CHAR`) of a sum type or record is in range. Before, `JInt(w)` gave `w` no range, so no contract that needs one applied to it. This closes F.2's known limit for fields. Elements of a `LIST[U64]` still have none, which is why `gjson` checks each byte it reads.
+  - gardelc: substitution avoids capture. A call's argument that mentions `k` was put into a `require` that binds its own `k` in a `match`, and the binder captured it. `JSON_CELL.reverse_down_ok` is the case: it is refused without the fix. The fix renames a `match` binder, a quantified variable, a lambda parameter or a `let` that an argument mentions.
+- **Tests.** `gjson/tests` is a client package, with 70 cases in `cases.txt`: every scalar form, every escape, the canonical order of keys, each error with its offset, and generated limits: 64 and 65 levels, 200,000 items, 300,000 bytes of text, 50,000 escapes, 3,000 fields in reverse order and a document over 4 MiB. Each accepted value must read back as itself, which covers stage 3. They run in 1.3 s. `tests/gjson.rs` runs them, proves the client facts above, refuses three lies, and checks the range of a field.
+- **Mutations.** Ten, each on a private copy, all red. The proof catches a raw `"`, a dropped minus sign and no depth limit. The cases catch a tab not treated as space, a trailing comma accepted, a duplicate key kept, no comma between fields, `-0` read as an integer, a raw control character accepted, and a lone surrogate accepted.
+- **Result.** `cargo test --release` passes, with `tests/gjson.rs` new. `--stdlib --strict`, every example, `ghttp`, `hello_api` and `gjson` stay 0/0. `--compare-with` against the prelude of `bb7e6cb` reports 0 breaking changes and 1 addition, `digits_step`.
+- **Found on the way, and not fixed.**
+  - `LIST.length` walks the list in C, so a loop that tests `bs.length` is quadratic. `gjson` tests `bs = LIST.empty`, which is constant. `MAP` and `NUMBER_TEXT.parse_digits` test `length`, and are quadratic in C.
+  - A call that is not a tail call takes a stack frame in C, and a 1 MB stack holds 30,000 to 60,000 of them. A loop over an input must be a tail call.
+  - Independent `let`s run as OpenMP tasks, with no cost model. In a loop over 200,000 items this took 36 s against 0.65 s without OpenMP. `gjson` avoids independent `let`s in its loops. Task F.14 is a cost model.
+  - Under `/typeEncoding:p`, the list axioms do not fire on a term that holds a prelude routine's result, such as `digits(n, ys).append(zs)`. Naming the result with `let` first works around it.
+  - Two arms of one `match` that bind the same name at different types are `E0199`.
+  - A call such as `b.to_bytes`, in a module that has a routine named `to_bytes`, counts as recursion in the call graph.
+  - F.13 was tried. Guarding every routine at `DefaultFuel` made `NUMBER_TEXT.nat_round_trip` and `i64_round_trip` run out of resources. Guarding the defining and step axioms at the fuel of the application made `STRING.find` run out. Both were reverted.
 
 ### Step 4: REST
 

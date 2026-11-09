@@ -1,0 +1,893 @@
+-- The reader gives back the value the writer wrote (Task F.4), proven in stages.
+--
+-- Stage 1, scalars: `null`, `true`, `false`, integers, other numbers and strings, with every
+-- escape (`read_scalar_document`). Each lemma reads `JSON_WIRE`'s text of a value followed by `rest`, and finds the
+-- value and `rest`. `ends(rest)` says what may follow a value in written text: nothing, a
+-- comma, or the end of an array or object.
+functions JSON_ROUND_TRIP
+
+feature {ANY}
+
+  -- Bytes the reader accepts.
+  input(bs: LIST[U64]): BOOL
+    do
+      JSON_BYTES.octets(bs) and bs.length <= 4194304
+    end
+
+  -- What may follow a value in written text.
+  ends(rest: LIST[U64]): BOOL
+    do
+      rest = LIST.empty or rest.head = 44 or rest.head = 93 or rest.head = 125
+    end
+
+  -- Octets: the written text of a scalar is made of bytes below 256.
+
+  octets_prepend(x: U64, xs: LIST[U64]): BOOL
+    require
+      octet: x < 256
+      rest_ok: JSON_BYTES.octets(xs)
+    do
+      let ys = xs.prepend(x)
+      check
+        whole: ys.head = x and ys.tail = xs and ys.length > 0
+      end
+      True
+    ensure
+      holds: Result
+      octets: JSON_BYTES.octets(xs.prepend(x))
+    end
+
+  octets_append(xs: LIST[U64], ys: LIST[U64]): BOOL
+    require
+      xs_ok: JSON_BYTES.octets(xs)
+      ys_ok: JSON_BYTES.octets(ys)
+    variant
+      xs.length
+    do
+      if xs = LIST.empty then
+        True
+      else
+        check
+          whole: xs.append(ys) = xs.tail.append(ys).prepend(xs.head)
+        end
+        octets_append(xs.tail, ys) and octets_prepend(xs.head, xs.tail.append(ys))
+      end
+    ensure
+      holds: Result
+      octets: JSON_BYTES.octets(xs.append(ys))
+    end
+
+  escaped_octets(b: U64, acc: LIST[U64]): BOOL
+    require
+      octet: b < 256
+      acc_ok: JSON_BYTES.octets(acc)
+    do
+      if b = 34 or b = 92 then
+        octets_prepend(b, acc) and octets_prepend(92, acc.prepend(b))
+      else if b = 8 or b = 12 or b = 10 or b = 13 or b = 9 then
+        let e = JSON_WIRE.escaped(b, acc)
+        octets_prepend(e.tail.head, acc) and octets_prepend(92, e.tail)
+      else if b < 32 then
+        let h1 = NUMBER_TEXT.hex_digit(b / 16)
+        let h2 = NUMBER_TEXT.hex_digit(b % 16)
+        let a1 = acc.prepend(h2)
+        let a2 = a1.prepend(h1)
+        let zero = NUMBER_TEXT.hex_digit(0)
+        let a3 = a2.prepend(zero)
+        let a4 = a3.prepend(zero)
+        let a5 = a4.prepend(117)
+        octets_prepend(h2, acc) and octets_prepend(h1, a1) and octets_prepend(zero, a2) and
+        octets_prepend(zero, a3) and octets_prepend(117, a4) and octets_prepend(92, a5)
+      else
+        octets_prepend(b, acc)
+      end end end
+    ensure
+      holds: Result
+      octets: JSON_BYTES.octets(JSON_WIRE.escaped(b, acc))
+    end
+
+  text_octets(t: LIST[U64], acc: LIST[U64]): BOOL
+    require
+      t_ok: JSON_BYTES.octets(t)
+      acc_ok: JSON_BYTES.octets(acc)
+    variant
+      t.length
+    do
+      if t = LIST.empty then
+        True
+      else
+        text_octets(t.tail, acc) and escaped_octets(t.head, JSON_WIRE.text_wire(t.tail, acc))
+      end
+    ensure
+      holds: Result
+      octets: JSON_BYTES.octets(JSON_WIRE.text_wire(t, acc))
+    end
+
+  digits_octets(n: NAT, ys: LIST[U64]): BOOL
+    require
+      ys_ok: JSON_BYTES.octets(ys)
+    variant
+      n
+    do
+      let whole = NUMBER_TEXT.digits(n, ys)
+      check
+        step: NUMBER_TEXT.digits_step(n, ys)
+      end
+      if n < 10 then
+        octets_prepend(48 + n, ys)
+      else
+        octets_prepend(48 + n % 10, ys) and digits_octets(n / 10, ys.prepend(48 + n % 10))
+      end
+    ensure
+      holds: Result
+      octets: JSON_BYTES.octets(NUMBER_TEXT.digits(n, ys))
+    end
+
+  -- A number literal the grammar accepts is made of ASCII bytes.
+  number_octets(t: LIST[U64], s: NAT): BOOL
+    require
+      accepted: JSON_CELL.number_state(t, s) != 9
+    variant
+      t.length
+    do
+      if t = LIST.empty then
+        True
+      else
+        check
+          whole: t.tail.prepend(t.head) = t
+        end
+        number_octets(t.tail, JSON_CELL.number_next(s, JSON_BYTES.first(t))) and
+        octets_prepend(t.head, t.tail)
+      end
+    ensure
+      holds: Result
+      octets: JSON_BYTES.octets(t)
+    end
+
+
+  -- Reading: the reader finds in each scalar's text the scalar, and what follows it.
+
+  -- `word` and then `rest`: what follows `word` is `rest`.
+  after_self(word: LIST[U64], rest: LIST[U64]): BOOL
+    variant
+      word.length
+    do
+      if word = LIST.empty then
+        True
+      else
+        let tail = word.tail.append(rest)
+        check
+          whole: word.append(rest) = tail.prepend(word.head)
+          step: JSON_READER.after_word(word.append(rest), word) = JSON_READER.after_word(tail, word.tail)
+        end
+        after_self(word.tail, rest)
+      end
+    ensure
+      holds: Result
+      found: JSON_READER.after_word(word.append(rest), word) = Some(rest)
+    end
+
+  -- `true`, `false` and `null`: the byte `b` and then `word`, read as `c`.
+  read_literal(b: U64, word: LIST[U64], c: JSON_CELL, rest: LIST[U64]): BOOL
+    require
+      octet: b < 256
+    do
+      let w = word.append(rest).prepend(b)
+      check
+        found: after_self(word, rest)
+        tail: w.tail = word.append(rest)
+      end
+      True
+    ensure
+      holds: Result
+      read: JSON_READER.literal(word.append(rest).prepend(b), word, c) = Ok(JSON_STEP.make(c, rest, 0))
+    end
+
+  read_null(rest: LIST[U64], d: NAT): BOOL
+    require
+      small: d < 1000
+    do
+      let word: LIST[U64] = LIST.empty.prepend(108).prepend(108).prepend(117)
+      let w = JSON_WIRE.scalar_wire(JNull, rest)
+      check
+        shape: w = word.append(rest).prepend(110)
+        lit: read_literal(110, word, JNull, rest)
+        byte: JSON_BYTES.first(w) = 110
+        val: JSON_READER.value(w, d) = JSON_READER.literal(w, word, JNull)
+      end
+      True
+    ensure
+      holds: Result
+      read: JSON_READER.value(JSON_WIRE.scalar_wire(JNull, rest), d) = Ok(JSON_STEP.make(JNull, rest, 0))
+    end
+
+  read_true(rest: LIST[U64], d: NAT): BOOL
+    require
+      small: d < 1000
+    do
+      let word: LIST[U64] = LIST.empty.prepend(101).prepend(117).prepend(114)
+      let w = JSON_WIRE.scalar_wire(JBool(True), rest)
+      check
+        shape: w = word.append(rest).prepend(116)
+        lit: read_literal(116, word, JBool(True), rest)
+        byte: JSON_BYTES.first(w) = 116
+        val: JSON_READER.value(w, d) = JSON_READER.literal(w, word, JBool(True))
+      end
+      True
+    ensure
+      holds: Result
+      read: JSON_READER.value(JSON_WIRE.scalar_wire(JBool(True), rest), d) = Ok(JSON_STEP.make(JBool(True), rest, 0))
+    end
+
+  read_false(rest: LIST[U64], d: NAT): BOOL
+    require
+      small: d < 1000
+    do
+      let word: LIST[U64] = LIST.empty.prepend(101).prepend(115).prepend(108).prepend(97)
+      let w = JSON_WIRE.scalar_wire(JBool(False), rest)
+      check
+        shape: w = word.append(rest).prepend(102)
+        lit: read_literal(102, word, JBool(False), rest)
+        byte: JSON_BYTES.first(w) = 102
+        val: JSON_READER.value(w, d) = JSON_READER.literal(w, word, JBool(False))
+      end
+      True
+    ensure
+      holds: Result
+      read: JSON_READER.value(JSON_WIRE.scalar_wire(JBool(False), rest), d) = Ok(JSON_STEP.make(JBool(False), rest, 0))
+    end
+
+  -- One byte of a string's text, escaped, reads back as that byte.
+  read_escaped(b: U64, ys: LIST[U64], racc: LIST[U64]): BOOL
+    require
+      octet: b < 256
+    do
+      let w = JSON_WIRE.escaped(b, ys)
+      if b = 34 or b = 92 or b = 8 or b = 12 or b = 10 or b = 13 or b = 9 then
+        let e = w.tail.head
+        check
+          first: JSON_BYTES.first(w) = 92
+          code: JSON_BYTES.first(w.tail) = e
+          esc: JSON_READER.escape(w.tail, racc, w) = Ok(JSON_SCAN.make(racc.prepend(b), ys))
+          step: JSON_READER.text(w, racc) = JSON_READER.text(ys, racc.prepend(b))
+        end
+        True
+      else if b < 32 then
+        let zero = NUMBER_TEXT.hex_digit(0)
+        let h1 = NUMBER_TEXT.hex_digit(b / 16)
+        let h2 = NUMBER_TEXT.hex_digit(b % 16)
+        let u = ys.prepend(h2).prepend(h1).prepend(zero).prepend(zero)
+        check
+          shape: w = u.prepend(117).prepend(92)
+          d0: JSON_READER.hex_at(u) = 0
+          t1: JSON_READER.drop_one(u) = u.tail
+          d1: JSON_READER.hex_at(u.tail) = 0
+          t2: JSON_READER.drop_one(u.tail) = u.tail.tail
+          d2: JSON_READER.hex_at(u.tail.tail) = b / 16
+          t3: JSON_READER.drop_one(u.tail.tail) = u.tail.tail.tail
+          d3: JSON_READER.hex_at(u.tail.tail.tail) = b % 16
+          t4: JSON_READER.drop_one(u.tail.tail.tail) = ys
+          sum: JSON_READER.four(0, 0, b / 16, b % 16) = b
+          value: JSON_READER.hex4(u) = b
+          r4: JSON_READER.drop4(u) = ys
+          pushed: JSON_READER.push_scalar(racc, b) = racc.prepend(b)
+          uni: JSON_READER.unicode(u, racc, w) = Ok(JSON_SCAN.make(racc.prepend(b), ys))
+          esc: JSON_READER.escape(u.prepend(117), racc, w) = JSON_READER.unicode(u, racc, w)
+          first: JSON_BYTES.first(w) = 92
+          step: JSON_READER.text(w, racc) = JSON_READER.text(ys, racc.prepend(b))
+        end
+        True
+      else
+        check
+          shape: w = ys.prepend(b)
+          first: JSON_BYTES.first(w) = b
+          step: JSON_READER.text(w, racc) = JSON_READER.text(ys, racc.prepend(b))
+        end
+        True
+      end end
+    ensure
+      holds: Result
+      step: JSON_READER.text(JSON_WIRE.escaped(b, ys), racc) = JSON_READER.text(ys, racc.prepend(b))
+    end
+
+  -- A string's escaped text and its closing quote read back as the text, reversed onto
+  -- `racc`, and `rest`.
+  read_text(t: LIST[U64], rest: LIST[U64], racc: LIST[U64]): BOOL
+    require
+      t_ok: JSON_BYTES.octets(t)
+    variant
+      t.length
+    do
+      if t = LIST.empty then
+        let close = rest.prepend(34)
+        check
+          first: JSON_BYTES.first(close) = 34
+          done: JSON_READER.text(close, racc) = Ok(JSON_SCAN.make(racc, rest))
+        end
+        True
+      else
+        let inner = JSON_WIRE.text_wire(t.tail, rest.prepend(34))
+        check
+          one: read_escaped(t.head, inner, racc)
+          more: read_text(t.tail, rest, racc.prepend(t.head))
+          rev: JSON_BYTES.reverse(t, racc) = JSON_BYTES.reverse(t.tail, racc.prepend(t.head))
+        end
+        True
+      end
+    ensure
+      holds: Result
+      read: JSON_READER.text(JSON_WIRE.text_wire(t, rest.prepend(34)), racc) =
+        Ok(JSON_SCAN.make(JSON_BYTES.reverse(t, racc), rest))
+    end
+
+  read_string(t: LIST[U64], rest: LIST[U64], d: NAT): BOOL
+    require
+      valid: JString(t).ok(0)
+      small: d < 1000
+      short: t.length <= 4194304
+    do
+      let none: LIST[U64] = LIST.empty
+      let inner = JSON_WIRE.text_wire(t, rest.prepend(34))
+      let w = JSON_WIRE.scalar_wire(JString(t), rest)
+      let back = JSON_BYTES.reverse(t, none)
+      check
+        shape: w = inner.prepend(34)
+        first: JSON_BYTES.first(w) = 34
+        text: read_text(t, rest, none)
+        twice: JSON_BYTES.reverse_twice(t, none, none)
+        same: t.append(none) = t
+        again: JSON_BYTES.reverse(back, none) = t
+        exact: JSON_BYTES.as_bytes(t).model = t
+        checked: JSON_READER.valid_text(t)
+        str: JSON_READER.string(inner) = Ok(JSON_STEP.make(JString(t), rest, 0))
+        val: JSON_READER.value(w, d) = JSON_READER.string(inner)
+      end
+      True
+    ensure
+      holds: Result
+      read: JSON_READER.value(JSON_WIRE.scalar_wire(JString(t), rest), d) = Ok(JSON_STEP.make(JString(t), rest, 0))
+    end
+
+
+  -- Numbers. The grammar takes a literal's bytes one by one, and stops at what follows it.
+  scan_number(t: LIST[U64], rest: LIST[U64], s: NAT, racc: LIST[U64]): BOOL
+    require
+      accepted: JSON_CELL.number_state(t, s) != 9
+    variant
+      t.length
+    do
+      if t = LIST.empty then
+        True
+      else
+        let s2 = JSON_CELL.number_next(s, JSON_BYTES.first(t))
+        let w = t.append(rest)
+        let inner = t.tail.append(rest)
+        check
+          octets: number_octets(t, s)
+          whole: w = inner.prepend(t.head)
+          byte: JSON_BYTES.first(w) = JSON_BYTES.first(t)
+          go: s2 != 9
+          state: JSON_CELL.number_state(t, s) = JSON_CELL.number_state(t.tail, s2)
+          step: JSON_READER.number_bytes(w, s, racc) = JSON_READER.number_bytes(inner, s2, racc.prepend(t.head))
+          more: scan_number(t.tail, rest, s2, racc.prepend(t.head))
+          rev: JSON_BYTES.reverse(t, racc) = JSON_BYTES.reverse(t.tail, racc.prepend(t.head))
+        end
+        True
+      end
+    ensure
+      holds: Result
+      scanned: JSON_READER.number_bytes(t.append(rest), s, racc) =
+        JSON_READER.number_bytes(rest, JSON_CELL.number_state(t, s), JSON_BYTES.reverse(t, racc))
+    end
+
+  -- What may follow a value ends a number, in any state.
+  ends_number(rest: LIST[U64], s: NAT, racc: LIST[U64]): BOOL
+    require
+      after: ends(rest)
+      done: JSON_CELL.number_end(s)
+    do
+      if rest = LIST.empty then
+        True
+      else
+        check
+          byte: JSON_BYTES.first(rest) = rest.head
+          stop: JSON_CELL.number_next(s, rest.head) = 9
+        end
+        True
+      end
+    ensure
+      holds: Result
+      stops: JSON_READER.number_bytes(rest, s, racc) = Ok(JSON_SCAN.make(racc, rest))
+    end
+
+  -- A number literal `t` the grammar ends on, then what may follow a value.
+  read_number(t: LIST[U64], rest: LIST[U64], d: NAT): BOOL
+    require
+      literal: JSON_CELL.number_end(JSON_CELL.number_state(t, 0))
+      after: ends(rest)
+      small: d < 1000
+    do
+      let none: LIST[U64] = LIST.empty
+      let w = t.append(rest)
+      let back = JSON_BYTES.reverse(t, none)
+      check
+        some: t.length > 0
+        octets: number_octets(t, 0)
+        whole: w = t.tail.append(rest).prepend(t.head)
+        byte: JSON_BYTES.first(w) = t.head
+        starts: JSON_CELL.number_next(0, t.head) != 9
+        scan: scan_number(t, rest, 0, none)
+        stop: ends_number(rest, JSON_CELL.number_state(t, 0), back)
+        twice: JSON_BYTES.reverse_twice(t, none, none)
+        same: t.append(none) = t
+        again: JSON_BYTES.reverse(back, none) = t
+        num: JSON_READER.number(w) = Ok(JSON_STEP.make(JSON_CELL.number_cell(t), rest, 0))
+        val: JSON_READER.value(w, d) = JSON_READER.number(w)
+      end
+      True
+    ensure
+      holds: Result
+      read: JSON_READER.value(t.append(rest), d) = Ok(JSON_STEP.make(JSON_CELL.number_cell(t), rest, 0))
+    end
+
+
+  -- Integers: their digits, with `-` before a negative one, are a number literal that
+  -- reads back as the integer.
+
+  -- `10` to the power `k`.
+  tens(k: NAT): MATH_INT
+    variant
+      k
+    do
+      if k = 0 then 1 else 10 * tens(k - 1) end
+    ensure
+      positive: Result >= 1
+    end
+
+  -- The digits of a number below `tens(k)` are at most `k`.
+  digits_len(n: NAT, ys: LIST[U64], k: NAT): BOOL
+    require
+      some: k >= 1
+      below: n < tens(k)
+    variant
+      n
+    do
+      check
+        step: NUMBER_TEXT.digits_step(n, ys)
+      end
+      if n < 10 then
+        True
+      else
+        check
+          more: k >= 2
+          one: tens(k) = 10 * tens(k - 1)
+          smaller: n / 10 < tens(k - 1)
+        end
+        digits_len(n / 10, ys.prepend(48 + n % 10), k - 1)
+      end
+    ensure
+      holds: Result
+      short: NUMBER_TEXT.digits(n, ys).length <= ys.length + k
+    end
+
+  -- Every `NAT` is below `tens(20)`.
+  twenty_digits(n: NAT): BOOL
+    do
+      check
+        t1: tens(1) = 10
+        t2: tens(2) = 100
+        t3: tens(3) = 1000
+        t4: tens(4) = 10000
+        t5: tens(5) = 100000
+        t6: tens(6) = 1000000
+        t7: tens(7) = 10000000
+        t8: tens(8) = 100000000
+        t9: tens(9) = 1000000000
+        t10: tens(10) = 10000000000
+        t11: tens(11) = 100000000000
+        t12: tens(12) = 1000000000000
+        t13: tens(13) = 10000000000000
+        t14: tens(14) = 100000000000000
+        t15: tens(15) = 1000000000000000
+        t16: tens(16) = 10000000000000000
+        t17: tens(17) = 100000000000000000
+        t18: tens(18) = 1000000000000000000
+        t19: tens(19) = 10000000000000000000
+        t20: tens(20) = 100000000000000000000
+      end
+      True
+    ensure
+      holds: Result
+      below: n < tens(20)
+      nineteen: tens(19) = 10000000000000000000
+    end
+
+  -- From a sign or the start, the digits of `n` end in state 3, or in state 2 for `0`.
+  digits_state(n: NAT, ys: LIST[U64], s: NAT): BOOL
+    require
+      start: s = 0 or s = 1
+    variant
+      n
+    do
+      let w = NUMBER_TEXT.digits(n, ys)
+      check
+        step: NUMBER_TEXT.digits_step(n, ys)
+      end
+      if n < 10 then
+        check
+          byte: JSON_BYTES.first(w) = 48 + n
+          is_digit: JSON_CELL.digit(48 + n)
+          next: (n = 0 implies JSON_CELL.number_next(s, 48 + n) = 2) and (n >= 1 implies JSON_CELL.number_next(s, 48 + n) = 3)
+          one: JSON_CELL.number_state(w, s) = JSON_CELL.number_state(ys, JSON_CELL.number_next(s, 48 + n))
+        end
+        True
+      else
+        let d = 48 + n % 10
+        let inner = ys.prepend(d)
+        check
+          more: digits_state(n / 10, inner, s)
+          high: n / 10 >= 1
+          byte: JSON_BYTES.first(inner) = d
+          is_digit: JSON_CELL.digit(d)
+          next: JSON_CELL.number_next(3, d) = 3
+          last: JSON_CELL.number_state(inner, 3) = JSON_CELL.number_state(ys, 3)
+        end
+        True
+      end
+    ensure
+      holds: Result
+      zero: n = 0 implies JSON_CELL.number_state(NUMBER_TEXT.digits(n, ys), s) = JSON_CELL.number_state(ys, 2)
+      more: n >= 1 implies JSON_CELL.number_state(NUMBER_TEXT.digits(n, ys), s) = JSON_CELL.number_state(ys, 3)
+    end
+
+  -- The text of an integer alone.
+  int_text(i: I64): LIST[U64]
+    do
+      JSON_WIRE.int_wire(i, LIST.empty)
+    end
+
+  -- The integer's text before `rest` is its text alone, then `rest`.
+  int_split(i: I64, rest: LIST[U64]): BOOL
+    do
+      if i >= 0 then
+        let n = NAT.from_i64(i)
+        let none: LIST[U64] = LIST.empty
+        let alone = NUMBER_TEXT.digits(n, none)
+        let whole = NUMBER_TEXT.digits(n, rest)
+        check
+          split: JSON_WIRE.digits_append(n, rest)
+          joined: whole = alone.append(rest)
+          wire: JSON_WIRE.int_wire(i, rest) = whole
+          wire_alone: JSON_WIRE.int_wire(i, none) = alone
+          text: int_text(i) = JSON_WIRE.int_wire(i, none)
+        end
+        True
+      else
+        let m = NUMBER_TEXT.magnitude(i)
+        let alone = NUMBER_TEXT.digits(m, LIST.empty)
+        let whole = NUMBER_TEXT.digits(m, rest)
+        check
+          split: JSON_WIRE.digits_append(m, rest)
+          joined: whole = alone.append(rest)
+          signed: alone.prepend(45).append(rest) = alone.append(rest).prepend(45)
+          wire: JSON_WIRE.int_wire(i, rest) = whole.prepend(45)
+          wire_alone: JSON_WIRE.int_wire(i, LIST.empty) = alone.prepend(45)
+          text: int_text(i) = JSON_WIRE.int_wire(i, LIST.empty)
+        end
+        True
+      end
+    ensure
+      holds: Result
+      split: JSON_WIRE.int_wire(i, rest) = int_text(i).append(rest)
+    end
+
+  -- The cell the reader makes of an integer's text is the integer.
+  int_cell(i: I64): BOOL
+    do
+      let none: LIST[U64] = LIST.empty
+      let t = int_text(i)
+      let minus_zero: LIST[U64] = LIST.empty.prepend(48).prepend(45)
+      let text = NUMBER_TEXT.i64_to_text(i)
+      let bytes = text.byte_model
+      check
+        law: NUMBER_TEXT.parse_i64(text) = Ok(i)
+        read: NUMBER_TEXT.parse_i64(text) = NUMBER_TEXT.parse_signed(bytes)
+        mz_tail: JSON_BYTES.first(minus_zero.tail) = 48
+        mz_two: JSON_CELL.number_state(minus_zero.tail, 1) = 2
+        mz_head: JSON_BYTES.first(minus_zero) = 45
+        state_mz: JSON_CELL.number_state(minus_zero, 0) = 2
+      end
+      if i >= 0 then
+        let n = NAT.from_i64(i)
+        let alone = NUMBER_TEXT.digits(n, none)
+        check
+          natural: bytes = alone
+          wire_alone: JSON_WIRE.int_wire(i, none) = alone
+          text: t = alone
+          same: bytes = t
+          state: digits_state(n, none, 0)
+          below: twenty_digits(n)
+          len: digits_len(n, none, 20)
+          head: NUMBER_TEXT.digits_head(n, none)
+          not_mz: not (t = minus_zero)
+          parsed: NUMBER_TEXT.parse_signed(t) = Ok(i)
+          short: JSON_CELL.at_most(t, 20)
+        end
+        True
+      else
+        let m = NUMBER_TEXT.magnitude(i)
+        let alone = NUMBER_TEXT.digits(m, none)
+        check
+          negative: bytes = alone.prepend(45)
+          wire_alone: JSON_WIRE.int_wire(i, none) = alone.prepend(45)
+          shape: t = alone.prepend(45)
+          same: bytes = t
+          state: digits_state(m, none, 1)
+          sign: JSON_CELL.number_state(t, 0) = JSON_CELL.number_state(alone, 1)
+          below: twenty_digits(m)
+          magnitude: m <= 9223372036854775808
+          len: digits_len(m, none, 19)
+          not_mz: not (t = minus_zero)
+          parsed: NUMBER_TEXT.parse_signed(t) = Ok(i)
+          short: JSON_CELL.at_most(t, 20)
+        end
+        True
+      end
+    ensure
+      holds: Result
+      literal: JSON_CELL.number_end(JSON_CELL.number_state(int_text(i), 0))
+      cell: JSON_CELL.number_cell(int_text(i)) = JInt(i)
+      short: int_text(i).length <= 20
+    end
+
+  read_int(i: I64, rest: LIST[U64], d: NAT): BOOL
+    require
+      after: ends(rest)
+      small: d < 1000
+    do
+      check
+        split: int_split(i, rest)
+        cell: int_cell(i)
+        read: read_number(int_text(i), rest, d)
+      end
+      True
+    ensure
+      holds: Result
+      read: JSON_READER.value(JSON_WIRE.int_wire(i, rest), d) = Ok(JSON_STEP.make(JInt(i), rest, 0))
+    end
+
+
+  -- The whole of stage 1.
+
+  -- A string's escaped text is at least as long as the text.
+  text_len(t: LIST[U64], acc: LIST[U64]): BOOL
+    require
+      t_ok: JSON_BYTES.octets(t)
+    variant
+      t.length
+    do
+      if t = LIST.empty then
+        True
+      else
+        let inner = JSON_WIRE.text_wire(t.tail, acc)
+        check
+          more: text_len(t.tail, acc)
+          one: JSON_WIRE.escaped(t.head, inner).length >= inner.length + 1
+        end
+        True
+      end
+    ensure
+      holds: Result
+      long: JSON_WIRE.text_wire(t, acc).length >= t.length + acc.length
+    end
+
+  scalar_octets(c: JSON_CELL, ys: LIST[U64]): BOOL
+    require
+      valid: c.ok(0)
+      scalar: JSON_WIRE.is_scalar(c)
+      ys_ok: JSON_BYTES.octets(ys)
+    do
+      match c
+        case JNull then
+          let w1 = ys.prepend(108)
+          let w2 = w1.prepend(108)
+          let w3 = w2.prepend(117)
+          octets_prepend(108, ys) and octets_prepend(108, w1) and octets_prepend(117, w2) and
+          octets_prepend(110, w3)
+        case JBool(b) then
+          if b then
+            let w1 = ys.prepend(101)
+            let w2 = w1.prepend(117)
+            let w3 = w2.prepend(114)
+            octets_prepend(101, ys) and octets_prepend(117, w1) and octets_prepend(114, w2) and
+            octets_prepend(116, w3)
+          else
+            let w1 = ys.prepend(101)
+            let w2 = w1.prepend(115)
+            let w3 = w2.prepend(108)
+            let w4 = w3.prepend(97)
+            octets_prepend(101, ys) and octets_prepend(115, w1) and octets_prepend(108, w2) and
+            octets_prepend(97, w3) and octets_prepend(102, w4)
+        end
+        case JInt(whole) then
+          check
+            split: int_split(whole, ys)
+            cell: int_cell(whole)
+            text: number_octets(int_text(whole), 0)
+            both: octets_append(int_text(whole), ys)
+          end
+          True
+        case JNumber(lit) then
+          number_octets(lit, 0) and octets_append(lit, ys)
+        case JString(t) then
+          let inner = JSON_WIRE.text_wire(t, ys.prepend(34))
+          octets_prepend(34, ys) and text_octets(t, ys.prepend(34)) and octets_prepend(34, inner)
+        case _ then True
+      end
+    ensure
+      holds: Result
+      octets: JSON_BYTES.octets(JSON_WIRE.scalar_wire(c, ys))
+    end
+
+  -- Each scalar's text, then what may follow a value, reads back as the scalar. The text
+  -- starts with no white space, so a document may start with it.
+  read_scalar(c: JSON_CELL, rest: LIST[U64], d: NAT): BOOL
+    require
+      valid: c.ok(0)
+      scalar: JSON_WIRE.is_scalar(c)
+      after: ends(rest)
+      small: d < 1000
+      short: JSON_WIRE.scalar_wire(c, rest).length <= 4194304
+    do
+      let w = JSON_WIRE.scalar_wire(c, rest)
+      match c
+        case JNull then
+          check
+            r: read_null(rest, d)
+            b: JSON_BYTES.first(w) = 110
+          end
+          True
+        case JBool(b) then
+          if b then
+            check
+              r: read_true(rest, d)
+              f: JSON_BYTES.first(w) = 116
+            end
+            True
+          else
+            check
+              r: read_false(rest, d)
+              f: JSON_BYTES.first(w) = 102
+            end
+            True
+          end
+        case JInt(whole) then
+          let t = int_text(whole)
+          check
+            split: int_split(whole, rest)
+            cell: int_cell(whole)
+            r: read_int(whole, rest, d)
+            octs: number_octets(t, 0)
+            some: t.length > 0
+            byte: JSON_BYTES.first(t) = t.head
+            first_state: JSON_CELL.number_state(t, 0) != 9
+            unfold: JSON_CELL.number_state(t, 0) = (if JSON_CELL.number_next(0, JSON_BYTES.first(t)) = 9 then 9 else JSON_CELL.number_state(t.tail, JSON_CELL.number_next(0, JSON_BYTES.first(t))) end)
+            go: JSON_CELL.number_next(0, JSON_BYTES.first(t)) != 9
+            digit: JSON_CELL.number_next(0, t.head) != 9
+            shape: w = t.tail.append(rest).prepend(t.head)
+            head: JSON_BYTES.first(w) = t.head
+          end
+          True
+        case JNumber(lit) then
+          check
+            n_r: read_number(lit, rest, d)
+            n_octs: number_octets(lit, 0)
+            n_some: lit.length > 0
+            n_byte: JSON_BYTES.first(lit) = lit.head
+            n_state: JSON_CELL.number_state(lit, 0) != 9
+            n_go: JSON_CELL.number_next(0, JSON_BYTES.first(lit)) != 9
+            n_digit: JSON_CELL.number_next(0, lit.head) != 9
+            n_shape: w = lit.tail.append(rest).prepend(lit.head)
+            n_head: JSON_BYTES.first(w) = lit.head
+          end
+          True
+        case JString(t) then
+          check
+            long: text_len(t, rest.prepend(34))
+            r: read_string(t, rest, d)
+            f: JSON_BYTES.first(w) = 34
+          end
+          True
+        case _ then True
+      end
+    ensure
+      holds: Result
+      read: JSON_READER.value(JSON_WIRE.scalar_wire(c, rest), d) = Ok(JSON_STEP.make(c, rest, 0))
+      kept: JSON_READER.skip_space(JSON_WIRE.scalar_wire(c, rest)) = JSON_WIRE.scalar_wire(c, rest)
+    end
+
+  -- A scalar's text, as a whole document, reads back as the scalar.
+  read_scalar_document(c: JSON_CELL): BOOL
+    require
+      valid: c.ok(0)
+      scalar: JSON_WIRE.is_scalar(c)
+      short: JSON_WRITER.write(c).length <= 4194304
+    do
+      let none: LIST[U64] = LIST.empty
+      let w = JSON_WIRE.scalar_wire(c, none)
+      check
+        written: JSON_WIRE.write_scalar(c)
+        octs: scalar_octets(c, none)
+        r: read_scalar(c, none, 64)
+        empty: JSON_READER.skip_space(none) = none
+        doc: JSON_READER.document(w, 64) = Ok(JSON_STEP.make(c, none, 0))
+      end
+      True
+    ensure
+      holds: Result
+      read: JSON_READER.document(JSON_WRITER.write(c), 64) = Ok(JSON_STEP.make(c, LIST.empty, 0))
+      octets: JSON_BYTES.octets(JSON_WRITER.write(c))
+    end
+
+
+  -- Bounds on the length of a scalar's text, for the builders of `JSON`.
+
+  -- A byte's escape has at most six bytes.
+  escaped_len(b: U64, acc: LIST[U64]): BOOL
+    require
+      octet: b < 256
+    do
+      True
+    ensure
+      holds: Result
+      short: JSON_WIRE.escaped(b, acc).length <= acc.length + 6
+    end
+
+  text_max(t: LIST[U64], acc: LIST[U64]): BOOL
+    require
+      t_ok: JSON_BYTES.octets(t)
+    variant
+      t.length
+    do
+      if t = LIST.empty then
+        True
+      else
+        text_max(t.tail, acc) and escaped_len(t.head, JSON_WIRE.text_wire(t.tail, acc))
+      end
+    ensure
+      holds: Result
+      short: JSON_WIRE.text_wire(t, acc).length <= 6 * t.length + acc.length
+    end
+
+  -- The text of a scalar, as a whole, is at most this long.
+  scalar_len(c: JSON_CELL): BOOL
+    require
+      valid: c.ok(0)
+      scalar: JSON_WIRE.is_scalar(c)
+    do
+      let none: LIST[U64] = LIST.empty
+      check
+        written: JSON_WIRE.write_scalar(c)
+      end
+      match c
+        case JInt(whole) then
+          check
+            split: int_split(whole, none)
+            cell: int_cell(whole)
+            same: int_text(whole).append(none) = int_text(whole)
+          end
+          True
+        case JString(t) then
+          text_max(t, none.prepend(34))
+        case _ then True
+      end
+    ensure
+      holds: Result
+      null: c = JNull implies JSON_WRITER.write(c).length = 4
+      bool: c = JBool(True) implies JSON_WRITER.write(c).length = 4
+      bool_false: c = JBool(False) implies JSON_WRITER.write(c).length = 5
+      int: (match c case JInt(_) then True case _ then False end) implies JSON_WRITER.write(c).length <= 20
+      string: (match c case JString(t) then JSON_WRITER.write(c).length <= 6 * t.length + 2 case _ then True end)
+    end
+
+end

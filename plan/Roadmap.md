@@ -865,7 +865,8 @@ flowchart TD
 | 2. Core libraries | [F.2](libraries/verified_libraries.md#task-f2-bytes-string-and-number-text) | `BYTES`, `STRING` and number text ✅ |
 | | [F.3](libraries/verified_libraries.md#task-f3-mapk-v) | `MAP[K, V]` ✅ |
 | | [F.13](libraries/verified_libraries.md#task-f13-fuel-guards-on-recursive-functions) | Fuel guards on recursive functions, found in F.5 |
-| 3. JSON | [F.4](libraries/verified_libraries.md#task-f4-the-gjson-package) | The `gjson` package |
+| | [F.14](libraries/verified_libraries.md#task-f14-a-cost-model-for-parallel-lets) | A cost model for parallel `let`s, found in F.4 |
+| 3. JSON | [F.4](libraries/verified_libraries.md#task-f4-the-gjson-package) | The `gjson` package, with the round trip proven for scalars and strings ✅ |
 | 4. REST | [F.5](libraries/verified_libraries.md#task-f5-a-parser-that-means-what-the-bytes-say) | A correct `ghttp` parser ✅ |
 | | [F.12](libraries/verified_libraries.md#task-f12-refined-function-types) | `require` and `ensure` on function types enforced |
 | | [F.6](libraries/verified_libraries.md#task-f6-grest-sync-rest) | `grest`, sync handlers, `todo_api` |
@@ -900,7 +901,7 @@ flowchart TD
 
 ## 6. Immediate Next Step
 
-**Phase F: Verified Libraries and Applications** is in progress, and Tasks F.0, F.1, F.2, F.3 and F.5 are completed. The next task is F.4, the `gjson` package, which needs F.2 and F.3. Decision 3 of [libraries/verified_libraries.md](libraries/verified_libraries.md) settles the order of `STRING`: byte order of the UTF-8 form.
+**Phase F: Verified Libraries and Applications** is in progress, and Tasks F.0 to F.5 are completed. `gjson` proves its round trip for scalars and strings, and tests it for arrays and objects. The next task is F.12, refined function types, which F.6 (`grest`) needs.
 
 **Phase E: Projects and Packages:** Tasks E.0 to E.5 and E.7 are completed, so Phase E is complete. Fetching dependencies and a lockfile were dropped, as a path dependency on a git submodule already pins a commit.
 

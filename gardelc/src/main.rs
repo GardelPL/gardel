@@ -8301,6 +8301,14 @@ fn emit_boogie_parts_with_options(
                         fnm,
                         map_boogie_type(fty, m)
                     ));
+                    // A field of a machine number type holds a value of that type: every
+                    // value is built from one, and each such value is proven in range.
+                    if let Some(range) = machine_range(fty) {
+                        out.push_str(&format!(
+                            "axiom (forall{tp_quant} x: {mod_bpl_ty} :: {{ {}_{}(x) }} {range}({}_{}(x)));\n",
+                            v.name, fnm, v.name, fnm
+                        ));
+                    }
                 }
 
                 // Constructor discriminator & field projection axioms
@@ -8460,6 +8468,13 @@ fn emit_boogie_parts_with_options(
                     fnm,
                     map_boogie_type(fty, m)
                 ));
+                // As for a variant's field above.
+                if let Some(range) = machine_range(fty) {
+                    out.push_str(&format!(
+                        "axiom (forall{tp_quant} x: {mod_bpl_ty} :: {{ {}_{}(x) }} {range}({}_{}(x)));\n",
+                        m.name, fnm, m.name, fnm
+                    ));
+                }
             }
             if !fields.is_empty() {
                 let arg_names: Vec<String> = fields.iter().map(|(fnm, _)| fnm.clone()).collect();
@@ -12200,6 +12215,46 @@ fn emit_boogie_block_expr(
     emit_boogie_expr_with_strings(&expr, m, implicit_fields, &revealed, fuel_var, strings)
 }
 
+/// The variables free in the replacements of a substitution.
+fn substs_free_vars(substs: &[(String, Expr)]) -> Vec<String> {
+    let mut out = Vec::new();
+    for (_, r) in substs {
+        expr_free_vars(r, &mut Vec::new(), &mut out);
+    }
+    out
+}
+
+/// A name for a renamed binder `b`: the first of `b_1`, `b_2`, ... that neither the
+/// replacements nor the binder's scope (`stmts` and `body`) mention. The name depends only on
+/// the expression, so generated Boogie stays the same from run to run.
+fn fresh_binder(b: &str, used: &[String], stmts: &[Stmt], body: &Expr) -> String {
+    let mut scope = Vec::new();
+    let blk = Expr::If(
+        Box::new(Expr::Bool(true)),
+        stmts.to_vec(),
+        Box::new(body.clone()),
+        Vec::new(),
+        Box::new(Expr::Unit),
+    );
+    expr_free_vars(&blk, &mut Vec::new(), &mut scope);
+    (1..)
+        .map(|i| format!("{b}_{i}"))
+        .find(|n| !used.contains(n) && !scope.contains(n))
+        .unwrap_or_else(|| format!("{b}_0"))
+}
+
+/// `p` with the binder `from` named `to`.
+fn rename_pattern_binder(p: &Pattern, from: &str, to: &str) -> Pattern {
+    match p {
+        Pattern::Bind(b) if b == from => Pattern::Bind(to.to_string()),
+        Pattern::Variant(c, sub) => {
+            Pattern::Variant(c.clone(), sub.iter().map(|q| rename_pattern_binder(q, from, to)).collect())
+        }
+        Pattern::Tuple(sub) => Pattern::Tuple(sub.iter().map(|q| rename_pattern_binder(q, from, to)).collect()),
+        _ => p.clone(),
+    }
+}
+
 pub fn subst_expr_var(e: &Expr, target: &str, replacement: &Expr) -> Expr {
     subst_expr_vars(e, &[(target.to_string(), replacement.clone())])
 }
@@ -12267,8 +12322,18 @@ pub fn subst_expr_vars(e: &Expr, substs: &[(String, Expr)]) -> Expr {
                         .filter(|(target, _)| !binds.contains(target))
                         .cloned()
                         .collect();
-                    let (stmts_sub, body_sub) = subst_block(&c.stmts, &c.body, &active_substs);
-                    MatchCase::new(c.pattern.clone(), stmts_sub, body_sub)
+                    // A binder that a replacement mentions is renamed first, or it would
+                    // capture that variable: `match c case F(k) then a.p(k)` with `a := F(k)`.
+                    let mut pattern = c.pattern.clone();
+                    let (mut stmts, mut body) = (c.stmts.clone(), c.body.clone());
+                    let used = substs_free_vars(&active_substs);
+                    for b in binds.iter().filter(|b| used.contains(b)) {
+                        let nb = fresh_binder(b, &used, &stmts, &body);
+                        pattern = rename_pattern_binder(&pattern, b, &nb);
+                        (stmts, body) = subst_block(&stmts, &body, &[(b.clone(), Expr::Var(nb))]);
+                    }
+                    let (stmts_sub, body_sub) = subst_block(&stmts, &body, &active_substs);
+                    MatchCase::new(pattern, stmts_sub, body_sub)
                 })
                 .collect();
             Expr::Match(Box::new(scrut_sub), new_cases)
@@ -12295,11 +12360,15 @@ pub fn subst_expr_vars(e: &Expr, substs: &[(String, Expr)]) -> Expr {
                 .filter(|(target, _)| target != v)
                 .cloned()
                 .collect();
-            Expr::Forall(
-                v.clone(),
-                ty.clone(),
-                Box::new(subst_expr_vars(body, &active_substs)),
-            )
+            let used = substs_free_vars(&active_substs);
+            let (v, body) = if used.contains(v) {
+                let nv = fresh_binder(v, &used, &[], body);
+                let renamed = subst_expr_var(body, v, &Expr::Var(nv.clone()));
+                (nv, renamed)
+            } else {
+                (v.clone(), (**body).clone())
+            };
+            Expr::Forall(v, ty.clone(), Box::new(subst_expr_vars(&body, &active_substs)))
         }
         Expr::Exists(v, ty, body) => {
             let active_substs: Vec<(String, Expr)> = substs
@@ -12307,11 +12376,15 @@ pub fn subst_expr_vars(e: &Expr, substs: &[(String, Expr)]) -> Expr {
                 .filter(|(target, _)| target != v)
                 .cloned()
                 .collect();
-            Expr::Exists(
-                v.clone(),
-                ty.clone(),
-                Box::new(subst_expr_vars(body, &active_substs)),
-            )
+            let used = substs_free_vars(&active_substs);
+            let (v, body) = if used.contains(v) {
+                let nv = fresh_binder(v, &used, &[], body);
+                let renamed = subst_expr_var(body, v, &Expr::Var(nv.clone()));
+                (nv, renamed)
+            } else {
+                (v.clone(), (**body).clone())
+            };
+            Expr::Exists(v, ty.clone(), Box::new(subst_expr_vars(&body, &active_substs)))
         }
         Expr::WithIo(stmts, final_e) => {
             let mut new_stmts = Vec::new();
@@ -12338,8 +12411,18 @@ pub fn subst_expr_vars(e: &Expr, substs: &[(String, Expr)]) -> Expr {
                 .filter(|(target, _)| !ps.iter().any(|(p, _)| p == target))
                 .cloned()
                 .collect();
-            let (stmts_sub, body_sub) = subst_block(stmts, body, &active_substs);
-            Expr::Lambda(ps.clone(), rt.clone(), stmts_sub, Box::new(body_sub))
+            let used = substs_free_vars(&active_substs);
+            let mut params = ps.clone();
+            let (mut stmts, mut body) = (stmts.clone(), (**body).clone());
+            for (p, _) in params.iter_mut() {
+                if used.contains(p) {
+                    let np = fresh_binder(p, &used, &stmts, &body);
+                    (stmts, body) = subst_block(&stmts, &body, &[(p.clone(), Expr::Var(np.clone()))]);
+                    *p = np;
+                }
+            }
+            let (stmts_sub, body_sub) = subst_block(&stmts, &body, &active_substs);
+            Expr::Lambda(params, rt.clone(), stmts_sub, Box::new(body_sub))
         }
     }
 }
@@ -12347,12 +12430,23 @@ pub fn subst_expr_vars(e: &Expr, substs: &[(String, Expr)]) -> Expr {
 fn subst_block(stmts: &[Stmt], body: &Expr, substs: &[(String, Expr)]) -> (Vec<Stmt>, Expr) {
     let mut new_stmts = Vec::new();
     let mut cur_substs = substs.to_vec();
-    for s in stmts {
+    for (i, s) in stmts.iter().enumerate() {
         match s {
             Stmt::Let(v, e) => {
                 let e_sub = subst_expr_vars(e, &cur_substs);
-                new_stmts.push(Stmt::Let(v.clone(), e_sub));
                 cur_substs.retain(|(target, _)| target != v);
+                // A `let` that a replacement mentions is renamed in what follows it, as a
+                // binder of a `match` arm is.
+                let used = substs_free_vars(&cur_substs);
+                if used.contains(v) {
+                    let nv = fresh_binder(v, &used, &stmts[i + 1..], body);
+                    new_stmts.push(Stmt::Let(nv.clone(), e_sub));
+                    let (rest, body_r) = subst_block(&stmts[i + 1..], body, &[(v.clone(), Expr::Var(nv))]);
+                    let (rest_sub, body_sub) = subst_block(&rest, &body_r, &cur_substs);
+                    new_stmts.extend(rest_sub);
+                    return (new_stmts, body_sub);
+                }
+                new_stmts.push(Stmt::Let(v.clone(), e_sub));
             }
             Stmt::Check(tag, e) => {
                 new_stmts.push(Stmt::Check(tag.clone(), subst_expr_vars(e, &cur_substs)));

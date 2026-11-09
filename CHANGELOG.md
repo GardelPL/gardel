@@ -9,6 +9,10 @@ All notable changes, theoretical soundess fixes, verification overhauls, front-e
 Spec draft v0.5. [plan/Roadmap.md](plan/Roadmap.md) holds the detail for each task.
 
 ### Language and runtime
+- **`gjson`** (F.4), a verified JSON package: an opaque `JSON` value whose invariant keeps text valid UTF-8, keys unique and in order, and nesting at most 64 levels; a total parser with byte offsets in every error and a 4 MiB limit; and a writer with no white space and keys in order. The law `JSON.scalar_round_trip` proves `parse(v.to_bytes) = Ok(v)` for scalars and strings. Arrays and objects are covered by tests (`gjson/tests/cases.txt`).
+- **A field of a machine number type is in range** in the proof (F.4), for sum types and records.
+- **Substitution avoids capture** (F.4): a `match` binder, quantified variable, lambda parameter or `let` in a `require` no longer captures a variable of the call's arguments.
+- **`NUMBER_TEXT.digits_step`** (F.4), a law with no trigger giving one step of `digits`.
 - **`MAP[K, V]`** (F.3), a prelude module: `empty`, `get`, `has`, `put`, `remove`, `size`, `keys`, `values` and `fold`, for any ordered key. Its representation is hidden, and its laws say what `get` gives after `put` and `remove` and that `keys` ascend. Each law has a trigger, so a client proves facts such as `m.put(1, x).get(2) = m.get(2)` with no call. `KEY_ORDER[K]` holds the ascending-list predicates. It runs in C with `STRING` keys and frees what it allocates.
 - **Function types of three parameters** (F.3), such as `(acc: B, k: K, v: V) -> B`, in the proof, in lambdas and in C. Before, the verifier knew one and two, and a third gave an invalid Boogie type.
 - **A law of another module states its hypotheses at their types** (F.3). `not j.equals(k)` on a bounded `K` was emitted as `OPTION`'s `equals`, and the client was `E0199`.
