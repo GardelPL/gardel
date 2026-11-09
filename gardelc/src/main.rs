@@ -13852,15 +13852,28 @@ pub fn find_solvers() -> (Option<String>, Option<String>) {
         which_solver("boogie")
     });
 
-    let z3 = env::var("Z3_EXE").ok().or_else(|| {
-        let bundled_z3 = r"C:\home\Learn\Gardel\tools\dafny\z3\bin\z3-4.12.1.exe";
-        if std::path::Path::new(bundled_z3).exists() {
-            return Some(bundled_z3.to_string());
-        }
-        which_solver("z3")
-    });
+    let z3 = env::var("Z3_EXE")
+        .ok()
+        .or_else(bundled_z3)
+        .or_else(|| which_solver("z3"));
 
     (boogie, z3)
+}
+
+/// Finds the Z3 bundled with the repository, at `tools/dafny/z3/bin`, in the
+/// nearest folder above the running executable that has it. The executable
+/// lives in `gardelc/target/<profile>/`, or one level deeper for a test, so
+/// this finds the repository's copy wherever the repository is.
+fn bundled_z3() -> Option<String> {
+    let exe = env::current_exe().ok()?;
+    let bin = std::path::Path::new("tools").join("dafny").join("z3").join("bin");
+    exe.ancestors().skip(1).find_map(|dir| {
+        ["z3-4.12.1.exe", "z3-4.12.1", "z3.exe", "z3"]
+            .iter()
+            .map(|name| dir.join(&bin).join(name))
+            .find(|p| p.is_file())
+            .map(|p| p.to_string_lossy().to_string())
+    })
 }
 
 fn which_solver(name: &str) -> Option<String> {
