@@ -306,6 +306,7 @@ The Standard Prelude provides an irreducible core of verified concepts, algebrai
   - `module STRING`: The standard opaque text ADT (`representation {NONE}`) with ghost model `specify chars: LIST[CHAR]` (§3). String literals (`"..."`) desugar directly to verified prelude `STRING` values.
   - `module BYTES`: The standard opaque boundary byte buffer ADT (`representation {NONE}`) with ghost model `specify model: LIST[U64]` (§3.1, §11).
   - `module BYTES_BUILDER`: Appends parts at constant cost and joins them once into `BYTES` (§3.1).
+  - `module MAP[K: ORD, V]`: A finite map with a hidden representation (`representation {NONE}`): `empty`, `get`, `has`, `put`, `remove`, `size`, `keys`, `values` and `fold`. Its laws state what `get` gives after `put` and `remove`, of the same key and of another, and that `keys` ascend (`keys_ascending`). Each law has a `trigger`, so a client uses it with no call. Keys are compared with `K`'s `equals`, and `remove` drops every key equal to the one given, as `ORD` does not promise that `less_than` agrees with `equals`. `module KEY_ORDER[K: ORD]` holds the ascending-list predicates and the key edits it proves them for.
   - `module NUMBER_TEXT` & `module NUMBER_ERROR`: Decimal and hex text of `NAT` and `I64`, with proven round trips, and why a parse failed (§3.1).
   - `module STRING_ERROR` & `module IO_ERROR`: Standard boundary error sum types for text decoding (`STRING.from_utf8`) and external I/O operations (§11).
   - `module BIGNAT`: Arbitrary-precision natural numbers represented as little-endian limbs in `LIST[U64]` with ghost model `specify model: MATH_INT` (§3, §6.4.B).
@@ -1560,7 +1561,7 @@ When Boogie/Z3 returns `unknown` or fails to prove an obligation:
 
 Functions are first-class values that carry contracts in their types, so libraries such as `map` and `filter` can be specified and verified.
 
-- **Function types.** `A -> B` is a total, pure function. A refined function type names its parameter and adds clauses: `(x: NAT) -> NAT require small: x < 100 ensure bounded: Result <= x`.
+- **Function types.** `A -> B` is a total, pure function, of one, two or three parameters: `(acc: B, k: K, v: V) -> B`. A refined function type names its parameter and adds clauses: `(x: NAT) -> NAT require small: x < 100 ensure bounded: Result <= x`.
 - **Functions in data.** A record field or a list element may hold a function, and `r.f(x)` applies field `f`. A function has no equality, so neither has a type that holds one: `=` on it does not build, nor does `has` on a list of it.
 - **Lambdas.** `fn(x: NAT): NAT do x + 1 end` is checked against the contract of the expected function type at the point of use. The obligations of its body (§12) are proven where the lambda is created, under what holds there, for every argument of its parameter types, because it can be applied to any of them.
 - **Totality.** Function arguments must be total. There are no partial functions and no exceptions.

@@ -1,0 +1,108 @@
+program MAIN
+
+feature {ANY}
+
+  -- `a` and `b` joined by ` | `, or `a` alone if that would not fit.
+  and_then(a: STRING, b: STRING): STRING
+    do
+      if a.byte_length <= 1000000 and b.byte_length <= 1000000 then
+        a.concat(" | ").concat(b)
+      else
+        a
+      end
+    end
+
+  number(o: OPTION[NAT]): STRING
+    do
+      match o
+        case Some(n) then NUMBER_TEXT.nat_to_text(n)
+        case None then "none"
+      end
+    end
+
+  text(o: OPTION[STRING]): STRING
+    do
+      match o
+        case Some(s) then s
+        case None then "none"
+      end
+    end
+
+  -- The keys joined by commas, in the order the map gives them.
+  joined(ks: LIST[STRING]): STRING
+    variant
+      ks.length
+    do
+      if ks.length = 0 then
+        ""
+      else if ks.length = 1 then
+        ks.head
+      else
+        let rest = joined(ks.tail)
+        if ks.head.byte_length <= 1000000 and rest.byte_length <= 1000000 then
+          ks.head.concat(",").concat(rest)
+        else
+          ks.head
+        end
+      end end
+    end
+
+  -- Text keys put out of order, one put twice and one removed.
+  fruit: MAP[STRING, NAT]
+    do
+      let m0: MAP[STRING, NAT] = MAP.empty
+      let m1 = m0.put("pear", 3)
+      let m2 = m1.put("apple", 1)
+      let m3 = m2.put("fig", 2)
+      let m4 = m3.put("apple", 10)
+      let m5 = m4.put("kiwi", 4)
+      m5.remove("fig")
+    end
+
+  total(m: MAP[STRING, NAT]): NAT
+    do
+      m.fold(0, fn(acc: NAT, k: STRING, v: NAT): NAT do if acc <= 1000000 and v <= 1000000 then acc + v else acc end end)
+    end
+
+  -- The longest key, by a fold that reads both the key and the value's key.
+  longest(m: MAP[STRING, NAT]): STRING
+    do
+      m.fold("", fn(acc: STRING, k: STRING, v: NAT): STRING do if k.byte_length > acc.byte_length then k else acc end end)
+    end
+
+  -- Text values under number keys.
+  names: MAP[NAT, STRING]
+    do
+      let m0: MAP[NAT, STRING] = MAP.empty
+      let m1 = m0.put(30, "thirty")
+      let m2 = m1.put(10, "ten")
+      let m3 = m2.put(20, "twenty")
+      m3.put(10, "TEN")
+    end
+
+  report: STRING
+    do
+      let m = fruit
+      let n = names
+      let a = and_then(NUMBER_TEXT.nat_to_text(m.size), joined(m.keys))
+      let b = and_then(a, and_then(number(m.get("apple")), and_then(number(m.get("fig")), number(m.get("kiwi")))))
+      let c = and_then(b, and_then(NUMBER_TEXT.nat_to_text(total(m)), longest(m)))
+      let d = and_then(c, and_then(text(n.get(10)), and_then(text(n.get(20)), text(n.get(40)))))
+      and_then(d, joined(n.values))
+    end
+
+  -- A plain number from the whole report, for the leak count, which calls it 51 times.
+  report_length: NAT
+    do
+      report.byte_length
+    end
+
+  main(args: SEQ[STRING]): IO[EXIT_CODE]
+    do
+      with IO
+        IO.print_line(report)
+        IO.exit(if report_length > 0 then 0 else 1 end)
+      end
+    end
+
+end

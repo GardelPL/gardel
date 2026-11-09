@@ -3755,6 +3755,14 @@ pub const STDLIB_SOURCES: &[(&str, &str)] = &[
         include_str!("../../stdlib/collections/list_ops.gdl"),
     ),
     (
+        "stdlib/collections/key_order.gdl",
+        include_str!("../../stdlib/collections/key_order.gdl"),
+    ),
+    (
+        "stdlib/collections/map.gdl",
+        include_str!("../../stdlib/collections/map.gdl"),
+    ),
+    (
         "stdlib/functional/function_ops.gdl",
         include_str!("../../stdlib/functional/function_ops.gdl"),
     ),
@@ -3812,6 +3820,10 @@ pub fn phase4_stdlib_source() -> &'static str {
         include_str!("../../stdlib/core/io_error.gdl"),
         "\n",
         include_str!("../../stdlib/collections/list_ops.gdl"),
+        "\n",
+        include_str!("../../stdlib/collections/key_order.gdl"),
+        "\n",
+        include_str!("../../stdlib/collections/map.gdl"),
         "\n",
         include_str!("../../stdlib/functional/function_ops.gdl"),
         "\n",
@@ -4454,6 +4466,13 @@ fn elem_receiver_type(e: &Expr, m: &ModuleDecl) -> Option<String> {
     match e {
         Expr::Var(v) if v == "Current" => Some(module_self_type(m)),
         Expr::Var(v) => ELEM_TYPE_ENV.with(|env| env.borrow().get(v).cloned()),
+        // `LIST_OPS.at(xs, i)` is an element of `xs`.
+        Expr::MethodCall(recv, r, args)
+            if r == "at" && args.len() == 2 && matches!(&**recv, Expr::Var(v) if v == "LIST_OPS") =>
+        {
+            let lt = elem_receiver_type(&args[0], m)?;
+            lt.strip_prefix("LIST[").and_then(|s| s.strip_suffix(']')).map(|s| s.trim().to_string())
+        }
         // Static call `M.r(..)` / unqualified call `r(..)` of a routine of the module.
         Expr::MethodCall(recv, r, _) if matches!(&**recv, Expr::Var(v) if v == &m.name) => {
             let (rd, _) = find_module_routine(m, r)?;
@@ -4476,6 +4495,12 @@ fn elem_receiver_type(e: &Expr, m: &ModuleDecl) -> Option<String> {
         }
         Expr::MethodCall(recv, r, args) if args.is_empty() => {
             let rt = elem_receiver_type(recv, m)?;
+            // `xs.head` of a `LIST[K]`, as `KEY_ORDER` writes `xs.head.equals(k)`.
+            if r == "head" {
+                if let Some(inner) = rt.strip_prefix("LIST[").and_then(|s| s.strip_suffix(']')) {
+                    return Some(inner.trim().to_string());
+                }
+            }
             if rt != module_self_type(m) && rt != m.name {
                 return None;
             }
@@ -4934,7 +4959,7 @@ pub const GCC_NET_LIBS: &[&str] = if cfg!(windows) { &["-lws2_32"] } else { &[] 
 /// `STRING` is injected for modules that mention it, contain string literals or use `IO`
 /// (Task B.3: literals denote prelude `STRING` values); `LIST_OPS` / `FUNCTION_OPS` are realized by the built-in
 /// `Seq_*` / `Fn1_*` preamble theories already present in every Boogie file.
-const BOOGIE_INJECTED_PRELUDE: [&str; 16] = [
+const BOOGIE_INJECTED_PRELUDE: [&str; 18] = [
     "OPTION",
     "RESULT",
     "SEQ",
@@ -4951,6 +4976,8 @@ const BOOGIE_INJECTED_PRELUDE: [&str; 16] = [
     "KEY",
     "EVENT",
     "STEP",
+    "KEY_ORDER",
+    "MAP",
 ];
 
 /// Marker on the opaque declaration of another prelude module's sort that a module's
@@ -5066,6 +5093,11 @@ impl BoogiePreludeCtx {
         }
         if wanted.contains("BYTES_BUILDER") || m.name == "BYTES_BUILDER" {
             wanted.insert("STRING");
+        }
+        // `MAP` keeps its keys with `KEY_ORDER` and answers `get` with an `OPTION`.
+        if wanted.contains("MAP") || m.name == "MAP" {
+            wanted.insert("KEY_ORDER");
+            wanted.insert("OPTION");
         }
         // `BYTES.index_of` gives an `OPTION`.
         if wanted.contains("BYTES") || m.name == "BYTES" {
@@ -5639,8 +5671,8 @@ fn expr_free_vars(e: &Expr, bound: &mut Vec<String>, out: &mut Vec<String>) {
     }
 }
 
-/// Lifts a lambda of one or two parameters to a fresh Boogie function `lam_M_k(captures)`
-/// returning an `Fn1`/`Fn2` value, defined by the axiom
+/// Lifts a lambda of one to three parameters to a fresh Boogie function `lam_M_k(captures)`
+/// returning an `Fn1`, `Fn2` or `Fn3` value, defined by the axiom
 /// `FnN_app(lam_M_k(c..), x..) == body`. The function symbol is fresh and has exactly one
 /// defining equation, so the axiom is consistent. Captured locals (variables of the
 /// enclosing routine with a known type) become arguments. Returns `None` for lambdas whose
@@ -5654,7 +5686,7 @@ fn lift_boogie_lambda(
     implicit_fields: &HashSet<String>,
     strings: &[String],
 ) -> Option<String> {
-    if params.is_empty() || params.len() > 2 {
+    if params.is_empty() || params.len() > 3 {
         return None;
     }
     let mentions_tp = |t: &str| type_tokens(t).iter().any(|tok| m.type_params.iter().any(|p| p == tok));
@@ -5718,7 +5750,11 @@ fn lift_boogie_lambda(
         ),
         m,
     );
-    let app = if params.len() == 1 { "Fn1_app" } else { "Fn2_app" };
+    let app = match params.len() {
+        1 => "Fn1_app",
+        2 => "Fn2_app",
+        _ => "Fn3_app",
+    };
     let call = format!("{name}({})", cap_names.join(", "));
     let mut quant: Vec<String> = cap_decls.clone();
     quant.extend(params.iter().map(|(p, t)| format!("{p}: {}", map_boogie_type(t, m))));
@@ -7612,6 +7648,9 @@ fn emit_prelude_contract_interface(p: &ModuleDecl) -> (String, HashSet<String>) 
         if !law.requires.iter().all(|(_, e)| visible(e)) {
             continue;
         }
+        // The law's parameters are typed while its clauses are emitted, as a routine's are for
+        // its `require` above: `j.equals(k)` on a bounded `K` must find `K`'s relation.
+        set_boogie_type_env(&cp, &law.params, None);
         let params: Vec<String> = law
             .params
             .iter()
@@ -7673,6 +7712,7 @@ fn emit_prelude_contract_interface(p: &ModuleDecl) -> (String, HashSet<String>) 
         ));
         names.insert(marker);
     }
+    clear_boogie_type_env();
     out.push('\n');
     (out, names)
 }
@@ -8120,7 +8160,9 @@ fn emit_boogie_parts_with_options(
     out.push_str("type Fn1 A B;\n");
     out.push_str("function Fn1_app<A, B>(f: Fn1 A B, x: A) returns (B);\n");
     out.push_str("type Fn2 A B C;\n");
-    out.push_str("function Fn2_app<A, B, C>(f: Fn2 A B C, x: A, y: B) returns (C);\n\n");
+    out.push_str("function Fn2_app<A, B, C>(f: Fn2 A B C, x: A, y: B) returns (C);\n");
+    out.push_str("type Fn3 A B C D;\n");
+    out.push_str("function Fn3_app<A, B, C, D>(f: Fn3 A B C D, x: A, y: B, z: C) returns (D);\n\n");
 
     out.push_str("function Fn1_id<A>() returns (Fn1 A A);\n");
     out.push_str("axiom (forall<A> x: A :: { Fn1_app(Fn1_id(), x) } Fn1_app(Fn1_id(), x) == x);\n");
@@ -9414,7 +9456,15 @@ fn map_boogie_type(ty: &str, m: &ModuleDecl) -> String {
                 map_boogie_type(t, m)
             })
             .collect();
-        if param_types.len() == 2 {
+        if param_types.len() == 3 {
+            return format!(
+                "(Fn3 {} {} {} {})",
+                param_types[0],
+                param_types[1],
+                param_types[2],
+                map_boogie_type(ret_cleaned, m)
+            );
+        } else if param_types.len() == 2 {
             return format!(
                 "(Fn2 {} {} {})",
                 param_types[0],
@@ -12867,6 +12917,8 @@ fn emit_boogie_expr_with_strings(
                     format!("Fn1_app({fname}, {})", a_str[0])
                 } else if a_str.len() == 2 {
                     format!("Fn2_app({fname}, {}, {})", a_str[0], a_str[1])
+                } else if a_str.len() == 3 {
+                    format!("Fn3_app({fname}, {}, {}, {})", a_str[0], a_str[1], a_str[2])
                 } else {
                     format!("{fname}({})", a_str.join(", "))
                 }
@@ -13049,6 +13101,8 @@ fn emit_boogie_expr_with_strings(
                     return format!("Fn1_app({r_str}, {})", a_str[0]);
                 } else if a_str.len() == 2 {
                     return format!("Fn2_app({r_str}, {}, {})", a_str[0], a_str[1]);
+                } else if a_str.len() == 3 {
+                    return format!("Fn3_app({r_str}, {}, {}, {})", a_str[0], a_str[1], a_str[2]);
                 }
             }
             let r_str = emit_boogie_expr_with_strings(
@@ -19844,7 +19898,7 @@ end
         let stdlib = parse_phase4_stdlib().expect("Phase 4 stdlib should parse");
         assert_eq!(stdlib.group, None);
         assert_eq!(stdlib.concepts.len(), 3);
-        assert_eq!(stdlib.modules.len(), 18);
+        assert_eq!(stdlib.modules.len(), 20);
         for m in &stdlib.modules {
             let mut diags = check_visibility_and_semantics(m);
             diags.extend(verify_module_phase3(
@@ -20336,7 +20390,7 @@ end
     #[test]
     fn test_plan3_multi_module_stdlib_pipeline() {
         let ast = parse_phase4_stdlib().expect("stdlib parses cleanly");
-        assert_eq!(ast.modules.len(), 18);
+        assert_eq!(ast.modules.len(), 20);
         let mut prog_env = ProgramEnv {
             modules: HashMap::new(),
             concepts: HashMap::new(),

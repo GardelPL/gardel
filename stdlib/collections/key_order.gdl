@@ -1,0 +1,181 @@
+-- Lists of keys in ascending order, and the two edits `MAP` makes to them (Task F.3).
+--
+-- `ascending(xs)` says that each key is below every key after it, by `K`'s `less_than`.
+-- As that order is irreflexive, no key appears twice. `put_keys` and `remove_keys` keep a
+-- list ascending (`ascending_put`, `ascending_remove`). These routines mention no value
+-- type, so they live apart from `MAP[K, V]`.
+--
+-- No routine here has a `require` on a function of its arguments, so the solver can unfold
+-- each one as deep as a proof needs (see the GUIDE, section 9, and Task F.13).
+module KEY_ORDER[K: ORD]
+
+create {ANY}
+
+  -- Every key of `xs` is above `lo`.
+  above(lo: K, xs: LIST[K]): BOOL
+    variant
+      xs.length
+    do
+      if xs.length = 0 then True else lo.less_than(xs.head) and KEY_ORDER.above(lo, xs.tail) end
+    end
+
+  -- Each key is below every key after it.
+  ascending(xs: LIST[K]): BOOL
+    variant
+      xs.length
+    do
+      if xs.length = 0 then True else KEY_ORDER.above(xs.head, xs.tail) and KEY_ORDER.ascending(xs.tail) end
+    end
+
+  -- `xs` with `k` in its place. A key equal to `k` already there is kept as it is.
+  put_keys(xs: LIST[K], k: K): LIST[K]
+    variant
+      xs.length
+    do
+      if xs.length = 0 then
+        LIST.empty.prepend(k)
+      else if xs.head.equals(k) then
+        xs
+      else if k.less_than(xs.head) then
+        xs.prepend(k)
+      else
+        KEY_ORDER.put_keys(xs.tail, k).prepend(xs.head)
+      end end end
+    end
+
+  -- `xs` without any key equal to `k`.
+  remove_keys(xs: LIST[K], k: K): LIST[K]
+    variant
+      xs.length
+    do
+      if xs.length = 0 then
+        xs
+      else if xs.head.equals(k) then
+        KEY_ORDER.remove_keys(xs.tail, k)
+      else
+        KEY_ORDER.remove_keys(xs.tail, k).prepend(xs.head)
+      end end
+    end
+
+  -- Lemmas, each proven by induction on `xs`.
+
+  above_weaken(a: K, b: K, xs: LIST[K]): BOOL
+    require
+      ab: a.less_than(b)
+      above_b: KEY_ORDER.above(b, xs)
+    variant
+      xs.length
+    do
+      if xs.length = 0 then True else KEY_ORDER.above_weaken(a, b, xs.tail) end
+    ensure
+      holds: Result
+      above_a: KEY_ORDER.above(a, xs)
+    end
+
+  above_at(lo: K, xs: LIST[K], j: NAT): BOOL
+    require
+      above: KEY_ORDER.above(lo, xs)
+      inside: j < xs.length
+    variant
+      j
+    do
+      if j = 0 then True else KEY_ORDER.above_at(lo, xs.tail, j - 1) end
+    ensure
+      holds: Result
+      below: lo.less_than(LIST_OPS.at(xs, j))
+    end
+
+  -- In an ascending list, a key is below every key after it, wherever the two are.
+  ascending_at(xs: LIST[K], i: NAT, j: NAT): BOOL
+    require
+      sorted: KEY_ORDER.ascending(xs)
+      ordered: i < j
+      inside: j < xs.length
+    variant
+      i
+    do
+      if i = 0 then
+        KEY_ORDER.above_at(xs.head, xs.tail, j - 1)
+      else
+        KEY_ORDER.ascending_at(xs.tail, i - 1, j - 1)
+      end
+    ensure
+      holds: Result
+      below: LIST_OPS.at(xs, i).less_than(LIST_OPS.at(xs, j))
+    end
+
+  above_put(lo: K, xs: LIST[K], k: K): BOOL
+    require
+      above: KEY_ORDER.above(lo, xs)
+      lo_k: lo.less_than(k)
+    variant
+      xs.length
+    do
+      if xs.length = 0 or xs.head.equals(k) or k.less_than(xs.head) then
+        True
+      else
+        KEY_ORDER.above_put(lo, xs.tail, k)
+      end
+    ensure
+      holds: Result
+      kept: KEY_ORDER.above(lo, KEY_ORDER.put_keys(xs, k))
+    end
+
+  ascending_put(xs: LIST[K], k: K): BOOL
+    require
+      sorted: KEY_ORDER.ascending(xs)
+    variant
+      xs.length
+    do
+      if xs.length = 0 or xs.head.equals(k) then
+        True
+      else if k.less_than(xs.head) then
+        check
+          tail: KEY_ORDER.above_weaken(k, xs.head, xs.tail)
+          whole: KEY_ORDER.above(k, xs)
+          put: KEY_ORDER.put_keys(xs, k) = xs.prepend(k)
+        end
+        True
+      else
+        check
+          below: xs.head.less_than(k)
+          head: KEY_ORDER.above_put(xs.head, xs.tail, k)
+          rest: KEY_ORDER.ascending_put(xs.tail, k)
+          put: KEY_ORDER.put_keys(xs, k) = KEY_ORDER.put_keys(xs.tail, k).prepend(xs.head)
+        end
+        True
+      end end
+    ensure
+      holds: Result
+      kept: KEY_ORDER.ascending(KEY_ORDER.put_keys(xs, k))
+    end
+
+  above_remove(lo: K, xs: LIST[K], k: K): BOOL
+    require
+      above: KEY_ORDER.above(lo, xs)
+    variant
+      xs.length
+    do
+      if xs.length = 0 then True else KEY_ORDER.above_remove(lo, xs.tail, k) end
+    ensure
+      holds: Result
+      kept: KEY_ORDER.above(lo, KEY_ORDER.remove_keys(xs, k))
+    end
+
+  ascending_remove(xs: LIST[K], k: K): BOOL
+    require
+      sorted: KEY_ORDER.ascending(xs)
+    variant
+      xs.length
+    do
+      if xs.length = 0 then
+        True
+      else
+        KEY_ORDER.above_remove(xs.head, xs.tail, k) and KEY_ORDER.ascending_remove(xs.tail, k)
+      end
+    ensure
+      holds: Result
+      kept: KEY_ORDER.ascending(KEY_ORDER.remove_keys(xs, k))
+    end
+
+end

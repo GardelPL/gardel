@@ -840,7 +840,7 @@ flowchart TD
 
 ### Phase F: Verified Libraries and Applications
 
-**Status:** In progress. Tasks F.0 and F.1 are completed, and decisions 1 to 12 of the plan are taken.
+**Status:** In progress. Tasks F.0, F.1, F.2, F.3 and F.5 are completed, and decisions 1 to 12 of the plan are taken.
 
 **Objective:** build real software on Phases A to E, and let it decide what the core libraries need: text, number and map libraries, a verified JSON package, a REST library with sync and then async handlers, and a terminal library with a tool built on it. Nothing goes into a library without a client in this plan that needs it.
 
@@ -863,7 +863,8 @@ flowchart TD
 | 1. Foundations | [F.0](libraries/verified_libraries.md#task-f0-resolve-the-failing-e3-test) | The failing E.3 test resolved ✅ |
 | | [F.1](libraries/verified_libraries.md#task-f1-compiler-gaps) | Generic bounds, match binders, function fields in C ✅ |
 | 2. Core libraries | [F.2](libraries/verified_libraries.md#task-f2-bytes-string-and-number-text) | `BYTES`, `STRING` and number text ✅ |
-| | [F.3](libraries/verified_libraries.md#task-f3-mapk-v) | `MAP[K, V]` |
+| | [F.3](libraries/verified_libraries.md#task-f3-mapk-v) | `MAP[K, V]` ✅ |
+| | [F.13](libraries/verified_libraries.md#task-f13-fuel-guards-on-recursive-functions) | Fuel guards on recursive functions, found in F.5 |
 | 3. JSON | [F.4](libraries/verified_libraries.md#task-f4-the-gjson-package) | The `gjson` package |
 | 4. REST | [F.5](libraries/verified_libraries.md#task-f5-a-parser-that-means-what-the-bytes-say) | A correct `ghttp` parser ✅ |
 | | [F.12](libraries/verified_libraries.md#task-f12-refined-function-types) | `require` and `ensure` on function types enforced |
@@ -899,7 +900,7 @@ flowchart TD
 
 ## 6. Immediate Next Step
 
-**Phase F: Verified Libraries and Applications** is in progress, and Tasks F.0, F.1, F.2 and F.5 are completed. The next task is F.3, `MAP[K, V]`. Decision 3 of [libraries/verified_libraries.md](libraries/verified_libraries.md) settles the order of `STRING`: byte order of the UTF-8 form.
+**Phase F: Verified Libraries and Applications** is in progress, and Tasks F.0, F.1, F.2, F.3 and F.5 are completed. The next task is F.4, the `gjson` package, which needs F.2 and F.3. Decision 3 of [libraries/verified_libraries.md](libraries/verified_libraries.md) settles the order of `STRING`: byte order of the UTF-8 form.
 
 **Phase E: Projects and Packages:** Tasks E.0 to E.5 and E.7 are completed, so Phase E is complete. Fetching dependencies and a lockfile were dropped, as a path dependency on a git submodule already pins a commit.
 

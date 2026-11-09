@@ -1242,7 +1242,8 @@ static bool {inst}__has(struct {inst}* xs, {ce} x) {{\n\
     /// A `let` whose value could not be built at its declared type.
     fn check_declared(v: &str, want: Option<&str>, got: &str) -> Result<(), String> {
         match want {
-            Some(t) if t != "Current" && t != got => Err(format!("`{v}` is declared `{t}`, and its value is `{got}`")),
+            // `NAT` and `U64` are one C type, also inside a type argument (`MAP[STRING, NAT]`).
+            Some(t) if t != "Current" && cnorm(t) != cnorm(got) => Err(format!("`{v}` is declared `{t}`, and its value is `{got}`")),
             _ => Ok(()),
         }
     }

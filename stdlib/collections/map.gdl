@@ -1,0 +1,312 @@
+-- A finite map from keys to values (Task F.3).
+--
+-- A client sees `get`, `put`, `remove`, `size`, `keys`, `values` and `fold`, and the laws
+-- below, which state what `get` says after each change. Keys are compared with `K`'s
+-- `equals` and ordered by its `less_than`.
+--
+-- The representation is hidden: the keys in ascending order and their values beside them
+-- (decision 4 of the libraries plan). Each operation walks the list, so `get`, `put` and
+-- `remove` take time linear in the size. A balanced tree can replace the lists without a
+-- change to any contract.
+--
+-- `ORD` does not promise that `less_than` agrees with `equals`. So `remove` drops every key
+-- equal to the one given, and the laws rest on the `EQ` and `ORD` laws alone.
+module MAP[K: ORD, V]
+
+representation {NONE}
+  ks: LIST[K]
+  vs: LIST[V]
+
+invariant
+  same_length: ks.length = vs.length
+  sorted: KEY_ORDER.ascending(ks)
+
+create {ANY}
+
+  empty: MAP[K, V]
+    do
+      { ks = LIST.empty, vs = LIST.empty }
+    ensure
+      no_keys: Result.size = 0
+    end
+
+create {NONE}
+
+  -- The value beside the first key of `xs` equal to `k`.
+  find(xs: LIST[K], ys: LIST[V], k: K): OPTION[V]
+    variant
+      xs.length
+    do
+      if xs.length = 0 or ys.length = 0 then
+        None
+      else if xs.head.equals(k) then
+        Some(ys.head)
+      else
+        MAP.find(xs.tail, ys.tail, k)
+      end end
+    end
+
+  -- `ys` changed as `KEY_ORDER.put_keys(xs, k)` changes `xs`, with `v` beside `k`.
+  put_values(xs: LIST[K], ys: LIST[V], k: K, v: V): LIST[V]
+    variant
+      xs.length
+    do
+      if xs.length = 0 or ys.length = 0 then
+        LIST.empty.prepend(v)
+      else if xs.head.equals(k) then
+        ys.tail.prepend(v)
+      else if k.less_than(xs.head) then
+        ys.prepend(v)
+      else
+        MAP.put_values(xs.tail, ys.tail, k, v).prepend(ys.head)
+      end end end
+    end
+
+  -- `ys` changed as `KEY_ORDER.remove_keys(xs, k)` changes `xs`.
+  remove_values(xs: LIST[K], ys: LIST[V], k: K): LIST[V]
+    variant
+      xs.length
+    do
+      if xs.length = 0 or ys.length = 0 then
+        ys
+      else if xs.head.equals(k) then
+        MAP.remove_values(xs.tail, ys.tail, k)
+      else
+        MAP.remove_values(xs.tail, ys.tail, k).prepend(ys.head)
+      end end
+    end
+
+  fold_entries[B](xs: LIST[K], ys: LIST[V], f: (acc: B, k: K, v: V) -> B, acc: B): B
+    variant
+      xs.length
+    do
+      if xs.length = 0 or ys.length = 0 then
+        acc
+      else
+        MAP.fold_entries(xs.tail, ys.tail, f, f(acc, xs.head, ys.head))
+      end
+    end
+
+  -- Lemmas. Each is proven by induction on `xs`, and holds whenever its `require` does.
+
+  put_lengths(xs: LIST[K], ys: LIST[V], k: K, v: V): BOOL
+    require
+      same: xs.length = ys.length
+    variant
+      xs.length
+    do
+      if xs.length = 0 or xs.head.equals(k) or k.less_than(xs.head) then
+        True
+      else
+        MAP.put_lengths(xs.tail, ys.tail, k, v)
+      end
+    ensure
+      holds: Result
+      same: MAP.put_values(xs, ys, k, v).length = KEY_ORDER.put_keys(xs, k).length
+    end
+
+  remove_lengths(xs: LIST[K], ys: LIST[V], k: K): BOOL
+    require
+      same: xs.length = ys.length
+    variant
+      xs.length
+    do
+      if xs.length = 0 then True else MAP.remove_lengths(xs.tail, ys.tail, k) end
+    ensure
+      holds: Result
+      same: MAP.remove_values(xs, ys, k).length = KEY_ORDER.remove_keys(xs, k).length
+    end
+
+  find_put_same(xs: LIST[K], ys: LIST[V], k: K, v: V): BOOL
+    require
+      same: xs.length = ys.length
+    variant
+      xs.length
+    do
+      if xs.length = 0 or xs.head.equals(k) or k.less_than(xs.head) then
+        True
+      else
+        MAP.find_put_same(xs.tail, ys.tail, k, v)
+      end
+    ensure
+      holds: Result
+      found: MAP.find(KEY_ORDER.put_keys(xs, k), MAP.put_values(xs, ys, k, v), k) = Some(v)
+    end
+
+  find_put_other(xs: LIST[K], ys: LIST[V], k: K, v: V, j: K): BOOL
+    require
+      same: xs.length = ys.length
+      other: not j.equals(k)
+    variant
+      xs.length
+    do
+      if xs.length = 0 or xs.head.equals(k) or k.less_than(xs.head) then
+        True
+      else
+        MAP.find_put_other(xs.tail, ys.tail, k, v, j)
+      end
+    ensure
+      holds: Result
+      unchanged: MAP.find(KEY_ORDER.put_keys(xs, k), MAP.put_values(xs, ys, k, v), j) = MAP.find(xs, ys, j)
+    end
+
+  find_remove_same(xs: LIST[K], ys: LIST[V], k: K): BOOL
+    require
+      same: xs.length = ys.length
+    variant
+      xs.length
+    do
+      if xs.length = 0 then True else MAP.find_remove_same(xs.tail, ys.tail, k) end
+    ensure
+      holds: Result
+      gone: MAP.find(KEY_ORDER.remove_keys(xs, k), MAP.remove_values(xs, ys, k), k) = None
+    end
+
+  find_remove_other(xs: LIST[K], ys: LIST[V], k: K, j: K): BOOL
+    require
+      same: xs.length = ys.length
+      other: not j.equals(k)
+    variant
+      xs.length
+    do
+      if xs.length = 0 then True else MAP.find_remove_other(xs.tail, ys.tail, k, j) end
+    ensure
+      holds: Result
+      unchanged: MAP.find(KEY_ORDER.remove_keys(xs, k), MAP.remove_values(xs, ys, k), j) = MAP.find(xs, ys, j)
+    end
+
+feature {ANY}
+
+  -- How many keys the map holds.
+  size: NAT
+    do
+      Current.ks.length
+    end
+
+  -- The value of `k`, or `None` when the map has no key equal to `k`.
+  get(k: K): OPTION[V]
+    do
+      MAP.find(Current.ks, Current.vs, k)
+    end
+
+  has(k: K): BOOL
+    do
+      Current.get(k).is_some
+    ensure
+      def: Result = Current.get(k).is_some
+    end
+
+  -- The map with `v` as the value of `k`, in place of any value it had.
+  put(k: K, v: V): MAP[K, V]
+    do
+      check
+        lengths: MAP.put_lengths(Current.ks, Current.vs, k, v)
+        sorted: KEY_ORDER.ascending_put(Current.ks, k)
+      end
+      { ks = KEY_ORDER.put_keys(Current.ks, k), vs = MAP.put_values(Current.ks, Current.vs, k, v) }
+    end
+
+  -- The map with no key equal to `k`.
+  remove(k: K): MAP[K, V]
+    do
+      check
+        lengths: MAP.remove_lengths(Current.ks, Current.vs, k)
+        sorted: KEY_ORDER.ascending_remove(Current.ks, k)
+      end
+      { ks = KEY_ORDER.remove_keys(Current.ks, k), vs = MAP.remove_values(Current.ks, Current.vs, k) }
+    end
+
+  -- `f` applied to each key and its value, in ascending order of keys, starting from `init`.
+  fold[B](init: B, f: (acc: B, k: K, v: V) -> B): B
+    do
+      MAP.fold_entries(Current.ks, Current.vs, f, init)
+    ensure
+      empty_case: Current.size = 0 implies Result = init
+    end
+
+  -- The keys, in ascending order.
+  keys: LIST[K]
+    do
+      Current.ks
+    ensure
+      sorted: KEY_ORDER.ascending(Result)
+      counted: Result.length = Current.size
+    end
+
+  -- The values, in the order of their keys.
+  values: LIST[V]
+    do
+      Current.vs
+    ensure
+      counted: Result.length = Current.size
+    end
+
+specify {ANY}
+
+  -- What `get` says after each change. With these a client proves facts about a map
+  -- without seeing how it is kept.
+
+  law get_empty(m: MAP[K, V], k: K)
+    require
+      no_keys: m.size = 0
+    trigger
+      m.get(k)
+    ensure
+      nothing: m.get(k) = None
+    end
+
+  law get_put_same(m: MAP[K, V], k: K, v: V)
+    trigger
+      m.put(k, v).get(k)
+    do
+      MAP.find_put_same(m.ks, m.vs, k, v)
+    ensure
+      found: m.put(k, v).get(k) = Some(v)
+    end
+
+  law get_put_other(m: MAP[K, V], k: K, v: V, j: K)
+    require
+      other: not j.equals(k)
+    trigger
+      m.put(k, v).get(j)
+    do
+      MAP.find_put_other(m.ks, m.vs, k, v, j)
+    ensure
+      unchanged: m.put(k, v).get(j) = m.get(j)
+    end
+
+  law get_remove_same(m: MAP[K, V], k: K)
+    trigger
+      m.remove(k).get(k)
+    do
+      MAP.find_remove_same(m.ks, m.vs, k)
+    ensure
+      gone: m.remove(k).get(k) = None
+    end
+
+  law get_remove_other(m: MAP[K, V], k: K, j: K)
+    require
+      other: not j.equals(k)
+    trigger
+      m.remove(k).get(j)
+    do
+      MAP.find_remove_other(m.ks, m.vs, k, j)
+    ensure
+      unchanged: m.remove(k).get(j) = m.get(j)
+    end
+
+  -- The keys ascend: one at a lower place is below one at a higher place, so no key
+  -- appears twice.
+  law keys_ascending(m: MAP[K, V], i: NAT, j: NAT)
+    require
+      ordered: i < j
+      inside: j < m.size
+    trigger
+      LIST_OPS.at(m.keys, i), LIST_OPS.at(m.keys, j)
+    do
+      KEY_ORDER.ascending_at(m.keys, i, j)
+    ensure
+      below: LIST_OPS.at(m.keys, i).less_than(LIST_OPS.at(m.keys, j))
+    end
+
+end
