@@ -1,0 +1,19 @@
+-- What the reader gives back after a string or a number: the bytes it took, last first,
+-- and the bytes after them.
+module JSON_SCAN
+
+representation {ANY}
+  taken: LIST[U64]
+  rest: LIST[U64]
+
+create {ANY}
+
+  make(t: LIST[U64], r: LIST[U64]): JSON_SCAN
+    do
+      { taken = t, rest = r }
+    ensure
+      taken_set: Result.taken = t
+      rest_set: Result.rest = r
+    end
+
+end

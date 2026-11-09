@@ -53,6 +53,7 @@ This guide is written for two audiences:
   - [Mutual Recursion](#mutual-recursion)
   - [No Recursion Through Function Values](#no-recursion-through-function-values)
   - [Known Limit: a `require` That Calls a Function](#known-limit-a-require-that-calls-a-function)
+  - [Loops That Run Fast in C](#loops-that-run-fast-in-c)
 - [10. Automatic Deterministic Parallelism](#10-automatic-deterministic-parallelism)
   - [Divide-and-Conquer Parallel Fork-Join](#divide-and-conquer-parallel-fork-join)
   - [Church-Rosser Confluence](#church-rosser-confluence)
@@ -92,6 +93,9 @@ This guide is written for two audiences:
   - [The Prelude Is Always There](#the-prelude-is-always-there)
   - [Multi-File Projects](#multi-file-projects)
   - [Project Manifests (`Gardel.toml`)](#project-manifests-gardeltoml)
+  - [Dependencies](#dependencies)
+  - [A Package for JSON: `gjson`](#a-package-for-json-gjson)
+  - [Checking a New Version](#checking-a-new-version)
   - [Name Resolution](#name-resolution)
   - [The Standard Library Sources (`stdlib/`)](#the-standard-library-sources-stdlib)
 - [18. Compiler CLI Cheatsheet & Grammar Reference](#18-compiler-cli-cheatsheet--grammar-reference)
@@ -423,6 +427,8 @@ read_back(n: NAT): RESULT[NUMBER_ERROR, NAT]
   end
 ```
 
+`NUMBER_TEXT.digits(n, rest)` puts the decimal digits of `n` in front of the byte list `rest`, as ASCII codes. A client cannot see its body, so the law `digits_step` gives one step of it: `digits(n, rest) = rest.prepend(48 + n)` when `n < 10`, and `digits(n / 10, rest.prepend(48 + n % 10))` otherwise. It has no trigger, so a proof calls it where it needs it, as in `check s: NUMBER_TEXT.digits_step(n, rest) end`.
+
 `MAP[K, V]` maps keys to values. `K` must be ordered (`ORD`): `STRING` and every number type are. Its representation is hidden, so what a client can prove comes from its laws, and each law reaches a client by itself:
 
 ```eiffel
@@ -537,6 +543,10 @@ feature {ANY}
     end
 end
 ```
+
+A field of a number type keeps the range of its type. In `| Box(n: NAT, i: I64)`, the `n` that `case Box(n, i)` binds is known to be in $[0, 2^{64} - 1]$ and `i` in $[-2^{63}, 2^{63} - 1]$, so a contract that needs that range applies to them. The same holds for a record's fields, and for `U64` and `CHAR`. An element of a `LIST[U64]` does not yet carry its range: check it, as `if b <= 255 then`, before relying on it.
+
+Two arms of one `match` may not bind the same name at different types, as `case JInt(v)` with `v: I64` beside `case JString(v)` with `v: LIST[U64]`. The verifier cannot translate it and reports `E0199`. Give each its own name.
 
 ### Refinement-Aware Pattern Matching
 
@@ -910,6 +920,21 @@ same_ci(a: BYTES, b: BYTES, i: NAT): BOOL
 
 A `require` on plain arguments, such as `n < 100`, is not affected, because its guard calls no function.
 
+A second limit concerns lists: the solver's facts about `LIST` do not apply to a term that holds a prelude routine's result directly, such as `NUMBER_TEXT.digits(n, ys).append(zs)`. Name the result first, and they do:
+
+```eiffel
+let ds = NUMBER_TEXT.digits(n, ys)
+ds.append(zs)
+```
+
+### Loops That Run Fast in C
+
+A routine over a long input, such as a parser over a document of a million bytes, runs as fast as a hand-written C loop if it follows three rules. `gjson`'s reader follows them.
+
+- **Make the recursive call the last thing the routine does.** A self tail call is a `while` loop. Any other call takes a stack frame, and a 1 MB stack holds only 30,000 to 60,000 of them. Carry the result in an argument (an accumulator), and reverse it once at the end if needed.
+- **Test `bs = LIST.empty`, not `bs.length`.** `LIST.length` walks the list, so testing it on every step makes the loop quadratic. If an error must report an offset, compute it only on the error path.
+- **Avoid independent `let`s inside a loop.** Two `let`s that do not use each other run as parallel OpenMP tasks, whatever they cost (§10). Inside a loop over 200,000 items this took 36 s against 0.65 s without it. Write the second one inline, or make one use the other. Task F.14 of the [libraries plan](../plan/libraries/verified_libraries.md#task-f14-a-cost-model-for-parallel-lets) adds a cost model.
+
 ---
 
 ## 10. Automatic Deterministic Parallelism
@@ -935,7 +960,7 @@ right_max = max_value(r);
 #pragma omp taskwait
 ```
 
-Both branches run in parallel on separate CPU cores, and task depth is capped so that small subtrees do not pay for a fork.
+Both branches run in parallel on separate CPU cores, and task depth is capped so that small subtrees do not pay for a fork. The cap does not look at what each `let` costs, so two cheap `let`s in a loop still fork on every step: see [Loops That Run Fast in C](#loops-that-run-fast-in-c).
 
 ### Church-Rosser Confluence
 
@@ -1845,6 +1870,36 @@ What you can rely on:
 - **A dependency's `program` is not yours.** It is verified but not built, and you cannot refer to it.
 
 Diagnostics name a dependency's module by its full name, such as `ghttp::HTTP_PARSER`. Aliases have no effect on proofs or generated code.
+
+### A Package for JSON: `gjson`
+
+`gjson/` is a verified JSON package (RFC 8259). Add it to `[dependencies]` as `gjson = { path = "../gjson" }`, with the path to your copy, and use `JSON`:
+
+```eiffel
+match JSON.parse_text("{\"b\": [1, 2.5, \"x\"], \"a\": null}")
+  case Ok(v) then v.to_text            -- {"a":null,"b":[1,2.5,"x"]}
+  case Error(e) then NUMBER_TEXT.nat_to_text(e.offset)   -- the byte where it went wrong
+end
+```
+
+- **The value.** `JSON` is opaque. Build it with `null`, `bool`, `int`, `number`, `string`, `empty_array`, `empty_object`, `with_item` and `with_field`, and read it with `is_null`, `as_bool`, `as_int`, `number_text`, `as_string`, `count`, `item`, `field` and `depth`. Its invariant keeps text valid UTF-8, the keys of an object unique and in ascending byte order, and nesting at most 64 levels, so `with_item` and `with_field` return an `OPTION`. An integer in the range of `I64` is an `I64`, and any other number keeps its text as read.
+- **Parsing.** `JSON.parse(b: BYTES)` and `JSON.parse_text(s: STRING)` are total and return `RESULT[JSON_ERROR, JSON]`. Every error names a byte offset (`e.offset`). Input over 4 MiB is `TooLarge`, nesting over 64 levels is `TooDeep`, and a repeated key is `DuplicateKey`.
+- **Writing.** `to_bytes` and `to_text` add no white space and write keys in order, so equal values give equal bytes.
+- **What you can prove.** The law `JSON.scalar_round_trip` says a scalar read back from its own bytes is itself. With the builders' contracts it reaches your code with no extra work:
+
+```eiffel
+back(i: I64, s: STRING): BOOL
+  require
+    short: s.byte_length <= 100000
+  do
+    True
+  ensure
+    int: JSON.parse(JSON.int(i).to_bytes) = Ok(JSON.int(i))
+    text: JSON.parse(JSON.string(s).to_bytes) = Ok(JSON.string(s))
+  end
+```
+
+The round trip of arrays and objects is tested (`gjson/tests/cases.txt`) but not proven. `gjson/README.md` lists the errors, the costs and what is proven.
 
 ### Checking a New Version
 

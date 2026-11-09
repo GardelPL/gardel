@@ -1,0 +1,21 @@
+-- What the reader gives back after a value: the value's cell, the bytes after it, and how
+-- deeply it nests.
+module JSON_STEP
+
+representation {ANY}
+  cell: JSON_CELL
+  rest: LIST[U64]
+  levels: NAT
+
+create {ANY}
+
+  make(c: JSON_CELL, r: LIST[U64], l: NAT): JSON_STEP
+    do
+      { cell = c, rest = r, levels = l }
+    ensure
+      cell_set: Result.cell = c
+      rest_set: Result.rest = r
+      levels_set: Result.levels = l
+    end
+
+end

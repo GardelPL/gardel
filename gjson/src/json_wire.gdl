@@ -1,0 +1,295 @@
+-- The text the writer gives for a value, stated first byte first, for the round-trip proof
+-- (Task F.4). `JSON_WRITER` pushes bytes last first onto a list it reverses at the end, so
+-- that it runs in loops; this states the same bytes the other way round, which is how the
+-- reader meets them. Each routine here is a proof helper: nothing runs it.
+functions JSON_WIRE
+
+feature {ANY}
+
+  -- The escape of byte `b` in front of `acc`, as `JSON_WRITER.push_byte` writes it.
+  escaped(b: U64, acc: LIST[U64]): LIST[U64]
+    require
+      octet: b < 256
+    do
+      if b = 34 or b = 92 then
+        acc.prepend(b).prepend(92)
+      else if b = 8 then
+        acc.prepend(98).prepend(92)
+      else if b = 12 then
+        acc.prepend(102).prepend(92)
+      else if b = 10 then
+        acc.prepend(110).prepend(92)
+      else if b = 13 then
+        acc.prepend(114).prepend(92)
+      else if b = 9 then
+        acc.prepend(116).prepend(92)
+      else if b < 32 then
+        let zero = NUMBER_TEXT.hex_digit(0)
+        acc.prepend(NUMBER_TEXT.hex_digit(b % 16)).prepend(NUMBER_TEXT.hex_digit(b / 16))
+          .prepend(zero).prepend(zero).prepend(117).prepend(92)
+      else
+        acc.prepend(b)
+      end end end end end end end
+    end
+
+  -- The text `t`, escaped, in front of `acc`.
+  text_wire(t: LIST[U64], acc: LIST[U64]): LIST[U64]
+    require
+      octets: JSON_BYTES.octets(t)
+    variant
+      t.length
+    do
+      if t = LIST.empty then acc else escaped(t.head, text_wire(t.tail, acc)) end
+    end
+
+  -- The digits of an integer, with `-` before a negative one, in front of `acc`.
+  int_wire(i: I64, acc: LIST[U64]): LIST[U64]
+    do
+      if i >= 0 then
+        NUMBER_TEXT.digits(NAT.from_i64(i), acc)
+      else
+        NUMBER_TEXT.digits(NUMBER_TEXT.magnitude(i), acc).prepend(45)
+      end
+    end
+
+  -- A scalar, in front of `acc`.
+  scalar_wire(c: JSON_CELL, acc: LIST[U64]): LIST[U64]
+    require
+      valid: c.ok(0)
+    do
+      match c
+        case JNull then acc.prepend(108).prepend(108).prepend(117).prepend(110)
+        case JBool(b) then
+          if b then
+            acc.prepend(101).prepend(117).prepend(114).prepend(116)
+          else
+            acc.prepend(101).prepend(115).prepend(108).prepend(97).prepend(102)
+          end
+        case JInt(w) then int_wire(w, acc)
+        case JNumber(t) then t.append(acc)
+        case JString(t) then text_wire(t, acc.prepend(34)).prepend(34)
+        case _ then acc
+      end
+    end
+
+  -- A scalar, a cell that is not an array or an object.
+  is_scalar(c: JSON_CELL): BOOL
+    do
+      match c
+        case JArray(_) then False
+        case JObject(_) then False
+        case _ then True
+      end
+    end
+
+  -- Lemmas: pushing a value's bytes, last first, onto `racc` is reversing its text onto
+  -- `racc`.
+
+  rev_escaped(b: U64, ys: LIST[U64], racc: LIST[U64]): BOOL
+    require
+      octet: b < 256
+    do
+      let e = escaped(b, ys)
+      if b = 34 or b = 92 or b = 8 or b = 12 or b = 10 or b = 13 or b = 9 then
+        check
+          two: JSON_BYTES.reverse(e, racc) = JSON_BYTES.reverse(e.tail, racc.prepend(92))
+          one: JSON_BYTES.reverse(e.tail, racc.prepend(92)) = JSON_BYTES.reverse(ys, racc.prepend(92).prepend(e.tail.head))
+        end
+        True
+      else if b < 32 then
+        let h1 = NUMBER_TEXT.hex_digit(b / 16)
+        let h2 = NUMBER_TEXT.hex_digit(b % 16)
+        let zero = NUMBER_TEXT.hex_digit(0)
+        let r1 = racc.prepend(92)
+        let r2 = r1.prepend(117)
+        let r3 = r2.prepend(zero)
+        let r4 = r3.prepend(zero)
+        let r5 = r4.prepend(h1)
+        check
+          s1: JSON_BYTES.reverse(e, racc) = JSON_BYTES.reverse(e.tail, r1)
+          s2: JSON_BYTES.reverse(e.tail, r1) = JSON_BYTES.reverse(e.tail.tail, r2)
+          s3: JSON_BYTES.reverse(e.tail.tail, r2) = JSON_BYTES.reverse(e.tail.tail.tail, r3)
+          s4: JSON_BYTES.reverse(e.tail.tail.tail, r3) = JSON_BYTES.reverse(e.tail.tail.tail.tail, r4)
+          s5: JSON_BYTES.reverse(e.tail.tail.tail.tail, r4) = JSON_BYTES.reverse(e.tail.tail.tail.tail.tail, r5)
+          s6: JSON_BYTES.reverse(e.tail.tail.tail.tail.tail, r5) = JSON_BYTES.reverse(ys, r5.prepend(h2))
+        end
+        True
+      else
+        True
+      end end
+    ensure
+      holds: Result
+      pushed: JSON_BYTES.reverse(escaped(b, ys), racc) = JSON_BYTES.reverse(ys, JSON_WRITER.push_byte(b, racc))
+    end
+
+  rev_text(t: LIST[U64], ys: LIST[U64], racc: LIST[U64]): BOOL
+    require
+      octets: JSON_BYTES.octets(t)
+    variant
+      t.length
+    do
+      if t = LIST.empty then
+        True
+      else
+        rev_escaped(t.head, text_wire(t.tail, ys), racc) and
+        rev_text(t.tail, ys, JSON_WRITER.push_byte(t.head, racc))
+      end
+    ensure
+      holds: Result
+      pushed: JSON_BYTES.reverse(text_wire(t, ys), racc) = JSON_BYTES.reverse(ys, JSON_WRITER.push_text(t, racc))
+    end
+
+  -- The digits of `n` before `ys` are its digits alone, then `ys`. A prelude routine's
+  -- result is named with `let` before the list laws are used on it: the solver does not
+  -- apply them to such a term written out in a formula.
+  digits_append(n: NAT, ys: LIST[U64]): BOOL
+    variant
+      n
+    do
+      let whole = NUMBER_TEXT.digits(n, ys)
+      let alone = NUMBER_TEXT.digits(n, LIST.empty)
+      check
+        step: NUMBER_TEXT.digits_step(n, ys)
+        none: NUMBER_TEXT.digits_step(n, LIST.empty)
+      end
+      if n < 10 then
+        True
+      else
+        let d = 48 + n % 10
+        let one: LIST[U64] = LIST.empty.prepend(d)
+        let high = NUMBER_TEXT.digits(n / 10, LIST.empty)
+        check
+          a: digits_append(n / 10, ys.prepend(d))
+          b: digits_append(n / 10, one)
+          c: whole = high.append(ys.prepend(d))
+          e: alone = high.append(one)
+          f: one.append(ys) = ys.prepend(d)
+          g: high.append(one).append(ys) = high.append(one.append(ys))
+        end
+        True
+      end
+    ensure
+      holds: Result
+      split: NUMBER_TEXT.digits(n, ys) = NUMBER_TEXT.digits(n, LIST.empty).append(ys)
+    end
+
+  rev_int(i: I64, ys: LIST[U64], racc: LIST[U64]): BOOL
+    do
+      if i >= 0 then
+        let n = NAT.from_i64(i)
+        let alone = NUMBER_TEXT.digits(n, LIST.empty)
+        let whole = NUMBER_TEXT.digits(n, ys)
+        check
+          split: digits_append(n, ys)
+          joined: whole = alone.append(ys)
+          rev: JSON_BYTES.reverse_append(alone, ys, racc)
+        end
+        True
+      else
+        let m = NUMBER_TEXT.magnitude(i)
+        let alone = NUMBER_TEXT.digits(m, LIST.empty)
+        let whole = NUMBER_TEXT.digits(m, ys)
+        check
+          sign: JSON_BYTES.reverse(whole.prepend(45), racc) = JSON_BYTES.reverse(whole, racc.prepend(45))
+          split: digits_append(m, ys)
+          joined: whole = alone.append(ys)
+          rev: JSON_BYTES.reverse_append(alone, ys, racc.prepend(45))
+        end
+        True
+      end
+    ensure
+      holds: Result
+      pushed: JSON_BYTES.reverse(int_wire(i, ys), racc) = JSON_BYTES.reverse(ys, JSON_WRITER.push_int(i, racc))
+    end
+
+  rev_scalar(c: JSON_CELL, ys: LIST[U64], racc: LIST[U64]): BOOL
+    require
+      valid: c.ok(0)
+      scalar: is_scalar(c)
+    do
+      match c
+        case JNull then
+          let w = scalar_wire(c, ys)
+          check
+            pv: JSON_WRITER.push_value(c, racc) = racc.prepend(110).prepend(117).prepend(108).prepend(108)
+            s1: JSON_BYTES.reverse(w, racc) = JSON_BYTES.reverse(w.tail, racc.prepend(110))
+            s2: JSON_BYTES.reverse(w.tail, racc.prepend(110)) = JSON_BYTES.reverse(w.tail.tail, racc.prepend(110).prepend(117))
+            s3: JSON_BYTES.reverse(w.tail.tail, racc.prepend(110).prepend(117)) = JSON_BYTES.reverse(w.tail.tail.tail, racc.prepend(110).prepend(117).prepend(108))
+            s4: JSON_BYTES.reverse(w.tail.tail.tail, racc.prepend(110).prepend(117).prepend(108)) = JSON_BYTES.reverse(ys, racc.prepend(110).prepend(117).prepend(108).prepend(108))
+          end
+          True
+        case JBool(b) then
+          let w = scalar_wire(c, ys)
+          if b then
+            check
+              s1: JSON_BYTES.reverse(w, racc) = JSON_BYTES.reverse(w.tail, racc.prepend(116))
+              s2: JSON_BYTES.reverse(w.tail, racc.prepend(116)) = JSON_BYTES.reverse(w.tail.tail, racc.prepend(116).prepend(114))
+              s3: JSON_BYTES.reverse(w.tail.tail, racc.prepend(116).prepend(114)) = JSON_BYTES.reverse(w.tail.tail.tail, racc.prepend(116).prepend(114).prepend(117))
+              s4: JSON_BYTES.reverse(w.tail.tail.tail, racc.prepend(116).prepend(114).prepend(117)) = JSON_BYTES.reverse(ys, racc.prepend(116).prepend(114).prepend(117).prepend(101))
+            end
+            True
+          else
+            check
+              s1: JSON_BYTES.reverse(w, racc) = JSON_BYTES.reverse(w.tail, racc.prepend(102))
+              s2: JSON_BYTES.reverse(w.tail, racc.prepend(102)) = JSON_BYTES.reverse(w.tail.tail, racc.prepend(102).prepend(97))
+              s3: JSON_BYTES.reverse(w.tail.tail, racc.prepend(102).prepend(97)) = JSON_BYTES.reverse(w.tail.tail.tail, racc.prepend(102).prepend(97).prepend(108))
+              s4: JSON_BYTES.reverse(w.tail.tail.tail, racc.prepend(102).prepend(97).prepend(108)) = JSON_BYTES.reverse(w.tail.tail.tail.tail, racc.prepend(102).prepend(97).prepend(108).prepend(115))
+              s5: JSON_BYTES.reverse(w.tail.tail.tail.tail, racc.prepend(102).prepend(97).prepend(108).prepend(115)) = JSON_BYTES.reverse(ys, racc.prepend(102).prepend(97).prepend(108).prepend(115).prepend(101))
+            end
+            True
+          end
+        case JInt(whole) then
+          check
+            i_pv: JSON_WRITER.push_value(c, racc) = JSON_WRITER.push_int(whole, racc)
+            i_sw: scalar_wire(c, ys) = int_wire(whole, ys)
+          end
+          rev_int(whole, ys, racc)
+        case JNumber(t) then
+          check
+            n_pv: JSON_WRITER.push_value(c, racc) = JSON_BYTES.reverse(t, racc)
+            n_sw: scalar_wire(c, ys) = t.append(ys)
+          end
+          JSON_BYTES.reverse_append(t, ys, racc)
+        case JString(t) then
+          let inner = text_wire(t, ys.prepend(34))
+          check
+            t_pv: JSON_WRITER.push_value(c, racc) = JSON_WRITER.push_string(t, racc)
+            t_ps: JSON_WRITER.push_string(t, racc) = JSON_WRITER.push_text(t, racc.prepend(34)).prepend(34)
+            t_sw: scalar_wire(c, ys) = inner.prepend(34)
+            t_open: JSON_BYTES.reverse(inner.prepend(34), racc) = JSON_BYTES.reverse(inner, racc.prepend(34))
+            t_text: rev_text(t, ys.prepend(34), racc.prepend(34))
+            t_close: JSON_BYTES.reverse(ys.prepend(34), JSON_WRITER.push_text(t, racc.prepend(34))) =
+              JSON_BYTES.reverse(ys, JSON_WRITER.push_text(t, racc.prepend(34)).prepend(34))
+          end
+          True
+        case _ then True
+      end
+    ensure
+      holds: Result
+      pushed: JSON_BYTES.reverse(scalar_wire(c, ys), racc) = JSON_BYTES.reverse(ys, JSON_WRITER.push_value(c, racc))
+    end
+
+  -- So the writer's text of a scalar is `scalar_wire` of it.
+  write_scalar(c: JSON_CELL): BOOL
+    require
+      valid: c.ok(0)
+      scalar: is_scalar(c)
+    do
+      let w = scalar_wire(c, LIST.empty)
+      let pushed = JSON_WRITER.push_value(c, LIST.empty)
+      let none: LIST[U64] = LIST.empty
+      check
+        rev: rev_scalar(c, none, none)
+        back: JSON_BYTES.reverse(w, none) = pushed
+        twice: JSON_BYTES.reverse_twice(w, none, none)
+        same: w.append(none) = w
+        whole: JSON_BYTES.reverse(none, w) = w
+        written: JSON_WRITER.write(c) = JSON_BYTES.reverse(pushed, none)
+      end
+      True
+    ensure
+      holds: Result
+      written: JSON_WRITER.write(c) = scalar_wire(c, LIST.empty)
+    end
+
+end

@@ -1,0 +1,183 @@
+-- What a parse result says, as text, and the documents a case line stands for.
+functions GJSON_TEXT
+
+feature {ANY}
+
+  -- `a` then `b`, or `a` alone if that would not fit.
+  join(a: STRING, b: STRING): STRING
+    do
+      if a.byte_length <= 100000000 and b.byte_length <= 100000000 then a.concat(b) else a end
+    end
+
+  number(n: NAT): STRING
+    do
+      NUMBER_TEXT.nat_to_text(n)
+    end
+
+  error_name(e: JSON_ERROR): STRING
+    do
+      match e
+        case TooLarge(_) then "TooLarge"
+        case UnexpectedEnd(_) then "UnexpectedEnd"
+        case UnexpectedByte(_) then "UnexpectedByte"
+        case TooDeep(_) then "TooDeep"
+        case BadNumber(_) then "BadNumber"
+        case ControlInString(_) then "ControlInString"
+        case BadEscape(_) then "BadEscape"
+        case LoneSurrogate(_) then "LoneSurrogate"
+        case BadString(_) then "BadString"
+        case DuplicateKey(_) then "DuplicateKey"
+        case TrailingBytes(_) then "TrailingBytes"
+      end
+    end
+
+  -- `ok` and the value written back, or `error`, the reason and its offset. A value that
+  -- does not read back as itself from what it writes says so.
+  describe(r: RESULT[JSON_ERROR, JSON], short: BOOL): STRING
+    do
+      match r
+        case Error(e) then
+          join(join(join("error ", error_name(e)), " "), number(e.offset))
+        case Ok(v) then
+          if reads_back(v) then join("ok ", body(v, short)) else join("not read back ", body(v, short)) end
+      end
+    end
+
+  -- Whether what `v` writes reads back as `v`.
+  reads_back(v: JSON): BOOL
+    do
+      match JSON.parse(v.to_bytes)
+        case Ok(w) then w.equals(v)
+        case Error(_) then False
+      end
+    end
+
+  body(v: JSON, short: BOOL): STRING
+    do
+      if short then
+        join(join(join(join(join("depth ", number(v.depth)), " count "), number(v.count)), " bytes "), number(v.to_bytes.length))
+      else
+        v.to_text
+      end
+    end
+
+  -- `raw` with each `%XX` replaced by the byte with hex value `XX`, from index `i`.
+  unescape(raw: BYTES, i: NAT, out: BYTES_BUILDER): BYTES
+    require
+      inside: i <= raw.length
+    variant
+      raw.length - i
+    do
+      if i = raw.length or out.length >= 1000000 then
+        out.to_bytes
+      else
+        let b = raw.at(i)
+        if b = 37 and raw.length - i > 2 then
+          let x = NUMBER_TEXT.hex_value(raw.at(i + 1)) * 16 + NUMBER_TEXT.hex_value(raw.at(i + 2))
+          if x < 256 then unescape(raw, i + 3, out.add_byte(x)) else out.to_bytes end
+        else
+          unescape(raw, i + 1, out.add_byte(b))
+        end
+      end
+    end
+
+  -- `s` with each `%XX` replaced by its byte, as text.
+  decoded(s: STRING): STRING
+    do
+      match STRING.from_utf8(unescape(s.to_utf8, 0, BYTES_BUILDER.empty))
+        case Ok(t) then t
+        case Error(_) then s
+      end
+    end
+
+  -- `n` copies of `part`, after `out`.
+  repeat(part: BYTES, n: NAT, out: BYTES_BUILDER): BYTES_BUILDER
+    variant
+      n
+    do
+      if n = 0 or part.length > 5000000 or out.length > 5000000 - part.length then
+        out
+      else
+        repeat(part, n - 1, out.add(part))
+      end
+    end
+
+  -- `out` then `s`, or `out` alone if that would not fit.
+  add(out: BYTES_BUILDER, s: STRING): BYTES_BUILDER
+    do
+      if out.length <= 100000000 and s.byte_length <= 100000000 then out.add_text(s) else out end
+    end
+
+  -- An object of `n` fields, keys from `k<n-1>` down to `k0`, each with the value 0.
+  fields(n: NAT, out: BYTES_BUILDER): BYTES_BUILDER
+    variant
+      n
+    do
+      if n = 0 or out.length > 3000000 then
+        out
+      else
+        let key = join(join("\"k", number(n - 1)), "\":0")
+        let sep = if n = 1 then "" else "," end
+        fields(n - 1, add(out, join(key, sep)))
+      end
+    end
+
+  -- The document that `@kind n` stands for.
+  generated(kind: STRING, n: NAT): BYTES
+    do
+      let b = BYTES_BUILDER.empty
+      if kind.equals("nest") then
+        repeat("]".to_utf8, n, repeat("[".to_utf8, n, b)).to_bytes
+      else if kind.equals("items") then
+        add(repeat(",0".to_utf8, n, add(b, "[0")), "]").to_bytes
+      else if kind.equals("chars") then
+        add(repeat("a".to_utf8, n, add(b, "\"")), "\"").to_bytes
+      else if kind.equals("escapes") then
+        add(repeat("\\n\\u00e9".to_utf8, n, add(b, "\"")), "\"").to_bytes
+      else if kind.equals("fields") then
+        add(fields(n, add(b, "{")), "}").to_bytes
+      else if kind.equals("digits") then
+        repeat("9".to_utf8, n, b).to_bytes
+      else
+        b.to_bytes
+      end end end end end end
+    end
+
+  -- 0 if a line of `cases.txt` holds, or is a comment, else 1.
+  check_line(line: STRING): NAT
+    do
+      if line.code_point_count = 0 or line.starts_with("#") then
+        0
+      else
+        match line.find(" => ", 0)
+          case None then
+            1
+          case Some(i) then
+            if i + 4 > line.code_point_count then
+              1
+            else
+              let doc = line.slice(0, i)
+              let expected = decoded(line.slice(i + 4, line.code_point_count))
+              let got = if doc.starts_with("@") then
+                  match doc.find_char(' ', 0)
+                    case None then "bad case"
+                    case Some(sp) then
+                      if sp + 1 <= doc.code_point_count then
+                        match NUMBER_TEXT.parse_nat(doc.slice(sp + 1, doc.code_point_count))
+                          case Ok(n) then describe(JSON.parse(generated(doc.slice(1, sp), n)), True)
+                          case Error(_) then "bad count"
+                        end
+                      else
+                        "bad case"
+                      end
+                  end
+                else
+                  describe(JSON.parse(unescape(doc.to_utf8, 0, BYTES_BUILDER.empty)), False)
+                end
+              if got.equals(expected) then 0 else 1 end
+            end
+        end
+      end
+    end
+
+end

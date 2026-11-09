@@ -1,0 +1,638 @@
+-- The flat cells a JSON value is made of (decision 1), and what makes them a valid value.
+--
+-- A value is a scalar, or an array or object whose elements form a chain: `JItem(v, next)`
+-- for an array, `JField(key, v, next)` for an object, each ending in `JEnd`. Text is kept as
+-- its UTF-8 bytes. `JSON` holds a cell that is `ok`, and offers no way to wrap any other, so a
+-- client that builds a cell by hand cannot make a `JSON` from it.
+--
+-- `ok(d)` says the cell is a value nested at most `d` levels deep: its text is well-formed
+-- UTF-8, each byte below 256, its number literals are JSON numbers that are not integers in the range of `I64`
+-- (those are `JInt`), and the keys of each object strictly ascend in byte order, so no key
+-- appears twice.
+--
+-- Every walk along a chain or a byte list here is a tail call, which C runs as a loop, and
+-- tests for the end with `= LIST.empty`, as `length` counts the whole list in C.
+module JSON_CELL satisfies CANONICAL_EQ
+
+representation {ANY}
+  | JNull
+  | JBool(flag: BOOL)
+  | JInt(whole: I64)
+  | JNumber(literal: LIST[U64])
+  | JString(text: LIST[U64])
+  | JArray(items: JSON_CELL)
+  | JObject(fields: JSON_CELL)
+  | JItem(value: JSON_CELL, next: JSON_CELL)
+  | JField(key: LIST[U64], value: JSON_CELL, next: JSON_CELL)
+  | JEnd
+
+create {ANY}
+
+  -- Byte order on keys: the first byte that differs decides, and a prefix comes first.
+  key_less(a: LIST[U64], b: LIST[U64]): BOOL
+    variant
+      a.length
+    do
+      if b = LIST.empty then
+        False
+      else if a = LIST.empty then
+        True
+      else if a.head < b.head then
+        True
+      else if a.head > b.head then
+        False
+      else
+        JSON_CELL.key_less(a.tail, b.tail)
+      end end end end
+    end
+
+  -- The state the number grammar of RFC 8259 reaches from `s` on byte `b`, or 9 if `b`
+  -- cannot follow. 0: start. 1: after `-`. 2: a leading `0`. 3: in the integer digits.
+  -- 4: after `.`. 5: in the fraction. 6: after `e`. 7: after the exponent's sign. 8: in the
+  -- exponent.
+  number_next(s: NAT, b: U64): NAT
+    do
+      -- No `let`s: two independent ones would run as parallel tasks in C, once per byte.
+      if s = 0 then
+        if b = 45 then 1 else if b = 48 then 2 else if JSON_CELL.digit(b) then 3 else 9 end end end
+      else if s = 1 then
+        if b = 48 then 2 else if JSON_CELL.digit(b) then 3 else 9 end end
+      else if s = 2 then
+        if b = 46 then 4 else if b = 101 or b = 69 then 6 else 9 end end
+      else if s = 3 then
+        if JSON_CELL.digit(b) then 3 else if b = 46 then 4 else if b = 101 or b = 69 then 6 else 9 end end end
+      else if s = 4 then
+        if JSON_CELL.digit(b) then 5 else 9 end
+      else if s = 5 then
+        if JSON_CELL.digit(b) then 5 else if b = 101 or b = 69 then 6 else 9 end end
+      else if s = 6 then
+        if b = 43 or b = 45 then 7 else if JSON_CELL.digit(b) then 8 else 9 end end
+      else if s = 7 or s = 8 then
+        if JSON_CELL.digit(b) then 8 else 9 end
+      else
+        9
+      end end end end end end end end
+    ensure
+      bounded: Result <= 9
+      ascii: Result < 9 implies (b >= 43 and b <= 101)
+    end
+
+  digit(b: U64): BOOL
+    do
+      b >= 48 and b <= 57
+    end
+
+  -- A state in which a number may end.
+  number_end(s: NAT): BOOL
+    do
+      s = 2 or s = 3 or s = 5 or s = 8
+    end
+
+  -- The state the grammar is in after all of `t`, from `s`.
+  number_state(t: LIST[U64], s: NAT): NAT
+    variant
+      t.length
+    do
+      if t = LIST.empty then
+        s
+      else if JSON_CELL.number_next(s, JSON_BYTES.first(t)) = 9 then
+        9
+      else
+        JSON_CELL.number_state(t.tail, JSON_CELL.number_next(s, JSON_BYTES.first(t)))
+      end end
+    end
+
+  -- Whether `t` has at most `n` bytes, looking at no more than `n + 1` of them.
+  at_most(t: LIST[U64], n: NAT): BOOL
+    variant
+      n
+    do
+      if t = LIST.empty then
+        True
+      else if n = 0 then
+        False
+      else
+        JSON_CELL.at_most(t.tail, n - 1)
+      end end
+    ensure
+      exact: Result = (t.length <= n)
+    end
+
+  -- The cell for the number literal `t`: `JInt` for an integer in the range of `I64`,
+  -- written without a fraction or exponent and not as `-0`, and `JNumber` for any other.
+  number_cell(t: LIST[U64]): JSON_CELL
+    do
+      let s = JSON_CELL.number_state(t, 0)
+      if (s = 2 or s = 3) and JSON_CELL.at_most(t, 20) and not (t = LIST.empty.prepend(48).prepend(45)) then
+        match NUMBER_TEXT.parse_signed(t)
+          case Ok(i) then JInt(i)
+          case Error(_) then JNumber(t)
+        end
+      else
+        JNumber(t)
+      end
+    ensure
+      shape: match Result
+        case JInt(_) then True
+        case _ then Result = JNumber(t)
+      end
+    end
+
+  -- The descending chain `acc` with the field `k: v` in its place, or `None` if `k` is
+  -- there already. `prefix` holds the fields passed over, which are above `k`, in
+  -- ascending order.
+  insert_field(k: LIST[U64], v: JSON_CELL, acc: JSON_CELL, prefix: JSON_CELL, d: NAT): OPTION[JSON_CELL]
+    require
+      key_ok: JSON_BYTES.octets(k) and BYTES.valid_utf8(k)
+      value_ok: v.ok(d)
+      acc_ok: acc.ok_fields_down(d)
+      prefix_ok: prefix.ok_fields(d)
+      prefix_above_k: prefix.above(k)
+      prefix_above_acc: match acc
+        case JField(top, _, _) then prefix.above(top)
+        case _ then True
+      end
+    variant
+      acc
+    do
+      match acc
+        case JField(k2, v2, n) then
+          if JSON_CELL.key_less(k2, k) then
+            check
+              p1: acc.below(k)
+              p2: JField(k, v, acc).ok_fields_down(d)
+              p3: match prefix case JField(top, _, _) then JField(k, v, acc).below(top) case _ then True end
+              placed: JSON_CELL.reverse_up_ok(prefix, JField(k, v, acc), d)
+            end
+            Some(JSON_CELL.reverse_fields(prefix, JField(k, v, acc)))
+          else if JSON_CELL.key_less(k, k2) then
+            JSON_CELL.insert_field(k, v, n, JField(k2, v2, prefix), d)
+          else
+            None
+          end end
+        case _ then
+          check
+            placed: JSON_CELL.reverse_up_ok(prefix, JField(k, v, acc), d)
+          end
+          Some(JSON_CELL.reverse_fields(prefix, JField(k, v, acc)))
+      end
+    ensure
+      kept: match Result
+        case Some(r) then r.ok_fields_down(d)
+        case None then True
+      end
+    end
+
+  -- The chain `c` reversed, in front of `acc`.
+  reverse_items(c: JSON_CELL, acc: JSON_CELL): JSON_CELL
+    variant
+      c
+    do
+      match c
+        case JItem(v, n) then JSON_CELL.reverse_items(n, JItem(v, acc))
+        case _ then acc
+      end
+    end
+
+  reverse_fields(c: JSON_CELL, acc: JSON_CELL): JSON_CELL
+    variant
+      c
+    do
+      match c
+        case JField(k, v, n) then JSON_CELL.reverse_fields(n, JField(k, v, acc))
+        case _ then acc
+      end
+    end
+
+feature {ANY}
+
+  equals(other: JSON_CELL): BOOL
+    do
+      Current = other
+    ensure
+      def: Result = (Current = other)
+    end
+
+  -- A value nested at most `d` levels deep.
+  ok(d: NAT): BOOL
+    variant
+      Current
+    do
+      match Current
+        case JNull then True
+        case JBool(_) then True
+        case JInt(_) then True
+        case JNumber(t) then
+          JSON_CELL.number_end(JSON_CELL.number_state(t, 0)) and JSON_CELL.number_cell(t) = JNumber(t)
+        case JString(t) then JSON_BYTES.octets(t) and BYTES.valid_utf8(t)
+        case JArray(i) then d >= 1 and i.ok_items(d - 1)
+        case JObject(f) then d >= 1 and f.ok_fields(d - 1)
+        case _ then False
+      end
+    end
+
+  -- A chain of array items, each a value within `d` levels.
+  ok_items(d: NAT): BOOL
+    variant
+      Current
+    do
+      match Current
+        case JEnd then True
+        case JItem(v, n) then v.ok(d) and n.ok_items(d)
+        case _ then False
+      end
+    end
+
+  -- A chain of object fields with keys in ascending order, each value within `d` levels.
+  ok_fields(d: NAT): BOOL
+    variant
+      Current
+    do
+      match Current
+        case JEnd then True
+        case JField(k, v, n) then JSON_BYTES.octets(k) and BYTES.valid_utf8(k) and v.ok(d) and n.ok_fields(d) and n.above(k)
+        case _ then False
+      end
+    end
+
+  -- The same, with keys in descending order: how the reader collects them.
+  ok_fields_down(d: NAT): BOOL
+    variant
+      Current
+    do
+      match Current
+        case JEnd then True
+        case JField(k, v, n) then JSON_BYTES.octets(k) and BYTES.valid_utf8(k) and v.ok(d) and n.ok_fields_down(d) and n.below(k)
+        case _ then False
+      end
+    end
+
+  -- The chain is empty or its first key is above `k`.
+  above(k: LIST[U64]): BOOL
+    do
+      match Current
+        case JField(k2, _, _) then JSON_CELL.key_less(k, k2)
+        case _ then True
+      end
+    end
+
+  -- The chain is empty or its first key is below `k`.
+  below(k: LIST[U64]): BOOL
+    do
+      match Current
+        case JField(k2, _, _) then JSON_CELL.key_less(k2, k)
+        case _ then True
+      end
+    end
+
+  -- Whether the cell nests at most `d` levels deep. It looks at no more than it must.
+  fits(d: NAT): BOOL
+    variant
+      Current
+    do
+      match Current
+        case JArray(its) then
+          if d = 0 then False else its.items_fit(d - 1) end
+        case JObject(fs) then
+          if d = 0 then False else fs.fields_fit(d - 1) end
+        case _ then True
+      end
+    end
+
+  items_fit(d: NAT): BOOL
+    variant
+      Current
+    do
+      match Current
+        case JItem(v, n) then
+          if v.fits(d) then n.items_fit(d) else False end
+        case _ then True
+      end
+    end
+
+  fields_fit(d: NAT): BOOL
+    variant
+      Current
+    do
+      match Current
+        case JField(_, v, n) then
+          if v.fits(d) then n.fields_fit(d) else False end
+        case _ then True
+      end
+    end
+
+  -- How deeply the cell nests: 0 for a scalar, one more than its deepest element for an
+  -- array or object.
+  levels: NAT
+    variant
+      Current
+    do
+      match Current
+        case JArray(its) then JSON_CELL.one_more(its.chain_levels(0))
+        case JObject(fs) then JSON_CELL.one_more(fs.chain_levels(0))
+        case _ then 0
+      end
+    end
+
+  -- The deepest element of the chain, or `m` if that is deeper.
+  chain_levels(m: NAT): NAT
+    variant
+      Current
+    do
+      match Current
+        case JItem(v, n) then
+          let l = v.levels
+          n.chain_levels(if l > m then l else m end)
+        case JField(_, v, n) then
+          let l = v.levels
+          n.chain_levels(if l > m then l else m end)
+        case _ then m
+      end
+    end
+
+specify {CANONICAL_EQ}
+
+  law agrees_with_structural(a: JSON_CELL, b: JSON_CELL)
+    ensure
+      sound: a.equals(b) = (a = b)
+    end
+
+specify {EQ}
+
+  law reflexive(a: JSON_CELL)
+    ensure
+      refl: a.equals(a)
+    end
+
+  law symmetric(a: JSON_CELL, b: JSON_CELL)
+    require
+      ab: a.equals(b)
+    ensure
+      ba: b.equals(a)
+    end
+
+  law transitive(a: JSON_CELL, b: JSON_CELL, c: JSON_CELL)
+    require
+      ab: a.equals(b)
+      bc: b.equals(c)
+    ensure
+      ac: a.equals(c)
+    end
+
+create {ANY}
+
+  -- Lemmas. Each is a routine whose contract is the fact, as a module's own laws are not
+  -- axioms inside it.
+
+  -- `key_less` is a strict total order, so ascending keys are distinct.
+  key_irreflexive(a: LIST[U64]): BOOL
+    variant
+      a.length
+    do
+      if a = LIST.empty then True else JSON_CELL.key_irreflexive(a.tail) end
+    ensure
+      holds: Result
+      not_self: not JSON_CELL.key_less(a, a)
+    end
+
+  key_transitive(a: LIST[U64], b: LIST[U64], c: LIST[U64]): BOOL
+    require
+      ab: JSON_CELL.key_less(a, b)
+      bc: JSON_CELL.key_less(b, c)
+    variant
+      a.length
+    do
+      if a = LIST.empty or b = LIST.empty or c = LIST.empty then
+        True
+      else if a.head = b.head and b.head = c.head then
+        JSON_CELL.key_transitive(a.tail, b.tail, c.tail)
+      else
+        True
+      end end
+    ensure
+      holds: Result
+      ac: JSON_CELL.key_less(a, c)
+    end
+
+  key_total(a: LIST[U64], b: LIST[U64]): BOOL
+    variant
+      a.length
+    do
+      if a = LIST.empty or b = LIST.empty then
+        True
+      else if a.head = b.head then
+        check
+          a_whole: a.tail.prepend(a.head) = a
+          b_whole: b.tail.prepend(b.head) = b
+        end
+        JSON_CELL.key_total(a.tail, b.tail)
+      else
+        True
+      end end
+    ensure
+      holds: Result
+      comparable: JSON_CELL.key_less(a, b) or a = b or JSON_CELL.key_less(b, a)
+    end
+
+  one_more(n: NAT): NAT
+    do
+      if n < 18446744073709551615 then n + 1 else n end
+    end
+
+  -- A valid value that fits within `d` levels is a value within `d` levels.
+  fits_ok(c: JSON_CELL, e: NAT, d: NAT): BOOL
+    require
+      valid: c.ok(e)
+      fit: c.fits(d)
+    variant
+      c
+    do
+      match c
+        case JArray(its) then JSON_CELL.items_fit_ok(its, e - 1, d - 1)
+        case JObject(fs) then JSON_CELL.fields_fit_ok(fs, e - 1, d - 1)
+        case _ then True
+      end
+    ensure
+      holds: Result
+      within: c.ok(d)
+    end
+
+  items_fit_ok(c: JSON_CELL, e: NAT, d: NAT): BOOL
+    require
+      valid: c.ok_items(e)
+      fit: c.items_fit(d)
+    variant
+      c
+    do
+      match c
+        case JItem(v, n) then JSON_CELL.fits_ok(v, e, d) and JSON_CELL.items_fit_ok(n, e, d)
+        case _ then True
+      end
+    ensure
+      holds: Result
+      within: c.ok_items(d)
+    end
+
+  fields_fit_ok(c: JSON_CELL, e: NAT, d: NAT): BOOL
+    require
+      valid: c.ok_fields(e)
+      fit: c.fields_fit(d)
+    variant
+      c
+    do
+      match c
+        case JField(_, v, n) then JSON_CELL.fits_ok(v, e, d) and JSON_CELL.fields_fit_ok(n, e, d)
+        case _ then True
+      end
+    ensure
+      holds: Result
+      within: c.ok_fields(d)
+    end
+
+  -- A value within `d` levels is within any more.
+  ok_up(c: JSON_CELL, d: NAT, e: NAT): BOOL
+    require
+      within: c.ok(d)
+      more: d <= e
+    variant
+      c
+    do
+      match c
+        case JArray(i) then JSON_CELL.items_up(i, d - 1, e - 1)
+        case JObject(f) then JSON_CELL.fields_up(f, d - 1, e - 1)
+        case _ then True
+      end
+    ensure
+      holds: Result
+      up: c.ok(e)
+    end
+
+  items_up(c: JSON_CELL, d: NAT, e: NAT): BOOL
+    require
+      within: c.ok_items(d)
+      more: d <= e
+    variant
+      c
+    do
+      match c
+        case JItem(v, n) then JSON_CELL.ok_up(v, d, e) and JSON_CELL.items_up(n, d, e)
+        case _ then True
+      end
+    ensure
+      holds: Result
+      up: c.ok_items(e)
+    end
+
+  fields_up(c: JSON_CELL, d: NAT, e: NAT): BOOL
+    require
+      within: c.ok_fields(d)
+      more: d <= e
+    variant
+      c
+    do
+      match c
+        case JField(_, v, n) then JSON_CELL.ok_up(v, d, e) and JSON_CELL.fields_up(n, d, e)
+        case _ then True
+      end
+    ensure
+      holds: Result
+      up: c.ok_fields(e)
+    end
+
+  fields_down_up(c: JSON_CELL, d: NAT, e: NAT): BOOL
+    require
+      within: c.ok_fields_down(d)
+      more: d <= e
+    variant
+      c
+    do
+      match c
+        case JField(_, v, n) then JSON_CELL.ok_up(v, d, e) and JSON_CELL.fields_down_up(n, d, e)
+        case _ then True
+      end
+    ensure
+      holds: Result
+      up: c.ok_fields_down(e)
+    end
+
+  -- Reversing a chain of items keeps every item.
+  reverse_items_ok(c: JSON_CELL, acc: JSON_CELL, d: NAT): BOOL
+    require
+      c_ok: c.ok_items(d)
+      acc_ok: acc.ok_items(d)
+    variant
+      c
+    do
+      match c
+        case JItem(v, n) then JSON_CELL.reverse_items_ok(n, JItem(v, acc), d)
+        case _ then True
+      end
+    ensure
+      holds: Result
+      reversed: JSON_CELL.reverse_items(c, acc).ok_items(d)
+    end
+
+  -- Descending keys reversed in front of ascending ones that are all above them ascend.
+  -- The recursive call passes `JField(k, v, acc)` for `acc`, and `joined` binds a `k` of
+  -- its own: before gardelc renamed such a binder, it captured the caller's `k`, and this
+  -- call could not be proven.
+  reverse_down_ok(c: JSON_CELL, acc: JSON_CELL, d: NAT): BOOL
+    require
+      c_ok: c.ok_fields_down(d)
+      acc_ok: acc.ok_fields(d)
+      joined: match c
+        case JField(k, _, _) then acc.above(k)
+        case _ then True
+      end
+    variant
+      c
+    do
+      match c
+        case JField(k, v, n) then
+          match n
+            case JField(k2, _, _) then
+              check
+                a: n.below(k)
+                b: JSON_CELL.key_less(k2, k)
+                c: JField(k, v, acc).above(k2)
+                e: JField(k, v, acc).ok_fields(d)
+              end
+              JSON_CELL.reverse_down_ok(n, JField(k, v, acc), d)
+            case _ then
+              JSON_CELL.reverse_down_ok(n, JField(k, v, acc), d)
+          end
+        case _ then True
+      end
+    ensure
+      holds: Result
+      reversed: JSON_CELL.reverse_fields(c, acc).ok_fields(d)
+    end
+
+  -- Ascending keys reversed in front of descending ones that are all below them descend.
+  reverse_up_ok(c: JSON_CELL, acc: JSON_CELL, d: NAT): BOOL
+    require
+      c_ok: c.ok_fields(d)
+      acc_ok: acc.ok_fields_down(d)
+      joined: match c
+        case JField(k, _, _) then acc.below(k)
+        case _ then True
+      end
+    variant
+      c
+    do
+      match c
+        case JField(k, v, n) then
+          match n
+            case JField(k2, _, _) then
+              JSON_CELL.reverse_up_ok(n, JField(k, v, acc), d) and JField(k, v, acc).below(k2)
+            case _ then
+              JSON_CELL.reverse_up_ok(n, JField(k, v, acc), d)
+          end
+        case _ then True
+      end
+    ensure
+      holds: Result
+      reversed: JSON_CELL.reverse_fields(c, acc).ok_fields_down(d)
+    end
+
+end

@@ -396,6 +396,15 @@ create {ANY}
 
 specify {ANY}
 
+  -- One step of `digits`, for a client proving what the digits of a number are (`gjson`).
+  -- It has no trigger, as a step names the digits of `n / 10`, and so on without end: a
+  -- client states it where it needs it, as `check NUMBER_TEXT.digits_step(n, rest) end`.
+  law digits_step(n: NAT, rest: LIST[U64])
+    ensure
+      low: n < 10 implies NUMBER_TEXT.digits(n, rest) = rest.prepend(48 + n)
+      high: n >= 10 implies NUMBER_TEXT.digits(n, rest) = NUMBER_TEXT.digits(n / 10, rest.prepend(48 + n % 10))
+    end
+
   -- The decimal text of a number reads back as that number.
   law nat_round_trip(n: NAT)
     trigger

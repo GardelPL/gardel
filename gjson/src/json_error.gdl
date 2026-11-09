@@ -1,0 +1,107 @@
+-- Why a document was refused, and where. `at` is a byte offset into the document.
+module JSON_ERROR satisfies CANONICAL_EQ
+
+representation {ANY}
+  -- The document is larger than `JSON.max_input` bytes.
+  | TooLarge(at: NAT)
+  -- The document ends inside a value.
+  | UnexpectedEnd(at: NAT)
+  -- A byte that cannot start or continue a value here.
+  | UnexpectedByte(at: NAT)
+  -- Arrays and objects nested deeper than `JSON.max_depth`.
+  | TooDeep(at: NAT)
+  -- A malformed number.
+  | BadNumber(at: NAT)
+  -- A control character (below U+0020) written raw inside a string.
+  | ControlInString(at: NAT)
+  -- A backslash followed by something that is not an escape.
+  | BadEscape(at: NAT)
+  -- A `\u` escape of a surrogate that is not half of a pair.
+  | LoneSurrogate(at: NAT)
+  -- A string, starting at `at`, whose text is not well-formed UTF-8 (RFC 8259, section
+  -- 8.1). Outside strings only ASCII may appear, and any other byte is `UnexpectedByte`.
+  | BadString(at: NAT)
+  -- A key that the object already has.
+  | DuplicateKey(at: NAT)
+  -- Something other than white space after the value.
+  | TrailingBytes(at: NAT)
+
+feature {ANY}
+
+  equals(other: JSON_ERROR): BOOL
+    do
+      Current = other
+    ensure
+      def: Result = (Current = other)
+    end
+
+  -- The offset of the error.
+  offset: NAT
+    do
+      match Current
+        case TooLarge(a) then a
+        case UnexpectedEnd(a) then a
+        case UnexpectedByte(a) then a
+        case TooDeep(a) then a
+        case BadNumber(a) then a
+        case ControlInString(a) then a
+        case BadEscape(a) then a
+        case LoneSurrogate(a) then a
+        case BadString(a) then a
+        case DuplicateKey(a) then a
+        case TrailingBytes(a) then a
+      end
+    end
+
+  -- The reader counts from the end, as `left` bytes remained when it stopped. This is the
+  -- same error counted from the start of a document of `size` bytes.
+  from_end(size: NAT): JSON_ERROR
+    do
+      let a = if Current.offset <= size then size - Current.offset else 0 end
+      match Current
+        case TooLarge(_) then TooLarge(a)
+        case UnexpectedEnd(_) then UnexpectedEnd(a)
+        case UnexpectedByte(_) then UnexpectedByte(a)
+        case TooDeep(_) then TooDeep(a)
+        case BadNumber(_) then BadNumber(a)
+        case ControlInString(_) then ControlInString(a)
+        case BadEscape(_) then BadEscape(a)
+        case LoneSurrogate(_) then LoneSurrogate(a)
+        case BadString(_) then BadString(a)
+        case DuplicateKey(_) then DuplicateKey(a)
+        case TrailingBytes(_) then TrailingBytes(a)
+      end
+    ensure
+      within: Result.offset <= size
+    end
+
+specify {CANONICAL_EQ}
+
+  law agrees_with_structural(a: JSON_ERROR, b: JSON_ERROR)
+    ensure
+      sound: a.equals(b) = (a = b)
+    end
+
+specify {EQ}
+
+  law reflexive(a: JSON_ERROR)
+    ensure
+      refl: a.equals(a)
+    end
+
+  law symmetric(a: JSON_ERROR, b: JSON_ERROR)
+    require
+      ab: a.equals(b)
+    ensure
+      ba: b.equals(a)
+    end
+
+  law transitive(a: JSON_ERROR, b: JSON_ERROR, c: JSON_ERROR)
+    require
+      ab: a.equals(b)
+      bc: b.equals(c)
+    ensure
+      ac: a.equals(c)
+    end
+
+end

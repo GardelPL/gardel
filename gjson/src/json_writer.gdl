@@ -1,0 +1,122 @@
+-- A value written as JSON text (RFC 8259), with no white space and its keys in ascending
+-- byte order, so equal values are written as equal bytes.
+--
+-- The bytes are pushed in order onto `racc`, which holds them last first, and reversed once
+-- at the end. So each array, object and string is written by a routine that calls itself
+-- last, which C runs as a loop. Only nesting recurses.
+functions JSON_WRITER
+
+feature {ANY}
+
+  -- One byte of a string's text, escaped where RFC 8259 requires: `"`, `\` and the control
+  -- characters, which have a short form where there is one and `\u00XX` otherwise.
+  push_byte(b: U64, racc: LIST[U64]): LIST[U64]
+    require
+      octet: b < 256
+    do
+      if b = 34 or b = 92 then
+        racc.prepend(92).prepend(b)
+      else if b = 8 then
+        racc.prepend(92).prepend(98)
+      else if b = 12 then
+        racc.prepend(92).prepend(102)
+      else if b = 10 then
+        racc.prepend(92).prepend(110)
+      else if b = 13 then
+        racc.prepend(92).prepend(114)
+      else if b = 9 then
+        racc.prepend(92).prepend(116)
+      else if b < 32 then
+        let zero = NUMBER_TEXT.hex_digit(0)
+        racc.prepend(92).prepend(117).prepend(zero).prepend(zero)
+          .prepend(NUMBER_TEXT.hex_digit(b / 16)).prepend(NUMBER_TEXT.hex_digit(b % 16))
+      else
+        racc.prepend(b)
+      end end end end end end end
+    end
+
+  -- The text `t`, escaped. Its bytes are octets in a valid value, so the test never
+  -- fails; it keeps the writer total, which lets the solver unfold it as deep as it needs.
+  push_text(t: LIST[U64], racc: LIST[U64]): LIST[U64]
+    variant
+      t.length
+    do
+      if t = LIST.empty then
+        racc
+      else if t.head >= 0 and t.head < 256 then
+        push_text(t.tail, push_byte(t.head, racc))
+      else
+        push_text(t.tail, racc)
+      end end
+    end
+
+  -- A string: the text between quotes.
+  push_string(t: LIST[U64], racc: LIST[U64]): LIST[U64]
+    do
+      push_text(t, racc.prepend(34)).prepend(34)
+    end
+
+  -- An integer in decimal, with `-` before a negative one.
+  push_int(i: I64, racc: LIST[U64]): LIST[U64]
+    do
+      if i >= 0 then
+        JSON_BYTES.reverse(NUMBER_TEXT.digits(NAT.from_i64(i), LIST.empty), racc)
+      else
+        JSON_BYTES.reverse(NUMBER_TEXT.digits(NUMBER_TEXT.magnitude(i), LIST.empty), racc.prepend(45))
+      end
+    end
+
+  -- A value.
+  push_value(c: JSON_CELL, racc: LIST[U64]): LIST[U64]
+    variant
+      c
+    do
+      match c
+        case JNull then racc.prepend(110).prepend(117).prepend(108).prepend(108)
+        case JBool(b) then
+          if b then
+            racc.prepend(116).prepend(114).prepend(117).prepend(101)
+          else
+            racc.prepend(102).prepend(97).prepend(108).prepend(115).prepend(101)
+          end
+        case JInt(w) then push_int(w, racc)
+        case JNumber(t) then JSON_BYTES.reverse(t, racc)
+        case JString(t) then push_string(t, racc)
+        case JArray(its) then push_items(its, racc.prepend(91), True).prepend(93)
+        case JObject(fs) then push_fields(fs, racc.prepend(123), True).prepend(125)
+        case _ then racc
+      end
+    end
+
+  -- The items of an array from `c` on, with a comma before each but the first.
+  push_items(c: JSON_CELL, racc: LIST[U64], first: BOOL): LIST[U64]
+    variant
+      c
+    do
+      match c
+        case JItem(v, n) then
+          push_items(n, push_value(v, if first then racc else racc.prepend(44) end), False)
+        case _ then racc
+      end
+    end
+
+  -- The fields of an object from `c` on.
+  push_fields(c: JSON_CELL, racc: LIST[U64], first: BOOL): LIST[U64]
+    variant
+      c
+    do
+      match c
+        case JField(k, v, n) then
+          let before = if first then racc else racc.prepend(44) end
+          push_fields(n, push_value(v, push_string(k, before).prepend(58)), False)
+        case _ then racc
+      end
+    end
+
+  -- The text of a value, as a list.
+  write(c: JSON_CELL): LIST[U64]
+    do
+      JSON_BYTES.reverse(push_value(c, LIST.empty), LIST.empty)
+    end
+
+end

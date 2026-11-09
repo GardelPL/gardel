@@ -1,0 +1,100 @@
+# Cases for GJSON_TEST, read on standard input:
+#
+#   build/gjson_test_bin.exe < gjson/tests/cases.txt
+#
+# Each line is a document, ` => `, and what `JSON.parse` must say of it: `ok` and the value
+# written back, or `error`, the reason and the byte offset. Every accepted value must also
+# read back as itself from what it writes. On either side, %XX stands for the byte with hex
+# value XX. `@kind n` stands for a generated document, and its value is summed up as its
+# depth, its count of items or fields and the length of what it writes. Lines that start
+# with # and empty lines are skipped.
+
+# Scalars.
+null => ok null
+true => ok true
+false => ok false
+0 => ok 0
+42 => ok 42
+-17 => ok -17
+9223372036854775807 => ok 9223372036854775807
+-9223372036854775808 => ok -9223372036854775808
+
+# Numbers that are not an `I64` keep their text.
+9223372036854775808 => ok 9223372036854775808
+-9223372036854775809 => ok -9223372036854775809
+-0 => ok -0
+1.5 => ok 1.5
+-0.0 => ok -0.0
+1e10 => ok 1e10
+1E+2 => ok 1E+2
+2.5e-3 => ok 2.5e-3
+@digits 40 => ok depth 0 count 0 bytes 40
+
+# Strings and escapes. Only `"`, `\` and control characters are escaped when written.
+"" => ok ""
+"abc" => ok "abc"
+"a\"b\\c\/d" => ok "a\"b\\c/d"
+"\b\f\n\r\t" => ok "\b\f\n\r\t"
+"Aé中" => ok "Aé中"
+"😀" => ok "😀"
+"\u0001\u001f\u0000" => ok "\u0001\u001f\u0000"
+"é中😀" => ok "é中😀"
+"%7f" => ok "%7f"
+
+# Arrays and objects. Keys come out in ascending byte order, and white space goes.
+[] => ok []
+{} => ok {}
+  [ 1 , 2 ]   => ok [1,2]
+[1,[2,[3]],[]] => ok [1,[2,[3]],[]]
+{"b":1,"a":2} => ok {"a":2,"b":1}
+{"a":{"c":3,"b":[true,null]}} => ok {"a":{"b":[true,null],"c":3}}
+{"":0} => ok {"":0}
+{"ab":1,"a":2,"b":3} => ok {"a":2,"ab":1,"b":3}
+{"é":1,"z":2} => ok {"z":2,"é":1}
+%09%0a%0d{%09"x"%0a:%0d[%20]%20} => ok {"x":[]}
+
+# Refused, with where.
+    => error UnexpectedEnd 3
+nul => error UnexpectedByte 0
+tru => error UnexpectedByte 0
+nulls => error TrailingBytes 4
+[1,] => error UnexpectedByte 3
+[1 2] => error UnexpectedByte 3
+[1 => error UnexpectedEnd 2
+{"a"} => error UnexpectedByte 4
+{"a":1 "b":2} => error UnexpectedByte 7
+{1:2} => error UnexpectedByte 1
+{"a":1,} => error UnexpectedByte 7
+{"a":1,"a":2} => error DuplicateKey 7
+{"b":{"x":1},"a":0,"b":2} => error DuplicateKey 19
+01 => error TrailingBytes 1
+1. => error BadNumber 2
+- => error BadNumber 1
+1e => error BadNumber 2
+1e+ => error BadNumber 3
+.5 => error UnexpectedByte 0
++1 => error UnexpectedByte 0
+"abc => error UnexpectedEnd 4
+"a%01b" => error ControlInString 2
+"\x" => error BadEscape 1
+"\u12" => error BadEscape 1
+"\ud800" => error LoneSurrogate 1
+"\udc00" => error LoneSurrogate 1
+"\ud800A" => error LoneSurrogate 1
+%ff => error UnexpectedByte 0
+[1,%c3] => error UnexpectedByte 3
+"%c3%22 => error BadString 0
+"%ed%a0%80" => error BadString 0
+{"a%ff":1} => error BadString 1
+%ef%bb%bf{} => error UnexpectedByte 0
+
+# Limits: 64 levels of nesting, and 4 MiB of input. Long arrays, strings and objects
+# are read and written by loops, so they need no stack.
+@nest 1 => ok depth 1 count 0 bytes 2
+@nest 64 => ok depth 64 count 1 bytes 128
+@nest 65 => error TooDeep 64
+@items 200000 => ok depth 1 count 200001 bytes 400003
+@chars 300000 => ok depth 0 count 0 bytes 300002
+@escapes 50000 => ok depth 0 count 0 bytes 200002
+@fields 3000 => ok depth 1 count 3000 bytes 28891
+@items 2100000 => error TooLarge 4194304
