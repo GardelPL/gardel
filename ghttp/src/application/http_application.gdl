@@ -9,7 +9,7 @@ feature {ANY}
   default_endpoint_handler(endpoint_id: NAT): HTTP_RESPONSE
     do
       if endpoint_id = 1 then
-        HTTP_RESPONSE.ok_text("OK", "2")
+        HTTP_RESPONSE.ok_text("OK")
       else
         HTTP_RESPONSE.not_found_empty
       end
@@ -24,7 +24,7 @@ feature {ANY}
       match router.match_request(req)
         case Matched(eid, _) then
           if eid = 1 then
-            HTTP_RESPONSE.ok_text("OK", "2")
+            HTTP_RESPONSE.ok_text("OK")
           else
             HTTP_RESPONSE.not_found_empty
           end

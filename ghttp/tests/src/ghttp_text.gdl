@@ -47,7 +47,11 @@ feature {ANY}
           let line = join(join(join(join(q.method.to_string, " "), q.target), " "), q.version.to_string)
           let hs = join(" headers ", NUMBER_TEXT.nat_to_text(q.request_header_count))
           let body = join(join(" body [", text_of(q.body)), "]")
-          join(join(join(join(line, hs), body), " rest ["), join(text_of(rest), "]"))
+          let framed = join(join(join(join(line, hs), body), " rest ["), join(text_of(rest), "]"))
+          match q.headers.lookup_header("Content-Type")
+            case None then framed
+            case Some(v) then join(join(join(framed, " type ["), v), "]")
+          end
         case Failed(e) then
           join("failed ", error_name(e))
       end

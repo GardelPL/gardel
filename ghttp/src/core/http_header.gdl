@@ -66,6 +66,51 @@ create {ANY}
       vlen_5: Result.value_byte_length = 5
     end
 
+  -- `b` with an ASCII capital letter made small; any other byte is itself.
+  fold_byte(b: U64): U64
+    do
+      if b >= 65 and b <= 90 then b + 32 else b end
+    end
+
+  -- Whether `a` and `b` agree from `i` on, ignoring the case of ASCII letters.
+  same_ci(a: BYTES, b: BYTES, i: NAT): BOOL
+    variant
+      a.length - i
+    do
+      if a.length != b.length then
+        False
+      else if i >= a.length then
+        True
+      else if HTTP_HEADER.fold_byte(a.at(i)) = HTTP_HEADER.fold_byte(b.at(i)) then
+        HTTP_HEADER.same_ci(a, b, i + 1)
+      else
+        False
+      end end end
+    ensure
+      same_length: Result implies a.length = b.length
+    end
+
+  -- Bytes that are the same are the same ignoring case.
+  same_ci_equal(a: BYTES, b: BYTES, i: NAT): BOOL
+    require
+      same: a.model = b.model
+    variant
+      a.length - i
+    do
+      if i >= a.length then
+        True
+      else
+        check
+          same_byte: a.at(i) = b.at(i)
+          same_fold: HTTP_HEADER.fold_byte(a.at(i)) = HTTP_HEADER.fold_byte(b.at(i))
+        end
+        HTTP_HEADER.same_ci_equal(a, b, i + 1)
+      end
+    ensure
+      holds: Result
+      ci: HTTP_HEADER.same_ci(a, b, i)
+    end
+
 feature {ANY}
 
   name: STRING
@@ -97,6 +142,24 @@ feature {ANY}
     ensure
       matches_str: Result = Current.value.byte_length
       bounded: Result <= 1024
+    end
+
+  -- Whether this field is named `key`. Field names ignore case (RFC 9110, section 5.1),
+  -- so `content-type` names the field `Content-Type`.
+  name_matches(key: STRING): BOOL
+    do
+      if Current.field_name.equals(key) then
+        check
+          ci: HTTP_HEADER.same_ci_equal(Current.field_name.to_utf8, key.to_utf8, 0)
+        end
+        HTTP_HEADER.same_ci(Current.field_name.to_utf8, key.to_utf8, 0)
+      else
+        HTTP_HEADER.same_ci(Current.field_name.to_utf8, key.to_utf8, 0)
+      end
+    ensure
+      def: Result = HTTP_HEADER.same_ci(Current.name.to_utf8, key.to_utf8, 0)
+      exact: Current.name.equals(key) implies Result
+      same_length: Result implies Current.name_byte_length = key.byte_length
     end
 
   wire_byte_length: NAT

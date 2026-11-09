@@ -15,6 +15,12 @@ PUT /a?b=1 HTTP/1.0\r\ncontent-length:  5 \r\nX-A:\tb\r\n\r\nhello => PUT /a?b=1
 POST /x HTTP/1.1\r\nContent-Length: 2\r\nContent-Length: 2\r\n\r\nok => POST /x HTTP/1.1 headers 2 body [ok] rest []
 DELETE /users/42 HTTP/1.1\r\n\r\n => DELETE /users/42 HTTP/1.1 headers 0 body [] rest []
 
+# Field names ignore case: each spelling finds `Content-Type`, shown as `type [...]`.
+GET /t HTTP/1.1\r\nContent-Type: text/plain\r\n\r\n => GET /t HTTP/1.1 headers 1 body [] rest [] type [text/plain]
+GET /t HTTP/1.1\r\ncontent-type: a/b\r\n\r\n => GET /t HTTP/1.1 headers 1 body [] rest [] type [a/b]
+GET /t HTTP/1.1\r\nCONTENT-TYPE:x\r\nHost: h\r\n\r\n => GET /t HTTP/1.1 headers 2 body [] rest [] type [x]
+GET /t HTTP/1.1\r\nContent-Typo: x\r\n\r\n => GET /t HTTP/1.1 headers 1 body [] rest []
+
 # What follows a request is handed back, not lost.
 GET /a HTTP/1.1\r\n\r\nGET /b => GET /a HTTP/1.1 headers 0 body [] rest [GET /b]
 POST /p HTTP/1.1\r\nContent-Length: 3\r\n\r\nabcGET => POST /p HTTP/1.1 headers 1 body [abc] rest [GET]

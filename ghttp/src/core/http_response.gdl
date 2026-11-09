@@ -1,4 +1,5 @@
--- Verified HTTP/1.1 response domain model with RFC 9112 framing invariants.
+-- Verified HTTP/1.1 response domain model with RFC 9112 framing invariants. The
+-- `Content-Length` it sends is computed from the body, never given by the caller.
 module HTTP_RESPONSE
 
 representation {NONE}
@@ -9,8 +10,6 @@ representation {NONE}
   digits_len: NAT
   body_text: STRING
   body_len: NAT
-  content_len_str: STRING
-  cl_str_len: NAT
 
 invariant
   status_num_matches: status_num = resp_status.status_code
@@ -19,19 +18,14 @@ invariant
   digits_exact_three: digits_len = 3
   body_len_matches: body_len = body_text.byte_length
   body_bounded: body_len <= 65536
-  cl_len_matches: cl_str_len = content_len_str.byte_length
-  len_str_non_empty: cl_str_len >= 1
-  len_str_bounded: cl_str_len <= 10
   no_body_when_forbidden: resp_status.forbids_body implies (body_len = 0)
 
 create {ANY}
 
-  make_text(st: HTTP_STATUS, text_body: STRING, len_decimal: STRING): HTTP_RESPONSE
+  make_text(st: HTTP_STATUS, text_body: STRING): HTTP_RESPONSE
     require
       allows_body: not st.forbids_body
       body_fits: text_body.byte_length <= 65536
-      len_present: len_decimal.byte_length >= 1
-      len_fits: len_decimal.byte_length <= 10
     do
       let d = st.code_digits
       { resp_version = Http11,
@@ -40,9 +34,7 @@ create {ANY}
         status_digits = d,
         digits_len = d.byte_length,
         body_text = text_body,
-        body_len = text_body.byte_length,
-        content_len_str = len_decimal,
-        cl_str_len = len_decimal.byte_length }
+        body_len = text_body.byte_length }
     ensure
       status_set: Result.status = st
       code_set: Result.response_status_code = st.status_code
@@ -50,11 +42,9 @@ create {ANY}
       body_len_set: Result.response_body_length = text_body.byte_length
     end
 
-  ok_text(text_body: STRING, len_decimal: STRING): HTTP_RESPONSE
+  ok_text(text_body: STRING): HTTP_RESPONSE
     require
       body_fits: text_body.byte_length <= 65536
-      len_present: len_decimal.byte_length >= 1
-      len_fits: len_decimal.byte_length <= 10
     do
       { resp_version = Http11,
         resp_status = HTTP_STATUS.ok,
@@ -62,19 +52,15 @@ create {ANY}
         status_digits = "200",
         digits_len = 3,
         body_text = text_body,
-        body_len = text_body.byte_length,
-        content_len_str = len_decimal,
-        cl_str_len = len_decimal.byte_length }
+        body_len = text_body.byte_length }
     ensure
       is_200: Result.response_status_code = 200
       body_len_set: Result.response_body_length = text_body.byte_length
     end
 
-  created_text(text_body: STRING, len_decimal: STRING): HTTP_RESPONSE
+  created_text(text_body: STRING): HTTP_RESPONSE
     require
       body_fits: text_body.byte_length <= 65536
-      len_present: len_decimal.byte_length >= 1
-      len_fits: len_decimal.byte_length <= 10
     do
       { resp_version = Http11,
         resp_status = HTTP_STATUS.created,
@@ -82,9 +68,7 @@ create {ANY}
         status_digits = "201",
         digits_len = 3,
         body_text = text_body,
-        body_len = text_body.byte_length,
-        content_len_str = len_decimal,
-        cl_str_len = len_decimal.byte_length }
+        body_len = text_body.byte_length }
     ensure
       is_201: Result.response_status_code = 201
       body_len_set: Result.response_body_length = text_body.byte_length
@@ -98,9 +82,7 @@ create {ANY}
         status_digits = "404",
         digits_len = 3,
         body_text = "",
-        body_len = 0,
-        content_len_str = "0",
-        cl_str_len = 1 }
+        body_len = 0 }
     ensure
       is_404: Result.response_status_code = 404
       empty_body: Result.response_body_length = 0
@@ -114,9 +96,7 @@ create {ANY}
         status_digits = "405",
         digits_len = 3,
         body_text = "",
-        body_len = 0,
-        content_len_str = "0",
-        cl_str_len = 1 }
+        body_len = 0 }
     ensure
       is_405: Result.response_status_code = 405
       empty_body: Result.response_body_length = 0
@@ -130,9 +110,7 @@ create {ANY}
         status_digits = "204",
         digits_len = 3,
         body_text = "",
-        body_len = 0,
-        content_len_str = "0",
-        cl_str_len = 1 }
+        body_len = 0 }
     ensure
       is_204: Result.response_status_code = 204
       empty_body: Result.response_body_length = 0
@@ -147,9 +125,7 @@ create {ANY}
         status_digits = d,
         digits_len = d.byte_length,
         body_text = "",
-        body_len = 0,
-        content_len_str = "0",
-        cl_str_len = 1 }
+        body_len = 0 }
     ensure
       status_set: Result.status = st
       code_set: Result.response_status_code = st.status_code
@@ -167,9 +143,7 @@ create {ANY}
         status_digits = d,
         digits_len = d.byte_length,
         body_text = "",
-        body_len = 0,
-        content_len_str = "0",
-        cl_str_len = 1 }
+        body_len = 0 }
     ensure
       is_err: Result.status.is_client_error or Result.status.is_server_error
       empty_body: Result.response_body_length = 0
@@ -227,10 +201,13 @@ feature {ANY}
       forbidden_implies_zero: Current.status.forbids_body implies (Result = 0)
     end
 
+  -- The `Content-Length` field value: the body's length in decimal, worked out here so it
+  -- cannot disagree with the body.
   content_length_header_value: STRING
     do
-      Current.content_len_str
+      NUMBER_TEXT.nat_to_text(Current.body_len)
     ensure
+      says_body: NUMBER_TEXT.parse_nat(Result) = Ok(Current.response_body_length)
       matches_cl_len: Result.byte_length = Current.content_length_digits_len
       non_empty: Result.byte_length >= 1
       bounded: Result.byte_length <= 10
@@ -238,7 +215,7 @@ feature {ANY}
 
   content_length_digits_len: NAT
     do
-      Current.cl_str_len
+      NUMBER_TEXT.digit_count(Current.body_len)
     ensure
       in_range: Result >= 1 and Result <= 10
     end

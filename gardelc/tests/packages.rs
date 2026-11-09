@@ -1151,6 +1151,8 @@ fn a_service_on_ghttp_verifies_and_answers() {
             ask(&["POST /echo HTTP/1.1\r\nHost: test\r\nContent-Length: 2\r\n\r\nhi"]),
             ask(&["POST /echo HTTP/1.1\r\nHost: test\r\nContent-Le", "ngth: 5\r\n\r\nhe", "llo"]),
             ask(&["POST /echo HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n"]),
+            // The length the answer declares is the library's, worked out from the body.
+            ask(&["POST /echo HTTP/1.1\r\ncontent-length: 12\r\n\r\nhello, world"]),
         ]
     } else {
         vec![]
@@ -1164,6 +1166,7 @@ fn a_service_on_ghttp_verifies_and_answers() {
     assert_eq!(answers[3], "HTTP/1.1 200\r\nContent-Length: 2\r\n\r\nhi");
     assert_eq!(answers[4], "HTTP/1.1 200\r\nContent-Length: 5\r\n\r\nhello");
     assert_eq!(answers[5], "HTTP/1.1 501\r\nContent-Length: 0\r\n\r\n");
+    assert_eq!(answers[6], "HTTP/1.1 200\r\nContent-Length: 12\r\n\r\nhello, world");
 }
 
 /// `ghttp`'s own suite, a client package of it: every case of `cases.txt` is parsed whole
