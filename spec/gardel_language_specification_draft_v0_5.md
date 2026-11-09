@@ -124,6 +124,7 @@ Rules:
 - **Unit type.** `UNIT` is a primitive type with exactly one value, written `()`. It represents computations evaluated purely for sequenced effects (such as `IO.print(...) : IO[UNIT]`), and erases at runtime.
 - **Conversions are explicit.** `NAT.of(m)` from a `MATH_INT` requires a proof that `0 <= m and m <= NAT.max`. Between the two machine types, `NAT.from_i64(i)` requires `i >= 0` and `I64.from_nat(n)` requires `n <= INT.max`, each as the obligation `in_range`. The result is the same number (`Result = i`, `Result = n`), and in C it is a plain cast.
 - **Quantifiers range over the type.** `forall k: NAT. P(k)` means P for every `k` in $[0, 2^{64} - 1]$, and `exists k: I64. P(k)` needs a witness in $[-2^{63}, 2^{63} - 1]$. The same holds for `U64`, `I64` and `CHAR`, and only `MATH_INT` ranges over all of $\mathbb{Z}$. A number outside the range is no value of the type, so it neither refutes a `forall` nor proves an `exists`. (Before Task F.2, the translation dropped the range, and a witness such as $-1$ could prove an `exists` over `NAT`.)
+- **Fields range over their type.** A field of type `NAT`, `U64`, `I64` or `CHAR` of a sum type or record holds a value of that type, so a value bound from it, as `w` in `case JInt(w)` or `r.count`, is in the type's range (Task F.4). An element of a `LIST` or `SEQ` of a machine type does not yet carry its range in the proof.
 - **Large numbers.** A prelude library type `BIGNAT` stores little-endian limbs in a `LIST[U64]` and has `MATH_INT` as its ghost model (Dual-Layer Model Refinement, §2).
 
 The classic midpoint shows the effect. The version below verifies; `(lo + hi) / 2` is rejected because `lo + hi` may exceed `NAT.max`.
@@ -250,6 +251,7 @@ A prelude module of routines only (Task F.2), called as `NUMBER_TEXT.parse_nat(s
 - `parse_nat(s: STRING): RESULT[NUMBER_ERROR, NAT]`: decimal digits only, with no sign or space. Leading zeros are allowed. `parse_i64` accepts one optional `-` first. Both are total, and their contracts define the result on `s.byte_model`.
 - `NUMBER_ERROR` is `NoDigits`, `NotADigit(offset: NAT)` (the byte offset of the first byte that is not a digit) or `OutOfRange`.
 - `hex4_text(n: NAT): BYTES` (requires `n < 65536`) writes four lowercase hex digits, as in a JSON `\uXXXX` escape. `parse_hex4(bs: BYTES, at: NAT): OPTION[NAT]` reads four at offset `at`, in either case.
+- `digits(n: NAT, rest: LIST[U64]): LIST[U64]` puts the ASCII digits of `n` in front of `rest`. It is the model of `nat_to_text`. The law `digits_step` (Task F.4) gives one step of it: `rest.prepend(48 + n)` for `n < 10`, and `digits(n / 10, rest.prepend(48 + n % 10))` otherwise. It has no trigger, so a client calls it where a proof needs it.
 - Laws, proven: `nat_round_trip`, `parse_nat(nat_to_text(n)) = Ok(n)`; `i64_round_trip`, `parse_i64(i64_to_text(i)) = Ok(i)`, which includes `INT.min`; and `hex4_round_trip`, `parse_hex4(hex4_text(n), 0) = Some(n)` for `n < 65536`. Each is an axiom for clients, triggered by the composed call.
 
 ---
@@ -1386,6 +1388,8 @@ Contracts are never evaluated at runtime, so a program must be able to establish
    Untrusted external data crosses the proof boundary into invariant-carrying verified ADTs strictly via total routines that return `RESULT[E, A]` or `OPTION[A]` (§7.2.2).
 5. **Opaque Bodies and Fuel:**
    Outside its declaring module, a function is known to the SMT solver strictly by its signature, precondition, and `ensure` postconditions. Inside its module, recursive functions unfold up to a configurable `fuel` bound (default 2), and `reveal f` unfolds a definition fully for the scope of the enclosing block. Key inductive facts must be stated as explicit `ensure` clauses so callers can utilize them without body unfolding.
+6. **Contracts at a Call:**
+   At a call, each parameter in the callee's `require` and `ensure` is replaced by the argument given for it. The replacement avoids capture: a name the contract binds itself, in a `match` arm, a `forall` or `exists`, a lambda or a `let`, is renamed where an argument mentions the same name, so the contract means at the call what it means at its declaration (Task F.4). Before, a `require` that bound `k` in a `match`, called with an argument that mentions the caller's `k`, could be refused though it held.
 
 ---
 
