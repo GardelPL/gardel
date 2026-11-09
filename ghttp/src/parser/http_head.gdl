@@ -1,0 +1,9 @@
+-- A parsed request head: the request line and headers, and the framing they declare.
+module HTTP_HEAD
+
+representation {ANY}
+  -- `content_length` is the declared body length, if any. `chunked` is whether a
+  -- `Transfer-Encoding` header was present.
+  | ParsedHead(request: HTTP_REQUEST, content_length: OPTION[NAT], chunked: BOOL)
+
+end

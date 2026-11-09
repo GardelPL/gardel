@@ -1,0 +1,72 @@
+-- What a parse result promises about the bytes it was given, and how a body is framed.
+functions HTTP_FRAMING
+
+feature {ANY}
+
+  -- What a parse of `buf`, all the bytes received, promises. A state that waits for more
+  -- holds `buf` under the same limits. A complete request is followed by the tail of `buf`,
+  -- and its body is the bytes just before that tail.
+  faithful(state: HTTP_PARSER_STATE, buf: BYTES, r: HTTP_PARSE_RESULT): BOOL
+    do
+      match r
+        case NeedMore(s) then
+          s.bytes_received.model = buf.model and
+          s.request_line_limit = state.request_line_limit and
+          s.header_limit = state.header_limit and
+          s.body_limit = state.body_limit
+        case Complete(q, rest) then
+          rest.length <= buf.length and q.body.length <= buf.length - rest.length and
+          rest.model = BYTES.list_take(BYTES.list_drop(buf.model, buf.length - rest.length), rest.length) and
+          q.body.model = BYTES.list_take(
+            BYTES.list_drop(buf.model, buf.length - rest.length - q.body.length), q.body.length)
+        case Failed(_) then
+          True
+      end
+    end
+
+  -- The body starts at `start`. Its length is `Content-Length`, or 0 without one.
+  -- Chunked transfer coding is not supported, and both framings at once are refused.
+  frame(state: HTTP_PARSER_STATE, buf: BYTES, req: HTTP_REQUEST,
+        cl: OPTION[NAT], te: BOOL, start: NAT): HTTP_PARSE_RESULT
+    require
+      head_fits: start <= state.request_line_limit + state.header_limit
+      in_buf: start <= buf.length
+    do
+      if te then
+        if cl.is_some then Failed(ConflictingFraming) else Failed(UnsupportedTransferEncoding) end
+      else
+        let n = declared_length(cl)
+        if n > state.body_limit then
+          Failed(BodyTooLarge)
+        else if req.method.is_safe and n > 0 then
+          Failed(BodyNotAllowed)
+        else if buf.length - start < n then
+          NeedMore(state.with_received(buf))
+        else
+          let body = buf.slice(start, start + n)
+          let rest = buf.slice(start + n, buf.length)
+          let full = req.with_body(body, state.body_limit)
+          check
+            rest_fits: rest.length <= buf.length
+            body_fits: full.body.length <= buf.length - rest.length
+            rest_tail: rest.model = BYTES.list_take(BYTES.list_drop(buf.model, buf.length - rest.length), rest.length)
+            body_before: full.body.model = BYTES.list_take(
+              BYTES.list_drop(buf.model, buf.length - rest.length - full.body.length), full.body.length)
+          end
+          Complete(full, rest)
+        end end end
+      end
+    ensure
+      sound: faithful(state, buf, Result)
+    end
+
+  -- The body length a `Content-Length` declares, or 0 without one.
+  declared_length(cl: OPTION[NAT]): NAT
+    do
+      match cl
+        case Some(k) then k
+        case None then 0
+      end
+    end
+
+end

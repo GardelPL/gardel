@@ -150,6 +150,16 @@ fn what_the_contracts_give_a_client() {
       model: Result = xs.head.to_list.length
     end
 
+  located(s: STRING, t: STRING): BOOL
+    require
+      fits: t.code_point_count <= s.code_point_count
+      there: s.matches_at(t, 0, 0)
+    do
+      s.find(t, 0).is_some
+    ensure
+      found: Result
+    end
+
   in_range(z: NAT): BOOL
     do
       True

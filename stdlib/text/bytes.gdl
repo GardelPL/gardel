@@ -910,6 +910,11 @@ feature {ANY}
         (from <= Result.get and Result.get + other.length <= Current.length and
          (forall k: NAT. k < other.length implies
            LIST_OPS.at(Current.model, Result.get + k) = LIST_OPS.at(other.model, k)))
+      first: Result.is_some implies
+        (forall p: NAT. (from <= p and p < Result.get) implies not Current.matches_at(other, p, 0))
+      absent: not Result.is_some implies
+        (forall p: NAT. (from <= p and p + other.length <= Current.length) implies
+          not Current.matches_at(other, p, 0))
     end
 
 specify {EQ}

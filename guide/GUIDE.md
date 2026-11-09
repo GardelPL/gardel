@@ -353,18 +353,76 @@ Floating-point math in Gardel follows strict syntactic expression-tree evaluatio
 
 `CHAR` is a Unicode scalar value. `STRING` is a prelude module (`stdlib/text/string.gdl`) whose ghost model is `chars: LIST[CHAR]`.
 
-> [!NOTE]
-> The current `STRING` is the **ASCII bootstrap**: every byte is `< 128`. Full multi-byte UTF-8 arrives with Roadmap Task C.2 without changing the public `chars` contracts.
+A `STRING` is well-formed UTF-8, and every index counts scalars, not bytes: `"café".code_point_count = 4` while its `byte_length` is 5. Raw input arrives as `BYTES`, and becomes text only through `STRING.from_utf8`, which returns an error for malformed input.
 
-String literals are ordinary verified values. `"Hi"` is defined as a chain of verified prelude calls (`STRING.make_empty(2).push_ascii('i').push_ascii('H')`), so the verifier knows `"Hi".chars` and `"Hi".byte_length = 2` with no extra trust. The compiler enforces the bootstrap rules:
+String literals are ordinary verified values. `"Hi"` is defined as a chain of verified prelude calls (`STRING.make_empty(2).push_ascii('i').push_ascii('H')`), so the verifier knows `"Hi".chars` and `"Hi".byte_length = 2` with no extra trust. The compiler enforces these rules:
 
 | Code | Rejected | Use instead |
 | :--- | :--- | :--- |
-| `E0303` | A literal with a non-ASCII character | ASCII text until Task C.2 |
 | `E0302` / `E0304` | Malformed escapes / surrogate code points | Valid escapes |
 | `E0311` | `=` with a `STRING` operand (`STRING` is not `CANONICAL_EQ`: two strings with different capacities are equal text) | `a.equals(b)` or `a.chars = b.chars` |
 | `E0312` | `+` on `STRING` | Print the pieces with separate `IO.print` calls |
 | `E0313` | String literals as `match` patterns | `if s.equals("...") then ... else ... end` |
+
+#### Working with text
+
+Every operation states its result on `chars` (or, for `BYTES`, on `model`), so a client can prove what it gets:
+
+| On `STRING` | Gives |
+| :--- | :--- |
+| `s.slice(lo, hi)` | Scalars `lo` up to, not including, `hi`. Needs `lo <= hi <= s.code_point_count`. |
+| `s.find(t, from)` | `Some(i)`, the first index at or after `from` where `t` occurs, or `None` when there is none. |
+| `s.find_char(c, from)` | The same for one `CHAR`. |
+| `s.starts_with(p)`, `s.ends_with(p)` | Whether `p` is at the start or the end. |
+| `s.trim` | `s` without ASCII white space at either end. |
+| `s.split(c)` | The parts between each `c`: `count_char(c, 0) + 1` of them. |
+| `a.less_than(b)` | Byte order of the UTF-8 form, so `STRING` is a key for a generic `[K: ORD]`. It is not a collation: `"Z"` comes before `"a"`. |
+
+The contract of `split` gives the number of parts, not their text, so the verifier knows nothing more about them. When a proof depends on the pieces, cut the text with `find_char` or `find` and `slice`, whose contracts are exact:
+
+```eiffel
+-- The text before the first `:`, or the whole line when there is none.
+header_name(line: STRING): STRING
+  do
+    match line.find_char(':', 0)
+      case Some(i) then line.slice(0, i)
+      case None then line
+    end
+  ensure
+    shorter: Result.code_point_count <= line.code_point_count
+  end
+```
+
+`BYTES` has `concat`, `slice`, `starts_with`, `index_of_byte` and `index_of`, with the same contracts. `slice` shares the buffer, so it costs no copy. `concat` copies both sides, so to build a buffer piece by piece use `BYTES_BUILDER`:
+
+```eiffel
+let out = BYTES_BUILDER.empty.add_text("HTTP/1.1 ").add_text("200 OK").add_byte(13).add_byte(10)
+out.to_bytes
+```
+
+Each `add` requires the total length to fit a `U64` (`fits`), so text of unknown length needs a bound first, such as `if s.byte_length <= 1000000 then ...`.
+
+`NUMBER_TEXT` turns numbers into decimal text and back. Parsing is total, and a value too large for its type is `Error(OutOfRange)`, never a wrapped number:
+
+```eiffel
+NUMBER_TEXT.nat_to_text(42)            -- "42"
+NUMBER_TEXT.parse_nat("18446744073709551616")  -- Error(OutOfRange)
+NUMBER_TEXT.parse_i64("-7")            -- Ok(-7)
+NUMBER_TEXT.parse_nat("4x")            -- Error(NotADigit(1))
+```
+
+The round trips are proven laws, so this verifies with no extra work:
+
+```eiffel
+read_back(n: NAT): RESULT[NUMBER_ERROR, NAT]
+  do
+    NUMBER_TEXT.parse_nat(NUMBER_TEXT.nat_to_text(n))
+  ensure
+    same: Result = Ok(n)
+  end
+```
+
+To change between `NAT` and `I64`, use `NAT.from_i64(i)`, which needs `i >= 0`, and `I64.from_nat(n)`, which needs `n <= 9223372036854775807`. Both are proof obligations (`in_range`), not run-time checks.
 
 ---
 
@@ -1668,8 +1726,8 @@ Every program automatically sees the **Standard Prelude**:
 | Concepts | `EQ`, `CANONICAL_EQ`, `ORD` |
 | Core types | `OPTION[A]`, `RESULT[E, A]`, `IO_ERROR` |
 | Collections | `SEQ[A]`, `LIST[A]`, `LIST_OPS` |
-| Numbers | `BIGNAT` |
-| Text | `STRING`, `STRING_ERROR` |
+| Numbers | `BIGNAT`, `NUMBER_TEXT`, `NUMBER_ERROR` |
+| Text | `STRING`, `STRING_ERROR`, `BYTES`, `BYTES_BUILDER` |
 | Functions | `FUNCTION_OPS` |
 | Reactive programs | `STEP[S]`, `COMMAND`, `EVENT`, `KEY`, `CONN_ID` |
 

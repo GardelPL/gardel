@@ -1,7 +1,8 @@
 -- Executable protocol, parser, router, and REST API extension test suite for Gardel HTTP (`ghttp`).
 -- Exit code 0 means all checks passed; k > 0 identifies the first failing check.
 --
---   gardelc ghttp/src/core ghttp/src/parser ghttp/src/serializer ghttp/src/routing ghttp/src/application ghttp/tests/ghttp_test.gdl --strict
+--   gardelc --project ghttp/tests --strict
+--   build/ghttp_test_bin.exe < ghttp/tests/cases.txt
 program GHTTP_TEST
 
 feature {ANY}
@@ -18,23 +19,6 @@ feature {ANY}
       else if HTTP_HEADER.content_type_json.wire_byte_length != 32 then 9
       else 0
       end end end end end end end end
-    end
-
-  check_parser_and_fragmentation: EXIT_CODE
-    do
-      let step1 = HTTP_PARSER.feed(HTTP_PARSER_STATE.make_default, "GET /ap".to_utf8)
-      if not HTTP_PARSER.parse("GET /any/path HTTP/1.1\r\n\r\n".to_utf8).is_complete then 10
-      else if not step1.is_need_more then 11
-      else
-        match step1
-          case NeedMore(st1) then
-            if not HTTP_PARSER.feed(st1, "i/v1\r\n\r\n".to_utf8).is_complete then 12
-            else if not HTTP_PARSER.parse("GET bad_target\r\n\r\n".to_utf8).is_failed then 13
-            else 0
-            end end
-          case _ then 14
-        end
-      end end
     end
 
   -- Example user-defined REST API handler extension (not part of the HTTP server core).
@@ -104,19 +88,49 @@ feature {ANY}
   first_failure: EXIT_CODE
     do
       let c1 = check_domain_model
-      if c1 != 0 then c1
+      if c1 != 0 then c1 else check_router_and_rest_extension end
+    end
+
+  -- Reads the parser cases on standard input, line `n` onward. The first line that fails
+  -- is printed, and the exit code is 100 plus its number, or 0 when every case holds.
+  run_cases(n: NAT): IO[EXIT_CODE]
+    require
+      bounded: n <= 10000
+    variant
+      10000 - n
+    do
+      with IO
+        line_res <- IO.read_line
+        match line_res
+          case Error(_) then
+            IO.exit(0)
+          case Ok(line) then
+            if GHTTP_TEXT.check_line(line) = 0 and n < 10000 then
+              run_cases(n + 1)
+            else
+              report(line, n)
+            end
+        end
+      end
+    end
+
+  -- Line `n`, `line`, failed, or it is the last line read.
+  report(line: STRING, n: NAT): IO[EXIT_CODE]
+    do
+      if GHTTP_TEXT.check_line(line) = 0 then
+        IO.exit(0)
       else
-        let c2 = check_parser_and_fragmentation
-        if c2 != 0 then c2
-        else
-          check_router_and_rest_extension
+        with IO
+          IO.print_line(line)
+          IO.exit(if n <= 150 then 100 + n else 250 end)
         end
       end
     end
 
   main(args: SEQ[STRING]): IO[EXIT_CODE]
     do
-      IO.exit(first_failure)
+      let code = first_failure
+      if code != 0 then IO.exit(code) else run_cases(1) end
     end
 
 end

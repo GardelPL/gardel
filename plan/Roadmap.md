@@ -854,7 +854,7 @@ flowchart TD
 
 **What probing found (commit `1349cb6`):**
 
-- **`ghttp` is wrong on a split request.** Its parser keeps a count and no bytes, so a request split across TCP reads is answered as `GET /`, and a split `GET /nope` gets `200 OK`. Headers and bodies are not parsed, so a `POST` with a body hangs. Task F.5 fixes this, and until then Phase E's "`ghttp` is the real second package" holds for its use as a package, not for its HTTP behaviour.
+- **`ghttp` is wrong on a split request.** Its parser keeps a count and no bytes, so a request split across TCP reads is answered as `GET /`, and a split `GET /nope` gets `200 OK`. Headers and bodies are not parsed, so a `POST` with a body hangs. Task F.5 fixed this (`ghttp` 0.2.0): every request is now parsed from all the bytes received, and the tests cut each one at every byte.
 - **The compiler needed work first (Task F.1, done).** A method from a concept bound now translates and means the instance chosen at each use, a bound is checked at each use, and a record can hold and call a function. Nested recursion through `LIST[SELF]` still cannot be proven, though a flat cell form can, and `variant` on a list is now `E0319` rather than `E0199`.
 - **The core proofs look feasible.** A string `find` with an exact postcondition and a digit round trip both verify today.
 
@@ -862,10 +862,10 @@ flowchart TD
 | :--- | :--- | :--- |
 | 1. Foundations | [F.0](libraries/verified_libraries.md#task-f0-resolve-the-failing-e3-test) | The failing E.3 test resolved ✅ |
 | | [F.1](libraries/verified_libraries.md#task-f1-compiler-gaps) | Generic bounds, match binders, function fields in C ✅ |
-| 2. Core libraries | [F.2](libraries/verified_libraries.md#task-f2-bytes-string-and-number-text) | `BYTES`, `STRING` and number text |
+| 2. Core libraries | [F.2](libraries/verified_libraries.md#task-f2-bytes-string-and-number-text) | `BYTES`, `STRING` and number text ✅ |
 | | [F.3](libraries/verified_libraries.md#task-f3-mapk-v) | `MAP[K, V]` |
 | 3. JSON | [F.4](libraries/verified_libraries.md#task-f4-the-gjson-package) | The `gjson` package |
-| 4. REST | [F.5](libraries/verified_libraries.md#task-f5-a-parser-that-means-what-the-bytes-say) | A correct `ghttp` parser |
+| 4. REST | [F.5](libraries/verified_libraries.md#task-f5-a-parser-that-means-what-the-bytes-say) | A correct `ghttp` parser ✅ |
 | | [F.12](libraries/verified_libraries.md#task-f12-refined-function-types) | `require` and `ensure` on function types enforced |
 | | [F.6](libraries/verified_libraries.md#task-f6-grest-sync-rest) | `grest`, sync handlers, `todo_api` |
 | 5. Async | [F.7](libraries/verified_libraries.md#task-f7-connect-and-correlation-ids) | `Connect`, correlation ids, `CancelTimer` |
@@ -899,7 +899,7 @@ flowchart TD
 
 ## 6. Immediate Next Step
 
-**Phase F: Verified Libraries and Applications** is in progress, and Tasks F.0 and F.1 are completed. Task F.2 is in progress; its status in the plan lists what is left. Decision 3 of [libraries/verified_libraries.md](libraries/verified_libraries.md) settles the order of `STRING`: byte order of the UTF-8 form.
+**Phase F: Verified Libraries and Applications** is in progress, and Tasks F.0, F.1, F.2 and F.5 are completed. The next task is F.3, `MAP[K, V]`. Decision 3 of [libraries/verified_libraries.md](libraries/verified_libraries.md) settles the order of `STRING`: byte order of the UTF-8 form.
 
 **Phase E: Projects and Packages:** Tasks E.0 to E.5 and E.7 are completed, so Phase E is complete. Fetching dependencies and a lockfile were dropped, as a path dependency on a git submodule already pins a commit.
 

@@ -39,17 +39,19 @@ A formally verified HTTP/1.1 protocol library and reactive TCP server written in
 | :--- | :--- | :--- |
 | **Domain Invariants** | `HTTP_METHOD`, `HTTP_VERSION`, `HTTP_STATUS`, `HTTP_ERROR` | `CANONICAL_EQ` & `EQ` laws (`reflexive`, `symmetric`, `transitive`, `agrees_with_structural`); status code range $100 \le \text{code} \le 599$; exhaustive 5-class partition (`1xx`..`5xx`); `safe_methods_are_idempotent`; `safe_methods_disallow_body`. |
 | **Header & Message Framing** | `HTTP_HEADER`, `HTTP_HEADERS`, `HTTP_REQUEST`, `HTTP_RESPONSE` | Non-empty header names ($\le 128$ bytes), bounded header values ($\le 1024$ bytes), exact wire line length (`name_len + value_len + 4`), bounded header collection ($\le 64$ headers), safe methods carry empty bodies, RFC 9112 §6.3 body-forbidden status codes (`1xx`, `204`, `304`) carry $0$ body bytes. |
-| **Incremental Parser** | `HTTP_PARSER_STATE`, `HTTP_PARSE_RESULT`, `HTTP_PARSER` | Accumulated bytes bounded by `max_request_line + max_header_bytes + max_body_bytes` ($\le 75{,}776$ bytes); exhaustive trichotomy of `NeedMore`, `Complete`, and `Failed`; safe indexed byte access (`i < raw.length`) with zero out-of-bounds reads or arithmetic overflow. |
+| **Incremental Parser** | `HTTP_PARSER_STATE`, `HTTP_PARSE_RESULT`, `HTTP_PARSER`, `HTTP_HEAD_PARSER`, `HTTP_FRAMING` | The state keeps every byte received, within `max_request_line + max_header_bytes + max_body_bytes` ($\le 75{,}776$ bytes), and each `feed` parses all of them again, so where TCP cut them does not matter. `HTTP_FRAMING.faithful` holds of every result: a `NeedMore` state holds every byte received, in order, under the same limits; after `Complete(req, rest)`, `rest` is the tail of those bytes and `req.body` the `Content-Length` bytes just before it. Exhaustive trichotomy of `NeedMore`, `Complete` and `Failed`; safe indexed byte access with no out-of-bounds read or overflow. |
 | **Wire Serialization** | `HTTP_SERIALIZER` | Wire output is always non-empty ($\ge 22$ bytes), strictly larger than body length when a body is present, and bounded ($\le 65{,}567$ bytes) without arithmetic overflow. |
 | **Routing** | `ROUTE_RESULT`, `HTTP_ROUTE`, `HTTP_ROUTER` | `CANONICAL_EQ` laws; exhaustive disjoint partition of `Matched`, `MethodNotAllowed`, and `NotFound`; bounded route table capacity ($\le 64$ routes). |
 | **Reactive Server Safety** | `CONNECTION_STATUS`, `HTTP_CONNECTION`, `HTTP_SERVER_STATE`, `HTTP_SERVER` | Active connection count never exceeds `max_connections` ($\le 64$ in `HTTP_SERVER`, $\le 1024$ max); closing/closed connections never accept further bytes; IO linearity and totality across all runtime events. |
 
-### 2. Executable Protocol & Integration Tests (`ghttp/tests/ghttp_test.gdl`)
+### 2. Executable Protocol & Integration Tests (`ghttp/tests/`)
+
+`ghttp/tests` is a package that depends on `ghttp`, so it sees only its contracts. `GHTTP_TEST` runs the suites, then reads the parser cases of `ghttp/tests/cases.txt` on standard input. Each line is a request and what the parser must say of it. `GHTTP_TEXT` turns a result into text so two results can be compared, and checks the request whole and cut into two reads at every byte. The cases are kept out of the source because string literals are costly to verify in a module that uses `ghttp`.
 
 | Suite | Verified Behavior |
 | :--- | :--- |
 | `check_domain_model` | Method safety/idempotence, status code classes (`200`, `204`), header wire length, and header lookup. |
-| `check_parser_and_fragmentation` | Single-chunk request parsing, multi-chunk TCP fragmentation (`NeedMore` $\rightarrow$ `Complete`), and malformed request target rejection (`Failed(InvalidTarget)`). |
+| `cases.txt` (`run_cases`) | Each request is parsed whole and cut into two reads at every byte offset, and every cut must give what the whole gives: targets as received, header counts, `Content-Length` bodies, the bytes after a request (`rest`), waiting for more, and each refusal (no version, bad target, unknown or lower-case method, HTTP/2, a bad header, chunked encoding (`501`), both framings, two different lengths, a bad or too large length, and a body on `GET`). |
 | `check_router_and_rest_extension` | Verifies that the default server router only serves `GET /` (`200`) and rejects unregistered routes (`404`) or disallowed methods (`405`), and demonstrates building a custom REST API extension (`GET /health`, `GET /users`, `POST /users`, `DELETE /users/:id`) using `HTTP_ROUTER.register` and `HTTP_APPLICATION.dispatch_with`. |
 
 ---
@@ -65,8 +67,8 @@ A formally verified HTTP/1.1 protocol library and reactive TCP server written in
 ### 2. Verify and Run the Protocol Test Suite (`GHTTP_TEST`)
 
 ```powershell
-./gardelc/target/release/gardelc.exe ghttp/src/core ghttp/src/parser ghttp/src/serializer ghttp/src/routing ghttp/src/application ghttp/tests/ghttp_test.gdl --strict
-./build/ghttp_test_bin.exe
+./gardelc/target/release/gardelc.exe --project ghttp/tests --strict
+Get-Content ghttp/tests/cases.txt | ./build/ghttp_test_bin.exe
 ```
 
 ### 3. Deterministic Scripted Server Execution (`GARDEL_EVENTS`)

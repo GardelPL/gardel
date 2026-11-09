@@ -354,6 +354,18 @@ create {ANY}
       is_n: NUMBER_TEXT.absorb(n, 0) = n
     end
 
+  -- The four hex digits of `n` add back up to `n`. Proven on its own, as this arithmetic
+  -- inside `hex4_round_trip` left that law at the edge of the solver's limit.
+  hex4_sum(n: NAT): BOOL
+    require
+      small: n < 65536
+    do
+      True
+    ensure
+      holds: Result
+      sum: n / 4096 * 4096 + n / 256 % 16 * 256 + n / 16 % 16 * 16 + n % 16 = n
+    end
+
   -- Parsing the digits of `n` adds them to the number read so far.
   parse_digits_step(n: NAT, rest: LIST[U64], k: NAT, offset: NAT): BOOL
     require
@@ -408,7 +420,7 @@ specify {ANY}
     trigger
       NUMBER_TEXT.parse_hex4(NUMBER_TEXT.hex4_text(n), 0)
     do
-      n / 4096 * 4096 + n / 256 % 16 * 256 + n / 16 % 16 * 16 + n % 16 = n and
+      NUMBER_TEXT.hex4_sum(n) and
       NUMBER_TEXT.hex_value(NUMBER_TEXT.hex4_text(n).at(0)) = n / 4096 and
       NUMBER_TEXT.hex_value(NUMBER_TEXT.hex4_text(n).at(1)) = n / 256 % 16 and
       NUMBER_TEXT.hex_value(NUMBER_TEXT.hex4_text(n).at(2)) = n / 16 % 16 and
