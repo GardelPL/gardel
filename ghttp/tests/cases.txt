@@ -1,0 +1,42 @@
+# Parser cases for GHTTP_TEST, read on standard input:
+#
+#   build/ghttp_test_bin.exe < ghttp/tests/cases.txt
+#
+# Each line is a request, ` => `, and what the parser must say of it, whole and cut into
+# two reads at every byte. In the request, \r, \n, \t and \\ stand for CR, LF, tab and a
+# backslash. Lines that start with # and empty lines are skipped.
+
+# Accepted.
+GET /any/path HTTP/1.1\r\n\r\n => GET /any/path HTTP/1.1 headers 0 body [] rest []
+GET /api/v1 HTTP/1.1\r\nHost: x\r\n\r\n => GET /api/v1 HTTP/1.1 headers 1 body [] rest []
+GET /nope HTTP/1.1\r\nHost: x\r\n\r\n => GET /nope HTTP/1.1 headers 1 body [] rest []
+POST /users HTTP/1.1\r\nHost: x\r\nContent-Length: 2\r\n\r\nhi => POST /users HTTP/1.1 headers 2 body [hi] rest []
+PUT /a?b=1 HTTP/1.0\r\ncontent-length:  5 \r\nX-A:\tb\r\n\r\nhello => PUT /a?b=1 HTTP/1.0 headers 2 body [hello] rest []
+POST /x HTTP/1.1\r\nContent-Length: 2\r\nContent-Length: 2\r\n\r\nok => POST /x HTTP/1.1 headers 2 body [ok] rest []
+DELETE /users/42 HTTP/1.1\r\n\r\n => DELETE /users/42 HTTP/1.1 headers 0 body [] rest []
+
+# What follows a request is handed back, not lost.
+GET /a HTTP/1.1\r\n\r\nGET /b => GET /a HTTP/1.1 headers 0 body [] rest [GET /b]
+POST /p HTTP/1.1\r\nContent-Length: 3\r\n\r\nabcGET => POST /p HTTP/1.1 headers 1 body [abc] rest [GET]
+
+# Not complete yet: the state holds every byte.
+GET /ap => more 7
+GET /ap HTTP/1.1\r\nHost: x\r\n => more 27
+POST /p HTTP/1.1\r\nContent-Length: 4\r\n\r\nab => more 41
+
+# Refused. The old parser answered the first as `GET /`: there is no version.
+GET /api/v1\r\n\r\n => failed MalformedRequestLine
+GET bad_target HTTP/1.1\r\n\r\n => failed InvalidTarget
+GET /a b HTTP/1.1\r\n\r\n => failed MalformedRequestLine
+BREW / HTTP/1.1\r\n\r\n => failed UnknownMethod
+get / HTTP/1.1\r\n\r\n => failed UnknownMethod
+GET / HTTP/2.0\r\n\r\n => failed UnsupportedVersion
+GET / HTTP/1.1\r\nNo colon\r\n\r\n => failed MalformedHeader
+GET / HTTP/1.1\r\nBad name: x\r\n\r\n => failed MalformedHeader
+GET / HTTP/1.1\r\n: empty name\r\n\r\n => failed MalformedHeader
+POST /x HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n => failed UnsupportedTransferEncoding
+POST /x HTTP/1.1\r\nContent-Length: 1\r\nTransfer-Encoding: chunked\r\n\r\n => failed ConflictingFraming
+POST /x HTTP/1.1\r\nContent-Length: 1\r\nContent-Length: 2\r\n\r\nab => failed ConflictingFraming
+POST /x HTTP/1.1\r\nContent-Length: -1\r\n\r\n => failed ContentLengthInvalid
+POST /x HTTP/1.1\r\nContent-Length: 99999\r\n\r\n => failed BodyTooLarge
+GET / HTTP/1.1\r\nContent-Length: 3\r\n\r\nabc => failed BodyNotAllowed

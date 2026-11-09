@@ -12,16 +12,35 @@ feature {ANY}
     do
       if id = 2 then
         HTTP_RESPONSE.ok_text("hello from a package", "20")
+      else if id = 3 then
+        echo(req)
       else
         HTTP_APPLICATION.default_endpoint_handler(id)
+      end end
+    end
+
+  -- `POST /echo` answers with the body it was sent.
+  echo(req: HTTP_REQUEST): HTTP_RESPONSE
+    do
+      match STRING.from_utf8(req.body)
+        case Error(_) then
+          HTTP_RESPONSE.from_error(MalformedHeader)
+        case Ok(text) then
+          let digits = NUMBER_TEXT.nat_to_text(text.byte_length)
+          if text.byte_length <= 65536 and digits.byte_length >= 1 and digits.byte_length <= 10 then
+            HTTP_RESPONSE.ok_text(text, digits)
+          else
+            HTTP_RESPONSE.from_error(BodyTooLarge)
+          end
       end
     end
 
   routes: HTTP_ROUTER
     do
-      HTTP_ROUTER.default_server_router.register(HTTP_ROUTE.make(Get, "/hello", 2))
+      let with_hello = HTTP_ROUTER.default_server_router.register(HTTP_ROUTE.make(Get, "/hello", 2))
+      with_hello.register(HTTP_ROUTE.make(Post, "/echo", 3))
     ensure
-      two: Result.num_routes = 2
+      three: Result.num_routes = 3
     end
 
   answer(s: HTTP_SERVER_STATE, c: CONN_ID, req: HTTP_REQUEST): STEP[HTTP_SERVER_STATE]

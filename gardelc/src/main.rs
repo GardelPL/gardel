@@ -3735,6 +3735,18 @@ pub const STDLIB_SOURCES: &[(&str, &str)] = &[
         include_str!("../../stdlib/text/string.gdl"),
     ),
     (
+        "stdlib/text/bytes_builder.gdl",
+        include_str!("../../stdlib/text/bytes_builder.gdl"),
+    ),
+    (
+        "stdlib/text/number_error.gdl",
+        include_str!("../../stdlib/text/number_error.gdl"),
+    ),
+    (
+        "stdlib/text/number_text.gdl",
+        include_str!("../../stdlib/text/number_text.gdl"),
+    ),
+    (
         "stdlib/core/io_error.gdl",
         include_str!("../../stdlib/core/io_error.gdl"),
     ),
@@ -3790,6 +3802,12 @@ pub fn phase4_stdlib_source() -> &'static str {
         include_str!("../../stdlib/text/bytes.gdl"),
         "\n",
         include_str!("../../stdlib/text/string.gdl"),
+        "\n",
+        include_str!("../../stdlib/text/bytes_builder.gdl"),
+        "\n",
+        include_str!("../../stdlib/text/number_error.gdl"),
+        "\n",
+        include_str!("../../stdlib/text/number_text.gdl"),
         "\n",
         include_str!("../../stdlib/core/io_error.gdl"),
         "\n",
@@ -4490,6 +4508,89 @@ fn elem_equals_fn(recv: &Expr, m: &ModuleDecl) -> Option<String> {
     }
 }
 
+/// `recv.f(args)` where `f` is a field of function type: applying that field. No routine is
+/// involved, so this reads `(recv.f)(args)`.
+fn function_field_call(recv: &Expr, f: &str, args: &[Expr], m: &ModuleDecl) -> Option<Expr> {
+    if args.is_empty() {
+        return None;
+    }
+    let ty = concept_receiver_type(recv, m)?;
+    let ctx = boogie_prelude_ctx();
+    let head = type_head(&ty);
+    let owner = if head == m.name { m } else { ctx.as_ref()?.module(head)? };
+    let ReprKind::Product(fields) = &owner.repr else {
+        return None;
+    };
+    let (_, fty) = fields.iter().find(|(n, _)| n == f)?;
+    if find_module_routine(owner, f).is_some() || split_top_level_arrow(fty).is_none() {
+        return None;
+    }
+    let field = Expr::MethodCall(Box::new(recv.clone()), f.to_string(), Vec::new());
+    Some(Expr::MethodCall(Box::new(field), "apply".to_string(), args.to_vec()))
+}
+
+/// The theory function of concept method `mname` on type parameter `tp` with bound `bound`:
+/// what `emit_boogie_parts_with_options` declares for an `EQ`-family or `ORD` bound.
+fn bound_method_relation(tp: &str, bound: &str, mname: &str) -> Option<String> {
+    if !BOUND_THEORY_CONCEPTS.contains(&bound) {
+        return None;
+    }
+    let closure = concept_closure(bound);
+    let has = |c: &str| closure.iter().any(|x| x == c);
+    match mname {
+        "equals" if has("EQ") => Some(format!("{tp}_eq")),
+        "less_than" if has("ORD") => Some(format!("{tp}_less")),
+        "less_or_equal" if has("ORD") => Some(format!("{tp}_less_eq")),
+        _ => None,
+    }
+}
+
+/// The Gardel type of a receiver, in any mode: what bootstrap emission tracks, else what the
+/// prelude context can infer.
+fn concept_receiver_type(recv: &Expr, m: &ModuleDecl) -> Option<String> {
+    elem_receiver_type(recv, m)
+        .or_else(|| boogie_prelude_ctx().and_then(|ctx| infer_gardel_type(recv, m, &ctx)))
+}
+
+/// The theory function behind `recv.mname(..)` when `recv` is a value of a bounded type
+/// parameter of `m`. The method belongs to whichever type instantiates the parameter, so here
+/// it is a relation carrying the bound's laws, tied to an instance only where one is chosen
+/// (`emit_bound_instance_links`).
+fn bound_method_fn(recv: &Expr, mname: &str, m: &ModuleDecl) -> Option<String> {
+    let ty = concept_receiver_type(recv, m)?;
+    if !m.type_params.contains(&ty) {
+        return None;
+    }
+    bound_method_relation(&ty, m.type_bounds.get(&ty)?, mname)
+}
+
+/// The range predicate of a machine number type. `MATH_INT` has none.
+fn machine_range(ty: &str) -> Option<&'static str> {
+    match ty.trim() {
+        "NAT" | "U64" | "EXIT_CODE" => Some("in_u64"),
+        "I64" | "INT" => Some("in_i64"),
+        "CHAR" => Some("in_char"),
+        _ => None,
+    }
+}
+
+/// A concept method on a scalar, which has no module to hold it. Every type mapped to `int` is
+/// ordered by value, and `False` is below `True` (§9).
+fn scalar_concept_method(ty: &str, mname: &str, a: &str, b: &str) -> Option<String> {
+    let int = matches!(ty, "NAT" | "U64" | "I64" | "INT" | "MATH_INT" | "CHAR" | "EXIT_CODE");
+    if !int && ty != "BOOL" {
+        return None;
+    }
+    match mname {
+        "equals" => Some(format!("({a} == {b})")),
+        "less_than" if int => Some(format!("({a} < {b})")),
+        "less_or_equal" if int => Some(format!("({a} <= {b})")),
+        "less_than" => Some(format!("(!{a} && {b})")),
+        "less_or_equal" => Some(format!("(!{a} || {b})")),
+        _ => None,
+    }
+}
+
 fn emit_boogie_concept_axioms(m: &ModuleDecl) -> String {
     let mut out = String::new();
     let Some(sat) = &m.satisfies else {
@@ -4833,7 +4934,7 @@ pub const GCC_NET_LIBS: &[&str] = if cfg!(windows) { &["-lws2_32"] } else { &[] 
 /// `STRING` is injected for modules that mention it, contain string literals or use `IO`
 /// (Task B.3: literals denote prelude `STRING` values); `LIST_OPS` / `FUNCTION_OPS` are realized by the built-in
 /// `Seq_*` / `Fn1_*` preamble theories already present in every Boogie file.
-const BOOGIE_INJECTED_PRELUDE: [&str; 13] = [
+const BOOGIE_INJECTED_PRELUDE: [&str; 16] = [
     "OPTION",
     "RESULT",
     "SEQ",
@@ -4841,6 +4942,9 @@ const BOOGIE_INJECTED_PRELUDE: [&str; 13] = [
     "BYTES",
     "STRING_ERROR",
     "STRING",
+    "BYTES_BUILDER",
+    "NUMBER_ERROR",
+    "NUMBER_TEXT",
     "IO_ERROR",
     "CONN_ID",
     "COMMAND",
@@ -4901,11 +5005,7 @@ fn boogie_receiver_type(recv: &Expr, m: &ModuleDecl) -> Option<String> {
         // A prelude module's own routines are emitted with no context installed.
         Expr::Var(v) => elem_env_type(v),
         Expr::Char(_) => Some("CHAR".to_string()),
-        Expr::MethodCall(owner, r, _)
-            if r == "from_scalar" && matches!(&**owner, Expr::Var(v) if v == "CHAR") =>
-        {
-            Some("CHAR".to_string())
-        }
+        Expr::MethodCall(owner, r, _) => conversion_result(owner, r).map(str::to_string),
         _ => None,
     })
 }
@@ -4957,6 +5057,18 @@ impl BoogiePreludeCtx {
         }
         // RESULT.to_option is stated over OPTION: inject the real OPTION theory alongside.
         if wanted.contains("RESULT") || m.name == "RESULT" {
+            wanted.insert("OPTION");
+        }
+        // The text modules built on `STRING` and `BYTES` state their contracts over them.
+        if wanted.contains("NUMBER_TEXT") || m.name == "NUMBER_TEXT" {
+            wanted.insert("NUMBER_ERROR");
+            wanted.insert("STRING");
+        }
+        if wanted.contains("BYTES_BUILDER") || m.name == "BYTES_BUILDER" {
+            wanted.insert("STRING");
+        }
+        // `BYTES.index_of` gives an `OPTION`.
+        if wanted.contains("BYTES") || m.name == "BYTES" {
             wanted.insert("OPTION");
         }
         if wanted.contains("STRING") || m.name == "STRING" {
@@ -5388,6 +5500,7 @@ fn emit_linked_background_theory(
     let mut text = parts.theory;
     text.push_str(&parts.client_axioms);
     text.push_str(&linked_contract_interface(n).0);
+    text.push_str(&invariant_of_every_value(n, &text));
     let map: HashMap<String, String> = boogie_declared_names(&text)
         .into_iter()
         .filter(|x| x != &n.name)
@@ -5718,6 +5831,48 @@ fn bind_boogie_env_type(v: &str, ty: &str) {
     }
 }
 
+/// Runs `f` with `vars` at the given types in the prelude type environment. Each one hides an
+/// outer name only inside `f`.
+fn with_scoped_boogie_types<T>(vars: &[(String, String)], f: impl FnOnce() -> T) -> T {
+    if boogie_prelude_ctx().is_none() {
+        return f();
+    }
+    let saved: Vec<Option<String>> = vars.iter().map(|(v, _)| boogie_env_type(v)).collect();
+    for (v, ty) in vars {
+        bind_boogie_env_type(v, ty);
+    }
+    let out = f();
+    BOOGIE_TYPE_ENV.with(|env| {
+        let mut env = env.borrow_mut();
+        for ((v, _), old) in vars.iter().zip(saved) {
+            match old {
+                Some(t) => env.insert(v.clone(), t),
+                None => env.remove(v),
+            };
+        }
+    });
+    out
+}
+
+/// `with_scoped_boogie_types`, and also in the environment that bootstrap emission has.
+fn with_scoped_var_types<T>(vars: &[(String, String)], f: impl FnOnce() -> T) -> T {
+    let saved: Vec<Option<String>> = vars.iter().map(|(v, _)| elem_env_type(v)).collect();
+    for (v, ty) in vars {
+        elem_env_bind(v, ty);
+    }
+    let out = with_scoped_boogie_types(vars, f);
+    ELEM_TYPE_ENV.with(|env| {
+        let mut env = env.borrow_mut();
+        for ((v, _), old) in vars.iter().zip(saved) {
+            match old {
+                Some(t) => env.insert(v.clone(), t),
+                None => env.remove(v),
+            };
+        }
+    });
+    out
+}
+
 /// Task B.3 / §9: static checks on prelude `STRING` values in a user module (prelude mode).
 ///
 /// * `E0311 non_canonical_equality`: `a = b` with a `STRING` operand. `STRING` is
@@ -5730,6 +5885,9 @@ fn bind_boogie_env_type(v: &str, ty: &str) {
 ///
 /// Operand types come from the same best-effort inference that routes prelude calls
 /// (literals, parameters, `Result`, `let`/IO-bound locals and prelude routine results).
+/// The concepts whose laws a type parameter's bound can carry into Boogie.
+const BOUND_THEORY_CONCEPTS: [&str; 3] = ["EQ", "CANONICAL_EQ", "ORD"];
+
 /// Concept `c` together with every concept it (transitively) refines.
 fn concept_closure(c: &str) -> Vec<String> {
     let prelude = standard_prelude();
@@ -5753,6 +5911,21 @@ fn concept_closure(c: &str) -> Vec<String> {
 /// bound; a module type satisfies the concepts it lists, provided its own `where`
 /// constraints hold for the type arguments.
 fn type_satisfies(ty: &str, concept: &str, m: &ModuleDecl, ctx: &BoogiePreludeCtx) -> bool {
+    let module = |head: &str| if head == m.name { Some(m) } else { ctx.module(head) };
+    let param_bound = |tp: &str| {
+        m.type_params.iter().any(|p| p == tp).then(|| m.type_bounds.get(tp).cloned())
+    };
+    satisfies_concept(ty, concept, &param_bound, &module)
+}
+
+/// `type_satisfies` with its scope given: `param_bound` says whether a name is a type parameter
+/// and what bounds it, and `module` finds a module type.
+pub(crate) fn satisfies_concept<'a>(
+    ty: &str,
+    concept: &str,
+    param_bound: &dyn Fn(&str) -> Option<Option<String>>,
+    module: &dyn Fn(&str) -> Option<&'a ModuleDecl>,
+) -> bool {
     let ty = ty.trim();
     if matches!(
         ty,
@@ -5760,19 +5933,11 @@ fn type_satisfies(ty: &str, concept: &str, m: &ModuleDecl, ctx: &BoogiePreludeCt
     ) {
         return matches!(concept, "EQ" | "CANONICAL_EQ" | "ORD");
     }
-    if m.type_params.iter().any(|tp| tp == ty) {
-        return m
-            .type_bounds
-            .get(ty)
-            .is_some_and(|b| concept_closure(b).iter().any(|c| c == concept));
+    if let Some(bound) = param_bound(ty) {
+        return bound.is_some_and(|b| concept_closure(&b).iter().any(|c| c == concept));
     }
     let (head, args) = split_type_app(ty);
-    let owner = if head == m.name {
-        Some(m)
-    } else {
-        ctx.module(head)
-    };
-    let Some(owner) = owner else {
+    let Some(owner) = module(head) else {
         return false;
     };
     let Some(sat) = &owner.satisfies else {
@@ -5787,7 +5952,7 @@ fn type_satisfies(ty: &str, concept: &str, m: &ModuleDecl, ctx: &BoogiePreludeCt
     }
     sat.where_constraints.iter().all(|(tp, req)| {
         match owner.type_params.iter().position(|p| p == tp) {
-            Some(i) if i < args.len() => type_satisfies(args[i], req, m, ctx),
+            Some(i) if i < args.len() => satisfies_concept(args[i], req, param_bound, module),
             Some(_) => false,
             None => true,
         }
@@ -5871,185 +6036,534 @@ pub fn check_higher_order_recursion(
         .collect()
 }
 
+/// A use of module `owner` with `arg` for its type parameter `tp`, declared `[tp: bound]`.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct BoundUse {
+    owner: String,
+    tp: String,
+    bound: String,
+    arg: String,
+}
+
+/// The bound written as `[tp: C]`. A `where` constraint is conditional: it limits what the
+/// module's conformance claims, not which types the module can be used at.
+fn declared_bound<'a>(owner: &'a ModuleDecl, tp: &str) -> Option<&'a String> {
+    let conditional = owner
+        .satisfies
+        .as_ref()
+        .is_some_and(|s| s.where_constraints.iter().any(|(t, _)| t == tp));
+    if conditional {
+        None
+    } else {
+        owner.type_bounds.get(tp)
+    }
+}
+
+/// Every application `H[a, b]` in a written type, nested ones included.
+fn type_applications(ty: &str) -> Vec<(&str, Vec<&str>)> {
+    let bytes = ty.as_bytes();
+    let is_ident = |c: u8| c.is_ascii_alphanumeric() || c == b'_';
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < bytes.len() {
+        if !is_ident(bytes[i]) {
+            i += 1;
+            continue;
+        }
+        let start = i;
+        while i < bytes.len() && is_ident(bytes[i]) {
+            i += 1;
+        }
+        if bytes.get(i) != Some(&b'[') {
+            continue;
+        }
+        let mut depth = 0usize;
+        let close = (i..bytes.len()).find(|&j| {
+            match bytes[j] {
+                b'[' => depth += 1,
+                b']' => depth -= 1,
+                _ => {}
+            }
+            depth == 0
+        });
+        if let Some(close) = close {
+            let args = split_top_level_commas(&ty[i + 1..close]).into_iter().map(str::trim);
+            out.push((&ty[start..i], args.collect()));
+        }
+    }
+    out
+}
+
+/// Walks a module for what depends on concepts: `where` constraints, the bound of each generic
+/// module it uses (written or inferred), concept methods on type parameters, and measures.
+struct ConceptWalk<'a> {
+    m: &'a ModuleDecl,
+    ctx: &'a BoogiePreludeCtx,
+    routine: String,
+    routine_tps: Vec<String>,
+    /// (routine, rule, message)
+    found: Vec<(String, &'static str, String)>,
+    uses: std::collections::BTreeSet<BoundUse>,
+}
+
+impl<'a> ConceptWalk<'a> {
+    fn owner(&self, head: &str) -> Option<&'a ModuleDecl> {
+        if head == self.m.name {
+            Some(self.m)
+        } else {
+            self.ctx.module(head)
+        }
+    }
+
+    fn report(&mut self, rule: &'static str, message: String) {
+        self.found.push((self.routine.clone(), rule, message));
+    }
+
+    fn note_instance(&mut self, owner: &ModuleDecl, tp: &str, arg: &str) {
+        let Some(bound) = declared_bound(owner, tp) else {
+            return;
+        };
+        if owner.name == self.m.name && arg == tp {
+            return; // the module's own parameter, under its own bound
+        }
+        if type_satisfies(arg, bound, self.m, self.ctx) {
+            self.uses.insert(BoundUse {
+                owner: owner.name.clone(),
+                tp: tp.to_string(),
+                bound: bound.clone(),
+                arg: arg.to_string(),
+            });
+            return;
+        }
+        let name = &owner.name;
+        self.report(
+            "E0317: unsatisfied_bound",
+            format!(
+                "E0317: unsatisfied_bound: `{name}[{tp}: {bound}]` is used at `{arg}`, which does not satisfy {bound} (§9)"
+            ),
+        );
+    }
+
+    fn note_type(&mut self, ty: &str) {
+        for (head, args) in type_applications(ty) {
+            if let Some(owner) = self.owner(head) {
+                if owner.type_params.len() == args.len() {
+                    for (tp, arg) in owner.type_params.iter().zip(&args) {
+                        self.note_instance(owner, tp, arg);
+                    }
+                }
+            }
+        }
+    }
+
+    /// The instance a call runs at, which a parameter can fix without the result showing it.
+    fn note_call(&mut self, recv: &Expr, r: &str, args: &[Expr]) {
+        let (m, ctx) = (self.m, self.ctx);
+        let is_static = |v: &str| {
+            boogie_env_type(v).is_none() && (v == m.name || ctx.module(v).is_some())
+        };
+        let (owner, self_type) = match recv {
+            Expr::Var(v) if is_static(v) => (self.owner(v), None),
+            _ => {
+                let Some(t) = infer_gardel_type(recv, m, ctx) else {
+                    return;
+                };
+                (self.owner(type_head(&t)), Some(t))
+            }
+        };
+        let Some(owner) = owner else {
+            return;
+        };
+        let Some((rd, _)) = find_module_routine(owner, r) else {
+            return;
+        };
+        let generic_self = module_self_type(owner);
+        let mut map = HashMap::new();
+        if let Some(t) = &self_type {
+            unify_type(&generic_self, t, &owner.type_params, &mut map);
+        }
+        if rd.params.len() == args.len() {
+            for ((_, pt), a) in rd.params.iter().zip(args) {
+                let pt = if pt.trim() == "Current" { generic_self.as_str() } else { pt.as_str() };
+                if let Some(at) = infer_gardel_type(a, m, ctx) {
+                    unify_type(pt, &at, &owner.type_params, &mut map);
+                }
+            }
+        }
+        for tp in &owner.type_params {
+            if let Some(arg) = map.get(tp) {
+                self.note_instance(owner, tp, arg);
+            }
+        }
+    }
+
+    /// `where` constraints of a concept method's owner, and methods on a type parameter.
+    fn note_concept_method(&mut self, e: &Expr, recv: &Expr, rname: &str) {
+        let (m, ctx) = (self.m, self.ctx);
+        let Some(t) = infer_gardel_type(recv, m, ctx) else {
+            return;
+        };
+        if m.type_params.contains(&t) || self.routine_tps.contains(&t) {
+            let known = m
+                .type_bounds
+                .get(&t)
+                .and_then(|b| bound_method_relation(&t, b, rname))
+                .is_some();
+            if !known {
+                let bound = m.type_bounds.get(&t).map_or("no bound".to_string(), |b| format!("bound {b}"));
+                self.report(
+                    "E0318: method_not_in_bound",
+                    format!(
+                        "E0318: method_not_in_bound: `{}` calls `{rname}` on a value of type parameter `{t}`, which has {bound}, and that gives it no such method (§9)",
+                        format_gardel_expr(e)
+                    ),
+                );
+            }
+            return;
+        }
+        let (head, targs) = split_type_app(&t);
+        let Some(owner) = self.owner(head) else {
+            return;
+        };
+        let Some(sat) = &owner.satisfies else {
+            return;
+        };
+        // The concept (listed directly) that declares this routine.
+        let prelude = standard_prelude();
+        let declaring = sat.concepts.iter().find(|c| {
+            prelude
+                .concepts
+                .iter()
+                .any(|cd| &cd.name == *c && cd.signatures.iter().any(|s| s.name == rname))
+        });
+        if declaring.is_none() {
+            return;
+        }
+        for (tp, req) in &sat.where_constraints {
+            let Some(i) = owner.type_params.iter().position(|p| p == tp) else {
+                continue;
+            };
+            let Some(arg) = targs.get(i) else {
+                continue;
+            };
+            if !type_satisfies(arg, req, m, ctx) {
+                let message = format!(
+                    "E0314: unsatisfied_where_constraint: `{}` calls `{rname}` of `{}` on `{t}`, but `{} satisfies {} where {tp} satisfies {req}` and `{arg}` does not satisfy {req} (§9)",
+                    format_gardel_expr(e),
+                    owner.name,
+                    owner.name,
+                    sat.concepts.join(", "),
+                );
+                self.report("E0314: unsatisfied_where_constraint", message);
+            }
+        }
+    }
+
+    /// A `variant` needs a measure: a number, or a value of a type with a structural size. Only
+    /// a parameter is measured structurally, and in a law only one of the module's own type.
+    fn note_variant(&mut self, v: &Expr, params: &[(String, String)], in_law: bool) {
+        let (m, ctx) = (self.m, self.ctx);
+        if matches!(v, Expr::Var(x) if x == "Current") {
+            return;
+        }
+        let Some(ty) = infer_gardel_type(v, m, ctx) else {
+            return;
+        };
+        let t = ty.trim();
+        if matches!(t, "NAT" | "U64" | "I64" | "INT" | "MATH_INT" | "CHAR" | "EXIT_CODE") {
+            return;
+        }
+        let structural = match v {
+            Expr::Var(x) => params.iter().any(|(pn, pt)| {
+                pn == x
+                    && if in_law {
+                        pt == "Current" || type_head(pt) == m.name
+                    } else {
+                        adt_size_fn(pt, m).is_some()
+                    }
+            }),
+            _ => false,
+        };
+        if !structural {
+            self.report(
+                "E0319: variant_no_measure",
+                format!(
+                    "E0319: variant_no_measure: `variant {}` has type `{t}`, which has no measure. A `variant` is a number, or a parameter of a sum type; on a `LIST` use `xs.length` (§7)",
+                    format_gardel_expr(v)
+                ),
+            );
+        }
+    }
+
+    fn stmts(&mut self, stmts: &[Stmt]) {
+        for (at, st) in stmts.iter().enumerate() {
+            match st {
+                Stmt::Let(v, x) => {
+                    self.expr(x);
+                    let declared = declared_let_type(stmts, at).map(ToString::to_string);
+                    let ty = declared.or_else(|| infer_gardel_type(x, self.m, self.ctx));
+                    if let Some(t) = ty {
+                        bind_boogie_env_type(v, &t);
+                    }
+                }
+                Stmt::LetType(_, t) => self.note_type(t),
+                Stmt::Check(_, x) | Stmt::Assume(_, x) => self.expr(x),
+                Stmt::Reveal(_) => {}
+            }
+        }
+    }
+
+    fn expr(&mut self, e: &Expr) {
+        let (m, ctx) = (self.m, self.ctx);
+        match e {
+            Expr::MethodCall(recv, rname, args) => {
+                self.expr(recv);
+                args.iter().for_each(|a| self.expr(a));
+                self.note_call(recv, rname, args);
+                self.note_concept_method(e, recv, rname);
+            }
+            Expr::BinOp(_, l, r) => {
+                self.expr(l);
+                self.expr(r);
+            }
+            Expr::UnaryNot(x) | Expr::UnaryNeg(x) => self.expr(x),
+            Expr::Call(_, args) => args.iter().for_each(|a| self.expr(a)),
+            Expr::If(c, ts, te, es, ee) => {
+                self.expr(c);
+                self.stmts(ts);
+                self.expr(te);
+                self.stmts(es);
+                self.expr(ee);
+            }
+            Expr::Match(scrut, cases) => {
+                self.expr(scrut);
+                for c in cases {
+                    let mut binders = Vec::new();
+                    if let Some((prefix, vdecl)) = boogie_match_variant(c.ctor(), m) {
+                        let inst = match_field_instantiation(scrut, &prefix, m);
+                        for (b, (_, fty)) in c.top_bindings().iter().zip(vdecl.fields.iter()) {
+                            if let Some(b) = b {
+                                binders.push((b.clone(), subst_type_idents(fty, &inst)));
+                            }
+                        }
+                    }
+                    with_scoped_boogie_types(&binders, || {
+                        self.stmts(&c.stmts);
+                        self.expr(&c.body);
+                    });
+                }
+            }
+            Expr::RecordLit(fs) => fs.iter().for_each(|(_, x)| self.expr(x)),
+            Expr::RecordUpdate(b, fs) => {
+                self.expr(b);
+                fs.iter().for_each(|(_, x)| self.expr(x));
+            }
+            Expr::TupleLit(xs) => xs.iter().for_each(|x| self.expr(x)),
+            Expr::Forall(v, ty, b) | Expr::Exists(v, ty, b) => {
+                self.note_type(ty);
+                with_scoped_boogie_types(&[(v.clone(), ty.clone())], || self.expr(b));
+            }
+            Expr::WithIo(stmts, fin) => {
+                for s in stmts {
+                    match s {
+                        IoStmt::Bind(v, x) => {
+                            self.expr(x);
+                            if let Some(t) = infer_gardel_type(x, m, ctx) {
+                                bind_boogie_env_type(v, &t);
+                            }
+                        }
+                        IoStmt::Action(x) => self.expr(x),
+                    }
+                }
+                self.expr(fin);
+            }
+            Expr::Lambda(ps, ret, stmts, body) => {
+                ps.iter().for_each(|(_, t)| self.note_type(t));
+                self.note_type(ret);
+                with_scoped_boogie_types(ps, || {
+                    self.stmts(stmts);
+                    self.expr(body);
+                });
+            }
+            _ => {}
+        }
+        if matches!(e, Expr::Call(..) | Expr::MethodCall(..)) {
+            if let Some(t) = infer_gardel_type(e, m, ctx) {
+                self.note_type(&t);
+            }
+        }
+    }
+
+    fn routine(&mut self, r: &RoutineDecl) {
+        self.routine.clone_from(&r.name);
+        self.routine_tps.clone_from(&r.type_params);
+        set_boogie_type_env(self.m, &r.params, Some(&r.ret_type));
+        r.params.iter().for_each(|(_, t)| self.note_type(t));
+        self.note_type(&r.ret_type);
+        for (_, x) in r.requires.iter().chain(r.ensures.iter()) {
+            self.expr(x);
+        }
+        self.stmts(&r.stmts);
+        for v in &r.variant {
+            self.note_variant(v, &r.params, false);
+        }
+        self.expr(&r.body);
+    }
+
+    fn law(&mut self, law: &LawDecl) {
+        self.routine.clone_from(&law.name);
+        self.routine_tps.clone_from(&law.type_params);
+        set_boogie_type_env(self.m, &law.params, None);
+        law.params.iter().for_each(|(_, t)| self.note_type(t));
+        for (_, x) in law.requires.iter().chain(law.ensures.iter()) {
+            self.expr(x);
+        }
+        self.stmts(&law.stmts);
+        for v in &law.variant {
+            self.note_variant(v, &law.params, true);
+        }
+        if let Some(b) = &law.body {
+            self.expr(b);
+        }
+    }
+
+    fn run(m: &'a ModuleDecl, ctx: &'a BoogiePreludeCtx) -> Self {
+        let mut w = ConceptWalk {
+            m,
+            ctx,
+            routine: m.name.clone(),
+            routine_tps: Vec::new(),
+            found: Vec::new(),
+            uses: std::collections::BTreeSet::new(),
+        };
+        match &m.repr {
+            ReprKind::Product(fs) => fs.iter().for_each(|(_, t)| w.note_type(t)),
+            ReprKind::Sum(vs) => {
+                vs.iter().flat_map(|v| v.fields.iter()).for_each(|(_, t)| w.note_type(t));
+            }
+        }
+        let routines = m
+            .create_routines
+            .iter()
+            .chain(m.feature_routines.iter())
+            .chain(m.specify_routines.iter());
+        for (_, r) in routines {
+            w.routine(r);
+        }
+        for (_, law) in &m.specify_laws {
+            w.law(law);
+        }
+        set_boogie_type_env(m, &[], None);
+        w.routine.clone_from(&m.name);
+        for (_, inv) in &m.invariants {
+            w.expr(inv);
+        }
+        clear_boogie_type_env();
+        w
+    }
+}
+
+/// Whether the proofs behind `arg` can depend on `m`: it names `m`, or a module that needs `m`.
+/// `m` must then not assume that `arg` keeps its concept's laws. Those laws are what `m` may be
+/// proving, or what a module that `m` is under depends on.
+fn type_rests_on(arg: &str, m: &ModuleDecl, ctx: &BoogiePreludeCtx) -> bool {
+    arg.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_')).any(|ident| {
+        ident == m.name
+            || ctx
+                .module(ident)
+                .is_some_and(|n| linked_user_modules_for(n).iter().any(|d| d.name == m.name))
+    })
+}
+
+/// Ties each use of a bounded generic to the instance chosen: `G[K: ORD]` used at `T` means
+/// `T.less_than` wherever `G`'s theory says `K_less`. `G`'s theory gives `K_less` the laws of
+/// `ORD`, so a link is an assumption that `T` keeps them. That holds because `E0317` requires
+/// `T satisfies ORD`, whose laws `T`'s own file proves. It never reaches a file that proves
+/// those laws (`type_rests_on`), and it is emitted beside the procedures of `m` rather than in
+/// its theory, so no other module inherits it.
+fn emit_bound_instance_links(m: &ModuleDecl, ctx: &BoogiePreludeCtx) -> String {
+    let has_bound = |n: &ModuleDecl| n.type_params.iter().any(|tp| declared_bound(n, tp).is_some());
+    if !ctx.modules.iter().any(has_bound) {
+        return String::new();
+    }
+    let mut out = String::new();
+    let empty = HashSet::new();
+    for u in &ConceptWalk::run(m, ctx).uses {
+        if u.owner == m.name || type_rests_on(&u.arg, m, ctx) {
+            continue;
+        }
+        let bty = map_boogie_type(&u.arg, m);
+        let tps: Vec<&str> = m
+            .type_params
+            .iter()
+            .map(String::as_str)
+            .filter(|tp| {
+                u.arg.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_')).any(|i| i == *tp)
+            })
+            .collect();
+        let quant = if tps.is_empty() { String::new() } else { format!("<{}>", tps.join(", ")) };
+        // `less_or_equal` follows from these two, on both sides.
+        for mname in ["equals", "less_than"] {
+            let Some(rel) = bound_method_relation(&u.tp, &u.bound, mname) else {
+                continue;
+            };
+            let (x, y) = ("_bx".to_string(), "_by".to_string());
+            let vars = [(x.clone(), u.arg.clone()), (y.clone(), u.arg.clone())];
+            let call = Expr::MethodCall(
+                Box::new(Expr::Var(x.clone())),
+                mname.to_string(),
+                vec![Expr::Var(y.clone())],
+            );
+            let inst = with_scoped_var_types(&vars, || {
+                emit_boogie_expr_with_strings(&call, m, &empty, &empty, "DefaultFuel", &[])
+            });
+            let rel_app = format!("{}__{rel}({x}, {y})", u.owner);
+            // Arithmetic and equality cannot be a trigger.
+            let triggers = if bty == "int" || bty == "bool" {
+                format!("{{ {rel_app} }}")
+            } else {
+                format!("{{ {rel_app} }} {{ {inst} }}")
+            };
+            out.push_str(&format!(
+                "axiom (forall{quant} {x}: {bty}, {y}: {bty} :: {triggers} {rel_app} <==> {inst});\n"
+            ));
+        }
+    }
+    clear_boogie_type_env();
+    out
+}
+
 pub fn check_where_constraints(m: &ModuleDecl, src: &str, input_path: &str) -> Vec<Diagnostic> {
     if !prelude_injection_enabled() || standard_prelude().declares(&m.name) {
         return Vec::new();
     }
     let ctx = Rc::new(BoogiePreludeCtx::for_module(m));
     let prev = BOOGIE_PRELUDE_CTX.with(|c| c.replace(Some(ctx.clone())));
-    let prelude = standard_prelude();
-
-    fn walk(
-        e: &Expr,
-        rn: &str,
-        m: &ModuleDecl,
-        ctx: &BoogiePreludeCtx,
-        out: &mut Vec<(String, String)>,
-    ) {
-        let walk_stmts = |stmts: &[Stmt], out: &mut Vec<(String, String)>| {
-            for st in stmts {
-                match st {
-                    Stmt::Let(v, x) => {
-                        walk(x, rn, m, ctx, out);
-                        if let Some(t) = infer_gardel_type(x, m, ctx) {
-                            bind_boogie_env_type(v, &t);
-                        }
-                    }
-                    Stmt::Check(_, x) | Stmt::Assume(_, x) => walk(x, rn, m, ctx, out),
-                    Stmt::Reveal(_) | Stmt::LetType(_, _) => {}
-                }
-            }
-        };
-        match e {
-            Expr::MethodCall(recv, rname, args) => {
-                walk(recv, rn, m, ctx, out);
-                args.iter().for_each(|a| walk(a, rn, m, ctx, out));
-                let Some(t) = infer_gardel_type(recv, m, ctx) else {
-                    return;
-                };
-                let (head, targs) = split_type_app(&t);
-                let owner = if head == m.name {
-                    Some(m)
-                } else {
-                    ctx.module(head)
-                };
-                let Some(owner) = owner else {
-                    return;
-                };
-                let Some(sat) = &owner.satisfies else {
-                    return;
-                };
-                // The concept (listed directly) that declares this routine.
-                let prelude = standard_prelude();
-                let declaring = sat.concepts.iter().find(|c| {
-                    prelude
-                        .concepts
-                        .iter()
-                        .any(|cd| &cd.name == *c && cd.signatures.iter().any(|s| &s.name == rname))
-                });
-                if declaring.is_none() {
-                    return;
-                }
-                for (tp, req) in &sat.where_constraints {
-                    let Some(i) = owner.type_params.iter().position(|p| p == tp) else {
-                        continue;
-                    };
-                    let Some(arg) = targs.get(i) else {
-                        continue;
-                    };
-                    if !type_satisfies(arg, req, m, ctx) {
-                        out.push((
-                            rn.to_string(),
-                            format!(
-                                "E0314: unsatisfied_where_constraint: `{}` calls `{rname}` of `{}` on `{t}`, but `{} satisfies {} where {tp} satisfies {req}` and `{arg}` does not satisfy {req} (§9)",
-                                format_gardel_expr(e),
-                                owner.name,
-                                owner.name,
-                                sat.concepts.join(", "),
-                            ),
-                        ));
-                    }
-                }
-            }
-            Expr::BinOp(_, l, r) => {
-                walk(l, rn, m, ctx, out);
-                walk(r, rn, m, ctx, out);
-            }
-            Expr::UnaryNot(x) | Expr::UnaryNeg(x) => walk(x, rn, m, ctx, out),
-            Expr::Call(_, args) => args.iter().for_each(|a| walk(a, rn, m, ctx, out)),
-            Expr::If(c, ts, te, es, ee) => {
-                walk(c, rn, m, ctx, out);
-                walk_stmts(ts, out);
-                walk(te, rn, m, ctx, out);
-                walk_stmts(es, out);
-                walk(ee, rn, m, ctx, out);
-            }
-            Expr::Match(scrut, cases) => {
-                walk(scrut, rn, m, ctx, out);
-                for c in cases {
-                    walk_stmts(&c.stmts, out);
-                    walk(&c.body, rn, m, ctx, out);
-                }
-            }
-            Expr::RecordLit(fs) => fs.iter().for_each(|(_, x)| walk(x, rn, m, ctx, out)),
-            Expr::RecordUpdate(b, fs) => {
-                walk(b, rn, m, ctx, out);
-                fs.iter().for_each(|(_, x)| walk(x, rn, m, ctx, out));
-            }
-            Expr::TupleLit(xs) => xs.iter().for_each(|x| walk(x, rn, m, ctx, out)),
-            Expr::Forall(_, _, b) | Expr::Exists(_, _, b) => walk(b, rn, m, ctx, out),
-            Expr::WithIo(stmts, fin) => {
-                for s in stmts {
-                    match s {
-                        IoStmt::Bind(v, x) => {
-                            walk(x, rn, m, ctx, out);
-                            if let Some(t) = infer_gardel_type(x, m, ctx) {
-                                bind_boogie_env_type(v, &t);
-                            }
-                        }
-                        IoStmt::Action(x) => walk(x, rn, m, ctx, out),
-                    }
-                }
-                walk(fin, rn, m, ctx, out);
-            }
-            Expr::Lambda(_, _, stmts, body) => {
-                walk_stmts(stmts, out);
-                walk(body, rn, m, ctx, out);
-            }
-            _ => {}
-        }
-    }
-
-    let mut found: Vec<(String, String)> = Vec::new();
-    let routines: Vec<&RoutineDecl> = m
-        .create_routines
-        .iter()
-        .chain(m.feature_routines.iter())
-        .chain(m.specify_routines.iter())
-        .map(|(_, r)| r)
-        .collect();
-    for r in routines {
-        set_boogie_type_env(m, &r.params, Some(&r.ret_type));
-        let mut exprs: Vec<&Expr> = r
-            .requires
-            .iter()
-            .chain(r.ensures.iter())
-            .map(|(_, e)| e)
-            .collect();
-        exprs.push(&r.body);
-        for st in &r.stmts {
-            if let Stmt::Let(_, x) | Stmt::Check(_, x) | Stmt::Assume(_, x) = st {
-                exprs.push(x);
-            }
-        }
-        for x in exprs {
-            walk(x, &r.name, m, &ctx, &mut found);
-        }
-    }
-    for (_, law) in &m.specify_laws {
-        set_boogie_type_env(m, &law.params, None);
-        for (_, x) in law.requires.iter().chain(law.ensures.iter()) {
-            walk(x, &law.name, m, &ctx, &mut found);
-        }
-    }
-    clear_boogie_type_env();
+    let mut found = ConceptWalk::run(m, &ctx).found;
     BOOGIE_PRELUDE_CTX.with(|c| *c.borrow_mut() = prev);
-    let _ = prelude;
+    for tp in &m.type_params {
+        if let Some(bound) = declared_bound(m, tp) {
+            if !BOUND_THEORY_CONCEPTS.contains(&bound.as_str()) {
+                found.push((
+                    m.name.clone(),
+                    "E0320: unsupported_bound",
+                    format!(
+                        "E0320: unsupported_bound: `[{tp}: {bound}]`: a bound must be EQ, CANONICAL_EQ or ORD, the concepts with a theory for a type parameter (§9)"
+                    ),
+                ));
+            }
+        }
+    }
     found.sort();
     found.dedup();
     found
         .into_iter()
-        .map(|(rn, msg)| {
-            let sp = locate_span(src, input_path, "unsatisfied_where_constraint", &rn);
-            Diagnostic::basic(
-                "error",
-                "E0314: unsatisfied_where_constraint",
-                rn,
-                "unsatisfied_where_constraint".to_string(),
-                msg,
-            )
-            .with_module(&m.name)
-            .with_ai_context(sp, Vec::new(), BTreeMap::new(), Vec::new())
+        .map(|(rn, rule, msg)| {
+            let tag = rule.split_once(": ").map_or(rule, |(_, t)| t);
+            let sp = locate_span(src, input_path, tag, &rn);
+            Diagnostic::basic("error", rule, rn, tag.to_string(), msg)
+                .with_module(&m.name)
+                .with_ai_context(sp, Vec::new(), BTreeMap::new(), Vec::new())
         })
         .collect()
 }
@@ -6489,10 +7003,8 @@ fn infer_gardel_type(e: &Expr, m: &ModuleDecl, ctx: &BoogiePreludeCtx) -> Option
                 .to_string(),
             )
         }
-        Expr::MethodCall(recv, r, _)
-            if r == "from_scalar" && matches!(&**recv, Expr::Var(v) if v == "CHAR") =>
-        {
-            Some("CHAR".to_string())
+        Expr::MethodCall(recv, r, _) if conversion_result(recv, r).is_some() => {
+            conversion_result(recv, r).map(str::to_string)
         }
         Expr::Bool(_) | Expr::UnaryNot(_) => Some("BOOL".to_string()),
         Expr::BinOp(op, l, rhs) => {
@@ -6588,6 +7100,9 @@ fn infer_gardel_type(e: &Expr, m: &ModuleDecl, ctx: &BoogiePreludeCtx) -> Option
                     return instantiate_ret_type(p, rd, None, &arg_tys, &[]);
                 }
             };
+            if r == "apply" && split_top_level_arrow(&rt).is_some() {
+                return c11_typed::fn_parts(&c11_typed::norm_type(&rt)).map(|(_, ret)| ret);
+            }
             let head = type_head(&rt).to_string();
             if head == "LIST" || (head == "SEQ" && ctx.module("SEQ").is_none()) {
                 let elem = split_type_app(&rt).1.first().map(|s| s.to_string());
@@ -6619,7 +7134,13 @@ fn infer_gardel_type(e: &Expr, m: &ModuleDecl, ctx: &BoogiePreludeCtx) -> Option
                 if let Some((_, fty)) = fields.iter().find(|(f, _)| f == r) {
                     let mut map = HashMap::new();
                     unify_type(&module_self_type(owner), &rt, &owner.type_params, &mut map);
-                    return Some(subst_type_idents(fty, &map));
+                    let fty = subst_type_idents(fty, &map);
+                    if !args.is_empty() {
+                        // `recv.f(x)` applies a function field.
+                        return c11_typed::fn_parts(&c11_typed::norm_type(&fty))
+                            .map(|(_, ret)| ret);
+                    }
+                    return Some(fty);
                 }
             }
             None
@@ -6825,6 +7346,19 @@ fn emit_boogie_prelude_ref(
                     }
                     if is_static_receiver_name(v, m) {
                         return None;
+                    }
+                }
+            }
+            // A field of another module's record is its projection. `names.rs` has already
+            // refused one the record's visibility hides.
+            if args.is_empty() {
+                let owner = infer_gardel_type(recv, m, &ctx)
+                    .filter(|t| type_head(t) != m.name)
+                    .and_then(|t| ctx.module(type_head(&t)));
+                if let Some(ReprKind::Product(fields)) = owner.map(|o| &o.repr) {
+                    if fields.iter().any(|(f, _)| f == r) {
+                        let head = owner.map_or("", |o| o.name.as_str());
+                        return Some(format!("{head}__{head}_{r}({})", emit(recv)));
                     }
                 }
             }
@@ -7145,6 +7679,20 @@ fn emit_prelude_contract_interface(p: &ModuleDecl) -> (String, HashSet<String>) 
 
 /// The namespaced background theory of prelude module `p` for injection into a user
 /// module's Boogie file: no `Verify_*` procedures, so no prelude obligation is re-proven.
+/// For a client of `p`: every value of `p`'s type satisfies `p`'s invariant. A parameter of
+/// that type already assumes it (`requires P__P_Invariant(x)`), as `p`'s own proofs establish
+/// it for every value `p` builds. Stated for every value, it also reaches a value that is no
+/// parameter, such as an element of a `LIST[BYTES]`, where `p`'s contracts are guarded by the
+/// invariant. Never part of `p`'s own file, whose proofs establish it. Empty when the invariant
+/// function is not in `theory`, as across a package boundary for a private invariant.
+fn invariant_of_every_value(p: &ModuleDecl, theory: &str) -> String {
+    let inv = format!("{}_Invariant", p.name);
+    if p.invariants.is_empty() || !p.type_params.is_empty() || !boogie_declared_names(theory).contains(&inv) {
+        return String::new();
+    }
+    format!("axiom (forall x: {} :: {inv}(x));\n", map_boogie_type("Current", p))
+}
+
 fn emit_prelude_background_theory(
     p: &ModuleDecl,
     fuel_limit: usize,
@@ -7170,6 +7718,11 @@ fn emit_prelude_background_theory(
         }
     }
     text.push_str(&prelude_contract_interface(p).0);
+    // Every value of a prelude type satisfies its bootstrap-verified invariant, which is what a
+    // parameter of that type already assumes. Stated for every value, it also covers a value
+    // that is no parameter, such as an element of a `LIST[BYTES]`: a contract of the type is
+    // guarded by its invariant. Only a client sees this, never the module's own proofs.
+    text.push_str(&invariant_of_every_value(p, &text));
     let mut map: HashMap<String, String> = boogie_declared_names(&text)
         .into_iter()
         .filter(|n| n != &p.name && !foreign.contains(n))
@@ -7262,6 +7815,7 @@ fn emit_boogie_numbered(m: &ModuleDecl, fuel_limit: usize) -> String {
         }
     }
     let parts = emit_boogie_parts(m, fuel_limit);
+    let instance_links = emit_bound_instance_links(m, &ctx);
     BOOGIE_PRELUDE_CTX.with(|c| *c.borrow_mut() = prev);
     let has_option_module = ctx.modules.iter().any(|p| p.name == "OPTION");
     let mut s = parts.preamble;
@@ -7270,6 +7824,7 @@ fn emit_boogie_numbered(m: &ModuleDecl, fuel_limit: usize) -> String {
     if !has_option_module {
         s.push_str(&parts.option_shim);
     }
+    s.push_str(&instance_links);
     s.push_str(&parts.procedures);
     s
 }
@@ -10380,6 +10935,32 @@ fn emit_boogie_proc_stmts_and_ret(
     s
 }
 
+/// The type that a conversion `T.from_x(v)` gives: `CHAR.from_scalar`, `NAT.from_i64` and
+/// `I64.from_nat`. Each is the identity on the number, under its range precondition.
+fn conversion_result(recv: &Expr, mname: &str) -> Option<&'static str> {
+    let Expr::Var(v) = recv else {
+        return None;
+    };
+    match (v.as_str(), mname) {
+        ("CHAR", "from_scalar") => Some("CHAR"),
+        ("NAT", "from_i64") => Some("NAT"),
+        ("I64", "from_nat") => Some("I64"),
+        _ => None,
+    }
+}
+
+/// The precondition of a number conversion: `NAT.from_i64(i)` needs `i >= 0`, and
+/// `I64.from_nat(n)` needs `n <= I64.max`.
+fn conversion_range(recv: &Expr, mname: &str) -> Option<fn(&Expr) -> Expr> {
+    match conversion_result(recv, mname)? {
+        "NAT" => Some(|n| Expr::BinOp(">=".into(), Box::new(n.clone()), Box::new(Expr::Int(0)))),
+        "I64" => Some(|n| {
+            Expr::BinOp("<=".into(), Box::new(n.clone()), Box::new(Expr::Int(9_223_372_036_854_775_807)))
+        }),
+        _ => None,
+    }
+}
+
 /// `CHAR.from_scalar(n)` precondition (§3.1):
 /// `valid_scalar: n <= 0xD7FF or (0xE000 <= n and n <= 0x10FFFF)`.
 fn valid_scalar_condition(n: &Expr) -> Expr {
@@ -10422,6 +11003,8 @@ fn guarded_wf(guard: Expr, wf: Option<Expr>) -> Option<Expr> {
 enum WfKind<'a> {
     /// `valid_scalar(n)` for every `CHAR.from_scalar(n)` call.
     FromScalar,
+    /// The range of the target, for every `NAT.from_i64(i)` and `I64.from_nat(n)`.
+    InRange,
     /// Reachable omitted constructors of every nested `match` (§5 exhaustiveness).
     MatchExhaustive(&'a ModuleDecl),
 }
@@ -10526,6 +11109,11 @@ fn wf_walk(k: WfKind<'_>, e: &Expr) -> Option<Expr> {
                     acc = and_wf(acc, Some(valid_scalar_condition(n)));
                 }
             }
+            if matches!(k, WfKind::InRange) {
+                if let (Some(range), Some(n)) = (conversion_range(recv, mname), args.first()) {
+                    acc = and_wf(acc, Some(range(n)));
+                }
+            }
             acc
         }
         Expr::Call(_, args) | Expr::TupleLit(args) => args
@@ -10556,7 +11144,7 @@ fn wf_walk(k: WfKind<'_>, e: &Expr) -> Option<Expr> {
             // every omitted constructor must be unreachable: a final `_ => False` arm.
             let missing = match k {
                 WfKind::MatchExhaustive(m) => !match_missing_ctors(cases, m).is_empty(),
-                WfKind::FromScalar => false,
+                WfKind::FromScalar | WfKind::InRange => false,
             };
             if !missing && case_wfs.iter().all(Option::is_none) {
                 return ws;
@@ -10608,6 +11196,7 @@ fn emit_from_scalar_obligation(
     let mut out = String::new();
     for (kind, tag) in [
         (WfKind::FromScalar, "require::valid_scalar"),
+        (WfKind::InRange, "require::in_range"),
         (WfKind::MatchExhaustive(m), "match::exhaustiveness"),
     ] {
         if let Some(wf) = wf_walk(kind, e) {
@@ -12069,6 +12658,18 @@ fn emit_boogie_expr_with_strings(
     fuel_var: &str,
     strings: &[String],
 ) -> String {
+    if let Expr::MethodCall(recv, f, args) = e {
+        if let Some(applied) = function_field_call(recv, f, args, m) {
+            return emit_boogie_expr_with_strings(
+                &applied,
+                m,
+                implicit_fields,
+                revealed,
+                fuel_var,
+                strings,
+            );
+        }
+    }
     if let Some(prelude_ref) =
         emit_boogie_prelude_ref(e, m, implicit_fields, revealed, fuel_var, strings)
     {
@@ -12378,7 +12979,7 @@ fn emit_boogie_expr_with_strings(
                         "identity" => return a_str[0].clone(),
                         _ => {}
                     }
-                } else if v == "CHAR" && mname == "from_scalar" && !args.is_empty() {
+                } else if conversion_result(recv, mname).is_some() && !args.is_empty() {
                     return emit_boogie_expr_with_strings(
                         &args[0],
                         m,
@@ -12551,6 +13152,28 @@ fn emit_boogie_expr_with_strings(
                             return format!("{eq_fn}({r_str}, {rhs})");
                         }
                     }
+                    // A method of a concept bound, or one on a scalar, has no routine: it
+                    // belongs to the instance, not to this module.
+                    if args.len() == 1 {
+                        let rhs = || {
+                            emit_boogie_expr_with_strings(
+                                &args[0],
+                                m,
+                                implicit_fields,
+                                revealed,
+                                fuel_var,
+                                strings,
+                            )
+                        };
+                        if let Some(f) = bound_method_fn(recv, mname, m) {
+                            return format!("{f}({r_str}, {})", rhs());
+                        }
+                        if let Some(rel) = concept_receiver_type(recv, m)
+                            .and_then(|t| scalar_concept_method(&t, mname, &r_str, &rhs()))
+                        {
+                            return rel;
+                        }
+                    }
                     if let ReprKind::Product(fields) = &m.repr {
                         if args.is_empty() && fields.iter().any(|(fnm, _)| fnm == mname) {
                             return format!("{}_{mname}({r_str})", m.name);
@@ -12718,33 +13341,26 @@ fn emit_boogie_expr_with_strings(
                 format!("({})", es.join(", "))
             }
         }
-        Expr::Forall(v, ty, body) => {
-            format!(
-                "(forall {v}: {} :: {})",
-                map_boogie_type(ty, m),
+        Expr::Forall(v, ty, body) | Expr::Exists(v, ty, body) => {
+            let is_forall = matches!(e, Expr::Forall(..));
+            let quantifier = if is_forall { "forall" } else { "exists" };
+            let inner = with_scoped_var_types(&[(v.clone(), ty.clone())], || {
                 emit_boogie_expr_with_strings(
                     body,
                     m,
                     implicit_fields,
                     revealed,
                     fuel_var,
-                    strings
+                    strings,
                 )
-            )
-        }
-        Expr::Exists(v, ty, body) => {
-            format!(
-                "(exists {v}: {} :: {})",
-                map_boogie_type(ty, m),
-                emit_boogie_expr_with_strings(
-                    body,
-                    m,
-                    implicit_fields,
-                    revealed,
-                    fuel_var,
-                    strings
-                )
-            )
+            });
+            let bty = map_boogie_type(ty, m);
+            // A machine type is a range of Boogie's `int`, and the quantifier ranges over it.
+            match (machine_range(ty), is_forall) {
+                (Some(range), true) => format!("(forall {v}: {bty} :: {range}({v}) ==> {inner})"),
+                (Some(range), false) => format!("(exists {v}: {bty} :: {range}({v}) && {inner})"),
+                (None, _) => format!("({quantifier} {v}: {bty} :: {inner})"),
+            }
         }
         Expr::WithIo(_, final_e) => {
             emit_boogie_expr_with_strings(final_e, m, implicit_fields, revealed, fuel_var, strings)
@@ -12887,14 +13503,27 @@ fn emit_boogie_match_case(
             }
         }
     }
-    let mut out = emit_boogie_expr_with_strings(
-        &expr,
-        m,
-        implicit_fields,
-        &HashSet::new(),
-        fuel_var,
-        strings,
-    );
+    // A binder has its field's type at this scrutinee's instance, as in `collect_proc_locals`:
+    // a function's axiom comes from this path alone, with no local declared for it.
+    let mut binder_types = Vec::new();
+    if let Some((proj_prefix, vdecl)) = boogie_match_variant(c.ctor(), m) {
+        let inst = match_field_instantiation(scrut, &proj_prefix, m);
+        for (opt_b, (_, fty)) in c.top_bindings().iter().zip(vdecl.fields.iter()) {
+            if let Some(b) = opt_b {
+                binder_types.push((b.clone(), subst_type_idents(fty, &inst)));
+            }
+        }
+    }
+    let mut out = with_scoped_boogie_types(&binder_types, || {
+        emit_boogie_expr_with_strings(
+            &expr,
+            m,
+            implicit_fields,
+            &HashSet::new(),
+            fuel_var,
+            strings,
+        )
+    });
     if let Some((proj_prefix, vdecl)) = boogie_match_variant(c.ctor(), m) {
         for (opt_b, (fname, _)) in c.top_bindings().iter().zip(vdecl.fields.iter()) {
             if let Some(bname) = opt_b {
@@ -15661,6 +16290,16 @@ fn eval_expr_symbolic(
                         return Err(EvalFault::Precondition("valid_scalar", e.clone()));
                     }
                     return Ok(n);
+                } else if conversion_result(recv, mname).is_some() && !args.is_empty() {
+                    let n = eval_expr_symbolic(&args[0], env, m, revealed, fuel)?;
+                    let GardelVal::Int(i) = n else {
+                        return Err(EvalFault::Unknown);
+                    };
+                    let fits = if v == "NAT" { i >= 0 } else { i <= i128::from(i64::MAX) };
+                    if !fits {
+                        return Err(EvalFault::Precondition("in_range", e.clone()));
+                    }
+                    return Ok(n);
                 } else if v == "IO" {
                     let mut eval_args = Vec::new();
                     for a in args {
@@ -16088,7 +16727,7 @@ fn emit_bend_expr(e: &Expr, mod_name: &str, indent: usize) -> String {
         }
         Expr::MethodCall(recv, mname, args) => {
             if let Expr::Var(v) = &**recv {
-                if v == "CHAR" && mname == "from_scalar" && !args.is_empty() {
+                if conversion_result(recv, mname).is_some() && !args.is_empty() {
                     return emit_bend_expr(&args[0], mod_name, indent);
                 }
                 if v == "IO" {
@@ -16502,6 +17141,7 @@ static inline bool gardel_string_equals(GardelString a, GardelString b) {
 }
 static inline uint32_t gardel_string_character_at(GardelString s, uint64_t index) {
     const uint8_t* p = (const uint8_t*)s.data;
+    if (s.chars == s.len) return p[index]; /* ASCII: one byte per scalar */
     uint64_t i = 0;
     for (;;) {
         uint8_t b0 = p[i];
@@ -16526,6 +17166,28 @@ static inline GardelString gardel_string_concat(GardelString a, GardelString b) 
     GardelString s = { buf, a.len + b.len, a.chars + b.chars, owner };
     return s;
 }
+/* The byte offset of scalar `index` in well-formed UTF-8. */
+static inline uint64_t gardel_utf8_offset(GardelString s, uint64_t index) {
+    if (s.chars == s.len) return index;
+    const uint8_t* p = (const uint8_t*)s.data;
+    uint64_t i = 0;
+    for (; index > 0; index--) i += p[i] < 0x80 ? 1 : p[i] < 0xE0 ? 2 : p[i] < 0xF0 ? 3 : 4;
+    return i;
+}
+/* Borrows `s`; the result shares its buffer (a new reference). */
+static inline GardelString gardel_string_slice(GardelString s, uint64_t lo, uint64_t hi) {
+    uint64_t a = gardel_utf8_offset(s, lo);
+    uint64_t b = gardel_utf8_offset(s, hi);
+    gardel_owner_dup(s.owner);
+    GardelString r = { s.data + a, b - a, hi - lo, s.owner };
+    return r;
+}
+/* Byte order of the UTF-8 form: the first byte that differs, and a prefix first. */
+static inline bool gardel_string_less_than(GardelString a, GardelString b) {
+    uint64_t n = a.len < b.len ? a.len : b.len;
+    int r = n ? memcmp(a.data, b.data, (size_t)n) : 0;
+    return r < 0 || (r == 0 && a.len < b.len);
+}
 /* Borrows `s`; the result shares its buffer (a new reference). */
 static inline GardelBytes gardel_string_to_utf8(GardelString s) {
     gardel_owner_dup(s.owner);
@@ -16539,6 +17201,22 @@ static inline bool gardel_bytes_is_empty(GardelBytes b) { return b.len == 0; }
 static inline uint64_t gardel_bytes_at(GardelBytes b, uint64_t i) { return b.data[i]; }
 static inline bool gardel_bytes_equals(GardelBytes a, GardelBytes b) {
     return a.len == b.len && memcmp(a.data, b.data, (size_t)a.len) == 0;
+}
+/* Borrows `a` and `b`; returns a new counted buffer. */
+static inline GardelBytes gardel_bytes_concat(GardelBytes a, GardelBytes b) {
+    void* owner = NULL;
+    char* buf = gardel_buf_alloc((size_t)(a.len + b.len + 1), &owner);
+    if (a.len) memcpy(buf, a.data, (size_t)a.len);
+    if (b.len) memcpy(buf + a.len, b.data, (size_t)b.len);
+    buf[a.len + b.len] = '\0';
+    GardelBytes r = { (const uint8_t*)buf, a.len + b.len, owner };
+    return r;
+}
+/* Borrows `b`; the result shares its buffer (a new reference). */
+static inline GardelBytes gardel_bytes_slice(GardelBytes b, uint64_t lo, uint64_t hi) {
+    gardel_owner_dup(b.owner);
+    GardelBytes r = { b.data + lo, hi - lo, b.owner };
+    return r;
 }
 
 static inline const char* gardel_io_read_line(char* buf, size_t cap) {
@@ -19166,7 +19844,7 @@ end
         let stdlib = parse_phase4_stdlib().expect("Phase 4 stdlib should parse");
         assert_eq!(stdlib.group, None);
         assert_eq!(stdlib.concepts.len(), 3);
-        assert_eq!(stdlib.modules.len(), 15);
+        assert_eq!(stdlib.modules.len(), 18);
         for m in &stdlib.modules {
             let mut diags = check_visibility_and_semantics(m);
             diags.extend(verify_module_phase3(
@@ -19658,7 +20336,7 @@ end
     #[test]
     fn test_plan3_multi_module_stdlib_pipeline() {
         let ast = parse_phase4_stdlib().expect("stdlib parses cleanly");
-        assert_eq!(ast.modules.len(), 15);
+        assert_eq!(ast.modules.len(), 18);
         let mut prog_env = ProgramEnv {
             modules: HashMap::new(),
             concepts: HashMap::new(),
@@ -26362,5 +27040,106 @@ end
         );
         let m = parse_user_module_with_prelude(&ok);
         assert!(compute_recursive_groups(&m).is_empty());
+    }
+
+    const F1_ROUTE: &str = r#"
+module ROUTE
+representation {ANY}
+  id: NAT
+  handler: NAT -> NAT
+create {ANY}
+  make(i: NAT, h: NAT -> NAT): ROUTE
+    do
+      { id = i, handler = h }
+    end
+  first_failure(k: NAT): NAT
+    do
+      let r = ROUTE.make(1, fn(x: NAT): NAT do x +% k end)
+      let rs = LIST.empty.prepend(r).prepend(ROUTE.make(2, fn(x: NAT): NAT do x end))
+      rs.tail.head.handler(1)
+    end
+feature {ANY}
+"#;
+
+    #[test]
+    fn test_f1_closures_held_by_records_and_lists_are_freed() {
+        let src = format!("{F1_ROUTE}end\n");
+        let (c, errs) = emit_c11_typed(&parse_user_module_with_prelude(&src), &[]);
+        assert!(errs.is_empty(), "{errs:?}");
+        if let Some((first, after)) = c3_live_after(&c, "f1routes", "ROUTE__first_failure(3)") {
+            assert_eq!((first, after), (0, 0), "a route and its closure must be freed");
+        }
+    }
+
+    #[test]
+    fn test_f1_equality_on_what_holds_a_function_cannot_be_executed() {
+        for routine in [
+            "  same(o: ROUTE): BOOL\n    do\n      Current = o\n    end\n",
+            "  same(a: LIST[ROUTE], b: LIST[ROUTE]): BOOL\n    do\n      a = b\n    end\n",
+            "  same(a: LIST[ROUTE]): BOOL\n    do\n      a.has(Current)\n    end\n",
+        ] {
+            let src = format!("{F1_ROUTE}{routine}end\n");
+            let (_, errs) = emit_c11_typed(&parse_user_module_with_prelude(&src), &[]);
+            assert!(errs.iter().any(|e| e.contains("cannot be executed")), "{routine}: {errs:?}");
+        }
+        // A list of them with no comparison needs none.
+        let src = format!("{F1_ROUTE}  count(a: LIST[ROUTE]): NAT\n    do\n      a.length\n    end\nend\n");
+        let (c, errs) = emit_c11_typed(&parse_user_module_with_prelude(&src), &[]);
+        assert!(errs.is_empty(), "{errs:?}");
+        assert!(!c.contains("__eq("), "no equality is generated for a list of routes");
+    }
+
+    /// Inference can leave a use unseen by `E0317`, but the C backend sees every instance.
+    #[test]
+    fn test_f1_c_backend_refuses_an_instance_outside_its_bound() {
+        let lib = parse_user_module_with_prelude(
+            "module BOX[K: ORD]\nrepresentation {ANY}\n  item: K\ncreate {ANY}\n  make(k: K): BOX[K]\n    do\n      { item = k }\n    end\nend\n",
+        );
+        // `STRING` is `ORD` (Task F.2), `BYTES` only `EQ`.
+        for (ty, ok) in [("NAT", true), ("BOOL", true), ("STRING", true), ("F64", false), ("BYTES", false)] {
+            let client = parse_user_module_with_prelude(&format!(
+                "module USE\nfeature {{ANY}}\n  f(x: {ty}): BOOL\n    do\n      let y = BOX.make(x)\n      True\n    end\nend\n"
+            ));
+            let (_, errs) = emit_c11_typed(&client, &[&lib]);
+            let refused = errs.iter().any(|e| e.contains("does not satisfy ORD"));
+            assert_eq!(refused, !ok, "{ty}: {errs:?}");
+        }
+    }
+
+    #[test]
+    fn test_f1_type_applications_find_nested_uses() {
+        let apps = type_applications("(a: LIST[MAP[K, OPTION[V]]]) -> TUPLE[A, B]");
+        let heads: Vec<&str> = apps.iter().map(|(h, _)| *h).collect();
+        assert_eq!(heads, ["LIST", "MAP", "OPTION", "TUPLE"]);
+        assert_eq!(apps[1].1, ["K", "OPTION[V]"]);
+        assert!(type_applications("NAT -> BOOL").is_empty());
+    }
+
+    #[test]
+    fn test_f1_a_where_constraint_is_not_a_declared_bound() {
+        let prelude = standard_prelude();
+        let option = prelude.module("OPTION").expect("prelude OPTION");
+        assert_eq!(option.type_bounds.get("A").map(String::as_str), Some("CANONICAL_EQ"));
+        assert_eq!(declared_bound(option, "A"), None, "OPTION[STRING] must stay usable");
+    }
+
+    /// Bootstrap emission has no prelude context, which is how `MAP` will be proven.
+    #[test]
+    fn test_f1_bound_methods_translate_without_a_prelude_context() {
+        let m = parse_single_module(
+            "module Q[K: ORD]\nrepresentation {ANY}\n  item: K\ncreate {ANY}\n  f(a: K): BOOL\n    do\n      a.less_or_equal(a)\n    ensure\n      all: forall x: K. not x.less_than(x)\n    end\nend\n",
+        );
+        let bpl = emit_boogie(&m, 2);
+        assert!(bpl.contains("K_less_eq(a, a)"), "{bpl}");
+        assert!(bpl.contains("!K_less(x, x)"), "{bpl}");
+        assert!(!bpl.contains("fn_less_than"), "every site uses the relation: {bpl}");
+    }
+
+    #[test]
+    fn test_f1_scalar_order_is_by_value_and_false_is_least() {
+        assert_eq!(scalar_concept_method("CHAR", "less_than", "a", "b").as_deref(), Some("(a < b)"));
+        assert_eq!(scalar_concept_method("BOOL", "less_than", "a", "b").as_deref(), Some("(!a && b)"));
+        assert_eq!(scalar_concept_method("BOOL", "less_or_equal", "a", "b").as_deref(), Some("(!a || b)"));
+        assert_eq!(scalar_concept_method("F64", "less_than", "a", "b"), None);
     }
 }

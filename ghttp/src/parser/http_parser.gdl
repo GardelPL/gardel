@@ -1,132 +1,39 @@
--- Incremental HTTP/1.1 request parser with resource-bound and framing checks.
--- Protocol-only: extracts method and arbitrary request-target slice without any hardcoded paths.
+-- Incremental HTTP/1.1 request parser (RFC 9112).
+--
+-- The parser state keeps every byte received. Each `feed` appends the new chunk and parses
+-- the whole buffer again, so the answer depends on the bytes alone, never on where TCP cut
+-- them. A request is complete when its framing says so: the head ends at the first blank
+-- line, and the body is exactly `Content-Length` bytes long.
 functions HTTP_PARSER
 
 feature {ANY}
 
-  -- Parses a method token from the leading bytes of `raw` and returns `(method, target_offset)`.
-  parse_method_prefix(raw: BYTES): RESULT[HTTP_ERROR, TUPLE[HTTP_METHOD, NAT]]
-    do
-      if raw.length < 8 then
-        Error(MalformedRequestLine)
-      else
-        let b0 = raw.at(0)
-        let b1 = raw.at(1)
-        let b2 = raw.at(2)
-        let b3 = raw.at(3)
-        let b4 = raw.at(4)
-        if b0 = 71 and b1 = 69 and b2 = 84 and b3 = 32 then
-          Ok((Get, 4))
-        else if b0 = 80 and b1 = 85 and b2 = 84 and b3 = 32 then
-          Ok((Put, 4))
-        else if b0 = 72 and b1 = 69 and b2 = 65 and b3 = 68 and b4 = 32 then
-          Ok((Head, 5))
-        else if b0 = 80 and b1 = 79 and b2 = 83 and b3 = 84 and b4 = 32 then
-          Ok((Post, 5))
-        else if b0 = 68 and b1 = 69 and b2 = 76 and b3 = 69 and b4 = 84 and raw.at(5) = 69 and raw.at(6) = 32 then
-          Ok((Delete, 7))
-        else if b0 = 79 and b1 = 80 and b2 = 84 and b3 = 73 and b4 = 79 and raw.at(5) = 78 and raw.at(6) = 83 and raw.at(7) = 32 then
-          Ok((Options, 8))
-        else if b0 >= 65 and b0 <= 90 then
-          Error(UnknownMethod)
-        else
-          Error(MalformedRequestLine)
-        end end end end end end end
-      end
-    ensure
-      valid_offset: Result.is_ok implies (Result.get.second >= 4 and Result.get.second <= 8)
-    end
-
-  -- Scans arbitrary request-target bytes starting at `offset` up to `' '` (ASCII 32).
-  scan_target_length(raw: BYTES, offset: NAT, idx: NAT): RESULT[HTTP_ERROR, NAT]
-    require
-      offset_range: offset >= 4 and offset <= 8
-      idx_ge_offset: idx >= offset
-      idx_bounded: idx <= offset + 512
-    variant
-      (offset + 512) - idx
-    do
-      if idx >= raw.length then
-        Error(MalformedRequestLine)
-      else
-        let b = raw.at(idx)
-        if b = 32 then
-          if idx = offset then
-            Error(InvalidTarget)
-          else
-            Ok(idx - offset)
-          end
-        else if b <= 32 or b >= 127 then
-          Error(InvalidTarget)
-        else if idx = offset + 512 then
-          Error(RequestLineTooLong)
-        else
-          scan_target_length(raw, offset, idx + 1)
-        end end end
-      end
-    ensure
-      valid_len: Result.is_ok implies (Result.get >= 1 and Result.get <= 512)
-    end
-
-  -- Validates that the request target at `offset` starts with `/` (ASCII 47) and returns its length.
-  parse_target_at(raw: BYTES, offset: NAT): RESULT[HTTP_ERROR, NAT]
-    require
-      offset_range: offset >= 4 and offset <= 8
-    do
-      if raw.length < 14 then
-        Error(MalformedRequestLine)
-      else if raw.at(offset) != 47 then
-        Error(InvalidTarget)
-      else
-        scan_target_length(raw, offset, offset)
-      end end
-    ensure
-      target_non_empty: Result.is_ok implies (Result.get >= 1 and Result.get <= 512)
-    end
-
-  -- Incremental feed: accepts the current parser state and incoming TCP byte chunk.
+  -- Appends `chunk` to the bytes received and parses them.
   feed(state: HTTP_PARSER_STATE, chunk: BYTES): HTTP_PARSE_RESULT
     do
-      if chunk.length = 0 then
-        if state.buffered_bytes = 0 then
-          Failed(EmptyRequest)
-        else
-          NeedMore(state)
-        end
-      else if chunk.length > 65536 then
-        Failed(BodyTooLarge)
-      else if not state.can_accept(chunk.length) then
-        Failed(RequestLineTooLong)
+      if chunk.length = 0 and state.buffered_bytes = 0 then
+        Failed(EmptyRequest)
       else
-        let total = state.buffered_bytes + chunk.length
-        let last_byte = chunk.at(chunk.length - 1)
-        if total < 14 or last_byte != 10 then
-          NeedMore(HTTP_PARSER_STATE.make_partial(
-            total,
-            state.request_line_limit,
-            state.header_limit,
-            state.body_limit
-          ))
-        else if state.buffered_bytes > 0 or chunk.length < 14 then
-          Complete(HTTP_REQUEST.make_simple(Get, "/"), "".to_utf8)
+        if chunk.length > 1048576 then
+          Failed(BodyTooLarge)
         else
-          match parse_method_prefix(chunk)
-            case Error(e) then
-              Failed(e)
-            case Ok(m_and_off) then
-              let m = m_and_off.first
-              let off = m_and_off.second
-              match parse_target_at(chunk, off)
-                case Error(e2) then
-                  Failed(e2)
-                case Ok(tlen) then
-                  Complete(HTTP_REQUEST.make_from_wire(m, chunk, off, tlen), "".to_utf8)
-              end
-          end
-        end end
-      end end end
+          parse_buffer(state, state.bytes_received.concat(chunk))
+        end
+      end
     ensure
       valid_result: Result.is_complete or Result.is_need_more or Result.is_failed
+      -- Nothing received is lost: a state that waits for more holds all of it, in order,
+      -- under the same limits.
+      keeps_bytes: match Result
+        case NeedMore(s) then
+          s.bytes_received.model = state.bytes_received.model.append(chunk.model) and
+          s.request_line_limit = state.request_line_limit and
+          s.header_limit = state.header_limit and
+          s.body_limit = state.body_limit
+        case _ then True
+      end
+      faithful: (chunk.length <= 1048576 and not (chunk.length = 0 and state.buffered_bytes = 0)) implies
+        HTTP_FRAMING.faithful(state, state.bytes_received.concat(chunk), Result)
     end
 
   -- One-shot parse convenience over a fresh default parser state.
@@ -135,6 +42,63 @@ feature {ANY}
       feed(HTTP_PARSER_STATE.make_default, raw)
     ensure
       valid_result: Result.is_complete or Result.is_need_more or Result.is_failed
+    end
+
+  -- Parses `buf`, all the bytes received, under the limits of `state`.
+  parse_buffer(state: HTTP_PARSER_STATE, buf: BYTES): HTTP_PARSE_RESULT
+    do
+      match buf.index_of("\r\n".to_utf8, 0)
+        case None then
+          if buf.length > state.request_line_limit then
+            Failed(RequestLineTooLong)
+          else
+            NeedMore(state.with_received(buf))
+          end
+        case Some(le) then
+          if le > state.request_line_limit then
+            Failed(RequestLineTooLong)
+          else
+            parse_head(state, buf, le)
+          end
+      end
+    ensure
+      sound: HTTP_FRAMING.faithful(state, buf, Result)
+    end
+
+  -- The request line ends at `le`. Looks for the blank line that ends the head.
+  parse_head(state: HTTP_PARSER_STATE, buf: BYTES, le: NAT): HTTP_PARSE_RESULT
+    require
+      line_fits: le <= state.request_line_limit
+      in_buf: le <= buf.length
+    do
+      match buf.index_of("\r\n\r\n".to_utf8, le)
+        case None then
+          if buf.length > state.request_line_limit + state.header_limit then
+            Failed(HeaderTooLarge)
+          else
+            NeedMore(state.with_received(buf))
+          end
+        case Some(he) then
+          if he + 4 > state.request_line_limit + state.header_limit or he + 4 > buf.length then
+            Failed(HeaderTooLarge)
+          else
+            match HTTP_HEAD_PARSER.request_line(buf, le)
+              case Error(e) then
+                Failed(e)
+              case Ok(line) then
+                match HTTP_HEAD_PARSER.parse_fields(buf, line, le + 2, he, HTTP_HEADERS.default_empty, None, False)
+                  case Error(e) then
+                    Failed(e)
+                  case Ok(head) then
+                    match head
+                      case ParsedHead(req, cl, te) then HTTP_FRAMING.frame(state, buf, req, cl, te, he + 4)
+                    end
+                end
+            end
+          end
+      end
+    ensure
+      sound: HTTP_FRAMING.faithful(state, buf, Result)
     end
 
 end

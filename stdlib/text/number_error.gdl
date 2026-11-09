@@ -1,0 +1,9 @@
+-- Why a number did not parse (`NUMBER_TEXT`).
+module NUMBER_ERROR
+
+representation {ANY}
+  | NoDigits
+  | NotADigit(offset: NAT)
+  | OutOfRange
+
+end

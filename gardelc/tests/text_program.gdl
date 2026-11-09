@@ -1,0 +1,170 @@
+program MAIN
+
+feature {ANY}
+
+  -- `a` and `b` joined by ` | `, or `a` alone if that would not fit.
+  and_then(a: STRING, b: STRING): STRING
+    do
+      if a.byte_length <= 1000000 and b.byte_length <= 1000000 then
+        a.concat(" | ").concat(b)
+      else
+        a
+      end
+    end
+
+  yes(b: BOOL): STRING
+    do
+      if b then "yes" else "no" end
+    end
+
+  index(o: OPTION[NAT]): STRING
+    do
+      match o
+        case Some(i) then NUMBER_TEXT.nat_to_text(i)
+        case None then "none"
+      end
+    end
+
+  why(e: NUMBER_ERROR): STRING
+    do
+      match e
+        case NoDigits then "no digits"
+        case NotADigit(at) then MAIN.and_then("not a digit at", NUMBER_TEXT.nat_to_text(at))
+        case OutOfRange then "out of range"
+      end
+    end
+
+  nat(r: RESULT[NUMBER_ERROR, NAT]): STRING
+    do
+      match r
+        case Ok(v) then NUMBER_TEXT.nat_to_text(v)
+        case Error(e) then MAIN.why(e)
+      end
+    end
+
+  int(r: RESULT[NUMBER_ERROR, I64]): STRING
+    do
+      match r
+        case Ok(v) then NUMBER_TEXT.i64_to_text(v)
+        case Error(e) then MAIN.why(e)
+      end
+    end
+
+  -- The parts as `[a][b]`, while they stay short.
+  parts(xs: LIST[STRING]): STRING
+    variant
+      xs.length
+    do
+      if xs.length = 0 then
+        ""
+      else
+        let rest = MAIN.parts(xs.tail)
+        if xs.head.byte_length <= 1000 and rest.byte_length <= 1000 then
+          "[".concat(xs.head).concat("]").concat(rest)
+        else
+          "?"
+        end
+      end
+    end
+
+  slice_of(s: STRING, lo: NAT, hi: NAT): STRING
+    do
+      if lo <= hi and hi <= s.code_point_count then s.slice(lo, hi) else "bad slice" end
+    end
+
+  bytes_text(b: BYTES): STRING
+    do
+      match STRING.from_utf8(b)
+        case Ok(s) then s
+        case Error(_) then "not utf-8"
+      end
+    end
+
+  find_part: STRING
+    do
+      let word = "naïve café"
+      let a = MAIN.and_then(MAIN.slice_of(word, 2, 7), MAIN.slice_of(word, 6, 10))
+      let c = MAIN.and_then(a, MAIN.index(word.find("café", 0)))
+      let d = MAIN.and_then(c, MAIN.index(word.find_char('é', 0)))
+      MAIN.and_then(d, MAIN.index(word.find("tea", 0)))
+    end
+
+  ends_part: STRING
+    do
+      let word = "naïve café"
+      let f = MAIN.and_then(MAIN.yes(word.starts_with("naï")), MAIN.yes(word.ends_with("fé")))
+      MAIN.and_then(f, MAIN.yes(word.ends_with("fe")))
+    end
+
+  trim_part: STRING
+    do
+      MAIN.and_then("  \t padded \r\n".trim, MAIN.and_then("[", MAIN.and_then("   ".trim, "]")))
+    end
+
+  order_part: STRING
+    do
+      let k = MAIN.and_then(MAIN.parts("a,b,,c".split(',')), MAIN.parts("".split(',')))
+      let m = MAIN.and_then(k, MAIN.yes("apple".less_than("banana")))
+      let n = MAIN.and_then(m, MAIN.yes("app".less_than("apple")))
+      let o = MAIN.and_then(n, MAIN.yes("é".less_than("z")))
+      MAIN.and_then(o, MAIN.yes("b".less_than("b")))
+    end
+
+  min_i64: I64
+    do
+      -9223372036854775807 - 1
+    end
+
+  minus_42: I64
+    do
+      -42
+    end
+
+  bytes: STRING
+    do
+      let b = "abcabc".to_utf8
+      let built = BYTES_BUILDER.empty.add_text("ab").add_byte(99).add_text("é!").to_bytes
+      let a = MAIN.and_then(MAIN.index(b.index_of_byte(99, 0)), MAIN.index(b.index_of("ca".to_utf8, 0)))
+      let c = MAIN.and_then(a, MAIN.index(b.index_of("cb".to_utf8, 0)))
+      let d = MAIN.and_then(c, MAIN.yes(b.starts_with("abc".to_utf8)))
+      let e = MAIN.and_then(d, MAIN.bytes_text(b.slice(2, 5)))
+      let f = MAIN.and_then(e, MAIN.bytes_text(b.concat("-x".to_utf8)))
+      let g = MAIN.and_then(f, MAIN.bytes_text(built))
+      MAIN.and_then(g, MAIN.bytes_text(BYTES.from_list("xyz".to_utf8.to_list)))
+    end
+
+  numbers: STRING
+    do
+      let a = MAIN.and_then(NUMBER_TEXT.nat_to_text(0), NUMBER_TEXT.nat_to_text(18446744073709551615))
+      let c = MAIN.and_then(a, NUMBER_TEXT.i64_to_text(MAIN.min_i64))
+      let d = MAIN.and_then(c, NUMBER_TEXT.i64_to_text(9223372036854775807))
+      let e = MAIN.and_then(d, NUMBER_TEXT.i64_to_text(MAIN.minus_42))
+      let f = MAIN.and_then(e, MAIN.nat(NUMBER_TEXT.parse_nat("18446744073709551615")))
+      let g = MAIN.and_then(f, MAIN.nat(NUMBER_TEXT.parse_nat("18446744073709551616")))
+      let h = MAIN.and_then(g, MAIN.nat(NUMBER_TEXT.parse_nat("007")))
+      let i = MAIN.and_then(h, MAIN.nat(NUMBER_TEXT.parse_nat("12a")))
+      let j = MAIN.and_then(i, MAIN.nat(NUMBER_TEXT.parse_nat("")))
+      let k = MAIN.and_then(j, MAIN.int(NUMBER_TEXT.parse_i64("-9223372036854775808")))
+      let l = MAIN.and_then(k, MAIN.int(NUMBER_TEXT.parse_i64("-9223372036854775809")))
+      let m = MAIN.and_then(l, MAIN.int(NUMBER_TEXT.parse_i64("9223372036854775808")))
+      let n = MAIN.and_then(m, MAIN.int(NUMBER_TEXT.parse_i64("-")))
+      let o = MAIN.and_then(n, MAIN.int(NUMBER_TEXT.parse_i64("-x")))
+      let p = MAIN.and_then(o, MAIN.bytes_text(NUMBER_TEXT.hex4_text(48879)))
+      let q = MAIN.and_then(p, MAIN.index(NUMBER_TEXT.parse_hex4("BeEf".to_utf8, 0)))
+      MAIN.and_then(q, MAIN.index(NUMBER_TEXT.parse_hex4("12g4".to_utf8, 0)))
+    end
+
+  main(args: SEQ[STRING]): IO[EXIT_CODE]
+    do
+      with IO
+        IO.print_line(MAIN.find_part)
+        IO.print_line(MAIN.ends_part)
+        IO.print_line(MAIN.trim_part)
+        IO.print_line(MAIN.order_part)
+        IO.print_line(MAIN.bytes)
+        IO.print_line(MAIN.numbers)
+        IO.exit(0)
+      end
+    end
+
+end

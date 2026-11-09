@@ -1,60 +1,68 @@
--- Incremental HTTP parser buffer and resource-limit state.
+-- The bytes of a request received so far, and the limits it must stay within.
 module HTTP_PARSER_STATE
 
 representation {NONE}
-  accumulated: NAT
+  received: BYTES
   max_request_line: NAT
   max_header_bytes: NAT
   max_body_bytes: NAT
-  has_partial_line: BOOL
 
 invariant
   req_line_limit_positive: max_request_line >= 16 and max_request_line <= 2048
   header_limit_positive: max_header_bytes >= 64 and max_header_bytes <= 8192
   body_limit_bounded: max_body_bytes <= 65536
-  accumulated_within_bounds: accumulated <= max_request_line + max_header_bytes + max_body_bytes
+  received_within_bounds: received.length <= max_request_line + max_header_bytes + max_body_bytes
 
 create {ANY}
 
   make_default: HTTP_PARSER_STATE
     do
-      { accumulated = 0,
+      { received = BYTES.empty,
         max_request_line = 512,
         max_header_bytes = 4096,
-        max_body_bytes = 4096,
-        has_partial_line = False }
+        max_body_bytes = 4096 }
     ensure
       empty_buf: Result.buffered_bytes = 0
+      none_yet: Result.bytes_received.model = LIST.empty
       req_line_512: Result.request_line_limit = 512
       hdr_4096: Result.header_limit = 4096
       body_4096: Result.body_limit = 4096
       not_partial: not Result.is_waiting_for_more
     end
 
-  make_partial(bytes_so_far: NAT, req_lim: NAT, hdr_lim: NAT, body_lim: NAT): HTTP_PARSER_STATE
+  make_with_limits(req_lim: NAT, hdr_lim: NAT, body_lim: NAT): HTTP_PARSER_STATE
     require
       req_ok: req_lim >= 16 and req_lim <= 2048
       hdr_ok: hdr_lim >= 64 and hdr_lim <= 8192
       body_ok: body_lim <= 65536
-      within_cap: bytes_so_far <= req_lim + hdr_lim + body_lim
     do
-      { accumulated = bytes_so_far,
+      { received = BYTES.empty,
         max_request_line = req_lim,
         max_header_bytes = hdr_lim,
-        max_body_bytes = body_lim,
-        has_partial_line = True }
+        max_body_bytes = body_lim }
     ensure
-      buffered_set: Result.buffered_bytes = bytes_so_far
-      waiting: Result.is_waiting_for_more
-      within_max: Result.buffered_bytes <= Result.max_total_bytes
+      empty_buf: Result.buffered_bytes = 0
+      none_yet: Result.bytes_received.model = LIST.empty
+      req_set: Result.request_line_limit = req_lim
+      hdr_set: Result.header_limit = hdr_lim
+      body_set: Result.body_limit = body_lim
     end
 
 feature {ANY}
 
+  -- Every byte received so far, in order.
+  bytes_received: BYTES
+    do
+      Current.received
+    ensure
+      within_max: Result.length <= Current.max_total_bytes
+    end
+
   buffered_bytes: NAT
     do
-      Current.accumulated
+      Current.received.length
     ensure
+      def: Result = Current.bytes_received.length
       within_max: Result <= Current.max_total_bytes
     end
 
@@ -89,17 +97,22 @@ feature {ANY}
 
   is_waiting_for_more: BOOL
     do
-      Current.has_partial_line
+      Current.received.length > 0
+    ensure
+      def: Result = (Current.buffered_bytes > 0)
     end
 
-  can_accept(chunk_len: NAT): BOOL
+  -- The same limits, holding `bs` as the bytes received.
+  with_received(bs: BYTES): HTTP_PARSER_STATE
     require
-      chunk_bounded: chunk_len <= 1048576
+      fits: bs.length <= Current.max_total_bytes
     do
-      Current.accumulated + chunk_len <= Current.max_total_bytes
+      { Current with received = bs }
     ensure
-      def: Result = (Current.buffered_bytes + chunk_len <= Current.max_total_bytes)
+      bytes_set: Result.bytes_received.model = bs.model
+      req_same: Result.request_line_limit = Current.request_line_limit
+      hdr_same: Result.header_limit = Current.header_limit
+      body_same: Result.body_limit = Current.body_limit
     end
 
 end
-

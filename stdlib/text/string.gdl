@@ -1,4 +1,4 @@
-module STRING satisfies EQ
+module STRING satisfies ORD
 
 -- Verification model of the prelude text type (spec §6.4.C). The bytes are an RFC 3629
 -- UTF-8 sequence, one octet per list element; the logical value is the scalar sequence
@@ -44,6 +44,12 @@ create {ANY}
       ok_chars: Result.is_ok implies Result.get.chars = BYTES.decode_utf8(bytes.model)
       ok_len: Result.is_ok implies Result.get.byte_length = bytes.length
       ok_points: Result.is_ok implies Result.get.code_point_count = Result.get.chars.length
+    end
+
+  -- ASCII white space: space, tab, line feed and carriage return.
+  is_space(c: CHAR): BOOL
+    do
+      c.code = 32 or c.code = 9 or c.code = 10 or c.code = 13
     end
 
 create {NONE}
@@ -272,6 +278,262 @@ feature {ANY}
       model_at: Result = LIST_OPS.at(Current.chars, index)
     end
 
+  -- Byte order of the UTF-8 form (decision 3), for map keys. Not a collation.
+  less_than(other: STRING): BOOL
+    do
+      BYTES.list_less(Current.bytes, other.bytes)
+    ensure
+      byte_order: Result = BYTES.list_less(Current.byte_model, other.byte_model)
+    end
+
+  -- The scalars from index `lo` up to, not including, `hi`. In C it shares this buffer.
+  slice(lo: NAT, hi: NAT): STRING
+    require
+      ordered: lo <= hi
+      in_bounds: hi <= Current.code_point_count
+    do
+      let a = BYTES.utf8_offset(Current.bytes, lo)
+      check
+        first_left: BYTES.utf8_split_left(Current.bytes, lo)
+        first_right: BYTES.utf8_split_right(Current.bytes, lo)
+      end
+      let rest = BYTES.list_drop(Current.bytes, a)
+      let b = BYTES.utf8_offset(rest, hi - lo)
+      check
+        second_left: BYTES.utf8_split_left(rest, hi - lo)
+        second_right: BYTES.utf8_split_right(rest, hi - lo)
+      end
+      { bytes = BYTES.list_take(rest, b),
+        size = b,
+        char_count = hi - lo,
+        limit = if b = 0 then 1 else b end }
+    ensure
+      count: Result.code_point_count = hi - lo
+      no_longer: Result.byte_length <= Current.byte_length
+      chars_slice: Result.chars = BYTES.list_take(BYTES.list_drop(Current.chars, lo), hi - lo)
+    end
+
+  -- Whether `other` occurs at scalar index `offset`, from its index `i` on.
+  matches_at(other: STRING, offset: NAT, i: NAT): BOOL
+    require
+      within: i <= other.code_point_count
+      not_longer: other.code_point_count <= Current.code_point_count
+      in_bounds: offset <= Current.code_point_count - other.code_point_count
+    variant
+      other.code_point_count - i
+    do
+      if i = other.code_point_count then
+        True
+      else
+        if Current.character_at(offset + i) = other.character_at(i) then
+          Current.matches_at(other, offset, i + 1)
+        else
+          False
+        end
+      end
+    ensure
+      all_match: Result = (forall k: NAT. (i <= k and k < other.code_point_count) implies
+        LIST_OPS.at(Current.chars, offset + k) = LIST_OPS.at(other.chars, k))
+    end
+
+  starts_with(prefix: STRING): BOOL
+    do
+      if prefix.code_point_count > Current.code_point_count then
+        False
+      else
+        Current.matches_at(prefix, 0, 0)
+      end
+    ensure
+      def: Result = (prefix.code_point_count <= Current.code_point_count and
+        (forall k: NAT. k < prefix.code_point_count implies
+          LIST_OPS.at(Current.chars, k) = LIST_OPS.at(prefix.chars, k)))
+    end
+
+  ends_with(suffix: STRING): BOOL
+    do
+      if suffix.code_point_count > Current.code_point_count then
+        False
+      else
+        Current.matches_at(suffix, Current.code_point_count - suffix.code_point_count, 0)
+      end
+    ensure
+      def: Result = (suffix.code_point_count <= Current.code_point_count and
+        (forall k: NAT. k < suffix.code_point_count implies
+          LIST_OPS.at(Current.chars, Current.code_point_count - suffix.code_point_count + k) =
+          LIST_OPS.at(suffix.chars, k)))
+    end
+
+  -- The first scalar index at or after `from` where `other` occurs.
+  find(other: STRING, from: NAT): OPTION[NAT]
+    require
+      in_bounds: from <= Current.code_point_count
+    variant
+      Current.code_point_count - from
+    do
+      if other.code_point_count > Current.code_point_count - from then
+        None
+      else
+        if Current.matches_at(other, from, 0) then
+          Some(from)
+        else
+          if from = Current.code_point_count then
+            None
+          else
+            Current.find(other, from + 1)
+          end
+        end
+      end
+    ensure
+      found: Result.is_some implies
+        (from <= Result.get and Result.get + other.code_point_count <= Current.code_point_count and
+         (forall k: NAT. k < other.code_point_count implies
+           LIST_OPS.at(Current.chars, Result.get + k) = LIST_OPS.at(other.chars, k)))
+      first: Result.is_some implies
+        (forall p: NAT. (from <= p and p < Result.get) implies not Current.matches_at(other, p, 0))
+      absent: not Result.is_some implies
+        (forall p: NAT. (from <= p and p + other.code_point_count <= Current.code_point_count) implies
+          not Current.matches_at(other, p, 0))
+    end
+
+  -- The first scalar index at or after `from` that holds `c`.
+  find_char(c: CHAR, from: NAT): OPTION[NAT]
+    require
+      in_bounds: from <= Current.code_point_count
+    variant
+      Current.code_point_count - from
+    do
+      if from = Current.code_point_count then
+        None
+      else
+        if Current.character_at(from) = c then
+          Some(from)
+        else
+          Current.find_char(c, from + 1)
+        end
+      end
+    ensure
+      found: Result.is_some implies
+        (from <= Result.get and Result.get < Current.code_point_count and
+         LIST_OPS.at(Current.chars, Result.get) = c)
+      first: Result.is_some implies
+        (forall k: NAT. (from <= k and k < Result.get) implies LIST_OPS.at(Current.chars, k) != c)
+      absent: not Result.is_some implies
+        (forall k: NAT. (from <= k and k < Current.code_point_count) implies
+          LIST_OPS.at(Current.chars, k) != c)
+    end
+
+  -- The first index at or after `i` that is not ASCII white space, or the length.
+  space_end(i: NAT): NAT
+    require
+      in_bounds: i <= Current.code_point_count
+    variant
+      Current.code_point_count - i
+    do
+      if i = Current.code_point_count then
+        i
+      else
+        if STRING.is_space(Current.character_at(i)) then
+          Current.space_end(i + 1)
+        else
+          i
+        end
+      end
+    ensure
+      after: i <= Result and Result <= Current.code_point_count
+      skipped: forall k: NAT. (i <= k and k < Result) implies STRING.is_space(LIST_OPS.at(Current.chars, k))
+      stops: Result < Current.code_point_count implies not STRING.is_space(LIST_OPS.at(Current.chars, Result))
+    end
+
+  -- Going down from `j`, but not below `floor`: the start of the white space that ends at `j`.
+  space_start(j: NAT, floor: NAT): NAT
+    require
+      ordered: floor <= j
+      in_bounds: j <= Current.code_point_count
+    variant
+      j
+    do
+      if j = floor then
+        j
+      else
+        if STRING.is_space(Current.character_at(j - 1)) then
+          Current.space_start(j - 1, floor)
+        else
+          j
+        end
+      end
+    ensure
+      before: floor <= Result and Result <= j
+      skipped: forall k: NAT. (Result <= k and k < j) implies STRING.is_space(LIST_OPS.at(Current.chars, k))
+      stops: Result > floor implies not STRING.is_space(LIST_OPS.at(Current.chars, Result - 1))
+    end
+
+  -- Without ASCII white space (space, tab, line feed, carriage return) at either end.
+  trim: STRING
+    do
+      let lo = Current.space_end(0)
+      Current.slice(lo, Current.space_start(Current.code_point_count, lo))
+    ensure
+      no_longer: Result.byte_length <= Current.byte_length
+      trimmed: Result.chars = BYTES.list_take(
+        BYTES.list_drop(Current.chars, Current.space_end(0)),
+        Current.space_start(Current.code_point_count, Current.space_end(0)) - Current.space_end(0))
+    end
+
+  -- How many times `c` occurs from index `i` on.
+  count_char(c: CHAR, i: NAT): NAT
+    require
+      in_bounds: i <= Current.code_point_count
+    variant
+      Current.code_point_count - i
+    do
+      if i = Current.code_point_count then
+        0
+      else
+        if Current.character_at(i) = c then
+          Current.count_char(c, i + 1) + 1
+        else
+          Current.count_char(c, i + 1)
+        end
+      end
+    ensure
+      bounded: Result <= Current.code_point_count - i
+      -- Each step as a contract, which holds at every fuel (see `BYTES.utf8_offset`).
+      at_end: i = Current.code_point_count implies Result = 0
+      hit: (i < Current.code_point_count and LIST_OPS.at(Current.chars, i) = c) implies
+        Result = Current.count_char(c, i + 1) + 1
+      miss: (i < Current.code_point_count and LIST_OPS.at(Current.chars, i) != c) implies
+        Result = Current.count_char(c, i + 1)
+    end
+
+  -- The parts between occurrences of `sep`, from index `start`, scanning at `i`.
+  split_from(sep: CHAR, start: NAT, i: NAT): LIST[STRING]
+    require
+      ordered: start <= i
+      in_bounds: i <= Current.code_point_count
+    variant
+      Current.code_point_count - i
+    do
+      if i = Current.code_point_count then
+        LIST.singleton(Current.slice(start, i))
+      else
+        if Current.character_at(i) = sep then
+          Current.split_from(sep, i + 1, i + 1).prepend(Current.slice(start, i))
+        else
+          Current.split_from(sep, start, i + 1)
+        end
+      end
+    ensure
+      parts: Result.length = Current.count_char(sep, i) + 1
+    end
+
+  -- `"a,b,,c".split(',')` is `["a", "b", "", "c"]`: one more part than there are separators.
+  split(sep: CHAR): LIST[STRING]
+    do
+      Current.split_from(sep, 0, 0)
+    ensure
+      parts: Result.length = Current.count_char(sep, 0) + 1
+    end
+
   -- The only precondition is that the total byte length is representable.
   concat(other: STRING): STRING
     require
@@ -395,6 +657,32 @@ specify {EQ}
       bc: b.equals(c)
     ensure
       ac: a.equals(c)
+    end
+
+specify {ORD}
+
+  law irreflexive(a: STRING)
+    do
+      BYTES.less_irreflexive(a.byte_model)
+    ensure
+      not_less_than_self: not a.less_than(a)
+    end
+
+  law transitive(a: STRING, b: STRING, c: STRING)
+    require
+      a_lt_b: a.less_than(b)
+      b_lt_c: b.less_than(c)
+    do
+      BYTES.less_transitive(a.byte_model, b.byte_model, c.byte_model)
+    ensure
+      a_lt_c: a.less_than(c)
+    end
+
+  law total(a: STRING, b: STRING)
+    do
+      BYTES.less_total(a.byte_model, b.byte_model)
+    ensure
+      comparable: a.less_than(b) or a.equals(b) or b.less_than(a)
     end
 
 invariant

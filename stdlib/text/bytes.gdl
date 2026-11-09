@@ -116,7 +116,209 @@ create {ANY}
       model_eq: Result.model = xs
     end
 
+  -- The byte offset of the scalar at index `i`.
+  utf8_offset(bs: LIST[U64], i: NAT): NAT
+    require
+      valid: valid_utf8(bs)
+      in_bounds: i <= decode_utf8(bs).length
+      fits: bs.length <= 18446744073709551615
+    variant
+      bs.length
+    do
+      if i = 0 then
+        0
+      else
+        if bs.head < 128 then
+          utf8_offset(bs.tail, i - 1) + 1
+        else
+          if bs.head <= 223 then
+            utf8_offset(bs.tail.tail, i - 1) + 2
+          else
+            if bs.head <= 239 then
+              utf8_offset(bs.tail.tail.tail, i - 1) + 3
+            else
+              utf8_offset(bs.tail.tail.tail.tail, i - 1) + 4
+            end
+          end
+        end
+      end
+    ensure
+      inside: Result <= bs.length
+      -- Each step, stated as a contract: a contract holds at every fuel, while unfolding the
+      -- body needs this precondition one fuel lower, where `decode_utf8` is unknown.
+      at_start: i = 0 implies Result = 0
+      step_1: (i > 0 and bs.head < 128) implies Result = utf8_offset(bs.tail, i - 1) + 1
+      step_2: (i > 0 and bs.head >= 128 and bs.head <= 223) implies
+        Result = utf8_offset(bs.tail.tail, i - 1) + 2
+      step_3: (i > 0 and bs.head > 223 and bs.head <= 239) implies
+        Result = utf8_offset(bs.tail.tail.tail, i - 1) + 3
+      step_4: (i > 0 and bs.head > 239) implies
+        Result = utf8_offset(bs.tail.tail.tail.tail, i - 1) + 4
+    end
+
+  -- Byte order: the first byte that differs decides, and a prefix comes first. On well-formed
+  -- UTF-8 this is also the order of code points (decision 3). It is a key order, not a
+  -- collation.
+  list_less(xs: LIST[U64], ys: LIST[U64]): BOOL
+    variant
+      xs.length
+    do
+      if ys.length = 0 then
+        False
+      else
+        if xs.length = 0 then
+          True
+        else
+          if xs.head < ys.head then
+            True
+          else
+            if xs.head > ys.head then
+              False
+            else
+              list_less(xs.tail, ys.tail)
+            end
+          end
+        end
+      end
+    end
+
+  -- The first `n` elements and what follows them. These are what a slice means. They are
+  -- generic because `STRING` states the same thing over `chars`.
+  list_take[A](xs: LIST[A], n: NAT): LIST[A]
+    require
+      fits: n <= xs.length
+    variant
+      n
+    do
+      if n = 0 then
+        LIST.empty
+      else
+        list_take(xs.tail, n - 1).prepend(xs.head)
+      end
+    ensure
+      len: Result.length = n
+    end
+
+  list_drop[A](xs: LIST[A], n: NAT): LIST[A]
+    require
+      fits: n <= xs.length
+    variant
+      n
+    do
+      if n = 0 then
+        xs
+      else
+        list_drop(xs.tail, n - 1)
+      end
+    ensure
+      len: Result.length = xs.length - n
+    end
+
 create {NONE}
+
+  -- `utf8_step_2` as a routine: inside this module a law is not an axiom, a contract is.
+  -- There is no `step_1`: its byte has no lower bound in the model, which the U64 parameter
+  -- would need, so the one-byte step is stated in place.
+  step_2(b0: U64, b1: U64, xs: LIST[U64]): BOOL
+    require
+      lead: b0 >= 194 and b0 <= 223
+      cont: b1 >= 128 and b1 <= 191
+      xs_valid: valid_utf8(xs)
+    do
+      True
+    ensure
+      holds: Result
+      step_valid: valid_utf8(xs.prepend(b1).prepend(b0))
+      step_decode: decode_utf8(xs.prepend(b1).prepend(b0)) = decode_utf8(xs).prepend(CHAR.from_scalar((b0 - 192) * 64 + (b1 - 128)))
+    end
+
+  -- `utf8_step_3` as a routine: inside this module a law is not an axiom, a contract is.
+  step_3(b0: U64, b1: U64, b2: U64, xs: LIST[U64]): BOOL
+    require
+      lead: b0 >= 224 and b0 <= 239
+      cont1: if b0 = 224 then (b1 >= 160 and b1 <= 191)
+             else if b0 = 237 then (b1 >= 128 and b1 <= 159)
+             else (b1 >= 128 and b1 <= 191) end end
+      cont2: b2 >= 128 and b2 <= 191
+      xs_valid: valid_utf8(xs)
+    do
+      True
+    ensure
+      holds: Result
+      step_valid: valid_utf8(xs.prepend(b2).prepend(b1).prepend(b0))
+      step_decode: decode_utf8(xs.prepend(b2).prepend(b1).prepend(b0)) = decode_utf8(xs).prepend(CHAR.from_scalar((b0 - 224) * 4096 + (b1 - 128) * 64 + (b2 - 128)))
+    end
+
+  -- `utf8_step_4` as a routine: inside this module a law is not an axiom, a contract is.
+  step_4(b0: U64, b1: U64, b2: U64, b3: U64, xs: LIST[U64]): BOOL
+    require
+      lead: b0 >= 240 and b0 <= 244
+      cont1: if b0 = 240 then (b1 >= 144 and b1 <= 191)
+             else if b0 = 244 then (b1 >= 128 and b1 <= 143)
+             else (b1 >= 128 and b1 <= 191) end end
+      cont2: b2 >= 128 and b2 <= 191
+      cont3: b3 >= 128 and b3 <= 191
+      xs_valid: valid_utf8(xs)
+    do
+      True
+    ensure
+      holds: Result
+      step_valid: valid_utf8(xs.prepend(b3).prepend(b2).prepend(b1).prepend(b0))
+      step_decode: decode_utf8(xs.prepend(b3).prepend(b2).prepend(b1).prepend(b0)) = decode_utf8(xs).prepend(CHAR.from_scalar((b0 - 240) * 262144 + (b1 - 128) * 4096 + (b2 - 128) * 64 + (b3 - 128)))
+    end
+
+  -- Ghost: a module's own laws are not axioms inside it, so what `concat` and `slice` need
+  -- about their octets is the contract of these routines. C uses a primitive for both.
+  octets_append(xs: LIST[U64], ys: LIST[U64]): LIST[U64]
+    require
+      xs_octets: all_octets(xs)
+      ys_octets: all_octets(ys)
+    variant
+      xs.length
+    do
+      if xs.length = 0 then
+        ys
+      else
+        octets_append(xs.tail, ys).prepend(xs.head)
+      end
+    ensure
+      same: Result = xs.append(ys)
+      octets: all_octets(Result)
+    end
+
+  octets_take(xs: LIST[U64], n: NAT): LIST[U64]
+    require
+      xs_octets: all_octets(xs)
+      fits: n <= xs.length
+    variant
+      n
+    do
+      if n = 0 then
+        LIST.empty
+      else
+        octets_take(xs.tail, n - 1).prepend(xs.head)
+      end
+    ensure
+      same: Result = list_take(xs, n)
+      octets: all_octets(Result)
+    end
+
+  octets_drop(xs: LIST[U64], n: NAT): LIST[U64]
+    require
+      xs_octets: all_octets(xs)
+      fits: n <= xs.length
+    variant
+      n
+    do
+      if n = 0 then
+        xs
+      else
+        octets_drop(xs.tail, n - 1)
+      end
+    ensure
+      same: Result = list_drop(xs, n)
+      octets: all_octets(Result)
+    end
 
   get_byte(bs: LIST[U64], i: NAT): U64
     require
@@ -309,6 +511,253 @@ specify {ANY}
         decode_utf8(xs).prepend(CHAR.from_scalar((b0 - 240) * 262144 + (b1 - 128) * 4096 + (b2 - 128) * 64 + (b3 - 128)))
     end
 
+  -- Cutting UTF-8 where a scalar starts: both sides stay well-formed, and they decode to the
+  -- two sides of the scalars. This is what `STRING.slice` rests on. It is two laws, as one
+  -- runs out of solver resources.
+  law utf8_split_left(bs: LIST[U64], i: NAT)
+    require
+      valid: valid_utf8(bs)
+      in_bounds: i <= decode_utf8(bs).length
+      fits: bs.length <= 18446744073709551615
+    variant
+      bs.length
+    do
+      if i = 0 then
+        True
+      else
+        if bs.head < 128 then
+          let k = utf8_offset(bs.tail, i - 1)
+          utf8_split_left(bs.tail, i - 1) and
+          bs.tail.prepend(bs.head) = bs and
+          decode_utf8(bs) = decode_utf8(bs.tail).prepend(CHAR.from_scalar(bs.head)) and
+          utf8_offset(bs, i) = k + 1 and
+          list_take(bs, k + 1) = list_take(bs.tail, k).prepend(bs.head) and
+          list_take(bs, k + 1) = list_take(bs.tail, k).prepend(bs.head) and
+          valid_utf8(list_take(bs.tail, k).prepend(bs.head)) and
+          decode_utf8(list_take(bs.tail, k).prepend(bs.head)) =
+            decode_utf8(list_take(bs.tail, k)).prepend(CHAR.from_scalar(bs.head)) and
+          list_take(decode_utf8(bs), i) = list_take(decode_utf8(bs.tail), i - 1).prepend(decode_utf8(bs).head)
+        else
+          if bs.head <= 223 then
+            let k = utf8_offset(bs.tail.tail, i - 1)
+            utf8_split_left(bs.tail.tail, i - 1) and
+            bs.tail.prepend(bs.head) = bs and
+            bs.tail.tail.prepend(bs.tail.head) = bs.tail and
+            step_2(bs.head, bs.tail.head, bs.tail.tail) and
+            utf8_offset(bs, i) = k + 2 and
+            list_take(bs, k + 2) = list_take(bs.tail, k + 1).prepend(bs.head) and
+            list_take(bs.tail, k + 1) = list_take(bs.tail.tail, k).prepend(bs.tail.head) and
+            list_take(bs, k + 2) = list_take(bs.tail.tail, k).prepend(bs.tail.head).prepend(bs.head) and
+            step_2(bs.head, bs.tail.head, list_take(bs.tail.tail, k)) and
+            list_take(decode_utf8(bs), i) = list_take(decode_utf8(bs.tail.tail), i - 1).prepend(decode_utf8(bs).head)
+          else
+            if bs.head <= 239 then
+              let k = utf8_offset(bs.tail.tail.tail, i - 1)
+              utf8_split_left(bs.tail.tail.tail, i - 1) and
+              bs.tail.prepend(bs.head) = bs and
+              bs.tail.tail.prepend(bs.tail.head) = bs.tail and
+              bs.tail.tail.tail.prepend(bs.tail.tail.head) = bs.tail.tail and
+              step_3(bs.head, bs.tail.head, bs.tail.tail.head, bs.tail.tail.tail) and
+              utf8_offset(bs, i) = k + 3 and
+              list_take(bs, k + 3) = list_take(bs.tail, k + 2).prepend(bs.head) and
+              list_take(bs.tail, k + 2) = list_take(bs.tail.tail, k + 1).prepend(bs.tail.head) and
+              list_take(bs.tail.tail, k + 1) = list_take(bs.tail.tail.tail, k).prepend(bs.tail.tail.head) and
+              list_take(bs, k + 3) = list_take(bs.tail.tail.tail, k).prepend(bs.tail.tail.head).prepend(bs.tail.head).prepend(bs.head) and
+              step_3(bs.head, bs.tail.head, bs.tail.tail.head, list_take(bs.tail.tail.tail, k)) and
+              list_take(decode_utf8(bs), i) = list_take(decode_utf8(bs.tail.tail.tail), i - 1).prepend(decode_utf8(bs).head)
+            else
+              let k = utf8_offset(bs.tail.tail.tail.tail, i - 1)
+              utf8_split_left(bs.tail.tail.tail.tail, i - 1) and
+              bs.tail.prepend(bs.head) = bs and
+              bs.tail.tail.prepend(bs.tail.head) = bs.tail and
+              bs.tail.tail.tail.prepend(bs.tail.tail.head) = bs.tail.tail and
+              bs.tail.tail.tail.tail.prepend(bs.tail.tail.tail.head) = bs.tail.tail.tail and
+              step_4(bs.head, bs.tail.head, bs.tail.tail.head, bs.tail.tail.tail.head, bs.tail.tail.tail.tail) and
+              utf8_offset(bs, i) = k + 4 and
+              list_take(bs, k + 4) = list_take(bs.tail, k + 3).prepend(bs.head) and
+              list_take(bs.tail, k + 3) = list_take(bs.tail.tail, k + 2).prepend(bs.tail.head) and
+              list_take(bs.tail.tail, k + 2) = list_take(bs.tail.tail.tail, k + 1).prepend(bs.tail.tail.head) and
+              list_take(bs.tail.tail.tail, k + 1) = list_take(bs.tail.tail.tail.tail, k).prepend(bs.tail.tail.tail.head) and
+              list_take(bs, k + 4) = list_take(bs.tail.tail.tail.tail, k).prepend(bs.tail.tail.tail.head).prepend(bs.tail.tail.head).prepend(bs.tail.head).prepend(bs.head) and
+              step_4(bs.head, bs.tail.head, bs.tail.tail.head, bs.tail.tail.tail.head, list_take(bs.tail.tail.tail.tail, k)) and
+              list_take(decode_utf8(bs), i) = list_take(decode_utf8(bs.tail.tail.tail.tail), i - 1).prepend(decode_utf8(bs).head)
+            end
+          end
+        end
+      end
+    ensure
+      left_valid: valid_utf8(list_take(bs, utf8_offset(bs, i)))
+      left_chars: decode_utf8(list_take(bs, utf8_offset(bs, i))) = list_take(decode_utf8(bs), i)
+    end
+
+  law utf8_split_right(bs: LIST[U64], i: NAT)
+    require
+      valid: valid_utf8(bs)
+      in_bounds: i <= decode_utf8(bs).length
+      fits: bs.length <= 18446744073709551615
+    variant
+      bs.length
+    do
+      if i = 0 then
+        True
+      else
+        if bs.head < 128 then
+          let k = utf8_offset(bs.tail, i - 1)
+          utf8_split_right(bs.tail, i - 1) and
+          bs.tail.prepend(bs.head) = bs and
+          decode_utf8(bs) = decode_utf8(bs.tail).prepend(CHAR.from_scalar(bs.head)) and
+          utf8_offset(bs, i) = k + 1 and
+          list_drop(bs, k + 1) = list_drop(bs.tail, k) and
+          list_drop(decode_utf8(bs), i) = list_drop(decode_utf8(bs.tail), i - 1)
+        else
+          if bs.head <= 223 then
+            let k = utf8_offset(bs.tail.tail, i - 1)
+            utf8_split_right(bs.tail.tail, i - 1) and
+            bs.tail.prepend(bs.head) = bs and
+            bs.tail.tail.prepend(bs.tail.head) = bs.tail and
+            step_2(bs.head, bs.tail.head, bs.tail.tail) and
+            utf8_offset(bs, i) = k + 2 and
+            list_drop(bs, k + 2) = list_drop(bs.tail, k + 1) and
+            list_drop(bs.tail, k + 1) = list_drop(bs.tail.tail, k) and
+            list_drop(decode_utf8(bs), i) = list_drop(decode_utf8(bs.tail.tail), i - 1)
+          else
+            if bs.head <= 239 then
+              let k = utf8_offset(bs.tail.tail.tail, i - 1)
+              utf8_split_right(bs.tail.tail.tail, i - 1) and
+              bs.tail.prepend(bs.head) = bs and
+              bs.tail.tail.prepend(bs.tail.head) = bs.tail and
+              bs.tail.tail.tail.prepend(bs.tail.tail.head) = bs.tail.tail and
+              step_3(bs.head, bs.tail.head, bs.tail.tail.head, bs.tail.tail.tail) and
+              utf8_offset(bs, i) = k + 3 and
+              list_drop(bs, k + 3) = list_drop(bs.tail, k + 2) and
+              list_drop(bs.tail, k + 2) = list_drop(bs.tail.tail, k + 1) and
+              list_drop(bs.tail.tail, k + 1) = list_drop(bs.tail.tail.tail, k) and
+              list_drop(decode_utf8(bs), i) = list_drop(decode_utf8(bs.tail.tail.tail), i - 1)
+            else
+              let k = utf8_offset(bs.tail.tail.tail.tail, i - 1)
+              utf8_split_right(bs.tail.tail.tail.tail, i - 1) and
+              bs.tail.prepend(bs.head) = bs and
+              bs.tail.tail.prepend(bs.tail.head) = bs.tail and
+              bs.tail.tail.tail.prepend(bs.tail.tail.head) = bs.tail.tail and
+              bs.tail.tail.tail.tail.prepend(bs.tail.tail.tail.head) = bs.tail.tail.tail and
+              step_4(bs.head, bs.tail.head, bs.tail.tail.head, bs.tail.tail.tail.head, bs.tail.tail.tail.tail) and
+              utf8_offset(bs, i) = k + 4 and
+              list_drop(bs, k + 4) = list_drop(bs.tail, k + 3) and
+              list_drop(bs.tail, k + 3) = list_drop(bs.tail.tail, k + 2) and
+              list_drop(bs.tail.tail, k + 2) = list_drop(bs.tail.tail.tail, k + 1) and
+              list_drop(bs.tail.tail.tail, k + 1) = list_drop(bs.tail.tail.tail.tail, k) and
+              list_drop(decode_utf8(bs), i) = list_drop(decode_utf8(bs.tail.tail.tail.tail), i - 1)
+            end
+          end
+        end
+      end
+    ensure
+      right_valid: valid_utf8(list_drop(bs, utf8_offset(bs, i)))
+      right_chars: decode_utf8(list_drop(bs, utf8_offset(bs, i))) = list_drop(decode_utf8(bs), i)
+    end
+
+  -- Reading back through `list_take` and `list_drop`.
+  law take_at[A](xs: LIST[A], n: NAT, i: NAT)
+    require
+      fits: n <= xs.length
+      in_bounds: i < n
+    variant
+      i
+    do
+      if i = 0 then
+        True
+      else
+        take_at(xs.tail, n - 1, i - 1)
+      end
+    ensure
+      same: LIST_OPS.at(list_take(xs, n), i) = LIST_OPS.at(xs, i)
+    end
+
+  law drop_at[A](xs: LIST[A], n: NAT, i: NAT)
+    require
+      fits: n <= xs.length
+      in_bounds: i < xs.length - n
+    variant
+      n
+    do
+      if n = 0 then
+        True
+      else
+        drop_at(xs.tail, n - 1, i) and
+        xs.tail.prepend(xs.head) = xs and
+        LIST_OPS.at(xs, n + i) = LIST_OPS.at(xs.tail, n - 1 + i)
+      end
+    ensure
+      shifted: LIST_OPS.at(list_drop(xs, n), i) = LIST_OPS.at(xs, n + i)
+    end
+
+  law take_drop[A](xs: LIST[A], n: NAT)
+    require
+      fits: n <= xs.length
+    variant
+      n
+    do
+      if n = 0 then
+        True
+      else
+        take_drop(xs.tail, n - 1)
+      end
+    ensure
+      whole: list_take(xs, n).append(list_drop(xs, n)) = xs
+    end
+
+  law less_irreflexive(xs: LIST[U64])
+    variant
+      xs.length
+    do
+      if xs.length = 0 then
+        True
+      else
+        less_irreflexive(xs.tail)
+      end
+    ensure
+      not_self: not list_less(xs, xs)
+    end
+
+  law less_transitive(xs: LIST[U64], ys: LIST[U64], zs: LIST[U64])
+    require
+      xy: list_less(xs, ys)
+      yz: list_less(ys, zs)
+    variant
+      xs.length
+    do
+      if xs.length = 0 then
+        True
+      else
+        if xs.head = ys.head and ys.head = zs.head then
+          less_transitive(xs.tail, ys.tail, zs.tail)
+        else
+          True
+        end
+      end
+    ensure
+      xz: list_less(xs, zs)
+    end
+
+  law less_total(xs: LIST[U64], ys: LIST[U64])
+    variant
+      xs.length
+    do
+      if xs.length = 0 or ys.length = 0 then
+        True
+      else
+        if xs.head = ys.head then
+          less_total(xs.tail, ys.tail) and
+          xs.tail.prepend(xs.head) = xs and
+          ys.tail.prepend(ys.head) = ys
+        else
+          True
+        end
+      end
+    ensure
+      comparable: list_less(xs, ys) or xs = ys or list_less(ys, xs)
+    end
+
 feature {ANY}
 
   length: NAT
@@ -348,6 +797,124 @@ feature {ANY}
       Current.items = other.items
     ensure
       def: Result = (Current.model = other.model)
+    end
+
+  -- The total size must be representable, as for `STRING.concat`.
+  concat(other: BYTES): BYTES
+    require
+      fits: Current.length <= 18446744073709551615 - other.length
+    do
+      { items = octets_append(Current.items, other.items), size = Current.size + other.size }
+    ensure
+      len: Result.length = Current.length + other.length
+      model_appended: Result.model = Current.model.append(other.model)
+    end
+
+  -- The bytes from `lo` up to, not including, `hi`. In C it shares this buffer, so it costs
+  -- no copy.
+  slice(lo: NAT, hi: NAT): BYTES
+    require
+      ordered: lo <= hi
+      in_bounds: hi <= Current.length
+    do
+      { items = octets_take(octets_drop(Current.items, lo), hi - lo), size = hi - lo }
+    ensure
+      len: Result.length = hi - lo
+      model_slice: Result.model = list_take(list_drop(Current.model, lo), hi - lo)
+    end
+
+  -- Whether `other` occurs at offset `at`. Compiled from this source, not hand-written C.
+  matches_at(other: BYTES, offset: NAT, i: NAT): BOOL
+    require
+      within: i <= other.length
+      in_bounds: offset <= Current.length - other.length
+      not_longer: other.length <= Current.length
+    variant
+      other.length - i
+    do
+      if i = other.length then
+        True
+      else
+        if Current.at(offset + i) = other.at(i) then
+          Current.matches_at(other, offset, i + 1)
+        else
+          False
+        end
+      end
+    ensure
+      all_match: Result = (forall k: NAT. (i <= k and k < other.length) implies
+        LIST_OPS.at(Current.model, offset + k) = LIST_OPS.at(other.model, k))
+    end
+
+  starts_with(prefix: BYTES): BOOL
+    do
+      if prefix.length > Current.length then
+        False
+      else
+        Current.matches_at(prefix, 0, 0)
+      end
+    ensure
+      def: Result = (prefix.length <= Current.length and
+        (forall k: NAT. k < prefix.length implies
+          LIST_OPS.at(Current.model, k) = LIST_OPS.at(prefix.model, k)))
+    end
+
+  -- The first offset at or after `from` that holds byte `b`.
+  index_of_byte(b: U64, from: NAT): OPTION[NAT]
+    require
+      in_bounds: from <= Current.length
+    variant
+      Current.length - from
+    do
+      if from = Current.length then
+        None
+      else
+        if Current.at(from) = b then
+          Some(from)
+        else
+          Current.index_of_byte(b, from + 1)
+        end
+      end
+    ensure
+      found: Result.is_some implies
+        (from <= Result.get and Result.get < Current.length and
+         LIST_OPS.at(Current.model, Result.get) = b)
+      first: Result.is_some implies
+        (forall k: NAT. (from <= k and k < Result.get) implies LIST_OPS.at(Current.model, k) != b)
+      absent: not Result.is_some implies
+        (forall k: NAT. (from <= k and k < Current.length) implies LIST_OPS.at(Current.model, k) != b)
+    end
+
+  -- The first offset at or after `from` where `other` occurs.
+  index_of(other: BYTES, from: NAT): OPTION[NAT]
+    require
+      in_bounds: from <= Current.length
+    variant
+      Current.length - from
+    do
+      if other.length > Current.length - from then
+        None
+      else
+        if Current.matches_at(other, from, 0) then
+          Some(from)
+        else
+          if from = Current.length then
+            None
+          else
+            Current.index_of(other, from + 1)
+          end
+        end
+      end
+    ensure
+      found: Result.is_some implies
+        (from <= Result.get and Result.get + other.length <= Current.length and
+         (forall k: NAT. k < other.length implies
+           LIST_OPS.at(Current.model, Result.get + k) = LIST_OPS.at(other.model, k)))
+      first: Result.is_some implies
+        (forall p: NAT. (from <= p and p < Result.get) implies not Current.matches_at(other, p, 0))
+      absent: not Result.is_some implies
+        (forall p: NAT. (from <= p and p + other.length <= Current.length) implies
+          not Current.matches_at(other, p, 0))
     end
 
 specify {EQ}

@@ -1,0 +1,311 @@
+-- The request line and header fields of a request head (RFC 9112 Sections 3 and 5).
+functions HTTP_HEAD_PARSER
+
+feature {ANY}
+
+  -- The request line `buf[0, le)`: method, target and version, separated by single spaces.
+  request_line(buf: BYTES, le: NAT): RESULT[HTTP_ERROR, HTTP_REQUEST]
+    require
+      in_buf: le <= buf.length
+    do
+      match buf.index_of_byte(32, 0)
+        case None then
+          Error(MalformedRequestLine)
+        case Some(s1) then
+          if s1 = 0 or s1 >= le then
+            Error(MalformedRequestLine)
+          else
+            match buf.index_of_byte(32, s1 + 1)
+              case None then
+                Error(MalformedRequestLine)
+              case Some(s2) then
+                if s2 >= le then
+                  Error(MalformedRequestLine)
+                else
+                  match method_of(buf.slice(0, s1))
+                    case Error(e) then
+                      Error(e)
+                    case Ok(m) then
+                      match target_of(buf, s1 + 1, s2)
+                        case Error(e) then
+                          Error(e)
+                        case Ok(t) then
+                          match version_of(buf.slice(s2 + 1, le))
+                            case Error(e) then Error(e)
+                            case Ok(v) then Ok(HTTP_REQUEST.make_line(m, t, v))
+                          end
+                      end
+                  end
+                end
+            end
+          end
+      end
+    end
+
+  -- The method a token names. RFC 9110 methods are case-sensitive.
+  method_of(tok: BYTES): RESULT[HTTP_ERROR, HTTP_METHOD]
+    do
+      if tok.equals("GET".to_utf8) then
+        Ok(Get)
+      else if tok.equals("HEAD".to_utf8) then
+        Ok(Head)
+      else if tok.equals("POST".to_utf8) then
+        Ok(Post)
+      else if tok.equals("PUT".to_utf8) then
+        Ok(Put)
+      else if tok.equals("DELETE".to_utf8) then
+        Ok(Delete)
+      else if tok.equals("OPTIONS".to_utf8) then
+        Ok(Options)
+      else if is_token(tok, 0) then
+        Error(UnknownMethod)
+      else
+        Error(MalformedRequestLine)
+      end end end end end end end
+    end
+
+  -- The protocol version a request line ends with.
+  version_of(v: BYTES): RESULT[HTTP_ERROR, HTTP_VERSION]
+    do
+      if v.equals("HTTP/1.1".to_utf8) then
+        Ok(Http11)
+      else if v.equals("HTTP/1.0".to_utf8) then
+        Ok(Http10)
+      else if v.starts_with("HTTP/".to_utf8) then
+        Error(UnsupportedVersion)
+      else
+        Error(MalformedRequestLine)
+      end end end
+    end
+
+  -- The target `buf[lo, hi)`: an origin form that starts with `/`, printable ASCII only.
+  target_of(buf: BYTES, lo: NAT, hi: NAT): RESULT[HTTP_ERROR, STRING]
+    require
+      ordered: lo <= hi
+      in_buf: hi <= buf.length
+    do
+      if hi - lo > 512 then
+        Error(RequestLineTooLong)
+      else if lo = hi or buf.at(lo) != 47 or not all_visible(buf, lo, hi) then
+        Error(InvalidTarget)
+      else
+        match STRING.from_utf8(buf.slice(lo, hi))
+          case Error(_) then
+            Error(InvalidTarget)
+          case Ok(t) then
+            if t.byte_length >= 1 and t.byte_length <= 512 then Ok(t) else Error(InvalidTarget) end
+        end
+      end end
+    ensure
+      fits: match Result
+        case Ok(t) then t.byte_length >= 1 and t.byte_length <= 512
+        case _ then True
+      end
+    end
+
+  -- The header lines from `pos` up to the blank line at `he`.
+  -- `cl` is the `Content-Length` seen so far, and `te` whether `Transfer-Encoding` was.
+  parse_fields(buf: BYTES, line: HTTP_REQUEST, pos: NAT, he: NAT,
+               hs: HTTP_HEADERS, cl: OPTION[NAT], te: BOOL): RESULT[HTTP_ERROR, HTTP_HEAD]
+    require
+      in_buf: he + 4 <= buf.length
+      not_past: pos <= he + 2
+    variant
+      he + 2 - pos
+    do
+      if pos = he + 2 then
+        Ok(ParsedHead(line.with_headers(hs), cl, te))
+      else
+        match buf.index_of("\r\n".to_utf8, pos)
+          case None then
+            Error(MalformedHeader)
+          case Some(e) then
+            if e > he or e = pos then
+              Error(MalformedHeader)
+            else if not hs.has_header_room then
+              Error(TooManyHeaders)
+            else
+              match field_at(buf, pos, e)
+                case Error(err) then
+                  Error(err)
+                case Ok(h) then
+                  let next_hs = hs.add(h)
+                  if ascii_equal_ci(h.name.to_utf8, "content-length".to_utf8, 0) then
+                    match NUMBER_TEXT.parse_nat(h.value)
+                      case Error(_) then
+                        Error(ContentLengthInvalid)
+                      case Ok(n) then
+                        -- A repeated `Content-Length` must repeat the same value.
+                        if cl.is_some and cl.get != n then
+                          Error(ConflictingFraming)
+                        else
+                          parse_fields(buf, line, e + 2, he, next_hs, Some(n), te)
+                        end
+                    end
+                  else if ascii_equal_ci(h.name.to_utf8, "transfer-encoding".to_utf8, 0) then
+                    parse_fields(buf, line, e + 2, he, next_hs, cl, True)
+                  else
+                    parse_fields(buf, line, e + 2, he, next_hs, cl, te)
+                  end end
+              end
+            end end
+        end
+      end
+    end
+
+  -- The header field `buf[pos, e)`: a token name, a colon, and a value without the spaces
+  -- or tabs around it.
+  field_at(buf: BYTES, pos: NAT, e: NAT): RESULT[HTTP_ERROR, HTTP_HEADER]
+    require
+      ordered: pos <= e
+      in_buf: e <= buf.length
+    do
+      match buf.index_of_byte(58, pos)
+        case None then
+          Error(MalformedHeader)
+        case Some(c) then
+          if c = pos or c >= e or not is_token(buf.slice(pos, c), 0) then
+            Error(MalformedHeader)
+          else
+            let vs = skip_ows(buf, c + 1, e)
+            let ve = trim_ows(buf, vs, e)
+            if not all_field_bytes(buf, vs, ve) then
+              Error(MalformedHeader)
+            else
+              match STRING.from_utf8(buf.slice(pos, c))
+                case Error(_) then
+                  Error(MalformedHeader)
+                case Ok(name) then
+                  match STRING.from_utf8(buf.slice(vs, ve))
+                    case Error(_) then
+                      Error(MalformedHeader)
+                    case Ok(value) then
+                      if name.byte_length < 1 or name.byte_length > 128 or value.byte_length > 1024 then
+                        Error(HeaderTooLarge)
+                      else
+                        Ok(HTTP_HEADER.make(name, value))
+                      end
+                  end
+              end
+            end
+          end
+      end
+    end
+
+  -- RFC 9110 `tchar`: the bytes a method or a field name may hold.
+  is_tchar(b: U64): BOOL
+    do
+      (b >= 48 and b <= 57) or (b >= 65 and b <= 90) or (b >= 97 and b <= 122) or
+      b = 33 or b = 35 or b = 36 or b = 37 or b = 38 or b = 39 or b = 42 or b = 43 or
+      b = 45 or b = 46 or b = 94 or b = 95 or b = 96 or b = 124 or b = 126
+    end
+
+  -- `tok[i, length)` is all `tchar`, and `tok` is not empty.
+  is_token(tok: BYTES, i: NAT): BOOL
+    require
+      in_bounds: i <= tok.length
+    variant
+      tok.length - i
+    do
+      if tok.length = 0 then
+        False
+      else if i = tok.length then
+        True
+      else if is_tchar(tok.at(i)) then
+        is_token(tok, i + 1)
+      else
+        False
+      end end end
+    end
+
+  -- `buf[lo, hi)` is printable ASCII, with no space.
+  all_visible(buf: BYTES, lo: NAT, hi: NAT): BOOL
+    require
+      ordered: lo <= hi
+      in_buf: hi <= buf.length
+    variant
+      hi - lo
+    do
+      if lo = hi then
+        True
+      else if buf.at(lo) <= 32 or buf.at(lo) >= 127 then
+        False
+      else
+        all_visible(buf, lo + 1, hi)
+      end end
+    end
+
+  -- `buf[lo, hi)` holds no control byte other than tab (RFC 9110 `field-value`).
+  all_field_bytes(buf: BYTES, lo: NAT, hi: NAT): BOOL
+    require
+      ordered: lo <= hi
+      in_buf: hi <= buf.length
+    variant
+      hi - lo
+    do
+      if lo = hi then
+        True
+      else if (buf.at(lo) < 32 and buf.at(lo) != 9) or buf.at(lo) = 127 then
+        False
+      else
+        all_field_bytes(buf, lo + 1, hi)
+      end end
+    end
+
+  -- The first index at or after `lo` that is not a space or tab, or `hi`.
+  skip_ows(buf: BYTES, lo: NAT, hi: NAT): NAT
+    require
+      ordered: lo <= hi
+      in_buf: hi <= buf.length
+    variant
+      hi - lo
+    do
+      if lo = hi then
+        hi
+      else if buf.at(lo) = 32 or buf.at(lo) = 9 then
+        skip_ows(buf, lo + 1, hi)
+      else
+        lo
+      end end
+    ensure
+      within: lo <= Result and Result <= hi
+    end
+
+  -- The end of `buf[lo, hi)` with trailing spaces and tabs removed.
+  trim_ows(buf: BYTES, lo: NAT, hi: NAT): NAT
+    require
+      ordered: lo <= hi
+      in_buf: hi <= buf.length
+    variant
+      hi - lo
+    do
+      if lo = hi then
+        lo
+      else if buf.at(hi - 1) = 32 or buf.at(hi - 1) = 9 then
+        trim_ows(buf, lo, hi - 1)
+      else
+        hi
+      end end
+    ensure
+      within: lo <= Result and Result <= hi
+    end
+
+  -- `a[i, length)` equals `lower[i, length)` ignoring ASCII case. `lower` is lower case.
+  ascii_equal_ci(a: BYTES, lower: BYTES, i: NAT): BOOL
+    require
+      in_bounds: i <= a.length
+    variant
+      a.length - i
+    do
+      if a.length != lower.length then
+        False
+      else if i = a.length then
+        True
+      else
+        let b = a.at(i)
+        let folded = if b >= 65 and b <= 90 then b + 32 else b end
+        if folded = lower.at(i) then ascii_equal_ci(a, lower, i + 1) else False end
+      end end
+    end
+
+end

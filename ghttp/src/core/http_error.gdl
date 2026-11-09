@@ -15,6 +15,7 @@ representation {ANY}
   | UnsupportedTransferEncoding
   | ContentLengthInvalid
   | BodyTooLarge
+  | BodyNotAllowed
 
 feature {ANY}
 

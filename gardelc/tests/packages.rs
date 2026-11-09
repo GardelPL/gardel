@@ -1124,18 +1124,70 @@ fn a_service_on_ghttp_verifies_and_answers() {
         return;
     }
     let mut server = Command::new(world.dir.join("build/hello_api_bin.exe")).spawn().expect("the service starts");
-    let mut answer = String::new();
-    for _ in 0..50 {
-        std::thread::sleep(std::time::Duration::from_millis(100));
-        if let Ok(mut socket) = std::net::TcpStream::connect(("127.0.0.1", 8090)) {
-            socket.write_all(b"GET /hello HTTP/1.1\r\nHost: test\r\n\r\n").expect("request");
-            socket.read_to_string(&mut answer).expect("response");
-            break;
+    // Each part is its own write, with a pause, so the server sees it as its own read.
+    let ask = |parts: &[&str]| -> String {
+        let mut socket = std::net::TcpStream::connect(("127.0.0.1", 8090)).expect("connect");
+        socket.set_nodelay(true).expect("nodelay");
+        for part in parts {
+            socket.write_all(part.as_bytes()).expect("request");
+            socket.flush().expect("flush");
+            std::thread::sleep(std::time::Duration::from_millis(100));
         }
-    }
+        let mut answer = String::new();
+        socket.read_to_string(&mut answer).expect("response");
+        answer
+    };
+    let up = (0..50).any(|_| {
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        std::net::TcpStream::connect(("127.0.0.1", 8090)).is_ok()
+    });
+    let answers = if up {
+        vec![
+            ask(&["GET /hello HTTP/1.1\r\nHost: test\r\n\r\n"]),
+            // Finding 1 of the libraries plan: a request cut across reads was answered as `GET /`.
+            ask(&["GET /he", "llo HTTP/1.1\r\nHost: test\r\n\r\n"]),
+            ask(&["GET /nope", " HTTP/1.1\r\nHost: test\r\n\r\n"]),
+            // Finding 2: a body that does not end in a newline arrives.
+            ask(&["POST /echo HTTP/1.1\r\nHost: test\r\nContent-Length: 2\r\n\r\nhi"]),
+            ask(&["POST /echo HTTP/1.1\r\nHost: test\r\nContent-Le", "ngth: 5\r\n\r\nhe", "llo"]),
+            ask(&["POST /echo HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n"]),
+        ]
+    } else {
+        vec![]
+    };
     drop(server.kill());
     drop(server.wait());
-    assert_eq!(answer, "HTTP/1.1 200\r\nContent-Length: 20\r\n\r\nhello from a package");
+    assert!(up, "the service did not start listening");
+    assert_eq!(answers[0], "HTTP/1.1 200\r\nContent-Length: 20\r\n\r\nhello from a package");
+    assert_eq!(answers[1], answers[0], "a split request gets the same answer");
+    assert_eq!(answers[2], "HTTP/1.1 404\r\nContent-Length: 0\r\n\r\n");
+    assert_eq!(answers[3], "HTTP/1.1 200\r\nContent-Length: 2\r\n\r\nhi");
+    assert_eq!(answers[4], "HTTP/1.1 200\r\nContent-Length: 5\r\n\r\nhello");
+    assert_eq!(answers[5], "HTTP/1.1 501\r\nContent-Length: 0\r\n\r\n");
+}
+
+/// `ghttp`'s own suite, a client package of it: every case of `cases.txt` is parsed whole
+/// and cut into two reads at every byte, and every cut must give what the whole gives.
+#[test]
+fn ghttp_parses_every_case_whole_and_split() {
+    let world = World::new("ghttp_cases", &[]);
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("..");
+    let out = Command::new(env!("CARGO_BIN_EXE_gardelc"))
+        .current_dir(&world.dir)
+        .env("GARDEL_CACHE_DIR", world.dir.join("cache"))
+        .args(["--project", &root.join("ghttp/tests").to_string_lossy(), "--strict"])
+        .output()
+        .expect("gardelc runs");
+    assert_ok(&out);
+    let cases = std::fs::read(root.join("ghttp/tests/cases.txt")).expect("cases.txt");
+    let mut run = Command::new(world.dir.join("build/ghttp_test_bin.exe"))
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .expect("the suite starts");
+    run.stdin.take().expect("stdin").write_all(&cases).expect("cases are sent");
+    let done = run.wait_with_output().expect("the suite ends");
+    assert!(done.status.success(), "exit {:?}, failing case: {}", done.status.code(), String::from_utf8_lossy(&done.stdout));
 }
 
 #[test]
