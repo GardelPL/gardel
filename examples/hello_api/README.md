@@ -1,141 +1,99 @@
 # Hello API Example (`hello_api`)
 
-A small, formally verified HTTP/1.1 service written in Gardel on top of the [`ghttp`](../../ghttp) package.
+A small, verified REST service written in Gardel on the [`grest`](../../grest) package. It is its
+handlers, its routes and two lines: [`REST_SERVER`](../../grest/src/rest/rest_server.gdl) holds the
+connections, and proves that each request is answered once and its connection closed after the
+answer, with at most 64 connections open.
 
-The server listens on `127.0.0.1:8090` (or `GARDEL_LISTEN_ADDR`), accepts up to a proven limit of 64 concurrent TCP connections, incrementally parses incoming HTTP/1.1 requests, and dispatches them through an extensible `HTTP_ROUTER`:
+| Request | Answer |
+| :--- | :--- |
+| `GET /` | `200`, `OK` as text |
+| `GET /hello` | `200`, `hello from a package` as text |
+| `GET /hello/:name` | `200`, `{"hello":"<name>"}`, the name decoded (`/hello/ana%20b` gives `ana b`) |
+| `POST /echo` | `200`, the body as text, or `400` if it is not UTF-8 |
+| Another method on one of these paths | `405`, `{"error":"method not allowed"}` |
+| Any other path | `404`, `{"error":"not found"}` |
+| A target that cannot be read, such as `/x%` | `400`, `{"error":"<reason>"}` |
 
-- `GET /` $\rightarrow$ `200 OK` with body `"OK"` (inherited from `ghttp`'s default server router, endpoint ID `1`)
-- `GET /hello` $\rightarrow$ `200 OK` with body `"hello from a package"` (registered by `HELLO_API`, endpoint ID `2`)
-- Unregistered paths $\rightarrow$ `404 Not Found`
-- Disallowed methods on registered paths $\rightarrow$ `405 Method Not Allowed`
+A `HEAD` request is answered by the `GET` route. Bytes that cannot be a request get `ghttp`'s
+status for the error, with no body.
 
----
+## Project
 
-## Project Structure & Package Dependency
+- [`Gardel.toml`](Gardel.toml) depends on `grest`, and on `ghttp` and `gjson` for the types of
+  its requests, responses and JSON values, as a package sees only the packages it names.
+- [`src/hello_api.gdl`](src/hello_api.gdl) is `reactive program HELLO_API`: four handlers, `routes`
+  (which proves it has four), and the two lines below. Its handlers do not look at the
+  service's state, so the state is a `NAT` that stays `0`;
+  [`todo_api`](../todo_api) is a service with a state.
 
-- [`Gardel.toml`](Gardel.toml): Declares `name = "hello-api"` and a local path dependency on `ghttp = { path = "../../ghttp" }`.
-- [`src/hello_api.gdl`](src/hello_api.gdl): Defines `reactive program HELLO_API`:
-  - `routes`: Extends `HTTP_ROUTER.default_server_router` with `HTTP_ROUTE.make(Get, "/hello", 2)` and proves `Result.num_routes = 2`.
-  - `endpoint`: Handles endpoint ID `2` (`"hello from a package"`) and delegates other IDs to `HTTP_APPLICATION.default_endpoint_handler`.
-  - `answer` & `on_bytes`: Feeds incoming TCP chunks into `HTTP_PARSER.feed`, dispatches completed requests via `HTTP_APPLICATION.dispatch_with`, serializes responses with `HTTP_SERIALIZER.serialize`, and closes the connection after sending.
-  - `init` & `step`: Initializes `HTTP_SERVER_STATE` with capacity `64` on port `8090` and handles `Accepted`, `Received`, `SendFailed`, `Closed`, `ListenFailed`, and `Shutdown`.
+  ```eiffel
+  init(args: SEQ[STRING]): STEP[REST_SERVER[NAT]]
+    do
+      REST_SERVER.start(args, 8090, routes, 0)
+    end
 
-Because `ghttp` is imported as a dependency in `Gardel.toml`, only `ghttp`'s public contracts are visible to `HELLO_API` during modular verification.
+  step(s: REST_SERVER[NAT], e: EVENT): STEP[REST_SERVER[NAT]]
+    do
+      s.serve(e)
+    end
+  ```
 
----
+Only the contracts of the three packages reach `HELLO_API` when it is verified.
 
-## Verification & Compilation
+## Verify, build and run
 
-From the repository root, verify and compile `hello_api` using `gardelc`:
+From the repository root:
 
 ```powershell
-# Using the project manifest (--project <DIR>)
-./gardelc/target/release/gardelc.exe --project examples/hello_api --strict
-
-# Or directly passing the directory operand
-./gardelc/target/release/gardelc.exe examples/hello_api --strict
+gardelc --project examples/hello_api --strict
+./build/hello_api_bin.exe        # on port 8090
+./build/hello_api_bin.exe 9000   # on port 9000
 ```
 
-If `gardelc` is on your `PATH`, you can also run it from inside `examples/hello_api`:
+The executable is built in `build/` under the current directory.
+
+The service listens on `127.0.0.1` unless `GARDEL_LISTEN_ADDR` names another address
+(`0.0.0.0` is every interface). It prints nothing while it runs. `Ctrl+C` stops it with exit
+status `0`. An argument that is not a port from 1 to 65535 stops it with exit status `2` and
+`grest: not a port: <argument>`. If the port is taken, it stops with exit status `1` and
+`grest: listen failed`.
+
+In another terminal:
 
 ```powershell
-cd examples/hello_api
-gardelc --strict
-```
-
-This verifies all contracts and produces the native executable:
-- From the repo root: `./build/hello_api_bin.exe` (or `examples/hello_api/build/hello_api_bin.exe` when built inside the project directory).
-
----
-
-## Running the Live Server
-
-Start the server using `gardelc --run` or by invoking the compiled binary directly:
-
-```powershell
-# Build, verify, and run immediately
-./gardelc/target/release/gardelc.exe --project examples/hello_api --run
-
-# Or run the compiled executable directly
-./build/hello_api_bin.exe
-```
-
-By default, `Listen(8090)` binds to `127.0.0.1:8090` (override the bind IP with `GARDEL_LISTEN_ADDR`, e.g., `GARDEL_LISTEN_ADDR=0.0.0.0`).
-The server runs silently while waiting for connections. Press `Ctrl+C` to send a `Shutdown` event and exit cleanly with code `0`.
-
-> **Troubleshooting `hello_api: listen failed`:**
-> Because the server runs silently without a startup banner, an earlier instance of `hello_api_bin.exe` may already be running and holding port `8090` (`WSAEADDRINUSE` / OS error `10048`). Check or stop the existing process with:
-> ```powershell
-> Get-NetTCPConnection -LocalPort 8090
-> Stop-Process -Name hello_api_bin
-> ```
-
----
-
-## Testing Live HTTP Requests
-
-While the server is running in one terminal, open a second terminal and query the endpoints:
-
-### Using `curl`
-
-```powershell
-# Custom route registered by HELLO_API (returns "hello from a package")
 curl.exe -i http://127.0.0.1:8090/hello
-
-# Default root route from ghttp (returns "OK")
-curl.exe -i http://127.0.0.1:8090/
-
-# Unregistered route (returns 404 Not Found)
+curl.exe -i http://127.0.0.1:8090/hello/ana%20b
+curl.exe -i -X POST --data "hi there" http://127.0.0.1:8090/echo
 curl.exe -i http://127.0.0.1:8090/missing
 ```
 
-### Using PowerShell (`Invoke-WebRequest`)
+```text
+HTTP/1.1 200
+Content-Type: application/json
+Content-Length: 17
 
-```powershell
-Invoke-WebRequest -Uri "http://127.0.0.1:8090/hello" | Select-Object StatusCode, Content
+{"hello":"ana b"}
 ```
 
----
+`cargo test --test packages a_service_on_grest` verifies the service and sends it requests over
+real sockets, some cut across several writes.
 
-## Deterministic Scripted Execution & Replay (`GARDEL_EVENTS`, `GARDEL_RECORD`, `GARDEL_REPLAY`)
+## Scripted runs and replay
 
-Because `HELLO_API` is a reactive program (§11.6), you can test HTTP parsing, routing, and wire serialization deterministically without opening network sockets.
+A reactive program (spec §11.6) can run from a script of events instead of the network.
+`Send` and `Close` are written to standard error, with `%XX` for each byte that is not a letter
+or digit:
 
-### 1. In-Memory Event Script (`GARDEL_EVENTS`)
-
-**PowerShell:**
-```powershell
-$env:GARDEL_EVENTS = "Accepted:1 Received:1:GET%20/hello%20HTTP/1.1%0D%0A%0D%0A Accepted:2 Received:2:GET%20/%20HTTP/1.1%0D%0A%0D%0A Shutdown"
-./build/hello_api_bin.exe
-Remove-Item Env:\GARDEL_EVENTS
-```
-
-**Bash:**
 ```bash
-GARDEL_EVENTS="Accepted:1 Received:1:GET%20/hello%20HTTP/1.1%0D%0A%0D%0A Accepted:2 Received:2:GET%20/%20HTTP/1.1%0D%0A%0D%0A Shutdown" ./build/hello_api_bin.exe
+GARDEL_EVENTS="Accepted:1 Received:1:GET%20/hello/ana%20HTTP/1.1%0D%0A%0D%0A Shutdown" ./build/hello_api_bin.exe
 ```
 
-**Output (on `stderr`):**
 ```text
 net: Listen 8090
-net: Send 1 HTTP%2F1%2E1%20200%0D%0AContent%2DLength%3A%2020%0D%0A%0D%0Ahello%20from%20a%20package
+net: Send 1 HTTP%2F1%2E1%20200%0D%0AContent%2DType%3A%20application%2Fjson%0D%0AContent%2DLength%3A%2015%0D%0A%0D%0A%7B%22hello%22%3A%22ana%22%7D
 net: Close 1
-net: Send 2 HTTP%2F1%2E1%20200%0D%0AContent%2DLength%3A%202%0D%0A%0D%0AOK
-net: Close 2
 ```
 
-### 2. Recording & Replaying a Live Session (`GARDEL_RECORD` / `GARDEL_REPLAY`)
-
-```powershell
-# Record a live session to a log file
-$env:GARDEL_RECORD = "hello_api.log"
-./build/hello_api_bin.exe
-# (Make HTTP requests from another terminal, then press Ctrl+C)
-Remove-Item Env:\GARDEL_RECORD
-
-# Replay the recorded session offline and verify identical commands/exit code
-$env:GARDEL_REPLAY = "hello_api.log"
-./build/hello_api_bin.exe
-Remove-Item Env:\GARDEL_REPLAY
-```
-
+`GARDEL_RECORD=<file>` records a live run, and `GARDEL_REPLAY=<file>` runs it again from the
+log and checks that each command and the exit status are the same.

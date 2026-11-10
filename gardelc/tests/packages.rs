@@ -1105,9 +1105,10 @@ fn verify_deps_proves_the_prelude_too() {
     assert!(all(&out).contains("Standard Prelude `gardel.core` proven"), "{}", all(&out));
 }
 
-/// The real second package: a service built on `ghttp`, whose modules it sees only as contracts.
+/// The real packages: a service built on `grest`, `ghttp` and `gjson`, whose modules it sees
+/// only as contracts, answering over real sockets.
 #[test]
-fn a_service_on_ghttp_verifies_and_answers() {
+fn a_service_on_grest_verifies_and_answers() {
     let world = World::new("ghttp", &[]);
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("..");
     let out = Command::new(env!("CARGO_BIN_EXE_gardelc"))
@@ -1118,6 +1119,7 @@ fn a_service_on_ghttp_verifies_and_answers() {
         .expect("gardelc runs");
     assert_ok(&out);
     assert!(all(&out).contains("ghttp::HTTP_PARSER"), "{}", all(&out));
+    assert!(all(&out).contains("grest::REST_SERVER"), "{}", all(&out));
 
     // The port is the example's own. If something else holds it, the proof above still stands.
     if std::net::TcpListener::bind(("127.0.0.1", 8090)).is_err() {
@@ -1153,6 +1155,8 @@ fn a_service_on_ghttp_verifies_and_answers() {
             ask(&["POST /echo HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n"]),
             // The length the answer declares is the library's, worked out from the body.
             ask(&["POST /echo HTTP/1.1\r\ncontent-length: 12\r\n\r\nhello, world"]),
+            ask(&["GET /hello/an", "a%20b HTTP/1.1\r\n\r\n"]),
+            ask(&["DELETE /hello HTTP/1.1\r\n\r\n"]),
         ]
     } else {
         vec![]
@@ -1160,13 +1164,18 @@ fn a_service_on_ghttp_verifies_and_answers() {
     drop(server.kill());
     drop(server.wait());
     assert!(up, "the service did not start listening");
-    assert_eq!(answers[0], "HTTP/1.1 200\r\nContent-Length: 20\r\n\r\nhello from a package");
+    let text = |body: &str| format!("HTTP/1.1 200\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: {}\r\n\r\n{body}", body.len());
+    let json = |code: u32, body: &str| format!("HTTP/1.1 {code}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}", body.len());
+    assert_eq!(answers[0], text("hello from a package"));
     assert_eq!(answers[1], answers[0], "a split request gets the same answer");
-    assert_eq!(answers[2], "HTTP/1.1 404\r\nContent-Length: 0\r\n\r\n");
-    assert_eq!(answers[3], "HTTP/1.1 200\r\nContent-Length: 2\r\n\r\nhi");
-    assert_eq!(answers[4], "HTTP/1.1 200\r\nContent-Length: 5\r\n\r\nhello");
+    assert_eq!(answers[2], json(404, r#"{"error":"not found"}"#));
+    assert_eq!(answers[3], text("hi"));
+    assert_eq!(answers[4], text("hello"));
     assert_eq!(answers[5], "HTTP/1.1 501\r\nContent-Length: 0\r\n\r\n");
-    assert_eq!(answers[6], "HTTP/1.1 200\r\nContent-Length: 12\r\n\r\nhello, world");
+    assert_eq!(answers[6], text("hello, world"));
+    // A parameter cut across reads, decoded.
+    assert_eq!(answers[7], json(200, r#"{"hello":"ana b"}"#));
+    assert_eq!(answers[8], json(405, r#"{"error":"method not allowed"}"#));
 }
 
 /// `ghttp`'s own suite, a client package of it: every case of `cases.txt` is parsed whole

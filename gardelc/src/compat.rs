@@ -747,7 +747,7 @@ fn solver_args(z3: &str, backstop: u32) -> Vec<String> {
     if let Some(seed) = current_z3_seed() {
         args.extend(boogie_seed_args(seed));
     }
-    args.push("/typeEncoding:p".to_string());
+    args.push(crate::BOOGIE_TYPE_ENCODING.to_string());
     args.push(format!("/rlimit:{}", current_z3_rlimit()));
     args.push(format!("/timeLimit:{backstop}"));
     args.push("/trace".to_string());

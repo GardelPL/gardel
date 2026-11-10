@@ -1,0 +1,31 @@
+-- What a handler gives back: the service's next state, and the response to send. A handler
+-- that only reads the state gives back the state it was given.
+module REST_OUTCOME[S]
+
+representation {NONE}
+  next: S
+  reply: HTTP_RESPONSE
+
+create {ANY}
+
+  make(s: S, resp: HTTP_RESPONSE): REST_OUTCOME[S]
+    do
+      { next = s, reply = resp }
+    ensure
+      state_set: Result.state = s
+      status_set: Result.response.response_status_code = resp.response_status_code
+    end
+
+feature {ANY}
+
+  state: S
+    do
+      Current.next
+    end
+
+  response: HTTP_RESPONSE
+    do
+      Current.reply
+    end
+
+end

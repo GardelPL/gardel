@@ -152,7 +152,7 @@ fn rest_client(claims: &str) -> String {
 
 feature {{ANY}}
 
-  f(req: HTTP_REQUEST, r: REST_ROUTER, v: JSON, e: JSON_ERROR, u: URL_ERROR, s: STRING): BOOL
+  f(req: HTTP_REQUEST, r: REST_ROUTER[NAT], n: NAT, v: JSON, e: JSON_ERROR, u: URL_ERROR, s: STRING): BOOL
     do
       True
     ensure
@@ -170,15 +170,17 @@ end
 #[test]
 fn a_client_proves_the_statuses_through_the_contracts() {
     let facts = rest_client(
-        "      bad_target: not REQUEST_TARGET.parse(req.target).is_ok implies r.dispatch(req).response_status_code = 400
-      no_routes: REQUEST_TARGET.parse(req.target).is_ok implies REST_ROUTER.empty.dispatch(req).response_status_code = 404
+        "      bad_target: not REQUEST_TARGET.parse(req.target).is_ok implies r.dispatch(n, req).response.response_status_code = 400
+      no_routes: REQUEST_TARGET.parse(req.target).is_ok implies REST_ROUTER.empty.dispatch(n, req).response.response_status_code = 404
       bad_body: REST_RESPONSE.bad_body(e).response_status_code = 400
       url: REST_RESPONSE.bad_target(u).response_status_code = 400
       conflict: REST_RESPONSE.error(HTTP_STATUS.make(409), s).response_status_code = 409
       json: REST_RESPONSE.ok_json(v).response_status_code = 200 or REST_RESPONSE.ok_json(v).response_status_code = 500
       created: REST_RESPONSE.created_json(v).response_status_code = 201 or REST_RESPONSE.created_json(v).response_status_code = 500
       gone: REST_RESPONSE.no_content.response_body_length = 0
-      routes: r.route_count <= 64",
+      routes: r.route_count <= 64
+      keeps: not REQUEST_TARGET.parse(req.target).is_ok implies r.dispatch(n, req).state = n
+      outcome: REST_OUTCOME.make(n, REST_RESPONSE.not_found).state = n",
     );
     assert_ok(&Project::new("statuses", &facts).check());
 }
@@ -187,15 +189,226 @@ fn a_client_proves_the_statuses_through_the_contracts() {
 fn a_claim_past_the_statuses_does_not_verify() {
     let lies = [
         // A target that cannot be read is a `400`, even with no routes.
-        ("no_routes", "      claim: REST_ROUTER.empty.dispatch(req).response_status_code = 404"),
+        ("no_routes", "      claim: REST_ROUTER.empty.dispatch(n, req).response.response_status_code = 404"),
         // A value too large to send is a `500`.
         ("json", "      claim: REST_RESPONSE.ok_json(v).response_status_code = 200"),
         // A route may answer with any status, `400` too.
-        ("routed", "      claim: REQUEST_TARGET.parse(req.target).is_ok implies r.dispatch(req).response_status_code != 400"),
+        ("routed", "      claim: REQUEST_TARGET.parse(req.target).is_ok implies r.dispatch(n, req).response.response_status_code != 400"),
+        // A route's handler may change the state.
+        ("kept", "      claim: r.dispatch(n, req).state = n"),
     ];
     for (name, claim) in lies {
         let out = Project::new(&format!("rest_lie_{name}"), &rest_client(claim)).check();
         assert!(!out.status.success(), "{name} must fail:\n{}", all(&out));
         assert!(all(&out).contains("condition `claim` failed"), "{name} must refuse the claim:\n{}", all(&out));
     }
+}
+
+fn server_client(claims: &str) -> String {
+    format!(
+        "functions CLIENT
+
+feature {{ANY}}
+
+  f(s: REST_SERVER[NAT], e: EVENT, args: SEQ[STRING], r: REST_ROUTER[NAT], n: NAT): BOOL
+    do
+      True
+    ensure
+{claims}
+    end
+
+end
+"
+    )
+}
+
+/// What a client knows of `REST_SERVER` for every state and event: the limit on connections
+/// holds and never changes, an event about a connection does nothing, closes it, or sends it
+/// one answer and closes it, any other event names no connection, a `Shutdown` stops, and a
+/// router with a pattern that is not valid does not start.
+#[test]
+fn a_client_proves_the_server_safety_through_the_contracts() {
+    let facts = server_client(
+        "      within: REST_SERVER.within(s, e, s.serve(e))
+      stops: e.is_shutdown implies s.serve(e).is_stop
+      limit: s.open_connections <= s.max_connections
+      bad_route: r.invalid_route.is_some implies REST_SERVER.start(args, 8090, r, n).is_stop
+      fresh: REST_SERVER.make(8090, r, n).open_connections = 0",
+    );
+    assert_ok(&Project::new("server", &facts).check());
+}
+
+#[test]
+fn a_claim_past_the_server_safety_does_not_verify() {
+    let lies = [
+        // A `Shutdown` stops the server.
+        ("claim_runs", "not s.serve(e).is_stop"),
+        // Most events send nothing.
+        ("claim_answers", "REST_SERVER.commands(s.serve(e)).length = 2"),
+        // A server may be full.
+        ("claim_room", "s.open_connections < s.max_connections"),
+        // An argument that is not a port stops it.
+        ("claim_starts", "r.invalid_route.is_none implies not REST_SERVER.start(args, 8090, r, n).is_stop"),
+    ];
+    let claims: Vec<String> = lies.iter().map(|(tag, claim)| format!("      {tag}: {claim}")).collect();
+    let out = Project::new("server_lies", &server_client(&claims.join("\n"))).check();
+    assert!(!out.status.success(), "the lies must fail:\n{}", all(&out));
+    for (tag, _) in lies {
+        assert!(all(&out).contains(&format!("condition `{tag}` failed")), "{tag} must be refused:\n{}", all(&out));
+    }
+}
+
+/// A verified service whose routes are `routes`, whose state is a count: `POST /bump` adds
+/// one to it, up to 1000, and `GET /count` says it.
+fn service(name: &str, routes: &str) -> Project {
+    let source = format!(
+        "reactive program CLIENT
+
+feature {{ANY}}
+
+  hi(r: REST_REQUEST): HTTP_RESPONSE
+    do
+      REST_RESPONSE.ok_text(\"hi\")
+    end
+
+  bump(n: NAT, r: REST_REQUEST): REST_OUTCOME[NAT]
+    do
+      if n < 1000 then
+        REST_OUTCOME.make(n + 1, REST_RESPONSE.ok_text(\"bumped\"))
+      else
+        REST_OUTCOME.make(n, REST_RESPONSE.error(HTTP_STATUS.make(409), \"full\"))
+      end
+    end
+
+  count(n: NAT, r: REST_REQUEST): HTTP_RESPONSE
+    do
+      if n <= 1000 then REST_RESPONSE.ok_json(JSON.int(I64.from_nat(n))) else REST_RESPONSE.not_found end
+    end
+
+  routes: REST_ROUTER[NAT]
+    do
+      {routes}
+    end
+
+  init(args: SEQ[STRING]): STEP[REST_SERVER[NAT]]
+    do
+      REST_SERVER.start(args, 8090, routes, 0)
+    end
+
+  step(s: REST_SERVER[NAT], e: EVENT): STEP[REST_SERVER[NAT]]
+    do
+      s.serve(e)
+    end
+
+end
+"
+    );
+    let project = Project::new(name, &source);
+    assert_ok(&project.check());
+    project
+}
+
+/// A scripted run of `service`, with `args` and the events `events`.
+fn run_service(service: &Project, args: &[&str], events: &str) -> Output {
+    Command::new(service.dir.join("build/client_bin.exe"))
+        .args(args)
+        .env("GARDEL_EVENTS", events)
+        .output()
+        .expect("the service runs")
+}
+
+/// A router with a pattern that is not valid, or an argument that is not a port, stops the
+/// service before it listens, with exit status 2, and a port it cannot listen on stops it
+/// with exit status 1. A full server closes the next connection it is given and answers none
+/// of its requests, each request gets one answer, and a connection is freed by its answer.
+#[test]
+fn a_service_starts_only_when_it_can_and_keeps_its_limit() {
+    let bad_route = service("bad_route", "REST_ROUTER.empty.on_get(\"/hi\", hi).on_get(\"/bad/:\", hi)");
+    let broken = run_service(&bad_route, &[], "Shutdown");
+    assert_eq!(broken.status.code(), Some(2), "{}", all(&broken));
+    assert!(all(&broken).contains("grest: route pattern is not valid: /bad/:"), "{}", all(&broken));
+    assert!(!all(&broken).contains("net: Listen"), "{}", all(&broken));
+
+    let good = service("good", "REST_ROUTER.empty.on_get(\"/hi\", hi)");
+    let port = run_service(&good, &["99999"], "Shutdown");
+    assert_eq!(port.status.code(), Some(2), "{}", all(&port));
+    assert!(all(&port).contains("grest: not a port: 99999"), "{}", all(&port));
+    let taken = run_service(&good, &[], "ListenFailed:8090:98");
+    assert_eq!(taken.status.code(), Some(1), "{}", all(&taken));
+    assert!(all(&taken).contains("grest: listen failed"), "{}", all(&taken));
+
+    // 65 connections, then a request on each of the last two and two on the first.
+    let request = "GET%20/hi%20HTTP/1.1%0D%0A%0D%0A";
+    let mut events: Vec<String> = (1..=65).map(|c| format!("Accepted:{c}")).collect();
+    events.push(format!("Received:65:{request}"));
+    events.push(format!("Received:64:{request}"));
+    events.push(format!("Received:1:{request}"));
+    events.push(format!("Received:1:{request}"));
+    events.push("Accepted:66".to_string());
+    events.push(format!("Received:66:{request}"));
+    let full = run_service(&good, &["9001"], &events.join(" "));
+    assert_eq!(full.status.code(), Some(0), "{}", all(&full));
+    let net: Vec<String> = String::from_utf8_lossy(&full.stderr).lines().filter(|l| l.starts_with("net: ")).map(str::to_owned).collect();
+    let answer = "HTTP%2F1%2E1%20200%0D%0AContent%2DType%3A%20text%2Fplain%3B%20charset%3Dutf%2D8%0D%0AContent%2DLength%3A%202%0D%0A%0D%0Ahi";
+    let expected = [
+        "net: Listen 9001".to_string(),
+        // The 65th is closed as it arrives, and its request is not answered.
+        "net: Close 65".to_string(),
+        "net: Close 65".to_string(),
+        format!("net: Send 64 {answer}"),
+        "net: Close 64".to_string(),
+        format!("net: Send 1 {answer}"),
+        "net: Close 1".to_string(),
+        // A second request on a connection that was answered is not answered.
+        "net: Close 1".to_string(),
+        // Two connections were freed, so the 66th is served.
+        format!("net: Send 66 {answer}"),
+        "net: Close 66".to_string(),
+    ];
+    assert_eq!(net, expected, "{}", all(&full));
+}
+
+/// The state a handler gives back is the one the next request sees, in the order the requests
+/// complete, and a request that is not answered by a handler, or that cannot be read, leaves
+/// it as it was.
+#[test]
+fn a_service_keeps_the_state_its_handlers_give() {
+    let counting = service(
+        "counting",
+        "REST_ROUTER.empty.on(Post, \"/bump\", bump).on_view(\"/count\", count)",
+    );
+    let req = |m: &str, path: &str| format!("{m}%20{path}%20HTTP/1.1%0D%0A%0D%0A");
+    let events = [
+        "Accepted:1".to_string(),
+        "Accepted:2".to_string(),
+        "Accepted:3".to_string(),
+        "Accepted:4".to_string(),
+        "Accepted:5".to_string(),
+        "Accepted:6".to_string(),
+        // The first part of a request on 1, which completes after 2's.
+        "Received:1:POST%20/bump%20HTTP/1.1%0D%0A".to_string(),
+        format!("Received:2:{}", req("POST", "/bump")),
+        "Received:1:%0D%0A".to_string(),
+        // Not a route, a method with no route, a target that cannot be read, and bytes that
+        // are not a request: none of them reaches a handler.
+        format!("Received:3:{}", req("POST", "/nothing")),
+        format!("Received:4:{}", req("DELETE", "/bump")),
+        format!("Received:5:{}", req("GET", "/count%25zz")),
+        "Received:6:%00%00%0D%0A%0D%0A".to_string(),
+        "Accepted:7".to_string(),
+        format!("Received:7:{}", req("GET", "/count")),
+    ];
+    let run = run_service(&counting, &["9002"], &events.join(" "));
+    assert_eq!(run.status.code(), Some(0), "{}", all(&run));
+    let sends: Vec<String> = String::from_utf8_lossy(&run.stderr)
+        .lines()
+        .filter(|l| l.starts_with("net: Send "))
+        .map(|l| {
+            let words: Vec<&str> = l.split_whitespace().collect();
+            format!("{} {}", words[2], &words[3]["HTTP%2F1%2E1%20".len()..][..3])
+        })
+        .collect();
+    assert_eq!(sends, ["2 200", "1 200", "3 404", "4 405", "5 400", "6 400", "7 200"], "{}", all(&run));
+    let last = String::from_utf8_lossy(&run.stderr).lines().filter(|l| l.starts_with("net: Send 7 ")).collect::<String>();
+    assert!(last.ends_with("%0D%0A%0D%0A2"), "two bumps, then the count: {last}");
 }

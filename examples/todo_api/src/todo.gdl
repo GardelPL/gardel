@@ -1,0 +1,99 @@
+-- One todo: its id, a title of 1 to 200 bytes, and whether it is done.
+module TODO
+
+representation {NONE}
+  key: NAT
+  name: STRING
+  finished: BOOL
+
+invariant
+  id_fits: key >= 1 and key <= 1000000
+  titled: name.byte_length >= 1 and name.byte_length <= 200
+
+create {ANY}
+
+  make(id: NAT, title: STRING, done: BOOL): TODO
+    require
+      id_fits: id >= 1 and id <= 1000000
+      titled: TODO.fits_title(title)
+    do
+      { key = id, name = title, finished = done }
+    ensure
+      id_set: Result.todo_id = id
+    end
+
+  -- A title is 1 to 200 bytes.
+  fits_title(s: STRING): BOOL
+    do
+      s.byte_length >= 1 and s.byte_length <= 200
+    ensure
+      def: Result = (s.byte_length >= 1 and s.byte_length <= 200)
+    end
+
+  -- The todo numbered `id` that `v` describes: an object with a string `"title"` and, if it
+  -- has one, a boolean `"done"`, which is `false` when it is missing.
+  from_json(id: NAT, v: JSON): OPTION[TODO]
+    require
+      id_fits: id >= 1 and id <= 1000000
+    do
+      match v.field("title")
+        case None then None
+        case Some(t) then
+          match t.as_string
+            case None then None
+            case Some(title) then
+              if not TODO.fits_title(title) then
+                None
+              else
+                match v.field("done")
+                  case None then Some(TODO.make(id, title, False))
+                  case Some(d) then
+                    match d.as_bool
+                      case None then None
+                      case Some(done) then Some(TODO.make(id, title, done))
+                    end
+                end
+              end
+          end
+      end
+    ensure
+      same_id: Result.is_some implies Result.get.todo_id = id
+    end
+
+feature {ANY}
+
+  todo_id: NAT
+    do
+      Current.key
+    ensure
+      fits: Result >= 1 and Result <= 1000000
+    end
+
+  title: STRING
+    do
+      Current.name
+    end
+
+  is_done: BOOL
+    do
+      Current.finished
+    end
+
+  -- `{"id":1,"title":"...","done":false}`.
+  to_json: JSON
+    do
+      match JSON.empty_object.with_field("id", JSON.int(I64.from_nat(Current.key)))
+        case None then JSON.empty_object
+        case Some(a) then
+          match a.with_field("title", JSON.string(Current.name))
+            case None then a
+            case Some(b) then
+              match b.with_field("done", JSON.bool(Current.finished))
+                case None then b
+                case Some(c) then c
+              end
+          end
+      end
+    end
+
+end

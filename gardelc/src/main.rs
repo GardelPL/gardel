@@ -13,6 +13,8 @@ use std::rc::Rc;
 
 use proof_cache::ProofCache;
 
+mod boogie_params;
+mod boogie_reserved;
 mod c11_typed;
 mod compat;
 pub mod manifest;
@@ -1710,6 +1712,7 @@ impl Parser {
         desugar_nullary_calls(&mut m);
         desugar_routine_values(&mut m);
         rename_repeated_binders(&mut m);
+        boogie_reserved::rename_reserved(&mut m);
         if let Some(site) = patterns::desugar_patterns(&mut m).first() {
             return Err(ParseError {
                 message: format!(
@@ -5828,8 +5831,11 @@ fn expr_free_vars(e: &Expr, bound: &mut Vec<String>, out: &mut Vec<String>) {
 /// returning an `Fn1`, `Fn2` or `Fn3` value, defined by the axiom
 /// `FnN_app(lam_M_k(c..), x..) == body`. The function symbol is fresh and has exactly one
 /// defining equation, so the axiom is consistent. Captured locals (variables of the
-/// enclosing routine with a known type) become arguments. Returns `None` for lambdas whose
-/// types mention a type parameter of `m` (they keep the special-cased encodings).
+/// enclosing routine with a known type) become arguments.
+///
+/// A lambda whose types mention type parameters of `m`, such as `fn(s: S, r: REST_REQUEST)`
+/// in `REST_ROUTE[S]`, is lifted to a generic function `lam_M_k<S>(..)`. Its call is typed
+/// with the function type, since a parameter that no capture mentions is fixed only by it.
 fn lift_boogie_lambda(
     params: &[(String, String)],
     ret_ty: &str,
@@ -5843,9 +5849,6 @@ fn lift_boogie_lambda(
         return None;
     }
     let mentions_tp = |t: &str| type_tokens(t).iter().any(|tok| m.type_params.iter().any(|p| p == tok));
-    if params.iter().any(|(_, t)| mentions_tp(t)) || mentions_tp(ret_ty) {
-        return None;
-    }
     let param_names: Vec<String> = params.iter().map(|(p, _)| p.clone()).collect();
     let mut free = Vec::new();
     let mut bound = param_names.clone();
@@ -5862,9 +5865,18 @@ fn lift_boogie_lambda(
         .filter(|v| !implicit_fields.contains(v))
         .filter_map(|v| boogie_env_type(&v).map(|t| (v, t)))
         .collect();
-    if captures.iter().any(|(_, t)| mentions_tp(t)) {
-        return None;
-    }
+    let lam_tps: Vec<String> = m
+        .type_params
+        .iter()
+        .filter(|tp| {
+            let here = |t: &str| type_tokens(t).iter().any(|tok| tok == *tp);
+            params.iter().any(|(_, t)| here(t)) || here(ret_ty) || captures.iter().any(|(_, t)| here(t))
+        })
+        .cloned()
+        .collect();
+    let generic = params.iter().any(|(_, t)| mentions_tp(t))
+        || mentions_tp(ret_ty)
+        || captures.iter().any(|(_, t)| mentions_tp(t));
     // Emit the body with the parameters typed (restoring any shadowed entries afterwards).
     let saved: Vec<(String, Option<String>)> =
         params.iter().map(|(p, _)| (p.clone(), boogie_env_type(p))).collect();
@@ -5908,12 +5920,22 @@ fn lift_boogie_lambda(
         2 => "Fn2_app",
         _ => "Fn3_app",
     };
-    let call = format!("{name}({})", cap_names.join(", "));
+    let call = if generic {
+        format!("({name}({}) : {fn_ty})", cap_names.join(", "))
+    } else {
+        format!("{name}({})", cap_names.join(", "))
+    };
     let mut quant: Vec<String> = cap_decls.clone();
     quant.extend(params.iter().map(|(p, t)| format!("{p}: {}", map_boogie_type(t, m))));
     let applied = format!("{app}({call}, {})", param_names.join(", "));
+    let (tp_decl, tp_quant) = if generic {
+        let tps = lam_tps.join(", ");
+        (format!("<{tps}>"), format!("<{tps}> "))
+    } else {
+        (String::new(), String::new())
+    };
     let decl = format!(
-        "function {name}({}) returns ({fn_ty});\naxiom (forall {} :: {{ {applied} }} {applied} == {body_bpl});\n",
+        "function {name}{tp_decl}({}) returns ({fn_ty});\naxiom (forall{tp_quant} {} :: {{ {applied} }} {applied} == {body_bpl});\n",
         cap_decls.join(", "),
         quant.join(", ")
     );
@@ -7978,7 +8000,7 @@ enum BoogieEmitScope {
 }
 
 pub fn emit_boogie(m: &ModuleDecl, fuel_limit: usize) -> String {
-    with_fresh_boogie_numbering(|| emit_boogie_numbered(m, fuel_limit))
+    boogie_params::scalars_last(&with_fresh_boogie_numbering(|| emit_boogie_numbered(m, fuel_limit)))
 }
 
 fn emit_boogie_numbered(m: &ModuleDecl, fuel_limit: usize) -> String {
@@ -8827,6 +8849,22 @@ fn emit_boogie_parts_with_options(
         let fn_step_two_app = format!("fn_{}({})", r.name, call_args_step_two.join(", "));
         let fn_succ_app = format!("fn_{}({})", r.name, call_args_succ.join(", "));
         let fn_f_app = format!("fn_{}({})", r.name, call_args_f.join(", "));
+        // A routine whose type parameters no argument mentions, such as `ROUTER[S].empty`, is
+        // fixed only by its result. In the contract axiom each call then carries the result
+        // type, as its trigger does: without it Boogie instantiates the parameter to `int`, and
+        // the axiom speaks of `ROUTER[int]` alone, so a client learns nothing of `empty`.
+        // Only such routines are typed, and only in that axiom: typing the definitional axioms
+        // too, or `RESULT.ok(v: A)`, whose `E` is fixed by its result, made those facts apply
+        // to every instance, and `STRING.find` and `matches_at` ran out of resources.
+        let result_only_tps = !r_all_tps.is_empty()
+            && r_all_tps
+                .iter()
+                .all(|tp| !q_params.iter().any(|qp| type_tokens(qp).iter().any(|t| *t == tp.as_str())));
+        let fn_f_term = if result_only_tps {
+            format!("({fn_f_app} : {ret_bty})")
+        } else {
+            fn_f_app.clone()
+        };
         let body_expr = match scope {
             BoogieEmitScope::Full => {
                 emit_boogie_block_expr(&r.stmts, &r.body, m, &empty_fields, "_fuel", &strings)
@@ -8851,7 +8889,7 @@ fn emit_boogie_parts_with_options(
         let fn_f_trigger = if r_all_tps.is_empty()
             || r_all_tps
                 .iter()
-                .all(|tp| q_params.iter().any(|qp| qp.contains(tp)))
+                .all(|tp| q_params.iter().any(|qp| type_tokens(qp).iter().any(|t| *t == tp.as_str())))
         {
             format!("{{ {fn_f_app} }}")
         } else {
@@ -8909,16 +8947,16 @@ fn emit_boogie_parts_with_options(
         // Opaque Postcondition Frame Axiom (holds at any fuel `_fuel`, including `ZeroFuel`)
         let mut post_clauses = Vec::new();
         if r.ret_type == "NAT" || r.ret_type == "U64" {
-            post_clauses.push(format!("in_u64({fn_f_app})"));
+            post_clauses.push(format!("in_u64({fn_f_term})"));
         } else if r.ret_type == "INT" || r.ret_type == "I64" {
-            post_clauses.push(format!("in_i64({fn_f_app})"));
+            post_clauses.push(format!("in_i64({fn_f_term})"));
         } else if r.ret_type == "CHAR" {
-            post_clauses.push(format!("in_char({fn_f_app})"));
+            post_clauses.push(format!("in_char({fn_f_term})"));
         } else if r.ret_type == m.name
             || r.ret_type == "Current"
             || r.ret_type.starts_with(&format!("{}[", m.name))
         {
-            post_clauses.push(format!("{}_Invariant({fn_f_app})", m.name));
+            post_clauses.push(format!("{}_Invariant({fn_f_term})", m.name));
         }
         if m.name == "SEQ" && r.name == "length" {
             post_clauses.push(format!(
@@ -8943,10 +8981,10 @@ fn emit_boogie_parts_with_options(
                 "_fuel",
                 &strings,
             )
-            .replace("Result", &fn_f_app);
+            .replace("Result", &fn_f_term);
             post_clauses.push(format!("({ens_bpl})"));
 
-            let model_call = format!("fn_model(_fuel, {fn_f_app})");
+            let model_call = format!("fn_model(_fuel, {fn_f_term})");
             if let Some(pos) = ens_bpl.find(&model_call) {
                 // The model query may be the module's own `fn_model` or a namespaced
                 // injected prelude one (e.g. `BIGNAT__fn_model`).
@@ -8979,7 +9017,7 @@ fn emit_boogie_parts_with_options(
         }
         let mentions_all_tps = r_all_tps
             .iter()
-            .all(|tp| q_params.iter().any(|qp| qp.contains(tp)));
+            .all(|tp| q_params.iter().any(|qp| type_tokens(qp).iter().any(|t| *t == tp.as_str())));
         if trusted && mentions_all_tps && !model_decoupled_ens.is_empty() {
             let mut decoupled_q_params = vec!["_f_query: Fuel".to_string()];
             decoupled_q_params.extend(q_params.clone());
@@ -11053,6 +11091,13 @@ fn emit_boogie_proc_stmts_and_ret(
                                     c.ctor(),
                                     fname
                                 ));
+                                // A binder of a machine type, such as `id` in `case Some(id)` on
+                                // an `OPTION[NAT]`, is in its range: every value of the type is.
+                                // The field's declared type is the generic `A`, so the range is
+                                // read from the binder's own type at this instance.
+                                if let Some(range) = boogie_env_type(bname).as_deref().and_then(machine_range) {
+                                    s.push_str(&format!("{pad}  assume {range}({bname});\n"));
+                                }
                                 if is_own
                                     && !m.invariants.is_empty()
                                     && (fty == &m.name
@@ -14246,6 +14291,8 @@ fn which_solver(name: &str) -> Option<String> {
 /// crate's version does not: it stayed `0.1.0` through soundness fixes that changed what is
 /// proven. Hashing the executable instead would take seconds in a debug build.
 const VERIFIER_SOURCES: &[(&str, &str)] = &[
+    ("boogie_params.rs", include_str!("boogie_params.rs")),
+    ("boogie_reserved.rs", include_str!("boogie_reserved.rs")),
     ("c11_typed.rs", include_str!("c11_typed.rs")),
     ("compat.rs", include_str!("compat.rs")),
     ("main.rs", include_str!("main.rs")),
@@ -14597,6 +14644,12 @@ pub fn current_z3_seed() -> Option<u32> {
     BOOGIE_Z3_SEED.with(|s| *s.borrow())
 }
 
+/// How Boogie encodes Gardel's generic types for Z3: type predicates. Every Boogie call site
+/// uses it. The default, `m` (monomorphize), does not terminate on a routine such as
+/// `OPTION.map[B]`. Under `a` (type arguments) a generic module's own invariant facts are lost
+/// (F.6). Boogie 3.4.3 has a bug in the type axioms of `p`, worked around in `boogie_params`.
+pub const BOOGIE_TYPE_ENCODING: &str = "/typeEncoding:p";
+
 /// The Boogie options that give Z3 a fixed random seed. Every Boogie call site uses these,
 /// so a seeded run cannot apply the seed to one path and miss another.
 fn boogie_seed_args(seed: u32) -> [String; 2] {
@@ -14634,7 +14687,7 @@ fn run_boogie_verification_once(
     if let Some(seed) = current_z3_seed() {
         cmd.args(boogie_seed_args(seed));
     }
-    cmd.arg("/typeEncoding:p");
+    cmd.arg(BOOGIE_TYPE_ENCODING);
     cmd.arg(format!("/rlimit:{}", current_z3_rlimit()));
     let backstop = solver_backstop_secs();
     cmd.arg(format!("/timeLimit:{backstop}"));
@@ -20142,7 +20195,7 @@ fn main() {
             .find(|cand| std::path::Path::new(cand).exists());
 
         let mut boogie_cmd = Command::new("boogie");
-        boogie_cmd.args(["/typeEncoding:p", "/mv:-", &primary_bpl]);
+        boogie_cmd.args([BOOGIE_TYPE_ENCODING, "/mv:-", &primary_bpl]);
         if let Some(solver) = found_solver {
             boogie_cmd.arg(format!("/proverOpt:PROVER_PATH={solver}"));
         }

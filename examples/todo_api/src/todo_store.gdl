@@ -1,0 +1,92 @@
+-- The todos of the service, by id, and the id the next one gets.
+--
+-- The invariant is what the service proves of its state after every request, whatever the
+-- requests were: each todo is kept under its own id, and no todo has an id at or past the
+-- next one, so a new todo never takes the place of another. The proof rests on `MAP`'s laws.
+module TODO_STORE
+
+representation {NONE}
+  items: MAP[NAT, TODO]
+  next: NAT
+
+invariant
+  next_fits: next >= 1 and next <= 1000001
+  keyed: forall k: NAT. items.get(k).is_some implies items.get(k).get.todo_id = k
+  fresh: forall k: NAT. k >= next implies items.get(k).is_none
+
+create {ANY}
+
+  empty: TODO_STORE
+    do
+      { items = MAP.empty, next = 1 }
+    ensure
+      first: Result.next_id = 1
+    end
+
+feature {ANY}
+
+  -- The id the next todo gets.
+  next_id: NAT
+    do
+      Current.next
+    ensure
+      fits: Result >= 1 and Result <= 1000001
+    end
+
+  -- Whether there is an id left for one more todo.
+  has_room: BOOL
+    do
+      Current.next <= 1000000
+    ensure
+      def: Result = (Current.next_id <= 1000000)
+    end
+
+  size: NAT
+    do
+      Current.items.size
+    end
+
+  find(id: NAT): OPTION[TODO]
+    do
+      Current.items.get(id)
+    ensure
+      keyed: Result.is_some implies Result.get.todo_id = id
+      fresh: id >= Current.next_id implies Result.is_none
+    end
+
+  -- The todos, in ascending order of id.
+  all: LIST[TODO]
+    do
+      Current.items.values
+    end
+
+  -- The store with `t`, the todo numbered `next_id`, added.
+  add(t: TODO): TODO_STORE
+    require
+      room: Current.has_room
+      numbered: t.todo_id = Current.next_id
+    do
+      { items = Current.items.put(t.todo_id, t), next = Current.next + 1 }
+    ensure
+      advanced: Result.next_id = Current.next_id + 1
+    end
+
+  -- The store with `t` in place of the todo with its id, which it has.
+  replace(t: TODO): TODO_STORE
+    require
+      present: Current.find(t.todo_id).is_some
+    do
+      { Current with items = Current.items.put(t.todo_id, t) }
+    ensure
+      same_next: Result.next_id = Current.next_id
+    end
+
+  -- The store without the todo numbered `id`.
+  remove(id: NAT): TODO_STORE
+    do
+      { Current with items = Current.items.remove(id) }
+    ensure
+      same_next: Result.next_id = Current.next_id
+    end
+
+end

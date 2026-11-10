@@ -1,0 +1,123 @@
+-- A REST service with a state: todos, created, read, replaced and deleted over JSON.
+--
+--   gardelc examples/todo_api --strict
+--   build/todo_api_bin.exe [port]          (8091 when no port is given)
+--
+--   GET    /todos       every todo, in ascending order of id
+--   POST   /todos       {"title":"...","done":false} -> 201 and the todo, with its id
+--   GET    /todos/:id   the todo, or 404
+--   PUT    /todos/:id   {"title":"...","done":true}  -> the todo, or 404
+--   DELETE /todos/:id   204, or 404
+--
+-- The state is a `TODO_STORE`, whose invariant holds after every request: each todo is kept
+-- under its own id, and a new todo never takes the id of another, even one deleted.
+-- `REST_SERVER` proves that each request is answered once and its connection closed.
+reactive program TODO_API
+
+feature {ANY}
+
+  -- `ts` as items after those of the array `acc`, while they fit.
+  array_of(ts: LIST[TODO], acc: JSON): JSON
+    variant
+      ts.length
+    do
+      if ts.length = 0 then
+        acc
+      else
+        match acc.with_item(ts.head.to_json)
+          case None then acc
+          case Some(more) then array_of(ts.tail, more)
+        end
+      end
+    end
+
+  -- The todo whose id the path gives, if there is one.
+  named(s: TODO_STORE, r: REST_REQUEST): OPTION[TODO]
+    do
+      match r.param_nat("id")
+        case None then None
+        case Some(id) then s.find(id)
+      end
+    ensure
+      held: Result.is_some implies s.find(Result.get.todo_id).is_some
+    end
+
+  not_a_todo: HTTP_RESPONSE
+    do
+      REST_RESPONSE.bad_request("a todo is an object with a title of 1 to 200 bytes and a boolean done")
+    end
+
+  list_todos(s: TODO_STORE, r: REST_REQUEST): HTTP_RESPONSE
+    do
+      REST_RESPONSE.ok_json(array_of(s.all, JSON.empty_array))
+    end
+
+  get_todo(s: TODO_STORE, r: REST_REQUEST): HTTP_RESPONSE
+    do
+      match named(s, r)
+        case None then REST_RESPONSE.not_found
+        case Some(t) then REST_RESPONSE.ok_json(t.to_json)
+      end
+    end
+
+  create_todo(s: TODO_STORE, r: REST_REQUEST, body: JSON): REST_OUTCOME[TODO_STORE]
+    do
+      if not s.has_room then
+        REST_OUTCOME.make(s, REST_RESPONSE.error(HTTP_STATUS.make(507), "no ids are left"))
+      else
+        match TODO.from_json(s.next_id, body)
+          case None then REST_OUTCOME.make(s, not_a_todo)
+          case Some(t) then REST_OUTCOME.make(s.add(t), REST_RESPONSE.created_json(t.to_json))
+        end
+      end
+    ensure
+      grows_by_one: Result.state.next_id = s.next_id or Result.state.next_id = s.next_id + 1
+    end
+
+  update_todo(s: TODO_STORE, r: REST_REQUEST, body: JSON): REST_OUTCOME[TODO_STORE]
+    do
+      match named(s, r)
+        case None then REST_OUTCOME.make(s, REST_RESPONSE.not_found)
+        case Some(old) then
+          match TODO.from_json(old.todo_id, body)
+            case None then REST_OUTCOME.make(s, not_a_todo)
+            case Some(t) then REST_OUTCOME.make(s.replace(t), REST_RESPONSE.ok_json(t.to_json))
+          end
+      end
+    ensure
+      same_next: Result.state.next_id = s.next_id
+    end
+
+  delete_todo(s: TODO_STORE, r: REST_REQUEST): REST_OUTCOME[TODO_STORE]
+    do
+      match named(s, r)
+        case None then REST_OUTCOME.make(s, REST_RESPONSE.not_found)
+        case Some(t) then REST_OUTCOME.make(s.remove(t.todo_id), REST_RESPONSE.no_content)
+      end
+    ensure
+      same_next: Result.state.next_id = s.next_id
+    end
+
+  routes: REST_ROUTER[TODO_STORE]
+    do
+      REST_ROUTER.empty
+        .on_view("/todos", list_todos)
+        .on_json(Post, "/todos", create_todo)
+        .on_view("/todos/:id", get_todo)
+        .on_json(Put, "/todos/:id", update_todo)
+        .on(Delete, "/todos/:id", delete_todo)
+    ensure
+      five: Result.route_count = 5
+    end
+
+  init(args: SEQ[STRING]): STEP[REST_SERVER[TODO_STORE]]
+    do
+      REST_SERVER.start(args, 8091, routes, TODO_STORE.empty)
+    end
+
+  step(s: REST_SERVER[TODO_STORE], e: EVENT): STEP[REST_SERVER[TODO_STORE]]
+    do
+      s.serve(e)
+    end
+
+end
