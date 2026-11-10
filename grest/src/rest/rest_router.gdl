@@ -1,0 +1,179 @@
+-- The routes of a service, tried in the order they were added. `dispatch` answers a request:
+--
+-- * a target that cannot be read is a `400` with its reason;
+-- * the first route whose pattern matches the path and whose method is the request's answers
+--   it, and a `HEAD` request is answered by a `GET` route;
+-- * a path that some route matches, with no route for the method, is a `405`;
+-- * any other path is a `404`.
+--
+-- Each error is a JSON object, `{"error":"not found"}`.
+module REST_ROUTER
+
+representation {NONE}
+  table: LIST[REST_ROUTE]
+  n_routes: NAT
+
+invariant
+  counted: n_routes = table.length
+  bounded: n_routes <= 64
+
+create {ANY}
+
+  empty: REST_ROUTER
+    do
+      { table = LIST.empty, n_routes = 0 }
+    ensure
+      none: Result.route_count = 0
+      room: Result.has_room
+    end
+
+  -- The most routes a router holds.
+  max_routes: NAT
+    do
+      64
+    end
+
+  -- The answer of the first route in `rs` for `req`, whose target reads as `t`.
+  -- `path_seen` says whether a route before `rs` matched the path but not the method.
+  find(rs: LIST[REST_ROUTE], req: HTTP_REQUEST, t: REQUEST_TARGET, path_seen: BOOL): HTTP_RESPONSE
+    variant
+      rs.length
+    do
+      if rs.length = 0 then
+        if path_seen then REST_RESPONSE.method_not_allowed else REST_RESPONSE.not_found end
+      else
+        let r = rs.head
+        let found = r.path_pattern.match_target(t)
+        check
+          found_len: found.is_some implies found.get.length <= 16
+        end
+        match found
+          case None then
+            REST_ROUTER.find(rs.tail, req, t, path_seen)
+          case Some(ps) then
+            if r.method = req.method or (req.method = Head and r.method = Get) then
+              r.respond(REST_REQUEST.make(req, t, ps))
+            else
+              REST_ROUTER.find(rs.tail, req, t, True)
+            end
+        end
+      end
+    ensure
+      empty_seen: (rs.length = 0 and path_seen) implies Result.response_status_code = 405
+      empty_unseen: (rs.length = 0 and not path_seen) implies Result.response_status_code = 404
+    end
+
+  -- The pattern of the first route in `rs` that is not valid.
+  first_invalid(rs: LIST[REST_ROUTE]): OPTION[STRING]
+    variant
+      rs.length
+    do
+      if rs.length = 0 then
+        None
+      else if rs.head.is_valid then
+        REST_ROUTER.first_invalid(rs.tail)
+      else
+        Some(rs.head.path_text)
+      end end
+    end
+
+feature {ANY}
+
+  route_count: NAT
+    do
+      Current.n_routes
+    ensure
+      bounded: Result <= 64
+    end
+
+  has_room: BOOL
+    do
+      Current.n_routes < 64
+    ensure
+      def: Result = (Current.route_count < 64)
+    end
+
+  routes: LIST[REST_ROUTE]
+    do
+      Current.table
+    ensure
+      counted: Result.length = Current.route_count
+    end
+
+  -- The router with `r` after its routes, so tried after them.
+  add(r: REST_ROUTE): REST_ROUTER
+    require
+      room: Current.has_room
+    do
+      { table = Current.table.append(LIST.singleton(r)), n_routes = Current.n_routes + 1 }
+    ensure
+      grew: Result.route_count = Current.route_count + 1
+    end
+
+  on_get(p: STRING, h: (r: REST_REQUEST) -> HTTP_RESPONSE): REST_ROUTER
+    require
+      room: Current.has_room
+    do
+      Current.add(REST_ROUTE.make(Get, p, h))
+    ensure
+      grew: Result.route_count = Current.route_count + 1
+    end
+
+  on_post(p: STRING, h: (r: REST_REQUEST) -> HTTP_RESPONSE): REST_ROUTER
+    require
+      room: Current.has_room
+    do
+      Current.add(REST_ROUTE.make(Post, p, h))
+    ensure
+      grew: Result.route_count = Current.route_count + 1
+    end
+
+  on_put(p: STRING, h: (r: REST_REQUEST) -> HTTP_RESPONSE): REST_ROUTER
+    require
+      room: Current.has_room
+    do
+      Current.add(REST_ROUTE.make(Put, p, h))
+    ensure
+      grew: Result.route_count = Current.route_count + 1
+    end
+
+  on_delete(p: STRING, h: (r: REST_REQUEST) -> HTTP_RESPONSE): REST_ROUTER
+    require
+      room: Current.has_room
+    do
+      Current.add(REST_ROUTE.make(Delete, p, h))
+    ensure
+      grew: Result.route_count = Current.route_count + 1
+    end
+
+  -- A route whose handler is given the body as JSON; see `REST_ROUTE.with_json`.
+  on_json(m: HTTP_METHOD, p: STRING, h: (r: REST_REQUEST, body: JSON) -> HTTP_RESPONSE): REST_ROUTER
+    require
+      room: Current.has_room
+    do
+      Current.add(REST_ROUTE.with_json(m, p, h))
+    ensure
+      grew: Result.route_count = Current.route_count + 1
+    end
+
+  -- The pattern of the first route that is not valid, which matches nothing. A server
+  -- reports it rather than start.
+  invalid_route: OPTION[STRING]
+    do
+      REST_ROUTER.first_invalid(Current.table)
+    end
+
+  -- The answer to `req`.
+  dispatch(req: HTTP_REQUEST): HTTP_RESPONSE
+    do
+      let parsed = REQUEST_TARGET.parse(req.target)
+      match parsed
+        case Error(e) then REST_RESPONSE.bad_target(e)
+        case Ok(t) then REST_ROUTER.find(Current.table, req, t, False)
+      end
+    ensure
+      bad_target: not REQUEST_TARGET.parse(req.target).is_ok implies Result.response_status_code = 400
+      no_routes: (Current.route_count = 0 and REQUEST_TARGET.parse(req.target).is_ok) implies Result.response_status_code = 404
+    end
+
+end

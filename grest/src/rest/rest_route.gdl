@@ -1,0 +1,93 @@
+-- A route: a method, a path pattern such as `/users/:id`, and the handler that answers a
+-- request that matches them. A handler is a pure function from a request to a response.
+--
+-- The pattern is kept as written, so a router can name a route whose pattern is not valid.
+module REST_ROUTE
+
+representation {NONE}
+  verb: HTTP_METHOD
+  path: STRING
+  pattern: PATH_PATTERN
+  answer: (r: REST_REQUEST) -> HTTP_RESPONSE
+
+create {ANY}
+
+  make(m: HTTP_METHOD, p: STRING, h: (r: REST_REQUEST) -> HTTP_RESPONSE): REST_ROUTE
+    do
+      { verb = m, path = p, pattern = PATH_PATTERN.parse(p), answer = h }
+    ensure
+      method_set: Result.method = m
+      path_set: Result.path_text.equals(p)
+    end
+
+  get(p: STRING, h: (r: REST_REQUEST) -> HTTP_RESPONSE): REST_ROUTE
+    do
+      REST_ROUTE.make(Get, p, h)
+    ensure
+      method_set: Result.method = Get
+    end
+
+  post(p: STRING, h: (r: REST_REQUEST) -> HTTP_RESPONSE): REST_ROUTE
+    do
+      REST_ROUTE.make(Post, p, h)
+    ensure
+      method_set: Result.method = Post
+    end
+
+  put(p: STRING, h: (r: REST_REQUEST) -> HTTP_RESPONSE): REST_ROUTE
+    do
+      REST_ROUTE.make(Put, p, h)
+    ensure
+      method_set: Result.method = Put
+    end
+
+  delete(p: STRING, h: (r: REST_REQUEST) -> HTTP_RESPONSE): REST_ROUTE
+    do
+      REST_ROUTE.make(Delete, p, h)
+    ensure
+      method_set: Result.method = Delete
+    end
+
+  -- A route whose handler is given the body as JSON. A body that is not one JSON value, or
+  -- no body, is answered with `REST_RESPONSE.bad_body`, a `400`, and `h` is not called.
+  with_json(m: HTTP_METHOD, p: STRING, h: (r: REST_REQUEST, body: JSON) -> HTTP_RESPONSE): REST_ROUTE
+    do
+      REST_ROUTE.make(m, p, fn(r: REST_REQUEST): HTTP_RESPONSE do
+        match r.json_body
+          case Error(e) then REST_RESPONSE.bad_body(e)
+          case Ok(v) then h(r, v)
+        end
+      end)
+    ensure
+      method_set: Result.method = m
+    end
+
+feature {ANY}
+
+  method: HTTP_METHOD
+    do
+      Current.verb
+    end
+
+  path_text: STRING
+    do
+      Current.path
+    end
+
+  path_pattern: PATH_PATTERN
+    do
+      Current.pattern
+    end
+
+  is_valid: BOOL
+    do
+      Current.pattern.is_valid
+    end
+
+  -- What the handler answers to `r`.
+  respond(r: REST_REQUEST): HTTP_RESPONSE
+    do
+      Current.answer(r)
+    end
+
+end

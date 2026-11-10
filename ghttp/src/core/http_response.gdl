@@ -10,6 +10,7 @@ representation {NONE}
   digits_len: NAT
   body_text: STRING
   body_len: NAT
+  ctype: HTTP_CONTENT_TYPE
 
 invariant
   status_num_matches: status_num = resp_status.status_code
@@ -34,7 +35,8 @@ create {ANY}
         status_digits = d,
         digits_len = d.byte_length,
         body_text = text_body,
-        body_len = text_body.byte_length }
+        body_len = text_body.byte_length,
+        ctype = Unstated }
     ensure
       status_set: Result.status = st
       code_set: Result.response_status_code = st.status_code
@@ -52,7 +54,8 @@ create {ANY}
         status_digits = "200",
         digits_len = 3,
         body_text = text_body,
-        body_len = text_body.byte_length }
+        body_len = text_body.byte_length,
+        ctype = Unstated }
     ensure
       is_200: Result.response_status_code = 200
       body_len_set: Result.response_body_length = text_body.byte_length
@@ -68,7 +71,8 @@ create {ANY}
         status_digits = "201",
         digits_len = 3,
         body_text = text_body,
-        body_len = text_body.byte_length }
+        body_len = text_body.byte_length,
+        ctype = Unstated }
     ensure
       is_201: Result.response_status_code = 201
       body_len_set: Result.response_body_length = text_body.byte_length
@@ -82,7 +86,8 @@ create {ANY}
         status_digits = "404",
         digits_len = 3,
         body_text = "",
-        body_len = 0 }
+        body_len = 0,
+        ctype = Unstated }
     ensure
       is_404: Result.response_status_code = 404
       empty_body: Result.response_body_length = 0
@@ -96,7 +101,8 @@ create {ANY}
         status_digits = "405",
         digits_len = 3,
         body_text = "",
-        body_len = 0 }
+        body_len = 0,
+        ctype = Unstated }
     ensure
       is_405: Result.response_status_code = 405
       empty_body: Result.response_body_length = 0
@@ -110,7 +116,8 @@ create {ANY}
         status_digits = "204",
         digits_len = 3,
         body_text = "",
-        body_len = 0 }
+        body_len = 0,
+        ctype = Unstated }
     ensure
       is_204: Result.response_status_code = 204
       empty_body: Result.response_body_length = 0
@@ -125,7 +132,8 @@ create {ANY}
         status_digits = d,
         digits_len = d.byte_length,
         body_text = "",
-        body_len = 0 }
+        body_len = 0,
+        ctype = Unstated }
     ensure
       status_set: Result.status = st
       code_set: Result.response_status_code = st.status_code
@@ -143,7 +151,8 @@ create {ANY}
         status_digits = d,
         digits_len = d.byte_length,
         body_text = "",
-        body_len = 0 }
+        body_len = 0,
+        ctype = Unstated }
     ensure
       is_err: Result.status.is_client_error or Result.status.is_server_error
       empty_body: Result.response_body_length = 0
@@ -191,6 +200,23 @@ feature {ANY}
     ensure
       exact_len: Result.length = Current.response_body_length
       bounded: Result.length <= 65536
+    end
+
+  -- The media type stated in `Content-Type`; `Unstated` unless `with_content_type` set it.
+  content_type: HTTP_CONTENT_TYPE
+    do
+      Current.ctype
+    end
+
+  -- The same response, stating the media type `t`.
+  with_content_type(t: HTTP_CONTENT_TYPE): HTTP_RESPONSE
+    do
+      { Current with ctype = t }
+    ensure
+      type_set: Result.content_type = t
+      status_same: Result.response_status_code = Current.response_status_code
+      body_same: Result.response_body_length = Current.response_body_length
+      body_text_same: Result.body_string.byte_model = Current.body_string.byte_model
     end
 
   response_body_length: NAT

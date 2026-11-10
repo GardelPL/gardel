@@ -7337,6 +7337,9 @@ fn infer_gardel_type(e: &Expr, m: &ModuleDecl, ctx: &BoogiePreludeCtx) -> Option
         Expr::If(_, _, t, _, f) => {
             infer_gardel_type(t, m, ctx).or_else(|| infer_gardel_type(f, m, ctx))
         }
+        // The type of the first arm whose type is known. The arms' binders are typed first,
+        // by `collect_proc_locals`, so an arm that is a binder has its type.
+        Expr::Match(_, cases) => cases.iter().find_map(|c| infer_gardel_type(&c.body, m, ctx)),
         // A lambda's parameter and result types are annotated.
         Expr::Lambda(ps, ret, _, _) => Some(c11_typed::norm_type(&format!(
             "({}) -> {ret}",
@@ -10679,6 +10682,9 @@ fn collect_proc_locals(
             if let Some(t) = elem_receiver_type(e, m) {
                 elem_env_bind(v, &t);
             }
+            // The binders and locals inside `e` first, so that `let s = match a case Some(x)
+            // then x ... end` finds the type of `x`.
+            collect_proc_locals(&[], e, r, m, out);
             let gty = declared_let_type(stmts, at)
                 .map(ToString::to_string)
                 .or_else(|| boogie_prelude_ctx().and_then(|ctx| infer_gardel_type(e, m, &ctx)));
@@ -10693,7 +10699,6 @@ fn collect_proc_locals(
                 bind_signed_local(v);
             }
             out.push((v.clone(), bty));
-            collect_proc_locals(&[], e, r, m, out);
         }
     }
     match body {

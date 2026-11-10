@@ -119,3 +119,50 @@ match /x/:id x => error NotAPath
 match users users => error NotAPath
 match users /users => no match
 match /:x /1/2/3/4/5/6/7/8/9/10/11/12/13/14/15/16/17 => error TooManySegments
+
+# Requests to GREST_TEST's router (`src/grest_api.gdl`): the status, then the content type
+# and the body when there is one.
+request GET / => 200 text hello
+request HEAD / => 200 text hello
+request GET /users/me => 200 text me
+request GET /users/42 => 200 json {"id":42}
+request GET /users/4%32 => 200 json {"id":42}
+request GET /users/42?x=1 => 200 json {"id":42}
+request GET /users/abc => 400 json {"error":"id is not a number"}
+request GET /users/42/ => 404 json {"error":"not found"}
+request GET /nope => 404 json {"error":"not found"}
+request POST / => 405 json {"error":"method not allowed"}
+request DELETE /users => 405 json {"error":"method not allowed"}
+request POST /users/9 {} => 405 json {"error":"method not allowed"}
+request DELETE /users/7 => 204
+request POST /users {"name":"Ana"} => 201 json {"name":"Ana"}
+request POST /users {"b": 1, "a": [true, null]} => 201 json {"a":[true,null],"b":1}
+request PUT /users/9 {"name":"Bo"} => 200 json {"id":"9","name":"Bo"}
+request PUT /users/9 [1] => 400 json {"error":"the body is not an object"}
+# A body that is not JSON, or none, is a 400 before the handler runs.
+request POST /users => 400 json {"at":0,"error":"invalid JSON body"}
+request POST /users {"name": => 400 json {"at":8,"error":"invalid JSON body"}
+request PUT /users/9 nope => 400 json {"at":0,"error":"invalid JSON body"}
+request POST /users {} {} => 400 json {"at":3,"error":"invalid JSON body"}
+request GET /search?q=a+b => 200 json {"q":"a b"}
+request GET /search?q=%22 => 200 json {"q":"\""}
+request GET /search => 200 json {"q":""}
+request GET /whoami H:X-Name:Ana => 200 text Ana
+request GET /whoami H:x-NAME:Ana => 200 text Ana
+request GET /whoami => 400 json {"error":"no X-Name"}
+# A target that cannot be read is a 400 with its reason.
+request GET /users/%zz => 400 json {"error":"a % is not followed by two hex digits"}
+request GET * => 400 json {"error":"the target is not a path"}
+request GET /%FF => 400 json {"error":"the decoded text is not UTF-8"}
+request GET /1/2/3/4/5/6/7/8/9/10/11/12/13/14/15/16/17 => 400 json {"error":"the path has too many segments"}
+
+# A router names its first pattern that is not valid.
+routes api => valid
+routes broken => invalid [/bad/:]
+
+# Responses as they are sent, each CRLF written `|`: a JSON or text body states its type.
+wire GET /users/42 => HTTP/1.1 200|Content-Type: application/json|Content-Length: 9||{"id":42}
+wire GET / => HTTP/1.1 200|Content-Type: text/plain; charset=utf-8|Content-Length: 5||hello
+wire DELETE /users/7 => HTTP/1.1 204|Content-Length: 0||
+wire GET /taken => HTTP/1.1 409|Content-Type: application/json|Content-Length: 17||{"error":"taken"}
+request GET /taken => 409 json {"error":"taken"}

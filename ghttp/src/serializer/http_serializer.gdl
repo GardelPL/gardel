@@ -6,12 +6,13 @@ feature {ANY}
   serialize_headers_string(resp: HTTP_RESPONSE): STRING
     do
       let status_line = "HTTP/1.1 ".concat(resp.status_digits_string).concat("\r\n")
+      let type_line = resp.content_type.header_line
       let cl_hdr = "Content-Length: ".concat(resp.content_length_header_value).concat("\r\n\r\n")
-      status_line.concat(cl_hdr)
+      status_line.concat(type_line).concat(cl_hdr)
     ensure
-      exact_hdr_len: Result.byte_length = 14 + resp.content_length_digits_len + 20
+      exact_hdr_len: Result.byte_length = 14 + resp.content_type.header_line.byte_length + resp.content_length_digits_len + 20
       min_hdr_len: Result.byte_length >= 35
-      bounded_hdr: Result.byte_length <= 44
+      bounded_hdr: Result.byte_length <= 85
     end
 
   serialize_to_string(resp: HTTP_RESPONSE): STRING
@@ -25,7 +26,7 @@ feature {ANY}
     ensure
       min_wire_len: Result.byte_length >= 35
       at_least_body: Result.byte_length > resp.response_body_length
-      bounded_wire: Result.byte_length <= 65580
+      bounded_wire: Result.byte_length <= 65621
     end
 
   serialize(resp: HTTP_RESPONSE): BYTES
@@ -34,7 +35,7 @@ feature {ANY}
     ensure
       min_wire_len: Result.length >= 35
       at_least_body: Result.length > resp.response_body_length
-      bounded_wire: Result.length <= 65580
+      bounded_wire: Result.length <= 65621
     end
 
 end
