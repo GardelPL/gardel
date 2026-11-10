@@ -1891,15 +1891,17 @@ When a manifest is used:
 
 ### Dependencies
 
-A package lists the packages it uses in `[dependencies]`, and then uses their modules by their bare names, with no import statement. `examples/hello_api` is an HTTP service built on the `ghttp` package:
+A package lists the packages it uses in `[dependencies]`, and then uses their modules by their bare names, with no import statement. `examples/hello_api` is a REST service built on the `grest` package. It lists `ghttp` and `gjson` too, because it names their types (`HTTP_RESPONSE`, `JSON`) and a package sees only the packages it lists:
 
 ```toml
 [project]
 name = "hello-api"
-version = "0.1.0"
+version = "0.2.0"
 
 [dependencies]
+grest = { path = "../../grest" }
 ghttp = { path = "../../ghttp" }
+gjson = { path = "../../gjson" }
 "acme.json" = { path = "../json", as = "J" }   # a dotted name is quoted, and `as` sets the alias
 ```
 

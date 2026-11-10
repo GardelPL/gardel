@@ -390,15 +390,15 @@ What was done:
 
 Client: `examples/hello_api`, moved to `grest`. Needs decisions 5 and 6, and Task F.12.
 
-**Status:** In progress. Step 0, a spike on three earlier findings that would hit `grest`, is done, and so are step 1, the URL layer (2026-11-09), and step 2, requests, responses and routes (2026-11-10). The server and `todo_api` remain.
+**Status:** In progress. Step 0, a spike on three earlier findings that would hit `grest`, is done, and so are step 1, the URL layer (2026-11-09), step 2, requests, responses and routes (2026-11-10), and step 3, the server (2026-11-10). `todo_api` remains.
 
 - [x] Step 0: string literals, a routine as a function value, and `LIST.length` in C.
 - [x] Step 1: Path patterns such as `/users/:id`, and query parsing with percent decoding. A proven limit on segments.
 - [x] Step 2: A route holds its handler. A handler is a pure function from a typed request to a response.
 - [x] Step 2: `REST_REQUEST` gives `param`, `query`, `header` and `json_body`, and `REST_RESPONSE` gives `json`, `text` and status helpers.
 - [x] Step 2: A bad or missing body is a `400` with a JSON error, by default.
-- [ ] `REST_SERVER` holds the connection loop now written by hand in `hello_api`: `init` and `step` are one line each in a client.
-- [ ] Proven server safety, carried over from `ghttp`: connection limit, one answer per request, and a `Close` after an error.
+- [x] Step 3: `REST_SERVER` holds the connection loop now written by hand in `hello_api`: `init` and `step` are one line each in a client.
+- [x] Step 3: Proven server safety, carried over from `ghttp`: connection limit, one answer per request, and a `Close` after an error.
 - [ ] `examples/todo_api`: create, read, update and delete over JSON, with a proven invariant on its state.
 - Acceptance: `hello_api` is little more than routes and handlers, and `todo_api` passes an end-to-end test over real sockets under `--strict`.
 
@@ -449,6 +449,18 @@ Step 2, requests, responses and routes:
   - A `405` has no `Allow` header: `HTTP_RESPONSE` has no headers but `Content-Type` and `Content-Length`.
   - A `HEAD` request gets the `GET` route's body too. The server closes the connection after each answer, so a client is not misled about where the answer ends.
   - A handler in a `module` cannot call a sibling routine (step 0), so handlers live in `functions` and `program` modules.
+
+Step 3, the server:
+
+- **`grest` 0.3.0** adds `REST_SERVER`, a `module` holding `ghttp`'s `HTTP_SERVER_STATE` and a `REST_ROUTER`. A client's `init` is `REST_SERVER.start(args, 8090, routes)` and its `step` is `s.serve(e)`. `start` listens on the port the first argument names, or on the one given. A route whose pattern is not valid (step 2's `invalid_route`) or an argument that is not a port from 1 to 65535 stops the program with exit status 2 and a message, before it listens. `--compare-with` against 0.2.0 reports one addition, the new name.
+- **Proven.** `serve`'s `ensure` is `REST_SERVER.within(Current, e, Result)`, for every state and event: the limit on connections is the same after the step, so with `HTTP_SERVER_STATE`'s invariant the number open never exceeds it; an event about a connection `c` (`Accepted`, `Received`, `SendFailed`, `Closed`) gives no command, `Close(c)`, or `Send(c, _)` then `Close(c)`; any other event gives at most one command, which names no connection. So a request, or bytes that cannot be one, get one answer, an error answer is followed by its `Close`, and no connection hears an answer meant for another. `within` and its parts are defined by their `ensure`, with `match` on `STEP`, `EVENT` and `COMMAND`, so a client can state them too. `start` is proven to stop on an invalid route.
+- **Client.** `examples/hello_api` 0.2.0 is four handlers, a router of four routes (`/`, `/hello`, `/hello/:name` giving JSON, `POST /echo`), and the two lines. Its 101-line connection loop is gone. The socket test in `tests/packages.rs` now checks the `Content-Type` of each answer, the JSON `404` and `405`, and a parameter cut across two writes and decoded.
+- **Tests.** `tests/grest.rs` has a client prove `within`, the `Shutdown` stop, the limit, the invalid-route stop and a fresh server's count through the contracts alone, and refuses four lies in one module: a server that never stops, one that always answers, one never full, and one that starts with any argument. A scripted service checks what the contracts do not: exit status 2 for an invalid route and a bad port, 1 for a failed `Listen`, and, with 65 connections offered, that the 65th is closed and its request not answered, a second request on an answered connection is not answered, and the two connections freed by their answers let a 66th in.
+- **Mutations.** Ten on a private copy, with `hello_api` as the client. All red. Six were caught by the verifier: an answer with no `Close`, a parse error answered with no `Close`, a full server that admits a connection, a `Shutdown` that continues, an invalid route that starts, and two answers to one request. Four were caught by the scripted run, as the contract allows them: a connection kept after its answer (the 66th is never let in), a failed `Listen` ignored, a bad port replaced by the default, and an answer sent to a connection the server never admitted, which the contract allows because it is one answer and a `Close`.
+- **Known limits.**
+  - One request per connection: the connection is closed after its answer, and bytes after the request are dropped. Persistent connections are F.8.
+  - A handler cannot change state. `todo_api` needs one that does: the next step decides how a route reaches a service's own state.
+  - The contract bounds what a step sends, not what it says: that a complete request gets the router's answer, and not only a `Close`, is checked by the scripted and socket tests, not proven.
 
 ### Step 5: Async
 

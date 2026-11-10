@@ -199,3 +199,152 @@ fn a_claim_past_the_statuses_does_not_verify() {
         assert!(all(&out).contains("condition `claim` failed"), "{name} must refuse the claim:\n{}", all(&out));
     }
 }
+
+fn server_client(claims: &str) -> String {
+    format!(
+        "functions CLIENT
+
+feature {{ANY}}
+
+  f(s: REST_SERVER, e: EVENT, args: SEQ[STRING], r: REST_ROUTER): BOOL
+    do
+      True
+    ensure
+{claims}
+    end
+
+end
+"
+    )
+}
+
+/// What a client knows of `REST_SERVER` for every state and event: the limit on connections
+/// holds and never changes, an event about a connection does nothing, closes it, or sends it
+/// one answer and closes it, any other event names no connection, a `Shutdown` stops, and a
+/// router with a pattern that is not valid does not start.
+#[test]
+fn a_client_proves_the_server_safety_through_the_contracts() {
+    let facts = server_client(
+        "      within: REST_SERVER.within(s, e, s.serve(e))
+      stops: e.is_shutdown implies s.serve(e).is_stop
+      limit: s.open_connections <= s.max_connections
+      bad_route: r.invalid_route.is_some implies REST_SERVER.start(args, 8090, r).is_stop
+      fresh: REST_SERVER.make(8090, r).open_connections = 0",
+    );
+    assert_ok(&Project::new("server", &facts).check());
+}
+
+#[test]
+fn a_claim_past_the_server_safety_does_not_verify() {
+    let lies = [
+        // A `Shutdown` stops the server.
+        ("claim_runs", "not s.serve(e).is_stop"),
+        // Most events send nothing.
+        ("claim_answers", "REST_SERVER.commands(s.serve(e)).length = 2"),
+        // A server may be full.
+        ("claim_room", "s.open_connections < s.max_connections"),
+        // An argument that is not a port stops it.
+        ("claim_starts", "r.invalid_route.is_none implies not REST_SERVER.start(args, 8090, r).is_stop"),
+    ];
+    let claims: Vec<String> = lies.iter().map(|(tag, claim)| format!("      {tag}: {claim}")).collect();
+    let out = Project::new("server_lies", &server_client(&claims.join("\n"))).check();
+    assert!(!out.status.success(), "the lies must fail:\n{}", all(&out));
+    for (tag, _) in lies {
+        assert!(all(&out).contains(&format!("condition `{tag}` failed")), "{tag} must be refused:\n{}", all(&out));
+    }
+}
+
+/// A verified service whose routes are `routes`.
+fn service(name: &str, routes: &str) -> Project {
+    let source = format!(
+        "reactive program CLIENT
+
+feature {{ANY}}
+
+  hi(r: REST_REQUEST): HTTP_RESPONSE
+    do
+      REST_RESPONSE.ok_text(\"hi\")
+    end
+
+  routes: REST_ROUTER
+    do
+      {routes}
+    end
+
+  init(args: SEQ[STRING]): STEP[REST_SERVER]
+    do
+      REST_SERVER.start(args, 8090, routes)
+    end
+
+  step(s: REST_SERVER, e: EVENT): STEP[REST_SERVER]
+    do
+      s.serve(e)
+    end
+
+end
+"
+    );
+    let project = Project::new(name, &source);
+    assert_ok(&project.check());
+    project
+}
+
+/// A scripted run of `service`, with `args` and the events `events`.
+fn run_service(service: &Project, args: &[&str], events: &str) -> Output {
+    Command::new(service.dir.join("build/client_bin.exe"))
+        .args(args)
+        .env("GARDEL_EVENTS", events)
+        .output()
+        .expect("the service runs")
+}
+
+/// A router with a pattern that is not valid, or an argument that is not a port, stops the
+/// service before it listens, with exit status 2, and a port it cannot listen on stops it
+/// with exit status 1. A full server closes the next connection it is given and answers none
+/// of its requests, each request gets one answer, and a connection is freed by its answer.
+#[test]
+fn a_service_starts_only_when_it_can_and_keeps_its_limit() {
+    let bad_route = service("bad_route", "REST_ROUTER.empty.on_get(\"/hi\", hi).on_get(\"/bad/:\", hi)");
+    let broken = run_service(&bad_route, &[], "Shutdown");
+    assert_eq!(broken.status.code(), Some(2), "{}", all(&broken));
+    assert!(all(&broken).contains("grest: route pattern is not valid: /bad/:"), "{}", all(&broken));
+    assert!(!all(&broken).contains("net: Listen"), "{}", all(&broken));
+
+    let good = service("good", "REST_ROUTER.empty.on_get(\"/hi\", hi)");
+    let port = run_service(&good, &["99999"], "Shutdown");
+    assert_eq!(port.status.code(), Some(2), "{}", all(&port));
+    assert!(all(&port).contains("grest: not a port: 99999"), "{}", all(&port));
+    let taken = run_service(&good, &[], "ListenFailed:8090:98");
+    assert_eq!(taken.status.code(), Some(1), "{}", all(&taken));
+    assert!(all(&taken).contains("grest: listen failed"), "{}", all(&taken));
+
+    // 65 connections, then a request on each of the last two and two on the first.
+    let request = "GET%20/hi%20HTTP/1.1%0D%0A%0D%0A";
+    let mut events: Vec<String> = (1..=65).map(|c| format!("Accepted:{c}")).collect();
+    events.push(format!("Received:65:{request}"));
+    events.push(format!("Received:64:{request}"));
+    events.push(format!("Received:1:{request}"));
+    events.push(format!("Received:1:{request}"));
+    events.push("Accepted:66".to_string());
+    events.push(format!("Received:66:{request}"));
+    let full = run_service(&good, &["9001"], &events.join(" "));
+    assert_eq!(full.status.code(), Some(0), "{}", all(&full));
+    let net: Vec<String> = String::from_utf8_lossy(&full.stderr).lines().filter(|l| l.starts_with("net: ")).map(str::to_owned).collect();
+    let answer = "HTTP%2F1%2E1%20200%0D%0AContent%2DType%3A%20text%2Fplain%3B%20charset%3Dutf%2D8%0D%0AContent%2DLength%3A%202%0D%0A%0D%0Ahi";
+    let expected = [
+        "net: Listen 9001".to_string(),
+        // The 65th is closed as it arrives, and its request is not answered.
+        "net: Close 65".to_string(),
+        "net: Close 65".to_string(),
+        format!("net: Send 64 {answer}"),
+        "net: Close 64".to_string(),
+        format!("net: Send 1 {answer}"),
+        "net: Close 1".to_string(),
+        // A second request on a connection that was answered is not answered.
+        "net: Close 1".to_string(),
+        // Two connections were freed, so the 66th is served.
+        format!("net: Send 66 {answer}"),
+        "net: Close 66".to_string(),
+    ];
+    assert_eq!(net, expected, "{}", all(&full));
+}

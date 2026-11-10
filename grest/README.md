@@ -1,12 +1,12 @@
 # Gardel REST (`grest`)
 
 A verified REST layer for Gardel, built on `ghttp` and `gjson` in Task F.6 of
-[plan/libraries/verified_libraries.md](../plan/libraries/verified_libraries.md). It is in progress:
-this version has the URL layer, typed requests and responses, and a router whose routes hold their
-handlers. The server loop comes next.
+[plan/libraries/verified_libraries.md](../plan/libraries/verified_libraries.md). It has the URL layer,
+typed requests and responses, a router whose routes hold their handlers, and a server. A service
+is its handlers, its routes and two lines:
 
 ```eiffel
-functions API
+reactive program API
 
 feature {ANY}
 
@@ -30,12 +30,27 @@ feature {ANY}
         .on_json(Post, "/users", add_user)
     end
 
+  init(args: SEQ[STRING]): STEP[REST_SERVER]
+    do
+      REST_SERVER.start(args, 8090, router)
+    end
+
+  step(s: REST_SERVER, e: EVENT): STEP[REST_SERVER]
+    do
+      s.serve(e)
+    end
+
 end
 ```
 
-`router.dispatch(req)` answers an `HTTP_REQUEST`. A handler is a pure function, and a routine's
-name is one. Handlers belong in a `functions` or `program` module: in a `module`, a lambda that calls
-a sibling routine is not yet translated.
+`REST_SERVER.start` listens on the port its first argument names, or on `8090` when there is
+none. A route whose pattern is not valid, or an argument that is not a port, stops the program
+with exit status 2 and a message, before it listens. [`examples/hello_api`](../examples/hello_api)
+is a service of four routes.
+
+A handler is a pure function, and a routine's name is one. Handlers belong in a `functions` or
+`program` module: in a `module`, a lambda that calls a sibling routine is not yet translated.
+`router.dispatch(req)` answers one `HTTP_REQUEST` without a server, as a test may.
 
 A client lists `ghttp` and `gjson` beside `grest` in its `Gardel.toml`, as a package sees only the
 packages it names:
@@ -51,6 +66,7 @@ gjson = { path = "../gjson" }
 
 | Module | What it does |
 | :--- | :--- |
+| `REST_SERVER` | The connections and the router of a service. `start` checks the routes and the port and listens; `serve` is the step for one event. Up to 64 connections are open at once, a request is answered when its bytes are complete, and the connection is closed after the answer. |
 | `REST_ROUTER` | Up to 64 routes, tried in the order they were added. `on_get`, `on_post`, `on_put`, `on_delete` and `on_json` add one. `dispatch` answers a request, and `invalid_route` names the first pattern that is not valid. |
 | `REST_ROUTE` | A method, a pattern and a handler, `(r: REST_REQUEST) -> HTTP_RESPONSE`. `with_json` makes a route whose handler is also given the body as `JSON`. |
 | `REST_REQUEST` | What a handler sees: `method`, `param` and `param_nat` (path parameters), `query`, `header` (ignoring the case of the name), `body`, `json_body`, and the `http` request itself. |
@@ -62,6 +78,11 @@ gjson = { path = "../gjson" }
 | `URL_ERROR` | Why a target was refused, each one a `400`, with a short `reason`. |
 
 ## How a request is answered
+
+`REST_SERVER.serve` admits a connection while fewer than 64 are open, and closes it at once
+otherwise. It gives each connection's bytes to `ghttp`'s parser until they make a request, then
+sends the router's answer and closes the connection. Bytes that cannot be a request are answered
+with `ghttp`'s status for the error (`400`, `413`, `414`, `431`, `501` or `505`, with no body) and the connection is closed.
 
 `REST_ROUTER.dispatch`:
 
@@ -89,6 +110,14 @@ empty one, so it does not match `/users`. Patterns are written decoded.
 - **A match gives one value per parameter.** If `pattern.match_target(t)` is `Some(ps)`, then `ps`
   has exactly `pattern.param_count` entries, never more than 16, and `t` has as many segments as the
   pattern.
+- **Server safety,** for every state and every event, by `serve`'s contract `REST_SERVER.within`:
+  - the limit on connections is the same after a step, and the number open never exceeds it;
+  - an event about a connection does nothing, closes it, or sends it one answer and then closes
+    it, so a request, or bytes that cannot be one, get one answer, and no connection hears an
+    answer meant for another;
+  - any other event names no connection, and a `Shutdown` stops the server.
+
+  `start` does not start a router with a pattern that is not valid.
 - **Statuses.** A target that cannot be read is a `400` whatever the routes. A router with no
   routes answers `404`. `bad_body` and `bad_target` are `400`. `error(st, m)` has the status `st`,
   even when its body cannot be built. `ok_json(v)` is a `200`, or a `500` if `v`'s text is larger
@@ -102,7 +131,10 @@ empty one, so it does not match `/users`. Patterns are written decoded.
 
 `gardelc/tests/grest.rs` checks that a client proves these through the contracts alone, and that
 claims past them are refused: a `404` for every request to an empty router, a `200` for every
-`ok_json`, a route that never answers `400`, and the limits less one.
+`ok_json`, a route that never answers `400`, the limits less one, a server that never stops, one
+that always answers, one that is never full, and one that starts with any argument. It also runs
+a scripted service: a bad route and a bad port stop it with exit status 2, and with 64
+connections open the next is closed and its request is not answered.
 
 ## Tests
 
@@ -125,3 +157,7 @@ Exit code 0 means every case holds. `cargo test --test grest` does both.
 - A `HEAD` request gets the `GET` route's body as well as its headers. The server closes the
   connection after each answer, so a client is not confused about where the answer ends.
 - A response body is at most 64 KiB, `ghttp`'s limit.
+- One request per connection: the connection is closed after its answer, and bytes after the
+  request are dropped. Persistent connections come with `ghttp`'s client (F.8).
+- A handler cannot change the server's state. A service with state of its own, as `todo_api`
+  will be, is the next step.
