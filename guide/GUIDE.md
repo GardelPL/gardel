@@ -1010,6 +1010,30 @@ A -> B
 (x: NAT) -> NAT require small: x < 1000 ensure bounded: Result <= x
 ```
 
+The clauses of a refined type are checked like a routine's contract. On a parameter, the body may apply `f` only within its `require`, and it may use its `ensure`:
+
+```eiffel
+apply_small(f: (x: NAT) -> NAT require small: x < 100 ensure bounded: Result <= x, k: NAT): NAT
+  require
+    k_small: k < 100
+  do
+    f(k)            -- proves `small` for k
+  ensure
+    le: Result <= k -- follows from `bounded`
+  end
+```
+
+A caller proves the `ensure` of what it passes. `apply_small(fn(x: NAT): NAT do x / 2 end, 50)` verifies. `apply_small(fn(x: NAT): NAT do x +% 1 end, 5)` is refused with `f_bounded`: each `ensure` becomes a `require` of the routine, named after the parameter and the clause.
+
+What each position means:
+
+- **A parameter** may have both clauses. Its `ensure` is proven by every caller, and its `require` at every application in the body.
+- **A record field** may have an `ensure`, which becomes an invariant of the record (`handler_le` for a field `handler` and a clause `le`). It is proven where a record is built, so a `make` must take the function at the refined type, not a plain `NAT -> NAT`. In return, `r.handler(x)` has the contract wherever `r` comes from, an element of a list included.
+- **A routine's result** may have an `ensure`, which becomes an `ensure` of the routine (`result_le`).
+- **Anywhere else**, a `let`, a lambda's parameter, a `LIST[...]` or a function type inside another, clauses are `E0321`, as nothing would check them there.
+
+A parameter with a `require` must not reach code that could apply it outside the `require`. It may be applied, or passed to a parameter whose type's `require` implies its own. `let g = f`, returning `f` or storing it is `E0322`. Passing it to `LIST_OPS.map`, whose `A -> B` has no `require`, or to `Some`, is refused by the verifier.
+
 ### Lambda Syntax (`fn`)
 
 Anonymous functions use the `fn` keyword:
@@ -1018,7 +1042,7 @@ Anonymous functions use the `fn` keyword:
 let add_one = fn(x: NAT): NAT do x + 1 end
 ```
 
-A lambda can be applied to any value of its parameter types, so its body is proved for all of them, using what is known where it is created. This one is rejected, because `x + 1` overflows at `NAT.max`. A captured fact counts: `fn(y: U64): U64 do y / z end` verifies where `z > 0` is known, and is rejected with `div_by_zero` otherwise. A lambda passed to a refined function type cannot yet use that type's `require`.
+A lambda can be applied to any value of its parameter types, so its body is proved for all of them, using what is known where it is created. This one is rejected, because `x + 1` overflows at `NAT.max`. A captured fact counts: `fn(y: U64): U64 do y / z end` verifies where `z > 0` is known, and is rejected with `div_by_zero` otherwise. A lambda passed straight to a parameter of a refined function type may also use that type's `require`: `two(fn(a: NAT, b: NAT): NAT do b - a end)` verifies when `two`'s parameter requires `a <= b`.
 
 ### Compile-Time Closure Conversion (Lambda Lifting)
 
@@ -1509,6 +1533,8 @@ When repairing failing Gardel code:
 | `E0318: method_not_in_bound` | `a.less_than(b)` on `K: EQ`, or `a.equals(b)` on a bare `K` | Add or strengthen the bound |
 | `E0319: variant_no_measure` | `variant xs` on a `LIST` or a `STRING` | Use a number (`xs.length`), or a parameter of a sum type |
 | `E0320: unsupported_bound` | `[K: MY_CONCEPT]` | Bound by `EQ`, `CANONICAL_EQ` or `ORD` |
+| `E0321: refined_function_type_position` | `let g: ((x: NAT) -> NAT ensure ...) = ...`, `LIST[(x: NAT) -> NAT ensure ...]`, a `require` on a field | Put the clauses on a parameter, a field or a result; a `require` on a parameter only |
+| `E0322: refined_function_escapes` | `let g = f` or returning `f`, where `f`'s type has a `require` | Apply `f`, or pass it to a parameter whose `require` implies `f`'s |
 
 ---
 

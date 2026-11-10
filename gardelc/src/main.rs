@@ -19,6 +19,7 @@ pub mod manifest;
 mod names;
 mod patterns;
 mod proof_cache;
+mod refined;
 mod resolve;
 pub use c11_typed::emit_c11_typed;
 
@@ -1171,33 +1172,53 @@ impl Parser {
         if *self.peek() == Token::Arrow {
             self.next();
             let ret = self.parse_type()?;
-            let mut req_str = String::new();
-            if self.is_kw("require") {
-                self.next();
-                let mut reqs = Vec::new();
-                while self.is_tagged_pred_start() {
-                    let tag = self.expect_lower_ident()?;
-                    self.expect(Token::Colon)?;
-                    let e = self.parse_expr()?;
-                    reqs.push(format!("{tag}: {}", format_gardel_expr(&e)));
+            let start = self.pos;
+            let (reqs, enss) = self.parse_type_clauses()?;
+            let text = |kw: &str, cs: &[(String, Expr)]| {
+                if cs.is_empty() {
+                    String::new()
+                } else {
+                    let parts: Vec<String> =
+                        cs.iter().map(|(tag, e)| format!("{tag}: {}", format_gardel_expr(e))).collect();
+                    format!(" {kw} {}", parts.join(" "))
                 }
-                req_str = format!(" require {}", reqs.join(" "));
-            }
-            let mut ens_str = String::new();
-            if self.is_kw("ensure") {
-                self.next();
-                let mut enss = Vec::new();
-                while self.is_tagged_pred_start() {
-                    let tag = self.expect_lower_ident()?;
-                    self.expect(Token::Colon)?;
-                    let e = self.parse_expr()?;
-                    enss.push(format!("{tag}: {}", format_gardel_expr(&e)));
+            };
+            let clauses = format!("{}{}", text("require", &reqs), text("ensure", &enss));
+            // The type is kept as text, and its clauses are read back from it (`refined.rs`),
+            // so the text must say exactly what was written.
+            if !clauses.is_empty() {
+                let back = tokenize(&clauses)
+                    .ok()
+                    .and_then(|t| Parser::new(t).parse_type_clauses().ok());
+                if back.as_ref() != Some(&(reqs.clone(), enss.clone())) {
+                    return Err(ParseError {
+                        message: "A clause of this function type is too complex to keep in the type; state it with simpler operators, or name it with a routine".to_string(),
+                        token_pos: start,
+                    });
                 }
-                ens_str = format!(" ensure {}", enss.join(" "));
             }
-            base = format!("{base} -> {ret}{req_str}{ens_str}");
+            base = format!("{base} -> {ret}{clauses}");
         }
         Ok(base)
+    }
+
+    /// The `require` and `ensure` clauses of a refined function type.
+    #[allow(clippy::type_complexity)]
+    pub fn parse_type_clauses(
+        &mut self,
+    ) -> Result<(Vec<(String, Expr)>, Vec<(String, Expr)>), ParseError> {
+        let mut out = (Vec::new(), Vec::new());
+        for (kw, list) in [("require", &mut out.0), ("ensure", &mut out.1)] {
+            if self.is_kw(kw) {
+                self.next();
+                while self.is_tagged_pred_start() {
+                    let tag = self.expect_lower_ident()?;
+                    self.expect(Token::Colon)?;
+                    list.push((tag, self.parse_expr()?));
+                }
+            }
+        }
+        Ok(out)
     }
 
     pub fn parse_file(&mut self) -> Result<FileAst, ParseError> {
@@ -1568,6 +1589,9 @@ impl Parser {
                 ),
                 token_pos: self.pos,
             });
+        }
+        if let Err(message) = refined::desugar_refined_fn_types(&mut m) {
+            return Err(ParseError { message, token_pos: self.pos });
         }
         Ok(m)
     }
@@ -10604,6 +10628,13 @@ fn match_field_instantiation(
     inst
 }
 
+/// The result type of a function type, without the clauses of a refined one.
+fn fn_type_result(ty: &str) -> Option<String> {
+    let (_, ret) = split_top_level_arrow(ty)?;
+    let ret = ret.split(" require ").next()?.split(" ensure ").next()?.trim();
+    Some(ret.to_string())
+}
+
 fn infer_boogie_expr_type(e: &Expr, r: &RoutineDecl, m: &ModuleDecl) -> String {
     match e {
         Expr::Int(_) => "int".to_string(),
@@ -10635,7 +10666,27 @@ fn infer_boogie_expr_type(e: &Expr, r: &RoutineDecl, m: &ModuleDecl) -> String {
                     return map_boogie_type(&cr.ret_type, m);
                 }
             }
+            // Applying a function parameter gives its result type.
+            if let Some(ret) = r
+                .params
+                .iter()
+                .find(|(p, _)| p == fname)
+                .and_then(|(_, t)| fn_type_result(t))
+            {
+                return map_boogie_type(&ret, m);
+            }
             map_boogie_type("Current", m)
+        }
+        Expr::MethodCall(recv, mname, _) if mname == "apply" => {
+            match &**recv {
+                Expr::Var(v) => r
+                    .params
+                    .iter()
+                    .find(|(p, _)| p == v)
+                    .and_then(|(_, t)| fn_type_result(t))
+                    .map_or_else(|| "int".to_string(), |ret| map_boogie_type(&ret, m)),
+                _ => "int".to_string(),
+            }
         }
         Expr::MethodCall(recv, mname, _) => {
             if let Expr::Var(v) = &**recv {
@@ -11345,6 +11396,145 @@ fn emit_local_call_precondition_obligations(
     s
 }
 
+thread_local! {
+    /// The refined function type a lambda is passed to, set just before the obligations of
+    /// that argument and taken by the `Expr::Lambda` arm, which may then assume its `require`.
+    static LAMBDA_EXPECTED: std::cell::RefCell<Option<refined::FnContract>> = const { std::cell::RefCell::new(None) };
+}
+
+/// The declared type of the function that `f` denotes where it is applied: a parameter of `r`,
+/// a typed local or binder, or a field.
+fn applied_fn_type(f: &Expr, r: &RoutineDecl, m: &ModuleDecl) -> Option<String> {
+    match f {
+        Expr::Var(v) => r
+            .params
+            .iter()
+            .find(|(p, _)| p == v)
+            .map(|(_, t)| t.clone())
+            .or_else(|| boogie_env_type(v))
+            .or_else(|| elem_env_type(v)),
+        Expr::MethodCall(recv, field, args) if args.is_empty() => {
+            let ty = concept_receiver_type(recv, m)?;
+            let ctx = boogie_prelude_ctx();
+            let head = type_head(&ty);
+            let owner = if head == m.name { m } else { ctx.as_ref()?.module(head)? };
+            let ReprKind::Product(fields) = &owner.repr else {
+                return None;
+            };
+            fields.iter().find(|(n, _)| n == field).map(|(_, t)| t.clone())
+        }
+        _ => None,
+    }
+}
+
+/// Task F.12: applying `f` to `args` must establish the `require` of `f`'s refined type.
+fn emit_fn_application_obligations(
+    f: &Expr,
+    args: &[Expr],
+    r: &RoutineDecl,
+    m: &ModuleDecl,
+    revealed: &HashSet<String>,
+    pad: &str,
+    strings: &[String],
+) -> String {
+    let Some(c) = applied_fn_type(f, r, m).and_then(|t| refined::fn_contract(&t)) else {
+        return String::new();
+    };
+    if c.params.len() != args.len() {
+        return String::new();
+    }
+    let substs = c.renames(args);
+    let mut s = String::new();
+    for (tag, req) in &c.requires {
+        let inst = subst_expr_vars(req, &substs);
+        s.push_str(&format!(
+            "{pad}assert {{:msg \"{}::require::{tag}\"}} {};\n",
+            r.name,
+            emit_boogie_expr_with_strings(&inst, m, &HashSet::new(), revealed, "DefaultFuel", strings)
+        ));
+    }
+    s
+}
+
+/// The parameters of the routine that the call `e` reaches, when it is known: one of `m`, or
+/// of an injected module.
+fn callee_param_types(e: &Expr, m: &ModuleDecl) -> Option<Vec<(String, String)>> {
+    match e {
+        Expr::Call(f, _) => find_module_routine(m, f).map(|(rd, _)| rd.params.clone()),
+        Expr::MethodCall(recv, mname, _) => {
+            if matches!(&**recv, Expr::Var(v) if v == &m.name) || is_module_typed_receiver(recv, m) {
+                return find_module_routine(m, mname).map(|(rd, _)| rd.params.clone());
+            }
+            let ctx = boogie_prelude_ctx()?;
+            let (pname, rname, _) = prelude_call_target(e, m, &ctx)?;
+            let p = ctx.module(&pname)?;
+            find_module_routine(p, &rname).map(|(rd, _)| rd.params.clone())
+        }
+        _ => None,
+    }
+}
+
+/// The obligations of a call's arguments. Task F.12: a lambda passed where a refined function
+/// type is expected may assume its `require`, and a parameter of `r` whose type has a
+/// `require` may be passed only where the receiving type's `require` implies it.
+#[allow(clippy::too_many_arguments)]
+fn emit_call_arg_obligations(
+    call: &Expr,
+    args: &[Expr],
+    r: &RoutineDecl,
+    m: &ModuleDecl,
+    revealed: &HashSet<String>,
+    indent: usize,
+    strings: &[String],
+) -> String {
+    let pad = " ".repeat(indent);
+    let expected = callee_param_types(call, m);
+    let mut s = String::new();
+    for (i, a) in args.iter().enumerate() {
+        let want = expected
+            .as_ref()
+            .and_then(|ps| ps.get(i))
+            .and_then(|(_, t)| refined::fn_contract(t));
+        if matches!(a, Expr::Lambda(..)) {
+            LAMBDA_EXPECTED.with(|l| *l.borrow_mut() = want.clone().filter(|c| !c.requires.is_empty()));
+        }
+        s.push_str(&emit_boogie_expr_obligations(a, r, m, revealed, indent, strings));
+        LAMBDA_EXPECTED.with(|l| *l.borrow_mut() = None);
+        let Expr::Var(v) = a else {
+            continue;
+        };
+        let Some(have) = r
+            .params
+            .iter()
+            .find(|(p, _)| p == v)
+            .and_then(|(_, t)| refined::fn_contract(t))
+            .filter(|c| !c.requires.is_empty())
+        else {
+            continue;
+        };
+        match refined::require_weakening(&have, want.as_ref(), v) {
+            Some(facts) => {
+                for (tag, fact) in facts {
+                    s.push_str(&format!(
+                        "{pad}assert {{:msg \"{}::require::{v}_{tag}\"}} {};\n",
+                        r.name,
+                        emit_boogie_expr_with_strings(&fact, m, &HashSet::new(), revealed, "DefaultFuel", strings)
+                    ));
+                }
+            }
+            None => {
+                for (tag, _) in &have.requires {
+                    s.push_str(&format!(
+                        "{pad}assert {{:msg \"{}::require::{v}_{tag}\"}} false;\n",
+                        r.name
+                    ));
+                }
+            }
+        }
+    }
+    s
+}
+
 /// True when `recv` is statically known to denote a value of module `m`'s own type.
 fn is_module_typed_receiver(recv: &Expr, m: &ModuleDecl) -> bool {
     if elem_equals_fn(recv, m).is_some() {
@@ -11763,10 +11953,12 @@ fn emit_boogie_expr_obligations(
             s.push_str(&emit_boogie_expr_obligations(
                 recv, r, m, revealed, indent, strings,
             ));
-            for a in args {
-                s.push_str(&emit_boogie_expr_obligations(
-                    a, r, m, revealed, indent, strings,
-                ));
+            s.push_str(&emit_call_arg_obligations(e, args, r, m, revealed, indent, strings));
+            // Applying a function, held or in a field, must establish its type's `require`.
+            if mname == "apply" {
+                s.push_str(&emit_fn_application_obligations(recv, args, r, m, revealed, &pad, strings));
+            } else if let Some(Expr::MethodCall(field, _, _)) = function_field_call(recv, mname, args, m) {
+                s.push_str(&emit_fn_application_obligations(&field, args, r, m, revealed, &pad, strings));
             }
             // Calls into the injected prelude must establish the callee's `require` clauses.
             if let Some(ctx) = boogie_prelude_ctx() {
@@ -11865,9 +12057,16 @@ fn emit_boogie_expr_obligations(
             }
         }
         Expr::Call(fname, args) => {
-            for a in args {
-                s.push_str(&emit_boogie_expr_obligations(
-                    a, r, m, revealed, indent, strings,
+            s.push_str(&emit_call_arg_obligations(e, args, r, m, revealed, indent, strings));
+            if find_module_routine(m, fname).is_none() {
+                s.push_str(&emit_fn_application_obligations(
+                    &Expr::Var(fname.clone()),
+                    args,
+                    r,
+                    m,
+                    revealed,
+                    &pad,
+                    strings,
                 ));
             }
             // Termination of (mutual) recursion within the module.
@@ -12004,6 +12203,11 @@ fn emit_boogie_expr_obligations(
             }
         }
         Expr::Lambda(params, _, stmts, body) => {
+            // Passed where a refined function type is expected, it is applied only within
+            // that type's `require` (Task F.12), so its body may assume it.
+            let expected = LAMBDA_EXPECTED
+                .with(|l| l.borrow_mut().take())
+                .filter(|c| c.params.len() == params.len());
             // A path of its own that stops at the end, so nothing assumed here leaks out.
             let inner_pad = format!("{pad}  ");
             let mut head = String::new();
@@ -12015,6 +12219,13 @@ fn emit_boogie_expr_obligations(
                 head.push_str(&emit_value_assumptions(&fresh, pty, m, &inner_pad));
                 renames.push((pname.clone(), Expr::Var(fresh.clone())));
                 fresh_locals.push((fresh, bty));
+            }
+            if let Some(g) = expected.and_then(|c| {
+                let names: Vec<Expr> = renames.iter().map(|(_, v)| v.clone()).collect();
+                c.guard(&names)
+            }) {
+                let g_bpl = emit_boogie_expr_with_strings(&g, m, &empty_fields, revealed, "DefaultFuel", strings);
+                head.push_str(&format!("{inner_pad}assume {g_bpl};\n"));
             }
             let (l_stmts, l_body) = subst_block(stmts, body, &renames);
             let code = emit_block_obligations(
@@ -13906,6 +14117,7 @@ const VERIFIER_SOURCES: &[(&str, &str)] = &[
     ("names.rs", include_str!("names.rs")),
     ("patterns.rs", include_str!("patterns.rs")),
     ("proof_cache.rs", include_str!("proof_cache.rs")),
+    ("refined.rs", include_str!("refined.rs")),
     ("resolve.rs", include_str!("resolve.rs")),
 ];
 
