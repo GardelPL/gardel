@@ -108,11 +108,23 @@ feature {ANY}
       bounded: Result.byte_length <= 28
     end
 
+  -- The request line without its line break: the method, a space, the target, a space and
+  -- the version.
+  line_text(m: HTTP_METHOD, t: STRING, v: HTTP_VERSION): STRING
+    require
+      target_fits: t.byte_length <= 512
+    do
+      m.to_string.concat(" ").concat(t).concat(" ").concat(v.to_string)
+    ensure
+      len: Result.byte_length = m.to_string.byte_length + t.byte_length + 10
+      bytes: Result.byte_model = m.to_string.byte_model.append(LIST.empty.prepend(32))
+        .append(t.byte_model).append(LIST.empty.prepend(32)).append(v.to_string.byte_model)
+    end
+
   -- The request line, the fields, the framing and the blank line.
   head_text(req: HTTP_REQUEST): STRING
     do
-      let line = req.method.to_string.concat(" ").concat(req.target).concat(" ")
-        .concat(req.version.to_string).concat("\r\n")
+      let line = line_text(req.method, req.target, req.version).concat("\r\n")
       line.concat(fields_text(req.headers.fields)).concat(length_line(req)).concat("\r\n")
     ensure
       bounded: Result.byte_length <= 531 + 73984 + 28 + 2

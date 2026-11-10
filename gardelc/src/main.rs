@@ -8314,6 +8314,14 @@ fn emit_boogie_parts_with_options(
     // which made `forall x. xs.has(x) implies ...` postconditions unprovable.
     out.push_str("axiom (forall<T> x: T :: { Seq_has((Seq_empty() : Seq T), x) } !Seq_has((Seq_empty() : Seq T), x));\n");
     out.push_str("axiom (forall<T> x: T, xs: Seq T, ys: Seq T :: { Seq_append(Seq_prepend(x, xs), ys) } Seq_append(Seq_prepend(x, xs), ys) == Seq_prepend(x, Seq_append(xs, ys)));\n");
+    // An item of an append, and of a tail, by index. `LIST_OPS.at_append` and `at_tail` prove
+    // them from the axioms above, by induction, so `LIST_OPS` itself is verified without them.
+    // Elsewhere they are what lets a proof read the bytes of `a.concat(b)` at an offset.
+    if m.name != "LIST_OPS" {
+        out.push_str("axiom (forall<T> xs: Seq T, ys: Seq T, i: int :: { Seq_at(Seq_append(xs, ys), i) } 0 <= i && i < Seq_length(xs) ==> Seq_at(Seq_append(xs, ys), i) == Seq_at(xs, i));\n");
+        out.push_str("axiom (forall<T> xs: Seq T, ys: Seq T, i: int :: { Seq_at(Seq_append(xs, ys), i) } Seq_length(xs) <= i && i < Seq_length(xs) + Seq_length(ys) ==> Seq_at(Seq_append(xs, ys), i) == Seq_at(ys, i - Seq_length(xs)));\n");
+        out.push_str("axiom (forall<T> xs: Seq T, i: int :: { Seq_at(Seq_tail(xs), i) } 0 <= i && i + 1 < Seq_length(xs) ==> Seq_at(Seq_tail(xs), i) == Seq_at(xs, i + 1));\n");
+    }
     out.push_str(
         "axiom (forall<T> x: T, y: T, xs: Seq T :: { Seq_has(Seq_prepend(y, xs), x) } Seq_has(Seq_prepend(y, xs), x) <==> (x == y || Seq_has(xs, x)));\n",
     );
@@ -9409,7 +9417,10 @@ fn emit_boogie_string_literal_procedures(strings: &[String]) -> String {
             "// \"{}\" desugars to STRING.make_empty(..).push_... (§3.1.4)\n",
             s.escape_debug()
         ));
-        let facts = string_literal_facts(idx, s);
+        // Two lemma procedures, from the same construction: the literal's facts, and its bytes,
+        // which only a procedure that reads bytes calls (see `literal_byte_lemma_calls`).
+        for (suffix, facts) in [("", string_literal_facts(idx, s)), ("_bytes", string_literal_byte_facts(idx, s))] {
+        let ctx_name = format!("{ctx_name}{suffix}");
         // A lemma procedure: its implementation proves the facts below (no `free` clause),
         // and procedures that use literals `call` it to obtain them as proven postconditions.
         out.push_str(&format!("procedure Verify_{ctx_name}()\n"));
@@ -9448,8 +9459,43 @@ fn emit_boogie_string_literal_procedures(strings: &[String]) -> String {
             out.push_str(&format!("  assert {{:msg \"{ctx_name}::{tag}\"}} {f};\n"));
         }
         out.push_str("}\n\n");
+        }
     }
     out
+}
+
+/// The UTF-8 bytes of `s` as a Boogie `Seq` term.
+fn boogie_literal_byte_list(s: &str) -> String {
+    let mut t = "Seq_empty()".to_string();
+    for b in s.bytes().rev() {
+        t = format!("Seq_prepend({b}, {t})");
+    }
+    t
+}
+
+/// The bytes of literal `idx` (`Verify_string_literal_idx_bytes`), which let a proof reason
+/// about the wire form of a literal, such as that `"GET"` holds no space. They are a lemma of
+/// their own: given to every procedure, the byte lists of a module with many literals made
+/// `hello_api` take twice as long to verify.
+fn string_literal_byte_facts(idx: usize, s: &str) -> Vec<(&'static str, String)> {
+    vec![(
+        "ensure::byte_model",
+        format!(
+            "STRING__fn_byte_model(DefaultFuel, str_lit_{idx}) == {}",
+            boogie_literal_byte_list(s)
+        ),
+    )]
+}
+
+/// Calls of the byte lemmas of every literal, for a procedure whose Boogie text `body` reads
+/// the bytes of a string, or nothing.
+fn literal_byte_lemma_calls(strings: &[String], body: &str) -> String {
+    if !prelude_string_mode() || !(body.contains("fn_to_utf8") || body.contains("fn_byte_model")) {
+        return String::new();
+    }
+    (0..strings.len())
+        .map(|idx| format!("  call Verify_string_literal_{idx}_bytes();\n"))
+        .collect()
 }
 
 /// The proven facts of literal `idx` (`Verify_string_literal_idx` postconditions): the
@@ -9831,6 +9877,7 @@ fn emit_boogie_verify_routine(
     let mut locals = Vec::new();
     collect_proc_locals(&r.stmts, &r.body, r, m, &mut locals);
     let mut code = emit_string_literal_lemma_calls(strings);
+    code.push_str("  //LITERAL_BYTE_LEMMAS_MARKER\n");
     for (_, req_e) in &r.requires {
         code.push_str(&emit_from_scalar_obligation(
             req_e, &r.name, m, &revealed, "  ", strings,
@@ -9885,7 +9932,8 @@ fn emit_boogie_verify_routine(
     }
 
     s.push_str("}\n\n");
-    s
+    let calls = literal_byte_lemma_calls(strings, &s);
+    s.replace("  //LITERAL_BYTE_LEMMAS_MARKER\n", &calls)
 }
 
 fn emit_boogie_verify_law(
@@ -9949,6 +9997,7 @@ fn emit_boogie_verify_law(
     }
     s.push_str("{\n");
     s.push_str(&emit_string_literal_lemma_calls(strings));
+    s.push_str("  //LITERAL_BYTE_LEMMAS_MARKER\n");
     let law_ctx = format!("{vis_prefix}{}", law.name);
     for (_, req_e) in &law.requires {
         s.push_str(&emit_from_scalar_obligation(
@@ -10051,6 +10100,8 @@ fn emit_boogie_verify_law(
     {
         params.insert(0, format!("Current: {}", map_boogie_type("Current", m)));
     }
+    let calls = literal_byte_lemma_calls(strings, &s);
+    let s = s.replace("  //LITERAL_BYTE_LEMMAS_MARKER\n", &calls);
     if canonical_where_guard(m, vis).is_none() {
         return format!(
             "procedure Verify_law_{vis_prefix}{}{tp_quant}({})\n{s}",
@@ -26565,8 +26616,12 @@ end
                 );
             }
         }
+        // The literal's two lemmas, its facts and its bytes (F.8), each reveal it once.
         let triggers = bpl.matches(&format!("str_lit_{hi}_defined(true)")).count();
-        assert_eq!(triggers, 1, "only the literal's lemma may reveal its definition");
+        assert_eq!(triggers, 2, "only the literal's lemmas may reveal its definition");
+        assert!(bpl.contains(&format!(
+            "assert {{:msg \"string_literal_{hi}_bytes::ensure::byte_model\"}} STRING__fn_byte_model(DefaultFuel, str_lit_{hi}) == Seq_prepend(104, Seq_prepend(105, Seq_empty()));"
+        )));
         // Each literal's invariant and chars model is a proof obligation of its own.
         assert!(bpl.contains(&format!("procedure Verify_string_literal_{hi}()")));
         assert!(bpl.contains(&format!(

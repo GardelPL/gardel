@@ -691,6 +691,31 @@ specify {ANY}
       shifted: LIST_OPS.at(list_drop(xs, n), i) = LIST_OPS.at(xs, n + i)
     end
 
+  -- An item of a slice is the item of the whole at the slice's offset. With its trigger the
+  -- solver applies it wherever a slice is indexed, as in `b.slice(lo, hi).at(k)`.
+  law slice_at[A](xs: LIST[A], lo: NAT, n: NAT, k: NAT)
+    require
+      fits: lo + n <= xs.length
+      in_bounds: k < n
+    trigger
+      LIST_OPS.at(list_take(list_drop(xs, lo), n), k)
+    variant
+      lo + k
+    do
+      if lo > 0 then
+        list_drop(xs, lo) = list_drop(xs.tail, lo - 1) and xs.tail.prepend(xs.head) = xs and
+        slice_at(xs.tail, lo - 1, n, k)
+      else if k > 0 then
+        list_drop(xs, 0) = xs and list_drop(xs.tail, 0) = xs.tail and
+        list_take(xs, n) = list_take(xs.tail, n - 1).prepend(xs.head) and
+        xs.tail.prepend(xs.head) = xs and slice_at(xs.tail, 0, n - 1, k - 1)
+      else
+        list_drop(xs, 0) = xs and list_take(xs, n) = list_take(xs.tail, n - 1).prepend(xs.head)
+      end end
+    ensure
+      same: LIST_OPS.at(list_take(list_drop(xs, lo), n), k) = LIST_OPS.at(xs, lo + k)
+    end
+
   law take_drop[A](xs: LIST[A], n: NAT)
     require
       fits: n <= xs.length
@@ -704,6 +729,28 @@ specify {ANY}
       end
     ensure
       whole: list_take(xs, n).append(list_drop(xs, n)) = xs
+    end
+
+  -- Lists of one length that agree at every index are the same list.
+  law same_items[A](xs: LIST[A], ys: LIST[A])
+    require
+      same_length: xs.length = ys.length
+      fits: xs.length < 18446744073709551615
+      same_at: forall k: NAT. k < xs.length implies LIST_OPS.at(xs, k) = LIST_OPS.at(ys, k)
+    variant
+      xs.length
+    do
+      if xs.length = 0 then
+        True
+      else
+        xs.tail.prepend(xs.head) = xs and ys.tail.prepend(ys.head) = ys and
+        LIST_OPS.at(xs, 0) = LIST_OPS.at(ys, 0) and
+        (forall k: NAT. k < xs.tail.length implies LIST_OPS.at(xs.tail, k) = LIST_OPS.at(xs, k + 1)) and
+        (forall k: NAT. k < ys.tail.length implies LIST_OPS.at(ys.tail, k) = LIST_OPS.at(ys, k + 1)) and
+        same_items(xs.tail, ys.tail)
+      end
+    ensure
+      equal: xs = ys
     end
 
   law less_irreflexive(xs: LIST[U64])

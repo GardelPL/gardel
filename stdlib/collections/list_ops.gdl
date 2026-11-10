@@ -112,6 +112,40 @@ specify {ANY}
       chains: LIST_OPS.fold_right(xs.append(ys), f, init) = LIST_OPS.fold_right(xs, f, LIST_OPS.fold_right(ys, f, init))
     end
 
+  -- An item of `xs.append(ys)`: one of `xs`, then one of `ys`. With its trigger the solver
+  -- applies it wherever an append is indexed.
+  law at_append[A](xs: LIST[A], ys: LIST[A], k: NAT)
+    require
+      inside: k < xs.length + ys.length
+    trigger
+      LIST_OPS.at(xs.append(ys), k)
+    variant
+      xs.length
+    do
+      if xs.length = 0 then
+        True
+      else if k = 0 then
+        xs.tail.prepend(xs.head) = xs
+      else
+        xs.tail.prepend(xs.head) = xs and at_append(xs.tail, ys, k - 1)
+      end end
+    ensure
+      left: k < xs.length implies LIST_OPS.at(xs.append(ys), k) = LIST_OPS.at(xs, k)
+      right: k >= xs.length implies LIST_OPS.at(xs.append(ys), k) = LIST_OPS.at(ys, k - xs.length)
+    end
+
+  -- An item of the tail is the next item of the list.
+  law at_tail[A](xs: LIST[A], k: NAT)
+    require
+      inside: k + 1 < xs.length
+    trigger
+      LIST_OPS.at(xs.tail, k)
+    do
+      xs.tail.prepend(xs.head) = xs
+    ensure
+      next: LIST_OPS.at(xs.tail, k) = LIST_OPS.at(xs, k + 1)
+    end
+
   law fold_map_fusion[A, B, C](xs: LIST[A], g: A -> B, f: (acc: C, b: B) -> C, init: C)
     ensure
       fused: LIST_OPS.fold_left(LIST_OPS.map(xs, g), f, init) =

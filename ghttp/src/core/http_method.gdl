@@ -112,5 +112,20 @@ specify {ANY}
       no_body: m.is_safe implies not m.allows_request_body
     end
 
+  -- What a request line needs of a method's spelling: no space in it, so the first space
+  -- of a line ends it, and no two methods spelled alike, so it reads back as itself.
+  law wire_no_space(m: HTTP_METHOD)
+    ensure
+      no_space: forall k: NAT. k < m.to_string.byte_length implies
+        LIST_OPS.at(m.to_string.byte_model, k) != 32
+    end
+
+  law wire_distinct(a: HTTP_METHOD, b: HTTP_METHOD)
+    require
+      different: a != b
+    ensure
+      spelled_apart: a.to_string.byte_model != b.to_string.byte_model
+    end
+
 end
 
