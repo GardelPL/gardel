@@ -46,3 +46,52 @@ POST /x HTTP/1.1\r\nContent-Length: 1\r\nContent-Length: 2\r\n\r\nab => failed C
 POST /x HTTP/1.1\r\nContent-Length: -1\r\n\r\n => failed ContentLengthInvalid
 POST /x HTTP/1.1\r\nContent-Length: 99999\r\n\r\n => failed BodyTooLarge
 GET / HTTP/1.1\r\nContent-Length: 3\r\n\r\nabc => failed BodyNotAllowed
+
+# The request writer (F.8). `write <request> => <bytes>`: the request is parsed, its own
+# framing fields are dropped, and it must be written as exactly these bytes, which must
+# parse back to it. Every request accepted above is also written and parsed back.
+write GET /a HTTP/1.1\r\nHost: x\r\nAccept: */*\r\n\r\n => GET /a HTTP/1.1\r\nHost: x\r\nAccept: */*\r\n\r\n
+write POST /users HTTP/1.1\r\nHost: x\r\nContent-Length: 2\r\n\r\nhi => POST /users HTTP/1.1\r\nHost: x\r\nContent-Length: 2\r\n\r\nhi
+write POST /p HTTP/1.1\r\n\r\n => POST /p HTTP/1.1\r\nContent-Length: 0\r\n\r\n
+write PUT /a?b=1 HTTP/1.0\r\ncontent-length:  5 \r\nX-A:\tb\r\n\r\nhello => PUT /a?b=1 HTTP/1.0\r\nX-A: b\r\nContent-Length: 5\r\n\r\nhello
+write DELETE /users/42 HTTP/1.1\r\n\r\n => DELETE /users/42 HTTP/1.1\r\n\r\n
+
+# The response reader (F.8). `response <method> <bytes> => <what>` reads the answer to a
+# request with that method; `closed` lines then close the connection. Each is read whole and
+# cut into two reads at every byte. A response shows as `<code> <version> headers <n> body
+# [...] rest [...]`.
+response GET HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nhi => 200 HTTP/1.1 headers 1 body [hi] rest []
+response GET HTTP/1.1 200\r\nContent-Length: 0\r\n\r\n => 200 HTTP/1.1 headers 1 body [] rest []
+response GET HTTP/1.1 201 Created\r\nContent-Type: application/json\r\nContent-Length: 7\r\n\r\n{"a":1} => 201 HTTP/1.1 headers 2 body [{"a":1}] rest []
+response GET HTTP/1.0 404 Not Found\r\nContent-Length: 3\r\n\r\nno!extra => 404 HTTP/1.0 headers 1 body [no!] rest [extra]
+response GET HTTP/1.1 200 OK\r\ncontent-length:  4 \r\n\r\nabcd => 200 HTTP/1.1 headers 1 body [abcd] rest []
+
+# No body, whatever is declared: the answer to a HEAD, and a 1xx, 204 or 304.
+response HEAD HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\n => 200 HTTP/1.1 headers 1 body [] rest []
+response GET HTTP/1.1 204 No Content\r\n\r\n => 204 HTTP/1.1 headers 0 body [] rest []
+response GET HTTP/1.1 304 Not Modified\r\nContent-Length: 9\r\n\r\n => 304 HTTP/1.1 headers 1 body [] rest []
+response GET HTTP/1.1 100 Continue\r\n\r\n => 100 HTTP/1.1 headers 0 body [] rest []
+
+# Not complete yet, and a body with no length, which runs to the close.
+response GET HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\nab => more 40
+response GET HTTP/1.1 200 OK\r\n\r\nuntil close => more 30
+response GET HTTP/1.1 200 OK\r\nConte => more 22
+closed GET HTTP/1.1 200 OK\r\n\r\nuntil close => 200 HTTP/1.1 headers 0 body [until close] rest []
+closed GET HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nhi => 200 HTTP/1.1 headers 1 body [hi] rest []
+closed GET HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\nab => failed IncompleteResponse
+closed GET HTTP/1.1 200 OK\r\nConte => failed IncompleteResponse
+closed GET HTTP/1.1 2 => failed IncompleteResponse
+
+# Refused.
+response GET HTTP/2 200\r\n\r\n => failed MalformedStatusLine
+response GET HTTP/2.0 200 OK\r\n\r\n => failed UnsupportedVersion
+response GET http/1.1 200 OK\r\n\r\n => failed MalformedStatusLine
+response GET HTTP/1.1 600 Odd\r\n\r\n => failed MalformedStatusLine
+response GET HTTP/1.1 099 Odd\r\n\r\n => failed MalformedStatusLine
+response GET HTTP/1.1 20 OK\r\n\r\n => failed MalformedStatusLine
+response GET HTTP/1.1 2000\r\n\r\n => failed MalformedStatusLine
+response GET HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n => failed UnsupportedTransferEncoding
+response GET HTTP/1.1 200 OK\r\nContent-Length: 1\r\nTransfer-Encoding: chunked\r\n\r\n => failed ConflictingFraming
+response GET HTTP/1.1 200 OK\r\nContent-Length: x\r\n\r\n => failed ContentLengthInvalid
+response GET HTTP/1.1 200 OK\r\nContent-Length: 1\r\nContent-Length: 2\r\n\r\nab => failed ConflictingFraming
+response GET HTTP/1.1 200 OK\r\nBad name: x\r\n\r\n => failed MalformedHeader

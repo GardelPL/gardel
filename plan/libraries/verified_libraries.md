@@ -517,7 +517,13 @@ What was done:
 
 Needs decisions 7 and 8.
 
-- [ ] `HTTP_CLIENT`: serialize a request and parse a response incrementally, reusing F.5's framing.
+**Status:** In progress. Step 1, the client side of `ghttp` (0.5.0), has its writer and its response reader (2026-11-10); the round-trip proof is next. Steps: 1, the client in `ghttp`; 2, persistent connections; 3, async handlers in `grest`; 4, `examples/api_gateway`.
+
+- [x] `HTTP_CLIENT`: serialize a request and parse a response incrementally, reusing F.5's framing. Done as `HTTP_REQUEST_WRITER` and `HTTP_RESPONSE_PARSER`:
+  - The writer writes only what `sendable` accepts, so that a request reads back as itself: an origin-form target of printable ASCII; token field names; field values with no control byte but tab and no space or tab at either end, as a parser trims them; and no `Content-Length` or `Transfer-Encoding`, since the writer frames the body itself. It is a test a client makes before sending, not a proof obligation on its callers' data. `HTTP_HEADER.make` still accepts any text, which a server never sends: a field is checked where it would reach the wire.
+  - The reader keeps the request parser's contract (`faithful`, `keeps_bytes`). A mutation that hands the body back as remaining bytes fails five obligations. The response is a new type, `HTTP_CLIENT_RESPONSE`, because `HTTP_RESPONSE` holds a UTF-8 body and no fields but its media type, which suits a server building one and not a client receiving one.
+  - Chunked transfer coding is refused, as on the server, so the reader serves upstreams that send `Content-Length` or close after the body, which `grest` and `ghttp` do. A 1xx is taken as a whole response with no body: a client that sends no `Expect` should not get one.
+  - Tests: every request `cases.txt` accepts is written without its framing and parsed back; a writer that sends the fields in reverse order fails the first case with two fields. 29 response lines, each read whole and cut at every byte.
 - [ ] Prove that parsing a serialized request gives the same request, moved here from F.5.
 - [ ] Persistent connections, moved here from F.5's known limits, on the server and the client. The server serves `Complete`'s remainder as the next request instead of closing. It closes after `Connection: close`, and by default after an HTTP/1.0 request. An idle timeout and a cap on requests per connection keep one client from holding a connection forever. Prove that each connection has at most one answer outstanding and that the cap holds.
 - [ ] Handlers return `Reply` or `Await`, with a tag and a timeout. A pure handler stays usable unchanged.

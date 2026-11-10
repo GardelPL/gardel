@@ -104,6 +104,14 @@ feature {ANY}
       none_when_empty: Current.has_no_headers implies Result.is_none
     end
 
+  -- The fields, the one added last first.
+  fields: LIST[HTTP_HEADER]
+    do
+      Current.items
+    ensure
+      count: Result.length = Current.num_headers
+    end
+
   -- The value of the field named `key`, ignoring case, or "" when there is none.
   value_of(key: STRING): STRING
     do

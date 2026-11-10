@@ -1,0 +1,132 @@
+-- Writes a request as HTTP/1.1 bytes (RFC 9112), for a client.
+--
+-- Only a request that reads back as itself is written, and `sendable` says which: its target
+-- is an origin form of printable ASCII, its field names are tokens, its field values hold no
+-- control byte other than tab and no space or tab at either end, and it states no
+-- `Content-Length` or `Transfer-Encoding` of its own, as the writer frames the body. Fields
+-- go out in the order they were added. A `POST`, a `PUT` and any request with a body get a
+-- `Content-Length`; other requests get none.
+functions HTTP_REQUEST_WRITER
+
+feature {ANY}
+
+  -- An origin form: `/` and then printable ASCII, with no space.
+  target_ok(t: STRING): BOOL
+    do
+      let b = t.to_utf8
+      if b.length = 0 then
+        False
+      else if b.at(0) != 47 then
+        False
+      else
+        HTTP_HEAD_PARSER.all_visible(b, 0, b.length)
+      end end
+    end
+
+  -- A space or a tab, which a parser takes off both ends of a field value.
+  is_ows(b: U64): BOOL
+    do
+      b = 32 or b = 9
+    end
+
+  -- A field that reads back as itself, and that does not frame the body.
+  field_ok(h: HTTP_HEADER): BOOL
+    do
+      let n = h.name.to_utf8
+      let v = h.value.to_utf8
+      if not HTTP_HEAD_PARSER.is_token(n, 0) then
+        False
+      else if HTTP_HEAD_PARSER.ascii_equal_ci(n, "content-length".to_utf8, 0) then
+        False
+      else if HTTP_HEAD_PARSER.ascii_equal_ci(n, "transfer-encoding".to_utf8, 0) then
+        False
+      else if not HTTP_HEAD_PARSER.all_field_bytes(v, 0, v.length) then
+        False
+      else if v.length = 0 then
+        True
+      else
+        not (is_ows(v.at(0)) or is_ows(v.at(v.length - 1)))
+      end end end end end
+    end
+
+  fields_ok(hs: LIST[HTTP_HEADER]): BOOL
+    variant
+      hs.length
+    do
+      if hs.length = 0 then
+        True
+      else if field_ok(hs.head) then
+        fields_ok(hs.tail)
+      else
+        False
+      end end
+    end
+
+  -- Whether `req` can be written so that it reads back as itself.
+  sendable(req: HTTP_REQUEST): BOOL
+    do
+      target_ok(req.target) and fields_ok(req.headers.fields)
+    end
+
+  -- Whether `req` is sent with a `Content-Length`.
+  needs_length(req: HTTP_REQUEST): BOOL
+    do
+      req.request_body_length > 0 or req.method.allows_request_body
+    end
+
+  -- The lines of `hs`, which holds the field added last first, in the order they were added.
+  fields_text(hs: LIST[HTTP_HEADER]): STRING
+    require
+      few: hs.length <= 64
+    variant
+      hs.length
+    do
+      if hs.length = 0 then
+        ""
+      else
+        let before = fields_text(hs.tail)
+        before.concat(hs.head.serialize_line)
+      end
+    ensure
+      bounded: Result.byte_length <= 1156 * hs.length
+    end
+
+  -- `Content-Length: <n>` and its line break, or "" when `req` is sent without one.
+  length_line(req: HTTP_REQUEST): STRING
+    do
+      if needs_length(req) then
+        let digits = NUMBER_TEXT.nat_to_text(req.request_body_length)
+        if digits.byte_length <= 10 then
+          "Content-Length: ".concat(digits).concat("\r\n")
+        else
+          "Content-Length: 0\r\n"
+        end
+      else
+        ""
+      end
+    ensure
+      bounded: Result.byte_length <= 28
+    end
+
+  -- The request line, the fields, the framing and the blank line.
+  head_text(req: HTTP_REQUEST): STRING
+    do
+      let line = req.method.to_string.concat(" ").concat(req.target).concat(" ")
+        .concat(req.version.to_string).concat("\r\n")
+      line.concat(fields_text(req.headers.fields)).concat(length_line(req)).concat("\r\n")
+    ensure
+      bounded: Result.byte_length <= 531 + 73984 + 28 + 2
+    end
+
+  -- `req` on the wire: its head, then its body.
+  serialize(req: HTTP_REQUEST): BYTES
+    require
+      sendable: HTTP_REQUEST_WRITER.sendable(req)
+    do
+      HTTP_REQUEST_WRITER.head_text(req).to_utf8.concat(req.body)
+    ensure
+      exact: Result.length = HTTP_REQUEST_WRITER.head_text(req).byte_length + req.request_body_length
+      bounded: Result.length <= 74545 + 65536
+    end
+
+end

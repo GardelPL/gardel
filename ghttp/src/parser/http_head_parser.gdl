@@ -103,10 +103,27 @@ feature {ANY}
       end
     end
 
-  -- The header lines from `pos` up to the blank line at `he`.
-  -- `cl` is the `Content-Length` seen so far, and `te` whether `Transfer-Encoding` was.
+  -- The head of a request: its request line `line`, and the header lines from `pos` up to
+  -- the blank line at `he`.
   parse_fields(buf: BYTES, line: HTTP_REQUEST, pos: NAT, he: NAT,
                hs: HTTP_HEADERS, cl: OPTION[NAT], te: BOOL): RESULT[HTTP_ERROR, HTTP_HEAD]
+    require
+      in_buf: he + 4 <= buf.length
+      not_past: pos <= he + 2
+    do
+      match fields(buf, pos, he, hs, cl, te)
+        case Error(e) then Error(e)
+        case Ok(f) then
+          match f
+            case ParsedFields(got, c, t) then Ok(ParsedHead(line.with_headers(got), c, t))
+          end
+      end
+    end
+
+  -- The header lines from `pos` up to the blank line at `he`, added to `hs`.
+  -- `cl` is the `Content-Length` seen so far, and `te` whether `Transfer-Encoding` was.
+  fields(buf: BYTES, pos: NAT, he: NAT,
+         hs: HTTP_HEADERS, cl: OPTION[NAT], te: BOOL): RESULT[HTTP_ERROR, HTTP_FIELDS]
     require
       in_buf: he + 4 <= buf.length
       not_past: pos <= he + 2
@@ -114,7 +131,7 @@ feature {ANY}
       he + 2 - pos
     do
       if pos = he + 2 then
-        Ok(ParsedHead(line.with_headers(hs), cl, te))
+        Ok(ParsedFields(hs, cl, te))
       else
         match buf.index_of("\r\n".to_utf8, pos)
           case None then
@@ -139,13 +156,13 @@ feature {ANY}
                         if cl.is_some and cl.get != n then
                           Error(ConflictingFraming)
                         else
-                          parse_fields(buf, line, e + 2, he, next_hs, Some(n), te)
+                          fields(buf, e + 2, he, next_hs, Some(n), te)
                         end
                     end
                   else if ascii_equal_ci(h.name.to_utf8, "transfer-encoding".to_utf8, 0) then
-                    parse_fields(buf, line, e + 2, he, next_hs, cl, True)
+                    fields(buf, e + 2, he, next_hs, cl, True)
                   else
-                    parse_fields(buf, line, e + 2, he, next_hs, cl, te)
+                    fields(buf, e + 2, he, next_hs, cl, te)
                   end end
               end
             end end

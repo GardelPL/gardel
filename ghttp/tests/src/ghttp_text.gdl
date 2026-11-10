@@ -26,6 +26,8 @@ feature {ANY}
         case ContentLengthInvalid then "ContentLengthInvalid"
         case BodyTooLarge then "BodyTooLarge"
         case BodyNotAllowed then "BodyNotAllowed"
+        case MalformedStatusLine then "MalformedStatusLine"
+        case IncompleteResponse then "IncompleteResponse"
       end
     end
 
@@ -119,12 +121,209 @@ feature {ANY}
       if c = 114 then 13 else if c = 110 then 10 else if c = 116 then 9 else c end end end
     end
 
+  -- A `Content-Length` or `Transfer-Encoding` field, which the writer adds itself.
+  frames(h: HTTP_HEADER): BOOL
+    do
+      HTTP_HEAD_PARSER.ascii_equal_ci(h.name.to_utf8, "content-length".to_utf8, 0) or
+      HTTP_HEAD_PARSER.ascii_equal_ci(h.name.to_utf8, "transfer-encoding".to_utf8, 0)
+    end
+
+  -- The fields of `hs`, the last added first, without those that frame a body, as headers
+  -- added in the same order.
+  unframed(hs: LIST[HTTP_HEADER]): HTTP_HEADERS
+    variant
+      hs.length
+    do
+      if hs.length = 0 then
+        HTTP_HEADERS.default_empty
+      else
+        let rest = unframed(hs.tail)
+        if frames(hs.head) or not rest.has_header_room then rest else rest.add(hs.head) end
+      end
+    end
+
+  -- `q` as a client would send it: its own fields, with no framing.
+  rewritten(q: HTTP_REQUEST): HTTP_REQUEST
+    do
+      q.with_headers(unframed(q.headers.fields))
+    end
+
+  -- The same fields, in the same order.
+  same_fields(a: LIST[HTTP_HEADER], b: LIST[HTTP_HEADER]): BOOL
+    variant
+      a.length
+    do
+      if a.length = 0 then
+        b.length = 0
+      else if b.length = 0 then
+        False
+      else if a.head.equals(b.head) then
+        same_fields(a.tail, b.tail)
+      else
+        False
+      end end end
+    end
+
+  -- Whether `q`, written, parses back as `q`: the same method, target, version, fields and
+  -- body, a `Content-Length` when the writer adds one, and nothing after it.
+  reads_back(q: HTTP_REQUEST): BOOL
+    do
+      if not HTTP_REQUEST_WRITER.sendable(q) then
+        False
+      else
+        match HTTP_PARSER.parse(HTTP_REQUEST_WRITER.serialize(q))
+          case Complete(r, rest) then
+            let framing = if HTTP_REQUEST_WRITER.needs_length(q) then 1 else 0 end
+            rest.length = 0 and r.method = q.method and r.target.equals(q.target) and
+            r.version = q.version and r.body.equals(q.body) and
+            r.request_header_count = q.request_header_count + framing and
+            same_fields(unframed(r.headers.fields).fields, q.headers.fields)
+          case _ then
+            False
+        end
+      end
+    end
+
+  -- 0 if `raw` parses to a request that, without its framing, is written as `wire` and reads
+  -- back as itself, else 4.
+  check_write(raw: BYTES, wire: BYTES): NAT
+    do
+      match HTTP_PARSER.parse(raw)
+        case Complete(q, _) then
+          let c = rewritten(q)
+          if not HTTP_REQUEST_WRITER.sendable(c) then
+            4
+          else if not HTTP_REQUEST_WRITER.serialize(c).equals(wire) then
+            4
+          else if not reads_back(c) then
+            4
+          else
+            0
+          end end end
+        case _ then
+          4
+      end
+    end
+
+  -- Everything a response reading says, as text.
+  describe_response(r: HTTP_RESPONSE_PARSE_RESULT): STRING
+    do
+      match r
+        case NeedMoreResponse(s) then
+          join("more ", NUMBER_TEXT.nat_to_text(s.buffered_bytes))
+        case CompleteResponse(q, rest) then
+          let line = join(join(NUMBER_TEXT.nat_to_text(q.status_code), " "), q.version.to_string)
+          let hs = join(" headers ", NUMBER_TEXT.nat_to_text(q.header_count))
+          let body = join(join(" body [", text_of(q.body)), "]")
+          join(join(join(join(line, hs), body), " rest ["), join(text_of(rest), "]"))
+        case FailedResponse(e) then
+          join("failed ", error_name(e))
+      end
+    end
+
+  -- The answer to a request with the method `m`, read as `first` then `second`, and then the
+  -- end of the connection when `closed`.
+  read_response(m: HTTP_METHOD, first: BYTES, second: BYTES, closed: BOOL): HTTP_RESPONSE_PARSE_RESULT
+    do
+      let once = match HTTP_RESPONSE_PARSER.feed(HTTP_RESPONSE_READER.for_method(m), first)
+        case NeedMoreResponse(s) then
+          if second.length = 0 then NeedMoreResponse(s) else HTTP_RESPONSE_PARSER.feed(s, second) end
+        case CompleteResponse(q, rest) then
+          if rest.length <= 1000000 and second.length <= 1000000 then CompleteResponse(q, rest.concat(second)) else CompleteResponse(q, rest) end
+        case FailedResponse(e) then
+          FailedResponse(e)
+      end
+      if closed then
+        match once
+          case NeedMoreResponse(s) then HTTP_RESPONSE_PARSER.finish(s)
+          case _ then once
+        end
+      else
+        once
+      end
+    end
+
+  -- 0 if every cut of `raw` at `k` or after reads as `whole`, else the first that does not.
+  first_bad_response_split(m: HTTP_METHOD, raw: BYTES, closed: BOOL, whole: STRING, k: NAT): NAT
+    require
+      from_one: k >= 1
+      inside: k <= raw.length
+    variant
+      raw.length - k
+    do
+      let got = describe_response(read_response(m, raw.slice(0, k), raw.slice(k, raw.length), closed))
+      if not got.equals(whole) then
+        k
+      else
+        if k = raw.length then 0 else first_bad_response_split(m, raw, closed, whole, k + 1) end
+      end
+    end
+
+  -- 0 if the answer to `m`, `raw`, read whole and cut at every byte, then closed when
+  -- `closed`, says `expected`; else 5.
+  check_read(m: HTTP_METHOD, raw: BYTES, expected: STRING, closed: BOOL): NAT
+    do
+      let whole = describe_response(read_response(m, raw, BYTES.empty, closed))
+      if not whole.equals(expected) then
+        5
+      else if raw.length > 0 and first_bad_response_split(m, raw, closed, whole, 1) != 0 then
+        5
+      else
+        0
+      end end
+    end
+
+  -- `check_read` of the line `rest`, whose method ends at `sp` and whose response at `i`.
+  check_response_at(rest: STRING, sp: NAT, i: NAT, closed: BOOL): NAT
+    require
+      ordered: sp + 1 <= i
+      inside: i + 4 <= rest.code_point_count
+    do
+      match HTTP_HEAD_PARSER.method_of(rest.slice(0, sp).to_utf8)
+        case Error(_) then 5
+        case Ok(m) then
+          check_read(m, unescape(rest.slice(sp + 1, i).to_utf8, 0, BYTES_BUILDER.empty),
+            rest.slice(i + 4, rest.code_point_count), closed)
+      end
+    end
+
+  -- 0 if `<method> <response> => <expected>` holds, as `check_read` says; else 5.
+  check_response(rest: STRING, closed: BOOL): NAT
+    do
+      match rest.find(" ", 0)
+        case None then 5
+        case Some(sp) then
+          match rest.find(" => ", sp)
+            case None then 5
+            case Some(i) then
+              if i + 4 > rest.code_point_count or sp + 1 > i then 5 else check_response_at(rest, sp, i, closed) end
+          end
+      end
+    end
+
   -- 0 if a line of `cases.txt` holds, or is a comment, else 1 when the whole request gives
-  -- something else, or 2 when a cut of it does.
+  -- something else, 2 when a cut of it does, 3 when a request it accepts, written without its
+  -- framing, does not read back as itself, and 4 when a `write` line does not hold.
   check_line(line: STRING): NAT
     do
       if line.code_point_count = 0 or line.starts_with("#") then
         0
+      else if line.starts_with("response ") then
+        check_response(line.slice(9, line.code_point_count), False)
+      else if line.starts_with("closed ") then
+        check_response(line.slice(7, line.code_point_count), True)
+      else if line.starts_with("write ") then
+        match line.find(" => ", 0)
+          case None then
+            4
+          case Some(i) then
+            if i < 6 or i + 4 > line.code_point_count then
+              4
+            else
+              check_write(unescape(line.slice(6, i).to_utf8, 0, BYTES_BUILDER.empty),
+                unescape(line.slice(i + 4, line.code_point_count).to_utf8, 0, BYTES_BUILDER.empty))
+            end
+        end
       else
         match line.find(" => ", 0)
           case None then
@@ -135,17 +334,23 @@ feature {ANY}
             else
               let raw = unescape(line.slice(0, i).to_utf8, 0, BYTES_BUILDER.empty)
               let expected = line.slice(i + 4, line.code_point_count)
-              let whole = describe(HTTP_PARSER.parse(raw))
+              let parsed = HTTP_PARSER.parse(raw)
+              let whole = describe(parsed)
               if not whole.equals(expected) then
                 1
               else if raw.length > 0 and first_bad_split(raw, whole, 1) != 0 then
                 2
               else
-                0
+                match parsed
+                  case Complete(q, _) then
+                    if HTTP_REQUEST_WRITER.sendable(rewritten(q)) and not reads_back(rewritten(q)) then 3 else 0 end
+                  case _ then
+                    0
+                end
               end end
             end
         end
-      end
+      end end end end
     end
 
 end
