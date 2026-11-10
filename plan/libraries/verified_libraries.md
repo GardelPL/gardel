@@ -462,6 +462,14 @@ Step 3, the server:
   - A handler cannot change state. `todo_api` needs one that does: the next step decides how a route reaches a service's own state.
   - The contract bounds what a step sends, not what it says: that a complete request gets the router's answer, and not only a `Close`, is checked by the scripted and socket tests, not proven.
 
+Step 4, handlers with state (decided 2026-11-10: a handler takes the service's state and returns the next state with its answer, so `REST_ROUTE`, `REST_ROUTER` and `REST_SERVER` take the state type as a parameter; the other option, a server that hands a request out and is answered later, is F.8's waiting table). A spike came first, as in step 0: a generic package with `OUTCOME[S]`, `ROUTE[S]` holding `(s: S, n: NAT) -> OUTCOME[S]`, `ROUTER[S]` and a reactive `SERVER[S]`, and a client whose state is a module with an invariant.
+
+- **Spike findings, both fixed in the compiler:**
+  - Boogie 3.4.3, under `/typeEncoding:p`, gives a generic function a type axiom whose argument guards are shifted by one after an `int` or `bool` parameter: for `on<S>(x: R S, k: int, h: Fn1 S S)` it guards `h` as an `int`. The type of a call is then unknown, and no axiom fires on a term that has such a call as an argument: `cnt(on(on(x, 1, h), 2, h)) == 2` fails while each step alone verifies. An eight-line Boogie file reproduces it, for any parameter after the scalar. `src/boogie_params.rs` moves the scalar parameters of each generic, non-inline function after the others, in its declaration and every call, as a pass over the emitted program. This is also what the F.4 finding above (list axioms that do not fire on `digits(n, ys).append(zs)`) may have been.
+  - The contract axiom of a routine whose type parameters no argument mentions, such as `ROUTER[S].empty`, carried the result type in its trigger only, so Boogie read it as a fact of `ROUTER[int]`. Its calls in that axiom are now typed. Typing more (the definitional axioms, or `RESULT.ok`, whose `E` only its result fixes) made `STRING.find` and `matches_at` run out of resources, so it is kept to that case.
+  - `/typeEncoding:a` was tried and rejected: the spike's generic router lost its own invariant facts.
+- **Spike result.** The client, `ROUTER.empty.on(1, peek).on(2, add)` with two handlers on a capped counter, verifies 0/0 in about 7 s cold and runs in C with the right answers, the cap kept. `tests/generic_handlers.rs` holds it, and a lie about it refused. Two compiler mutants, each fix undone, turn it red. The stdlib, every example and every package stay 0/0, and `cargo test` passes, 404 tests.
+
 ### Step 5: Async
 
 #### Task F.7: `Connect` and Correlation Ids
