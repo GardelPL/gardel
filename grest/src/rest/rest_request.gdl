@@ -1,0 +1,107 @@
+-- A request as a handler sees it: the HTTP request, its decoded target, and the values of
+-- the route's path parameters.
+module REST_REQUEST
+
+representation {NONE}
+  raw: HTTP_REQUEST
+  url: REQUEST_TARGET
+  path_params: LIST[URL_PARAM]
+  n_params: NAT
+
+invariant
+  params_counted: n_params = path_params.length
+  params_bounded: n_params <= 16
+
+create {ANY}
+
+  -- `r` with its target read as `t` and the path parameters `ps`, which a route's pattern
+  -- gave. A handler is given one; a test may build one.
+  make(r: HTTP_REQUEST, t: REQUEST_TARGET, ps: LIST[URL_PARAM]): REST_REQUEST
+    require
+      bounded: ps.length <= 16
+    do
+      { raw = r, url = t, path_params = ps, n_params = ps.length }
+    ensure
+      method_set: Result.method = r.method
+      params_set: Result.param_count = ps.length
+    end
+
+feature {ANY}
+
+  method: HTTP_METHOD
+    do
+      Current.raw.method
+    end
+
+  -- The request as it was received.
+  http: HTTP_REQUEST
+    do
+      Current.raw
+    end
+
+  -- The decoded path segments and query fields.
+  target: REQUEST_TARGET
+    do
+      Current.url
+    end
+
+  -- The path parameters, one for each in the route's pattern, in order.
+  params: LIST[URL_PARAM]
+    do
+      Current.path_params
+    ensure
+      counted: Result.length = Current.param_count
+    end
+
+  param_count: NAT
+    do
+      Current.n_params
+    ensure
+      bounded: Result <= 16
+    end
+
+  -- The decoded value of the path parameter `name`, such as `42` for `:id` in `/users/42`.
+  param(name: STRING): OPTION[STRING]
+    do
+      URL_PARAM.find(Current.path_params, name)
+    end
+
+  -- The path parameter `name` as a decimal number, if it is one.
+  param_nat(name: STRING): OPTION[NAT]
+    do
+      match URL_PARAM.find(Current.path_params, name)
+        case None then None
+        case Some(v) then
+          match NUMBER_TEXT.parse_nat(v)
+            case Ok(n) then Some(n)
+            case Error(_) then None
+          end
+      end
+    end
+
+  -- The decoded value of the first query field `name`.
+  query(name: STRING): OPTION[STRING]
+    do
+      Current.url.query(name)
+    end
+
+  -- The value of the header `name`, ignoring the case of the name.
+  header(name: STRING): OPTION[STRING]
+    do
+      Current.raw.headers.lookup_header(name)
+    end
+
+  body: BYTES
+    do
+      Current.raw.body
+    ensure
+      bounded: Result.length <= 65536
+    end
+
+  -- The body as one JSON value. A missing body is `UnexpectedEnd(0)`.
+  json_body: RESULT[JSON_ERROR, JSON]
+    do
+      JSON.parse(Current.raw.body)
+    end
+
+end

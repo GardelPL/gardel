@@ -1,0 +1,66 @@
+-- Why a request target was refused. Each one is a `400 Bad Request`.
+module URL_ERROR satisfies CANONICAL_EQ
+
+representation {ANY}
+  -- The target does not start with `/`.
+  | NotAPath
+  -- A `%` not followed by two hex digits.
+  | BadEscape
+  -- The decoded bytes are not UTF-8.
+  | NotUtf8
+  -- More than `REQUEST_TARGET.max_segments` path segments.
+  | TooManySegments
+  -- More than `REQUEST_TARGET.max_fields` query fields.
+  | TooManyFields
+
+feature {ANY}
+
+  equals(other: URL_ERROR): BOOL
+    do
+      Current = other
+    ensure
+      def: Result = (Current = other)
+    end
+
+  -- A short English reason, for an error body.
+  reason: STRING
+    do
+      match Current
+        case NotAPath then "the target is not a path"
+        case BadEscape then "a % is not followed by two hex digits"
+        case NotUtf8 then "the decoded text is not UTF-8"
+        case TooManySegments then "the path has too many segments"
+        case TooManyFields then "the query has too many fields"
+      end
+    end
+
+specify {CANONICAL_EQ}
+
+  law agrees_with_structural(a: URL_ERROR, b: URL_ERROR)
+    ensure
+      sound: a.equals(b) = (a = b)
+    end
+
+specify {EQ}
+
+  law reflexive(a: URL_ERROR)
+    ensure
+      refl: a.equals(a)
+    end
+
+  law symmetric(a: URL_ERROR, b: URL_ERROR)
+    require
+      ab: a.equals(b)
+    ensure
+      ba: b.equals(a)
+    end
+
+  law transitive(a: URL_ERROR, b: URL_ERROR, c: URL_ERROR)
+    require
+      ab: a.equals(b)
+      bc: b.equals(c)
+    ensure
+      ac: a.equals(c)
+    end
+
+end

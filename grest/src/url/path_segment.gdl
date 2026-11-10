@@ -1,0 +1,41 @@
+-- One segment of a path pattern: text the request segment must equal, or a named parameter
+-- that takes any segment.
+module PATH_SEGMENT
+
+representation {ANY}
+  | Fixed(text: STRING)
+  | Param(name: STRING)
+
+create {ANY}
+
+  -- How many segments of `ps` are parameters.
+  params_in(ps: LIST[PATH_SEGMENT]): NAT
+    require
+      short: ps.length <= 16
+    variant
+      ps.length
+    do
+      if ps.length = 0 then
+        0
+      else
+        let rest = PATH_SEGMENT.params_in(ps.tail)
+        if ps.head.is_param then rest + 1 else rest end
+      end
+    ensure
+      bounded: Result <= ps.length
+      empty: ps.length = 0 implies Result = 0
+      param: (ps.length > 0 and ps.head.is_param) implies Result = PATH_SEGMENT.params_in(ps.tail) + 1
+      fixed: (ps.length > 0 and not ps.head.is_param) implies Result = PATH_SEGMENT.params_in(ps.tail)
+    end
+
+feature {ANY}
+
+  is_param: BOOL
+    do
+      match Current
+        case Param(_) then True
+        case Fixed(_) then False
+      end
+    end
+
+end

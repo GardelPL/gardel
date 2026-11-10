@@ -1,0 +1,8 @@
+[project]
+name = "grest-tests"
+version = "0.1.0"
+
+[dependencies]
+grest = { path = ".." }
+ghttp = { path = "../../ghttp" }
+gjson = { path = "../../gjson" }

@@ -72,6 +72,97 @@ fn desugar_routine_values(m: &mut ModuleDecl) {
     });
 }
 
+/// A `match` binder whose name is already bound in its routine (a parameter, a `let`, or an
+/// earlier binder, in any branch) is renamed, with each use in its arm. The verifier declares
+/// every binder of a routine as one local of the procedure, so `case Some(e)` in one arm and
+/// `case Error(e)` in another, of different types, gave one local two types (Task F.6).
+fn rename_repeated_binders(m: &mut ModuleDecl) {
+    fn block(stmts: &mut [Stmt], body: &mut Expr, seen: &mut Vec<String>) {
+        for st in stmts.iter_mut() {
+            match st {
+                Stmt::Let(v, e) => {
+                    expr(e, seen);
+                    seen.push(v.clone());
+                }
+                Stmt::Check(_, e) | Stmt::Assume(_, e) => expr(e, seen),
+                Stmt::Reveal(_) | Stmt::LetType(_, _) => {}
+            }
+        }
+        expr(body, seen);
+    }
+    fn expr(e: &mut Expr, seen: &mut Vec<String>) {
+        match e {
+            Expr::Var(_) | Expr::Int(_) | Expr::Float(_) | Expr::Char(_) | Expr::Unit | Expr::Bool(_) | Expr::Str(_) => {}
+            Expr::UnaryNot(x) | Expr::UnaryNeg(x) => expr(x, seen),
+            Expr::BinOp(_, l, r) => {
+                expr(l, seen);
+                expr(r, seen);
+            }
+            Expr::Call(_, args) => args.iter_mut().for_each(|a| expr(a, seen)),
+            Expr::MethodCall(recv, _, args) => {
+                expr(recv, seen);
+                args.iter_mut().for_each(|a| expr(a, seen));
+            }
+            Expr::If(c, ts, te, es, ee) => {
+                expr(c, seen);
+                block(ts, te, seen);
+                block(es, ee, seen);
+            }
+            Expr::Match(sc, cases) => {
+                expr(sc, seen);
+                for c in cases.iter_mut() {
+                    for b in c.bindings() {
+                        if seen.contains(&b) {
+                            let nb = fresh_binder(&b, seen, &c.stmts, &c.body);
+                            c.pattern = rename_pattern_binder(&c.pattern, &b, &nb);
+                            (c.stmts, c.body) = subst_block(&c.stmts, &c.body, &[(b, Expr::Var(nb.clone()))]);
+                            seen.push(nb);
+                        } else {
+                            seen.push(b);
+                        }
+                    }
+                    block(&mut c.stmts, &mut c.body, seen);
+                }
+            }
+            Expr::RecordLit(fs) => fs.iter_mut().for_each(|(_, x)| expr(x, seen)),
+            Expr::RecordUpdate(b, fs) => {
+                expr(b, seen);
+                fs.iter_mut().for_each(|(_, x)| expr(x, seen));
+            }
+            Expr::TupleLit(xs) => xs.iter_mut().for_each(|x| expr(x, seen)),
+            // A quantified variable is bound by the quantifier, not declared as a local.
+            Expr::Forall(_, _, b) | Expr::Exists(_, _, b) => expr(b, seen),
+            Expr::WithIo(io, fin) => {
+                for st in io.iter_mut() {
+                    match st {
+                        IoStmt::Bind(v, x) => {
+                            expr(x, seen);
+                            seen.push(v.clone());
+                        }
+                        IoStmt::Action(x) => expr(x, seen),
+                    }
+                }
+                expr(fin, seen);
+            }
+            Expr::Lambda(ps, _, stmts, body) => {
+                seen.extend(ps.iter().map(|(p, _)| p.clone()));
+                block(stmts, body, seen);
+            }
+        }
+    }
+    let all = m
+        .create_routines
+        .iter_mut()
+        .chain(m.feature_routines.iter_mut())
+        .chain(m.specify_routines.iter_mut());
+    for (_, r) in all {
+        let mut seen: Vec<String> = r.params.iter().map(|(p, _)| p.clone()).collect();
+        seen.push("Current".into());
+        seen.push("Result".into());
+        block(&mut r.stmts, &mut r.body, &mut seen);
+    }
+}
+
 /// Replaces each free `Var(v)` of the routines of `m` for which `f(v)` gives an expression.
 /// Locals, parameters, `match` binders, lambda parameters, quantified variables and `Result`
 /// (in an `ensure`) shadow the names. A replacement is not walked again.
@@ -1618,6 +1709,7 @@ impl Parser {
         };
         desugar_nullary_calls(&mut m);
         desugar_routine_values(&mut m);
+        rename_repeated_binders(&mut m);
         if let Some(site) = patterns::desugar_patterns(&mut m).first() {
             return Err(ParseError {
                 message: format!(
@@ -7245,6 +7337,9 @@ fn infer_gardel_type(e: &Expr, m: &ModuleDecl, ctx: &BoogiePreludeCtx) -> Option
         Expr::If(_, _, t, _, f) => {
             infer_gardel_type(t, m, ctx).or_else(|| infer_gardel_type(f, m, ctx))
         }
+        // The type of the first arm whose type is known. The arms' binders are typed first,
+        // by `collect_proc_locals`, so an arm that is a binder has its type.
+        Expr::Match(_, cases) => cases.iter().find_map(|c| infer_gardel_type(&c.body, m, ctx)),
         // A lambda's parameter and result types are annotated.
         Expr::Lambda(ps, ret, _, _) => Some(c11_typed::norm_type(&format!(
             "({}) -> {ret}",
@@ -10587,6 +10682,9 @@ fn collect_proc_locals(
             if let Some(t) = elem_receiver_type(e, m) {
                 elem_env_bind(v, &t);
             }
+            // The binders and locals inside `e` first, so that `let s = match a case Some(x)
+            // then x ... end` finds the type of `x`.
+            collect_proc_locals(&[], e, r, m, out);
             let gty = declared_let_type(stmts, at)
                 .map(ToString::to_string)
                 .or_else(|| boogie_prelude_ctx().and_then(|ctx| infer_gardel_type(e, m, &ctx)));
@@ -10601,7 +10699,6 @@ fn collect_proc_locals(
                 bind_signed_local(v);
             }
             out.push((v.clone(), bty));
-            collect_proc_locals(&[], e, r, m, out);
         }
     }
     match body {

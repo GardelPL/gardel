@@ -1,0 +1,102 @@
+-- A small API for the `request` cases: a handler for each route, and the router that holds
+-- them. A routine's name is its handler.
+functions GREST_API
+
+feature {ANY}
+
+  -- `{"<key>":v}`.
+  object1(key: STRING, v: JSON): JSON
+    do
+      match JSON.empty_object.with_field(key, v)
+        case Some(o) then o
+        case None then JSON.empty_object
+      end
+    end
+
+  hello(r: REST_REQUEST): HTTP_RESPONSE
+    do
+      REST_RESPONSE.ok_text("hello")
+    end
+
+  -- Added before `/users/:id`, so it answers `/users/me`.
+  me(r: REST_REQUEST): HTTP_RESPONSE
+    do
+      REST_RESPONSE.ok_text("me")
+    end
+
+  user(r: REST_REQUEST): HTTP_RESPONSE
+    do
+      match r.param_nat("id")
+        case None then
+          REST_RESPONSE.bad_request("id is not a number")
+        case Some(n) then
+          let id: I64 = if n <= 1000000 then I64.from_nat(n) else 0 end
+          REST_RESPONSE.ok_json(object1("id", JSON.int(id)))
+      end
+    end
+
+  -- The body, as it was sent.
+  add_user(r: REST_REQUEST, body: JSON): HTTP_RESPONSE
+    do
+      REST_RESPONSE.created_json(body)
+    end
+
+  -- The body, with `"id"` set to the path's.
+  replace(r: REST_REQUEST, body: JSON): HTTP_RESPONSE
+    do
+      let id = match r.param("id") case Some(s) then s case None then "" end
+      match body.with_field("id", JSON.string(id))
+        case Some(v) then REST_RESPONSE.ok_json(v)
+        case None then REST_RESPONSE.bad_request("the body is not an object")
+      end
+    end
+
+  remove(r: REST_REQUEST): HTTP_RESPONSE
+    do
+      REST_RESPONSE.no_content
+    end
+
+  search(r: REST_REQUEST): HTTP_RESPONSE
+    do
+      let q = match r.query("q") case Some(s) then s case None then "" end
+      REST_RESPONSE.ok_json(object1("q", JSON.string(q)))
+    end
+
+  whoami(r: REST_REQUEST): HTTP_RESPONSE
+    do
+      match r.header("x-name")
+        case None then REST_RESPONSE.bad_request("no X-Name")
+        case Some(name) then
+          if name.byte_length <= 65536 then REST_RESPONSE.ok_text(name) else REST_RESPONSE.bad_request("too long") end
+      end
+    end
+
+  -- A status `HTTP_STATUS` has no constructor for.
+  taken(r: REST_REQUEST): HTTP_RESPONSE
+    do
+      REST_RESPONSE.error(HTTP_STATUS.make(409), "taken")
+    end
+
+  router: REST_ROUTER
+    do
+      REST_ROUTER.empty
+        .on_get("/", hello)
+        .on_get("/users/me", me)
+        .on_get("/users/:id", user)
+        .on_json(Post, "/users", add_user)
+        .on_json(Put, "/users/:id", replace)
+        .on_delete("/users/:id", remove)
+        .on_get("/search", search)
+        .on_get("/whoami", whoami)
+        .on_get("/taken", taken)
+    ensure
+      nine: Result.route_count = 9
+    end
+
+  -- A router with a pattern that is not valid.
+  broken: REST_ROUTER
+    do
+      REST_ROUTER.empty.on_get("/ok", hello).on_get("/bad/:", hello)
+    end
+
+end

@@ -198,7 +198,10 @@ feature {ANY}
       else if Current.raw_code = 431 then "431"
       else if Current.raw_code = 501 then "501"
       else if Current.raw_code = 505 then "505"
-      else "500"
+      else
+        -- Any other code in 100..599 has three digits, so the test never fails.
+        let t = NUMBER_TEXT.nat_to_text(Current.raw_code)
+        if t.byte_length = 3 then t else "500" end
       end end end end end end end end end end end
     ensure
       exact_three_bytes: Result.byte_length = 3

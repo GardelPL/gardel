@@ -1,0 +1,278 @@
+-- What decoding, a target and a pattern match say, as text, for the lines of `cases.txt`:
+--
+--   decode path <text> => ok [<decoded>]        or  => error <reason>
+--   decode query <text> => ok [<decoded>]
+--   target <target> => segments [a] [b] query [name]=[value] ...
+--   pattern <pattern> => valid <segments> <parameters>   or  => invalid
+--   match <pattern> <target> => params [name]=[value] ...  or  => no match
+--   request <METHOD> <target> [H:<name>:<value>]... [<body>] => <status> [text|json <body>]
+--   wire <METHOD> <target> ... => the response as sent, each CRLF written `|`
+--   routes api|broken => valid  or  => invalid [<pattern>]
+functions GREST_TEXT
+
+feature {ANY}
+
+  -- `a` then `b`, or `a` alone if that would not fit.
+  join(a: STRING, b: STRING): STRING
+    do
+      if a.byte_length <= 100000000 and b.byte_length <= 100000000 then a.concat(b) else a end
+    end
+
+  number(n: NAT): STRING
+    do
+      NUMBER_TEXT.nat_to_text(n)
+    end
+
+  bracket(s: STRING): STRING
+    do
+      join(join("[", s), "]")
+    end
+
+  error_name(e: URL_ERROR): STRING
+    do
+      match e
+        case NotAPath then "NotAPath"
+        case BadEscape then "BadEscape"
+        case NotUtf8 then "NotUtf8"
+        case TooManySegments then "TooManySegments"
+        case TooManyFields then "TooManyFields"
+      end
+    end
+
+  decoded(r: RESULT[URL_ERROR, STRING]): STRING
+    do
+      match r
+        case Ok(s) then join("ok ", bracket(s))
+        case Error(e) then join("error ", error_name(e))
+      end
+    end
+
+  -- ` [a] [b]` for each segment.
+  segments(xs: LIST[STRING]): STRING
+    variant
+      xs.length
+    do
+      if xs.length = 0 then STRING.make_empty(1) else join(join(" ", bracket(xs.head)), segments(xs.tail)) end
+    end
+
+  -- ` [name]=[value]` for each parameter.
+  params(ps: LIST[URL_PARAM]): STRING
+    variant
+      ps.length
+    do
+      if ps.length = 0 then
+        STRING.make_empty(1)
+      else
+        join(join(join(join(" ", bracket(ps.head.name)), "="), bracket(ps.head.value)), params(ps.tail))
+      end
+    end
+
+  target(t: STRING): STRING
+    do
+      match REQUEST_TARGET.parse(t)
+        case Error(e) then join("error ", error_name(e))
+        case Ok(rt) then join(join(join("segments", segments(rt.segments)), " query"), params(rt.query_fields))
+      end
+    end
+
+  pattern(p: STRING): STRING
+    do
+      let pp = PATH_PATTERN.parse(p)
+      if pp.is_valid then
+        join(join(join("valid ", number(pp.segment_count)), " "), number(pp.param_count))
+      else
+        "invalid"
+      end
+    end
+
+  matched(p: STRING, t: STRING): STRING
+    do
+      match REQUEST_TARGET.parse(t)
+        case Error(e) then
+          join("error ", error_name(e))
+        case Ok(rt) then
+          match PATH_PATTERN.parse(p).match_target(rt)
+            case None then "no match"
+            case Some(ps) then join("params", params(ps))
+          end
+      end
+    end
+
+  -- The words `ws`, with a space between each two.
+  unwords(ws: LIST[STRING]): STRING
+    variant
+      ws.length
+    do
+      if ws.length = 0 then
+        STRING.make_empty(1)
+      else if ws.tail.length = 0 then
+        ws.head
+      else
+        join(join(ws.head, " "), unwords(ws.tail))
+      end end
+    end
+
+  method_of(w: STRING): OPTION[HTTP_METHOD]
+    do
+      if w.equals("GET") then Some(Get)
+      else if w.equals("HEAD") then Some(Head)
+      else if w.equals("POST") then Some(Post)
+      else if w.equals("PUT") then Some(Put)
+      else if w.equals("DELETE") then Some(Delete)
+      else if w.equals("OPTIONS") then Some(Options)
+      else None
+      end end end end end end
+    end
+
+  -- `<status>`, then ` text <body>` or ` json <body>` if there is a body.
+  answer(resp: HTTP_RESPONSE): STRING
+    do
+      let code = number(resp.response_status_code)
+      if resp.response_body_length = 0 then
+        code
+      else
+        let kind = match resp.content_type
+          case Unstated then "none"
+          case PlainText then "text"
+          case Json then "json"
+        end
+        join(join(join(join(code, " "), kind), " "), resp.body_string)
+      end
+    end
+
+  -- The headers named by the leading `H:<name>:<value>` words of `ws`, added to `hs`.
+  headers(ws: LIST[STRING], hs: HTTP_HEADERS): HTTP_HEADERS
+    variant
+      ws.length
+    do
+      if ws.length = 0 or not ws.head.starts_with("H:") then
+        hs
+      else
+        let w = ws.head
+        let rest = w.slice(2, w.code_point_count)
+        match rest.find_char(':', 0)
+          case None then hs
+          case Some(i) then
+            let n = rest.slice(0, i)
+            let v = rest.slice(i + 1, rest.code_point_count)
+            if n.byte_length >= 1 and n.byte_length <= 128 and v.byte_length <= 1024 and hs.has_header_room then
+              headers(ws.tail, hs.add(HTTP_HEADER.make(n, v)))
+            else
+              hs
+            end
+        end
+      end
+    end
+
+  -- `ws` past its leading `H:` words.
+  after_headers(ws: LIST[STRING]): LIST[STRING]
+    variant
+      ws.length
+    do
+      if ws.length = 0 or not ws.head.starts_with("H:") then ws else after_headers(ws.tail) end
+    end
+
+  -- `s` from `i` on, with each CRLF written `|`.
+  crlf_bars(s: STRING, i: NAT): STRING
+    variant
+      s.code_point_count - i
+    do
+      let n = s.code_point_count
+      if i >= n then
+        STRING.make_empty(1)
+      else
+        match s.find("\r\n", i)
+          case None then s.slice(i, n)
+          case Some(j) then
+            if j >= i and j + 2 <= n then join(join(s.slice(i, j), "|"), crlf_bars(s, j + 2)) else s.slice(i, n) end
+        end
+      end
+    end
+
+  -- The response as text, or as it is sent when `wire`.
+  shown(resp: HTTP_RESPONSE, wire: BOOL): STRING
+    do
+      if wire then crlf_bars(HTTP_SERIALIZER.serialize_to_string(resp), 0) else answer(resp) end
+    end
+
+  -- What `GREST_API.router` answers to the request the words `ws` say: a method, a target,
+  -- headers, and a body.
+  request(ws: LIST[STRING], wire: BOOL): STRING
+    do
+      if ws.length < 2 then
+        "bad case"
+      else
+        let t = ws.tail.head
+        match method_of(ws.head)
+          case None then "bad case"
+          case Some(m) then
+            let hs = headers(ws.tail.tail, HTTP_HEADERS.default_empty)
+            let b = unwords(after_headers(ws.tail.tail)).to_utf8
+            if t.byte_length < 1 or t.byte_length > 512 or hs.num_headers > 64 or b.length > 65536 or (m.is_safe and b.length > 0) then
+              "bad case"
+            else
+              let req = HTTP_REQUEST.make_simple(m, t).with_headers(hs).with_body(b, 65536)
+              shown(GREST_API.router.dispatch(req), wire)
+            end
+        end
+      end
+    end
+
+  routes(which: STRING): STRING
+    do
+      let r = if which.equals("broken") then GREST_API.broken else GREST_API.router end
+      match r.invalid_route
+        case None then "valid"
+        case Some(p) then join("invalid ", bracket(p))
+      end
+    end
+
+  -- What the words of a case line say.
+  run(words: LIST[STRING]): STRING
+    do
+      if words.length < 2 then
+        "bad case"
+      else
+        let kind = words.head
+        let first = words.tail.head
+        if kind.equals("decode") and words.length = 3 then
+          decoded(URL_TEXT.decode(words.tail.tail.head, first.equals("query")))
+        else if kind.equals("target") and words.length = 2 then
+          target(first)
+        else if kind.equals("pattern") and words.length = 2 then
+          pattern(first)
+        else if kind.equals("match") and words.length = 3 then
+          matched(first, words.tail.tail.head)
+        else if kind.equals("request") then
+          request(words.tail, False)
+        else if kind.equals("wire") then
+          request(words.tail, True)
+        else if kind.equals("routes") and words.length = 2 then
+          routes(first)
+        else
+          "bad case"
+        end end end end end end end
+      end
+    end
+
+  -- 0 if a line of `cases.txt` holds, or is a comment, else 1.
+  check_line(line: STRING): NAT
+    do
+      if line.code_point_count = 0 or line.starts_with("#") then
+        0
+      else
+        match line.find(" => ", 0)
+          case None then
+            1
+          case Some(i) then
+            if i + 4 > line.code_point_count then
+              1
+            else
+              let got = run(line.slice(0, i).split(' '))
+              if got.equals(line.slice(i + 4, line.code_point_count)) then 0 else 1 end
+            end
+        end
+      end
+    end
+
+end

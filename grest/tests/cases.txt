@@ -1,0 +1,168 @@
+# Cases for GREST_TEST, read on standard input:
+#
+#   build/grest_test_bin.exe < grest/tests/cases.txt
+#
+# Each line is a case, ` => `, and what it must give. See `src/grest_text.gdl` for the kinds.
+# Lines that start with # and empty lines are skipped.
+
+# Percent decoding. In a path `+` is itself; in a query it is a space.
+decode path abc => ok [abc]
+decode path  => ok []
+decode path a%20b => ok [a b]
+decode path a+b => ok [a+b]
+decode query a+b => ok [a b]
+# With a `%` too, so the text is not returned as it is.
+decode path a+b%20c => ok [a+b c]
+decode query a+b%20c => ok [a b c]
+decode query a%2Bb => ok [a+b]
+decode path %41%42%43 => ok [ABC]
+decode path %4a%4A => ok [JJ]
+decode path %2F => ok [/]
+decode path 100%25 => ok [100%]
+decode path caf%C3%A9 => ok [café]
+decode path %E2%82%AC => ok [€]
+decode path café => ok [café]
+decode path %F0%9F%98%80 => ok [😀]
+decode query %3D%26 => ok [=&]
+# A `%` needs two hex digits after it.
+decode path % => error BadEscape
+decode path a% => error BadEscape
+decode path %4 => error BadEscape
+decode path %G1 => error BadEscape
+decode path %1G => error BadEscape
+decode path %%41 => error BadEscape
+decode path ok%2 => error BadEscape
+# What it decodes to must be UTF-8.
+decode path %FF => error NotUtf8
+decode path %C3 => error NotUtf8
+decode path %C3%28 => error NotUtf8
+decode path %ED%A0%80 => error NotUtf8
+decode path %C0%AF => error NotUtf8
+decode query %80 => error NotUtf8
+
+# Targets: segments, then query fields, each decoded.
+target / => segments [] query
+target /users => segments [users] query
+target /users/ => segments [users] [] query
+target /users/42 => segments [users] [42] query
+target //x => segments [] [x] query
+target /a%2Fb/c => segments [a/b] [c] query
+target /a+b => segments [a+b] query
+target /a+b%21 => segments [a+b!] query
+target /caf%C3%A9 => segments [café] query
+target /users?sort=name => segments [users] query [sort]=[name]
+target /s?q=a+b&lang=en => segments [s] query [q]=[a b] [lang]=[en]
+target /s?q=a%26b => segments [s] query [q]=[a&b]
+target /s?flag => segments [s] query [flag]=[]
+target /s?a=&b= => segments [s] query [a]=[] [b]=[]
+target /s?a=1=2 => segments [s] query [a]=[1=2]
+target /s?&&a=1&& => segments [s] query [a]=[1]
+target /s?a=1&a=2 => segments [s] query [a]=[1] [a]=[2]
+target /s? => segments [s] query
+target /? => segments [] query
+target /s?x=%3F => segments [s] query [x]=[?]
+target /s?x=1?2 => segments [s] query [x]=[1?2]
+target /s?%3D=%3D => segments [s] query [=]=[=]
+# Refused.
+target users => error NotAPath
+target * => error NotAPath
+target /a%zz => error BadEscape
+target /a?q=%zz => error BadEscape
+target /%FF => error NotUtf8
+target /a?q=%C3 => error NotUtf8
+# At most 16 segments and 32 fields.
+target /1/2/3/4/5/6/7/8/9/10/11/12/13/14/15/16 => segments [1] [2] [3] [4] [5] [6] [7] [8] [9] [10] [11] [12] [13] [14] [15] [16] query
+target /1/2/3/4/5/6/7/8/9/10/11/12/13/14/15/16/17 => error TooManySegments
+target /1/2/3/4/5/6/7/8/9/10/11/12/13/14/15/ => segments [1] [2] [3] [4] [5] [6] [7] [8] [9] [10] [11] [12] [13] [14] [15] [] query
+target /1/2/3/4/5/6/7/8/9/10/11/12/13/14/15/16/ => error TooManySegments
+target /x?1&2&3&4&5&6&7&8&9&10&11&12&13&14&15&16&17&18&19&20&21&22&23&24&25&26&27&28&29&30&31&32 => segments [x] query [1]=[] [2]=[] [3]=[] [4]=[] [5]=[] [6]=[] [7]=[] [8]=[] [9]=[] [10]=[] [11]=[] [12]=[] [13]=[] [14]=[] [15]=[] [16]=[] [17]=[] [18]=[] [19]=[] [20]=[] [21]=[] [22]=[] [23]=[] [24]=[] [25]=[] [26]=[] [27]=[] [28]=[] [29]=[] [30]=[] [31]=[] [32]=[]
+target /x?1&2&3&4&5&6&7&8&9&10&11&12&13&14&15&16&17&18&19&20&21&22&23&24&25&26&27&28&29&30&31&32&33 => error TooManyFields
+# The limit counts `&`, so 32 separators are refused even if the fields are empty.
+target /x?&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&& => error TooManyFields
+
+# Patterns: segments and parameters.
+pattern / => valid 1 0
+pattern /users => valid 1 0
+pattern /users/:id => valid 2 1
+pattern /users/:id/posts/:post => valid 4 2
+pattern /users/ => valid 2 0
+pattern /:a/:b/:c => valid 3 3
+pattern /1/2/3/4/5/6/7/8/9/10/11/12/13/14/15/16 => valid 16 0
+pattern /1/2/3/4/5/6/7/8/9/10/11/12/13/14/15/16/17 => invalid
+pattern users => invalid
+pattern  => invalid
+pattern /users/: => invalid
+pattern /users?x => invalid
+pattern /a%20b => invalid
+
+# Matching.
+match / / => params
+match /users /users => params
+match /users /users/ => no match
+match /users/ /users => no match
+match /users /Users => no match
+match /users/:id /users/42 => params [id]=[42]
+match /users/:id /users => no match
+match /users/:id /users/42/x => no match
+match /users/:id /users/ => params [id]=[]
+match /users/:id /users/a%20b => params [id]=[a b]
+match /users/:id /users/a%2Fb => params [id]=[a/b]
+match /users/:id /users/42?x=1 => params [id]=[42]
+match /users/:id/posts/:post /users/7/posts/9 => params [id]=[7] [post]=[9]
+match /users/:id/posts/:post /users/7/post/9 => no match
+match /:a/:b /x/y => params [a]=[x] [b]=[y]
+match /caf%C3%A9 /caf%C3%A9 => no match
+match /café /caf%C3%A9 => params
+match /a+b /a+b => params
+match /users/:id /users/%zz => error BadEscape
+match /x/:id x => error NotAPath
+match users users => error NotAPath
+match users /users => no match
+match /:x /1/2/3/4/5/6/7/8/9/10/11/12/13/14/15/16/17 => error TooManySegments
+
+# Requests to GREST_TEST's router (`src/grest_api.gdl`): the status, then the content type
+# and the body when there is one.
+request GET / => 200 text hello
+request HEAD / => 200 text hello
+request GET /users/me => 200 text me
+request GET /users/42 => 200 json {"id":42}
+request GET /users/4%32 => 200 json {"id":42}
+request GET /users/42?x=1 => 200 json {"id":42}
+request GET /users/abc => 400 json {"error":"id is not a number"}
+request GET /users/42/ => 404 json {"error":"not found"}
+request GET /nope => 404 json {"error":"not found"}
+request POST / => 405 json {"error":"method not allowed"}
+request DELETE /users => 405 json {"error":"method not allowed"}
+request POST /users/9 {} => 405 json {"error":"method not allowed"}
+request DELETE /users/7 => 204
+request POST /users {"name":"Ana"} => 201 json {"name":"Ana"}
+request POST /users {"b": 1, "a": [true, null]} => 201 json {"a":[true,null],"b":1}
+request PUT /users/9 {"name":"Bo"} => 200 json {"id":"9","name":"Bo"}
+request PUT /users/9 [1] => 400 json {"error":"the body is not an object"}
+# A body that is not JSON, or none, is a 400 before the handler runs.
+request POST /users => 400 json {"at":0,"error":"invalid JSON body"}
+request POST /users {"name": => 400 json {"at":8,"error":"invalid JSON body"}
+request PUT /users/9 nope => 400 json {"at":0,"error":"invalid JSON body"}
+request POST /users {} {} => 400 json {"at":3,"error":"invalid JSON body"}
+request GET /search?q=a+b => 200 json {"q":"a b"}
+request GET /search?q=%22 => 200 json {"q":"\""}
+request GET /search => 200 json {"q":""}
+request GET /whoami H:X-Name:Ana => 200 text Ana
+request GET /whoami H:x-NAME:Ana => 200 text Ana
+request GET /whoami => 400 json {"error":"no X-Name"}
+# A target that cannot be read is a 400 with its reason.
+request GET /users/%zz => 400 json {"error":"a % is not followed by two hex digits"}
+request GET * => 400 json {"error":"the target is not a path"}
+request GET /%FF => 400 json {"error":"the decoded text is not UTF-8"}
+request GET /1/2/3/4/5/6/7/8/9/10/11/12/13/14/15/16/17 => 400 json {"error":"the path has too many segments"}
+
+# A router names its first pattern that is not valid.
+routes api => valid
+routes broken => invalid [/bad/:]
+
+# Responses as they are sent, each CRLF written `|`: a JSON or text body states its type.
+wire GET /users/42 => HTTP/1.1 200|Content-Type: application/json|Content-Length: 9||{"id":42}
+wire GET / => HTTP/1.1 200|Content-Type: text/plain; charset=utf-8|Content-Length: 5||hello
+wire DELETE /users/7 => HTTP/1.1 204|Content-Length: 0||
+wire GET /taken => HTTP/1.1 409|Content-Type: application/json|Content-Length: 17||{"error":"taken"}
+request GET /taken => 409 json {"error":"taken"}

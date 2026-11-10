@@ -390,13 +390,13 @@ What was done:
 
 Client: `examples/hello_api`, moved to `grest`. Needs decisions 5 and 6, and Task F.12.
 
-**Status:** In progress. Step 0, a spike on three earlier findings that would hit `grest`, is done (2026-11-09).
+**Status:** In progress. Step 0, a spike on three earlier findings that would hit `grest`, is done, and so are step 1, the URL layer (2026-11-09), and step 2, requests, responses and routes (2026-11-10). The server and `todo_api` remain.
 
 - [x] Step 0: string literals, a routine as a function value, and `LIST.length` in C.
-- [ ] Path patterns such as `/users/:id`, and query parsing with percent decoding. A proven limit on segments.
-- [ ] A route holds its handler. A handler is a pure function from a typed request to a response.
-- [ ] `REST_REQUEST` gives `param`, `query`, `header` and `json_body`, and `REST_RESPONSE` gives `json`, `text` and status helpers.
-- [ ] A bad or missing body is a `400` with a JSON error, by default.
+- [x] Step 1: Path patterns such as `/users/:id`, and query parsing with percent decoding. A proven limit on segments.
+- [x] Step 2: A route holds its handler. A handler is a pure function from a typed request to a response.
+- [x] Step 2: `REST_REQUEST` gives `param`, `query`, `header` and `json_body`, and `REST_RESPONSE` gives `json`, `text` and status helpers.
+- [x] Step 2: A bad or missing body is a `400` with a JSON error, by default.
 - [ ] `REST_SERVER` holds the connection loop now written by hand in `hello_api`: `init` and `step` are one line each in a client.
 - [ ] Proven server safety, carried over from `ghttp`: connection limit, one answer per request, and a `Close` after an error.
 - [ ] `examples/todo_api`: create, read, update and delete over JSON, with a proven invariant on its state.
@@ -414,6 +414,41 @@ Step 0, what was found and fixed:
 - **Known limits.**
   - In a `module`, a lambda that calls a sibling routine is `E0199` (`undeclared identifier: Current`), whether written by hand or made from a name, as a lifted lambda does not capture `Current`. Handlers live in `functions` and `program` modules, so `grest` is not blocked.
   - A routine of another module, `OTHER.halve`, is not a function value: it parses as a call with no arguments. A generic routine is not converted either.
+
+Step 1, the URL layer:
+
+- **`grest` 0.1.0** has five modules under `src/url/`, with no dependency yet: `URL_TEXT` (percent decoding, with `+` as a space in a query), `REQUEST_TARGET` (decoded segments and query fields), `PATH_PATTERN` and `PATH_SEGMENT` (`/users/:id`), `URL_PARAM` (a name and a value) and `URL_ERROR` (each refusal, a `400`). `ghttp` and `gjson` come in with the request type, the next step.
+- **Proven.** A parsed target has at most 16 segments and 32 query fields, and a target with more is refused. A match gives exactly one value per parameter of the pattern, so at most 16, and only a valid pattern matches. Decoding never makes text longer, and text with no `%` (nor `+` in a query) decodes to itself, with no copy. `tests/grest.rs` has a client prove the limits and the plain-text fact through the contracts alone, and three claims past them refused: 15 segments, 31 fields, and plain text decoded as itself in a query.
+- **A pattern is total.** `PATH_PATTERN.parse` takes any text, and a bad pattern (no leading `/`, more than 16 segments, a `?` or `%`, or `:` with no name) is not valid and matches nothing. A precondition on the pattern text would need the solver to evaluate `count_char` over a literal one character at a time at every route, which step 0 showed is where cost comes from. The cost of the choice is that a typo makes a route that never matches. The router can report invalid routes when it is built, in the next step.
+- **Splitting.** A target and a pattern are split the same way: `/` is one empty segment, and `/users/` is `users` and an empty one, so it does not match `/users`. A segment is decoded after the split, so `%2F` stays inside it. Patterns are written decoded.
+- **Tests.** `grest/tests/cases.txt` has 101 cases, run in C by `cargo test`: decoding in a path and in a query, every kind of bad escape, decoded bytes that are not UTF-8 (a lone lead byte, an overlong form, a surrogate), targets at and past both limits, patterns, and matches.
+- **Mutations.** Fourteen on a private copy of `grest`, all red: four caught by the verifier (a fast path that ignores `+`, limits of 17 segments and 33 fields, a longer request that matches) and ten by the cases. One survived at first, `+` decoded in a path, because every `+` case in a path had no `%` and took the fast path. The cases now mix them. Two more on the compiler, both red: no renaming of binders (`tests/binders.rs`), and `STRING.make_empty` not lowered (`tests/grest.rs`).
+- **Compiler fixes found on the way**, each with a test:
+  - Two `match` binders of one name and different types in a routine, such as `case Some(e)` beside `case Error(e)`, or a binder that reuses a parameter's name, declared one local twice in the proof, and the module was `E0199`. A pass after parsing, `rename_repeated_binders`, renames a binder whose name is already bound in its routine. `tests/binders.rs` has a program with a binder of a parameter's name, a `let`'s name and another binder's name, which verifies and computes the same values in C, and a lie about one refused.
+  - `STRING.make_empty` compiled to a constructor that does not exist in C. It is now the static empty string.
+- **Known limits.**
+  - A list's length has no upper bound in the proof, so `count(tail) + 1` over a list cannot be proven not to overflow. A routine that counts over a list needs a precondition that bounds it, as `PATH_SEGMENT.params_in` has (`ps.length <= 16`). When such an overflow fails, the routine's whole contract is withdrawn for the next pass, so the first error to read is the overflow.
+  - A call with a constructor as an argument, such as `pick(Some(7), b)`, is `E0199` (`fn_get`) when the callee's `require` calls a method on that parameter, such as `a.get`. Binding the value with a typed `let` works. This is older than F.6.
+  - `=` on two binders taken from an `OPTION[NAT]` is `E0311`, as their type is not inferred. `<` works. This is older than F.6.
+
+Step 2, requests, responses and routes:
+
+- **`grest` 0.2.0** depends on `ghttp` and `gjson` (decision 5) and adds four modules under `src/rest/`:
+  - `REST_ROUTE`: a method, a pattern as written and parsed, and a handler, `(r: REST_REQUEST) -> HTTP_RESPONSE`, stored as a function (decision 6). `with_json` wraps a handler of the request and the body: a body that is not one JSON value, or none, is `REST_RESPONSE.bad_body`, a `400` with the byte where it went wrong, and the handler is not called.
+  - `REST_ROUTER`: up to 64 routes, tried in the order added (`on_get`, `on_post`, `on_put`, `on_delete`, `on_json`). `dispatch` gives a `400` for a target that cannot be read, the first matching route's answer (`HEAD` by a `GET` route), a `405` when a route matches the path but not the method, and otherwise a `404`. `invalid_route` names the first pattern that is not valid, which is how step 1's total patterns are reported: the server can refuse to start.
+  - `REST_REQUEST`: `param`, `param_nat`, `query`, `header` (case-insensitive), `body`, `json_body` and the `http` request.
+  - `REST_RESPONSE`: `json`, `ok_json`, `created_json`, `text`, `ok_text`, `no_content`, and errors as `{"error": ...}` (`error`, `bad_request`, `not_found`, `method_not_allowed`, `bad_target`, `bad_body`).
+- **`ghttp` 0.4.0.** A REST answer needs a `Content-Type`, and `ghttp` sent none, so `HTTP_RESPONSE` gains a media type from a fixed set, `HTTP_CONTENT_TYPE` (`Unstated`, `PlainText`, `Json`), and `with_content_type`. The serializer's head is still stated exactly, now 35 to 85 bytes. A fixed set keeps a line break out of the head with no proof about text. Writing the 409 case found that `HTTP_STATUS.code_digits` sent `500` for any code it did not list, so `HTTP_STATUS.make(409)` went out as `500`; it now sends the code. Responses with no media type are sent as before, so `hello_api` and the `ghttp` cases are unchanged.
+- **Proven, through the contracts alone** (`tests/grest.rs`): a target that cannot be read is a `400` whatever the routes; a router with no routes answers `404`; `bad_body` and `bad_target` are `400`; `error(st, m)` keeps `st`, even for a code `HTTP_STATUS` has no constructor for; `ok_json` is a `200` or, when the text is over 64 KiB, a `500`; a router has at most 64 routes. Three lies are refused: a `404` from an empty router for every request, a `200` from every `ok_json`, and a route that never answers `400`.
+- **A client lists its packages.** A package sees only the packages its manifest names, so a `grest` client names `ghttp` and `gjson` too. As in Cargo, there is no re-export.
+- **Tests.** `grest/tests/src/grest_api.gdl` is a nine-route API whose handlers are routine names. `cases.txt` gains 32 requests and 4 answers compared as sent, with each CRLF written `|`: route order (`/users/me` before `/users/:id`), `HEAD`, `405` against `404`, JSON bodies echoed and edited, a missing, broken and trailing body, query fields, a header in another case, every kind of bad target, the `Content-Type` of JSON and text, a `204` with no type, and a `409`. 140 cases in all.
+- **Mutations.** Fourteen on a private copy, all red. Three were caught by the verifier: a bad target answered `404`, an error that loses its status when its body cannot be built, and a head without its `Content-Type` line. Eleven were caught by the cases: `HEAD` not answered by `GET`, no `405`, the last route tried first, a bad body reaching the handler, JSON sent with no type, a parameter read from the query, an invalid route not reported, a bad body without its offset, a header ignored, other codes sent as `500`, and a misspelled media type. One more on the compiler is listed below.
+- **Compiler fix found on the way.** A `let` bound to a `match` expression, `let s = match a case Some(x) then x case None then "" end`, was declared an integer in the proof, and the module was `E0199`. `infer_gardel_type` had no arm for `match`, and the arms' binders were typed after the `let`. The binders are now typed first, and a `match` has the type of its first arm whose type is known. `tests/let_match.rs` has a program whose `let`s take a `STRING` and an `OPTION[NAT]` from a `match`, which verifies and prints the same values in C, and a lie about one refused. Removing the `match` arm of `infer_gardel_type` turns it red.
+- **Cost.** `grest` verifies in about 20 s on a warm cache of `ghttp` and `gjson`, and its test package in under a minute. `cargo test --test grest` takes about 8 minutes, as each client project verifies the three packages in a cache of its own.
+- **Known limits.**
+  - A `405` has no `Allow` header: `HTTP_RESPONSE` has no headers but `Content-Type` and `Content-Length`.
+  - A `HEAD` request gets the `GET` route's body too. The server closes the connection after each answer, so a client is not misled about where the answer ends.
+  - A handler in a `module` cannot call a sibling routine (step 0), so handlers live in `functions` and `program` modules.
 
 ### Step 5: Async
 

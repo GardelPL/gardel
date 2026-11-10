@@ -1,0 +1,142 @@
+-- Responses for a REST service: a JSON or a text body with its `Content-Type`, and errors as
+-- a JSON object, `{"error":"not found"}`.
+functions REST_RESPONSE
+
+feature {ANY}
+
+  -- `v` as the body, with the status `st`. A body that does not fit a response (65536 bytes)
+  -- is an empty `500` instead.
+  json(st: HTTP_STATUS, v: JSON): HTTP_RESPONSE
+    require
+      allows_body: not st.forbids_body
+    do
+      let t = v.to_text
+      if t.byte_length <= 65536 then
+        HTTP_RESPONSE.make_text(st, t).with_content_type(Json)
+      else
+        HTTP_RESPONSE.make_empty(HTTP_STATUS.internal_server_error)
+      end
+    ensure
+      status: Result.response_status_code = st.status_code or Result.response_status_code = 500
+    end
+
+  ok_json(v: JSON): HTTP_RESPONSE
+    do
+      REST_RESPONSE.json(HTTP_STATUS.ok, v)
+    ensure
+      status: Result.response_status_code = 200 or Result.response_status_code = 500
+    end
+
+  created_json(v: JSON): HTTP_RESPONSE
+    do
+      REST_RESPONSE.json(HTTP_STATUS.created, v)
+    ensure
+      status: Result.response_status_code = 201 or Result.response_status_code = 500
+    end
+
+  -- `s` as a `text/plain` body, with the status `st`.
+  text(st: HTTP_STATUS, s: STRING): HTTP_RESPONSE
+    require
+      allows_body: not st.forbids_body
+      fits: s.byte_length <= 65536
+    do
+      HTTP_RESPONSE.make_text(st, s).with_content_type(PlainText)
+    ensure
+      status: Result.response_status_code = st.status_code
+      body: Result.response_body_length = s.byte_length
+    end
+
+  ok_text(s: STRING): HTTP_RESPONSE
+    require
+      fits: s.byte_length <= 65536
+    do
+      REST_RESPONSE.text(HTTP_STATUS.ok, s)
+    ensure
+      status: Result.response_status_code = 200
+      body: Result.response_body_length = s.byte_length
+    end
+
+  -- `204`, with no body.
+  no_content: HTTP_RESPONSE
+    do
+      HTTP_RESPONSE.no_content_empty
+    ensure
+      status: Result.response_status_code = 204
+      empty: Result.response_body_length = 0
+    end
+
+  -- The JSON text of `v` as a body with the status `st`, or no body if it does not fit. The
+  -- status is `st` either way.
+  error_body(st: HTTP_STATUS, v: OPTION[JSON]): HTTP_RESPONSE
+    require
+      allows_body: not st.forbids_body
+    do
+      match v
+        case None then
+          HTTP_RESPONSE.make_empty(st)
+        case Some(j) then
+          let t = j.to_text
+          if t.byte_length <= 65536 then
+            HTTP_RESPONSE.make_text(st, t).with_content_type(Json)
+          else
+            HTTP_RESPONSE.make_empty(st)
+          end
+      end
+    ensure
+      status: Result.response_status_code = st.status_code
+    end
+
+  -- `{"error":message}` with the status `st`.
+  error(st: HTTP_STATUS, message: STRING): HTTP_RESPONSE
+    require
+      allows_body: not st.forbids_body
+    do
+      REST_RESPONSE.error_body(st, JSON.empty_object.with_field("error", JSON.string(message)))
+    ensure
+      status: Result.response_status_code = st.status_code
+    end
+
+  bad_request(message: STRING): HTTP_RESPONSE
+    do
+      REST_RESPONSE.error(HTTP_STATUS.bad_request, message)
+    ensure
+      status: Result.response_status_code = 400
+    end
+
+  not_found: HTTP_RESPONSE
+    do
+      REST_RESPONSE.error(HTTP_STATUS.not_found, "not found")
+    ensure
+      status: Result.response_status_code = 404
+    end
+
+  method_not_allowed: HTTP_RESPONSE
+    do
+      REST_RESPONSE.error(HTTP_STATUS.method_not_allowed, "method not allowed")
+    ensure
+      status: Result.response_status_code = 405
+    end
+
+  -- A request target that could not be read: `{"error":"<reason>"}`, a `400`.
+  bad_target(e: URL_ERROR): HTTP_RESPONSE
+    do
+      REST_RESPONSE.bad_request(e.reason)
+    ensure
+      status: Result.response_status_code = 400
+    end
+
+  -- A body that is not one JSON value: `{"at":<byte>,"error":"invalid JSON body"}`, a `400`.
+  -- A missing body is one, at byte 0.
+  bad_body(e: JSON_ERROR): HTTP_RESPONSE
+    do
+      let at: I64 = if e.offset <= 9223372036854775807 then I64.from_nat(e.offset) else 0 end
+      let message = JSON.empty_object.with_field("error", JSON.string("invalid JSON body"))
+      match message
+        case None then REST_RESPONSE.error_body(HTTP_STATUS.bad_request, message)
+        case Some(o) then REST_RESPONSE.error_body(HTTP_STATUS.bad_request, o.with_field("at", JSON.int(at)))
+      end
+    ensure
+      status: Result.response_status_code = 400
+    end
+
+end

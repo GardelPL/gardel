@@ -1,0 +1,50 @@
+-- The `grest` cases, read on standard input:
+--
+--   gardelc --project grest/tests --strict
+--   build/grest_test_bin.exe < grest/tests/cases.txt
+--
+-- Exit code 0 means every case holds; 100 + n means line n is the first that does not,
+-- and it is printed.
+program GREST_TEST
+
+feature {ANY}
+
+  run_cases(n: NAT): IO[EXIT_CODE]
+    require
+      bounded: n <= 10000
+    variant
+      10000 - n
+    do
+      with IO
+        line_res <- IO.read_line
+        match line_res
+          case Error(_) then
+            IO.exit(0)
+          case Ok(line) then
+            if GREST_TEXT.check_line(line) = 0 and n < 10000 then
+              run_cases(n + 1)
+            else
+              report(line, n)
+            end
+        end
+      end
+    end
+
+  report(line: STRING, n: NAT): IO[EXIT_CODE]
+    do
+      if GREST_TEXT.check_line(line) = 0 then
+        IO.exit(0)
+      else
+        with IO
+          IO.print_line(line)
+          IO.exit(if n <= 150 then 100 + n else 250 end)
+        end
+      end
+    end
+
+  main(args: SEQ[STRING]): IO[EXIT_CODE]
+    do
+      run_cases(1)
+    end
+
+end
