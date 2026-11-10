@@ -2290,6 +2290,8 @@ representation {ANY}
   | Listen(port: NAT)                 -- answered by Accepted / ListenFailed
   | Send(conn: CONN_ID, data: BYTES)  -- a failure is answered by SendFailed
   | Close(conn: CONN_ID)
+  | Connect(tag: NAT, host: STRING, port: NAT)  -- answered by Connected / ConnectFailed
+  | CancelTimer(id: NAT)              -- the pending Tick(id), if any, never comes
 end
 
 module EVENT
@@ -2303,6 +2305,8 @@ representation {ANY}
   | SendFailed(conn: CONN_ID, err: IO_ERROR)
   | Closed(conn: CONN_ID)
   | Shutdown
+  | Connected(tag: NAT, conn: CONN_ID)
+  | ConnectFailed(tag: NAT, err: IO_ERROR)
 end
 
 module KEY
@@ -2329,10 +2333,10 @@ Rules:
 4. **Shutdown must stop.** `step` has the implicit postcondition `e.is_shutdown implies Result.is_stop`, tagged `shutdown_must_stop`. It is always added, so a clause the programmer writes cannot replace it. Constructor queries are used because `EVENT` is not `CANONICAL_EQ` (§9).
 5. **Commands never block.** Commands in one `cmds` list run in order. A command that can fail reports the failure as a later event, never as a crash (§7.2). Output is flushed after each list, before the program waits. The commands of a `Stop` run before the process exits, and its `code` is the exit status. If `init` returns `Stop`, `step` is never called.
 6. **Events are untrusted.** The verifier assumes nothing about a payload beyond its type. Payloads become invariant-carrying values only through `RESULT`-returning boundary routines (§7.2, §11.4).
-7. **Handles.** Each `CONN_ID` comes from exactly one `Accepted` event, and an id is never used again. After `Close(c)` runs, at most one more event mentions `c`, and it is `Closed(c)`. No event mentions `c` after `Closed(c)`, and a command naming a closed connection does nothing.
+7. **Handles.** Each `CONN_ID` comes from exactly one `Accepted` or `Connected` event, and an id is never used again. After `Close(c)` runs, at most one more event mentions `c`, and it is `Closed(c)`. No event mentions `c` after `Closed(c)`, and a command naming a closed connection does nothing.
 8. **Closed types.** `COMMAND` and `EVENT` are closed, and adding a variant is a prelude change. A program should end a `match` on `EVENT` with `case _` (§5.1).
 
-**Timers.** A timer fires once: `SetTimer(id, millis)` is answered by one `Tick(id)` after at least `millis` milliseconds, on a monotonic clock. A repeating timer sets the next one in `step`. Setting an id that is pending replaces it. Timers fire in deadline order, and in the order they were set on a tie. A pending `Shutdown` comes before any timer that is due, so a program that keeps setting a zero timer can still be stopped. Timers end with the program.
+**Timers.** A timer fires once: `SetTimer(id, millis)` is answered by one `Tick(id)` after at least `millis` milliseconds, on a monotonic clock. A repeating timer sets the next one in `step`. Setting an id that is pending replaces it, and `CancelTimer(id)` removes it, so no `Tick(id)` comes for it, even when the id is set again later; cancelling an id with no pending timer does nothing. Timers fire in deadline order, and in the order they were set on a tie. A pending `Shutdown` comes before any timer that is due, so a program that keeps setting a zero timer can still be stopped. Timers end with the program.
 
 **Console input.** `ReadLine` and `ReadKey` ask for one line or one key, and are answered by one `Line` or `Key` event. A program asks again for the next. Requests are served in order, on a thread of their own, so a blocked read never holds up timers or a `Shutdown`. `Line` carries the result of `IO.read_line` (§11, item 4): an `Error` for malformed UTF-8 or the end of input. `KEY` has no error case: malformed input is `Other`, so `Char` always holds a valid `CHAR`, and the end of input is `KeysEnded`, so a program cannot hang on a closed input. `ReadKey` puts a terminal in raw mode, with no line editing or echo, and `ReadLine` takes it back. Ctrl-C stays a `Shutdown` in raw mode. The terminal is restored when the program ends through `Stop`, a `Shutdown` or a host error. It cannot be restored after a crash or `SIGKILL`.
 
@@ -2342,13 +2346,15 @@ Rules:
 
 A connection ends in one way, with `Closed`. It comes after `Close`, once the queue has gone out, after the peer closes, once the queue has gone out, or after an error. A peer that closes only its sending side therefore still gets what was queued for it, but a program cannot answer it afterwards: it has seen `Closed`. A failed `Send` ends the connection, since the stream would have a hole, so `SendFailed` is always followed by `Closed`, and the handle guarantee means nothing is reported after a `Close`. A queue that takes no data for 5 seconds is dropped while its connection is ending. The commands of a `Stop` run first, and the program then waits at most 1 second for queues to empty.
 
+`Connect(tag, host, port)` opens a TCP connection, and is answered by one `Connected(tag, conn)` or one `ConnectFailed(tag, err)`, so a program tells its connects apart by the tag it chose. It never blocks: a connect that cannot finish at once is watched by the loop with the other sockets. `host` is an IPv4 address in four decimal parts or `localhost`; a name is not looked up, since a lookup blocks. A host that is neither, and a port that is 0 or above 65535, fail at once with no socket. A connect that has not finished after 10 seconds, or the milliseconds that `GARDEL_CONNECT_TIMEOUT_MS` gives, fails with the system's code for a timeout. A connection made by `Connect` is a connection as any other: `Send`, `Received`, `Close` and `Closed` work on it as on an accepted one, and its id comes from the same sequence.
+
 Every ready socket gets one event per pass, and sockets and timers take turns, so no client, and no zero timer, starves the rest. A pending `Shutdown` comes first.
 
-For tests and replay, `GARDEL_EVENTS` replaces the outside world with a script: event names separated by spaces, such as `Tick:1 Key:Up Key:113 Line:hello%20there LineEnd LineFailed:5 Accepted:1 Received:1:hi%20there SendFailed:1:32 ListenFailed:8888:98 Closed:1 Shutdown`. `Key:<n>` is a `Char` by scalar value, and `%XX` in a line or in received data is a byte, so a script can hold a space or malformed input. `LineEnd` is the end of input, and `LineFailed:<code>` a read that failed. Timers, reads and sockets do not run in a script, so it does not depend on the clock, the terminal or the network; `Listen`, `Send` and `Close` are written to standard error as lines such as `net: Send 1 hi%20there`. An unknown name stops the program with exit status 2. The end of a script is a `Shutdown`, so a scripted run always ends.
+For tests and replay, `GARDEL_EVENTS` replaces the outside world with a script: event names separated by spaces, such as `Tick:1 Key:Up Key:113 Line:hello%20there LineEnd LineFailed:5 Accepted:1 Received:1:hi%20there SendFailed:1:32 ListenFailed:8888:98 Closed:1 Connected:5:2 ConnectFailed:6:111 Shutdown`. `Connected:<tag>:<id>` and `ConnectFailed:<tag>:<code>` give the tag first. `Key:<n>` is a `Char` by scalar value, and `%XX` in a line or in received data is a byte, so a script can hold a space or malformed input. `LineEnd` is the end of input, and `LineFailed:<code>` a read that failed. Timers, reads and sockets do not run in a script, so it does not depend on the clock, the terminal or the network; `Listen`, `Connect`, `Send` and `Close` are written to standard error as lines such as `net: Send 1 hi%20there` or `net: Connect 5 127%2E0%2E0%2E1 8080`. An unknown name stops the program with exit status 2. The end of a script is a `Shutdown`, so a scripted run always ends.
 
 **Event log and replay.** With `GARDEL_RECORD=<file>` a run writes a log, and with `GARDEL_REPLAY=<file>` the program runs from one. These are environment variables, as `GARDEL_EVENTS` is, because the command line belongs to the program: a flag taken from it would change `args`, and `args` is an input to the run.
 
-A log is text, with one line for each thing that happened, in order: a `gardel-log 1 <PROGRAM>` header, an `arg <text>` line per argument, an `event <token>` line per delivered event, in the script syntax above, a `command <token>` line per command, as `Print:<text>`, `SetTimer:<id>:<millis>`, `ReadLine`, `ReadKey`, `Listen:<port>`, `Send:<id>:<text>` or `Close:<id>`, and finally `exit <code>`. Texts use `%XX`. Each event reaches the file before `step` runs, so a run that dies leaves the event that killed it, and a command is logged before it is performed.
+A log is text, with one line for each thing that happened, in order: a `gardel-log 1 <PROGRAM>` header, an `arg <text>` line per argument, an `event <token>` line per delivered event, in the script syntax above, a `command <token>` line per command, as `Print:<text>`, `SetTimer:<id>:<millis>`, `ReadLine`, `ReadKey`, `Listen:<port>`, `Send:<id>:<text>`, `Close:<id>`, `Connect:<tag>:<host>:<port>` or `CancelTimer:<id>`, and finally `exit <code>`. Texts use `%XX`. Each event reaches the file before `step` runs, so a run that dies leaves the event that killed it, and a command is logged before it is performed.
 
 A replay is a scripted run: arguments and events come from the log, and timers, reads and sockets do not run. Each command, and the exit code, is compared with the log before it takes effect. The first difference stops the program with exit status 3 and a message giving the log line, what the log says and what the program did. A log that is not for this program, malformed text, arguments on the command line, or `GARDEL_REPLAY` with `GARDEL_RECORD` or `GARDEL_EVENTS` stop it with exit status 2.
 

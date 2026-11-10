@@ -7,9 +7,9 @@
 --   step(s: REST_SERVER[STORE], e: EVENT): STEP[REST_SERVER[STORE]] do s.serve(e) end
 --
 -- Each request is answered once and its connection closed after the answer, and the state is
--- the one its handler gave back. `serve` proves the first for every event: see
--- `REST_SERVER.within`. The state is an `S`, so whatever `S`'s invariant says holds of it
--- after every request.
+-- the one its handler gave back. `serve` proves both for every event: see
+-- `REST_SERVER.within` and `moves_to`. The state is an `S`, so whatever `S`'s invariant says
+-- holds of it after every request.
 module REST_SERVER[S]
 
 representation {NONE}
@@ -128,6 +128,24 @@ feature {ANY}
       Current.app
     end
 
+  -- The request that `data` completes on `c`, if it completes one that `c` may still send.
+  completed(c: CONN_ID, data: BYTES): OPTION[HTTP_REQUEST]
+    do
+      match Current.conns.lookup_connection(c)
+        case None then None
+        case Some(conn) then
+          if not conn.connection_status.can_accept_bytes then
+            None
+          else
+            match HTTP_PARSER.feed(conn.parser_state, data)
+              case Complete(req, _) then Some(req)
+              case NeedMore(_) then None
+              case Failed(_) then None
+            end
+          end
+      end
+    end
+
   -- The server with its connections replaced.
   with_conns(cs: HTTP_SERVER_STATE): REST_SERVER[S]
     require
@@ -173,6 +191,8 @@ feature {ANY}
       end
     ensure
       within: REST_SERVER.within(Current, Received(c, data), Result)
+      served: Current.completed(c, data).is_some implies (match Result case Continue(n, _) then n.state = Current.router.dispatch(Current.state, Current.completed(c, data).get).state case Stop(_, _) then False end)
+      kept: Current.completed(c, data).is_none implies (match Result case Continue(n, _) then n.state = Current.state case Stop(_, _) then False end)
     end
 
   -- The step of a REST service for the event `e`.
@@ -201,6 +221,28 @@ feature {ANY}
     ensure
       shutdown_must_stop: e.is_shutdown implies Result.is_stop
       within: REST_SERVER.within(Current, e, Result)
+      state: Current.moves_to(e, Result)
+    end
+
+specify {ANY}
+
+  -- What `serve` promises of the state after `e`: a step that continues has the state the
+  -- handler of the request that `e` completes gave back, or, when `e` completes none, the
+  -- state it had.
+  moves_to(e: EVENT, st: STEP[REST_SERVER[S]]): BOOL
+    do
+      match st
+        case Stop(_, _) then True
+        case Continue(n, _) then
+          match e
+            case Received(c, data) then
+              match Current.completed(c, data)
+                case Some(req) then n.state = Current.router.dispatch(Current.state, req).state
+                case None then n.state = Current.state
+              end
+            case _ then n.state = Current.state
+          end
+      end
     end
 
 end

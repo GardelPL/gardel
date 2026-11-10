@@ -1,7 +1,7 @@
 # Phase F: Verified Libraries and Applications
 
 **Date:** November 6, 2026
-**Status:** In progress. Tasks F.0 to F.5 and F.12 are completed, and the decisions below are taken.
+**Status:** In progress. Tasks F.0 to F.7 and F.12 are completed (F.7 on Windows only), and the decisions below are taken.
 **Roadmap entry:** [Phase F in Roadmap.md](../Roadmap.md#phase-f-verified-libraries-and-applications)
 **Probed at:** commit `1349cb6`
 
@@ -482,6 +482,11 @@ Step 4, handlers with state (decided 2026-11-10: a handler takes the service's s
   - Caught by the verifier: `add` keeping the next id, `add` putting a todo under the wrong key (both the invariant), and `PUT` making a todo with the next id instead of its own (`TODO.from_json`'s `require`).
   - Caught by the scripted run: `remove` that keeps the todo, `POST` that drops the new state, the server dropping the state a handler gave back, a JSON route that never calls its handler, and `on_view` adding a `POST` route instead of a `GET` one.
   - So the invariant is proven, but that a handler's change reaches the next request, and that a delete deletes, are checked by the runs, not proven: `REST_SERVER`'s contract says nothing of the state, and `TODO_STORE`'s says nothing of which todos it holds after a change, as a `find` fact stated through the hidden map is a visibility warning under `--strict`.
+- **Follow-up (2026-11-10): both are proven now.**
+  - `TODO_STORE`'s `add`, `replace` and `remove` ensure what `find` gives after them: the added todo is found, the replaced one has its new `done`, the removed id is not found, and every other id is found as before. They are stated through `find`, so `--strict` has no visibility warning.
+  - They did not verify at first, for a reason in the compiler: a routine whose body is hidden from a module, `MAP.get` here, had a step axiom between fuels but was otherwise a different function at each fuel. Its laws speak of it at `DefaultFuel`, and `find`'s body unfolds to a `get` one fuel lower, so no law reached it. Such a routine is now one function at every fuel (an axiom `F(f, x) = F(DefaultFuel, x)`, emitted only where its body is hidden). `tests/hidden_body_fuel.rs` fails without it.
+  - `grest` 0.4.1: `REST_SERVER.completed(c, data)`, the request bytes complete, and `on_bytes` ensures that the next state is `router.dispatch(state, req).state` for that request, or the same when there is none. `serve` ensures `moves_to(e, Result)`, a ghost query in `specify {ANY}`. Stating it only through `moves_to` did not verify in `on_bytes`: `moves_to` unfolds `completed`, which unfolds to calls at one fuel less again; stated on `on_bytes` directly, it does, and `serve`'s follows. The mutation of the server dropping the handler's state, which only the scripted run caught, is now caught by the verifier (`served`).
+  - `rename_reserved` still does not cover law parameters.
 
 ### Step 5: Async
 
@@ -489,12 +494,24 @@ Step 4, handlers with state (decided 2026-11-10: a handler takes the service's s
 
 Needs decision 9.
 
-- [ ] `Connect(tag: NAT, host: STRING, port: NAT)`, with `Connected(tag, conn)` and `ConnectFailed(tag, err)`.
-- [ ] Non-blocking connect on the shared `poll` / `WSAPoll` loop, behind the event source interface.
-- [ ] `CancelTimer(id)`: an async program must be able to clear a timeout it no longer needs, or a stale `Tick` could hit a reused id.
-- [ ] Scripted and log forms, and replay through a connect.
-- [ ] Check prelude name clashes with existing users, as Phase D did for `EVENT` and `KEY`.
+**Status:** Done on Windows (2026-11-10). The POSIX side is written beside the Windows one, but no Linux or macOS machine has run it yet.
+
+- [x] `Connect(tag: NAT, host: STRING, port: NAT)`, with `Connected(tag, conn)` and `ConnectFailed(tag, err)`.
+- [x] Non-blocking connect on the shared `poll` / `WSAPoll` loop, behind the event source interface.
+- [x] `CancelTimer(id)`: an async program must be able to clear a timeout it no longer needs, or a stale `Tick` could hit a reused id.
+- [x] Scripted and log forms, and replay through a connect.
+- [x] Check prelude name clashes with existing users, as Phase D did for `EVENT` and `KEY`.
 - Acceptance: over real TCP, a refused, timed out and successful connect each give the right event. A replay reproduces the commands exactly.
+
+What was done:
+
+- **Prelude.** `COMMAND` gains `Connect(tag, host, port)` and `CancelTimer(id)`, and `EVENT` gains `Connected(tag, conn)` and `ConnectFailed(tag, err)`, each at the end. No program, package or test in the repository declares these names, and every `match` on `EVENT` or `COMMAND` in them ends with `case _`, so none changed.
+- **Addresses (decision 9).** An IPv4 address in four decimal parts, or `localhost`. Anything else, `example.com`, `127.0.0` or `256.1.1.1`, and a port of 0 or above 65535, is a `ConnectFailed` at once, with no socket. The parser is the runtime's own, as `inet_addr` takes forms such as `127.1` and `0x7f.0.0.1`.
+- **The loop.** A connect that cannot finish at once is a pending entry, watched for writing in the same pass as the listeners and connections (`FD_CONNECT` on Windows, which wakes the loop). When it is ready, `SO_ERROR` says `Connected` or `ConnectFailed`. A connected socket becomes a connection like an accepted one, with the next id of the same sequence, so the handle rules of spec 11.6 hold for both. A pending connect has a deadline, 10 s, or `GARDEL_CONNECT_TIMEOUT_MS`; past it, it fails with the system's timeout code (10060, `ETIMEDOUT`), and the loop's wait never sleeps past it. `Stop` closes pending connects.
+- **`CancelTimer`.** It removes the pending timer with that id. A `Tick` is made only when its timer is due, so none can be left over for a later `SetTimer` of the id.
+- **Script and log.** Events `Connected:<tag>:<id>` and `ConnectFailed:<tag>:<code>`. Commands `Connect:<tag>:<host>:<port>` and `CancelTimer:<id>` in the log, and `net: Connect <tag> <host> <port>` on standard error in a script.
+- **Tests.** `tests/connect.rs` runs `tests/reactive/net_client.gdl`, verified under `--strict`: a connect to a server on `127.0.0.1` and on `localhost` sends `ping`, gets `pong`, is recorded and replays with the same output; a refused port fails (about 2 s on Windows, which retries the SYN); `10.255.255.1` with a 300 ms limit times out (`ConnectFailed:5:10060` on this machine); five hosts or ports that are not valid fail; and a script gives both events, with four malformed tokens refused. The timer set and cancelled in `init` never ticks.
+- Known limits: no name lookup; IPv4 only; the timeout is one for the whole program, not one per `Connect`.
 
 #### Task F.8: HTTP Client and Async Handlers
 

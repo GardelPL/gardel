@@ -8912,9 +8912,32 @@ fn emit_boogie_parts_with_options(
                 q_params.join(", ")
             ));
         }
-        if !binds_io {
+        // Where the body is hidden, the axiom below makes every fuel one, so this step would
+        // only add a term one fuel lower for each call, and its facts again.
+        if !binds_io && scope == BoogieEmitScope::Full {
             out.push_str(&format!(
                 "axiom (forall{r_tp_quant} {} :: {fn_step_two_trigger} {guard_str}{fn_step_two_app} == {fn_succ_app});\n",
+                q_params.join(", ")
+            ));
+        }
+        // A routine whose body is hidden here, such as `MAP.get` in a client, is one function
+        // whatever the fuel: fuel only bounds how far a body unfolds, and there is none to
+        // unfold. Its laws speak of it at `DefaultFuel`, while a body that calls it, such as
+        // `find(id) do Current.items.get(id) end`, unfolds to a call at one fuel less, which
+        // the laws never reached.
+        if !binds_io && scope == BoogieEmitScope::ContractOnly {
+            let default_app = format!(
+                "fn_{}({})",
+                r.name,
+                std::iter::once("DefaultFuel").chain(call_args_f.iter().skip(1).map(String::as_str)).collect::<Vec<_>>().join(", ")
+            );
+            let (lhs, rhs) = if result_only_tps {
+                (format!("({fn_f_app} : {ret_bty})"), format!("({default_app} : {ret_bty})"))
+            } else {
+                (fn_f_app.clone(), default_app)
+            };
+            out.push_str(&format!(
+                "axiom (forall{r_tp_quant} {} :: {fn_f_trigger} {lhs} == {rhs});\n",
                 q_params.join(", ")
             ));
         }

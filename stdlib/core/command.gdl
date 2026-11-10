@@ -8,5 +8,7 @@ representation {ANY}
   | Listen(port: NAT)
   | Send(conn: CONN_ID, data: BYTES)
   | Close(conn: CONN_ID)
+  | Connect(tag: NAT, host: STRING, port: NAT)
+  | CancelTimer(id: NAT)
 
 end
