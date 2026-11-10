@@ -9,6 +9,8 @@ All notable changes, theoretical soundess fixes, verification overhauls, front-e
 Spec draft v0.5. [plan/Roadmap.md](plan/Roadmap.md) holds the detail for each task.
 
 ### Language and runtime
+- **Refined function types are enforced** (F.12). In `(x: NAT) -> NAT require small: x < 100 ensure bounded: Result <= x`, the `require` is proven at each application, and the `ensure` is proven of every function passed, by the caller, and assumed in the body. A lambda passed to such a parameter may use its `require`. On a record field, an `ensure` is an invariant of the record, and on a result an `ensure` of the routine. Before, both clauses were ignored. Clauses that nothing would enforce, in a `let`, a lambda, a type argument or a nested function type, are `E0321`, and a parameter with a `require` that is bound to a name or returned is `E0322`.
+- **`let a = f(k)` on a function parameter `f`** has `f`'s result type in the proof (F.12). It had the module's type, and the module was `E0199`.
 - **`gjson`** (F.4), a verified JSON package: an opaque `JSON` value whose invariant keeps text valid UTF-8, keys unique and in order, and nesting at most 64 levels; a total parser with byte offsets in every error and a 4 MiB limit; and a writer with no white space and keys in order. The law `JSON.scalar_round_trip` proves `parse(v.to_bytes) = Ok(v)` for scalars and strings. Arrays and objects are covered by tests (`gjson/tests/cases.txt`).
 - **A field of a machine number type is in range** in the proof (F.4), for sum types and records.
 - **Substitution avoids capture** (F.4): a `match` binder, quantified variable, lambda parameter or `let` in a `require` no longer captures a variable of the call's arguments.

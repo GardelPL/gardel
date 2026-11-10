@@ -1566,6 +1566,14 @@ When Boogie/Z3 returns `unknown` or fails to prove an obligation:
 Functions are first-class values that carry contracts in their types, so libraries such as `map` and `filter` can be specified and verified.
 
 - **Function types.** `A -> B` is a total, pure function, of one, two or three parameters: `(acc: B, k: K, v: V) -> B`. A refined function type names its parameter and adds clauses: `(x: NAT) -> NAT require small: x < 100 ensure bounded: Result <= x`.
+- **Refined function types are enforced** (Task F.12). Each clause binds where the function is held:
+  - On a routine or law parameter `f`, each `ensure` is a `require` of the routine, tagged `f_<tag>`: `forall x: NAT. x < 100 implies f(x) <= x`. A caller proves it of what it passes, and the body assumes it.
+  - Each `require` is proven at every application of the function, `f(k)`, as a call proves a routine's `require`.
+  - A lambda passed where a refined type is expected is proven against that type there, and its body may assume the type's `require`.
+  - On a record field, each `ensure` is an invariant of the record, tagged `<field>_<tag>`, so it is proven where the record is built and holds wherever one is read. On a routine's result, each `ensure` is an `ensure` of the routine, tagged `result_<tag>`.
+  - A parameter whose type has a `require` may only be applied, or passed as an argument where the receiving type's `require` implies its own. Bound to a name, returned or stored, it could be applied outside its `require`, which is `E0322: refined_function_escapes`. Passed to a plain function type, such as `LIST_OPS.map`'s `A -> B`, or to a constructor, the implication cannot be proven, and the call is refused.
+  - A `require` is accepted on a parameter only. Clauses anywhere else, on a field's or result's `require`, a variant's field, a `let`, a lambda's parameter, a quantifier, a type argument such as `LIST[...]`, or a function type nested in another, are `E0321: refined_function_type_position`, as nothing would enforce them there.
+  - A clause is kept in the type as text. One that does not read back as written is a parse error.
 - **Functions in data.** A record field or a list element may hold a function, and `r.f(x)` applies field `f`. A function has no equality, so neither has a type that holds one: `=` on it does not build, nor does `has` on a list of it.
 - **Lambdas.** `fn(x: NAT): NAT do x + 1 end` is checked against the contract of the expected function type at the point of use. The obligations of its body (§12) are proven where the lambda is created, under what holds there, for every argument of its parameter types, because it can be applied to any of them.
 - **Totality.** Function arguments must be total. There are no partial functions and no exceptions.
@@ -2379,7 +2387,7 @@ Both `create` and `feature` routines returning an instance of `Current` (or any 
 | `check` | each `check` block | the predicate holds, then joins the active proof context |
 | `assume` | each `assume` block | none; joins the proof context and is listed by `gardelc --audit` |
 
-Static rules introduced in v0.5: `E0104: entry_point_reference` (§4), `E0316: unreachable_match_arm` (§5.1), `E0317: unsatisfied_bound`, `E0318: method_not_in_bound` and `E0320: unsupported_bound` (§9), `E0319: variant_no_measure` (§7), and the family `"Phase 4 (Reactive Violation)"` with the tags `missing_init`, `missing_step`, `main_in_reactive`, `bad_init_signature`, `bad_step_signature`, `state_type_mismatch`, `entry_point_require`, `io_in_reactive` and `shutdown_must_stop` (§11.6).
+Static rules introduced in v0.5: `E0104: entry_point_reference` (§4), `E0316: unreachable_match_arm` (§5.1), `E0317: unsatisfied_bound`, `E0318: method_not_in_bound` and `E0320: unsupported_bound` (§9), `E0319: variant_no_measure` (§7), `E0321: refined_function_type_position` and `E0322: refined_function_escapes` (§8), and the family `"Phase 4 (Reactive Violation)"` with the tags `missing_init`, `missing_step`, `main_in_reactive`, `bad_init_signature`, `bad_step_signature`, `state_type_mismatch`, `entry_point_require`, `io_in_reactive` and `shutdown_must_stop` (§11.6).
 
 A solver result that is neither proof nor refutation is an error with its own rule, and its message says that the obligation is unproven: `"Phase 3 Boogie (Verification Resource Limit)"` for an obligation that exhausted the solver limit (§7.3), `"Phase 3 Boogie (Verification Timeout)"` for a procedure that did not finish, and `"Phase 3 Boogie (Verification Incomplete)"` when Boogie gives no clean result. A refutation always carries a counterexample.
 

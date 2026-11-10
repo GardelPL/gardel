@@ -868,7 +868,7 @@ flowchart TD
 | | [F.14](libraries/verified_libraries.md#task-f14-a-cost-model-for-parallel-lets) | A cost model for parallel `let`s, found in F.4 |
 | 3. JSON | [F.4](libraries/verified_libraries.md#task-f4-the-gjson-package) | The `gjson` package, with the round trip proven for scalars and strings ✅ |
 | 4. REST | [F.5](libraries/verified_libraries.md#task-f5-a-parser-that-means-what-the-bytes-say) | A correct `ghttp` parser ✅ |
-| | [F.12](libraries/verified_libraries.md#task-f12-refined-function-types) | `require` and `ensure` on function types enforced |
+| | [F.12](libraries/verified_libraries.md#task-f12-refined-function-types) | `require` and `ensure` on function types enforced ✅ |
 | | [F.6](libraries/verified_libraries.md#task-f6-grest-sync-rest) | `grest`, sync handlers, `todo_api` |
 | 5. Async | [F.7](libraries/verified_libraries.md#task-f7-connect-and-correlation-ids) | `Connect`, correlation ids, `CancelTimer` |
 | | [F.8](libraries/verified_libraries.md#task-f8-http-client-and-async-handlers) | HTTP client, async handlers, `api_gateway` |
@@ -901,7 +901,7 @@ flowchart TD
 
 ## 6. Immediate Next Step
 
-**Phase F: Verified Libraries and Applications** is in progress, and Tasks F.0 to F.5 are completed. `gjson` proves its round trip for scalars and strings, and tests it for arrays and objects. The next task is F.12, refined function types, which F.6 (`grest`) needs.
+**Phase F: Verified Libraries and Applications** is in progress, and Tasks F.0 to F.5 and F.12 are completed. `gjson` proves its round trip for scalars and strings, and tests it for arrays and objects. The clauses of a refined function type are enforced, so a route can hold a handler with a contract. The next task is F.6, `grest`.
 
 **Phase E: Projects and Packages:** Tasks E.0 to E.5 and E.7 are completed, so Phase E is complete. Fetching dependencies and a lockfile were dropped, as a path dependency on a git submodule already pins a commit.
 
