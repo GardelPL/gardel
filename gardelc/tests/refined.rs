@@ -384,3 +384,108 @@ fn clauses_that_nothing_would_enforce_are_refused() {
         assert!(all(&out).contains("E0321"), "{name} must be E0321:\n{}", all(&out));
     }
 }
+
+/// A routine's name passed where a function is expected is that routine as a function value
+/// (Task F.6), checked against a refined type exactly as the lambda `fn(x) do r(x) end` is.
+#[test]
+fn a_routine_name_is_a_function_value() {
+    let client = functions(
+        "CLIENT",
+        "  halve(x: NAT): NAT
+    do
+      x / 2
+    ensure
+      le: Result <= x
+    end
+
+  bounded_halve(x: NAT): NAT
+    require
+      under: x < 100
+    do
+      x / 2
+    ensure
+      le: Result <= x
+    end
+
+  by_name: NAT
+    do
+      APPLY.apply_small(halve, 50)
+    ensure
+      small: Result <= 50
+    end
+
+  within_the_require: NAT
+    do
+      APPLY.apply_small(bounded_halve, 50)
+    end
+
+  shadowed(halve: NAT): NAT
+    do
+      halve / 3
+    end
+
+  mapped(xs: LIST[NAT]): LIST[NAT]
+    do
+      LIST_OPS.map(xs, halve)
+    end
+",
+    );
+    let main = "program MAIN
+
+feature {ANY}
+
+  quarter(x: NAT): NAT
+    do
+      x / 4
+    ensure
+      le: Result <= x
+    end
+
+  main(args: SEQ[STRING]): IO[EXIT_CODE]
+    do
+      let r = ROUTE.make(1, quarter)
+      with IO
+        IO.exit(r.run(40))
+      end
+    end
+
+end
+";
+    let p = Project::new(
+        "routine_values",
+        &[("apply.gdl", &functions("APPLY", APPLY)), ("client.gdl", &client), ("route.gdl", ROUTE), ("main.gdl", main)],
+    );
+    assert_ok(&p.check());
+    assert_eq!(p.run_binary(), 10);
+
+    let lies = functions(
+        "LIES",
+        "  grow(x: NAT): NAT
+    do
+      x +% 1
+    end
+
+  tiny_only(x: NAT): NAT
+    require
+      tiny: x < 10
+    do
+      x
+    ensure
+      le: Result <= x
+    end
+
+  grows: NAT
+    do
+      APPLY.apply_small(grow, 5)
+    end
+
+  needs_more: NAT
+    do
+      APPLY.apply_small(tiny_only, 5)
+    end
+",
+    );
+    let p = Project::new("routine_value_lies", &[("apply.gdl", &functions("APPLY", APPLY)), ("lies.gdl", &lies)]);
+    // `tiny_only` keeps its `ensure` only below 10, so `f_bounded` fails there too.
+    assert_refused_exactly(&p.check(), &["f_bounded", "tiny", "f_bounded"]);
+}

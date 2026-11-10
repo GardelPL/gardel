@@ -43,7 +43,41 @@ fn desugar_nullary_calls(m: &mut ModuleDecl) {
     if nullary.is_empty() {
         return;
     }
-    fn block(stmts: &mut [Stmt], body: &mut Expr, n: &HashSet<String>, bound: &mut Vec<String>) {
+    rewrite_free_vars(m, &|v| nullary.contains(v).then(|| Expr::Call(v.to_string(), Vec::new())));
+}
+
+/// A free name that is a routine of the module with parameters is that routine as a function
+/// value: `apply_to(halve, 7)` means `apply_to(fn(x: NAT): NAT do halve(x) end, 7)` (Task F.6).
+/// The lambda is exactly what a client would write by hand, so every later phase (the checks of
+/// refined function types, verification, code generation) treats it as one: a `require` of the
+/// routine is proven inside the lambda, and its `ensure` is known of each application through
+/// the call. A generic routine is left as it is, as its lambda would need its type arguments.
+/// Locals, parameters, binders and quantified variables shadow routine names, as above.
+fn desugar_routine_values(m: &mut ModuleDecl) {
+    let routines: HashMap<String, (Vec<(String, String)>, String)> = m
+        .create_routines
+        .iter()
+        .chain(&m.feature_routines)
+        .chain(&m.specify_routines)
+        .filter(|(_, r)| !r.params.is_empty() && r.type_params.is_empty())
+        .map(|(_, r)| (r.name.clone(), (r.params.clone(), r.ret_type.clone())))
+        .collect();
+    if routines.is_empty() {
+        return;
+    }
+    rewrite_free_vars(m, &|v| {
+        let (params, ret) = routines.get(v)?;
+        let args = params.iter().map(|(p, _)| Expr::Var(p.clone())).collect();
+        Some(Expr::Lambda(params.clone(), ret.clone(), Vec::new(), Box::new(Expr::Call(v.to_string(), args))))
+    });
+}
+
+/// Replaces each free `Var(v)` of the routines of `m` for which `f(v)` gives an expression.
+/// Locals, parameters, `match` binders, lambda parameters, quantified variables and `Result`
+/// (in an `ensure`) shadow the names. A replacement is not walked again.
+fn rewrite_free_vars(m: &mut ModuleDecl, f: &dyn Fn(&str) -> Option<Expr>) {
+    type Rw<'a> = &'a dyn Fn(&str) -> Option<Expr>;
+    fn block(stmts: &mut [Stmt], body: &mut Expr, n: Rw<'_>, bound: &mut Vec<String>) {
         let mark = bound.len();
         for st in stmts.iter_mut() {
             match st {
@@ -58,11 +92,13 @@ fn desugar_nullary_calls(m: &mut ModuleDecl) {
         expr(body, n, bound);
         bound.truncate(mark);
     }
-    fn expr(e: &mut Expr, n: &HashSet<String>, bound: &mut Vec<String>) {
+    fn expr(e: &mut Expr, n: Rw<'_>, bound: &mut Vec<String>) {
         match e {
             Expr::Var(v) => {
-                if n.contains(v.as_str()) && !bound.iter().any(|b| b == v) {
-                    *e = Expr::Call(v.clone(), Vec::new());
+                if !bound.iter().any(|b| b == v) {
+                    if let Some(x) = n(v.as_str()) {
+                        *e = x;
+                    }
                 }
             }
             Expr::Int(_) | Expr::Float(_) | Expr::Char(_) | Expr::Unit | Expr::Bool(_) | Expr::Str(_) => {}
@@ -133,15 +169,15 @@ fn desugar_nullary_calls(m: &mut ModuleDecl) {
     for (_, r) in all {
         let mut bound: Vec<String> = r.params.iter().map(|(p, _)| p.clone()).collect();
         for (_, e) in r.requires.iter_mut() {
-            expr(e, &nullary, &mut bound);
+            expr(e, f, &mut bound);
         }
         for e in r.variant.iter_mut() {
-            expr(e, &nullary, &mut bound);
+            expr(e, f, &mut bound);
         }
-        block(&mut r.stmts, &mut r.body, &nullary, &mut bound);
+        block(&mut r.stmts, &mut r.body, f, &mut bound);
         bound.push("Result".into());
         for (_, e) in r.ensures.iter_mut() {
-            expr(e, &nullary, &mut bound);
+            expr(e, f, &mut bound);
         }
     }
 }
@@ -1581,6 +1617,7 @@ impl Parser {
             invariants,
         };
         desugar_nullary_calls(&mut m);
+        desugar_routine_values(&mut m);
         if let Some(site) = patterns::desugar_patterns(&mut m).first() {
             return Err(ParseError {
                 message: format!(
@@ -8092,7 +8129,7 @@ fn emit_boogie_parts_with_options(
     }
     if string_mode {
         // Task B.3 (§3.1.4): each literal is a compiler-defined prelude `STRING` constant.
-        theory.push_str(&emit_boogie_string_literal_decls(&strings));
+        theory.push_str(&emit_boogie_string_literal_decls(&strings, true));
     } else {
         // Bootstrap (`--no-prelude`) mode: no prelude `STRING`; legacy opaque literal sort.
         for (idx, s) in strings.iter().enumerate() {
@@ -9122,69 +9159,68 @@ fn boogie_string_literal_term(s: &str) -> String {
 }
 
 /// Declarations of the literal constants of a module in prelude mode. Each literal `k` gets
-/// one constant `str_lit_k: STRING` and exactly one axiom, its *definition*
-/// `str_lit_k == <prelude construction term>` (a conservative extension: a fresh constant
-/// equated to a ground term). No property of the literal is axiomatized: its invariant and
-/// `chars` model follow from the bootstrap-verified `make_empty` / `push_...` contracts and
-/// are re-proven per literal by `Verify_string_literal_k`.
-fn emit_boogie_string_literal_decls(strings: &[String]) -> String {
+/// one constant `str_lit_k: STRING` and its *definition* `str_lit_k == <prelude construction
+/// term>`, through named steps `str_lit_k_s<j>` that keep the terms linear in the literal's
+/// length (a conservative extension: fresh constants equated to ground terms). No property of
+/// the literal is axiomatized: its invariant and `chars` model follow from the
+/// bootstrap-verified `make_empty` / `push_...` contracts and are re-proven per literal by
+/// `Verify_string_literal_k`.
+///
+/// With `guarded`, a literal's definition is one quantified axiom whose only trigger is
+/// `str_lit_k_defined(b)`, a term that only `Verify_string_literal_k` mentions. Every other
+/// proof knows the literal through that lemma's facts alone, so it never sees the construction
+/// terms of the module's literals. Left ground, they cost every proof of the module, and every
+/// literal's lemma, in proportion to all the literals together: 30 route paths next to `ghttp`
+/// ran out of resources (Task F.6). The axiom is still a conservative extension, as
+/// `str_lit_k_defined` may be the identity. The guard's body uses `b`, or the solver would
+/// drop the quantifier and make the definition ground again.
+fn emit_boogie_string_literal_decls(strings: &[String], guarded: bool) -> String {
     let mut out =
         String::from("// --- String literals (Task B.3, §3.1.4): prelude STRING constants ---\n");
     for (idx, s) in strings.iter().enumerate() {
-        // Intermediate construction steps are named (`str_lit_k_s<j>`) to keep the
-        // emitted terms linear in the literal length.
         let cap = string_literal_capacity(s);
         out.push_str(&format!("// str_lit_{idx} = \"{}\"\n", s.escape_debug()));
-        out.push_str(&format!("const str_lit_{idx}_s0: STRING;\n"));
-        out.push_str(&format!(
-            "axiom str_lit_{idx}_s0 == STRING__fn_make_empty(DefaultFuel, {cap});\n"
-        ));
-        let mut step = 0;
-        for c in s.chars().rev() {
+        let mut defs = vec![(
+            format!("str_lit_{idx}_s0"),
+            format!("STRING__fn_make_empty(DefaultFuel, {cap})"),
+        )];
+        for (step, c) in s.chars().rev().enumerate().map(|(i, c)| (i + 1, c)) {
             let mut buf = [0u8; 4];
             let bytes = c.encode_utf8(&mut buf).as_bytes();
-            step += 1;
-            out.push_str(&format!("const str_lit_{idx}_s{step}: STRING;\n"));
-            match bytes.len() {
-                1 => {
-                    out.push_str(&format!(
-                        "axiom str_lit_{idx}_s{step} == STRING__fn_push_ascii(DefaultFuel, str_lit_{idx}_s{}, {});\n",
-                        step - 1,
-                        c as u32
-                    ));
-                }
-                2 => {
-                    out.push_str(&format!(
-                        "axiom str_lit_{idx}_s{step} == STRING__fn_push_utf8_2(DefaultFuel, str_lit_{idx}_s{}, {}, {});\n",
-                        step - 1,
-                        bytes[0],
-                        bytes[1]
-                    ));
-                }
-                3 => {
-                    out.push_str(&format!(
-                        "axiom str_lit_{idx}_s{step} == STRING__fn_push_utf8_3(DefaultFuel, str_lit_{idx}_s{}, {}, {}, {});\n",
-                        step - 1,
-                        bytes[0],
-                        bytes[1],
-                        bytes[2]
-                    ));
-                }
-                4 => {
-                    out.push_str(&format!(
-                        "axiom str_lit_{idx}_s{step} == STRING__fn_push_utf8_4(DefaultFuel, str_lit_{idx}_s{}, {}, {}, {}, {});\n",
-                        step - 1,
-                        bytes[0],
-                        bytes[1],
-                        bytes[2],
-                        bytes[3]
-                    ));
-                }
+            let prev = format!("str_lit_{idx}_s{}", step - 1);
+            let term = match bytes.len() {
+                1 => format!("STRING__fn_push_ascii(DefaultFuel, {prev}, {})", c as u32),
+                2 => format!("STRING__fn_push_utf8_2(DefaultFuel, {prev}, {}, {})", bytes[0], bytes[1]),
+                3 => format!(
+                    "STRING__fn_push_utf8_3(DefaultFuel, {prev}, {}, {}, {})",
+                    bytes[0], bytes[1], bytes[2]
+                ),
+                4 => format!(
+                    "STRING__fn_push_utf8_4(DefaultFuel, {prev}, {}, {}, {}, {})",
+                    bytes[0], bytes[1], bytes[2], bytes[3]
+                ),
                 _ => unreachable!(),
+            };
+            defs.push((format!("str_lit_{idx}_s{step}"), term));
+        }
+        let last = defs.len() - 1;
+        defs.push((format!("str_lit_{idx}"), format!("str_lit_{idx}_s{last}")));
+        if guarded {
+            for (name, _) in &defs {
+                out.push_str(&format!("const {name}: STRING;\n"));
+            }
+            let body: Vec<String> = defs.iter().map(|(name, term)| format!("{name} == {term}")).collect();
+            out.push_str(&format!("function str_lit_{idx}_defined(b: bool): bool;\n"));
+            out.push_str(&format!(
+                "axiom (forall b: bool :: {{ str_lit_{idx}_defined(b) }} str_lit_{idx}_defined(b) == b && {});\n",
+                body.join(" && ")
+            ));
+        } else {
+            for (name, term) in &defs {
+                out.push_str(&format!("const {name}: STRING;\n"));
+                out.push_str(&format!("axiom {name} == {term};\n"));
             }
         }
-        out.push_str(&format!("const str_lit_{idx}: STRING;\n"));
-        out.push_str(&format!("axiom str_lit_{idx} == str_lit_{idx}_s{step};\n"));
     }
     out
 }
@@ -9225,6 +9261,9 @@ fn emit_boogie_string_literal_procedures(strings: &[String]) -> String {
             out.push_str(&format!("  ensures {f};\n"));
         }
         out.push_str("{\n");
+        // The only mention of the literal's guard: it brings the definition into this proof
+        // (see `emit_boogie_string_literal_decls`).
+        out.push_str(&format!("  var defined: bool;\n  defined := str_lit_{idx}_defined(true);\n"));
         let cap = string_literal_capacity(s);
         for (pre, tag) in pre_names("make_empty") {
             out.push_str(&format!(
@@ -26332,26 +26371,29 @@ end
             .iter()
             .position(|s| s == "hi")
             .expect("literal collected");
+        // A literal's definition sits behind a guard that only its own lemma triggers (F.6).
         assert!(bpl.contains(&format!(
-            "axiom str_lit_{hi}_s0 == STRING__fn_make_empty(DefaultFuel, 2);"
+            "axiom (forall b: bool :: {{ str_lit_{hi}_defined(b) }} str_lit_{hi}_defined(b) == b && \
+             str_lit_{hi}_s0 == STRING__fn_make_empty(DefaultFuel, 2) && \
+             str_lit_{hi}_s1 == STRING__fn_push_ascii(DefaultFuel, str_lit_{hi}_s0, 105) && \
+             str_lit_{hi}_s2 == STRING__fn_push_ascii(DefaultFuel, str_lit_{hi}_s1, 104) && \
+             str_lit_{hi} == str_lit_{hi}_s2);"
         )));
-        assert!(bpl.contains(&format!(
-            "axiom str_lit_{hi}_s1 == STRING__fn_push_ascii(DefaultFuel, str_lit_{hi}_s0, 105);"
-        )));
-        assert!(bpl.contains(&format!("axiom str_lit_{hi} == str_lit_{hi}_s2;")));
-        // (Quantified axioms mentioning a literal are the user routines' own definitional /
-        // contract axioms; every ground axiom about a literal is one of its definitions.)
-        for line in bpl
-            .lines()
-            .filter(|l| l.starts_with("axiom") && !l.contains("forall") && l.contains("str_lit_"))
-        {
-            assert!(
-                line.starts_with("axiom str_lit_")
-                    && !line.contains("chars")
-                    && !line.contains("Invariant"),
-                "unexpected trusted literal fact: {line}"
-            );
+        // (Other quantified axioms mentioning a literal are the user routines' own definitional /
+        // contract axioms; every axiom about a literal alone is one of its guarded definitions,
+        // and no axiom states a literal's fact. Nothing outside the lemma triggers the guard.)
+        for line in bpl.lines().filter(|l| l.starts_with("axiom") && l.contains("str_lit_")) {
+            if line.contains("_defined(b)") || !line.contains("forall") {
+                assert!(
+                    line.starts_with("axiom (forall b: bool :: { str_lit_")
+                        && !line.contains("chars")
+                        && !line.contains("Invariant"),
+                    "unexpected trusted literal fact: {line}"
+                );
+            }
         }
+        let triggers = bpl.matches(&format!("str_lit_{hi}_defined(true)")).count();
+        assert_eq!(triggers, 1, "only the literal's lemma may reveal its definition");
         // Each literal's invariant and chars model is a proof obligation of its own.
         assert!(bpl.contains(&format!("procedure Verify_string_literal_{hi}()")));
         assert!(bpl.contains(&format!(

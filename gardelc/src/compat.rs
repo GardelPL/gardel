@@ -663,7 +663,7 @@ fn query(bare: &ModuleDecl, claims: &[(usize, &Claim)], fuel: usize) -> String {
         if !ctx.modules.iter().any(|p| p.name == "OPTION") {
             s.push_str(&parts.option_shim);
         }
-        s.push_str(&emit_boogie_string_literal_decls(&strings));
+        s.push_str(&emit_boogie_string_literal_decls(&strings, false));
         for (index, claim) in claims {
             s.push_str(&procedure(*index, claim, bare, &strings));
         }
