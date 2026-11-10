@@ -390,7 +390,7 @@ What was done:
 
 Client: `examples/hello_api`, moved to `grest`. Needs decisions 5 and 6, and Task F.12.
 
-**Status:** In progress. Step 0, a spike on three earlier findings that would hit `grest`, is done, and so are step 1, the URL layer (2026-11-09), step 2, requests, responses and routes (2026-11-10), and step 3, the server (2026-11-10). `todo_api` remains.
+**Status:** Done (2026-11-10). Step 0, a spike on three earlier findings that would hit `grest`, step 1, the URL layer (2026-11-09), step 2, requests, responses and routes, step 3, the server, and step 4, handlers with state and `todo_api` (2026-11-10).
 
 - [x] Step 0: string literals, a routine as a function value, and `LIST.length` in C.
 - [x] Step 1: Path patterns such as `/users/:id`, and query parsing with percent decoding. A proven limit on segments.
@@ -399,7 +399,8 @@ Client: `examples/hello_api`, moved to `grest`. Needs decisions 5 and 6, and Tas
 - [x] Step 2: A bad or missing body is a `400` with a JSON error, by default.
 - [x] Step 3: `REST_SERVER` holds the connection loop now written by hand in `hello_api`: `init` and `step` are one line each in a client.
 - [x] Step 3: Proven server safety, carried over from `ghttp`: connection limit, one answer per request, and a `Close` after an error.
-- [ ] `examples/todo_api`: create, read, update and delete over JSON, with a proven invariant on its state.
+- [x] Step 4: handlers with state. `REST_ROUTE[S]`, `REST_ROUTER[S]` and `REST_SERVER[S]`, and a handler gives the next state with its answer (`grest` 0.4.0).
+- [x] `examples/todo_api`: create, read, update and delete over JSON, with a proven invariant on its state.
 - Acceptance: `hello_api` is little more than routes and handlers, and `todo_api` passes an end-to-end test over real sockets under `--strict`.
 
 Step 0, what was found and fixed:
@@ -459,7 +460,7 @@ Step 3, the server:
 - **Mutations.** Ten on a private copy, with `hello_api` as the client. All red. Six were caught by the verifier: an answer with no `Close`, a parse error answered with no `Close`, a full server that admits a connection, a `Shutdown` that continues, an invalid route that starts, and two answers to one request. Four were caught by the scripted run, as the contract allows them: a connection kept after its answer (the 66th is never let in), a failed `Listen` ignored, a bad port replaced by the default, and an answer sent to a connection the server never admitted, which the contract allows because it is one answer and a `Close`.
 - **Known limits.**
   - One request per connection: the connection is closed after its answer, and bytes after the request are dropped. Persistent connections are F.8.
-  - A handler cannot change state. `todo_api` needs one that does: the next step decides how a route reaches a service's own state.
+  - A handler cannot change state. `todo_api` needs one that does: the next step decides how a route reaches a service's own state. Done in step 4.
   - The contract bounds what a step sends, not what it says: that a complete request gets the router's answer, and not only a `Close`, is checked by the scripted and socket tests, not proven.
 
 Step 4, handlers with state (decided 2026-11-10: a handler takes the service's state and returns the next state with its answer, so `REST_ROUTE`, `REST_ROUTER` and `REST_SERVER` take the state type as a parameter; the other option, a server that hands a request out and is answered later, is F.8's waiting table). A spike came first, as in step 0: a generic package with `OUTCOME[S]`, `ROUTE[S]` holding `(s: S, n: NAT) -> OUTCOME[S]`, `ROUTER[S]` and a reactive `SERVER[S]`, and a client whose state is a module with an invariant.
@@ -469,6 +470,18 @@ Step 4, handlers with state (decided 2026-11-10: a handler takes the service's s
   - The contract axiom of a routine whose type parameters no argument mentions, such as `ROUTER[S].empty`, carried the result type in its trigger only, so Boogie read it as a fact of `ROUTER[int]`. Its calls in that axiom are now typed. Typing more (the definitional axioms, or `RESULT.ok`, whose `E` only its result fixes) made `STRING.find` and `matches_at` run out of resources, so it is kept to that case.
   - `/typeEncoding:a` was tried and rejected: the spike's generic router lost its own invariant facts.
 - **Spike result.** The client, `ROUTER.empty.on(1, peek).on(2, add)` with two handlers on a capped counter, verifies 0/0 in about 7 s cold and runs in C with the right answers, the cap kept. `tests/generic_handlers.rs` holds it, and a lie about it refused. Two compiler mutants, each fix undone, turn it red. The stdlib, every example and every package stay 0/0, and `cargo test` passes, 404 tests.
+- **`grest` 0.4.0.** `REST_OUTCOME[S]` (a `state` and a `response`), `REST_ROUTE[S]` holding `(s: S, r: REST_REQUEST) -> REST_OUTCOME[S]`, `REST_ROUTER[S]` and `REST_SERVER[S]`, which holds the state beside the connections and the router. `REST_ROUTE.plain`, `viewing` and `with_json` wrap a handler that ignores the state, one that only reads it, and one given the body as JSON, each as a lambda over `S`. The routines of `REST_SERVER` that mention no state (`for_conn`, `shaped`, `answer`, `port_of`, ...) moved to `REST_COMMANDS`: in a generic module, a type parameter that nothing fixes is the case the spike found. `serve`'s safety contract is the same. `REST_OUTCOME.make` ensures `state = s`, and `dispatch` keeps the state for a target that cannot be read and for a router with no routes. `--compare-with` against 0.3.0: 42 breaking changes, 8 additions.
+- **Three more compiler faults, found by the conversion:**
+  - A lambda whose types mention a type parameter was emitted as its body, outside any binder of its parameters (`undeclared identifier: s`). It is now lifted to a generic Boogie function `lam_M_k<S>(captures)`, and each call carries its function type, as a parameter only the result fixes needs.
+  - Whether an argument mentions a type parameter was decided on the text of its type, so `S` was found in `REST_REQUEST`. The trigger of `REST_ROUTE[S].plain` was then left untyped, which Boogie refuses. Types are compared by name.
+  - A `match` binder of a number type, `id` in `case Some(id)` on an `OPTION[NAT]`, was not known to be in its range, so `TODO_STORE.find(id)`'s facts, guarded by `in_u64(id)`, never applied. It is assumed now, as every value of the type is in range.
+  - A Gardel name that Boogie reserves, such as `old` in `case Some(old)`, was a parse error in the emitted program (`E0199`). `src/boogie_reserved.rs` renames, in each routine, every parameter, `let`, binder, lambda parameter and quantified variable so named (`old_1`), at its bindings and its uses in scope, right after parsing. `tests/boogie_reserved.rs` has a program use `old`, `var`, `type`, `function` and `int`, verify, run, and refuse a lie about them.
+- **`examples/todo_api`.** The state is `TODO_STORE`, a `MAP[NAT, TODO]` and the next id. Its invariant: each todo is kept under its own id (`items.get(k).get.todo_id = k`), and none has an id at or past the next (`items.get(k).is_none` for `k >= next`), so no id is given twice, even after a delete. Each change, `add`, `replace` and `remove`, is proven to keep it from `MAP`'s laws (`get_put_same`, `get_put_other`, `get_remove_*`), with no lemma of its own. Five routes: `GET /todos`, `POST /todos`, `GET`, `PUT` and `DELETE /todos/:id`. The service verifies 0/0 under `--strict` in about 45 s with `grest` cached, and the generic `grest` in about 105 s cold with `ghttp` and `gjson`.
+- **Tests.** `tests/todo_api.rs`: a client proves the invariant through the contracts (`keyed`, `fresh`, that an added todo leaves the ids past it free, that a delete keeps the next id), three claims past it are refused, and a session of 14 requests over real sockets gets the exact answers, a deleted id not given again among them. `tests/grest.rs` adds a scripted service whose state is a count: each request that reaches its handler adds one, in the order the requests complete, and one refused by the router or the parser does not; and the state facts of `dispatch`, with a lie (a routed request keeps the state) refused.
+- **Mutations,** eight, all red:
+  - Caught by the verifier: `add` keeping the next id, `add` putting a todo under the wrong key (both the invariant), and `PUT` making a todo with the next id instead of its own (`TODO.from_json`'s `require`).
+  - Caught by the scripted run: `remove` that keeps the todo, `POST` that drops the new state, the server dropping the state a handler gave back, a JSON route that never calls its handler, and `on_view` adding a `POST` route instead of a `GET` one.
+  - So the invariant is proven, but that a handler's change reaches the next request, and that a delete deletes, are checked by the runs, not proven: `REST_SERVER`'s contract says nothing of the state, and `TODO_STORE`'s says nothing of which todos it holds after a change, as a `find` fact stated through the hidden map is a visibility warning under `--strict`.
 
 ### Step 5: Async
 

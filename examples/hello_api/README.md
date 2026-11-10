@@ -23,15 +23,17 @@ status for the error, with no body.
 - [`Gardel.toml`](Gardel.toml) depends on `grest`, and on `ghttp` and `gjson` for the types of
   its requests, responses and JSON values, as a package sees only the packages it names.
 - [`src/hello_api.gdl`](src/hello_api.gdl) is `reactive program HELLO_API`: four handlers, `routes`
-  (which proves it has four), and
+  (which proves it has four), and the two lines below. Its handlers do not look at the
+  service's state, so the state is a `NAT` that stays `0`;
+  [`todo_api`](../todo_api) is a service with a state.
 
   ```eiffel
-  init(args: SEQ[STRING]): STEP[REST_SERVER]
+  init(args: SEQ[STRING]): STEP[REST_SERVER[NAT]]
     do
-      REST_SERVER.start(args, 8090, routes)
+      REST_SERVER.start(args, 8090, routes, 0)
     end
 
-  step(s: REST_SERVER, e: EVENT): STEP[REST_SERVER]
+  step(s: REST_SERVER[NAT], e: EVENT): STEP[REST_SERVER[NAT]]
     do
       s.serve(e)
     end

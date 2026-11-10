@@ -1896,7 +1896,7 @@ A package lists the packages it uses in `[dependencies]`, and then uses their mo
 ```toml
 [project]
 name = "hello-api"
-version = "0.2.0"
+version = "0.3.0"
 
 [dependencies]
 grest = { path = "../../grest" }

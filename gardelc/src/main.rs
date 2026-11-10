@@ -14,6 +14,7 @@ use std::rc::Rc;
 use proof_cache::ProofCache;
 
 mod boogie_params;
+mod boogie_reserved;
 mod c11_typed;
 mod compat;
 pub mod manifest;
@@ -1711,6 +1712,7 @@ impl Parser {
         desugar_nullary_calls(&mut m);
         desugar_routine_values(&mut m);
         rename_repeated_binders(&mut m);
+        boogie_reserved::rename_reserved(&mut m);
         if let Some(site) = patterns::desugar_patterns(&mut m).first() {
             return Err(ParseError {
                 message: format!(
@@ -5829,8 +5831,11 @@ fn expr_free_vars(e: &Expr, bound: &mut Vec<String>, out: &mut Vec<String>) {
 /// returning an `Fn1`, `Fn2` or `Fn3` value, defined by the axiom
 /// `FnN_app(lam_M_k(c..), x..) == body`. The function symbol is fresh and has exactly one
 /// defining equation, so the axiom is consistent. Captured locals (variables of the
-/// enclosing routine with a known type) become arguments. Returns `None` for lambdas whose
-/// types mention a type parameter of `m` (they keep the special-cased encodings).
+/// enclosing routine with a known type) become arguments.
+///
+/// A lambda whose types mention type parameters of `m`, such as `fn(s: S, r: REST_REQUEST)`
+/// in `REST_ROUTE[S]`, is lifted to a generic function `lam_M_k<S>(..)`. Its call is typed
+/// with the function type, since a parameter that no capture mentions is fixed only by it.
 fn lift_boogie_lambda(
     params: &[(String, String)],
     ret_ty: &str,
@@ -5844,9 +5849,6 @@ fn lift_boogie_lambda(
         return None;
     }
     let mentions_tp = |t: &str| type_tokens(t).iter().any(|tok| m.type_params.iter().any(|p| p == tok));
-    if params.iter().any(|(_, t)| mentions_tp(t)) || mentions_tp(ret_ty) {
-        return None;
-    }
     let param_names: Vec<String> = params.iter().map(|(p, _)| p.clone()).collect();
     let mut free = Vec::new();
     let mut bound = param_names.clone();
@@ -5863,9 +5865,18 @@ fn lift_boogie_lambda(
         .filter(|v| !implicit_fields.contains(v))
         .filter_map(|v| boogie_env_type(&v).map(|t| (v, t)))
         .collect();
-    if captures.iter().any(|(_, t)| mentions_tp(t)) {
-        return None;
-    }
+    let lam_tps: Vec<String> = m
+        .type_params
+        .iter()
+        .filter(|tp| {
+            let here = |t: &str| type_tokens(t).iter().any(|tok| tok == *tp);
+            params.iter().any(|(_, t)| here(t)) || here(ret_ty) || captures.iter().any(|(_, t)| here(t))
+        })
+        .cloned()
+        .collect();
+    let generic = params.iter().any(|(_, t)| mentions_tp(t))
+        || mentions_tp(ret_ty)
+        || captures.iter().any(|(_, t)| mentions_tp(t));
     // Emit the body with the parameters typed (restoring any shadowed entries afterwards).
     let saved: Vec<(String, Option<String>)> =
         params.iter().map(|(p, _)| (p.clone(), boogie_env_type(p))).collect();
@@ -5909,12 +5920,22 @@ fn lift_boogie_lambda(
         2 => "Fn2_app",
         _ => "Fn3_app",
     };
-    let call = format!("{name}({})", cap_names.join(", "));
+    let call = if generic {
+        format!("({name}({}) : {fn_ty})", cap_names.join(", "))
+    } else {
+        format!("{name}({})", cap_names.join(", "))
+    };
     let mut quant: Vec<String> = cap_decls.clone();
     quant.extend(params.iter().map(|(p, t)| format!("{p}: {}", map_boogie_type(t, m))));
     let applied = format!("{app}({call}, {})", param_names.join(", "));
+    let (tp_decl, tp_quant) = if generic {
+        let tps = lam_tps.join(", ");
+        (format!("<{tps}>"), format!("<{tps}> "))
+    } else {
+        (String::new(), String::new())
+    };
     let decl = format!(
-        "function {name}({}) returns ({fn_ty});\naxiom (forall {} :: {{ {applied} }} {applied} == {body_bpl});\n",
+        "function {name}{tp_decl}({}) returns ({fn_ty});\naxiom (forall{tp_quant} {} :: {{ {applied} }} {applied} == {body_bpl});\n",
         cap_decls.join(", "),
         quant.join(", ")
     );
@@ -8838,7 +8859,7 @@ fn emit_boogie_parts_with_options(
         let result_only_tps = !r_all_tps.is_empty()
             && r_all_tps
                 .iter()
-                .all(|tp| !q_params.iter().any(|qp| qp.contains(tp)));
+                .all(|tp| !q_params.iter().any(|qp| type_tokens(qp).iter().any(|t| *t == tp.as_str())));
         let fn_f_term = if result_only_tps {
             format!("({fn_f_app} : {ret_bty})")
         } else {
@@ -8868,7 +8889,7 @@ fn emit_boogie_parts_with_options(
         let fn_f_trigger = if r_all_tps.is_empty()
             || r_all_tps
                 .iter()
-                .all(|tp| q_params.iter().any(|qp| qp.contains(tp)))
+                .all(|tp| q_params.iter().any(|qp| type_tokens(qp).iter().any(|t| *t == tp.as_str())))
         {
             format!("{{ {fn_f_app} }}")
         } else {
@@ -8996,7 +9017,7 @@ fn emit_boogie_parts_with_options(
         }
         let mentions_all_tps = r_all_tps
             .iter()
-            .all(|tp| q_params.iter().any(|qp| qp.contains(tp)));
+            .all(|tp| q_params.iter().any(|qp| type_tokens(qp).iter().any(|t| *t == tp.as_str())));
         if trusted && mentions_all_tps && !model_decoupled_ens.is_empty() {
             let mut decoupled_q_params = vec!["_f_query: Fuel".to_string()];
             decoupled_q_params.extend(q_params.clone());
@@ -11070,6 +11091,13 @@ fn emit_boogie_proc_stmts_and_ret(
                                     c.ctor(),
                                     fname
                                 ));
+                                // A binder of a machine type, such as `id` in `case Some(id)` on
+                                // an `OPTION[NAT]`, is in its range: every value of the type is.
+                                // The field's declared type is the generic `A`, so the range is
+                                // read from the binder's own type at this instance.
+                                if let Some(range) = boogie_env_type(bname).as_deref().and_then(machine_range) {
+                                    s.push_str(&format!("{pad}  assume {range}({bname});\n"));
+                                }
                                 if is_own
                                     && !m.invariants.is_empty()
                                     && (fty == &m.name
@@ -14264,6 +14292,7 @@ fn which_solver(name: &str) -> Option<String> {
 /// proven. Hashing the executable instead would take seconds in a debug build.
 const VERIFIER_SOURCES: &[(&str, &str)] = &[
     ("boogie_params.rs", include_str!("boogie_params.rs")),
+    ("boogie_reserved.rs", include_str!("boogie_reserved.rs")),
     ("c11_typed.rs", include_str!("c11_typed.rs")),
     ("compat.rs", include_str!("compat.rs")),
     ("main.rs", include_str!("main.rs")),

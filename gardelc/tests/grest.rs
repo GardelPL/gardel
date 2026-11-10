@@ -152,7 +152,7 @@ fn rest_client(claims: &str) -> String {
 
 feature {{ANY}}
 
-  f(req: HTTP_REQUEST, r: REST_ROUTER, v: JSON, e: JSON_ERROR, u: URL_ERROR, s: STRING): BOOL
+  f(req: HTTP_REQUEST, r: REST_ROUTER[NAT], n: NAT, v: JSON, e: JSON_ERROR, u: URL_ERROR, s: STRING): BOOL
     do
       True
     ensure
@@ -170,15 +170,17 @@ end
 #[test]
 fn a_client_proves_the_statuses_through_the_contracts() {
     let facts = rest_client(
-        "      bad_target: not REQUEST_TARGET.parse(req.target).is_ok implies r.dispatch(req).response_status_code = 400
-      no_routes: REQUEST_TARGET.parse(req.target).is_ok implies REST_ROUTER.empty.dispatch(req).response_status_code = 404
+        "      bad_target: not REQUEST_TARGET.parse(req.target).is_ok implies r.dispatch(n, req).response.response_status_code = 400
+      no_routes: REQUEST_TARGET.parse(req.target).is_ok implies REST_ROUTER.empty.dispatch(n, req).response.response_status_code = 404
       bad_body: REST_RESPONSE.bad_body(e).response_status_code = 400
       url: REST_RESPONSE.bad_target(u).response_status_code = 400
       conflict: REST_RESPONSE.error(HTTP_STATUS.make(409), s).response_status_code = 409
       json: REST_RESPONSE.ok_json(v).response_status_code = 200 or REST_RESPONSE.ok_json(v).response_status_code = 500
       created: REST_RESPONSE.created_json(v).response_status_code = 201 or REST_RESPONSE.created_json(v).response_status_code = 500
       gone: REST_RESPONSE.no_content.response_body_length = 0
-      routes: r.route_count <= 64",
+      routes: r.route_count <= 64
+      keeps: not REQUEST_TARGET.parse(req.target).is_ok implies r.dispatch(n, req).state = n
+      outcome: REST_OUTCOME.make(n, REST_RESPONSE.not_found).state = n",
     );
     assert_ok(&Project::new("statuses", &facts).check());
 }
@@ -187,11 +189,13 @@ fn a_client_proves_the_statuses_through_the_contracts() {
 fn a_claim_past_the_statuses_does_not_verify() {
     let lies = [
         // A target that cannot be read is a `400`, even with no routes.
-        ("no_routes", "      claim: REST_ROUTER.empty.dispatch(req).response_status_code = 404"),
+        ("no_routes", "      claim: REST_ROUTER.empty.dispatch(n, req).response.response_status_code = 404"),
         // A value too large to send is a `500`.
         ("json", "      claim: REST_RESPONSE.ok_json(v).response_status_code = 200"),
         // A route may answer with any status, `400` too.
-        ("routed", "      claim: REQUEST_TARGET.parse(req.target).is_ok implies r.dispatch(req).response_status_code != 400"),
+        ("routed", "      claim: REQUEST_TARGET.parse(req.target).is_ok implies r.dispatch(n, req).response.response_status_code != 400"),
+        // A route's handler may change the state.
+        ("kept", "      claim: r.dispatch(n, req).state = n"),
     ];
     for (name, claim) in lies {
         let out = Project::new(&format!("rest_lie_{name}"), &rest_client(claim)).check();
@@ -206,7 +210,7 @@ fn server_client(claims: &str) -> String {
 
 feature {{ANY}}
 
-  f(s: REST_SERVER, e: EVENT, args: SEQ[STRING], r: REST_ROUTER): BOOL
+  f(s: REST_SERVER[NAT], e: EVENT, args: SEQ[STRING], r: REST_ROUTER[NAT], n: NAT): BOOL
     do
       True
     ensure
@@ -228,8 +232,8 @@ fn a_client_proves_the_server_safety_through_the_contracts() {
         "      within: REST_SERVER.within(s, e, s.serve(e))
       stops: e.is_shutdown implies s.serve(e).is_stop
       limit: s.open_connections <= s.max_connections
-      bad_route: r.invalid_route.is_some implies REST_SERVER.start(args, 8090, r).is_stop
-      fresh: REST_SERVER.make(8090, r).open_connections = 0",
+      bad_route: r.invalid_route.is_some implies REST_SERVER.start(args, 8090, r, n).is_stop
+      fresh: REST_SERVER.make(8090, r, n).open_connections = 0",
     );
     assert_ok(&Project::new("server", &facts).check());
 }
@@ -244,7 +248,7 @@ fn a_claim_past_the_server_safety_does_not_verify() {
         // A server may be full.
         ("claim_room", "s.open_connections < s.max_connections"),
         // An argument that is not a port stops it.
-        ("claim_starts", "r.invalid_route.is_none implies not REST_SERVER.start(args, 8090, r).is_stop"),
+        ("claim_starts", "r.invalid_route.is_none implies not REST_SERVER.start(args, 8090, r, n).is_stop"),
     ];
     let claims: Vec<String> = lies.iter().map(|(tag, claim)| format!("      {tag}: {claim}")).collect();
     let out = Project::new("server_lies", &server_client(&claims.join("\n"))).check();
@@ -254,7 +258,8 @@ fn a_claim_past_the_server_safety_does_not_verify() {
     }
 }
 
-/// A verified service whose routes are `routes`.
+/// A verified service whose routes are `routes`, whose state is a count: `POST /bump` adds
+/// one to it, up to 1000, and `GET /count` says it.
 fn service(name: &str, routes: &str) -> Project {
     let source = format!(
         "reactive program CLIENT
@@ -266,17 +271,31 @@ feature {{ANY}}
       REST_RESPONSE.ok_text(\"hi\")
     end
 
-  routes: REST_ROUTER
+  bump(n: NAT, r: REST_REQUEST): REST_OUTCOME[NAT]
+    do
+      if n < 1000 then
+        REST_OUTCOME.make(n + 1, REST_RESPONSE.ok_text(\"bumped\"))
+      else
+        REST_OUTCOME.make(n, REST_RESPONSE.error(HTTP_STATUS.make(409), \"full\"))
+      end
+    end
+
+  count(n: NAT, r: REST_REQUEST): HTTP_RESPONSE
+    do
+      if n <= 1000 then REST_RESPONSE.ok_json(JSON.int(I64.from_nat(n))) else REST_RESPONSE.not_found end
+    end
+
+  routes: REST_ROUTER[NAT]
     do
       {routes}
     end
 
-  init(args: SEQ[STRING]): STEP[REST_SERVER]
+  init(args: SEQ[STRING]): STEP[REST_SERVER[NAT]]
     do
-      REST_SERVER.start(args, 8090, routes)
+      REST_SERVER.start(args, 8090, routes, 0)
     end
 
-  step(s: REST_SERVER, e: EVENT): STEP[REST_SERVER]
+  step(s: REST_SERVER[NAT], e: EVENT): STEP[REST_SERVER[NAT]]
     do
       s.serve(e)
     end
@@ -347,4 +366,49 @@ fn a_service_starts_only_when_it_can_and_keeps_its_limit() {
         "net: Close 66".to_string(),
     ];
     assert_eq!(net, expected, "{}", all(&full));
+}
+
+/// The state a handler gives back is the one the next request sees, in the order the requests
+/// complete, and a request that is not answered by a handler, or that cannot be read, leaves
+/// it as it was.
+#[test]
+fn a_service_keeps_the_state_its_handlers_give() {
+    let counting = service(
+        "counting",
+        "REST_ROUTER.empty.on(Post, \"/bump\", bump).on_view(\"/count\", count)",
+    );
+    let req = |m: &str, path: &str| format!("{m}%20{path}%20HTTP/1.1%0D%0A%0D%0A");
+    let events = [
+        "Accepted:1".to_string(),
+        "Accepted:2".to_string(),
+        "Accepted:3".to_string(),
+        "Accepted:4".to_string(),
+        "Accepted:5".to_string(),
+        "Accepted:6".to_string(),
+        // The first part of a request on 1, which completes after 2's.
+        "Received:1:POST%20/bump%20HTTP/1.1%0D%0A".to_string(),
+        format!("Received:2:{}", req("POST", "/bump")),
+        "Received:1:%0D%0A".to_string(),
+        // Not a route, a method with no route, a target that cannot be read, and bytes that
+        // are not a request: none of them reaches a handler.
+        format!("Received:3:{}", req("POST", "/nothing")),
+        format!("Received:4:{}", req("DELETE", "/bump")),
+        format!("Received:5:{}", req("GET", "/count%25zz")),
+        "Received:6:%00%00%0D%0A%0D%0A".to_string(),
+        "Accepted:7".to_string(),
+        format!("Received:7:{}", req("GET", "/count")),
+    ];
+    let run = run_service(&counting, &["9002"], &events.join(" "));
+    assert_eq!(run.status.code(), Some(0), "{}", all(&run));
+    let sends: Vec<String> = String::from_utf8_lossy(&run.stderr)
+        .lines()
+        .filter(|l| l.starts_with("net: Send "))
+        .map(|l| {
+            let words: Vec<&str> = l.split_whitespace().collect();
+            format!("{} {}", words[2], &words[3]["HTTP%2F1%2E1%20".len()..][..3])
+        })
+        .collect();
+    assert_eq!(sends, ["2 200", "1 200", "3 404", "4 405", "5 400", "6 400", "7 200"], "{}", all(&run));
+    let last = String::from_utf8_lossy(&run.stderr).lines().filter(|l| l.starts_with("net: Send 7 ")).collect::<String>();
+    assert!(last.ends_with("%0D%0A%0D%0A2"), "two bumps, then the count: {last}");
 }

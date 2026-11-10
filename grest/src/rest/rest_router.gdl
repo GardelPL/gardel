@@ -1,4 +1,5 @@
--- The routes of a service, tried in the order they were added. `dispatch` answers a request:
+-- The routes of a service whose state is an `S`, tried in the order they were added.
+-- `dispatch` answers a request in a state:
 --
 -- * a target that cannot be read is a `400` with its reason;
 -- * the first route whose pattern matches the path and whose method is the request's answers
@@ -6,11 +7,12 @@
 -- * a path that some route matches, with no route for the method, is a `405`;
 -- * any other path is a `404`.
 --
--- Each error is a JSON object, `{"error":"not found"}`.
-module REST_ROUTER
+-- Each error is a JSON object, `{"error":"not found"}`, and keeps the state. Only a route's
+-- handler gives the next state.
+module REST_ROUTER[S]
 
 representation {NONE}
-  table: LIST[REST_ROUTE]
+  table: LIST[REST_ROUTE[S]]
   n_routes: NAT
 
 invariant
@@ -19,7 +21,8 @@ invariant
 
 create {ANY}
 
-  empty: REST_ROUTER
+  -- A router with no routes. It holds at most 64.
+  empty: REST_ROUTER[S]
     do
       { table = LIST.empty, n_routes = 0 }
     ensure
@@ -27,20 +30,18 @@ create {ANY}
       room: Result.has_room
     end
 
-  -- The most routes a router holds.
-  max_routes: NAT
-    do
-      64
-    end
-
-  -- The answer of the first route in `rs` for `req`, whose target reads as `t`.
-  -- `path_seen` says whether a route before `rs` matched the path but not the method.
-  find(rs: LIST[REST_ROUTE], req: HTTP_REQUEST, t: REQUEST_TARGET, path_seen: BOOL): HTTP_RESPONSE
+  -- The outcome of the first route in `rs` for `req` in the state `s`, whose target reads
+  -- as `t`. `path_seen` says whether a route before `rs` matched the path but not the method.
+  find(rs: LIST[REST_ROUTE[S]], s: S, req: HTTP_REQUEST, t: REQUEST_TARGET, path_seen: BOOL): REST_OUTCOME[S]
     variant
       rs.length
     do
       if rs.length = 0 then
-        if path_seen then REST_RESPONSE.method_not_allowed else REST_RESPONSE.not_found end
+        if path_seen then
+          REST_OUTCOME.make(s, REST_RESPONSE.method_not_allowed)
+        else
+          REST_OUTCOME.make(s, REST_RESPONSE.not_found)
+        end
       else
         let r = rs.head
         let found = r.path_pattern.match_target(t)
@@ -49,22 +50,23 @@ create {ANY}
         end
         match found
           case None then
-            REST_ROUTER.find(rs.tail, req, t, path_seen)
+            REST_ROUTER.find(rs.tail, s, req, t, path_seen)
           case Some(ps) then
             if r.method = req.method or (req.method = Head and r.method = Get) then
-              r.respond(REST_REQUEST.make(req, t, ps))
+              r.respond(s, REST_REQUEST.make(req, t, ps))
             else
-              REST_ROUTER.find(rs.tail, req, t, True)
+              REST_ROUTER.find(rs.tail, s, req, t, True)
             end
         end
       end
     ensure
-      empty_seen: (rs.length = 0 and path_seen) implies Result.response_status_code = 405
-      empty_unseen: (rs.length = 0 and not path_seen) implies Result.response_status_code = 404
+      empty_seen: (rs.length = 0 and path_seen) implies Result.response.response_status_code = 405
+      empty_unseen: (rs.length = 0 and not path_seen) implies Result.response.response_status_code = 404
+      empty_keeps: rs.length = 0 implies Result.state = s
     end
 
   -- The pattern of the first route in `rs` that is not valid.
-  first_invalid(rs: LIST[REST_ROUTE]): OPTION[STRING]
+  first_invalid(rs: LIST[REST_ROUTE[S]]): OPTION[STRING]
     variant
       rs.length
     do
@@ -93,7 +95,7 @@ feature {ANY}
       def: Result = (Current.route_count < 64)
     end
 
-  routes: LIST[REST_ROUTE]
+  routes: LIST[REST_ROUTE[S]]
     do
       Current.table
     ensure
@@ -101,7 +103,7 @@ feature {ANY}
     end
 
   -- The router with `r` after its routes, so tried after them.
-  add(r: REST_ROUTE): REST_ROUTER
+  add(r: REST_ROUTE[S]): REST_ROUTER[S]
     require
       room: Current.has_room
     do
@@ -110,48 +112,70 @@ feature {ANY}
       grew: Result.route_count = Current.route_count + 1
     end
 
-  on_get(p: STRING, h: (r: REST_REQUEST) -> HTTP_RESPONSE): REST_ROUTER
+  -- A route whose handler gives the next state; see `REST_ROUTE.make`.
+  on(m: HTTP_METHOD, p: STRING, h: (s: S, r: REST_REQUEST) -> REST_OUTCOME[S]): REST_ROUTER[S]
     require
       room: Current.has_room
     do
-      Current.add(REST_ROUTE.make(Get, p, h))
+      Current.add(REST_ROUTE.make(m, p, h))
     ensure
       grew: Result.route_count = Current.route_count + 1
     end
 
-  on_post(p: STRING, h: (r: REST_REQUEST) -> HTTP_RESPONSE): REST_ROUTER
+  -- A `GET` route whose handler reads the state; see `REST_ROUTE.viewing`.
+  on_view(p: STRING, h: (s: S, r: REST_REQUEST) -> HTTP_RESPONSE): REST_ROUTER[S]
     require
       room: Current.has_room
     do
-      Current.add(REST_ROUTE.make(Post, p, h))
-    ensure
-      grew: Result.route_count = Current.route_count + 1
-    end
-
-  on_put(p: STRING, h: (r: REST_REQUEST) -> HTTP_RESPONSE): REST_ROUTER
-    require
-      room: Current.has_room
-    do
-      Current.add(REST_ROUTE.make(Put, p, h))
-    ensure
-      grew: Result.route_count = Current.route_count + 1
-    end
-
-  on_delete(p: STRING, h: (r: REST_REQUEST) -> HTTP_RESPONSE): REST_ROUTER
-    require
-      room: Current.has_room
-    do
-      Current.add(REST_ROUTE.make(Delete, p, h))
+      Current.add(REST_ROUTE.viewing(Get, p, h))
     ensure
       grew: Result.route_count = Current.route_count + 1
     end
 
   -- A route whose handler is given the body as JSON; see `REST_ROUTE.with_json`.
-  on_json(m: HTTP_METHOD, p: STRING, h: (r: REST_REQUEST, body: JSON) -> HTTP_RESPONSE): REST_ROUTER
+  on_json(m: HTTP_METHOD, p: STRING, h: (s: S, r: REST_REQUEST, body: JSON) -> REST_OUTCOME[S]): REST_ROUTER[S]
     require
       room: Current.has_room
     do
       Current.add(REST_ROUTE.with_json(m, p, h))
+    ensure
+      grew: Result.route_count = Current.route_count + 1
+    end
+
+  -- The routes below have handlers that do not look at the state; see `REST_ROUTE.plain`.
+
+  on_get(p: STRING, h: (r: REST_REQUEST) -> HTTP_RESPONSE): REST_ROUTER[S]
+    require
+      room: Current.has_room
+    do
+      Current.add(REST_ROUTE.plain(Get, p, h))
+    ensure
+      grew: Result.route_count = Current.route_count + 1
+    end
+
+  on_post(p: STRING, h: (r: REST_REQUEST) -> HTTP_RESPONSE): REST_ROUTER[S]
+    require
+      room: Current.has_room
+    do
+      Current.add(REST_ROUTE.plain(Post, p, h))
+    ensure
+      grew: Result.route_count = Current.route_count + 1
+    end
+
+  on_put(p: STRING, h: (r: REST_REQUEST) -> HTTP_RESPONSE): REST_ROUTER[S]
+    require
+      room: Current.has_room
+    do
+      Current.add(REST_ROUTE.plain(Put, p, h))
+    ensure
+      grew: Result.route_count = Current.route_count + 1
+    end
+
+  on_delete(p: STRING, h: (r: REST_REQUEST) -> HTTP_RESPONSE): REST_ROUTER[S]
+    require
+      room: Current.has_room
+    do
+      Current.add(REST_ROUTE.plain(Delete, p, h))
     ensure
       grew: Result.route_count = Current.route_count + 1
     end
@@ -163,17 +187,19 @@ feature {ANY}
       REST_ROUTER.first_invalid(Current.table)
     end
 
-  -- The answer to `req`.
-  dispatch(req: HTTP_REQUEST): HTTP_RESPONSE
+  -- The next state and the answer for `req` in the state `s`.
+  dispatch(s: S, req: HTTP_REQUEST): REST_OUTCOME[S]
     do
       let parsed = REQUEST_TARGET.parse(req.target)
       match parsed
-        case Error(e) then REST_RESPONSE.bad_target(e)
-        case Ok(t) then REST_ROUTER.find(Current.table, req, t, False)
+        case Error(e) then REST_OUTCOME.make(s, REST_RESPONSE.bad_target(e))
+        case Ok(t) then REST_ROUTER.find(Current.table, s, req, t, False)
       end
     ensure
-      bad_target: not REQUEST_TARGET.parse(req.target).is_ok implies Result.response_status_code = 400
-      no_routes: (Current.route_count = 0 and REQUEST_TARGET.parse(req.target).is_ok) implies Result.response_status_code = 404
+      bad_target: not REQUEST_TARGET.parse(req.target).is_ok implies Result.response.response_status_code = 400
+      no_routes: (Current.route_count = 0 and REQUEST_TARGET.parse(req.target).is_ok) implies Result.response.response_status_code = 404
+      bad_target_keeps: not REQUEST_TARGET.parse(req.target).is_ok implies Result.state = s
+      no_routes_keep: Current.route_count = 0 implies Result.state = s
     end
 
 end

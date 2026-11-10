@@ -1,5 +1,5 @@
 -- A small API for the `request` cases: a handler for each route, and the router that holds
--- them. A routine's name is its handler.
+-- them. A routine's name is its handler. The state is a `NAT` the handlers keep.
 functions GREST_API
 
 feature {ANY}
@@ -35,19 +35,19 @@ feature {ANY}
       end
     end
 
-  -- The body, as it was sent.
-  add_user(r: REST_REQUEST, body: JSON): HTTP_RESPONSE
+  -- The body, as it was sent. The state, a count, is not looked at.
+  add_user(n: NAT, r: REST_REQUEST, body: JSON): REST_OUTCOME[NAT]
     do
-      REST_RESPONSE.created_json(body)
+      REST_OUTCOME.make(n, REST_RESPONSE.created_json(body))
     end
 
   -- The body, with `"id"` set to the path's.
-  replace(r: REST_REQUEST, body: JSON): HTTP_RESPONSE
+  replace(n: NAT, r: REST_REQUEST, body: JSON): REST_OUTCOME[NAT]
     do
       let id = match r.param("id") case Some(s) then s case None then "" end
       match body.with_field("id", JSON.string(id))
-        case Some(v) then REST_RESPONSE.ok_json(v)
-        case None then REST_RESPONSE.bad_request("the body is not an object")
+        case Some(v) then REST_OUTCOME.make(n, REST_RESPONSE.ok_json(v))
+        case None then REST_OUTCOME.make(n, REST_RESPONSE.bad_request("the body is not an object"))
       end
     end
 
@@ -77,7 +77,7 @@ feature {ANY}
       REST_RESPONSE.error(HTTP_STATUS.make(409), "taken")
     end
 
-  router: REST_ROUTER
+  router: REST_ROUTER[NAT]
     do
       REST_ROUTER.empty
         .on_get("/", hello)
@@ -94,7 +94,7 @@ feature {ANY}
     end
 
   -- A router with a pattern that is not valid.
-  broken: REST_ROUTER
+  broken: REST_ROUTER[NAT]
     do
       REST_ROUTER.empty.on_get("/ok", hello).on_get("/bad/:", hello)
     end

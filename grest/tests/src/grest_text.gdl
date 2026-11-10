@@ -212,7 +212,7 @@ feature {ANY}
               "bad case"
             else
               let req = HTTP_REQUEST.make_simple(m, t).with_headers(hs).with_body(b, 65536)
-              shown(GREST_API.router.dispatch(req), wire)
+              shown(GREST_API.router.dispatch(0, req).response, wire)
             end
         end
       end

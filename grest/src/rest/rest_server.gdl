@@ -1,51 +1,56 @@
--- The server of a REST service: `ghttp`'s table of connections and a `REST_ROUTER`. A client's
--- reactive program is its routes, its handlers and two lines:
+-- The server of a REST service whose state is an `S`: `ghttp`'s table of connections, a
+-- `REST_ROUTER[S]`, and the state. A client's reactive program is its state, its routes, its
+-- handlers and two lines:
 --
---   init(args: SEQ[STRING]): STEP[REST_SERVER] do REST_SERVER.start(args, 8090, routes) end
---   step(s: REST_SERVER, e: EVENT): STEP[REST_SERVER] do s.serve(e) end
+--   init(args: SEQ[STRING]): STEP[REST_SERVER[STORE]]
+--     do REST_SERVER.start(args, 8090, routes, STORE.empty) end
+--   step(s: REST_SERVER[STORE], e: EVENT): STEP[REST_SERVER[STORE]] do s.serve(e) end
 --
--- Each request is answered once and its connection closed after the answer. `serve` proves it
--- for every event: see `REST_SERVER.within`.
-module REST_SERVER
+-- Each request is answered once and its connection closed after the answer, and the state is
+-- the one its handler gave back. `serve` proves the first for every event: see
+-- `REST_SERVER.within`. The state is an `S`, so whatever `S`'s invariant says holds of it
+-- after every request.
+module REST_SERVER[S]
 
 representation {NONE}
   conns: HTTP_SERVER_STATE
-  api: REST_ROUTER
+  api: REST_ROUTER[S]
+  app: S
 
 create {ANY}
 
-  -- A server for `api` with no connections, listening on `p`.
-  make(p: NAT, api: REST_ROUTER): REST_SERVER
+  -- A server for `api` in the state `s`, with no connections, listening on `p`.
+  make(p: NAT, api: REST_ROUTER[S], s: S): REST_SERVER[S]
     require
       valid_port: p >= 1 and p <= 65535
     do
-      { conns = HTTP_SERVER_STATE.make_on_port(64, p), api = api }
+      { conns = HTTP_SERVER_STATE.make_on_port(64, p), api = api, app = s }
     ensure
       none_open: Result.open_connections = 0
       limit_set: Result.max_connections = 64
       port_set: Result.port = p
     end
 
-  -- Starts `api` on the port the first argument names, or on `p` when there is none. An
-  -- argument that is not a port from 1 to 65535, or a route whose pattern is not valid, stops
-  -- the program with exit status 2 and a message, before it listens.
-  start(args: SEQ[STRING], p: NAT, api: REST_ROUTER): STEP[REST_SERVER]
+  -- Starts `api` in the state `s`, on the port the first argument names, or on `p` when there
+  -- is none. An argument that is not a port from 1 to 65535, or a route whose pattern is not
+  -- valid, stops the program with exit status 2 and a message, before it listens.
+  start(args: SEQ[STRING], p: NAT, api: REST_ROUTER[S], s: S): STEP[REST_SERVER[S]]
     require
       valid_port: p >= 1 and p <= 65535
     do
       match api.invalid_route
         case Some(bad) then
-          Stop(2, LIST.empty.prepend(Print(REST_SERVER.complaint("grest: route pattern is not valid: ", bad))))
+          Stop(2, LIST.empty.prepend(Print(REST_COMMANDS.complaint("grest: route pattern is not valid: ", bad))))
         case None then
-          match REST_SERVER.first_arg(args)
+          match REST_COMMANDS.first_arg(args)
             case None then
-              Continue(REST_SERVER.make(p, api), LIST.empty.prepend(Listen(p)))
+              Continue(REST_SERVER.make(p, api, s), LIST.empty.prepend(Listen(p)))
             case Some(a) then
-              match REST_SERVER.port_of(a)
+              match REST_COMMANDS.port_of(a)
                 case Some(q) then
-                  Continue(REST_SERVER.make(q, api), LIST.empty.prepend(Listen(q)))
+                  Continue(REST_SERVER.make(q, api, s), LIST.empty.prepend(Listen(q)))
                 case None then
-                  Stop(2, LIST.empty.prepend(Print(REST_SERVER.complaint("grest: not a port: ", a))))
+                  Stop(2, LIST.empty.prepend(Print(REST_COMMANDS.complaint("grest: not a port: ", a))))
               end
           end
       end
@@ -53,105 +58,8 @@ create {ANY}
       bad_route_stops: api.invalid_route.is_some implies Result.is_stop
     end
 
-  -- `what` followed by `s`, or `what` alone if `s` is too long to add.
-  complaint(what: STRING, s: STRING): STRING
-    do
-      if s.byte_length <= 1024 and what.byte_length <= 1024 then what.concat(s) else what end
-    end
-
-  -- The first argument, if there is one.
-  first_arg(args: SEQ[STRING]): OPTION[STRING]
-    variant
-      args
-    do
-      match args
-        case Empty then None
-        case Leaf(a) then Some(a)
-        case Concat(l, _, _) then REST_SERVER.first_arg(l)
-      end
-    end
-
-  -- `a` as a TCP port: decimal digits for a number from 1 to 65535.
-  port_of(a: STRING): OPTION[NAT]
-    do
-      match NUMBER_TEXT.parse_nat(a)
-        case Ok(n) then
-          if n >= 1 and n <= 65535 then Some(n) else None end
-        case Error(_) then None
-      end
-    ensure
-      in_range: Result.is_some implies (Result.get >= 1 and Result.get <= 65535)
-    end
-
-  -- `cmd` is `Close(c)`.
-  closes(cmd: COMMAND, c: CONN_ID): BOOL
-    do
-      match cmd
-        case Close(d) then d = c
-        case _ then False
-      end
-    ensure
-      def: Result = (match cmd case Close(d) then d = c case _ then False end)
-    end
-
-  -- `cmd` is `Send(c, _)`.
-  sends(cmd: COMMAND, c: CONN_ID): BOOL
-    do
-      match cmd
-        case Send(d, _) then d = c
-        case _ then False
-      end
-    ensure
-      def: Result = (match cmd case Send(d, _) then d = c case _ then False end)
-    end
-
-  -- `cmd` names no connection.
-  quiet(cmd: COMMAND): BOOL
-    do
-      match cmd
-        case Send(_, _) then False
-        case Close(_) then False
-        case _ then True
-      end
-    ensure
-      def: Result = (match cmd case Send(_, _) then False case Close(_) then False case _ then True end)
-    end
-
-  -- What an event about the connection `c` may do: nothing, close `c`, or send `c` one
-  -- answer and close it.
-  for_conn(cmds: LIST[COMMAND], c: CONN_ID): BOOL
-    do
-      if cmds.length = 0 then
-        True
-      else if cmds.length = 1 then
-        REST_SERVER.closes(cmds.head, c)
-      else if cmds.length = 2 then
-        REST_SERVER.sends(cmds.head, c) and REST_SERVER.closes(cmds.tail.head, c)
-      else
-        False
-      end end end
-    ensure
-      def: Result = (cmds.length = 0
-        or (cmds.length = 1 and REST_SERVER.closes(cmds.head, c))
-        or (cmds.length = 2 and REST_SERVER.sends(cmds.head, c) and REST_SERVER.closes(cmds.tail.head, c)))
-    end
-
-  -- What any other event may do: at most one command, which names no connection.
-  for_none(cmds: LIST[COMMAND]): BOOL
-    do
-      if cmds.length = 0 then
-        True
-      else if cmds.length = 1 then
-        REST_SERVER.quiet(cmds.head)
-      else
-        False
-      end end
-    ensure
-      def: Result = (cmds.length = 0 or (cmds.length = 1 and REST_SERVER.quiet(cmds.head)))
-    end
-
   -- The commands of a step.
-  commands(st: STEP[REST_SERVER]): LIST[COMMAND]
+  commands(st: STEP[REST_SERVER[S]]): LIST[COMMAND]
     do
       match st
         case Continue(_, cmds) then cmds
@@ -168,15 +76,15 @@ create {ANY}
   --   closes it, so a request, or a request that cannot be read, is answered once, and no
   --   connection hears an answer meant for another;
   -- * any other event names no connection.
-  within(s: REST_SERVER, e: EVENT, st: STEP[REST_SERVER]): BOOL
+  within(s: REST_SERVER[S], e: EVENT, st: STEP[REST_SERVER[S]]): BOOL
     do
-      REST_SERVER.limit_kept(s, st) and REST_SERVER.shaped(e, REST_SERVER.commands(st))
+      REST_SERVER.limit_kept(s, st) and REST_COMMANDS.shaped(e, REST_SERVER.commands(st))
     ensure
-      def: Result = (REST_SERVER.limit_kept(s, st) and REST_SERVER.shaped(e, REST_SERVER.commands(st)))
+      def: Result = (REST_SERVER.limit_kept(s, st) and REST_COMMANDS.shaped(e, REST_SERVER.commands(st)))
     end
 
   -- `st` keeps the limit on connections of `s`.
-  limit_kept(s: REST_SERVER, st: STEP[REST_SERVER]): BOOL
+  limit_kept(s: REST_SERVER[S], st: STEP[REST_SERVER[S]]): BOOL
     do
       match st
         case Continue(n, _) then n.max_connections = s.max_connections
@@ -184,42 +92,6 @@ create {ANY}
       end
     ensure
       def: Result = (match st case Continue(n, _) then n.max_connections = s.max_connections case Stop(_, _) then True end)
-    end
-
-  -- `cmds` is what an event `e` may do: see `within`.
-  shaped(e: EVENT, cmds: LIST[COMMAND]): BOOL
-    do
-      match e
-        case Accepted(c) then REST_SERVER.for_conn(cmds, c)
-        case Received(c, _) then REST_SERVER.for_conn(cmds, c)
-        case SendFailed(c, _) then REST_SERVER.for_conn(cmds, c)
-        case Closed(c) then REST_SERVER.for_conn(cmds, c)
-        case _ then REST_SERVER.for_none(cmds)
-      end
-    ensure
-      def: Result = (match e
-        case Accepted(c) then REST_SERVER.for_conn(cmds, c)
-        case Received(c, _) then REST_SERVER.for_conn(cmds, c)
-        case SendFailed(c, _) then REST_SERVER.for_conn(cmds, c)
-        case Closed(c) then REST_SERVER.for_conn(cmds, c)
-        case _ then REST_SERVER.for_none(cmds)
-      end)
-    end
-
-  -- One answer to the connection `c`, then its close.
-  answer(c: CONN_ID, resp: HTTP_RESPONSE): LIST[COMMAND]
-    do
-      LIST.empty.prepend(Close(c)).prepend(Send(c, HTTP_SERIALIZER.serialize(resp)))
-    ensure
-      once: REST_SERVER.for_conn(Result, c)
-    end
-
-  -- Only `Close(c)`.
-  close_only(c: CONN_ID): LIST[COMMAND]
-    do
-      LIST.empty.prepend(Close(c))
-    ensure
-      once: REST_SERVER.for_conn(Result, c)
     end
 
 feature {ANY}
@@ -245,13 +117,19 @@ feature {ANY}
       in_range: Result >= 1 and Result <= 65535
     end
 
-  router: REST_ROUTER
+  router: REST_ROUTER[S]
     do
       Current.api
     end
 
+  -- The service's state.
+  state: S
+    do
+      Current.app
+    end
+
   -- The server with its connections replaced.
-  with_conns(cs: HTTP_SERVER_STATE): REST_SERVER
+  with_conns(cs: HTTP_SERVER_STATE): REST_SERVER[S]
     require
       same_limit: cs.max_connections = Current.max_connections
     do
@@ -260,24 +138,36 @@ feature {ANY}
       limit_kept: Result.max_connections = Current.max_connections
     end
 
+  -- The server with its connections and its state replaced.
+  with_conns_and_state(cs: HTTP_SERVER_STATE, s: S): REST_SERVER[S]
+    require
+      same_limit: cs.max_connections = Current.max_connections
+    do
+      { Current with conns = cs, app = s }
+    ensure
+      limit_kept: Result.max_connections = Current.max_connections
+    end
+
   -- Bytes from `c`: wait for more, or answer the request they complete, or the error that
-  -- stops them, and close `c`.
-  on_bytes(c: CONN_ID, data: BYTES): STEP[REST_SERVER]
+  -- stops them, and close `c`. A complete request moves the service to the state its
+  -- handler gives back.
+  on_bytes(c: CONN_ID, data: BYTES): STEP[REST_SERVER[S]]
     do
       match Current.conns.lookup_connection(c)
         case None then
-          Continue(Current, REST_SERVER.close_only(c))
+          Continue(Current, REST_COMMANDS.close_only(c))
         case Some(conn) then
           if not conn.connection_status.can_accept_bytes then
-            Continue(Current.with_conns(Current.conns.release_connection(c)), REST_SERVER.close_only(c))
+            Continue(Current.with_conns(Current.conns.release_connection(c)), REST_COMMANDS.close_only(c))
           else
             match HTTP_PARSER.feed(conn.parser_state, data)
               case NeedMore(next_p) then
                 Continue(Current.with_conns(Current.conns.save_connection(conn.with_parser_state(next_p))), LIST.empty)
               case Complete(req, _) then
-                Continue(Current.with_conns(Current.conns.release_connection(c)), REST_SERVER.answer(c, Current.api.dispatch(req)))
+                let out = Current.api.dispatch(Current.app, req)
+                Continue(Current.with_conns_and_state(Current.conns.release_connection(c), out.state), REST_COMMANDS.answer(c, out.response))
               case Failed(err) then
-                Continue(Current.with_conns(Current.conns.release_connection(c)), REST_SERVER.answer(c, HTTP_RESPONSE.from_error(err)))
+                Continue(Current.with_conns(Current.conns.release_connection(c)), REST_COMMANDS.answer(c, HTTP_RESPONSE.from_error(err)))
             end
           end
       end
@@ -286,19 +176,19 @@ feature {ANY}
     end
 
   -- The step of a REST service for the event `e`.
-  serve(e: EVENT): STEP[REST_SERVER]
+  serve(e: EVENT): STEP[REST_SERVER[S]]
     do
       match e
         case Accepted(c) then
           if Current.conns.has_connection_room then
             Continue(Current.with_conns(Current.conns.admit_connection(c)), LIST.empty)
           else
-            Continue(Current, REST_SERVER.close_only(c))
+            Continue(Current, REST_COMMANDS.close_only(c))
           end
         case Received(c, data) then
           Current.on_bytes(c, data)
         case SendFailed(c, _) then
-          Continue(Current.with_conns(Current.conns.release_connection(c)), REST_SERVER.close_only(c))
+          Continue(Current.with_conns(Current.conns.release_connection(c)), REST_COMMANDS.close_only(c))
         case Closed(c) then
           Continue(Current.with_conns(Current.conns.release_connection(c)), LIST.empty)
         case ListenFailed(_, _) then

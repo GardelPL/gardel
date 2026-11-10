@@ -3,7 +3,9 @@
 --   gardelc examples/hello_api --strict
 --
 -- It is its routes and handlers: `REST_SERVER` holds the connections, and proves that each
--- request is answered once and its connection closed after the answer.
+-- request is answered once and its connection closed after the answer. Its handlers do not
+-- look at the service's state, so the state is a `NAT` that stays `0`; see `todo_api` for a
+-- service with a state.
 reactive program HELLO_API
 
 feature {ANY}
@@ -41,7 +43,7 @@ feature {ANY}
       end
     end
 
-  routes: REST_ROUTER
+  routes: REST_ROUTER[NAT]
     do
       REST_ROUTER.empty
         .on_get("/", root)
@@ -52,12 +54,12 @@ feature {ANY}
       four: Result.route_count = 4
     end
 
-  init(args: SEQ[STRING]): STEP[REST_SERVER]
+  init(args: SEQ[STRING]): STEP[REST_SERVER[NAT]]
     do
-      REST_SERVER.start(args, 8090, routes)
+      REST_SERVER.start(args, 8090, routes, 0)
     end
 
-  step(s: REST_SERVER, e: EVENT): STEP[REST_SERVER]
+  step(s: REST_SERVER[NAT], e: EVENT): STEP[REST_SERVER[NAT]]
     do
       s.serve(e)
     end

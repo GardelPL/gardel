@@ -119,6 +119,8 @@ end
 │   ├── bounded_stack.gdl
 │   ├── echo_server/           # TCP echo server with a proven connection limit
 │   ├── greeter.gdl
+│   ├── hello_api/             # A REST service on grest: routes and handlers only
+│   ├── todo_api/              # A REST service with a state whose invariant is proven
 │   ├── reactive_clock/        # Countdown: a reactive program with timers and a proven state
 │   ├── reactive_game/         # A small terminal game with a proven board
 │   ├── reactive_hello.gdl
