@@ -744,7 +744,8 @@ impl<'a> TypedC<'a> {
         }
     }
 
-    /// `LIST[T]` runtime: an immutable, counted cons list (`NULL` is the empty list).
+    /// `LIST[T]` runtime: an immutable, counted cons list (`NULL` is the empty list). Each cell
+    /// keeps the length of the list it starts, so `length` takes constant time (Task F.6).
     /// The functions borrow their arguments and take their own references to what they
     /// store; they are iterative, so long lists do not exhaust the C stack.
     fn ensure_list(&mut self, elem: &str) -> Result<(), String> {
@@ -756,7 +757,7 @@ impl<'a> TypedC<'a> {
         let ce = self.ctype(elem)?;
         self.struct_fwd.push(format!("struct {inst};\n"));
         self.type_defs.push(format!(
-            "struct {inst} {{ _Atomic uint64_t _rc; {ce} head; struct {inst}* tail; }};\n\
+            "struct {inst} {{ _Atomic uint64_t _rc; uint64_t len; {ce} head; struct {inst}* tail; }};\n\
              static inline struct {inst}* dup_{inst}(struct {inst}* p) {{\n    if (p) atomic_fetch_add_explicit(&p->_rc, 1, memory_order_relaxed);\n    return p;\n}}\n\n"
         ));
         // Elements holding a function have no equality, so their list has no `=` or `has`.
@@ -789,15 +790,16 @@ static void drop_{inst}(struct {inst}* p) {{\n\
         struct {inst}* next = p->tail;\n        {drop_h}        gardel_free(p, sizeof(struct {inst}));\n        p = next;\n    }}\n}}\n\
 static struct {inst}* {inst}__prepend(struct {inst}* xs, {ce} x) {{\n\
     struct {inst}* c = (struct {inst}*)gardel_alloc(sizeof(struct {inst}));\n\
-    atomic_init(&c->_rc, 1);\n    c->head = {dup_x};\n    c->tail = dup_{inst}(xs);\n    return c;\n}}\n\
+    atomic_init(&c->_rc, 1);\n    c->len = xs ? xs->len + 1 : 1;\n    c->head = {dup_x};\n    c->tail = dup_{inst}(xs);\n    return c;\n}}\n\
 static struct {inst}* {inst}__append(struct {inst}* xs, struct {inst}* ys) {{\n\
     struct {inst}* out = NULL;\n    struct {inst}** at = &out;\n\
+    uint64_t n = (xs ? xs->len : 0) + (ys ? ys->len : 0);\n\
     for (; xs; xs = xs->tail) {{\n\
         struct {inst}* c = (struct {inst}*)gardel_alloc(sizeof(struct {inst}));\n\
-        atomic_init(&c->_rc, 1);\n        c->head = {dup_h};\n        c->tail = NULL;\n        *at = c;\n        at = &c->tail;\n    }}\n\
+        atomic_init(&c->_rc, 1);\n        c->len = n--;\n        c->head = {dup_h};\n        c->tail = NULL;\n        *at = c;\n        at = &c->tail;\n    }}\n\
     *at = dup_{inst}(ys);\n    return out;\n}}\n\
 static uint64_t {inst}__length(struct {inst}* xs) {{\n\
-    uint64_t n = 0;\n    for (; xs; xs = xs->tail) n++;\n    return n;\n}}\n"
+    return xs ? xs->len : 0;\n}}\n"
         ));
         if let Some((eq, eqx)) = eq_helpers {
             self.bodies.push(format!(
@@ -1774,7 +1776,9 @@ static bool {inst}__has(struct {inst}* xs, {ce} x) {{\n\
         let rt = rv.ty.clone();
         let elem = split_type_app(&rt).1.first().map(|s| cnorm(s)).unwrap_or_default();
         self.ctype(&rt)?;
-        let inst = c_instance_name(&rt);
+        // The runtime is emitted under the normalized type (`LIST[U64]` for `LIST[NAT]`), so
+        // a value declared `LIST[NAT]` must call it by that name too.
+        let inst = c_instance_name(&cnorm(&rt));
         match (m, args.len()) {
             ("prepend", 1) => {
                 let x = self.lower(cx, &args[0], Some(&elem), hc)?;

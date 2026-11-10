@@ -929,11 +929,12 @@ ds.append(zs)
 
 ### Loops That Run Fast in C
 
-A routine over a long input, such as a parser over a document of a million bytes, runs as fast as a hand-written C loop if it follows three rules. `gjson`'s reader follows them.
+A routine over a long input, such as a parser over a document of a million bytes, runs as fast as a hand-written C loop if it follows two rules. `gjson`'s reader follows them.
 
 - **Make the recursive call the last thing the routine does.** A self tail call is a `while` loop. Any other call takes a stack frame, and a 1 MB stack holds only 30,000 to 60,000 of them. Carry the result in an argument (an accumulator), and reverse it once at the end if needed.
-- **Test `bs = LIST.empty`, not `bs.length`.** `LIST.length` walks the list, so testing it on every step makes the loop quadratic. If an error must report an offset, compute it only on the error path.
 - **Avoid independent `let`s inside a loop.** Two `let`s that do not use each other run as parallel OpenMP tasks, whatever they cost (§10). Inside a loop over 200,000 items this took 36 s against 0.65 s without it. Write the second one inline, or make one use the other. Task F.14 of the [libraries plan](../plan/libraries/verified_libraries.md#task-f14-a-cost-model-for-parallel-lets) adds a cost model.
+
+`LIST.length` takes constant time in C, as each cell keeps the length of the list it starts, so a loop may test `bs.length` on every step.
 
 ---
 
@@ -1043,6 +1044,26 @@ let add_one = fn(x: NAT): NAT do x + 1 end
 ```
 
 A lambda can be applied to any value of its parameter types, so its body is proved for all of them, using what is known where it is created. This one is rejected, because `x + 1` overflows at `NAT.max`. A captured fact counts: `fn(y: U64): U64 do y / z end` verifies where `z > 0` is known, and is rejected with `div_by_zero` otherwise. A lambda passed straight to a parameter of a refined function type may also use that type's `require`: `two(fn(a: NAT, b: NAT): NAT do b - a end)` verifies when `two`'s parameter requires `a <= b`.
+
+### A Routine as a Function Value
+
+The name of a routine of the same module, with no call, is that routine as a function: `apply_small(halve, 50)` means `apply_small(fn(x: NAT): NAT do halve(x) end, 50)`, and it is checked exactly as that lambda is. `halve`'s `ensure` gives the `ensure` a refined type asks for, and its `require` is proven inside the lambda, where the type's `require` is known. So a routine whose `require` is weaker than the type's passes, and one whose `require` is stronger is refused with its own clause's name.
+
+```eiffel
+halve(x: NAT): NAT
+  do
+    x / 2
+  ensure
+    le: Result <= x
+  end
+
+by_name: NAT
+  do
+    apply_small(halve, 50)    -- verifies: `le` gives `bounded`
+  end
+```
+
+A local, a parameter or a binder of the same name hides the routine. A generic routine is not turned into a function, as its lambda would need type arguments, and nor is a routine of another module: wrap it in a lambda. In a `module`, a lambda cannot call a sibling routine yet, as it does not capture `Current`, so this works in a `functions`, `program` or `reactive program` module.
 
 ### Compile-Time Closure Conversion (Lambda Lifting)
 
