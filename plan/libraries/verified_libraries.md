@@ -390,10 +390,10 @@ What was done:
 
 Client: `examples/hello_api`, moved to `grest`. Needs decisions 5 and 6, and Task F.12.
 
-**Status:** In progress. Step 0, a spike on three earlier findings that would hit `grest`, is done (2026-11-09).
+**Status:** In progress. Step 0, a spike on three earlier findings that would hit `grest`, is done, and so is step 1, the URL layer (2026-11-09).
 
 - [x] Step 0: string literals, a routine as a function value, and `LIST.length` in C.
-- [ ] Path patterns such as `/users/:id`, and query parsing with percent decoding. A proven limit on segments.
+- [x] Step 1: Path patterns such as `/users/:id`, and query parsing with percent decoding. A proven limit on segments.
 - [ ] A route holds its handler. A handler is a pure function from a typed request to a response.
 - [ ] `REST_REQUEST` gives `param`, `query`, `header` and `json_body`, and `REST_RESPONSE` gives `json`, `text` and status helpers.
 - [ ] A bad or missing body is a `400` with a JSON error, by default.
@@ -414,6 +414,22 @@ Step 0, what was found and fixed:
 - **Known limits.**
   - In a `module`, a lambda that calls a sibling routine is `E0199` (`undeclared identifier: Current`), whether written by hand or made from a name, as a lifted lambda does not capture `Current`. Handlers live in `functions` and `program` modules, so `grest` is not blocked.
   - A routine of another module, `OTHER.halve`, is not a function value: it parses as a call with no arguments. A generic routine is not converted either.
+
+Step 1, the URL layer:
+
+- **`grest` 0.1.0** has five modules under `src/url/`, with no dependency yet: `URL_TEXT` (percent decoding, with `+` as a space in a query), `REQUEST_TARGET` (decoded segments and query fields), `PATH_PATTERN` and `PATH_SEGMENT` (`/users/:id`), `URL_PARAM` (a name and a value) and `URL_ERROR` (each refusal, a `400`). `ghttp` and `gjson` come in with the request type, the next step.
+- **Proven.** A parsed target has at most 16 segments and 32 query fields, and a target with more is refused. A match gives exactly one value per parameter of the pattern, so at most 16, and only a valid pattern matches. Decoding never makes text longer, and text with no `%` (nor `+` in a query) decodes to itself, with no copy. `tests/grest.rs` has a client prove the limits and the plain-text fact through the contracts alone, and three claims past them refused: 15 segments, 31 fields, and plain text decoded as itself in a query.
+- **A pattern is total.** `PATH_PATTERN.parse` takes any text, and a bad pattern (no leading `/`, more than 16 segments, a `?` or `%`, or `:` with no name) is not valid and matches nothing. A precondition on the pattern text would need the solver to evaluate `count_char` over a literal one character at a time at every route, which step 0 showed is where cost comes from. The cost of the choice is that a typo makes a route that never matches. The router can report invalid routes when it is built, in the next step.
+- **Splitting.** A target and a pattern are split the same way: `/` is one empty segment, and `/users/` is `users` and an empty one, so it does not match `/users`. A segment is decoded after the split, so `%2F` stays inside it. Patterns are written decoded.
+- **Tests.** `grest/tests/cases.txt` has 101 cases, run in C by `cargo test`: decoding in a path and in a query, every kind of bad escape, decoded bytes that are not UTF-8 (a lone lead byte, an overlong form, a surrogate), targets at and past both limits, patterns, and matches.
+- **Mutations.** Fourteen on a private copy of `grest`, all red: four caught by the verifier (a fast path that ignores `+`, limits of 17 segments and 33 fields, a longer request that matches) and ten by the cases. One survived at first, `+` decoded in a path, because every `+` case in a path had no `%` and took the fast path. The cases now mix them. Two more on the compiler, both red: no renaming of binders (`tests/binders.rs`), and `STRING.make_empty` not lowered (`tests/grest.rs`).
+- **Compiler fixes found on the way**, each with a test:
+  - Two `match` binders of one name and different types in a routine, such as `case Some(e)` beside `case Error(e)`, or a binder that reuses a parameter's name, declared one local twice in the proof, and the module was `E0199`. A pass after parsing, `rename_repeated_binders`, renames a binder whose name is already bound in its routine. `tests/binders.rs` has a program with a binder of a parameter's name, a `let`'s name and another binder's name, which verifies and computes the same values in C, and a lie about one refused.
+  - `STRING.make_empty` compiled to a constructor that does not exist in C. It is now the static empty string.
+- **Known limits.**
+  - A list's length has no upper bound in the proof, so `count(tail) + 1` over a list cannot be proven not to overflow. A routine that counts over a list needs a precondition that bounds it, as `PATH_SEGMENT.params_in` has (`ps.length <= 16`). When such an overflow fails, the routine's whole contract is withdrawn for the next pass, so the first error to read is the overflow.
+  - A call with a constructor as an argument, such as `pick(Some(7), b)`, is `E0199` (`fn_get`) when the callee's `require` calls a method on that parameter, such as `a.get`. Binding the value with a typed `let` works. This is older than F.6.
+  - `=` on two binders taken from an `OPTION[NAT]` is `E0311`, as their type is not inferred. `<` works. This is older than F.6.
 
 ### Step 5: Async
 

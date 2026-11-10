@@ -1,0 +1,46 @@
+-- A decoded name and value: a path parameter such as `id` in `/users/:id`, or a query field.
+module URL_PARAM
+
+representation {NONE}
+  param_name: STRING
+  param_value: STRING
+
+create {ANY}
+
+  make(n: STRING, v: STRING): URL_PARAM
+    do
+      { param_name = n, param_value = v }
+    ensure
+      name_set: Result.name.equals(n)
+      value_set: Result.value.equals(v)
+    end
+
+  -- The value of the first parameter of `ps` named `n`.
+  find(ps: LIST[URL_PARAM], n: STRING): OPTION[STRING]
+    variant
+      ps.length
+    do
+      if ps.length = 0 then
+        None
+      else
+        if ps.head.name.equals(n) then Some(ps.head.value) else URL_PARAM.find(ps.tail, n) end
+      end
+    ensure
+      empty: ps.length = 0 implies not Result.is_some
+      first: (ps.length > 0 and ps.head.name.equals(n)) implies
+        (Result.is_some and Result.get.equals(ps.head.value))
+    end
+
+feature {ANY}
+
+  name: STRING
+    do
+      Current.param_name
+    end
+
+  value: STRING
+    do
+      Current.param_value
+    end
+
+end

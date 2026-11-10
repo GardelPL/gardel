@@ -1,0 +1,211 @@
+-- A request target such as `/users/42?sort=name&q=a+b`, split and decoded: its path segments
+-- (`users`, `42`) and its query fields (`sort` = `name`, `q` = `a b`).
+--
+-- The path is what follows the first `/`, up to the first `?`, split at each `/`. So `/` has
+-- one empty segment and `/users/` has two, `users` and an empty one. A segment is decoded
+-- after the split, so `%2F` is a `/` inside a segment. Query fields are split at `&`, then at
+-- the first `=`; empty fields are skipped, and a field with no `=` has an empty value.
+--
+-- At most `max_segments` segments and `max_fields` fields: a target with more is refused, so
+-- the work a route match does is bounded whatever a client sends.
+module REQUEST_TARGET
+
+representation {NONE}
+  segs: LIST[STRING]
+  seg_count: NAT
+  fields: LIST[URL_PARAM]
+  n_fields: NAT
+
+invariant
+  segs_counted: seg_count = segs.length
+  segs_bounded: seg_count <= 16
+  fields_counted: n_fields = fields.length
+  fields_bounded: n_fields <= 32
+
+create {ANY}
+
+  max_segments: NAT
+    do
+      16
+    end
+
+  max_fields: NAT
+    do
+      32
+    end
+
+  -- Each of `parts`, decoded as a path segment.
+  decode_segments(parts: LIST[STRING]): RESULT[URL_ERROR, LIST[STRING]]
+    variant
+      parts.length
+    do
+      if parts.length = 0 then
+        Ok(LIST.empty)
+      else
+        let rest = REQUEST_TARGET.decode_segments(parts.tail)
+        check rest_len: rest.is_ok implies rest.get.length = parts.tail.length end
+        match rest
+          case Error(e) then
+            Error(e)
+          case Ok(done) then
+            match URL_TEXT.decode(parts.head, False)
+              case Error(e) then Error(e)
+              case Ok(s) then Ok(done.prepend(s))
+            end
+        end
+      end
+    ensure
+      same_length: Result.is_ok implies Result.get.length = parts.length
+    end
+
+  -- One query field, `name=value` or `name`.
+  read_field(p: STRING): RESULT[URL_ERROR, URL_PARAM]
+    do
+      match p.find_char('=', 0)
+        case None then
+          match URL_TEXT.decode(p, True)
+            case Error(e) then Error(e)
+            case Ok(n) then Ok(URL_PARAM.make(n, STRING.make_empty(1)))
+          end
+        case Some(e) then
+          match URL_TEXT.decode(p.slice(0, e), True)
+            case Error(err) then
+              Error(err)
+            case Ok(n) then
+              match URL_TEXT.decode(p.slice(e + 1, p.code_point_count), True)
+                case Error(err) then Error(err)
+                case Ok(v) then Ok(URL_PARAM.make(n, v))
+              end
+          end
+      end
+    end
+
+  -- The fields of `pieces`, skipping empty ones.
+  read_fields(pieces: LIST[STRING]): RESULT[URL_ERROR, LIST[URL_PARAM]]
+    variant
+      pieces.length
+    do
+      if pieces.length = 0 then
+        Ok(LIST.empty)
+      else
+        let rest = REQUEST_TARGET.read_fields(pieces.tail)
+        check rest_len: rest.is_ok implies rest.get.length <= pieces.tail.length end
+        match rest
+          case Error(e) then
+            Error(e)
+          case Ok(done) then
+            if pieces.head.code_point_count = 0 then
+              Ok(done)
+            else
+              match REQUEST_TARGET.read_field(pieces.head)
+                case Error(e) then Error(e)
+                case Ok(f) then Ok(done.prepend(f))
+              end
+            end
+        end
+      end
+    ensure
+      no_more: Result.is_ok implies Result.get.length <= pieces.length
+    end
+
+  -- The fields of the query `q`, at most `max_fields`.
+  read_query(q: STRING): RESULT[URL_ERROR, LIST[URL_PARAM]]
+    do
+      if q.count_char('&', 0) >= 32 then
+        Error(TooManyFields)
+      else
+        let pieces = q.split('&')
+        let r = REQUEST_TARGET.read_fields(pieces)
+        check r_len: r.is_ok implies r.get.length <= pieces.length end
+        r
+      end
+    ensure
+      bounded: Result.is_ok implies Result.get.length <= 32
+    end
+
+  -- What follows index `i` of `t`, or nothing if `i` is its end.
+  query_after(t: STRING, i: NAT): STRING
+    require
+      inside: i <= t.code_point_count
+    do
+      if i < t.code_point_count then t.slice(i + 1, t.code_point_count) else STRING.make_empty(1) end
+    end
+
+  parse(t: STRING): RESULT[URL_ERROR, REQUEST_TARGET]
+    do
+      if t.code_point_count = 0 then
+        Error(NotAPath)
+      else if t.character_at(0) != '/' then
+        Error(NotAPath)
+      else
+        let n = t.code_point_count
+        let path_end = match t.find_char('?', 1)
+            case Some(k) then k
+            case None then n
+          end
+        let path = t.slice(1, path_end)
+        if path.count_char('/', 0) >= 16 then
+          Error(TooManySegments)
+        else
+          let parts = path.split('/')
+          let decoded = REQUEST_TARGET.decode_segments(parts)
+          check d_len: decoded.is_ok implies decoded.get.length = parts.length end
+          match decoded
+            case Error(e) then
+              Error(e)
+            case Ok(segments) then
+              let read = REQUEST_TARGET.read_query(REQUEST_TARGET.query_after(t, path_end))
+              check q_len: read.is_ok implies read.get.length <= 32 end
+              match read
+                case Error(e) then
+                  Error(e)
+                case Ok(fs) then
+                  Ok({ segs = segments, seg_count = segments.length, fields = fs, n_fields = fs.length })
+              end
+          end
+        end
+      end end
+    ensure
+      bounded: Result.is_ok implies
+        (Result.get.segment_count <= 16 and Result.get.field_count <= 32)
+    end
+
+feature {ANY}
+
+  -- The decoded path segments, in order.
+  segments: LIST[STRING]
+    do
+      Current.segs
+    ensure
+      counted: Result.length = Current.segment_count
+    end
+
+  segment_count: NAT
+    do
+      Current.seg_count
+    ensure
+      bounded: Result <= 16
+    end
+
+  -- The decoded query fields, in order.
+  query_fields: LIST[URL_PARAM]
+    do
+      Current.fields
+    ensure
+      counted: Result.length = Current.field_count
+    end
+
+  field_count: NAT
+    do
+      Current.n_fields
+    ensure
+      bounded: Result <= 32
+    end
+
+  -- The value of the first query field named `name`.
+  query(name: STRING): OPTION[STRING]
+    do
+      URL_PARAM.find(Current.fields, name)
+    end
+
+end

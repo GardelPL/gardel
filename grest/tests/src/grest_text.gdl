@@ -1,0 +1,140 @@
+-- What decoding, a target and a pattern match say, as text, for the lines of `cases.txt`:
+--
+--   decode path <text> => ok [<decoded>]        or  => error <reason>
+--   decode query <text> => ok [<decoded>]
+--   target <target> => segments [a] [b] query [name]=[value] ...
+--   pattern <pattern> => valid <segments> <parameters>   or  => invalid
+--   match <pattern> <target> => params [name]=[value] ...  or  => no match
+functions GREST_TEXT
+
+feature {ANY}
+
+  -- `a` then `b`, or `a` alone if that would not fit.
+  join(a: STRING, b: STRING): STRING
+    do
+      if a.byte_length <= 100000000 and b.byte_length <= 100000000 then a.concat(b) else a end
+    end
+
+  number(n: NAT): STRING
+    do
+      NUMBER_TEXT.nat_to_text(n)
+    end
+
+  bracket(s: STRING): STRING
+    do
+      join(join("[", s), "]")
+    end
+
+  error_name(e: URL_ERROR): STRING
+    do
+      match e
+        case NotAPath then "NotAPath"
+        case BadEscape then "BadEscape"
+        case NotUtf8 then "NotUtf8"
+        case TooManySegments then "TooManySegments"
+        case TooManyFields then "TooManyFields"
+      end
+    end
+
+  decoded(r: RESULT[URL_ERROR, STRING]): STRING
+    do
+      match r
+        case Ok(s) then join("ok ", bracket(s))
+        case Error(e) then join("error ", error_name(e))
+      end
+    end
+
+  -- ` [a] [b]` for each segment.
+  segments(xs: LIST[STRING]): STRING
+    variant
+      xs.length
+    do
+      if xs.length = 0 then STRING.make_empty(1) else join(join(" ", bracket(xs.head)), segments(xs.tail)) end
+    end
+
+  -- ` [name]=[value]` for each parameter.
+  params(ps: LIST[URL_PARAM]): STRING
+    variant
+      ps.length
+    do
+      if ps.length = 0 then
+        STRING.make_empty(1)
+      else
+        join(join(join(join(" ", bracket(ps.head.name)), "="), bracket(ps.head.value)), params(ps.tail))
+      end
+    end
+
+  target(t: STRING): STRING
+    do
+      match REQUEST_TARGET.parse(t)
+        case Error(e) then join("error ", error_name(e))
+        case Ok(rt) then join(join(join("segments", segments(rt.segments)), " query"), params(rt.query_fields))
+      end
+    end
+
+  pattern(p: STRING): STRING
+    do
+      let pp = PATH_PATTERN.parse(p)
+      if pp.is_valid then
+        join(join(join("valid ", number(pp.segment_count)), " "), number(pp.param_count))
+      else
+        "invalid"
+      end
+    end
+
+  matched(p: STRING, t: STRING): STRING
+    do
+      match REQUEST_TARGET.parse(t)
+        case Error(e) then
+          join("error ", error_name(e))
+        case Ok(rt) then
+          match PATH_PATTERN.parse(p).match_target(rt)
+            case None then "no match"
+            case Some(ps) then join("params", params(ps))
+          end
+      end
+    end
+
+  -- What the words of a case line say.
+  run(words: LIST[STRING]): STRING
+    do
+      if words.length < 2 then
+        "bad case"
+      else
+        let kind = words.head
+        let first = words.tail.head
+        if kind.equals("decode") and words.length = 3 then
+          decoded(URL_TEXT.decode(words.tail.tail.head, first.equals("query")))
+        else if kind.equals("target") and words.length = 2 then
+          target(first)
+        else if kind.equals("pattern") and words.length = 2 then
+          pattern(first)
+        else if kind.equals("match") and words.length = 3 then
+          matched(first, words.tail.tail.head)
+        else
+          "bad case"
+        end end end end
+      end
+    end
+
+  -- 0 if a line of `cases.txt` holds, or is a comment, else 1.
+  check_line(line: STRING): NAT
+    do
+      if line.code_point_count = 0 or line.starts_with("#") then
+        0
+      else
+        match line.find(" => ", 0)
+          case None then
+            1
+          case Some(i) then
+            if i + 4 > line.code_point_count then
+              1
+            else
+              let got = run(line.slice(0, i).split(' '))
+              if got.equals(line.slice(i + 4, line.code_point_count)) then 0 else 1 end
+            end
+        end
+      end
+    end
+
+end

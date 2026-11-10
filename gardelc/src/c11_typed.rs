@@ -2529,6 +2529,12 @@ static bool {inst}__has(struct {inst}* xs, {ce} x) {{\n\
             ("BYTES", "empty", 0) => {
                 return Ok(owned("((GardelBytes){ NULL, 0, NULL })".to_string(), "BYTES"));
             }
+            ("STRING", "make_empty", 1) => {
+                // The capacity is a fact of the verification model only: in C the empty
+                // string is static text, with no owner.
+                let a = self.lower(cx, &args[0], Some("NAT"), hc)?;
+                return Ok(owned(format!("((void)({}), (GardelString){{ \"\", 0, 0, NULL }})", a.code), "STRING"));
+            }
             ("STRING", _, _) | ("BYTES", _, _) => {
                 // Not a primitive: a routine with no `Current` compiles from its verified source.
                 let md = self.module(v).ok_or_else(|| format!("unknown name `{v}`"))?;

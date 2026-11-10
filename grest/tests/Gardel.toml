@@ -1,0 +1,6 @@
+[project]
+name = "grest-tests"
+version = "0.1.0"
+
+[dependencies]
+grest = { path = ".." }

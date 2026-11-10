@@ -1,0 +1,156 @@
+-- A path pattern such as `/users/:id/posts`: a segment that starts with `:` is a parameter
+-- named by the rest of it, and every other segment must be equal to the request's, after the
+-- request's is decoded. Patterns are split as `REQUEST_TARGET` splits a path, so `/` is one
+-- empty segment and a trailing `/` is an empty segment of its own.
+--
+-- Any text gives a pattern. One that does not start with `/`, has more than
+-- `REQUEST_TARGET.max_segments` segments, has a `?` or a `%`, or has a parameter with no name,
+-- is not valid and matches nothing.
+module PATH_PATTERN
+
+representation {NONE}
+  segs: LIST[PATH_SEGMENT]
+  seg_count: NAT
+  n_params: NAT
+  valid: BOOL
+
+invariant
+  segs_counted: seg_count = segs.length
+  segs_bounded: seg_count <= 16
+  params_counted: n_params = PATH_SEGMENT.params_in(segs)
+  invalid_empty: not valid implies seg_count = 0
+
+create {ANY}
+
+  -- The segments `parts` stand for, or `None` if one is a parameter with no name.
+  segments_of(parts: LIST[STRING]): OPTION[LIST[PATH_SEGMENT]]
+    variant
+      parts.length
+    do
+      if parts.length = 0 then
+        Some(LIST.empty)
+      else
+        let rest = PATH_PATTERN.segments_of(parts.tail)
+        check rest_len: rest.is_some implies rest.get.length = parts.tail.length end
+        match rest
+          case None then
+            None
+          case Some(done) then
+            let p = parts.head
+            if p.code_point_count > 0 and p.character_at(0) = ':' then
+              if p.code_point_count = 1 then None else Some(done.prepend(Param(p.slice(1, p.code_point_count)))) end
+            else
+              Some(done.prepend(Fixed(p)))
+            end
+        end
+      end
+    ensure
+      same_length: Result.is_some implies Result.get.length = parts.length
+    end
+
+  parse(p: STRING): PATH_PATTERN
+    do
+      if p.code_point_count = 0 then
+        PATH_PATTERN.nothing
+      else if p.character_at(0) != '/' or p.find_char('?', 0).is_some or p.find_char('%', 0).is_some then
+        PATH_PATTERN.nothing
+      else
+        let path = p.slice(1, p.code_point_count)
+        if path.count_char('/', 0) >= 16 then
+          PATH_PATTERN.nothing
+        else
+          let parts = path.split('/')
+          let found = PATH_PATTERN.segments_of(parts)
+          check f_len: found.is_some implies found.get.length = parts.length end
+          match found
+            case None then
+              PATH_PATTERN.nothing
+            case Some(ss) then
+              { segs = ss, seg_count = ss.length, n_params = PATH_SEGMENT.params_in(ss), valid = True }
+          end
+        end
+      end end
+    end
+
+  -- The pattern that matches nothing.
+  nothing: PATH_PATTERN
+    do
+      { segs = LIST.empty, seg_count = 0, n_params = 0, valid = False }
+    ensure
+      invalid: not Result.is_valid
+    end
+
+  -- The parameters `ps` binds when it matches `xs`, one for each parameter segment, in order.
+  match_segments(ps: LIST[PATH_SEGMENT], xs: LIST[STRING]): OPTION[LIST[URL_PARAM]]
+    require
+      short: ps.length <= 16
+    variant
+      ps.length
+    do
+      if ps.length = 0 then
+        if xs.length = 0 then Some(LIST.empty) else None end
+      else if xs.length = 0 then
+        None
+      else
+        let rest = PATH_PATTERN.match_segments(ps.tail, xs.tail)
+        check rest_len: rest.is_some implies rest.get.length = PATH_SEGMENT.params_in(ps.tail) end
+        match rest
+          case None then
+            None
+          case Some(done) then
+            match ps.head
+              case Fixed(text) then
+                if text.equals(xs.head) then Some(done) else None end
+              case Param(name) then
+                Some(done.prepend(URL_PARAM.make(name, xs.head)))
+            end
+        end
+      end end
+    ensure
+      one_each: Result.is_some implies Result.get.length = PATH_SEGMENT.params_in(ps)
+      same_length: Result.is_some implies ps.length = xs.length
+    end
+
+feature {ANY}
+
+  is_valid: BOOL
+    do
+      Current.valid
+    end
+
+  segment_count: NAT
+    do
+      Current.seg_count
+    ensure
+      bounded: Result <= 16
+    end
+
+  param_count: NAT
+    do
+      Current.n_params
+    ensure
+      bounded: Result <= Current.segment_count
+    end
+
+  -- The parameters of `t`'s path, if it matches: one for each parameter of the pattern, in
+  -- order, so never more than `REQUEST_TARGET.max_segments`.
+  match_target(t: REQUEST_TARGET): OPTION[LIST[URL_PARAM]]
+    do
+      if Current.valid then
+        let r = PATH_PATTERN.match_segments(Current.segs, t.segments)
+        check
+          r_len: r.is_some implies r.get.length = Current.n_params
+          r_segs: r.is_some implies Current.seg_count = t.segment_count
+        end
+        r
+      else
+        None
+      end
+    ensure
+      only_valid: Result.is_some implies Current.is_valid
+      one_each: Result.is_some implies Result.get.length = Current.param_count
+      bounded: Result.is_some implies Result.get.length <= 16
+      same_length: Result.is_some implies t.segment_count = Current.segment_count
+    end
+
+end

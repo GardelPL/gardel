@@ -1,0 +1,90 @@
+-- Percent decoding (RFC 3986 section 2.1). In a query, `+` also stands for a space, as HTML
+-- forms send it (`plus`); in a path it is itself.
+functions URL_TEXT
+
+feature {ANY}
+
+  -- Whether no byte of `bs` from `i` on is `%`, nor, with `plus`, `+`.
+  plain_from(bs: BYTES, i: NAT, plus: BOOL): BOOL
+    require
+      inside: i <= bs.length
+    variant
+      bs.length - i
+    do
+      if i = bs.length then
+        True
+      else
+        bs.at(i) != 37 and not (plus and bs.at(i) = 43) and plain_from(bs, i + 1, plus)
+      end
+    ensure
+      def: Result = (forall k: NAT. (i <= k and k < bs.length) implies
+        (LIST_OPS.at(bs.model, k) != 37 and not (plus and LIST_OPS.at(bs.model, k) = 43)))
+    end
+
+  -- The bytes of `raw` from `i` on, decoded, after `out`. Never more bytes than it reads.
+  decode_from(raw: BYTES, i: NAT, plus: BOOL, out: BYTES_BUILDER): RESULT[URL_ERROR, BYTES]
+    require
+      inside: i <= raw.length
+      no_longer: out.length <= i
+    variant
+      raw.length - i
+    do
+      if i = raw.length then
+        Ok(out.to_bytes)
+      else
+        let b = raw.at(i)
+        if b = 37 then
+          if raw.length - i >= 3 then
+            let high = NUMBER_TEXT.hex_value(raw.at(i + 1))
+            let low = NUMBER_TEXT.hex_value(raw.at(i + 2))
+            if high < 16 and low < 16 then
+              decode_from(raw, i + 3, plus, out.add_byte(high * 16 + low))
+            else
+              Error(BadEscape)
+            end
+          else
+            Error(BadEscape)
+          end
+        else
+          if plus and b = 43 then
+            decode_from(raw, i + 1, plus, out.add_byte(32))
+          else
+            decode_from(raw, i + 1, plus, out.add_byte(b))
+          end
+        end
+      end
+    ensure
+      shorter: Result.is_ok implies Result.get.length <= out.length + (raw.length - i)
+    end
+
+  -- `s` decoded. Text with no `%`, nor `+` in a query, is returned as it is, with no copy.
+  decode(s: STRING, plus: BOOL): RESULT[URL_ERROR, STRING]
+    do
+      let raw = s.to_utf8
+      check raw_len: raw.length = s.byte_length end
+      if plain_from(raw, 0, plus) then
+        Ok(s)
+      else
+        let r = decode_from(raw, 0, plus, BYTES_BUILDER.empty)
+        check r_short: r.is_ok implies r.get.length <= raw.length end
+        match r
+          case Error(e) then
+            Error(e)
+          case Ok(b) then
+            check b_short: b.length <= raw.length end
+            match STRING.from_utf8(b)
+              case Ok(t) then
+                check t_len: t.byte_length = b.length end
+                Ok(t)
+              case Error(_) then Error(NotUtf8)
+            end
+        end
+      end
+    ensure
+      plain: (forall k: NAT. k < s.byte_length implies
+        (LIST_OPS.at(s.byte_model, k) != 37 and not (plus and LIST_OPS.at(s.byte_model, k) = 43)))
+        implies (Result.is_ok and Result.get.equals(s))
+      shorter: Result.is_ok implies Result.get.byte_length <= s.byte_length
+    end
+
+end
