@@ -69,6 +69,9 @@ feature {ANY}
       { items = Current.items.put(t.todo_id, t), next = Current.next + 1 }
     ensure
       advanced: Result.next_id = Current.next_id + 1
+      added: Result.find(t.todo_id).is_some
+      added_done: (Result.find(t.todo_id).get.is_done = t.is_done)
+      others_kept: forall k: NAT. k != t.todo_id implies (Result.find(k).is_some = Current.find(k).is_some)
     end
 
   -- The store with `t` in place of the todo with its id, which it has.
@@ -79,6 +82,9 @@ feature {ANY}
       { Current with items = Current.items.put(t.todo_id, t) }
     ensure
       same_next: Result.next_id = Current.next_id
+      kept: Result.find(t.todo_id).is_some
+      done_set: (Result.find(t.todo_id).get.is_done = t.is_done)
+      others_kept: forall k: NAT. k != t.todo_id implies (Result.find(k).is_some = Current.find(k).is_some)
     end
 
   -- The store without the todo numbered `id`.
@@ -87,6 +93,8 @@ feature {ANY}
       { Current with items = Current.items.remove(id) }
     ensure
       same_next: Result.next_id = Current.next_id
+      gone: Result.find(id).is_none
+      others_kept: forall k: NAT. k != id implies (Result.find(k).is_some = Current.find(k).is_some)
     end
 
 end

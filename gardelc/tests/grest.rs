@@ -224,8 +224,9 @@ end
 
 /// What a client knows of `REST_SERVER` for every state and event: the limit on connections
 /// holds and never changes, an event about a connection does nothing, closes it, or sends it
-/// one answer and closes it, any other event names no connection, a `Shutdown` stops, and a
-/// router with a pattern that is not valid does not start.
+/// one answer and closes it, any other event names no connection, a `Shutdown` stops, a
+/// router with a pattern that is not valid does not start, and the next state is the one the
+/// handler of a completed request gave back, or the same.
 #[test]
 fn a_client_proves_the_server_safety_through_the_contracts() {
     let facts = server_client(
@@ -233,7 +234,8 @@ fn a_client_proves_the_server_safety_through_the_contracts() {
       stops: e.is_shutdown implies s.serve(e).is_stop
       limit: s.open_connections <= s.max_connections
       bad_route: r.invalid_route.is_some implies REST_SERVER.start(args, 8090, r, n).is_stop
-      fresh: REST_SERVER.make(8090, r, n).open_connections = 0",
+      fresh: REST_SERVER.make(8090, r, n).open_connections = 0
+      moves: s.moves_to(e, s.serve(e))",
     );
     assert_ok(&Project::new("server", &facts).check());
 }
@@ -249,6 +251,8 @@ fn a_claim_past_the_server_safety_does_not_verify() {
         ("claim_room", "s.open_connections < s.max_connections"),
         // An argument that is not a port stops it.
         ("claim_starts", "r.invalid_route.is_none implies not REST_SERVER.start(args, 8090, r, n).is_stop"),
+        // A handler may change the state.
+        ("claim_frozen", "(match s.serve(e) case Continue(x, _) then x.state = s.state case Stop(_, _) then True end)"),
     ];
     let claims: Vec<String> = lies.iter().map(|(tag, claim)| format!("      {tag}: {claim}")).collect();
     let out = Project::new("server_lies", &server_client(&claims.join("\n"))).check();

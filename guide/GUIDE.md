@@ -1384,8 +1384,8 @@ The runtime calls `init`, performs the commands it returns, waits for an event, 
 | Prelude type | Contents |
 | :--- | :--- |
 | `STEP[S]` | `Continue(next, cmds)` or `Stop(code, cmds)` |
-| `COMMAND` | `Print`, `SetTimer`, `ReadLine`, `ReadKey`, `Listen`, `Send`, `Close` |
-| `EVENT` | `Tick`, `Line`, `Key`, `Accepted`, `ListenFailed`, `Received`, `SendFailed`, `Closed`, `Shutdown` |
+| `COMMAND` | `Print`, `SetTimer`, `CancelTimer`, `ReadLine`, `ReadKey`, `Listen`, `Connect`, `Send`, `Close` |
+| `EVENT` | `Tick`, `Line`, `Key`, `Accepted`, `ListenFailed`, `Connected`, `ConnectFailed`, `Received`, `SendFailed`, `Closed`, `Shutdown` |
 | `KEY` | `Char(c)`, arrows, `Enter`, `Escape`, `Backspace`, `Tab`, `Other`, `KeysEnded` |
 | `CONN_ID` | An opaque connection handle: it can be compared and stored, never forged |
 
@@ -1393,6 +1393,8 @@ Rules worth knowing:
 - There is no `main`, no `IO` type and no `with IO`. `Stop` is the only way out, and its `code` is the exit status.
 - `init` and `step` have no `require`, because the runtime calls them with every input.
 - End a `match` on `EVENT` with `case _`.
+- `Connect(tag, host, port)` is answered by `Connected(tag, conn)` or `ConnectFailed(tag, err)`, with the tag you chose. `host` is an IPv4 address or `localhost`: names are not looked up. A connection you made works like an accepted one.
+- `CancelTimer(id)` clears a pending timer, so a stale `Tick` cannot reach a later use of the id.
 - A command never blocks the loop. One that can fail reports it as a later event.
 - The compiler adds `e.is_shutdown implies Result.is_stop` to every `step`, tagged `shutdown_must_stop`, and a clause you write cannot replace it.
 
@@ -1460,6 +1462,7 @@ A reactive program is a pure function of its arguments and its events, so a run 
 | `GARDEL_RECORD=<file>` | Write a log of the run |
 | `GARDEL_REPLAY=<file>` | Run from a log, with no timers, reads or sockets |
 | `GARDEL_LISTEN_ADDR=<ip>` | Bind `Listen` to an address other than loopback |
+| `GARDEL_CONNECT_TIMEOUT_MS=<n>` | How long a `Connect` may take before it fails, 10000 by default |
 
 The log holds the commands and the exit code as well as the events. A replay compares each command before it takes effect, and the first difference stops the program with exit status 3 and the line that differs, so a log from a working build is a regression test for a changed one. These are environment variables, not flags, because the command line belongs to the program and is part of what is replayed.
 

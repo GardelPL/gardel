@@ -2849,7 +2849,8 @@ static struct SEQ_STRING* gardel_main_args(int argc, char** argv) {
 const REACTIVE_RUNTIME: &str = r#"/* Reactive host (spec 11.6). */
 enum gardel_host_kind {
     GARDEL_HOST_SHUTDOWN, GARDEL_HOST_TICK, GARDEL_HOST_LINE, GARDEL_HOST_KEY, GARDEL_HOST_ACCEPTED,
-    GARDEL_HOST_LISTEN_FAILED, GARDEL_HOST_RECEIVED, GARDEL_HOST_SEND_FAILED, GARDEL_HOST_CLOSED
+    GARDEL_HOST_LISTEN_FAILED, GARDEL_HOST_RECEIVED, GARDEL_HOST_SEND_FAILED, GARDEL_HOST_CLOSED,
+    GARDEL_HOST_CONNECTED, GARDEL_HOST_CONNECT_FAILED
 };
 enum gardel_host_key {
     GARDEL_KEY_CHAR, GARDEL_KEY_UP, GARDEL_KEY_DOWN, GARDEL_KEY_LEFT, GARDEL_KEY_RIGHT,
@@ -2858,7 +2859,7 @@ enum gardel_host_key {
 };
 struct gardel_host_event {
     enum gardel_host_kind kind;
-    uint64_t id;                /* Tick: the timer. Sockets: the connection, or the port */
+    uint64_t id;                /* Tick: the timer. Sockets: the connection, or the port. ConnectFailed: none */
     void* line;                 /* Line: an owned RESULT[IO_ERROR, STRING] */
     enum gardel_host_key key;   /* Key */
     uint32_t ch;                /* Key: a Unicode scalar, for GARDEL_KEY_CHAR */
@@ -2867,6 +2868,7 @@ struct gardel_host_event {
     int line_state;             /* Line: a GARDEL_LINE_* */
     char* raw;                  /* Line: the bytes read, kept only when recording */
     size_t raw_len;
+    uint64_t tag;               /* Connected, ConnectFailed: the tag of the Connect */
 };
 
 /* Scripted events, from GARDEL_EVENTS: names separated by spaces. NULL reads the OS. */
@@ -2905,6 +2907,7 @@ typedef unsigned long long gardel_sock;
 #define GARDEL_POLL_BASE 0
 #define GARDEL_ERR_INVALID 10022
 #define GARDEL_ERR_NO_BUFFERS 10055
+#define GARDEL_ERR_TIMED_OUT 10060
 struct gardel_pollfd { gardel_sock fd; short events, revents; };
 struct gardel_sockaddr { short family; unsigned short port; uint32_t addr; char zero[8]; };
 static struct gardel_pollfd* gardel_pfds = NULL;
@@ -2922,6 +2925,8 @@ __declspec(dllimport) int __stdcall send(gardel_sock, const char*, int, int);
 __declspec(dllimport) int __stdcall shutdown(gardel_sock, int);
 __declspec(dllimport) int __stdcall closesocket(gardel_sock);
 __declspec(dllimport) unsigned long __stdcall inet_addr(const char*);
+__declspec(dllimport) int __stdcall connect(gardel_sock, const struct gardel_sockaddr*, int);
+__declspec(dllimport) int __stdcall getsockopt(gardel_sock, int, int, char*, int*);
 static void* gardel_net_event = NULL;
 static bool gardel_sock_start(void) {
     if (gardel_net_event) return true;
@@ -2947,9 +2952,26 @@ static bool gardel_sock_bind(gardel_sock s, uint64_t port, uint32_t ip) {
     return bind(s, &a, sizeof a) == 0 && listen(s, 128) == 0;
 }
 static gardel_sock gardel_sock_accept(gardel_sock s) { return accept(s, NULL, NULL); }
-/* FD_ACCEPT, or FD_READ | FD_WRITE | FD_CLOSE. WSAEventSelect also makes the socket non-blocking. */
+/* FD_ACCEPT, or FD_READ | FD_WRITE | FD_CONNECT | FD_CLOSE. WSAEventSelect also makes the
+   socket non-blocking. */
 static void gardel_sock_watch(gardel_sock s, bool listener) {
-    if (WSAEventSelect(s, gardel_net_event, listener ? 8 : 1 | 2 | 32) != 0) abort();
+    if (WSAEventSelect(s, gardel_net_event, listener ? 8 : 1 | 2 | 16 | 32) != 0) abort();
+}
+/* 0 when connected now, 1 while the connect goes on, -1 on an error. */
+static int gardel_sock_connect(gardel_sock s, uint64_t port, uint32_t ip) {
+    struct gardel_sockaddr a;
+    memset(&a, 0, sizeof a);
+    a.family = 2;
+    a.port = (unsigned short)(((port & 0xFF) << 8) | (port >> 8));
+    a.addr = ip;
+    if (connect(s, &a, sizeof a) == 0) return 0;
+    return gardel_sock_error() == 10035 ? 1 : -1;
+}
+/* The outcome of a connect that went on: 0, or the error. SOL_SOCKET, SO_ERROR. */
+static int gardel_sock_connect_error(gardel_sock s) {
+    int err = 0, len = sizeof err;
+    if (getsockopt(s, 0xFFFF, 0x1007, (char*)&err, &len) != 0) return gardel_sock_error();
+    return err;
 }
 static long gardel_sock_recv(gardel_sock s, char* buf, size_t n) { return recv(s, buf, (int)n, 0); }
 static long gardel_sock_send(gardel_sock s, const char* buf, size_t n) {
@@ -3106,6 +3128,7 @@ typedef int gardel_sock;
 #define GARDEL_POLL_BASE 2 /* the wake pipes come first */
 #define GARDEL_ERR_INVALID EINVAL
 #define GARDEL_ERR_NO_BUFFERS ENOBUFS
+#define GARDEL_ERR_TIMED_OUT ETIMEDOUT
 /* What the last pass over the sockets watched, after the two wake pipes. */
 static struct pollfd* gardel_pfds = NULL;
 static size_t gardel_poll_count = 0;
@@ -3135,6 +3158,23 @@ static void gardel_sock_watch(gardel_sock s, bool listener) {
     (void)listener;
     int flags = fcntl(s, F_GETFL, 0);
     if (flags < 0 || fcntl(s, F_SETFL, flags | O_NONBLOCK) != 0) abort();
+}
+/* 0 when connected now, 1 while the connect goes on, -1 on an error. */
+static int gardel_sock_connect(gardel_sock s, uint64_t port, uint32_t ip) {
+    struct sockaddr_in a;
+    memset(&a, 0, sizeof a);
+    a.sin_family = AF_INET;
+    a.sin_port = htons((uint16_t)port);
+    a.sin_addr.s_addr = ip;
+    if (connect(s, (const struct sockaddr*)&a, sizeof a) == 0) return 0;
+    return errno == EINPROGRESS || errno == EINTR ? 1 : -1;
+}
+/* The outcome of a connect that went on: 0, or the error. */
+static int gardel_sock_connect_error(gardel_sock s) {
+    int err = 0;
+    socklen_t len = sizeof err;
+    if (getsockopt(s, SOL_SOCKET, SO_ERROR, &err, &len) != 0) return errno;
+    return err;
 }
 static long gardel_sock_recv(gardel_sock s, char* buf, size_t n) { return (long)recv(s, buf, n, 0); }
 static long gardel_sock_send(gardel_sock s, const char* buf, size_t n) { return (long)send(s, buf, n, 0); }
@@ -3280,6 +3320,18 @@ static void gardel_host_set_timer(uint64_t id, uint64_t millis) {
         gardel_timer_count++;
     }
     gardel_timers[i] = (struct gardel_timer){ id, deadline, gardel_timer_seq++ };
+}
+
+/* A pending timer with this id will not fire. Its Tick is never queued before it is due, so
+   none can come after this, even on an id set again later. */
+static void gardel_host_cancel_timer(uint64_t id) {
+    if (gardel_host_script) return;
+    for (size_t i = 0; i < gardel_timer_count; i++) {
+        if (gardel_timers[i].id == id) {
+            gardel_timers[i] = gardel_timers[--gardel_timer_count];
+            return;
+        }
+    }
 }
 
 /* Blocking input runs on one reader thread, so that a command never blocks the loop (spec
@@ -3453,14 +3505,21 @@ struct gardel_conn {
     bool peer_ended;    /* the peer sent all it will: the same, but Send still works */
     uint64_t deadline;  /* of a connection ending, moved by each byte the peer takes */
 };
-struct gardel_poll_entry { uint64_t conn; size_t listener; }; /* conn 0 is a listener */
+/* A Connect still going on. `key` names it in a pass, as indexes move when one ends. */
+struct gardel_pending { uint64_t key, tag; gardel_sock fd; uint64_t deadline; };
+/* conn 0 and pending 0 is a listener */
+struct gardel_poll_entry { uint64_t conn; size_t listener; uint64_t pending; };
+#define GARDEL_NET_CONNECT_MS 10000  /* how long a Connect may take, unless GARDEL_CONNECT_TIMEOUT_MS */
 
 static struct gardel_listener* gardel_listeners = NULL;
 static size_t gardel_listener_count = 0, gardel_listener_cap = 0;
 static struct gardel_conn* gardel_conns = NULL; /* sorted by id: new ids are the largest */
 static size_t gardel_conn_count = 0, gardel_conn_cap = 0;
 static uint64_t gardel_next_conn = 1;
-static struct gardel_answer* gardel_net_queue = NULL; /* failures and Closed, in order */
+static struct gardel_pending* gardel_pendings = NULL;
+static size_t gardel_pending_count = 0, gardel_pending_cap = 0;
+static uint64_t gardel_next_pending = 1;
+static struct gardel_answer* gardel_net_queue = NULL; /* failures, Closed and Connect outcomes, in order */
 static struct gardel_answer** gardel_net_queue_end = &gardel_net_queue;
 static struct gardel_poll_entry* gardel_poll_entries = NULL;
 static size_t gardel_entry_cap = 0, gardel_pfd_cap = 0, gardel_poll_next = 0;
@@ -3486,7 +3545,7 @@ static GardelBytes gardel_bytes_copy(const void* src, size_t n) {
     return b;
 }
 
-static void gardel_net_push(enum gardel_host_kind kind, uint64_t id, int64_t err) {
+static struct gardel_answer* gardel_net_push(enum gardel_host_kind kind, uint64_t id, int64_t err) {
     struct gardel_answer* a = (struct gardel_answer*)calloc(1, sizeof *a);
     if (!a) abort();
     a->ev.kind = kind;
@@ -3494,6 +3553,7 @@ static void gardel_net_push(enum gardel_host_kind kind, uint64_t id, int64_t err
     a->ev.err = err;
     *gardel_net_queue_end = a;
     gardel_net_queue_end = &a->next;
+    return a;
 }
 
 static bool gardel_net_pop(struct gardel_host_event* ev) {
@@ -3663,25 +3723,120 @@ static void gardel_host_close(uint64_t id) {
     else gardel_conn_ended(c);
 }
 
+/* A new connection on `s`, with the next id: ids only grow, whether accepted or connected. */
+static uint64_t gardel_conn_add(gardel_sock s) {
+    gardel_conns = (struct gardel_conn*)gardel_grow(gardel_conns, &gardel_conn_cap, gardel_conn_count + 1, sizeof *gardel_conns);
+    memset(&gardel_conns[gardel_conn_count], 0, sizeof *gardel_conns);
+    gardel_conns[gardel_conn_count].id = gardel_next_conn++;
+    gardel_conns[gardel_conn_count].fd = s;
+    return gardel_conns[gardel_conn_count++].id;
+}
+
+/* An IPv4 address in four decimal parts, 0 to 255, in network order, or `localhost`. Anything
+   else is refused rather than looked up: a lookup blocks the loop (decision 9). */
+static bool gardel_host_ipv4(const uint8_t* s, uint64_t n, uint32_t* out) {
+    if (n == 9 && memcmp(s, "localhost", 9) == 0) {
+        s = (const uint8_t*)"127.0.0.1";
+        n = 9;
+    }
+    uint8_t parts[4];
+    uint64_t i = 0;
+    for (int k = 0; k < 4; k++) {
+        if (k > 0) {
+            if (i >= n || s[i] != '.') return false;
+            i++;
+        }
+        uint64_t start = i, v = 0;
+        while (i < n && s[i] >= '0' && s[i] <= '9' && i - start < 3) v = v * 10 + (uint64_t)(s[i++] - '0');
+        if (i == start || v > 255 || (i < n && s[i] >= '0' && s[i] <= '9')) return false;
+        parts[k] = (uint8_t)v;
+    }
+    if (i != n) return false;
+    memcpy(out, parts, 4);
+    return true;
+}
+
+static uint64_t gardel_connect_timeout(void) {
+    const char* t = getenv("GARDEL_CONNECT_TIMEOUT_MS");
+    if (!t || !*t) return GARDEL_NET_CONNECT_MS;
+    uint64_t v = 0;
+    for (; *t; t++) {
+        if (*t < '0' || *t > '9' || v > 100000000) return GARDEL_NET_CONNECT_MS;
+        v = v * 10 + (uint64_t)(*t - '0');
+    }
+    return v;
+}
+
+static void gardel_connect_failed(uint64_t tag, int64_t err) {
+    gardel_net_push(GARDEL_HOST_CONNECT_FAILED, 0, err)->ev.tag = tag;
+}
+
+/* Never blocks: a connect that cannot finish at once is watched by the loop, and its outcome,
+   Connected or ConnectFailed, comes as an event, as a failure found here does. */
+static void gardel_host_connect(uint64_t tag, GardelString host, uint64_t port) {
+    if (gardel_host_script) {
+        fprintf(stderr, "net: Connect %llu ", (unsigned long long)tag);
+        gardel_trace_bytes((GardelBytes){ (const uint8_t*)host.data, host.len, NULL });
+        fprintf(stderr, " %llu\n", (unsigned long long)port);
+        return;
+    }
+    uint32_t ip;
+    if (port == 0 || port > 65535 || !gardel_host_ipv4((const uint8_t*)host.data, host.len, &ip)) {
+        gardel_connect_failed(tag, GARDEL_ERR_INVALID);
+        return;
+    }
+    if (!gardel_sock_start()) {
+        gardel_connect_failed(tag, GARDEL_ERR_NO_BUFFERS);
+        return;
+    }
+    gardel_sock s = gardel_sock_tcp();
+    if (s == GARDEL_NO_SOCK) {
+        gardel_connect_failed(tag, gardel_sock_error());
+        return;
+    }
+    gardel_sock_watch(s, false);
+    int r = gardel_sock_connect(s, port, ip);
+    if (r < 0) {
+        int err = gardel_sock_error();
+        gardel_sock_close(s);
+        gardel_connect_failed(tag, err);
+    } else if (r == 0) {
+        gardel_net_push(GARDEL_HOST_CONNECTED, gardel_conn_add(s), 0)->ev.tag = tag;
+    } else {
+        gardel_pendings = (struct gardel_pending*)gardel_grow(gardel_pendings, &gardel_pending_cap, gardel_pending_count + 1, sizeof *gardel_pendings);
+        gardel_pendings[gardel_pending_count++] = (struct gardel_pending){ gardel_next_pending++, tag, s, gardel_host_now_ms() + gardel_connect_timeout() };
+    }
+}
+
+static void gardel_pending_remove(size_t i) {
+    memmove(&gardel_pendings[i], &gardel_pendings[i + 1], (gardel_pending_count - i - 1) * sizeof *gardel_pendings);
+    gardel_pending_count--;
+}
+
 /* What the next pass watches: every listener not pausing, and each connection for what it can
    take. A connection with a long queue is not read: a client that sends and never reads then
    fills its own TCP window, and not this process. */
 static void gardel_net_build(uint64_t now) {
-    size_t want = gardel_listener_count + gardel_conn_count;
+    size_t want = gardel_listener_count + gardel_conn_count + gardel_pending_count;
     gardel_poll_entries = (struct gardel_poll_entry*)gardel_grow(gardel_poll_entries, &gardel_entry_cap, want + 1, sizeof *gardel_poll_entries);
     gardel_pfds = (struct gardel_pollfd*)gardel_grow(gardel_pfds, &gardel_pfd_cap, want + 1 + GARDEL_POLL_BASE, sizeof *gardel_pfds);
     gardel_poll_count = 0;
     for (size_t i = 0; i < gardel_listener_count; i++) {
         if (gardel_listeners[i].retry_at > now) continue;
         gardel_pfds[GARDEL_POLL_BASE + gardel_poll_count] = (struct gardel_pollfd){ gardel_listeners[i].fd, GARDEL_POLLIN, 0 };
-        gardel_poll_entries[gardel_poll_count++] = (struct gardel_poll_entry){ 0, i };
+        gardel_poll_entries[gardel_poll_count++] = (struct gardel_poll_entry){ 0, i, 0 };
+    }
+    /* A connect is done when its socket can be written, or reports an error. */
+    for (size_t i = 0; i < gardel_pending_count && !gardel_net_exiting; i++) {
+        gardel_pfds[GARDEL_POLL_BASE + gardel_poll_count] = (struct gardel_pollfd){ gardel_pendings[i].fd, GARDEL_POLLOUT, 0 };
+        gardel_poll_entries[gardel_poll_count++] = (struct gardel_poll_entry){ 0, 0, gardel_pendings[i].key };
     }
     for (size_t i = 0; i < gardel_conn_count; i++) {
         const struct gardel_conn* c = &gardel_conns[i];
         short events = gardel_conn_has_queue(c) ? GARDEL_POLLOUT : 0;
         if (!gardel_net_exiting && !gardel_conn_ending(c) && c->out_len - c->out_off < GARDEL_NET_PAUSE) events |= GARDEL_POLLIN;
         gardel_pfds[GARDEL_POLL_BASE + gardel_poll_count] = (struct gardel_pollfd){ c->fd, events, 0 };
-        gardel_poll_entries[gardel_poll_count++] = (struct gardel_poll_entry){ c->id, 0 };
+        gardel_poll_entries[gardel_poll_count++] = (struct gardel_poll_entry){ c->id, 0, 0 };
     }
 }
 
@@ -3689,11 +3844,18 @@ static void gardel_net_build(uint64_t now) {
 static bool gardel_net_poll(void) {
     gardel_poll_next = gardel_poll_count = 0;
     gardel_sock_rearm();
-    if (gardel_listener_count + gardel_conn_count == 0) return false;
+    if (gardel_listener_count + gardel_conn_count + gardel_pending_count == 0) return false;
     uint64_t now = gardel_host_now_ms();
     for (size_t i = gardel_conn_count; i-- > 0;) {
         struct gardel_conn* c = &gardel_conns[i];
         if (gardel_conn_ending(c) && c->deadline <= now) gardel_conn_ended(c);
+    }
+    /* In the order they were made, so outcomes come in the order of their Connects on a tie. */
+    for (size_t i = 0; i < gardel_pending_count;) {
+        if (gardel_pendings[i].deadline > now) { i++; continue; }
+        gardel_sock_close(gardel_pendings[i].fd);
+        gardel_connect_failed(gardel_pendings[i].tag, GARDEL_ERR_TIMED_OUT);
+        gardel_pending_remove(i);
     }
     gardel_net_build(now);
     if (gardel_poll_count == 0) return false;
@@ -3718,13 +3880,28 @@ static bool gardel_net_accept(size_t i, struct gardel_host_event* ev) {
         return false;
     }
     gardel_sock_watch(s, false);
-    gardel_conns = (struct gardel_conn*)gardel_grow(gardel_conns, &gardel_conn_cap, gardel_conn_count + 1, sizeof *gardel_conns);
-    memset(&gardel_conns[gardel_conn_count], 0, sizeof *gardel_conns);
-    gardel_conns[gardel_conn_count].id = gardel_next_conn++;
-    gardel_conns[gardel_conn_count].fd = s;
     ev->kind = GARDEL_HOST_ACCEPTED;
-    ev->id = gardel_conns[gardel_conn_count].id;
-    gardel_conn_count++;
+    ev->id = gardel_conn_add(s);
+    return true;
+}
+
+/* A connect the pass found ready: connected, or failed, as the socket says. */
+static bool gardel_net_connected(uint64_t key, struct gardel_host_event* ev) {
+    size_t i = 0;
+    while (i < gardel_pending_count && gardel_pendings[i].key != key) i++;
+    if (i == gardel_pending_count) return false;
+    struct gardel_pending p = gardel_pendings[i];
+    gardel_pending_remove(i);
+    int err = gardel_sock_connect_error(p.fd);
+    ev->tag = p.tag;
+    if (err != 0) {
+        gardel_sock_close(p.fd);
+        ev->kind = GARDEL_HOST_CONNECT_FAILED;
+        ev->err = err;
+        return true;
+    }
+    ev->kind = GARDEL_HOST_CONNECTED;
+    ev->id = gardel_conn_add(p.fd);
     return true;
 }
 
@@ -3732,6 +3909,7 @@ static bool gardel_net_accept(size_t i, struct gardel_host_event* ev) {
 static bool gardel_net_serve(size_t i, struct gardel_host_event* ev) {
     if (gardel_pfds[GARDEL_POLL_BASE + i].revents == 0) return false;
     struct gardel_poll_entry e = gardel_poll_entries[i];
+    if (e.pending != 0) return gardel_net_connected(e.pending, ev);
     if (e.conn == 0) return gardel_net_accept(e.listener, ev);
     /* Commands ran since the pass: this one may have gone, or be closing. */
     struct gardel_conn* c = gardel_conn_find(e.conn);
@@ -3784,6 +3962,11 @@ static uint64_t gardel_net_wait_limit(uint64_t ms) {
         uint64_t left = c->deadline > now ? c->deadline - now : 0;
         if (left < ms) ms = left;
     }
+    for (size_t i = 0; i < gardel_pending_count; i++) {
+        uint64_t at = gardel_pendings[i].deadline;
+        uint64_t left = at > now ? at - now : 0;
+        if (left < ms) ms = left;
+    }
     return ms;
 }
 
@@ -3791,6 +3974,7 @@ static uint64_t gardel_net_wait_limit(uint64_t ms) {
 static void gardel_net_finish(void) {
     uint64_t end = gardel_host_now_ms() + GARDEL_NET_EXIT_MS;
     while (gardel_listener_count > 0) gardel_sock_close(gardel_listeners[--gardel_listener_count].fd);
+    while (gardel_pending_count > 0) gardel_sock_close(gardel_pendings[--gardel_pending_count].fd);
     gardel_net_exiting = true;
     for (;;) {
         bool pending = false;
@@ -4120,6 +4304,18 @@ static void gardel_log_event(struct gardel_host_event* ev) {
             gardel_log_word(":");
             gardel_log_number((uint64_t)ev->err);
             break;
+        case GARDEL_HOST_CONNECTED:
+            gardel_log_word("Connected:");
+            gardel_log_number(ev->tag);
+            gardel_log_word(":");
+            gardel_log_number(ev->id);
+            break;
+        case GARDEL_HOST_CONNECT_FAILED:
+            gardel_log_word("ConnectFailed:");
+            gardel_log_number(ev->tag);
+            gardel_log_word(":");
+            gardel_log_number((uint64_t)ev->err);
+            break;
         default: abort();
         }
         gardel_log_finish(true);
@@ -4140,12 +4336,14 @@ static void gardel_log_exit(int code) {
 }
 
 /* Socket tokens of a script: `Accepted:<id>`, `Closed:<id>`, `Received:<id>:<text>`,
-   `ListenFailed:<port>:<code>`, `SendFailed:<id>:<code>`. */
+   `ListenFailed:<port>:<code>`, `SendFailed:<id>:<code>`, `Connected:<tag>:<id>` and
+   `ConnectFailed:<tag>:<code>`. */
 static bool gardel_script_net(const char* name, size_t n, struct gardel_host_event* ev) {
     static const struct { const char* name; enum gardel_host_kind kind; } kinds[] = {
         {"Accepted:", GARDEL_HOST_ACCEPTED}, {"Closed:", GARDEL_HOST_CLOSED},
         {"Received:", GARDEL_HOST_RECEIVED}, {"ListenFailed:", GARDEL_HOST_LISTEN_FAILED},
-        {"SendFailed:", GARDEL_HOST_SEND_FAILED},
+        {"SendFailed:", GARDEL_HOST_SEND_FAILED}, {"Connected:", GARDEL_HOST_CONNECTED},
+        {"ConnectFailed:", GARDEL_HOST_CONNECT_FAILED},
     };
     for (size_t k = 0; k < sizeof kinds / sizeof kinds[0]; k++) {
         size_t i = strlen(kinds[k].name);
@@ -4154,6 +4352,16 @@ static bool gardel_script_net(const char* name, size_t n, struct gardel_host_eve
         if (!gardel_script_number(name, n, &i, &id)) return false;
         if (kinds[k].kind == GARDEL_HOST_ACCEPTED || kinds[k].kind == GARDEL_HOST_CLOSED) {
             if (i != n) return false;
+        } else if (kinds[k].kind == GARDEL_HOST_CONNECTED || kinds[k].kind == GARDEL_HOST_CONNECT_FAILED) {
+            /* The tag first, then the connection or the error. */
+            if (i == n || name[i] != ':') return false;
+            i++;
+            if (!gardel_script_number(name, n, &i, &code) || i != n) return false;
+            ev->kind = kinds[k].kind;
+            ev->tag = id;
+            if (kinds[k].kind == GARDEL_HOST_CONNECTED) ev->id = code;
+            else ev->err = (int64_t)code;
+            return true;
         } else {
             if (i == n || name[i] != ':') return false;
             i++;
@@ -4298,6 +4506,8 @@ pub(crate) fn host_command_code(variant: &str) -> Option<&'static str> {
         "Listen" => Some("gardel_host_listen(c->Listen.port);"),
         "Send" => Some("gardel_host_send(c->Send.conn->id, c->Send.data);"),
         "Close" => Some("gardel_host_close(c->Close.conn->id);"),
+        "Connect" => Some("gardel_host_connect(c->Connect.tag, c->Connect.host, c->Connect.port);"),
+        "CancelTimer" => Some("gardel_host_cancel_timer(c->CancelTimer.id);"),
         _ => None,
     }
 }
@@ -4314,6 +4524,8 @@ pub(crate) fn host_command_log(variant: &str) -> Option<&'static str> {
         "Listen" => Some("gardel_log_word(\"Listen:\"); gardel_log_number(c->Listen.port);"),
         "Send" => Some("gardel_log_word(\"Send:\"); gardel_log_number(c->Send.conn->id); gardel_log_word(\":\"); gardel_log_text(c->Send.data.data, c->Send.data.len);"),
         "Close" => Some("gardel_log_word(\"Close:\"); gardel_log_number(c->Close.conn->id);"),
+        "Connect" => Some("gardel_log_word(\"Connect:\"); gardel_log_number(c->Connect.tag); gardel_log_word(\":\"); gardel_log_text(c->Connect.host.data, c->Connect.host.len); gardel_log_word(\":\"); gardel_log_number(c->Connect.port);"),
+        "CancelTimer" => Some("gardel_log_word(\"CancelTimer:\"); gardel_log_number(c->CancelTimer.id);"),
         _ => None,
     }
 }
@@ -4330,6 +4542,8 @@ pub(crate) fn host_event_code(variant: &str) -> Option<&'static str> {
         "Received" => Some("case GARDEL_HOST_RECEIVED: return make_EVENT_Received(make_CONN_ID(ev.id), ev.data);"),
         "SendFailed" => Some("case GARDEL_HOST_SEND_FAILED: return make_EVENT_SendFailed(make_CONN_ID(ev.id), make_IO_ERROR_OsError(ev.err));"),
         "Closed" => Some("case GARDEL_HOST_CLOSED: return make_EVENT_Closed(make_CONN_ID(ev.id));"),
+        "Connected" => Some("case GARDEL_HOST_CONNECTED: return make_EVENT_Connected(ev.tag, make_CONN_ID(ev.id));"),
+        "ConnectFailed" => Some("case GARDEL_HOST_CONNECT_FAILED: return make_EVENT_ConnectFailed(ev.tag, make_IO_ERROR_OsError(ev.err));"),
         _ => None,
     }
 }

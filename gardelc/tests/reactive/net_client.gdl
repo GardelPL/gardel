@@ -1,0 +1,74 @@
+-- A client (Task F.7): connects to the host and port it is given, sends a line, prints what
+-- comes back, and stops when the connection closes or the connect fails. Timer 7 is set and
+-- cancelled at once, so its Tick never comes; timer 8 ends the run.
+--
+--   net_client <host> <port>
+reactive program NET_CLIENT
+
+feature {ANY}
+
+  -- The `i`th argument, or "".
+  arg(xs: LIST[STRING], i: NAT): STRING
+    variant
+      i
+    do
+      if xs.length = 0 then
+        ""
+      else if i = 0 then
+        xs.head
+      else
+        arg(xs.tail, i - 1)
+      end end
+    end
+
+  -- `label` and `t`, when they fit in a line.
+  joined(label: STRING, t: STRING): STRING
+    do
+      if label.byte_length <= 100 and t.byte_length <= 1000 then label.concat(t) else label end
+    end
+
+  init(args: SEQ[STRING]): STEP[NAT]
+    do
+      match NUMBER_TEXT.parse_nat(arg(args.to_list, 1))
+        case Error(_) then
+          Stop(2, LIST.empty.prepend(Print("usage: net_client <host> <port>")))
+        case Ok(port) then
+          Continue(0, LIST.empty
+            .prepend(Connect(5, arg(args.to_list, 0), port))
+            .prepend(CancelTimer(7))
+            .prepend(SetTimer(7, 30)))
+      end
+    end
+
+  step(s: NAT, e: EVENT): STEP[NAT]
+    do
+      match e
+        case Connected(tag, c) then
+          Continue(s, LIST.empty
+            .prepend(Send(c, "ping\n".to_utf8))
+            .prepend(Print(joined("connected ", NUMBER_TEXT.nat_to_text(tag)))))
+        case ConnectFailed(tag, err) then
+          Continue(s, LIST.empty
+            .prepend(SetTimer(8, 60))
+            .prepend(Print(joined("connect failed ", NUMBER_TEXT.nat_to_text(tag)))))
+        case Received(c, data) then
+          match STRING.from_utf8(data)
+            case Ok(text) then Continue(s, LIST.empty.prepend(Close(c)).prepend(Print(joined("received ", text))))
+            case Error(_) then Continue(s, LIST.empty.prepend(Close(c)).prepend(Print("received bytes")))
+          end
+        case Closed(c) then
+          Continue(s, LIST.empty.prepend(SetTimer(8, 60)).prepend(Print("closed")))
+        case Tick(id) then
+          if id = 8 then
+            Stop(0, LIST.empty.prepend(Print("done")))
+          else
+            Continue(s, LIST.empty.prepend(Print(joined("tick ", NUMBER_TEXT.nat_to_text(id)))))
+          end
+        case Shutdown then
+          Stop(9, LIST.empty)
+        case _ then
+          Continue(s, LIST.empty)
+      end
+    end
+
+end

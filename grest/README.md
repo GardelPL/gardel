@@ -131,7 +131,10 @@ empty one, so it does not match `/users`. Patterns are written decoded.
   - any other event names no connection, and a `Shutdown` stops the server.
 
   `start` does not start a router with a pattern that is not valid.
-- **The state is the handlers'.** `REST_OUTCOME.make(s, resp).state` is `s`. A target that
+- **The state is the handlers'.** After `serve(e)`, a server that goes on has the state that
+  the handler of the request `e` completes gave back, `router.dispatch(state, req).state`, or,
+  when `e` completes none, the state it had (`moves_to`). `completed(c, data)` is the request
+  that bytes `data` complete on `c`. `REST_OUTCOME.make(s, resp).state` is `s`. A target that
   cannot be read, and any request to a router with no routes, keep the state they were given.
 - **Statuses.** A target that cannot be read is a `400` whatever the routes. A router with no
   routes answers `404`. `bad_body` and `bad_target` are `400`. `error(st, m)` has the status `st`,
@@ -147,7 +150,8 @@ empty one, so it does not match `/users`. Patterns are written decoded.
 `gardelc/tests/grest.rs` checks that a client proves these through the contracts alone, and that
 claims past them are refused: a `404` for every request to an empty router, a `200` for every
 `ok_json`, a route that never answers `400`, the limits less one, a server that never stops, one
-that always answers, one that is never full, and one that starts with any argument. It also runs
+that always answers, one that is never full, one that starts with any argument, and one whose
+state never changes. It also runs
 a scripted service: a bad route and a bad port stop it with exit status 2, with 64
 connections open the next is closed and its request is not answered, and a count kept as the
 state goes up with each request that reaches its handler, in the order the requests complete,

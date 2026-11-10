@@ -10,6 +10,8 @@ representation {ANY}
   | SendFailed(conn: CONN_ID, err: IO_ERROR)
   | Closed(conn: CONN_ID)
   | Shutdown
+  | Connected(tag: NAT, conn: CONN_ID)
+  | ConnectFailed(tag: NAT, err: IO_ERROR)
 
 feature {ANY}
 

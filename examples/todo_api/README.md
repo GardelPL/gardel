@@ -28,14 +28,20 @@ each handler takes it and gives back the next one with its answer.
   `REST_SERVER[TODO_STORE]` holds one after each step without a proof in `grest`. It rests on
   `MAP`'s laws (what `get` says after a `put` or a `remove`).
 - **Each todo** has an id from 1 to 1000000 and a title of 1 to 200 bytes.
+- **What each change does.** `add` makes the new todo found, `replace` gives the todo its new
+  `done`, and `remove` makes the id not found, and each leaves every other id as found or not
+  found as it was.
 - **The handlers.** `create_todo` moves the next id by one at most, and `update_todo` and
   `delete_todo` leave it alone. `PUT` replaces only a todo that is there.
+- **The state a request leaves is the one its handler gave back,** from `REST_SERVER`'s
+  contract, so the next request sees it.
 - **The server's safety,** from `REST_SERVER`'s contract: each request is answered once, its
   connection is closed after the answer, and at most 64 connections are open.
 
-`cargo test --test todo_api` checks that a client proves the invariant through the contracts
-alone and that claims past it are refused (that a store holds a todo, that the ids below the next
-are all taken, that a delete moves the next id back). It then runs a session over real sockets.
+`cargo test --test todo_api` checks that a client proves the invariant and what each change
+does through the contracts alone, and that claims past them are refused (that a store holds a
+todo, that the ids below the next are all taken, that a delete moves the next id back, that a
+delete removes every todo). It then runs a session over real sockets.
 
 ## Verify, build and run
 

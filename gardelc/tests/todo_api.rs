@@ -72,7 +72,8 @@ fn store_client(dir: &Dir, claims: &[(&str, &str)]) -> PathBuf {
 
 /// What any state of the service satisfies, whatever requests led to it: each todo is kept
 /// under its own id, no todo has an id at or past the next, and so an added todo leaves every
-/// id past its own free.
+/// id past its own free. And what each change does: an added todo is found, a deleted one is
+/// not, a replaced one has its new `done`, and the other todos stay.
 #[test]
 fn a_client_proves_the_store_invariant() {
     let dir = Dir::new("facts");
@@ -83,6 +84,10 @@ fn a_client_proves_the_store_invariant() {
             ("fresh", "k >= s.next_id implies s.find(k).is_none"),
             ("added_fresh", "(s.has_room and t.todo_id = s.next_id and k > s.next_id) implies s.add(t).find(k).is_none"),
             ("deleted_keep_next", "s.remove(k).next_id = s.next_id"),
+            ("deleted_gone", "s.remove(k).find(k).is_none"),
+            ("added_found", "(s.has_room and t.todo_id = s.next_id) implies s.add(t).find(t.todo_id).is_some"),
+            ("others_kept", "(s.find(k).is_some and k != t.todo_id) implies s.remove(t.todo_id).find(k).is_some"),
+            ("replaced_done", "s.find(t.todo_id).is_some implies (s.replace(t).find(t.todo_id).get.is_done = t.is_done)"),
         ],
     );
     assert_ok(&dir.check(&project));
@@ -97,6 +102,8 @@ fn a_claim_past_the_store_invariant_does_not_verify() {
         ("claim_dense", "k < s.next_id implies s.find(k).is_some"),
         // The next id never goes back, so a store never reuses one.
         ("claim_reuse", "s.remove(k).next_id < s.next_id"),
+        // A delete deletes one todo, not every other.
+        ("claim_delete_all", "s.remove(t.todo_id).find(k).is_none"),
     ];
     let dir = Dir::new("lies");
     let out = dir.check(&store_client(&dir, &lies));
