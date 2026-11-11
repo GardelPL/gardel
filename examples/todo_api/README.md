@@ -35,8 +35,8 @@ each handler takes it and gives back the next one with its answer.
   `delete_todo` leave it alone. `PUT` replaces only a todo that is there.
 - **The state a request leaves is the one its handler gave back,** from `REST_SERVER`'s
   contract, so the next request sees it.
-- **The server's safety,** from `REST_SERVER`'s contract: each request is answered once, its
-  connection is closed after the answer, and at most 64 connections are open.
+- **The server's safety,** from `REST_SERVER`'s contract: each request is answered once, in
+  order, at most 64 connections are open, and no connection gets more than 100 answers.
 
 `cargo test --test todo_api` checks that a client proves the invariant and what each change
 does through the contracts alone, and that claims past them are refused (that a store holds a

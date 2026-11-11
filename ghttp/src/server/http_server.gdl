@@ -70,10 +70,10 @@ feature {ANY}
               case NeedMore(next_p) then
                 Continue(s.save_connection(conn.with_parser_state(next_p)), LIST.empty)
               case Complete(req, _) then
-                let wire = HTTP_SERIALIZER.serialize(HTTP_APPLICATION.dispatch(req, s.router))
+                let wire = HTTP_SERIALIZER.serialize_answer(HTTP_APPLICATION.dispatch(req, s.router), req.method.equals(Head), True)
                 Continue(s.release_connection(c), LIST.empty.prepend(Close(c)).prepend(Send(c, wire)))
               case Failed(err) then
-                let wire = HTTP_SERIALIZER.serialize(HTTP_RESPONSE.from_error(err))
+                let wire = HTTP_SERIALIZER.serialize_answer(HTTP_RESPONSE.from_error(err), False, True)
                 Continue(s.release_connection(c), LIST.empty.prepend(Close(c)).prepend(Send(c, wire)))
             end
           end

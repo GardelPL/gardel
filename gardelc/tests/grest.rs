@@ -341,8 +341,9 @@ fn a_service_starts_only_when_it_can_and_keeps_its_limit() {
     assert_eq!(taken.status.code(), Some(1), "{}", all(&taken));
     assert!(all(&taken).contains("grest: listen failed"), "{}", all(&taken));
 
-    // 65 connections, then a request on each of the last two and two on the first.
-    let request = "GET%20/hi%20HTTP/1.1%0D%0A%0D%0A";
+    // 65 connections, then a request on each of the last two and two on the first, each
+    // asking to close its connection.
+    let request = "GET%20/hi%20HTTP/1.1%0D%0AConnection%3A%20close%0D%0A%0D%0A";
     let mut events: Vec<String> = (1..=65).map(|c| format!("Accepted:{c}")).collect();
     events.push(format!("Received:65:{request}"));
     events.push(format!("Received:64:{request}"));
@@ -353,7 +354,7 @@ fn a_service_starts_only_when_it_can_and_keeps_its_limit() {
     let full = run_service(&good, &["9001"], &events.join(" "));
     assert_eq!(full.status.code(), Some(0), "{}", all(&full));
     let net: Vec<String> = String::from_utf8_lossy(&full.stderr).lines().filter(|l| l.starts_with("net: ")).map(str::to_owned).collect();
-    let answer = "HTTP%2F1%2E1%20200%0D%0AContent%2DType%3A%20text%2Fplain%3B%20charset%3Dutf%2D8%0D%0AContent%2DLength%3A%202%0D%0A%0D%0Ahi";
+    let answer = "HTTP%2F1%2E1%20200%0D%0AContent%2DType%3A%20text%2Fplain%3B%20charset%3Dutf%2D8%0D%0AConnection%3A%20close%0D%0AContent%2DLength%3A%202%0D%0A%0D%0Ahi";
     let expected = [
         "net: Listen 9001".to_string(),
         // The 65th is closed as it arrives, and its request is not answered.
@@ -370,6 +371,62 @@ fn a_service_starts_only_when_it_can_and_keeps_its_limit() {
         "net: Close 66".to_string(),
     ];
     assert_eq!(net, expected, "{}", all(&full));
+}
+
+/// A connection stays open after an answer (F.8): requests in turn and requests sent at once
+/// are answered in order, a `HEAD` answer has no body, and the connection closes after a
+/// request that asks for it, after an HTTP/1.0 request, after bytes that are not a request,
+/// and after its 100th request, whose answer says so. Bytes after the close are not read.
+#[test]
+fn a_connection_stays_open_until_it_closes_or_reaches_its_cap() {
+    let good = service("persistent", "REST_ROUTER.empty.on_get(\"/hi\", hi)");
+    let get = "GET%20/hi%20HTTP/1.1%0D%0A%0D%0A";
+    let head = "HEAD%20/hi%20HTTP/1.1%0D%0A%0D%0A";
+    let close = "GET%20/hi%20HTTP/1.1%0D%0AConnection%3A%20keep-alive%2C%20Close%0D%0A%0D%0A";
+    let old = "GET%20/hi%20HTTP/1.0%0D%0A%0D%0A";
+    let events = [
+        "Accepted:1".to_string(),
+        format!("Received:1:{get}"),
+        format!("Received:1:{get}"),
+        format!("Received:1:{get}{head}{close}{get}"),
+        "Accepted:2".to_string(),
+        format!("Received:2:{old}"),
+        "Accepted:3".to_string(),
+        format!("Received:3:{}", get.repeat(101)),
+        "Accepted:4".to_string(),
+        format!("Received:4:{}", get.repeat(99)),
+        format!("Received:4:{}", get.repeat(2)),
+        "Accepted:5".to_string(),
+        format!("Received:5:{get}%00%00%0D%0A%0D%0A{get}"),
+    ];
+    let run = run_service(&good, &["9003"], &events.join(" "));
+    assert_eq!(run.status.code(), Some(0), "{}", all(&run));
+    let net: Vec<String> = String::from_utf8_lossy(&run.stderr).lines().filter(|l| l.starts_with("net: ")).map(str::to_owned).collect();
+    let hi = "HTTP%2F1%2E1%20200%0D%0AContent%2DType%3A%20text%2Fplain%3B%20charset%3Dutf%2D8%0D%0AContent%2DLength%3A%202%0D%0A%0D%0Ahi";
+    let hi_head = "HTTP%2F1%2E1%20200%0D%0AContent%2DType%3A%20text%2Fplain%3B%20charset%3Dutf%2D8%0D%0AContent%2DLength%3A%202%0D%0A%0D%0A";
+    let hi_close = "HTTP%2F1%2E1%20200%0D%0AContent%2DType%3A%20text%2Fplain%3B%20charset%3Dutf%2D8%0D%0AConnection%3A%20close%0D%0AContent%2DLength%3A%202%0D%0A%0D%0Ahi";
+    let bad = "HTTP%2F1%2E1%20400%0D%0AConnection%3A%20close%0D%0AContent%2DLength%3A%200%0D%0A%0D%0A";
+    let mut expected = vec![
+        "net: Listen 9003".to_string(),
+        format!("net: Send 1 {hi}"),
+        format!("net: Send 1 {hi}"),
+        format!("net: Send 1 {hi}"),
+        format!("net: Send 1 {hi_head}"),
+        format!("net: Send 1 {hi_close}"),
+        "net: Close 1".to_string(),
+        format!("net: Send 2 {hi_close}"),
+        "net: Close 2".to_string(),
+    ];
+    for conn in [3, 4] {
+        expected.extend((1..100).map(|_| format!("net: Send {conn} {hi}")));
+        expected.push(format!("net: Send {conn} {hi_close}"));
+        expected.push(format!("net: Close {conn}"));
+    }
+    expected.extend([format!("net: Send 5 {hi}"), format!("net: Send 5 {bad}"), "net: Close 5".to_string()]);
+    assert_eq!(net.len(), expected.len(), "{}", net.join("\n"));
+    for (i, (got, want)) in net.iter().zip(expected.iter()).enumerate() {
+        assert_eq!(got, want, "line {i}");
+    }
 }
 
 /// The state a handler gives back is the one the next request sees, in the order the requests

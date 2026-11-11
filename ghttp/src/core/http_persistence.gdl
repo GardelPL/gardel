@@ -1,0 +1,85 @@
+-- Whether a connection stays open after an exchange (RFC 9112, section 9.3). An HTTP/1.1
+-- message keeps it open unless a `Connection` field lists the option `close`. An HTTP/1.0
+-- message closes it: this library does not take part in HTTP/1.0's `keep-alive`, which
+-- would need the answer to say so.
+functions HTTP_PERSISTENCE
+
+feature {ANY}
+
+  -- Whether the item `v[lo, hi)` of a list, without the spaces and tabs around it, is
+  -- `close` in any case.
+  item_is_close(v: BYTES, lo: NAT, hi: NAT): BOOL
+    require
+      ordered: lo <= hi
+      in_value: hi <= v.length
+    do
+      let s = HTTP_HEAD_PARSER.skip_ows(v, lo, hi)
+      let e = HTTP_HEAD_PARSER.trim_ows(v, s, hi)
+      HTTP_HEADER.same_ci(v.slice(s, e), "close".to_utf8, 0)
+    end
+
+  -- Whether the comma-separated list `v[from, length)` has the item `close`.
+  lists_close(v: BYTES, from: NAT): BOOL
+    require
+      in_value: from <= v.length
+    variant
+      v.length - from
+    do
+      match v.index_of_byte(44, from)
+        case None then
+          HTTP_PERSISTENCE.item_is_close(v, from, v.length)
+        case Some(k) then
+          if HTTP_PERSISTENCE.item_is_close(v, from, k) then
+            True
+          else
+            HTTP_PERSISTENCE.lists_close(v, k + 1)
+          end
+      end
+    end
+
+  -- Whether a field of `hs` named `Connection` lists `close`.
+  says_close_in(hs: LIST[HTTP_HEADER]): BOOL
+    variant
+      hs.length
+    do
+      if hs.length = 0 then
+        False
+      else if hs.head.name_matches("Connection") and HTTP_PERSISTENCE.lists_close(hs.head.value.to_utf8, 0) then
+        True
+      else
+        HTTP_PERSISTENCE.says_close_in(hs.tail)
+      end end
+    end
+
+  -- Whether the fields `hs` ask for the connection to close after this message.
+  says_close(hs: HTTP_HEADERS): BOOL
+    do
+      HTTP_PERSISTENCE.says_close_in(hs.fields)
+    end
+
+  -- Whether the connection stays open after a message of version `v` with fields `hs`.
+  stays_open(v: HTTP_VERSION, hs: HTTP_HEADERS): BOOL
+    do
+      v.is_http11 and not HTTP_PERSISTENCE.says_close(hs)
+    ensure
+      def: Result = (v.is_http11 and not HTTP_PERSISTENCE.says_close(hs))
+      old_closes: (v = Http10) implies not Result
+    end
+
+  -- Whether a server may read another request on the connection after answering `req`.
+  request_keeps_open(req: HTTP_REQUEST): BOOL
+    do
+      HTTP_PERSISTENCE.stays_open(req.version, req.headers)
+    ensure
+      def: Result = HTTP_PERSISTENCE.stays_open(req.version, req.headers)
+    end
+
+  -- Whether a client may send another request on the connection after receiving `resp`.
+  response_keeps_open(resp: HTTP_CLIENT_RESPONSE): BOOL
+    do
+      HTTP_PERSISTENCE.stays_open(resp.version, resp.headers)
+    ensure
+      def: Result = HTTP_PERSISTENCE.stays_open(resp.version, resp.headers)
+    end
+
+end

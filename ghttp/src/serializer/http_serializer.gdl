@@ -38,4 +38,37 @@ feature {ANY}
       bounded_wire: Result.length <= 65621
     end
 
+  -- The head of `resp`, with `Connection: close` when `closing`: the server closes the
+  -- connection after this answer, and says so (RFC 9112, section 9.6).
+  answer_head(resp: HTTP_RESPONSE, closing: BOOL): STRING
+    do
+      let status_line = "HTTP/1.1 ".concat(resp.status_digits_string).concat("\r\n")
+      let type_line = resp.content_type.header_line
+      let cl_hdr = "Content-Length: ".concat(resp.content_length_header_value).concat("\r\n\r\n")
+      if closing then
+        status_line.concat(type_line).concat("Connection: close\r\n").concat(cl_hdr)
+      else
+        status_line.concat(type_line).concat(cl_hdr)
+      end
+    ensure
+      min_hdr_len: Result.byte_length >= 35
+      bounded_hdr: Result.byte_length <= 104
+    end
+
+  -- `resp` as sent on a connection that may carry more answers: with `Connection: close`
+  -- when `closing`, and with no body when `head_only`, the answer to a `HEAD`, whose
+  -- `Content-Length` is the length the `GET` would have sent (RFC 9110, section 9.3.2).
+  serialize_answer(resp: HTTP_RESPONSE, head_only: BOOL, closing: BOOL): BYTES
+    do
+      let hdr_str = answer_head(resp, closing)
+      if head_only or resp.response_body_length = 0 then
+        hdr_str.to_utf8
+      else
+        hdr_str.concat(resp.body_string).to_utf8
+      end
+    ensure
+      min_wire_len: Result.length >= 35
+      bounded_wire: Result.length <= 65640
+    end
+
 end

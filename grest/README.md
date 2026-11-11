@@ -77,10 +77,11 @@ gjson = { path = "../gjson" }
 
 | Module | What it does |
 | :--- | :--- |
-| `REST_SERVER[S]` | The connections, the router and the state of a service. `start` checks the routes and the port and listens; `serve` is the step for one event, and `state` the service's state. Up to 64 connections are open at once, a request is answered when its bytes are complete, the state becomes the one its handler gave back, and the connection is closed after the answer. |
+| `REST_SERVER[S]` | The connections, the router and the state of a service. `start` checks the routes and the port and listens; `serve` is the step for one event, and `state` the service's state. Up to 64 connections are open at once, a request is answered when its bytes are complete, and the state becomes the one its handler gave back. A connection stays open for the next request until a request asks to close it, an HTTP/1.0 request, or its 100th request. |
 | `REST_ROUTER[S]` | Up to 64 routes, tried in the order they were added. `on(m, p, h)` adds one whose handler gives the next state, `on_json` one whose handler is also given the body as `JSON`, `on_view` a `GET` route that reads the state, and `on_get`, `on_post`, `on_put` and `on_delete` routes whose handlers do not look at it. `dispatch` answers a request in a state, and `invalid_route` names the first pattern that is not valid. |
 | `REST_ROUTE[S]` | A method, a pattern and a handler, `(s: S, r: REST_REQUEST) -> REST_OUTCOME[S]`. `plain`, `viewing` and `with_json` make one from a handler of another shape. |
 | `REST_OUTCOME[S]` | What a handler gives back: the next `state` and the `response`. |
+| `REST_REPLIES[S]` | The answers to a batch of requests on one connection, and the state after them. |
 | `REST_COMMANDS` | The commands a server step may give (`for_conn`, `for_none`, `shaped`), and what `start` reads from its arguments. They do not depend on the state, so they are apart from the generic server. |
 | `REST_REQUEST` | What a handler sees: `method`, `param` and `param_nat` (path parameters), `query`, `header` (ignoring the case of the name), `body`, `json_body`, and the `http` request itself. |
 | `REST_RESPONSE` | `json`, `ok_json`, `created_json`, `text`, `ok_text` and `no_content`, and errors as a JSON object: `error(status, message)`, `bad_request`, `not_found`, `method_not_allowed`, `bad_target` and `bad_body`. A JSON body is sent with `Content-Type: application/json`, and text with `text/plain; charset=utf-8`. |
@@ -93,9 +94,14 @@ gjson = { path = "../gjson" }
 ## How a request is answered
 
 `REST_SERVER.serve` admits a connection while fewer than 64 are open, and closes it at once
-otherwise. It gives each connection's bytes to `ghttp`'s parser until they make a request, then
-sends the router's answer and closes the connection. Bytes that cannot be a request are answered
-with `ghttp`'s status for the error (`400`, `413`, `414`, `431`, `501` or `505`, with no body) and the connection is closed.
+otherwise. It gives each connection's bytes to `ghttp`'s `HTTP_PIPELINE.split`, which reads the
+requests they complete one after another (RFC 9112, section 9.3). The server answers them in
+order, each in the state the one before it left, and keeps the connection open for the next. It
+closes the connection after a request whose `Connection` field lists `close`, after an HTTP/1.0
+request, and after the connection's 100th request, and that answer says `Connection: close`.
+Bytes after it are not read. An answer to `HEAD` has the `GET`'s `Content-Length` and no body.
+Bytes that cannot be a request are answered with `ghttp`'s status for the error (`400`, `413`,
+`414`, `431`, `501` or `505`, with no body) and the connection is closed.
 
 `REST_ROUTER.dispatch`:
 
@@ -125,16 +131,17 @@ empty one, so it does not match `/users`. Patterns are written decoded.
   pattern.
 - **Server safety,** for every state and every event, by `serve`'s contract `REST_SERVER.within`:
   - the limit on connections is the same after a step, and the number open never exceeds it;
-  - an event about a connection does nothing, closes it, or sends it one answer and then closes
-    it, so a request, or bytes that cannot be one, get one answer, and no connection hears an
-    answer meant for another;
+  - an event about a connection sends it answers and then perhaps closes it, and nothing after
+    the close, so no connection hears an answer meant for another;
+  - no connection gets more than 100 answers: `on_bytes` proves that what a step sends, with
+    what was sent before (`answered_on`), is at most 100;
   - any other event names no connection, and a `Shutdown` stops the server.
 
   `start` does not start a router with a pattern that is not valid.
 - **The state is the handlers'.** After `serve(e)`, a server that goes on has the state that
-  the handler of the request `e` completes gave back, `router.dispatch(state, req).state`, or,
-  when `e` completes none, the state it had (`moves_to`). `completed(c, data)` is the request
-  that bytes `data` complete on `c`. `REST_OUTCOME.make(s, resp).state` is `s`. A target that
+  the handlers of the requests `e` completes gave back, one after another,
+  `router.run(state, completed(c, data))`, or, when `e` completes none, the state it had
+  (`moves_to`). `completed(c, data)` is the list of requests that bytes `data` complete on `c`. `REST_OUTCOME.make(s, resp).state` is `s`. A target that
   cannot be read, and any request to a router with no routes, keep the state they were given.
 - **Statuses.** A target that cannot be read is a `400` whatever the routes. A router with no
   routes answers `404`. `bad_body` and `bad_target` are `400`. `error(st, m)` has the status `st`,
@@ -155,7 +162,10 @@ state never changes. It also runs
 a scripted service: a bad route and a bad port stop it with exit status 2, with 64
 connections open the next is closed and its request is not answered, and a count kept as the
 state goes up with each request that reaches its handler, in the order the requests complete,
-and not with one that is refused.
+and not with one that is refused. On one connection, requests sent in turn and at once are
+answered in order, a `HEAD` without a body, and the connection is closed after `Connection:
+close`, an HTTP/1.0 request, bytes that are not a request, and the 100th request, whether the
+100 came in one read or two.
 
 ## Tests
 
@@ -175,11 +185,10 @@ Exit code 0 means every case holds. `cargo test --test grest` does both.
 
 - A `405` has no `Allow` header, as an `HTTP_RESPONSE` has no headers but `Content-Type` and
   `Content-Length`.
-- A `HEAD` request gets the `GET` route's body as well as its headers. The server closes the
-  connection after each answer, so a client is not confused about where the answer ends.
 - A response body is at most 64 KiB, `ghttp`'s limit.
-- One request per connection: the connection is closed after its answer, and bytes after the
-  request are dropped. Persistent connections come with `ghttp`'s client (F.8).
+- A connection that sends nothing stays open: there is no idle timeout yet (F.8, step 2).
+- That a request which asks to close gets its connection closed, and that a `HEAD` answer has
+  no body, is checked by the scripted run, not proven.
 - The state is the whole service's: each request sees the state the one before it left, and two
   requests are never handled at once. A handler that must wait for something else, such as
   another service, comes with F.8.

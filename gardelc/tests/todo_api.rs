@@ -130,16 +130,17 @@ fn todo_api_verifies_and_serves_crud_over_sockets() {
         std::thread::sleep(std::time::Duration::from_millis(100));
         std::net::TcpStream::connect(("127.0.0.1", port)).is_ok()
     });
+    // The whole session is one persistent connection: each answer is read by its length.
+    let socket = std::cell::RefCell::new(None::<std::net::TcpStream>);
     let ask = |method: &str, path: &str, body: Option<&str>| -> String {
-        let mut socket = std::net::TcpStream::connect(("127.0.0.1", port)).expect("connect");
+        let mut slot = socket.borrow_mut();
+        let socket = slot.get_or_insert_with(|| std::net::TcpStream::connect(("127.0.0.1", port)).expect("connect"));
         let request = match body {
             None => format!("{method} {path} HTTP/1.1\r\nHost: test\r\n\r\n"),
             Some(b) => format!("{method} {path} HTTP/1.1\r\nHost: test\r\nContent-Length: {}\r\n\r\n{b}", b.len()),
         };
         socket.write_all(request.as_bytes()).expect("request");
-        let mut answer = String::new();
-        socket.read_to_string(&mut answer).expect("response");
-        answer
+        read_answer(socket)
     };
     let session: &[(&str, &str, Option<&str>)] = &[
         ("POST", "/todos", Some(r#"{"title":"milk"}"#)),
@@ -158,6 +159,11 @@ fn todo_api_verifies_and_serves_crud_over_sockets() {
         ("PATCH", "/todos/1", None),
     ];
     let answers: Vec<String> = if up { session.iter().map(|(m, p, b)| ask(m, p, *b)).collect() } else { vec![] };
+    // After the last answer the server closes the connection.
+    let closed = up && {
+        let mut rest = Vec::new();
+        socket.borrow_mut().as_mut().expect("the connection").read_to_end(&mut rest).map_or(false, |_| rest.is_empty())
+    };
     drop(server.kill());
     drop(server.wait());
     assert!(up, "the service did not start listening");
@@ -178,10 +184,36 @@ fn todo_api_verifies_and_serves_crud_over_sockets() {
         json(200, r#"{"done":false,"id":3,"title":"tea"}"#),
         not_found.clone(),
         not_found,
-        // `ghttp` knows no `PATCH`, so the request never reaches the router.
-        "HTTP/1.1 501\r\nContent-Length: 0\r\n\r\n".to_string(),
+        // `ghttp` knows no `PATCH`, so the request never reaches the router, and the
+        // connection is closed after the error.
+        "HTTP/1.1 501\r\nConnection: close\r\nContent-Length: 0\r\n\r\n".to_string(),
     ];
     for (i, (got, want)) in answers.iter().zip(expected.iter()).enumerate() {
         assert_eq!(got, want, "request {i}: {:?}", session[i]);
     }
+    assert!(closed, "the connection stays open after the error");
+}
+
+/// One answer from `socket`: its head, up to the blank line, and as many body bytes as its
+/// `Content-Length` says. A connection that ends first gives what arrived.
+pub fn read_answer(socket: &mut std::net::TcpStream) -> String {
+    socket.set_read_timeout(Some(std::time::Duration::from_secs(10))).expect("timeout");
+    let mut got: Vec<u8> = Vec::new();
+    let mut byte = [0u8; 1];
+    while !got.ends_with(b"\r\n\r\n") {
+        match socket.read(&mut byte) {
+            Ok(1) => got.push(byte[0]),
+            _ => return String::from_utf8_lossy(&got).into_owned(),
+        }
+    }
+    let head = String::from_utf8_lossy(&got).into_owned();
+    let length = head
+        .lines()
+        .filter_map(|l| l.split_once(':'))
+        .find(|(k, _)| k.trim().eq_ignore_ascii_case("content-length"))
+        .map_or(0, |(_, v)| v.trim().parse::<usize>().expect("a length"));
+    let mut body = vec![0u8; length];
+    socket.read_exact(&mut body).expect("the body");
+    got.extend(body);
+    String::from_utf8_lossy(&got).into_owned()
 }

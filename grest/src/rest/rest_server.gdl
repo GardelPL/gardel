@@ -6,7 +6,9 @@
 --     do REST_SERVER.start(args, 8090, routes, STORE.empty) end
 --   step(s: REST_SERVER[STORE], e: EVENT): STEP[REST_SERVER[STORE]] do s.serve(e) end
 --
--- Each request is answered once and its connection closed after the answer, and the state is
+-- A connection stays open for the next request (RFC 9112, section 9.3), until a request asks
+-- to close it, an HTTP/1.0 request, or its 100th request. Requests sent before the last was
+-- answered are answered in order. Each request is answered once, and the state after it is
 -- the one its handler gave back. `serve` proves both for every event: see
 -- `REST_SERVER.within` and `moves_to`. The state is an `S`, so whatever `S`'s invariant says
 -- holds of it after every request.
@@ -72,9 +74,8 @@ create {ANY}
   -- What `serve` promises of a step `st` taken on `e` from `s`:
   --
   -- * the limit on connections is the same, so the number open stays within it;
-  -- * an event about a connection `c` does nothing, closes `c`, or sends `c` one answer and
-  --   closes it, so a request, or a request that cannot be read, is answered once, and no
-  --   connection hears an answer meant for another;
+  -- * an event about a connection `c` sends `c` answers and then perhaps closes it, and
+  --   sends nothing after the close, so no connection hears an answer meant for another;
   -- * any other event names no connection.
   within(s: REST_SERVER[S], e: EVENT, st: STEP[REST_SERVER[S]]): BOOL
     do
@@ -128,22 +129,53 @@ feature {ANY}
       Current.app
     end
 
-  -- The request that `data` completes on `c`, if it completes one that `c` may still send.
-  completed(c: CONN_ID, data: BYTES): OPTION[HTTP_REQUEST]
+  -- The requests that `data` completes on `c`, in order, if `c` may still send them.
+  completed(c: CONN_ID, data: BYTES): LIST[HTTP_REQUEST]
     do
       match Current.conns.lookup_connection(c)
-        case None then None
+        case None then LIST.empty
         case Some(conn) then
           if not conn.connection_status.can_accept_bytes then
-            None
+            LIST.empty
           else
-            match HTTP_PARSER.feed(conn.parser_state, data)
-              case Complete(req, _) then Some(req)
-              case NeedMore(_) then None
-              case Failed(_) then None
-            end
+            HTTP_PIPELINE.split(conn, data).requests
           end
       end
+    end
+
+  -- The requests answered on `c` so far, or 0 for a connection the server does not hold.
+  answered_on(c: CONN_ID): NAT
+    do
+      match Current.conns.lookup_connection(c)
+        case None then 0
+        case Some(conn) then conn.completed_requests
+      end
+    ensure
+      below_cap: Result < 100
+    end
+
+  -- The answers to `reqs` on `c`, in order, from the state `s`, then `after`. The last
+  -- answer says `Connection: close` when `closing`, and an answer to a `HEAD` has no body.
+  replies(s: S, reqs: LIST[HTTP_REQUEST], c: CONN_ID, closing: BOOL, after: LIST[COMMAND]): REST_REPLIES[S]
+    require
+      shaped: REST_COMMANDS.for_conn(after, c)
+      few: reqs.length <= 100
+      short: after.length <= 2
+    variant
+      reqs.length
+    do
+      if reqs.length = 0 then
+        REST_REPLIES.make(s, after)
+      else
+        let out = Current.api.dispatch(s, reqs.head)
+        let wire = HTTP_SERIALIZER.serialize_answer(out.response, reqs.head.method = Head, closing and (reqs.length = 1))
+        Current.replies(out.state, reqs.tail, c, closing, after).sent_first(Send(c, wire))
+      end
+    ensure
+      shaped: REST_COMMANDS.for_conn(Result.commands, c)
+      state: Result.state = Current.router.run(s, reqs)
+      count: Result.commands.length = reqs.length + after.length
+      answers: REST_COMMANDS.sent_to(Result.commands, c) = reqs.length + REST_COMMANDS.sent_to(after, c)
     end
 
   -- The server with its connections replaced.
@@ -166,9 +198,10 @@ feature {ANY}
       limit_kept: Result.max_connections = Current.max_connections
     end
 
-  -- Bytes from `c`: wait for more, or answer the request they complete, or the error that
-  -- stops them, and close `c`. A complete request moves the service to the state its
-  -- handler gives back.
+  -- Bytes from `c`: answer the requests they complete, in order, then wait for the next, or
+  -- close `c` when the last asked for it or was its last by the cap, or answer the error that
+  -- stops the bytes after them and close `c`. The service moves through the states the
+  -- handlers give back, one request after another.
   on_bytes(c: CONN_ID, data: BYTES): STEP[REST_SERVER[S]]
     do
       match Current.conns.lookup_connection(c)
@@ -178,21 +211,28 @@ feature {ANY}
           if not conn.connection_status.can_accept_bytes then
             Continue(Current.with_conns(Current.conns.release_connection(c)), REST_COMMANDS.close_only(c))
           else
-            match HTTP_PARSER.feed(conn.parser_state, data)
-              case NeedMore(next_p) then
-                Continue(Current.with_conns(Current.conns.save_connection(conn.with_parser_state(next_p))), LIST.empty)
-              case Complete(req, _) then
-                let out = Current.api.dispatch(Current.app, req)
-                Continue(Current.with_conns_and_state(Current.conns.release_connection(c), out.state), REST_COMMANDS.answer(c, out.response))
-              case Failed(err) then
-                Continue(Current.with_conns(Current.conns.release_connection(c)), REST_COMMANDS.answer(c, HTTP_RESPONSE.from_error(err)))
+            let b = HTTP_PIPELINE.split(conn, data)
+            match b.ending
+              case ReadOn(n) then
+                let r = Current.replies(Current.app, b.requests, c, False, LIST.empty)
+                Continue(Current.with_conns_and_state(Current.conns.save_connection(n), r.state), r.commands)
+              case CloseAfter then
+                let r = Current.replies(Current.app, b.requests, c, True, REST_COMMANDS.close_only(c))
+                Continue(Current.with_conns_and_state(Current.conns.release_connection(c), r.state), r.commands)
+              case FailAfter(err) then
+                let r = Current.replies(Current.app, b.requests, c, False, REST_COMMANDS.answer(c, HTTP_RESPONSE.from_error(err)))
+                Continue(Current.with_conns_and_state(Current.conns.release_connection(c), r.state), r.commands)
             end
           end
       end
     ensure
       within: REST_SERVER.within(Current, Received(c, data), Result)
-      served: Current.completed(c, data).is_some implies (match Result case Continue(n, _) then n.state = Current.router.dispatch(Current.state, Current.completed(c, data).get).state case Stop(_, _) then False end)
-      kept: Current.completed(c, data).is_none implies (match Result case Continue(n, _) then n.state = Current.state case Stop(_, _) then False end)
+      served: match Result
+        case Continue(n, _) then n.state = Current.router.run(Current.state, Current.completed(c, data))
+        case Stop(_, _) then False
+      end
+      -- With the answers sent before, no connection gets more than 100.
+      capped: REST_COMMANDS.sent_to(REST_SERVER.commands(Result), c) + Current.answered_on(c) <= 100
     end
 
   -- The step of a REST service for the event `e`.
@@ -227,19 +267,15 @@ feature {ANY}
 specify {ANY}
 
   -- What `serve` promises of the state after `e`: a step that continues has the state the
-  -- handler of the request that `e` completes gave back, or, when `e` completes none, the
-  -- state it had.
+  -- handlers of the requests that `e` completes gave back, one after another, or, when `e`
+  -- completes none, the state it had.
   moves_to(e: EVENT, st: STEP[REST_SERVER[S]]): BOOL
     do
       match st
         case Stop(_, _) then True
         case Continue(n, _) then
           match e
-            case Received(c, data) then
-              match Current.completed(c, data)
-                case Some(req) then n.state = Current.router.dispatch(Current.state, req).state
-                case None then n.state = Current.state
-              end
+            case Received(c, data) then n.state = Current.router.run(Current.state, Current.completed(c, data))
             case _ then n.state = Current.state
           end
       end

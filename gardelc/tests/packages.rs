@@ -1145,37 +1145,93 @@ fn a_service_on_grest_verifies_and_answers() {
     });
     let answers = if up {
         vec![
-            ask(&["GET /hello HTTP/1.1\r\nHost: test\r\n\r\n"]),
+            ask(&["GET /hello HTTP/1.1\r\nConnection: close\r\nHost: test\r\n\r\n"]),
             // Finding 1 of the libraries plan: a request cut across reads was answered as `GET /`.
-            ask(&["GET /he", "llo HTTP/1.1\r\nHost: test\r\n\r\n"]),
-            ask(&["GET /nope", " HTTP/1.1\r\nHost: test\r\n\r\n"]),
+            ask(&["GET /he", "llo HTTP/1.1\r\nConnection: close\r\nHost: test\r\n\r\n"]),
+            ask(&["GET /nope", " HTTP/1.1\r\nConnection: close\r\nHost: test\r\n\r\n"]),
             // Finding 2: a body that does not end in a newline arrives.
-            ask(&["POST /echo HTTP/1.1\r\nHost: test\r\nContent-Length: 2\r\n\r\nhi"]),
-            ask(&["POST /echo HTTP/1.1\r\nHost: test\r\nContent-Le", "ngth: 5\r\n\r\nhe", "llo"]),
-            ask(&["POST /echo HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n"]),
+            ask(&["POST /echo HTTP/1.1\r\nConnection: close\r\nHost: test\r\nContent-Length: 2\r\n\r\nhi"]),
+            ask(&["POST /echo HTTP/1.1\r\nConnection: close\r\nHost: test\r\nContent-Le", "ngth: 5\r\n\r\nhe", "llo"]),
+            ask(&["POST /echo HTTP/1.1\r\nConnection: close\r\nTransfer-Encoding: chunked\r\n\r\n"]),
             // The length the answer declares is the library's, worked out from the body.
-            ask(&["POST /echo HTTP/1.1\r\ncontent-length: 12\r\n\r\nhello, world"]),
-            ask(&["GET /hello/an", "a%20b HTTP/1.1\r\n\r\n"]),
-            ask(&["DELETE /hello HTTP/1.1\r\n\r\n"]),
+            ask(&["POST /echo HTTP/1.1\r\nConnection: close\r\ncontent-length: 12\r\n\r\nhello, world"]),
+            ask(&["GET /hello/an", "a%20b HTTP/1.1\r\nConnection: close\r\n\r\n"]),
+            ask(&["DELETE /hello HTTP/1.1\r\nConnection: close\r\n\r\n"]),
         ]
+    } else {
+        vec![]
+    };
+    // A persistent connection (F.8): two requests in turn, then three sent at once, a `HEAD`
+    // among them, the last asking to close; and an HTTP/1.0 request, which closes.
+    let kept = if up {
+        let mut socket = std::net::TcpStream::connect(("127.0.0.1", 8090)).expect("connect");
+        socket.set_read_timeout(Some(std::time::Duration::from_secs(10))).expect("timeout");
+        let mut got = Vec::new();
+        socket.write_all(b"GET /hello HTTP/1.1\r\n\r\n").expect("request");
+        got.push(read_answer(&mut socket));
+        socket.write_all(b"GET /hello/ana HTTP/1.1\r\n\r\n").expect("request");
+        got.push(read_answer(&mut socket));
+        socket
+            .write_all(b"GET /hello HTTP/1.1\r\n\r\nHEAD /hello HTTP/1.1\r\n\r\nGET /nope HTTP/1.1\r\nConnection: close\r\n\r\n")
+            .expect("requests");
+        let mut rest = String::new();
+        socket.read_to_string(&mut rest).expect("answers, then the close");
+        got.push(rest);
+        let mut old = std::net::TcpStream::connect(("127.0.0.1", 8090)).expect("connect");
+        old.write_all(b"GET /hello HTTP/1.0\r\n\r\n").expect("request");
+        let mut answer = String::new();
+        old.read_to_string(&mut answer).expect("the answer, then the close");
+        got.push(answer);
+        got
     } else {
         vec![]
     };
     drop(server.kill());
     drop(server.wait());
     assert!(up, "the service did not start listening");
-    let text = |body: &str| format!("HTTP/1.1 200\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: {}\r\n\r\n{body}", body.len());
-    let json = |code: u32, body: &str| format!("HTTP/1.1 {code}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}", body.len());
+    let text = |body: &str| format!("HTTP/1.1 200\r\nContent-Type: text/plain; charset=utf-8\r\nConnection: close\r\nContent-Length: {}\r\n\r\n{body}", body.len());
+    let json = |code: u32, body: &str| format!("HTTP/1.1 {code}\r\nContent-Type: application/json\r\nConnection: close\r\nContent-Length: {}\r\n\r\n{body}", body.len());
     assert_eq!(answers[0], text("hello from a package"));
     assert_eq!(answers[1], answers[0], "a split request gets the same answer");
     assert_eq!(answers[2], json(404, r#"{"error":"not found"}"#));
     assert_eq!(answers[3], text("hi"));
     assert_eq!(answers[4], text("hello"));
-    assert_eq!(answers[5], "HTTP/1.1 501\r\nContent-Length: 0\r\n\r\n");
+    assert_eq!(answers[5], "HTTP/1.1 501\r\nConnection: close\r\nContent-Length: 0\r\n\r\n");
     assert_eq!(answers[6], text("hello, world"));
     // A parameter cut across reads, decoded.
     assert_eq!(answers[7], json(200, r#"{"hello":"ana b"}"#));
     assert_eq!(answers[8], json(405, r#"{"error":"method not allowed"}"#));
+
+    let open_text = |body: &str| format!("HTTP/1.1 200\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: {}\r\n\r\n{body}", body.len());
+    assert_eq!(kept[0], open_text("hello from a package"));
+    assert_eq!(kept[1], "HTTP/1.1 200\r\nContent-Type: application/json\r\nContent-Length: 15\r\n\r\n{\"hello\":\"ana\"}");
+    // The `HEAD` answer has the `GET`'s length and no body.
+    let head = "HTTP/1.1 200\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: 20\r\n\r\n";
+    assert_eq!(kept[2], format!("{}{head}{}", open_text("hello from a package"), json(404, r#"{"error":"not found"}"#)));
+    assert_eq!(kept[3], text("hello from a package"));
+}
+
+/// One answer from `socket`: its head, up to the blank line, and as many body bytes as its
+/// `Content-Length` says.
+fn read_answer(socket: &mut std::net::TcpStream) -> String {
+    let mut got: Vec<u8> = Vec::new();
+    let mut byte = [0u8; 1];
+    while !got.ends_with(b"\r\n\r\n") {
+        match socket.read(&mut byte) {
+            Ok(1) => got.push(byte[0]),
+            _ => return String::from_utf8_lossy(&got).into_owned(),
+        }
+    }
+    let head = String::from_utf8_lossy(&got).into_owned();
+    let length = head
+        .lines()
+        .filter_map(|l| l.split_once(':'))
+        .find(|(k, _)| k.trim().eq_ignore_ascii_case("content-length"))
+        .map_or(0, |(_, v)| v.trim().parse::<usize>().expect("a length"));
+    let mut body = vec![0u8; length];
+    socket.read_exact(&mut body).expect("the body");
+    got.extend(body);
+    String::from_utf8_lossy(&got).into_owned()
 }
 
 /// `ghttp`'s own suite, a client package of it: every case of `cases.txt` is parsed whole

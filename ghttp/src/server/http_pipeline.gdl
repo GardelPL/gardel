@@ -1,0 +1,57 @@
+-- A persistent connection (RFC 9112, section 9.3): the bytes a client sends may finish one
+-- request and hold the next ones, sent before the first was answered. `split` reads them as
+-- a server must, one request after another, each from the bytes the last one left.
+functions HTTP_PIPELINE
+
+feature {ANY}
+
+  -- The requests that `data` completes on `conn`, and what follows them. A request that asks
+  -- to close, or that is the connection's last by `HTTP_CONNECTION.max_requests`, ends the
+  -- batch with `CloseAfter`, and bytes after it are not read.
+  split(conn: HTTP_CONNECTION, data: BYTES): HTTP_BATCH
+    require
+      reading: conn.connection_status.can_accept_bytes
+    variant
+      100 - conn.completed_requests
+    do
+      match HTTP_PARSER.feed(conn.parser_state, data)
+        case NeedMore(p) then
+          HTTP_BATCH.make(LIST.empty, ReadOn(conn.with_parser_state(p)))
+        case Failed(e) then
+          HTTP_BATCH.make(LIST.empty, FailAfter(e))
+        case Complete(req, rest) then
+          if conn.completed_requests + 1 >= 100 or not HTTP_PERSISTENCE.request_keeps_open(req) then
+            HTTP_BATCH.make(LIST.empty.prepend(req), CloseAfter)
+          else
+            let done = conn.answered
+            if rest.length = 0 then
+              HTTP_BATCH.make(LIST.empty.prepend(req), ReadOn(done))
+            else
+              HTTP_PIPELINE.split(done, rest).after(req)
+            end
+          end
+      end
+    ensure
+      -- No connection answers more than `HTTP_CONNECTION.max_requests` requests.
+      capped: Result.requests.length + conn.completed_requests <= 100
+      -- A connection read on has counted every request of the batch, and is the same one.
+      counted: match Result.ending
+        case ReadOn(n) then
+          n.completed_requests = conn.completed_requests + Result.requests.length and
+          n.connection_id = conn.connection_id and
+          n.connection_status.can_accept_bytes
+        case _ then True
+      end
+      -- A batch that fails leaves room for the answer to its error.
+      room_to_fail: match Result.ending
+        case FailAfter(_) then Result.requests.length + conn.completed_requests < 100
+        case _ then True
+      end
+      -- A batch that closes has answered something, or fails.
+      closes_after_one: match Result.ending
+        case CloseAfter then Result.requests.length >= 1
+        case _ then True
+      end
+    end
+
+end

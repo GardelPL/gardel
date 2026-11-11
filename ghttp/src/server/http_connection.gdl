@@ -1,4 +1,5 @@
--- Per-connection parser and lifecycle state (M4).
+-- Per-connection parser and lifecycle state (M4), and the requests answered on it. A
+-- connection answers at most `max_requests` requests: the last is answered with a close.
 module HTTP_CONNECTION
 
 representation {NONE}
@@ -8,10 +9,20 @@ representation {NONE}
   lifecycle: CONNECTION_STATUS
 
 invariant
-  bounded_requests: req_count <= 1000000
+  -- Below the cap, so that the connection can answer one more.
+  bounded_requests: req_count < 100
   closing_no_more_reads: (lifecycle = ConnClosing or lifecycle = ConnClosed) implies not lifecycle.can_accept_bytes
 
 create {ANY}
+
+  -- The most requests a connection answers: a client that keeps sending cannot hold one
+  -- forever.
+  max_requests: NAT
+    do
+      100
+    ensure
+      def: Result = 100
+    end
 
   make_reading(c: CONN_ID): HTTP_CONNECTION
     do
@@ -42,7 +53,7 @@ feature {ANY}
     do
       Current.req_count
     ensure
-      bounded: Result <= 1000000
+      below_cap: Result < 100
     end
 
   connection_status: CONNECTION_STATUS
@@ -58,6 +69,21 @@ feature {ANY}
     ensure
       same_conn: Result.connection_id = Current.connection_id
       same_status: Result.connection_status = Current.connection_status
+      same_count: Result.completed_requests = Current.completed_requests
+    end
+
+  -- The connection after one more answer, reading the next request with nothing buffered,
+  -- under the same limits.
+  answered: HTTP_CONNECTION
+    require
+      room: Current.completed_requests + 1 < 100
+    do
+      { Current with req_count = Current.req_count + 1, p_state = Current.p_state.with_received(BYTES.empty) }
+    ensure
+      same_conn: Result.connection_id = Current.connection_id
+      same_status: Result.connection_status = Current.connection_status
+      one_more: Result.completed_requests = Current.completed_requests + 1
+      nothing_buffered: Result.parser_state.buffered_bytes = 0
     end
 
   mark_closing: HTTP_CONNECTION

@@ -68,23 +68,42 @@ feature {ANY}
       def: Result = (match cmd case Send(_, _) then False case Close(_) then False case _ then True end)
     end
 
-  -- What an event about the connection `c` may do: nothing, close `c`, or send `c` one
-  -- answer and close it.
+  -- What an event about the connection `c` may do: send `c` answers, one per request, and
+  -- then perhaps close it. Nothing is sent after the close, and nothing to another
+  -- connection.
   for_conn(cmds: LIST[COMMAND], c: CONN_ID): BOOL
+    variant
+      cmds.length
     do
       if cmds.length = 0 then
         True
       else if cmds.length = 1 then
-        REST_COMMANDS.closes(cmds.head, c)
-      else if cmds.length = 2 then
-        REST_COMMANDS.sends(cmds.head, c) and REST_COMMANDS.closes(cmds.tail.head, c)
+        REST_COMMANDS.closes(cmds.head, c) or REST_COMMANDS.sends(cmds.head, c)
       else
-        False
-      end end end
+        REST_COMMANDS.sends(cmds.head, c) and REST_COMMANDS.for_conn(cmds.tail, c)
+      end end
     ensure
       def: Result = (cmds.length = 0
-        or (cmds.length = 1 and REST_COMMANDS.closes(cmds.head, c))
-        or (cmds.length = 2 and REST_COMMANDS.sends(cmds.head, c) and REST_COMMANDS.closes(cmds.tail.head, c)))
+        or (cmds.length = 1 and (REST_COMMANDS.closes(cmds.head, c) or REST_COMMANDS.sends(cmds.head, c)))
+        or (cmds.length >= 2 and REST_COMMANDS.sends(cmds.head, c) and REST_COMMANDS.for_conn(cmds.tail, c)))
+    end
+
+  -- How many answers `cmds` sends to `c`.
+  sent_to(cmds: LIST[COMMAND], c: CONN_ID): NAT
+    require
+      bounded: cmds.length <= 1000
+    variant
+      cmds.length
+    do
+      if cmds.length = 0 then
+        0
+      else if REST_COMMANDS.sends(cmds.head, c) then
+        REST_COMMANDS.sent_to(cmds.tail, c) + 1
+      else
+        REST_COMMANDS.sent_to(cmds.tail, c)
+      end end
+    ensure
+      at_most: Result <= cmds.length
     end
 
   -- What any other event may do: at most one command, which names no connection.
@@ -121,12 +140,13 @@ feature {ANY}
       end)
     end
 
-  -- One answer to the connection `c`, then its close.
+  -- One answer to the connection `c`, saying `Connection: close`, then its close.
   answer(c: CONN_ID, resp: HTTP_RESPONSE): LIST[COMMAND]
     do
-      LIST.empty.prepend(Close(c)).prepend(Send(c, HTTP_SERIALIZER.serialize(resp)))
+      LIST.empty.prepend(Close(c)).prepend(Send(c, HTTP_SERIALIZER.serialize_answer(resp, False, True)))
     ensure
       once: REST_COMMANDS.for_conn(Result, c)
+      two: Result.length = 2
     end
 
   -- Only `Close(c)`.
@@ -135,6 +155,7 @@ feature {ANY}
       LIST.empty.prepend(Close(c))
     ensure
       once: REST_COMMANDS.for_conn(Result, c)
+      one: Result.length = 1
     end
 
 end

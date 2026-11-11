@@ -1,0 +1,40 @@
+-- The answers a `REST_SERVER` sends for a batch of requests on one connection, and the
+-- service's state after them.
+module REST_REPLIES[S]
+
+representation {NONE}
+  next: S
+  cmds: LIST[COMMAND]
+
+create {ANY}
+
+  make(s: S, cs: LIST[COMMAND]): REST_REPLIES[S]
+    do
+      { next = s, cmds = cs }
+    ensure
+      state_set: Result.state = s
+      commands_set: Result.commands = cs
+    end
+
+feature {ANY}
+
+  state: S
+    do
+      Current.next
+    end
+
+  commands: LIST[COMMAND]
+    do
+      Current.cmds
+    end
+
+  -- The same replies, with `cmd` sent before them.
+  sent_first(cmd: COMMAND): REST_REPLIES[S]
+    do
+      { Current with cmds = Current.cmds.prepend(cmd) }
+    ensure
+      same_state: Result.state = Current.state
+      commands_set: Result.commands = Current.commands.prepend(cmd)
+    end
+
+end
