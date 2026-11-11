@@ -1,0 +1,59 @@
+-- What a sweep of the waiting table leaves: the waits kept, each one sweep older, and the ones
+-- whose time ran out, to be answered late.
+module REST_WAIT_SWEEP
+
+representation {NONE}
+  kept_waits: LIST[REST_WAIT]
+  late_waits: LIST[REST_WAIT]
+
+create {ANY}
+
+  -- Every one of `ws` has waited through a sweep.
+  all_aged(ws: LIST[REST_WAIT]): BOOL
+    variant
+      ws.length
+    do
+      if ws.length = 0 then True else ws.head.sweeps_waited >= 1 and REST_WAIT_SWEEP.all_aged(ws.tail) end
+    ensure
+      def: Result = (ws.length = 0 or (ws.head.sweeps_waited >= 1 and REST_WAIT_SWEEP.all_aged(ws.tail)))
+    end
+
+  make(ks: LIST[REST_WAIT], ls: LIST[REST_WAIT]): REST_WAIT_SWEEP
+    do
+      { kept_waits = ks, late_waits = ls }
+    ensure
+      kept_set: Result.kept = ks
+      expired_set: Result.expired = ls
+    end
+
+feature {ANY}
+
+  -- The waits that go on.
+  kept: LIST[REST_WAIT]
+    do
+      Current.kept_waits
+    end
+
+  -- The waits whose time ran out.
+  expired: LIST[REST_WAIT]
+    do
+      Current.late_waits
+    end
+
+  keeping(w: REST_WAIT): REST_WAIT_SWEEP
+    do
+      { Current with kept_waits = Current.kept_waits.prepend(w) }
+    ensure
+      kept_set: Result.kept = Current.kept.prepend(w)
+      same_expired: Result.expired = Current.expired
+    end
+
+  expiring(w: REST_WAIT): REST_WAIT_SWEEP
+    do
+      { Current with late_waits = Current.late_waits.prepend(w) }
+    ensure
+      same_kept: Result.kept = Current.kept
+      one_more: Result.expired.length = Current.expired.length + 1
+    end
+
+end

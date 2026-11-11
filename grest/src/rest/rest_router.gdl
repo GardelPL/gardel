@@ -8,7 +8,8 @@
 -- * any other path is a `404`.
 --
 -- Each error is a JSON object, `{"error":"not found"}`, and keeps the state. Only a route's
--- handler gives the next state.
+-- handler gives the next state. `dispatch_as` also offers a tag to an async handler, so that
+-- it may wait.
 module REST_ROUTER[S]
 
 representation {NONE}
@@ -32,7 +33,7 @@ create {ANY}
 
   -- The outcome of the first route in `rs` for `req` in the state `s`, whose target reads
   -- as `t`. `path_seen` says whether a route before `rs` matched the path but not the method.
-  find(rs: LIST[REST_ROUTE[S]], s: S, req: HTTP_REQUEST, t: REQUEST_TARGET, path_seen: BOOL): REST_OUTCOME[S]
+  find(rs: LIST[REST_ROUTE[S]], s: S, req: HTTP_REQUEST, t: REQUEST_TARGET, path_seen: BOOL, w: OPTION[NAT]): REST_OUTCOME[S]
     variant
       rs.length
     do
@@ -50,12 +51,12 @@ create {ANY}
         end
         match found
           case None then
-            REST_ROUTER.find(rs.tail, s, req, t, path_seen)
+            REST_ROUTER.find(rs.tail, s, req, t, path_seen, w)
           case Some(ps) then
             if r.method = req.method or (req.method = Head and r.method = Get) then
-              r.respond(s, REST_REQUEST.make(req, t, ps))
+              r.respond_as(s, REST_REQUEST.make(req, t, ps), w)
             else
-              REST_ROUTER.find(rs.tail, s, req, t, True)
+              REST_ROUTER.find(rs.tail, s, req, t, True, w)
             end
         end
       end
@@ -63,6 +64,7 @@ create {ANY}
       empty_seen: (rs.length = 0 and path_seen) implies Result.response.response_status_code = 405
       empty_unseen: (rs.length = 0 and not path_seen) implies Result.response.response_status_code = 404
       empty_keeps: rs.length = 0 implies Result.state = s
+      empty_answers: rs.length = 0 implies not Result.waits
     end
 
   -- The pattern of the first route in `rs` that is not valid.
@@ -142,6 +144,16 @@ feature {ANY}
       grew: Result.route_count = Current.route_count + 1
     end
 
+  -- A route whose handler may wait for its answer; see `REST_ROUTE.awaiting`.
+  on_await(m: HTTP_METHOD, p: STRING, h: (s: S, r: REST_REQUEST, tag: NAT) -> REST_OUTCOME[S]): REST_ROUTER[S]
+    require
+      room: Current.has_room
+    do
+      Current.add(REST_ROUTE.awaiting(m, p, h))
+    ensure
+      grew: Result.route_count = Current.route_count + 1
+    end
+
   -- The routes below have handlers that do not look at the state; see `REST_ROUTE.plain`.
 
   on_get(p: STRING, h: (r: REST_REQUEST) -> HTTP_RESPONSE): REST_ROUTER[S]
@@ -187,19 +199,32 @@ feature {ANY}
       REST_ROUTER.first_invalid(Current.table)
     end
 
-  -- The next state and the answer for `req` in the state `s`.
+  -- The next state and the answer for `req` in the state `s`, with no tag to wait with.
   dispatch(s: S, req: HTTP_REQUEST): REST_OUTCOME[S]
+    do
+      Current.dispatch_as(s, req, None)
+    ensure
+      bad_target: not REQUEST_TARGET.parse(req.target).is_ok implies Result.response.response_status_code = 400
+      no_routes: (Current.route_count = 0 and REQUEST_TARGET.parse(req.target).is_ok) implies Result.response.response_status_code = 404
+      bad_target_keeps: not REQUEST_TARGET.parse(req.target).is_ok implies Result.state = s
+      no_routes_keep: Current.route_count = 0 implies Result.state = s
+    end
+
+  -- The next state and the answer for `req` in the state `s`, with the tag `w` offers to an
+  -- async handler.
+  dispatch_as(s: S, req: HTTP_REQUEST, w: OPTION[NAT]): REST_OUTCOME[S]
     do
       let parsed = REQUEST_TARGET.parse(req.target)
       match parsed
         case Error(e) then REST_OUTCOME.make(s, REST_RESPONSE.bad_target(e))
-        case Ok(t) then REST_ROUTER.find(Current.table, s, req, t, False)
+        case Ok(t) then REST_ROUTER.find(Current.table, s, req, t, False, w)
       end
     ensure
       bad_target: not REQUEST_TARGET.parse(req.target).is_ok implies Result.response.response_status_code = 400
       no_routes: (Current.route_count = 0 and REQUEST_TARGET.parse(req.target).is_ok) implies Result.response.response_status_code = 404
       bad_target_keeps: not REQUEST_TARGET.parse(req.target).is_ok implies Result.state = s
       no_routes_keep: Current.route_count = 0 implies Result.state = s
+      no_routes_answer: Current.route_count = 0 implies not Result.waits
     end
 
   -- The state after `reqs`, answered in order from the state `s`: each request's handler
@@ -216,6 +241,24 @@ feature {ANY}
     ensure
       none: reqs.length = 0 implies Result = s
       step: reqs.length > 0 implies Result = Current.run(Current.dispatch(s, reqs.head).state, reqs.tail)
+    end
+
+  -- The state after `reqs`, answered in order from the state `s`, with the tag `w` offers,
+  -- up to and with the first request held to wait: the requests after it are not answered.
+  run_as(s: S, reqs: LIST[HTTP_REQUEST], w: OPTION[NAT]): S
+    variant
+      reqs.length
+    do
+      if reqs.length = 0 then
+        s
+      else
+        let out = Current.dispatch_as(s, reqs.head, w)
+        if out.held_by(w) then out.state else Current.run_as(out.state, reqs.tail, w) end
+      end
+    ensure
+      none: reqs.length = 0 implies Result = s
+      held: (reqs.length > 0 and Current.dispatch_as(s, reqs.head, w).held_by(w)) implies Result = Current.dispatch_as(s, reqs.head, w).state
+      step: (reqs.length > 0 and not Current.dispatch_as(s, reqs.head, w).held_by(w)) implies Result = Current.run_as(Current.dispatch_as(s, reqs.head, w).state, reqs.tail, w)
     end
 
 end

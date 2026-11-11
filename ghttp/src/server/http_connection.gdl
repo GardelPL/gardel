@@ -2,7 +2,8 @@
 -- sweeps it has waited through since its last answer. A connection answers at most
 -- `max_requests` requests: the last is answered with a close. It waits through fewer than
 -- `max_idle_ticks` sweeps for a request: a sweep that would reach it closes the connection
--- instead.
+-- instead. A connection whose request waits for an answer made elsewhere (`awaiting`) reads
+-- nothing and is not swept until the answer is sent (`resumed`).
 module HTTP_CONNECTION
 
 representation {NONE}
@@ -133,6 +134,38 @@ feature {ANY}
       same_status: Result.connection_status = Current.connection_status
       same_count: Result.completed_requests = Current.completed_requests
       one_more: Result.idle_ticks = Current.idle_ticks + 1
+    end
+
+  -- Whether the connection waits for the answer to its last request, made elsewhere.
+  is_waiting: BOOL
+    do
+      Current.lifecycle = ConnWriting
+    ensure
+      def: Result = (Current.connection_status = ConnWriting)
+    end
+
+  -- The connection while the answer to its last request is made elsewhere: it reads no
+  -- bytes, and no sweep counts against it.
+  awaiting: HTTP_CONNECTION
+    do
+      { Current with lifecycle = ConnWriting }
+    ensure
+      same_conn: Result.connection_id = Current.connection_id
+      waits: Result.is_waiting
+      cannot_read: not Result.connection_status.can_accept_bytes
+      same_count: Result.completed_requests = Current.completed_requests
+    end
+
+  -- The connection once that answer is sent: reading the next request, and not idle.
+  resumed: HTTP_CONNECTION
+    do
+      { Current with lifecycle = ConnReading, idle = 0 }
+    ensure
+      same_conn: Result.connection_id = Current.connection_id
+      reading: Result.connection_status.can_accept_bytes
+      not_waiting: not Result.is_waiting
+      same_count: Result.completed_requests = Current.completed_requests
+      not_idle: Result.idle_ticks = 0
     end
 
   mark_closing: HTTP_CONNECTION

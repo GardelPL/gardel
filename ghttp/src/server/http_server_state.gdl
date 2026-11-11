@@ -114,7 +114,8 @@ create {NONE}
       not_longer: Result.length <= cs.length
     end
 
-  -- Each of `cs` one sweep older, or closed if that sweep makes it idle too long.
+  -- Each of `cs` one sweep older, or closed if that sweep makes it idle too long. One that
+  -- waits for its answer is kept as it is.
   sweep_conns(cs: LIST[HTTP_CONNECTION]): HTTP_SWEEP
     variant
       cs.length
@@ -123,15 +124,17 @@ create {NONE}
         HTTP_SWEEP.make(LIST.empty, LIST.empty)
       else
         let rest = sweep_conns(cs.tail)
-        if cs.head.idle_out then
+        if cs.head.is_waiting then
+          rest.keeping(cs.head)
+        else if cs.head.idle_out then
           rest.closing(cs.head.connection_id)
         else
           rest.keeping(cs.head.aged)
-        end
+        end end
       end
     ensure
       accounted: Result.kept.length + Result.closed.length = cs.length
-      -- The sweep counted itself on each connection it kept.
+      -- The sweep counted itself on each connection it kept that does not wait.
       aged: HTTP_SWEEP.all_waited(Result.kept)
     end
 

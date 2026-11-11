@@ -1,6 +1,8 @@
 -- A route of a service whose state is an `S`: a method, a path pattern such as `/users/:id`,
 -- and the handler that answers a request that matches them. A handler is a pure function from
--- the state and a request to the next state and a response, a `REST_OUTCOME[S]`.
+-- the state and a request to the next state and a response, a `REST_OUTCOME[S]`. An async
+-- handler (`awaiting`) is also given a tag to wait with, when the server has room for one more
+-- waiting request.
 --
 -- The pattern is kept as written, so a router can name a route whose pattern is not valid.
 module REST_ROUTE[S]
@@ -9,13 +11,31 @@ representation {NONE}
   verb: HTTP_METHOD
   path: STRING
   pattern: PATH_PATTERN
-  run: (s: S, r: REST_REQUEST) -> REST_OUTCOME[S]
+  run: (s: S, r: REST_REQUEST, w: OPTION[NAT]) -> REST_OUTCOME[S]
 
 create {ANY}
 
   make(m: HTTP_METHOD, p: STRING, h: (s: S, r: REST_REQUEST) -> REST_OUTCOME[S]): REST_ROUTE[S]
     do
-      { verb = m, path = p, pattern = PATH_PATTERN.parse(p), run = h }
+      { verb = m, path = p, pattern = PATH_PATTERN.parse(p),
+        run = fn(s: S, r: REST_REQUEST, w: OPTION[NAT]): REST_OUTCOME[S] do h(s, r) end }
+    ensure
+      method_set: Result.method = m
+      path_set: Result.path_text.equals(p)
+    end
+
+  -- A route whose handler may wait for its answer: it is given the tag to wait with. When
+  -- the server has no room for one more waiting request, the request is answered
+  -- `REST_RESPONSE.unavailable`, a `503`, the state is kept, and `h` is not called.
+  awaiting(m: HTTP_METHOD, p: STRING, h: (s: S, r: REST_REQUEST, tag: NAT) -> REST_OUTCOME[S]): REST_ROUTE[S]
+    do
+      { verb = m, path = p, pattern = PATH_PATTERN.parse(p),
+        run = fn(s: S, r: REST_REQUEST, w: OPTION[NAT]): REST_OUTCOME[S] do
+          match w
+            case None then REST_OUTCOME.make(s, REST_RESPONSE.unavailable)
+            case Some(t) then h(s, r, t)
+          end
+        end }
     ensure
       method_set: Result.method = m
       path_set: Result.path_text.equals(p)
@@ -78,10 +98,16 @@ feature {ANY}
       Current.pattern.is_valid
     end
 
-  -- What the handler answers to `r` in the state `s`.
+  -- What the handler answers to `r` in the state `s`, with no tag to wait with.
   respond(s: S, r: REST_REQUEST): REST_OUTCOME[S]
     do
-      Current.run(s, r)
+      Current.run(s, r, None)
+    end
+
+  -- What the handler answers to `r` in the state `s`, with the tag `w` offers.
+  respond_as(s: S, r: REST_REQUEST, w: OPTION[NAT]): REST_OUTCOME[S]
+    do
+      Current.run(s, r, w)
     end
 
 end

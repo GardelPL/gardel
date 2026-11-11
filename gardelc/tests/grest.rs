@@ -518,3 +518,185 @@ fn a_service_keeps_the_state_its_handlers_give() {
     let last = String::from_utf8_lossy(&run.stderr).lines().filter(|l| l.starts_with("net: Send 7 ")).collect::<String>();
     assert!(last.ends_with("%0D%0A%0D%0A2"), "two bumps, then the count: {last}");
 }
+
+/// A verified service with an async route (F.8): `GET /up` waits through 6 sweeps for an
+/// upstream at `127.0.0.1:9999`, whose tag is the state; the upstream is sent `ping` when it
+/// connects, and its first bytes answer `pong`; a failed connect answers `502`. `GET /forged`
+/// waits with a tag it was not given, and `GET /hi` answers at once.
+fn async_service(name: &str) -> Project {
+    let source = "reactive program CLIENT
+
+feature {ANY}
+
+  hi(r: REST_REQUEST): HTTP_RESPONSE
+    do
+      REST_RESPONSE.ok_text(\"hi\")
+    end
+
+  up(s: NAT, r: REST_REQUEST, tag: NAT): REST_OUTCOME[NAT]
+    do
+      REST_OUTCOME.waiting(tag, tag, LIST.empty.prepend(Connect(tag, \"127.0.0.1\", 9999)), 6, REST_RESPONSE.timed_out)
+    end
+
+  forged(s: NAT, r: REST_REQUEST): REST_OUTCOME[NAT]
+    do
+      REST_OUTCOME.waiting(s, 999, LIST.empty.prepend(Connect(999, \"127.0.0.1\", 9999)), 3, REST_RESPONSE.timed_out)
+    end
+
+  wake(s: NAT, e: EVENT): REST_WAKE[NAT]
+    do
+      match e
+        case Connected(_, c) then REST_WAKE.make(s, LIST.empty.prepend(Send(c, \"ping\".to_utf8)))
+        case ConnectFailed(t, _) then REST_WAKE.answering(s, LIST.empty, t, REST_RESPONSE.error(HTTP_STATUS.make(502), \"down\"))
+        case Received(c, _) then REST_WAKE.answering(s, LIST.empty.prepend(Close(c)), s, REST_RESPONSE.ok_text(\"pong\"))
+        case _ then REST_WAKE.make(s, LIST.empty)
+      end
+    end
+
+  routes: REST_ROUTER[NAT]
+    do
+      REST_ROUTER.empty.on_get(\"/hi\", hi).on_await(Get, \"/up\", up).on(Get, \"/forged\", forged)
+    end
+
+  init(args: SEQ[STRING]): STEP[REST_SERVER[NAT]]
+    do
+      REST_SERVER.start_waking(args, 8090, routes, wake, 0)
+    end
+
+  step(s: REST_SERVER[NAT], e: EVENT): STEP[REST_SERVER[NAT]]
+    do
+      s.serve(e)
+    end
+
+end
+";
+    let project = Project::new(name, source);
+    assert_ok(&project.check());
+    project
+}
+
+/// `s` with its `%XX` escapes decoded.
+fn decode(s: &str) -> String {
+    let b = s.as_bytes();
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'%' && i + 2 < b.len() {
+            out.push(u8::from_str_radix(&s[i + 1..i + 3], 16).expect("an escape"));
+            i += 3;
+        } else {
+            out.push(b[i]);
+            i += 1;
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// The `net:` lines of a run, with each answer cut to its connection, status and body.
+fn answers(run: &Output) -> Vec<String> {
+    String::from_utf8_lossy(&run.stderr)
+        .lines()
+        .filter(|l| l.starts_with("net: "))
+        .map(|l| {
+            let words: Vec<&str> = l.split_whitespace().collect();
+            if words[1] == "Send" && words[3].starts_with("HTTP%2F1%2E1%20") {
+                let wire = &words[3];
+                let body = decode(wire.rsplit("%0D%0A%0D%0A").next().unwrap_or(""));
+                let close = if wire.contains("Connection%3A%20close") { " close" } else { "" };
+                format!("Send {} {}{close} {body}", words[2], &wire["HTTP%2F1%2E1%20".len()..][..3])
+            } else {
+                words[1..].join(" ")
+            }
+        })
+        .collect()
+}
+
+/// An async handler (F.8): a request waits while the server answers others, and is answered
+/// by its tag when the upstream answers; a request whose upstream does not answer is answered
+/// `504` on its sixth sweep, and its connection is not swept as idle meanwhile; a failed
+/// connect is a `502`; an answer to a request that no longer waits, as it timed out or its
+/// connection closed, is dropped; a handler that waits with a tag it was not given is
+/// answered at once; a request after one that waits is not answered, and the connection
+/// closes after the answer; bytes while a request waits close the connection, unanswered;
+/// and a 33rd request that would wait is a `503`.
+#[test]
+fn an_async_handler_waits_for_its_answer() {
+    let relay = async_service("relay");
+    let get = |path: &str| format!("GET%20{path}%20HTTP/1.1%0D%0A%0D%0A");
+    let sweeps = |n: usize| vec!["Tick:0"; n].join(" ");
+    let mut events = vec![
+        // Tag 0: answered by its upstream, while another connection is served.
+        "Accepted:1".to_string(),
+        format!("Received:1:{}", get("/up")),
+        "Accepted:2".to_string(),
+        format!("Received:2:{}", get("/hi")),
+        "Connected:0:50".to_string(),
+        "Received:50:pong".to_string(),
+        // The connection reads again.
+        format!("Received:1:{}", get("/hi")),
+        // Tag 1: no upstream answer, so a 504 on the sixth sweep; then its answer is late.
+        format!("Received:2:{}", get("/up")),
+        sweeps(3),
+        format!("Received:1:{}", get("/hi")),
+        sweeps(3),
+        "Received:51:late".to_string(),
+        // Tag 2: the connect fails.
+        format!("Received:1:{}", get("/up")),
+        "ConnectFailed:2:10061".to_string(),
+        // Tag 3: its connection closes, so the answer is dropped.
+        "Accepted:3".to_string(),
+        format!("Received:3:{}", get("/up")),
+        "Closed:3".to_string(),
+        "Received:52:pong".to_string(),
+        // A forged tag is answered at once with the late answer, and its Connect is not sent.
+        format!("Received:1:{}", get("/forged")),
+        // Tag 4: a request after it is not answered, and the connection closes after the answer.
+        "Accepted:4".to_string(),
+        format!("Received:4:{}{}", get("/up"), get("/hi")),
+        "Received:53:pong".to_string(),
+        // Tag 5: bytes while it waits close the connection, unanswered.
+        "Accepted:5".to_string(),
+        format!("Received:5:{}", get("/up")),
+        format!("Received:5:{}", get("/hi")),
+        "Received:54:pong".to_string(),
+    ];
+    // Tags 6 to 37: 32 wait, and the 33rd is a 503.
+    for c in 10..43 {
+        events.push(format!("Accepted:{c}"));
+        events.push(format!("Received:{c}:{}", get("/up")));
+    }
+    let run = run_service(&relay, &["9005"], &events.join(" "));
+    assert_eq!(run.status.code(), Some(0), "{}", all(&run));
+    let mut expected: Vec<String> = [
+        "Listen 9005",
+        "Connect 0 127%2E0%2E0%2E1 9999",
+        "Send 2 200 hi",
+        "Send 50 ping",
+        "Close 50",
+        "Send 1 200 pong",
+        "Send 1 200 hi",
+        "Connect 1 127%2E0%2E0%2E1 9999",
+        "Send 1 200 hi",
+        "Send 2 504 {\"error\":\"timed out\"}",
+        "Close 51",
+        "Connect 2 127%2E0%2E0%2E1 9999",
+        "Send 1 502 {\"error\":\"down\"}",
+        "Connect 3 127%2E0%2E0%2E1 9999",
+        "Close 52",
+        "Send 1 504 {\"error\":\"timed out\"}",
+        "Connect 4 127%2E0%2E0%2E1 9999",
+        "Close 53",
+        "Send 4 200 close pong",
+        "Close 4",
+        "Connect 5 127%2E0%2E0%2E1 9999",
+        "Close 5",
+        "Close 54",
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect();
+    expected.extend((6..38).map(|t| format!("Connect {t} 127%2E0%2E0%2E1 9999")));
+    expected.push("Send 42 503 {\"error\":\"busy\"}".to_string());
+    let got = answers(&run);
+    assert_eq!(got, expected, "{}", got.join("\n"));
+}

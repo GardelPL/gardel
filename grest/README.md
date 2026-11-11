@@ -52,7 +52,8 @@ none. A route whose pattern is not valid, or an argument that is not a port, sto
 with exit status 2 and a message, before it listens.
 [`examples/todo_api`](../examples/todo_api) is a service with a state, and
 [`examples/hello_api`](../examples/hello_api) one of four routes whose handlers do not look at
-it, so its state is a `NAT` that stays `0`.
+it, so its state is a `NAT` that stays `0`. [`examples/api_gateway`](../examples/api_gateway)
+waits for another service.
 
 A handler is a pure function, and a routine's name is one. Handlers belong in a `functions` or
 `program` module: in a `module`, a lambda that calls a sibling routine is not yet translated.
@@ -77,11 +78,13 @@ gjson = { path = "../gjson" }
 
 | Module | What it does |
 | :--- | :--- |
-| `REST_SERVER[S]` | The connections, the router and the state of a service. `start` checks the routes and the port and listens; `serve` is the step for one event, and `state` the service's state. Up to 64 connections are open at once, a request is answered when its bytes are complete, and the state becomes the one its handler gave back. A connection stays open for the next request until a request asks to close it, an HTTP/1.0 request, or its 100th request. |
-| `REST_ROUTER[S]` | Up to 64 routes, tried in the order they were added. `on(m, p, h)` adds one whose handler gives the next state, `on_json` one whose handler is also given the body as `JSON`, `on_view` a `GET` route that reads the state, and `on_get`, `on_post`, `on_put` and `on_delete` routes whose handlers do not look at it. `dispatch` answers a request in a state, and `invalid_route` names the first pattern that is not valid. |
+| `REST_SERVER[S]` | The connections, the router, the state and the waiting requests of a service. `start` checks the routes and the port and listens, and `start_waking` also takes the service's handler for the events that are not the server's own; `serve` is the step for one event, and `state` the service's state. Up to 64 connections are open at once, a request is answered when its bytes are complete, and the state becomes the one its handler gave back. A connection stays open for the next request until a request asks to close it, an HTTP/1.0 request, or its 100th request. |
+| `REST_ROUTER[S]` | Up to 64 routes, tried in the order they were added. `on(m, p, h)` adds one whose handler gives the next state, `on_json` one whose handler is also given the body as `JSON`, `on_view` a `GET` route that reads the state, `on_await` one whose handler may wait for its answer, and `on_get`, `on_post`, `on_put` and `on_delete` routes whose handlers do not look at it. `dispatch` answers a request in a state, and `invalid_route` names the first pattern that is not valid. |
 | `REST_ROUTE[S]` | A method, a pattern and a handler, `(s: S, r: REST_REQUEST) -> REST_OUTCOME[S]`. `plain`, `viewing` and `with_json` make one from a handler of another shape. |
-| `REST_OUTCOME[S]` | What a handler gives back: the next `state` and the `response`. |
-| `REST_REPLIES[S]` | The answers to a batch of requests on one connection, and the state after them. |
+| `REST_OUTCOME[S]` | What a handler gives back: the next `state` and the `response`; or, from `waiting(s, tag, cmds, sweeps, late)`, a request that waits for its answer, with the commands that start the work, its tag, its timeout in sweeps (1 to 30), and the answer sent when the time runs out. |
+| `REST_WAKE[S]` | What a service gives back for an event that is not the server's own: the next state, commands, and perhaps an answer to a waiting request by its tag (`answering`). `unknown` is the handler of a service that waits for nothing. |
+| `REST_WAITING`, `REST_WAIT`, `REST_WAIT_SWEEP` | The requests that wait, at most 32, each with its connection, tag and timeout, and what a sweep keeps and times out. |
+| `REST_REPLIES[S]` | The answers to a batch of requests on one connection, the state after them, and the request held to wait, if one is. |
 | `REST_COMMANDS` | The commands a server step may give (`for_conn`, `for_none`, `shaped`), and what `start` reads from its arguments. They do not depend on the state, so they are apart from the generic server. |
 | `REST_REQUEST` | What a handler sees: `method`, `param` and `param_nat` (path parameters), `query`, `header` (ignoring the case of the name), `body`, `json_body`, and the `http` request itself. |
 | `REST_RESPONSE` | `json`, `ok_json`, `created_json`, `text`, `ok_text` and `no_content`, and errors as a JSON object: `error(status, message)`, `bad_request`, `not_found`, `method_not_allowed`, `bad_target` and `bad_body`. A JSON body is sent with `Content-Type: application/json`, and text with `text/plain; charset=utf-8`. |
@@ -118,6 +121,37 @@ A route made by `on_json` or `REST_ROUTE.with_json` reads the body as JSON first
 one JSON value, or no body, is a `400`, `{"at":<byte>,"error":"invalid JSON body"}`, and its handler
 is not called.
 
+## Async handlers
+
+A route made with `on_await(m, p, h)` may wait: `h(s, r, tag)` gives
+`REST_OUTCOME.waiting(s2, tag, cmds, sweeps, late)`, and the server sends `cmds`, such as a
+`Connect` to another service, and holds the request. Up to 32 requests wait at once; past that, a
+request to such a route is a `503`, `{"error":"busy"}`, and `h` is not called. Every event that is
+not the server's own, a `Connected`, bytes from a connection the service opened, a timer of its
+own, goes to the handler given to `start_waking`, which keeps its state and may answer the request
+by its tag. A sketch, where `GATE` is the service's state and its queries are the service's own;
+[`examples/api_gateway`](../examples/api_gateway) is the whole of one, over `ghttp`'s client:
+
+```gardel
+wake(s: GATE, e: EVENT): REST_WAKE[GATE]
+  do
+    match e
+      case Connected(t, c) then REST_WAKE.make(s, LIST.empty.prepend(Send(c, s.request_for(t))))
+      case Received(c, data) then REST_WAKE.answering(s, LIST.empty.prepend(Close(c)), s.tag_of(c), s.answer(data))
+      case _ then REST_WAKE.make(s, LIST.empty)
+    end
+  end
+```
+
+The sweep counts once a second against every waiting request, and answers `late` to the one that
+reaches its limit, so a request that waits `n` sweeps is answered within `n` seconds. While a
+request waits, its connection reads nothing and is not swept as idle; other connections are served
+as usual. Requests sent after it on the same connection are not answered, and the connection
+closes after the answer, so the client sends them again; bytes that arrive while it waits close
+the connection. An answer to a request that no longer waits, as it timed out or its connection
+closed, is dropped. The server sends only the service's commands that name none of its
+connections and leave timer 0 alone.
+
 A pattern is split as a target is: `/` is one empty segment, and `/users/` has two, `users` and an
 empty one, so it does not match `/users`. Patterns are written decoded.
 
@@ -141,13 +175,21 @@ empty one, so it does not match `/users`. Patterns are written decoded.
   - the sweep closes connections and sets the next sweep, last; `start` sets the first, and no
     other step sets or cancels timer 0, so the sweep comes back for as long as the server runs;
     every connection is kept or closed, and each kept is counted one sweep older;
-  - any other event names no connection, and a `Shutdown` stops the server.
+  - an event the service handles sends commands of its own, which name none of the server's
+    connections and leave timer 0 alone, then perhaps one answer to a request that waited, and a
+    `Shutdown` stops the server.
+- **Waiting requests.** At most 32 wait, each with a count of sweeps below its limit, of at
+  most 30; a request waits only under the tag offered to it, which is offered only when there is
+  room; each sweep counts itself on every wait it keeps and answers the others late, so no wait
+  outlives its limit while the sweep is armed; a connection that closes or fails frees its wait;
+  and an answer under a tag that no request waits under reaches none of the server's connections.
 
   `start` does not start a router with a pattern that is not valid.
 - **The state is the handlers'.** After `serve(e)`, a server that goes on has the state that
   the handlers of the requests `e` completes gave back, one after another,
-  `router.run(state, completed(c, data))`, or, when `e` completes none, the state it had
-  (`moves_to`). `completed(c, data)` is the list of requests that bytes `data` complete on `c`. `REST_OUTCOME.make(s, resp).state` is `s`. A target that
+  `router.run_as(state, completed(c, data), offered)`, up to and with the first request that
+  waits, or, for an event the service handles, the state its handler gave, or else the state it
+  had (`moves_to`). `completed(c, data)` is the list of requests that bytes `data` complete on `c`. `REST_OUTCOME.make(s, resp).state` is `s`. A target that
   cannot be read, and any request to a router with no routes, keep the state they were given.
 - **Statuses.** A target that cannot be read is a `400` whatever the routes. A router with no
   routes answers `404`. `bad_body` and `bad_target` are `400`. `error(st, m)` has the status `st`,
@@ -171,7 +213,10 @@ state goes up with each request that reaches its handler, in the order the reque
 and not with one that is refused. On one connection, requests sent in turn and at once are
 answered in order, a `HEAD` without a body, and the connection is closed after `Connection:
 close`, an HTTP/1.0 request, bytes that are not a request, and the 100th request, whether the
-100 came in one read or two.
+100 came in one read or two. A scripted relay checks async handlers: a request answered by its
+upstream while another is served, a `504` on its last sweep with the connection kept, a failed
+connect, answers dropped after a timeout and after a close, a forged tag, requests after a
+waiting one, bytes while waiting, and a `503` when 32 wait.
 
 ## Tests
 
@@ -195,5 +240,11 @@ Exit code 0 means every case holds. `cargo test --test grest` does both.
 - That a request which asks to close gets its connection closed, and that a `HEAD` answer has
   no body, is checked by the scripted run, not proven.
 - The state is the whole service's: each request sees the state the one before it left, and two
-  requests are never handled at once. A handler that must wait for something else, such as
-  another service, comes with F.8.
+  requests are never handled at once. A handler that waits keeps what it waits for in that
+  state, visible to the verifier, not in a hidden continuation.
+- A request after one that waits on the same connection is not answered: the connection closes
+  after the answer, and the client sends it again.
+- Timeouts are counted in sweeps of one second: a wait of `n` sweeps ends after `n - 1` to `n`
+  seconds.
+- That the late answer sent is the waiting request's own, and that an answered wait leaves the
+  table, are checked by the scripted run, not proven.

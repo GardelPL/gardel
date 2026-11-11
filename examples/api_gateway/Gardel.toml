@@ -1,0 +1,8 @@
+[project]
+name = "api-gateway"
+version = "0.1.0"
+
+[dependencies]
+grest = { path = "../../grest" }
+ghttp = { path = "../../ghttp" }
+gjson = { path = "../../gjson" }

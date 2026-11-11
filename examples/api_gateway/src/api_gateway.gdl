@@ -1,0 +1,290 @@
+-- A gateway in front of another service (F.8, step 4): `GET /todos/:id` asks the upstream,
+-- a `todo_api` say, for the same path and answers with what it answers, while the gateway
+-- goes on serving other requests.
+--
+--   gardelc --project examples/api_gateway --strict
+--   build/api_gateway_bin.exe [port] [upstream port]   (8092 and 8091 when not given)
+--
+--   GET /health      200 "ok", from the gateway itself
+--   GET /todos/:id   the upstream's status, media type and body for GET /todos/:id;
+--                    502 if it cannot be reached or its answer cannot be read,
+--                    504 if it has not answered in 4 to 5 seconds,
+--                    503 if 32 requests already wait
+--
+-- The request waits in the server under the tag it is given, which tags the call upstream,
+-- its `Connect` and, plus one, its timer. The server answers it `504` on its fifth sweep;
+-- the call's timer closes the upstream connection after 8 s, so a call never outlives its
+-- request by much. The upstream is on 127.0.0.1.
+reactive program API_GATEWAY
+
+feature {ANY}
+
+  -- The `i`th argument, or "".
+  arg(xs: LIST[STRING], i: NAT): STRING
+    variant
+      i
+    do
+      if xs.length = 0 then
+        ""
+      else if i = 0 then
+        xs.head
+      else
+        arg(xs.tail, i - 1)
+      end end
+    end
+
+  -- How long a call may stay open upstream, in milliseconds.
+  deadline: U64
+    do
+      8000
+    end
+
+  upstream_unavailable: HTTP_RESPONSE
+    do
+      REST_RESPONSE.error(HTTP_STATUS.make(502), "upstream unavailable")
+    end
+
+  upstream_timed_out: HTTP_RESPONSE
+    do
+      REST_RESPONSE.error(HTTP_STATUS.make(504), "upstream timed out")
+    end
+
+  health(r: REST_REQUEST): HTTP_RESPONSE
+    do
+      REST_RESPONSE.ok_text("ok")
+    end
+
+  -- The request for the todo `id`, to the upstream on the port `p`. It asks the upstream to
+  -- close the connection after its answer.
+  upstream_request(p: NAT, id: NAT): OPTION[HTTP_REQUEST]
+    do
+      let d = NUMBER_TEXT.nat_to_text(id)
+      let q = NUMBER_TEXT.nat_to_text(p)
+      if d.byte_length <= 20 and q.byte_length <= 5 then
+        let hs = HTTP_HEADERS.default_empty
+          .add(HTTP_HEADER.make("Host", "127.0.0.1:".concat(q)))
+          .add(HTTP_HEADER.make("Connection", "close"))
+        Some(HTTP_REQUEST.make_simple(Get, "/todos/".concat(d)).with_headers(hs))
+      else
+        None
+      end
+    end
+
+  -- The media type the upstream's answer states, as far as a response here can state it.
+  media_of(q: HTTP_CLIENT_RESPONSE): HTTP_CONTENT_TYPE
+    do
+      match q.header("Content-Type")
+        case None then Unstated
+        case Some(v) then if v.starts_with("application/json") then Json else PlainText end
+      end
+    end
+
+  -- The upstream's answer `q`, as the gateway's: its status, media type and body, or `502`
+  -- for an interim answer or a body that is not UTF-8 or too long.
+  relayed(q: HTTP_CLIENT_RESPONSE): HTTP_RESPONSE
+    do
+      if q.status.is_informational then
+        upstream_unavailable
+      else if q.status.forbids_body then
+        HTTP_RESPONSE.make_empty(q.status)
+      else
+        match STRING.from_utf8(q.body)
+          case Error(_) then upstream_unavailable
+          case Ok(t) then
+            if t.byte_length <= 65536 then
+              HTTP_RESPONSE.make_text(q.status, t).with_content_type(media_of(q))
+            else
+              upstream_unavailable
+            end
+        end
+      end end
+    end
+
+  -- The call `k` is made, and its request waits for the answer through 5 sweeps.
+  calling(s: GATEWAY_CALLS, k: GATEWAY_CALL): REST_OUTCOME[GATEWAY_CALLS]
+    require
+      room: s.has_room
+    do
+      let next = s.adding(k)
+      let timer = SetTimer(k.timer, deadline)
+      let connect = Connect(k.tag, "127.0.0.1", s.upstream_port)
+      REST_OUTCOME.waiting(next, k.tag, LIST.empty.prepend(timer).prepend(connect), 5, upstream_timed_out)
+    ensure
+      waits: Result.waits and Result.wait_tag = k.tag and Result.state.holds(k.tag)
+      one_more: Result.state.count <= s.count + 1
+    end
+
+  -- `GET /todos/:id`: a call upstream, and the request waits for its answer through 5
+  -- sweeps. An id that is not a number is a `404` here, and with 32 calls upstream the
+  -- request is a `503`.
+  fetch_todo(s: GATEWAY_CALLS, r: REST_REQUEST, tag: NAT): REST_OUTCOME[GATEWAY_CALLS]
+    do
+      match r.param_nat("id")
+        case None then
+          REST_OUTCOME.make(s, REST_RESPONSE.not_found)
+        case Some(id) then
+          match upstream_request(s.upstream_port, id)
+            case None then
+              REST_OUTCOME.make(s, REST_RESPONSE.not_found)
+            case Some(req) then
+              if not s.has_room or tag >= GATEWAY_CALL.max_tag then
+                REST_OUTCOME.make(s, REST_RESPONSE.unavailable)
+              else if not HTTP_REQUEST_WRITER.sendable(req) then
+                REST_OUTCOME.make(s, REST_RESPONSE.not_found)
+              else
+                let k = GATEWAY_CALL.make(tag, req)
+                calling(s, k)
+              end end
+          end
+      end
+    ensure
+      -- The request waits only under the tag it was given, and the call is made under it.
+      own_tag: Result.waits implies (Result.wait_tag = tag and Result.state.holds(tag))
+      one_more: Result.state.count <= s.count + 1
+    end
+
+  -- The answer `resp` to the call `k` on `c`, which ends it: `c` is closed and the timer
+  -- cancelled.
+  finished(s: GATEWAY_CALLS, k: GATEWAY_CALL, c: CONN_ID, resp: HTTP_RESPONSE): REST_WAKE[GATEWAY_CALLS]
+    do
+      REST_WAKE.answering(s.ending(k.tag).closing(c), LIST.empty.prepend(CancelTimer(k.timer)).prepend(Close(c)), k.tag, resp)
+    ensure
+      tag_set: Result.answer_tag = k.tag
+      freed: not Result.state.holds_on(c)
+      not_more: Result.state.count <= s.count
+    end
+
+  -- The call tagged `t` is connected on `c`: its request is sent. A connect that ends after
+  -- its call did is closed.
+  on_connected(s: GATEWAY_CALLS, t: NAT, c: CONN_ID): REST_WAKE[GATEWAY_CALLS]
+    do
+      match s.call(t)
+        case None then REST_WAKE.make(s, LIST.empty.prepend(Close(c)))
+        case Some(k) then REST_WAKE.make(s.updating(k.connected(c)), LIST.empty.prepend(Send(c, k.request_bytes)))
+      end
+    ensure
+      no_answer: Result.answer.is_none
+      same_count: Result.state.count = s.count
+    end
+
+  -- The connect of the call tagged `t` failed: `502`.
+  connect_failed(s: GATEWAY_CALLS, t: NAT): REST_WAKE[GATEWAY_CALLS]
+    do
+      match s.call(t)
+        case None then REST_WAKE.make(s, LIST.empty)
+        case Some(k) then REST_WAKE.answering(s.ending(t), LIST.empty.prepend(CancelTimer(k.timer)), t, upstream_unavailable)
+      end
+    ensure
+      held: Result.answer.is_some implies s.holds(Result.answer_tag)
+      not_more: Result.state.count <= s.count
+    end
+
+  -- The bytes `data` came on `c`: more of a call's answer, or all of it. Bytes on a
+  -- connection that is no call's close it.
+  received(s: GATEWAY_CALLS, c: CONN_ID, data: BYTES): REST_WAKE[GATEWAY_CALLS]
+    do
+      match s.call_on(c)
+        case None then
+          REST_WAKE.make(s, LIST.empty.prepend(Close(c)))
+        case Some(k) then
+          match HTTP_CLIENT.receive(k.exchange, data)
+            case Waiting(n) then REST_WAKE.make(s.updating(k.reading(n)), LIST.empty)
+            case Reuse(_, q) then finished(s, k, c, relayed(q))
+            case Done(q) then finished(s, k, c, relayed(q))
+            case Broken(_) then finished(s, k, c, upstream_unavailable)
+            case Unanswered then finished(s, k, c, upstream_unavailable)
+          end
+      end
+    ensure
+      held: Result.answer.is_some implies s.holds(Result.answer_tag)
+      not_more: Result.state.count <= s.count
+    end
+
+  -- `c` closed, or a send on it failed: a call on it ends, with what came of its answer, or
+  -- `502`.
+  ended(s: GATEWAY_CALLS, c: CONN_ID): REST_WAKE[GATEWAY_CALLS]
+    do
+      match s.call_on(c)
+        case None then
+          REST_WAKE.make(s.closing(c), LIST.empty)
+        case Some(k) then
+          match HTTP_CLIENT.closed(k.exchange)
+            case Done(q) then finished(s, k, c, relayed(q))
+            case _ then finished(s, k, c, upstream_unavailable)
+          end
+      end
+    ensure
+      held: Result.answer.is_some implies s.holds(Result.answer_tag)
+      freed: not Result.state.holds_on(c)
+      not_more: Result.state.count <= s.count
+    end
+
+  -- The timer `id` ran out: the call it times ends, and its connection, if it has one, is
+  -- closed. Its request has been answered `504` by then; the answer here is dropped.
+  expired(s: GATEWAY_CALLS, id: NAT): REST_WAKE[GATEWAY_CALLS]
+    do
+      if id = 0 then
+        REST_WAKE.make(s, LIST.empty)
+      else
+        match s.call(id - 1)
+          case None then
+            REST_WAKE.make(s, LIST.empty)
+          case Some(k) then
+            match k.connection
+              case None then REST_WAKE.answering(s.ending(k.tag), LIST.empty, k.tag, upstream_timed_out)
+              case Some(c) then finished(s, k, c, upstream_timed_out)
+            end
+        end
+      end
+    ensure
+      held: Result.answer.is_some implies s.holds(Result.answer_tag)
+      not_more: Result.state.count <= s.count
+    end
+
+  -- Every event that is not the server's own.
+  wake(s: GATEWAY_CALLS, e: EVENT): REST_WAKE[GATEWAY_CALLS]
+    do
+      match e
+        case Connected(t, c) then on_connected(s, t, c)
+        case ConnectFailed(t, _) then connect_failed(s, t)
+        case Received(c, data) then received(s, c, data)
+        case Closed(c) then ended(s, c)
+        case SendFailed(c, _) then ended(s, c)
+        case Tick(id) then expired(s, id)
+        case _ then REST_WAKE.make(s, LIST.empty)
+      end
+    ensure
+      -- An answer goes only to a request a call was made for.
+      answers_a_call: Result.answer.is_some implies s.holds(Result.answer_tag)
+      -- Only a request makes a call.
+      not_more: Result.state.count <= s.count
+      -- A connection that closes ends its call.
+      freed: match e case Closed(c) then not Result.state.holds_on(c) case _ then True end
+    end
+
+  routes: REST_ROUTER[GATEWAY_CALLS]
+    do
+      REST_ROUTER.empty
+        .on_get("/health", health)
+        .on_await(Get, "/todos/:id", fetch_todo)
+    end
+
+  init(args: SEQ[STRING]): STEP[REST_SERVER[GATEWAY_CALLS]]
+    do
+      let a = arg(args.to_list, 1)
+      if a.byte_length = 0 then
+        REST_SERVER.start_waking(args, 8092, routes, wake, GATEWAY_CALLS.empty(8091))
+      else
+        match REST_COMMANDS.port_of(a)
+          case Some(p) then REST_SERVER.start_waking(args, 8092, routes, wake, GATEWAY_CALLS.empty(p))
+          case None then Stop(2, LIST.empty.prepend(Print(REST_COMMANDS.complaint("api_gateway: not an upstream port: ", a))))
+        end
+      end
+    end
+
+  step(s: REST_SERVER[GATEWAY_CALLS], e: EVENT): STEP[REST_SERVER[GATEWAY_CALLS]]
+    do
+      s.serve(e)
+    end
+
+end
