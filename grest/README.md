@@ -52,7 +52,8 @@ none. A route whose pattern is not valid, or an argument that is not a port, sto
 with exit status 2 and a message, before it listens.
 [`examples/todo_api`](../examples/todo_api) is a service with a state, and
 [`examples/hello_api`](../examples/hello_api) one of four routes whose handlers do not look at
-it, so its state is a `NAT` that stays `0`.
+it, so its state is a `NAT` that stays `0`. [`examples/api_gateway`](../examples/api_gateway)
+waits for another service.
 
 A handler is a pure function, and a routine's name is one. Handlers belong in a `functions` or
 `program` module: in a `module`, a lambda that calls a sibling routine is not yet translated.
@@ -128,7 +129,8 @@ A route made with `on_await(m, p, h)` may wait: `h(s, r, tag)` gives
 request to such a route is a `503`, `{"error":"busy"}`, and `h` is not called. Every event that is
 not the server's own, a `Connected`, bytes from a connection the service opened, a timer of its
 own, goes to the handler given to `start_waking`, which keeps its state and may answer the request
-by its tag. A sketch, where `GATE` is the service's state and its queries are the service's own:
+by its tag. A sketch, where `GATE` is the service's state and its queries are the service's own;
+[`examples/api_gateway`](../examples/api_gateway) is the whole of one, over `ghttp`'s client:
 
 ```gardel
 wake(s: GATE, e: EVENT): REST_WAKE[GATE]

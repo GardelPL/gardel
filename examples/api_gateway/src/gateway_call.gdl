@@ -1,0 +1,105 @@
+-- A call the gateway makes upstream for one waiting request (F.8, step 4). Its tag is the tag
+-- the server gave the request it answers, which is also the tag of its `Connect` and, plus
+-- one, the id of its timer, as timer 0 is the server's sweep. It holds the bytes of the
+-- request it sends once connected, the connection once there is one, and the client side of
+-- the exchange, which waits for the answer from the start.
+module GATEWAY_CALL
+
+representation {NONE}
+  id: NAT
+  link: OPTION[CONN_ID]
+  wire: BYTES
+  client: HTTP_CLIENT_CONNECTION
+
+invariant
+  waits: not client.is_free
+  tag_fits: id < 1000000000
+
+create {ANY}
+
+  -- Tags are below this, as a `grest` server gives them.
+  max_tag: NAT
+    do
+      1000000000
+    ensure
+      def: Result = 1000000000
+    end
+
+  -- The call tagged `t` that sends `req`.
+  make(t: NAT, req: HTTP_REQUEST): GATEWAY_CALL
+    require
+      sendable: HTTP_REQUEST_WRITER.sendable(req)
+      tag_fits: t < 1000000000
+    do
+      { id = t, link = None, wire = HTTP_REQUEST_WRITER.serialize(req), client = HTTP_CLIENT_CONNECTION.fresh.sending(req) }
+    ensure
+      tag_set: Result.tag = t
+      not_yet: Result.connection.is_none
+    end
+
+feature {ANY}
+
+  tag: NAT
+    do
+      Current.id
+    end
+
+  -- The timer that ends the call if no answer comes: never the sweep's.
+  timer: NAT
+    do
+      Current.id + 1
+    ensure
+      not_sweep: Result >= 1
+    end
+
+  -- The connection, once it is made.
+  connection: OPTION[CONN_ID]
+    do
+      Current.link
+    end
+
+  -- Whether the call is on `c`.
+  is_on(c: CONN_ID): BOOL
+    do
+      match Current.link
+        case Some(d) then d = c
+        case None then False
+      end
+    ensure
+      def: Result = (match Current.connection case Some(d) then d = c case None then False end)
+    end
+
+  -- The request, as it is sent.
+  request_bytes: BYTES
+    do
+      Current.wire
+    end
+
+  -- The client side of the exchange: it waits for the answer.
+  exchange: HTTP_CLIENT_CONNECTION
+    do
+      Current.client
+    ensure
+      waiting: not Result.is_free
+    end
+
+  -- The call, connected on `c`.
+  connected(c: CONN_ID): GATEWAY_CALL
+    do
+      { Current with link = Some(c) }
+    ensure
+      on: Result.is_on(c)
+      same_tag: Result.tag = Current.tag
+    end
+
+  -- The call, with what has come of the answer held by `n`.
+  reading(n: HTTP_CLIENT_CONNECTION): GATEWAY_CALL
+    require
+      waiting: not n.is_free
+    do
+      { Current with client = n }
+    ensure
+      same_tag: Result.tag = Current.tag
+    end
+
+end

@@ -1,0 +1,218 @@
+-- The gateway's state: the upstream's port and the calls it has made there, at most 32, as
+-- many as requests wait in a `grest` server. A call is found by its tag, the tag of the
+-- request it answers, or by its connection.
+module GATEWAY_CALLS
+
+representation {NONE}
+  port: NAT
+  calls: LIST[GATEWAY_CALL]
+
+invariant
+  valid_port: port >= 1 and port <= 65535
+  bounded: calls.length <= 32
+
+create {ANY}
+
+  -- No calls yet, to an upstream on the port `p`.
+  empty(p: NAT): GATEWAY_CALLS
+    require
+      valid_port: p >= 1 and p <= 65535
+    do
+      { port = p, calls = LIST.empty }
+    ensure
+      none: Result.count = 0
+      port_set: Result.upstream_port = p
+    end
+
+create {NONE}
+
+  -- The first call of `ks` tagged `t`.
+  find_tag(ks: LIST[GATEWAY_CALL], t: NAT): OPTION[GATEWAY_CALL]
+    variant
+      ks.length
+    do
+      if ks.length = 0 then
+        None
+      else if ks.head.tag = t then
+        Some(ks.head)
+      else
+        find_tag(ks.tail, t)
+      end end
+    ensure
+      tagged: Result.is_some implies Result.get.tag = t
+      first: (ks.length > 0 and ks.head.tag = t) implies Result.is_some
+      rest: (ks.length > 0 and ks.head.tag != t) implies Result.is_some = find_tag(ks.tail, t).is_some
+    end
+
+  -- The first call of `ks` on `c`. Its tag finds a call too.
+  find_conn(ks: LIST[GATEWAY_CALL], c: CONN_ID): OPTION[GATEWAY_CALL]
+    variant
+      ks.length
+    do
+      if ks.length = 0 then
+        None
+      else if ks.head.is_on(c) then
+        Some(ks.head)
+      else
+        find_conn(ks.tail, c)
+      end end
+    ensure
+      on: Result.is_some implies Result.get.is_on(c)
+      tag_found: Result.is_some implies find_tag(ks, Result.get.tag).is_some
+    end
+
+  -- Some call of `ks` is on `c`.
+  on(ks: LIST[GATEWAY_CALL], c: CONN_ID): BOOL
+    variant
+      ks.length
+    do
+      if ks.length = 0 then False else ks.head.is_on(c) or on(ks.tail, c) end
+    ensure
+      def: Result = (ks.length > 0 and (ks.head.is_on(c) or on(ks.tail, c)))
+    end
+
+  -- `ks` with no call tagged `t`.
+  without_tag(ks: LIST[GATEWAY_CALL], t: NAT): LIST[GATEWAY_CALL]
+    variant
+      ks.length
+    do
+      if ks.length = 0 then
+        LIST.empty
+      else
+        let rest = without_tag(ks.tail, t)
+        if ks.head.tag = t then rest else rest.prepend(ks.head) end
+      end
+    ensure
+      not_longer: Result.length <= ks.length
+      gone: find_tag(Result, t).is_none
+    end
+
+  -- `ks` with no call on `c`.
+  without_conn(ks: LIST[GATEWAY_CALL], c: CONN_ID): LIST[GATEWAY_CALL]
+    variant
+      ks.length
+    do
+      if ks.length = 0 then
+        LIST.empty
+      else
+        let rest = without_conn(ks.tail, c)
+        if ks.head.is_on(c) then rest else rest.prepend(ks.head) end
+      end
+    ensure
+      not_longer: Result.length <= ks.length
+      gone: not on(Result, c)
+    end
+
+  -- `ks` with `k` in place of each call with its tag.
+  replaced(ks: LIST[GATEWAY_CALL], k: GATEWAY_CALL): LIST[GATEWAY_CALL]
+    variant
+      ks.length
+    do
+      if ks.length = 0 then
+        LIST.empty
+      else
+        let rest = replaced(ks.tail, k)
+        if ks.head.tag = k.tag then rest.prepend(k) else rest.prepend(ks.head) end
+      end
+    ensure
+      same_length: Result.length = ks.length
+    end
+
+feature {ANY}
+
+  -- The upstream's port.
+  upstream_port: NAT
+    do
+      Current.port
+    ensure
+      valid: Result >= 1 and Result <= 65535
+    end
+
+  -- How many calls are upstream.
+  count: NAT
+    do
+      Current.calls.length
+    ensure
+      bounded: Result <= 32
+    end
+
+  has_room: BOOL
+    do
+      Current.calls.length < 32
+    ensure
+      def: Result = (Current.count < 32)
+    end
+
+  -- The call tagged `t`.
+  call(t: NAT): OPTION[GATEWAY_CALL]
+    do
+      find_tag(Current.calls, t)
+    ensure
+      tagged: Result.is_some implies Result.get.tag = t
+    end
+
+  -- Whether a call is tagged `t`.
+  holds(t: NAT): BOOL
+    do
+      find_tag(Current.calls, t).is_some
+    ensure
+      def: Result = Current.call(t).is_some
+    end
+
+  -- The call on `c`.
+  call_on(c: CONN_ID): OPTION[GATEWAY_CALL]
+    do
+      find_conn(Current.calls, c)
+    ensure
+      on: Result.is_some implies Result.get.is_on(c)
+      held: Result.is_some implies Current.holds(Result.get.tag)
+    end
+
+  -- Whether a call is on `c`.
+  holds_on(c: CONN_ID): BOOL
+    do
+      on(Current.calls, c)
+    end
+
+  -- The calls with `k`, in place of any with its tag.
+  adding(k: GATEWAY_CALL): GATEWAY_CALLS
+    require
+      room: Current.has_room
+    do
+      { Current with calls = without_tag(Current.calls, k.tag).prepend(k) }
+    ensure
+      held: Result.holds(k.tag)
+      not_more: Result.count <= Current.count + 1
+      same_port: Result.upstream_port = Current.upstream_port
+    end
+
+  -- The calls with `k` in place of the one with its tag.
+  updating(k: GATEWAY_CALL): GATEWAY_CALLS
+    do
+      { Current with calls = replaced(Current.calls, k) }
+    ensure
+      same_count: Result.count = Current.count
+      same_port: Result.upstream_port = Current.upstream_port
+    end
+
+  -- The calls without the one tagged `t`, once it has ended.
+  ending(t: NAT): GATEWAY_CALLS
+    do
+      { Current with calls = without_tag(Current.calls, t) }
+    ensure
+      gone: not Result.holds(t)
+      not_more: Result.count <= Current.count
+      same_port: Result.upstream_port = Current.upstream_port
+    end
+
+  -- The calls without any on `c`, once `c` has closed.
+  closing(c: CONN_ID): GATEWAY_CALLS
+    do
+      { Current with calls = without_conn(Current.calls, c) }
+    ensure
+      gone: not Result.holds_on(c)
+      not_more: Result.count <= Current.count
+      same_port: Result.upstream_port = Current.upstream_port
+    end
+
+end
