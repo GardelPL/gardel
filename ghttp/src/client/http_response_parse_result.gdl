@@ -1,0 +1,32 @@
+-- What reading a response gives: a reader waiting for more, the response and the bytes after
+-- it, or the error that stops it.
+module HTTP_RESPONSE_PARSE_RESULT
+
+representation {ANY}
+  | NeedMoreResponse(reader: HTTP_RESPONSE_READER)
+  | CompleteResponse(response: HTTP_CLIENT_RESPONSE, remaining: BYTES)
+  | FailedResponse(err: HTTP_ERROR)
+
+feature {ANY}
+
+  is_complete: BOOL
+    do
+      match Current
+        case CompleteResponse(_, _) then True
+        case _ then False
+      end
+    ensure
+      def: Result = (match Current case CompleteResponse(_, _) then True case _ then False end)
+    end
+
+  is_need_more: BOOL
+    do
+      match Current
+        case NeedMoreResponse(_) then True
+        case _ then False
+      end
+    ensure
+      def: Result = (match Current case NeedMoreResponse(_) then True case _ then False end)
+    end
+
+end

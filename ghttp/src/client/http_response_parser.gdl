@@ -1,0 +1,201 @@
+-- Incremental HTTP/1.1 response reader, for a client (RFC 9112).
+--
+-- As `HTTP_PARSER` does for requests, each `feed` appends the new bytes and reads the whole
+-- buffer again, so the answer depends on the bytes alone, never on where TCP cut them. The
+-- head ends at the first blank line. The body is framed as RFC 9112 section 6.3 says: none
+-- for the answer to a `HEAD` and for a 1xx, 204 or 304; else `Content-Length` bytes; else
+-- every byte until the connection closes, which `finish` reads. Chunked transfer coding is
+-- not supported. The status line may leave out its reason phrase, as `HTTP_SERIALIZER`'s do.
+functions HTTP_RESPONSE_PARSER
+
+feature {ANY}
+
+  -- Appends `chunk` to the bytes received and reads them.
+  feed(r: HTTP_RESPONSE_READER, chunk: BYTES): HTTP_RESPONSE_PARSE_RESULT
+    do
+      if chunk.length > 1048576 then
+        FailedResponse(BodyTooLarge)
+      else
+        parse_buffer(r, r.bytes_received.concat(chunk), False)
+      end
+    ensure
+      -- Nothing received is lost: a reader that waits for more holds all of it, in order.
+      keeps_bytes: match Result
+        case NeedMoreResponse(s) then
+          s.bytes_received.model = r.bytes_received.model.append(chunk.model) and
+          s.answers_head = r.answers_head and
+          s.head_limit = r.head_limit and
+          s.body_limit = r.body_limit
+        case _ then True
+      end
+      faithful: chunk.length <= 1048576 implies
+        HTTP_RESPONSE_PARSER.faithful(r, r.bytes_received.concat(chunk), Result)
+    end
+
+  -- The connection closed. A body that runs to the close ends here, and a response that is
+  -- not complete is an `IncompleteResponse`: nothing waits for more.
+  finish(r: HTTP_RESPONSE_READER): HTTP_RESPONSE_PARSE_RESULT
+    do
+      parse_buffer(r, r.bytes_received, True)
+    ensure
+      ends: not Result.is_need_more
+      faithful: HTTP_RESPONSE_PARSER.faithful(r, r.bytes_received, Result)
+    end
+
+  -- What reading `buf`, all the bytes received, promises. A reader that waits for more holds
+  -- `buf`, for the same request and under the same limits. A complete response is followed
+  -- by the tail of `buf`, and its body is the bytes just before that tail.
+  faithful(r: HTTP_RESPONSE_READER, buf: BYTES, res: HTTP_RESPONSE_PARSE_RESULT): BOOL
+    do
+      match res
+        case NeedMoreResponse(s) then
+          s.bytes_received.model = buf.model and
+          s.answers_head = r.answers_head and
+          s.head_limit = r.head_limit and
+          s.body_limit = r.body_limit
+        case CompleteResponse(q, rest) then
+          rest.length <= buf.length and q.body.length <= buf.length - rest.length and
+          rest.model = BYTES.list_take(BYTES.list_drop(buf.model, buf.length - rest.length), rest.length) and
+          q.body.model = BYTES.list_take(
+            BYTES.list_drop(buf.model, buf.length - rest.length - q.body.length), q.body.length)
+        case FailedResponse(_) then
+          True
+      end
+    end
+
+  -- Reads `buf`, all the bytes received. `closed` says the connection has closed.
+  parse_buffer(r: HTTP_RESPONSE_READER, buf: BYTES, closed: BOOL): HTTP_RESPONSE_PARSE_RESULT
+    do
+      match buf.index_of("\r\n".to_utf8, 0)
+        case None then
+          if buf.length > r.head_limit then
+            FailedResponse(HeaderTooLarge)
+          else if closed then
+            FailedResponse(IncompleteResponse)
+          else
+            NeedMoreResponse(r.with_received(buf))
+          end end
+        case Some(le) then
+          if le > r.head_limit then
+            FailedResponse(HeaderTooLarge)
+          else
+            parse_head(r, buf, le, closed)
+          end
+      end
+    ensure
+      sound: HTTP_RESPONSE_PARSER.faithful(r, buf, Result)
+      closed_ends: closed implies not Result.is_need_more
+    end
+
+  -- The status line ends at `le`. Looks for the blank line that ends the head.
+  parse_head(r: HTTP_RESPONSE_READER, buf: BYTES, le: NAT, closed: BOOL): HTTP_RESPONSE_PARSE_RESULT
+    require
+      line_fits: le <= r.head_limit
+      in_buf: le <= buf.length
+    do
+      match buf.index_of("\r\n\r\n".to_utf8, le)
+        case None then
+          if buf.length > r.head_limit then
+            FailedResponse(HeaderTooLarge)
+          else if closed then
+            FailedResponse(IncompleteResponse)
+          else
+            NeedMoreResponse(r.with_received(buf))
+          end end
+        case Some(he) then
+          if he + 4 > r.head_limit or he + 4 > buf.length then
+            FailedResponse(HeaderTooLarge)
+          else
+            match status_line(buf, le)
+              case Error(e) then
+                FailedResponse(e)
+              case Ok(vs) then
+                match HTTP_HEAD_PARSER.fields(buf, le + 2, he, HTTP_HEADERS.empty_with_limit(64), None, False)
+                  case Error(e) then
+                    FailedResponse(e)
+                  case Ok(f) then
+                    match f
+                      case ParsedFields(hs, cl, te) then
+                        HTTP_RESPONSE_PARSER.frame(r, buf, vs.first, vs.second, hs, cl, te, he + 4, closed)
+                    end
+                end
+            end
+          end
+      end
+    ensure
+      sound: HTTP_RESPONSE_PARSER.faithful(r, buf, Result)
+      closed_ends: closed implies not Result.is_need_more
+    end
+
+  -- A decimal digit.
+  is_digit(b: U64): BOOL
+    do
+      b >= 48 and b <= 57
+    end
+
+  -- The status line `buf[0, le)`: `HTTP/1.1` or `HTTP/1.0`, a space, three digits from 100 to
+  -- 599, and nothing more, or a space and a reason phrase, which is not kept.
+  status_line(buf: BYTES, le: NAT): RESULT[HTTP_ERROR, TUPLE[HTTP_VERSION, HTTP_STATUS]]
+    require
+      in_buf: le <= buf.length
+    do
+      if le < 12 then
+        Error(MalformedStatusLine)
+      else
+        match HTTP_HEAD_PARSER.version_of(buf.slice(0, 8))
+          case Error(e) then
+            if e.equals(UnsupportedVersion) then Error(UnsupportedVersion) else Error(MalformedStatusLine) end
+          case Ok(v) then
+            let a = buf.at(9)
+            let b = buf.at(10)
+            let c = buf.at(11)
+            if buf.at(8) != 32 or a < 49 or a > 53 or not is_digit(b) or not is_digit(c) then
+              Error(MalformedStatusLine)
+            else if le > 12 and buf.at(12) != 32 then
+              Error(MalformedStatusLine)
+            else
+              Ok((v, HTTP_STATUS.make((a - 48) * 100 + (b - 48) * 10 + (c - 48))))
+            end end
+        end
+      end
+    end
+
+  -- The body starts at `start`, after a head that gave the version `v`, the status `st`, the
+  -- fields `hs`, and the framing `cl` and `te`.
+  frame(r: HTTP_RESPONSE_READER, buf: BYTES, v: HTTP_VERSION, st: HTTP_STATUS, hs: HTTP_HEADERS,
+        cl: OPTION[NAT], te: BOOL, start: NAT, closed: BOOL): HTTP_RESPONSE_PARSE_RESULT
+    require
+      head_fits: start <= r.head_limit
+      in_buf: start <= buf.length
+    do
+      if r.answers_head or st.forbids_body then
+        CompleteResponse(HTTP_CLIENT_RESPONSE.make(v, st, hs, BYTES.empty), buf.slice(start, buf.length))
+      else if te then
+        if cl.is_some then FailedResponse(ConflictingFraming) else FailedResponse(UnsupportedTransferEncoding) end
+      else
+        match cl
+          case Some(n) then
+            if n > r.body_limit then
+              FailedResponse(BodyTooLarge)
+            else if buf.length - start < n then
+              if closed then FailedResponse(IncompleteResponse) else NeedMoreResponse(r.with_received(buf)) end
+            else
+              CompleteResponse(HTTP_CLIENT_RESPONSE.make(v, st, hs, buf.slice(start, start + n)),
+                buf.slice(start + n, buf.length))
+            end end
+          case None then
+            if buf.length - start > r.body_limit then
+              FailedResponse(BodyTooLarge)
+            else if closed then
+              CompleteResponse(HTTP_CLIENT_RESPONSE.make(v, st, hs, buf.slice(start, buf.length)), BYTES.empty)
+            else
+              NeedMoreResponse(r.with_received(buf))
+            end end
+        end
+      end end
+    ensure
+      sound: HTTP_RESPONSE_PARSER.faithful(r, buf, Result)
+      closed_ends: closed implies not Result.is_need_more
+    end
+
+end

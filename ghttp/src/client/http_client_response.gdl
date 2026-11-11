@@ -1,0 +1,76 @@
+-- A response a client received: its version, status, fields and body. Unlike
+-- `HTTP_RESPONSE`, which a server builds, it holds any fields, and its body is any bytes.
+module HTTP_CLIENT_RESPONSE
+
+representation {NONE}
+  resp_version: HTTP_VERSION
+  resp_status: HTTP_STATUS
+  resp_headers: HTTP_HEADERS
+  resp_body: BYTES
+
+invariant
+  body_bounded: resp_body.length <= 16777216
+  no_body_when_forbidden: resp_status.forbids_body implies resp_body.length = 0
+
+create {ANY}
+
+  make(v: HTTP_VERSION, st: HTTP_STATUS, hs: HTTP_HEADERS, b: BYTES): HTTP_CLIENT_RESPONSE
+    require
+      body_fits: b.length <= 16777216
+      allowed: st.forbids_body implies b.length = 0
+    do
+      { resp_version = v, resp_status = st, resp_headers = hs, resp_body = b }
+    ensure
+      version_set: Result.version = v
+      status_set: Result.status_code = st.status_code
+      headers_set: Result.header_count = hs.num_headers
+      body_set: Result.body.model = b.model
+    end
+
+feature {ANY}
+
+  version: HTTP_VERSION
+    do
+      Current.resp_version
+    end
+
+  status: HTTP_STATUS
+    do
+      Current.resp_status
+    end
+
+  status_code: NAT
+    do
+      Current.resp_status.status_code
+    ensure
+      def: Result = Current.status.status_code
+      in_range: Result >= 100 and Result <= 599
+    end
+
+  headers: HTTP_HEADERS
+    do
+      Current.resp_headers
+    end
+
+  header_count: NAT
+    do
+      Current.resp_headers.num_headers
+    ensure
+      def: Result = Current.headers.num_headers
+    end
+
+  -- The value of the field named `key`, ignoring the case of the name.
+  header(key: STRING): OPTION[STRING]
+    do
+      Current.resp_headers.lookup_header(key)
+    end
+
+  body: BYTES
+    do
+      Current.resp_body
+    ensure
+      bounded: Result.length <= 16777216
+      forbidden_empty: Current.status.forbids_body implies Result.length = 0
+    end
+
+end

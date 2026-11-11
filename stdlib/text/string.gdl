@@ -20,6 +20,7 @@ create {ANY}
       { bytes = LIST.empty, size = 0, char_count = 0, limit = cap }
     ensure
       empty_bytes: Result.byte_length = 0
+      empty_model: Result.byte_model = LIST.empty
       empty_chars: Result.chars = LIST.empty
       empty_count: Result.code_point_count = 0
       empty_str: Result.is_empty
@@ -43,6 +44,7 @@ create {ANY}
       ok_iff_valid: Result.is_ok = BYTES.valid_utf8(bytes.model)
       ok_chars: Result.is_ok implies Result.get.chars = BYTES.decode_utf8(bytes.model)
       ok_len: Result.is_ok implies Result.get.byte_length = bytes.length
+      ok_bytes: Result.is_ok implies Result.get.byte_model = bytes.model
       ok_points: Result.is_ok implies Result.get.code_point_count = Result.get.chars.length
     end
 
@@ -547,6 +549,7 @@ feature {ANY}
       bytes_appended: Result.byte_length = Current.byte_length + other.byte_length
       chars_appended: Result.code_point_count = Current.code_point_count + other.code_point_count
       chars_model: Result.chars = Current.chars.append(other.chars)
+      bytes_model: Result.byte_model = Current.byte_model.append(other.byte_model)
     end
 
   to_utf8: BYTES
@@ -572,6 +575,7 @@ feature {ANY}
       grew: Result.byte_length = Current.byte_length + 1
       code_point_grew: Result.code_point_count = Current.code_point_count + 1
       chars_prepended: Result.chars = Current.chars.prepend(c)
+      bytes_prepended: Result.byte_model = Current.byte_model.prepend(c.code)
       non_empty: not Result.is_empty
       same_capacity: Result.capacity = Current.capacity
     end
@@ -590,6 +594,7 @@ feature {ANY}
       grew: Result.byte_length = Current.byte_length + 2
       code_point_grew: Result.code_point_count = Current.code_point_count + 1
       chars_prepended: Result.chars = Current.chars.prepend(CHAR.from_scalar((b0 - 192) * 64 + (b1 - 128)))
+      bytes_prepended: Result.byte_model = Current.byte_model.prepend(b1).prepend(b0)
       non_empty: not Result.is_empty
       same_capacity: Result.capacity = Current.capacity
     end
@@ -611,6 +616,7 @@ feature {ANY}
       grew: Result.byte_length = Current.byte_length + 3
       code_point_grew: Result.code_point_count = Current.code_point_count + 1
       chars_prepended: Result.chars = Current.chars.prepend(CHAR.from_scalar((b0 - 224) * 4096 + (b1 - 128) * 64 + (b2 - 128)))
+      bytes_prepended: Result.byte_model = Current.byte_model.prepend(b2).prepend(b1).prepend(b0)
       non_empty: not Result.is_empty
       same_capacity: Result.capacity = Current.capacity
     end
@@ -633,6 +639,7 @@ feature {ANY}
       grew: Result.byte_length = Current.byte_length + 4
       code_point_grew: Result.code_point_count = Current.code_point_count + 1
       chars_prepended: Result.chars = Current.chars.prepend(CHAR.from_scalar((b0 - 240) * 262144 + (b1 - 128) * 4096 + (b2 - 128) * 64 + (b3 - 128)))
+      bytes_prepended: Result.byte_model = Current.byte_model.prepend(b3).prepend(b2).prepend(b1).prepend(b0)
       non_empty: not Result.is_empty
       same_capacity: Result.capacity = Current.capacity
     end

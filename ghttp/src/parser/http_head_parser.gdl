@@ -42,20 +42,37 @@ feature {ANY}
       end
     end
 
-  -- The method a token names. RFC 9110 methods are case-sensitive.
+  -- The bytes of `m`, as a request line spells it.
+  spelling(m: HTTP_METHOD): BYTES
+    do
+      m.to_string.to_utf8
+    ensure
+      def: Result.model = m.to_string.byte_model
+    end
+
+  -- The bytes of `v`, as a request line spells it.
+  version_spelling(v: HTTP_VERSION): BYTES
+    do
+      v.to_string.to_utf8
+    ensure
+      def: Result.model = v.to_string.byte_model
+    end
+
+  -- The method a token names. RFC 9110 methods are case-sensitive. Each is compared with
+  -- `HTTP_METHOD.to_string`, the spelling a writer uses, so the two cannot disagree.
   method_of(tok: BYTES): RESULT[HTTP_ERROR, HTTP_METHOD]
     do
-      if tok.equals("GET".to_utf8) then
+      if tok.equals(spelling(Get)) then
         Ok(Get)
-      else if tok.equals("HEAD".to_utf8) then
+      else if tok.equals(spelling(Head)) then
         Ok(Head)
-      else if tok.equals("POST".to_utf8) then
+      else if tok.equals(spelling(Post)) then
         Ok(Post)
-      else if tok.equals("PUT".to_utf8) then
+      else if tok.equals(spelling(Put)) then
         Ok(Put)
-      else if tok.equals("DELETE".to_utf8) then
+      else if tok.equals(spelling(Delete)) then
         Ok(Delete)
-      else if tok.equals("OPTIONS".to_utf8) then
+      else if tok.equals(spelling(Options)) then
         Ok(Options)
       else if is_token(tok, 0) then
         Error(UnknownMethod)
@@ -67,9 +84,9 @@ feature {ANY}
   -- The protocol version a request line ends with.
   version_of(v: BYTES): RESULT[HTTP_ERROR, HTTP_VERSION]
     do
-      if v.equals("HTTP/1.1".to_utf8) then
+      if v.equals(version_spelling(Http11)) then
         Ok(Http11)
-      else if v.equals("HTTP/1.0".to_utf8) then
+      else if v.equals(version_spelling(Http10)) then
         Ok(Http10)
       else if v.starts_with("HTTP/".to_utf8) then
         Error(UnsupportedVersion)
@@ -103,10 +120,27 @@ feature {ANY}
       end
     end
 
-  -- The header lines from `pos` up to the blank line at `he`.
-  -- `cl` is the `Content-Length` seen so far, and `te` whether `Transfer-Encoding` was.
+  -- The head of a request: its request line `line`, and the header lines from `pos` up to
+  -- the blank line at `he`.
   parse_fields(buf: BYTES, line: HTTP_REQUEST, pos: NAT, he: NAT,
                hs: HTTP_HEADERS, cl: OPTION[NAT], te: BOOL): RESULT[HTTP_ERROR, HTTP_HEAD]
+    require
+      in_buf: he + 4 <= buf.length
+      not_past: pos <= he + 2
+    do
+      match fields(buf, pos, he, hs, cl, te)
+        case Error(e) then Error(e)
+        case Ok(f) then
+          match f
+            case ParsedFields(got, c, t) then Ok(ParsedHead(line.with_headers(got), c, t))
+          end
+      end
+    end
+
+  -- The header lines from `pos` up to the blank line at `he`, added to `hs`.
+  -- `cl` is the `Content-Length` seen so far, and `te` whether `Transfer-Encoding` was.
+  fields(buf: BYTES, pos: NAT, he: NAT,
+         hs: HTTP_HEADERS, cl: OPTION[NAT], te: BOOL): RESULT[HTTP_ERROR, HTTP_FIELDS]
     require
       in_buf: he + 4 <= buf.length
       not_past: pos <= he + 2
@@ -114,7 +148,7 @@ feature {ANY}
       he + 2 - pos
     do
       if pos = he + 2 then
-        Ok(ParsedHead(line.with_headers(hs), cl, te))
+        Ok(ParsedFields(hs, cl, te))
       else
         match buf.index_of("\r\n".to_utf8, pos)
           case None then
@@ -139,13 +173,13 @@ feature {ANY}
                         if cl.is_some and cl.get != n then
                           Error(ConflictingFraming)
                         else
-                          parse_fields(buf, line, e + 2, he, next_hs, Some(n), te)
+                          fields(buf, e + 2, he, next_hs, Some(n), te)
                         end
                     end
                   else if ascii_equal_ci(h.name.to_utf8, "transfer-encoding".to_utf8, 0) then
-                    parse_fields(buf, line, e + 2, he, next_hs, cl, True)
+                    fields(buf, e + 2, he, next_hs, cl, True)
                   else
-                    parse_fields(buf, line, e + 2, he, next_hs, cl, te)
+                    fields(buf, e + 2, he, next_hs, cl, te)
                   end end
               end
             end end
@@ -306,6 +340,74 @@ feature {ANY}
         let folded = if b >= 65 and b <= 90 then b + 32 else b end
         if folded = lower.at(i) then ascii_equal_ci(a, lower, i + 1) else False end
       end end
+    end
+
+specify {ANY}
+
+  -- A method reads back as itself from its spelling, as the writer spells it.
+  law method_reads_back(m: HTTP_METHOD, tok: BYTES)
+    require
+      spelled: tok.model = m.to_string.byte_model
+    do
+      match m
+        case Get then True
+        case Head then HTTP_METHOD.wire_distinct(Head, Get)
+        case Post then HTTP_METHOD.wire_distinct(Post, Get) and HTTP_METHOD.wire_distinct(Post, Head)
+        case Put then
+          HTTP_METHOD.wire_distinct(Put, Get) and HTTP_METHOD.wire_distinct(Put, Head) and
+          HTTP_METHOD.wire_distinct(Put, Post)
+        case Delete then
+          HTTP_METHOD.wire_distinct(Delete, Get) and HTTP_METHOD.wire_distinct(Delete, Head) and
+          HTTP_METHOD.wire_distinct(Delete, Post) and HTTP_METHOD.wire_distinct(Delete, Put)
+        case Options then
+          HTTP_METHOD.wire_distinct(Options, Get) and HTTP_METHOD.wire_distinct(Options, Head) and
+          HTTP_METHOD.wire_distinct(Options, Post) and HTTP_METHOD.wire_distinct(Options, Put) and
+          HTTP_METHOD.wire_distinct(Options, Delete)
+      end
+    ensure
+      reads: match HTTP_HEAD_PARSER.method_of(tok) case Ok(x) then x = m case Error(_) then False end
+    end
+
+  -- A version reads back as itself from its spelling.
+  law version_reads_back(v: HTTP_VERSION, tok: BYTES)
+    require
+      spelled: tok.model = v.to_string.byte_model
+    do
+      match v
+        case Http11 then True
+        case Http10 then HTTP_VERSION.wire_distinct(Http10, Http11)
+      end
+    ensure
+      reads: match HTTP_HEAD_PARSER.version_of(tok) case Ok(x) then x = v case Error(_) then False end
+    end
+
+  -- What `all_visible` says, byte by byte, and back.
+  law visible_bytes(b: BYTES, lo: NAT, hi: NAT)
+    require
+      ordered: lo <= hi
+      in_buf: hi <= b.length
+      visible: HTTP_HEAD_PARSER.all_visible(b, lo, hi)
+    variant
+      hi - lo
+    do
+      if lo = hi then True else visible_bytes(b, lo + 1, hi) end
+    ensure
+      each: forall k: NAT. (lo <= k and k < hi) implies
+        (LIST_OPS.at(b.model, k) > 32 and LIST_OPS.at(b.model, k) < 127)
+    end
+
+  law visible_from(b: BYTES, lo: NAT, hi: NAT)
+    require
+      ordered: lo <= hi
+      in_buf: hi <= b.length
+      each: forall k: NAT. (lo <= k and k < hi) implies
+        (LIST_OPS.at(b.model, k) > 32 and LIST_OPS.at(b.model, k) < 127)
+    variant
+      hi - lo
+    do
+      if lo = hi then True else visible_from(b, lo + 1, hi) end
+    ensure
+      visible: HTTP_HEAD_PARSER.all_visible(b, lo, hi)
     end
 
 end

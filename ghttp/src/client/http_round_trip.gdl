@@ -1,0 +1,78 @@
+-- What the request parser makes of what `HTTP_REQUEST_WRITER` writes (F.8, step 1): a
+-- request reads back as itself. Proven in stages, as `gjson` did for its round trip:
+--
+-- * A, `request_line_reads_back`: the line the writer writes parses to the same method,
+--   target and version.
+-- * B, `body_reads_back`: after a head that declares the body's length, the framing gives
+--   the same body and nothing after it.
+--
+-- Still covered by tests only (`ghttp/tests/cases.txt`, where every request the parser
+-- accepts is written and parsed back): that the parser's searches for the end of the line
+-- and of the head find the writer's, and that the field lines give the same fields in order.
+functions HTTP_ROUND_TRIP
+
+specify {ANY}
+
+  -- Stage A. Any bytes that start with the line that `line_text` writes parse, up to its end,
+  -- to the same method, target and version.
+  law request_line_reads_back(m: HTTP_METHOD, t: STRING, v: HTTP_VERSION, buf: BYTES)
+    require
+      target: HTTP_REQUEST_WRITER.target_ok(t)
+      fits: t.byte_length <= 512
+      prefix: buf.starts_with(HTTP_REQUEST_WRITER.line_text(m, t, v).to_utf8)
+    do
+      HTTP_METHOD.wire_no_space(m) and
+      t.to_utf8.model = t.byte_model and
+      HTTP_HEAD_PARSER.visible_bytes(t.to_utf8, 0, t.byte_length) and
+      HTTP_REQUEST_WRITER.line_text(m, t, v).to_utf8.model = HTTP_REQUEST_WRITER.line_text(m, t, v).byte_model and
+      -- The two spaces.
+      LIST_OPS.at(buf.model, m.to_string.byte_length) = 32 and
+      LIST_OPS.at(buf.model, m.to_string.byte_length + 1 + t.byte_length) = 32 and
+      -- The method, the target and the version, each read back from its slice.
+      BYTES.same_items(buf.slice(0, m.to_string.byte_length).model, m.to_string.byte_model) and
+      HTTP_HEAD_PARSER.method_reads_back(m, buf.slice(0, m.to_string.byte_length)) and
+      BYTES.same_items(
+        buf.slice(m.to_string.byte_length + 1, m.to_string.byte_length + 1 + t.byte_length).model,
+        t.byte_model) and
+      HTTP_HEAD_PARSER.visible_from(buf, m.to_string.byte_length + 1, m.to_string.byte_length + 1 + t.byte_length) and
+      BYTES.same_items(
+        buf.slice(m.to_string.byte_length + 2 + t.byte_length, m.to_string.byte_length + t.byte_length + 10).model,
+        v.to_string.byte_model) and
+      HTTP_HEAD_PARSER.version_reads_back(v,
+        buf.slice(m.to_string.byte_length + 2 + t.byte_length, m.to_string.byte_length + t.byte_length + 10)) and
+      -- What `request_line` finds on the way.
+      buf.index_of_byte(32, 0).is_some and
+      buf.index_of_byte(32, 0).get = m.to_string.byte_length and
+      buf.index_of_byte(32, m.to_string.byte_length + 1).is_some and
+      buf.index_of_byte(32, m.to_string.byte_length + 1).get = m.to_string.byte_length + 1 + t.byte_length and
+      HTTP_HEAD_PARSER.target_of(buf, m.to_string.byte_length + 1, m.to_string.byte_length + 1 + t.byte_length).is_ok and
+      HTTP_HEAD_PARSER.target_of(buf, m.to_string.byte_length + 1, m.to_string.byte_length + 1 + t.byte_length).get.equals(t)
+    ensure
+      reads: match HTTP_HEAD_PARSER.request_line(buf, HTTP_REQUEST_WRITER.line_text(m, t, v).byte_length)
+        case Ok(q) then q.method = m and q.target.equals(t) and q.version = v
+        case Error(_) then False
+      end
+    end
+
+  -- Stage B. A head `h` that declares the length of the body `b` that follows it, as the
+  -- writer's does, gives back `b`, and nothing after it, whatever request the head read.
+  law body_reads_back(st: HTTP_PARSER_STATE, req: HTTP_REQUEST, h: BYTES, b: BYTES, cl: OPTION[NAT])
+    require
+      head_fits: h.length <= st.request_line_limit + st.header_limit
+      body_fits: b.length <= st.body_limit
+      declared: match cl case Some(n) then n = b.length case None then b.length = 0 end
+      safe_empty: req.method.is_safe implies b.length = 0
+    do
+      h.concat(b).length = h.length + b.length and
+      BYTES.same_items(h.concat(b).slice(h.length, h.length + b.length).model, b.model)
+    ensure
+      reads: match HTTP_FRAMING.frame(st, h.concat(b), req, cl, False, h.length)
+        case Complete(q, rest) then
+          rest.length = 0 and q.body.model = b.model and q.method = req.method and
+          q.target.equals(req.target) and q.version = req.version and
+          q.request_header_count = req.request_header_count
+        case _ then False
+      end
+    end
+
+end

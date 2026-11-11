@@ -16,6 +16,10 @@ representation {ANY}
   | ContentLengthInvalid
   | BodyTooLarge
   | BodyNotAllowed
+  -- A response's first line is not `HTTP/1.x <3 digits>` with an optional reason.
+  | MalformedStatusLine
+  -- The connection closed before the response was complete.
+  | IncompleteResponse
 
 feature {ANY}
 

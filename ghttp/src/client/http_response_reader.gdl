@@ -1,0 +1,93 @@
+-- The bytes of a response received so far, whether it answers a `HEAD`, and the limits it
+-- must stay within: the status line and fields, and the body.
+module HTTP_RESPONSE_READER
+
+representation {NONE}
+  received: BYTES
+  after_head: BOOL
+  max_head: NAT
+  max_body: NAT
+
+invariant
+  head_limit_ok: max_head >= 64 and max_head <= 65536
+  body_limit_ok: max_body <= 16777216
+  received_within_bounds: received.length <= max_head + max_body
+
+create {ANY}
+
+  -- A reader for the answer to a request with the method `m`: at most 8 KiB of head and
+  -- 1 MiB of body.
+  for_method(m: HTTP_METHOD): HTTP_RESPONSE_READER
+    do
+      { received = BYTES.empty, after_head = (m = Head), max_head = 8192, max_body = 1048576 }
+    ensure
+      empty_buf: Result.buffered_bytes = 0
+      head_set: Result.answers_head = (m = Head)
+      head_8k: Result.head_limit = 8192
+      body_1m: Result.body_limit = 1048576
+    end
+
+  with_limits(m: HTTP_METHOD, head_lim: NAT, body_lim: NAT): HTTP_RESPONSE_READER
+    require
+      head_ok: head_lim >= 64 and head_lim <= 65536
+      body_ok: body_lim <= 16777216
+    do
+      { received = BYTES.empty, after_head = (m = Head), max_head = head_lim, max_body = body_lim }
+    ensure
+      empty_buf: Result.buffered_bytes = 0
+      head_set: Result.answers_head = (m = Head)
+      head_lim_set: Result.head_limit = head_lim
+      body_lim_set: Result.body_limit = body_lim
+    end
+
+feature {ANY}
+
+  -- Every byte received so far, in order.
+  bytes_received: BYTES
+    do
+      Current.received
+    ensure
+      within_max: Result.length <= Current.head_limit + Current.body_limit
+    end
+
+  buffered_bytes: NAT
+    do
+      Current.received.length
+    ensure
+      def: Result = Current.bytes_received.length
+    end
+
+  -- Whether the request was a `HEAD`, whose answer has no body whatever it declares.
+  answers_head: BOOL
+    do
+      Current.after_head
+    end
+
+  head_limit: NAT
+    do
+      Current.max_head
+    ensure
+      in_range: Result >= 64 and Result <= 65536
+    end
+
+  body_limit: NAT
+    do
+      Current.max_body
+    ensure
+      bounded: Result <= 16777216
+    end
+
+  -- The same reader, holding `bs` as the bytes received.
+  with_received(bs: BYTES): HTTP_RESPONSE_READER
+    require
+      fits: bs.length <= Current.head_limit + Current.body_limit
+    do
+      { Current with received = bs }
+    ensure
+      bytes_set: Result.bytes_received.model = bs.model
+      head_same: Result.answers_head = Current.answers_head
+      head_lim_same: Result.head_limit = Current.head_limit
+      body_lim_same: Result.body_limit = Current.body_limit
+    end
+
+end

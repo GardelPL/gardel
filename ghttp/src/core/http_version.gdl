@@ -71,5 +71,15 @@ specify {EQ}
       ac: a.equals(c)
     end
 
+specify {ANY}
+
+  -- No two versions are spelled alike, so a version reads back as itself.
+  law wire_distinct(a: HTTP_VERSION, b: HTTP_VERSION)
+    require
+      different: a != b
+    ensure
+      spelled_apart: a.to_string.byte_model != b.to_string.byte_model
+    end
+
 end
 

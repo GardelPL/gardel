@@ -1,0 +1,10 @@
+-- The header fields of a message head, and the framing they declare. A request and a
+-- response share them: each has its own first line, then these.
+module HTTP_FIELDS
+
+representation {ANY}
+  -- `content_length` is the declared body length, if any. `chunked` is whether a
+  -- `Transfer-Encoding` header was present.
+  | ParsedFields(headers: HTTP_HEADERS, content_length: OPTION[NAT], chunked: BOOL)
+
+end
