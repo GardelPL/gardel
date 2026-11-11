@@ -1,0 +1,76 @@
+-- A client's exchanges on one connection: the answer to the request it waits for, read from
+-- the bytes as they arrive, and what follows from it.
+functions HTTP_CLIENT
+
+feature {ANY}
+
+  -- The bytes `data` arrived. A client that gets bytes on a free connection, which answer
+  -- no request, closes it.
+  receive(conn: HTTP_CLIENT_CONNECTION, data: BYTES): HTTP_EXCHANGE
+    require
+      waiting: not conn.is_free
+    do
+      match conn.reader
+        case None then
+          Broken(IncompleteResponse)
+        case Some(r) then
+          match HTTP_RESPONSE_PARSER.feed(r, data)
+            case NeedMoreResponse(s) then
+              Waiting(conn.reading(s))
+            case CompleteResponse(q, rest) then
+              if conn.exchanges + 1 < 100 and conn.keeps and HTTP_PERSISTENCE.response_keeps_open(q) and rest.length = 0 then
+                Reuse(conn.freed, q)
+              else
+                Done(q)
+              end
+            case FailedResponse(e) then
+              Broken(e)
+          end
+      end
+    ensure
+      -- A connection that waits holds every byte of the answer received, in order.
+      waits: match Result
+        case Waiting(n) then
+          not n.is_free and n.keeps = conn.keeps and n.exchanges = conn.exchanges and
+          n.received.model = conn.received.model.append(data.model)
+        case _ then True
+      end
+      -- A connection is freed for another request only when the request and the answer
+      -- both keep it open, below the cap, and then it counts one more answer.
+      reuses: match Result
+        case Reuse(n, q) then
+          n.is_free and n.exchanges = conn.exchanges + 1 and
+          conn.keeps and HTTP_PERSISTENCE.response_keeps_open(q)
+        case _ then True
+      end
+      never_unanswered: match Result
+        case Unanswered then False
+        case _ then True
+      end
+    end
+
+  -- The connection closed while it waited. Nothing is reused after a close.
+  closed(conn: HTTP_CLIENT_CONNECTION): HTTP_EXCHANGE
+    require
+      waiting: not conn.is_free
+    do
+      match conn.reader
+        case None then
+          Unanswered
+        case Some(r) then
+          if r.buffered_bytes = 0 then
+            Unanswered
+          else
+            match HTTP_RESPONSE_PARSER.finish(r)
+              case CompleteResponse(q, _) then Done(q)
+              case FailedResponse(e) then Broken(e)
+              case NeedMoreResponse(_) then Broken(IncompleteResponse)
+            end
+          end
+      end
+    ensure
+      ends: not Result.is_waiting and not Result.is_reuse
+      unanswered_when_empty: (conn.received.length = 0) implies (match Result case Unanswered then True case _ then False end)
+    end
+
+end

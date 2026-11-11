@@ -1,0 +1,25 @@
+-- What a server does on a connection once it has answered the requests of a batch.
+module HTTP_BATCH_END
+
+representation {ANY}
+  -- Keep reading: `conn` holds the bytes of the next request so far, and the count of
+  -- requests answered.
+  | ReadOn(conn: HTTP_CONNECTION)
+  -- Close: the last request asked for it, or it was the connection's last by the cap.
+  | CloseAfter
+  -- Answer `err` and close: the bytes after the requests cannot be one.
+  | FailAfter(err: HTTP_ERROR)
+
+feature {ANY}
+
+  is_read_on: BOOL
+    do
+      match Current
+        case ReadOn(_) then True
+        case _ then False
+      end
+    ensure
+      def: Result = (match Current case ReadOn(_) then True case _ then False end)
+    end
+
+end

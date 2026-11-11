@@ -2,8 +2,9 @@
 
 A small, verified REST service written in Gardel on the [`grest`](../../grest) package. It is its
 handlers, its routes and two lines: [`REST_SERVER`](../../grest/src/rest/rest_server.gdl) holds the
-connections, and proves that each request is answered once and its connection closed after the
-answer, with at most 64 connections open.
+connections, and proves that each request is answered once, in order, with at most 64
+connections open and at most 100 answers on one. A connection stays open for the next request
+until it asks to close.
 
 | Request | Answer |
 | :--- | :--- |
@@ -92,8 +93,10 @@ GARDEL_EVENTS="Accepted:1 Received:1:GET%20/hello/ana%20HTTP/1.1%0D%0A%0D%0A Shu
 ```text
 net: Listen 8090
 net: Send 1 HTTP%2F1%2E1%20200%0D%0AContent%2DType%3A%20application%2Fjson%0D%0AContent%2DLength%3A%2015%0D%0A%0D%0A%7B%22hello%22%3A%22ana%22%7D
-net: Close 1
 ```
+
+The connection stays open after the answer. With `Connection:%20close` in the request, the
+answer says `Connection: close` and a `net: Close 1` follows it.
 
 `GARDEL_RECORD=<file>` records a live run, and `GARDEL_REPLAY=<file>` runs it again from the
 log and checks that each command and the exit status are the same.

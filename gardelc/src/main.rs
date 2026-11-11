@@ -7903,12 +7903,17 @@ fn emit_prelude_contract_interface(p: &ModuleDecl) -> (String, HashSet<String>) 
 /// parameter, such as an element of a `LIST[BYTES]`, where `p`'s contracts are guarded by the
 /// invariant. Never part of `p`'s own file, whose proofs establish it. Empty when the invariant
 /// function is not in `theory`, as across a package boundary for a private invariant.
+///
+/// A generic module's invariant holds for every instance (`forall<S> x: (P S)`): `p`'s proofs
+/// are generic in `S`, so they establish it whatever `S` is. Without it a value of `P[S]` that
+/// is no parameter, such as a field read in another module, had none of `p`'s contracts.
 fn invariant_of_every_value(p: &ModuleDecl, theory: &str) -> String {
     let inv = format!("{}_Invariant", p.name);
-    if p.invariants.is_empty() || !p.type_params.is_empty() || !boogie_declared_names(theory).contains(&inv) {
+    if p.invariants.is_empty() || !boogie_declared_names(theory).contains(&inv) {
         return String::new();
     }
-    format!("axiom (forall x: {} :: {inv}(x));\n", map_boogie_type("Current", p))
+    let tq = if p.type_params.is_empty() { String::new() } else { format!("<{}>", p.type_params.join(", ")) };
+    format!("axiom (forall{tq} x: {} :: {inv}(x));\n", map_boogie_type("Current", p))
 }
 
 fn emit_prelude_background_theory(

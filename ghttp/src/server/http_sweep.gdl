@@ -1,0 +1,63 @@
+-- What a sweep of the connection table leaves: the connections kept, each one sweep older,
+-- and the ones it closes, which had waited through `HTTP_CONNECTION.max_idle_ticks` sweeps
+-- less one without a request.
+module HTTP_SWEEP
+
+representation {NONE}
+  kept_conns: LIST[HTTP_CONNECTION]
+  closed_ids: LIST[CONN_ID]
+
+create {ANY}
+
+  -- Every one of `ks` has waited through a sweep since its last answer.
+  all_waited(ks: LIST[HTTP_CONNECTION]): BOOL
+    variant
+      ks.length
+    do
+      if ks.length = 0 then True else ks.head.idle_ticks >= 1 and HTTP_SWEEP.all_waited(ks.tail) end
+    ensure
+      def: Result = (ks.length = 0 or (ks.head.idle_ticks >= 1 and HTTP_SWEEP.all_waited(ks.tail)))
+    end
+
+  make(ks: LIST[HTTP_CONNECTION], ids: LIST[CONN_ID]): HTTP_SWEEP
+    do
+      { kept_conns = ks, closed_ids = ids }
+    ensure
+      kept_set: Result.kept = ks
+      closed_set: Result.closed = ids
+    end
+
+feature {ANY}
+
+  -- The connections that stay open.
+  kept: LIST[HTTP_CONNECTION]
+    do
+      Current.kept_conns
+    end
+
+  -- The connections to close.
+  closed: LIST[CONN_ID]
+    do
+      Current.closed_ids
+    end
+
+  -- The sweep with `c` kept as well.
+  keeping(c: HTTP_CONNECTION): HTTP_SWEEP
+    do
+      { Current with kept_conns = Current.kept_conns.prepend(c) }
+    ensure
+      one_more: Result.kept.length = Current.kept.length + 1
+      kept_set: Result.kept = Current.kept.prepend(c)
+      same_closed: Result.closed.length = Current.closed.length
+    end
+
+  -- The sweep with `c` closed as well.
+  closing(c: CONN_ID): HTTP_SWEEP
+    do
+      { Current with closed_ids = Current.closed_ids.prepend(c) }
+    ensure
+      same_kept: Result.kept = Current.kept
+      one_more: Result.closed.length = Current.closed.length + 1
+    end
+
+end

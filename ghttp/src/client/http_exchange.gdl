@@ -1,0 +1,42 @@
+-- What a client's connection gives when bytes arrive on it, or when it closes, while it waits
+-- for an answer.
+module HTTP_EXCHANGE
+
+representation {ANY}
+  -- The answer is not complete: `conn` holds what has arrived of it.
+  | Waiting(conn: HTTP_CLIENT_CONNECTION)
+  -- The answer `response`, and `conn`, free to send the next request: the request and the
+  -- answer both kept the connection open, and nothing came after the answer.
+  | Reuse(conn: HTTP_CLIENT_CONNECTION, response: HTTP_CLIENT_RESPONSE)
+  -- The answer `response`, after which the client closes the connection, or the server has.
+  | Done(response: HTTP_CLIENT_RESPONSE)
+  -- The answer cannot be read, for the reason `err`: the client closes the connection.
+  | Broken(err: HTTP_ERROR)
+  -- The connection closed before any byte of the answer. On a connection that was reused,
+  -- the server may have closed it as idle just as the request went out (RFC 9112, section
+  -- 9.3.1): a client may send an idempotent request again, on a new connection.
+  | Unanswered
+
+feature {ANY}
+
+  is_waiting: BOOL
+    do
+      match Current
+        case Waiting(_) then True
+        case _ then False
+      end
+    ensure
+      def: Result = (match Current case Waiting(_) then True case _ then False end)
+    end
+
+  is_reuse: BOOL
+    do
+      match Current
+        case Reuse(_, _) then True
+        case _ then False
+      end
+    ensure
+      def: Result = (match Current case Reuse(_, _) then True case _ then False end)
+    end
+
+end

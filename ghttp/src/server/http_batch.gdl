@@ -1,0 +1,39 @@
+-- The requests that bytes received on a connection complete, in the order they came, and
+-- what the server does after answering them.
+module HTTP_BATCH
+
+representation {NONE}
+  reqs: LIST[HTTP_REQUEST]
+  end_with: HTTP_BATCH_END
+
+create {ANY}
+
+  make(rs: LIST[HTTP_REQUEST], e: HTTP_BATCH_END): HTTP_BATCH
+    do
+      { reqs = rs, end_with = e }
+    ensure
+      requests_set: Result.requests = rs
+    end
+
+feature {ANY}
+
+  requests: LIST[HTTP_REQUEST]
+    do
+      Current.reqs
+    end
+
+  ending: HTTP_BATCH_END
+    do
+      Current.end_with
+    end
+
+  -- The batch with `r` before its requests.
+  after(r: HTTP_REQUEST): HTTP_BATCH
+    do
+      { Current with reqs = Current.reqs.prepend(r) }
+    ensure
+      one_more: Result.requests.length = Current.requests.length + 1
+      rest: Result.requests.tail = Current.requests
+    end
+
+end

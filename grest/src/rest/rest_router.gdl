@@ -202,4 +202,20 @@ feature {ANY}
       no_routes_keep: Current.route_count = 0 implies Result.state = s
     end
 
+  -- The state after `reqs`, answered in order from the state `s`: each request's handler
+  -- runs in the state the one before it gave back.
+  run(s: S, reqs: LIST[HTTP_REQUEST]): S
+    variant
+      reqs.length
+    do
+      if reqs.length = 0 then
+        s
+      else
+        Current.run(Current.dispatch(s, reqs.head).state, reqs.tail)
+      end
+    ensure
+      none: reqs.length = 0 implies Result = s
+      step: reqs.length > 0 implies Result = Current.run(Current.dispatch(s, reqs.head).state, reqs.tail)
+    end
+
 end

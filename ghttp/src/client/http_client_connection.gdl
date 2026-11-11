@@ -1,0 +1,122 @@
+-- A client's side of one connection: free to send a request, or waiting for the answer to
+-- the one it sent. A client sends one request at a time on a connection: `sending` takes a
+-- free connection and gives one that waits, and only an answer frees it again
+-- (`HTTP_CLIENT`), so a connection never has two answers outstanding. It is freed for the
+-- next request only when the request and its answer both keep it open (`HTTP_PERSISTENCE`),
+-- nothing came after the answer, and it has had fewer than 100 answers. An answer whose body
+-- runs to the close is complete only when the connection closes, so it is never reused. The
+-- bytes of a request are `HTTP_REQUEST_WRITER.serialize`'s.
+module HTTP_CLIENT_CONNECTION
+
+representation {NONE}
+  -- The reader of the answer awaited, or `None` when the connection is free.
+  pending: OPTION[HTTP_RESPONSE_READER]
+  -- The request awaiting its answer did not ask to close.
+  keep: BOOL
+  -- The answers received on the connection.
+  count: NAT
+
+invariant
+  -- Below the cap, so that the connection can take one more answer.
+  bounded_exchanges: count < 100
+
+create {ANY}
+
+  -- The most answers a client reads on one connection, as many as a `grest` server gives:
+  -- the last ends the connection.
+  max_exchanges: NAT
+    do
+      100
+    ensure
+      def: Result = 100
+    end
+
+  -- A connection just opened: free, with no answer received.
+  fresh: HTTP_CLIENT_CONNECTION
+    do
+      { pending = None, keep = True, count = 0 }
+    ensure
+      free: Result.is_free
+      none_yet: Result.exchanges = 0
+    end
+
+feature {ANY}
+
+  -- Whether a request may be sent: the connection waits for no answer.
+  is_free: BOOL
+    do
+      Current.pending.is_none
+    end
+
+  -- The answers received on the connection, each to a request sent on it.
+  exchanges: NAT
+    do
+      Current.count
+    ensure
+      below_cap: Result < 100
+    end
+
+  -- Whether the request awaiting its answer leaves the connection open.
+  keeps: BOOL
+    do
+      Current.keep
+    end
+
+  -- The reader of the answer awaited, or `None` when the connection is free.
+  reader: OPTION[HTTP_RESPONSE_READER]
+    do
+      Current.pending
+    ensure
+      free_none: Current.is_free = Result.is_none
+    end
+
+  -- The bytes of the answer received so far, none when the connection is free.
+  received: BYTES
+    do
+      match Current.pending
+        case None then BYTES.empty
+        case Some(r) then r.bytes_received
+      end
+    end
+
+  -- The connection once `req` is sent on it: it waits for the answer, read as the answer to
+  -- `req`'s method.
+  sending(req: HTTP_REQUEST): HTTP_CLIENT_CONNECTION
+    require
+      free: Current.is_free
+      sendable: HTTP_REQUEST_WRITER.sendable(req)
+    do
+      { Current with pending = Some(HTTP_RESPONSE_READER.for_method(req.method)),
+        keep = HTTP_PERSISTENCE.request_keeps_open(req) }
+    ensure
+      waits: not Result.is_free
+      nothing_yet: Result.received.length = 0
+      keeps_set: Result.keeps = HTTP_PERSISTENCE.request_keeps_open(req)
+      same_count: Result.exchanges = Current.exchanges
+    end
+
+  -- The same connection, waiting with the reader `r`, which holds the answer so far.
+  reading(r: HTTP_RESPONSE_READER): HTTP_CLIENT_CONNECTION
+    require
+      waiting: not Current.is_free
+    do
+      { Current with pending = Some(r) }
+    ensure
+      waits: not Result.is_free
+      held: Result.received.model = r.bytes_received.model
+      same_keeps: Result.keeps = Current.keeps
+      same_count: Result.exchanges = Current.exchanges
+    end
+
+  -- The connection once an answer has come: free, with one more answer.
+  freed: HTTP_CLIENT_CONNECTION
+    require
+      room: Current.exchanges + 1 < 100
+    do
+      { Current with pending = None, count = Current.count + 1 }
+    ensure
+      free: Result.is_free
+      one_more: Result.exchanges = Current.exchanges + 1
+    end
+
+end
