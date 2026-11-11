@@ -95,3 +95,43 @@ response GET HTTP/1.1 200 OK\r\nContent-Length: 1\r\nTransfer-Encoding: chunked\
 response GET HTTP/1.1 200 OK\r\nContent-Length: x\r\n\r\n => failed ContentLengthInvalid
 response GET HTTP/1.1 200 OK\r\nContent-Length: 1\r\nContent-Length: 2\r\n\r\nab => failed ConflictingFraming
 response GET HTTP/1.1 200 OK\r\nBad name: x\r\n\r\n => failed MalformedHeader
+
+# A client's connection (F.8). `exchange <method> <keep|close> <bytes> => <what>` sends a
+# request with that method, asking to close or not, on a new connection, and reads the bytes
+# as its answer; `exchange-closed` then closes the connection. Each is read whole and cut
+# into two reads at every byte. `reuse` frees the connection for another request, `done`
+# ends it, after an answer.
+exchange GET keep HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nhi => reuse 200 body [hi] exchanges 1
+exchange HEAD keep HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\n => reuse 200 body [] exchanges 1
+exchange GET keep HTTP/1.1 204 No Content\r\n\r\n => reuse 204 body [] exchanges 1
+exchange GET keep HTTP/1.1 200 OK\r\nConnection: keep-alive\r\nContent-Length: 0\r\n\r\n => reuse 200 body [] exchanges 1
+
+# The request asks to close, the answer does, or the answer is HTTP/1.0: done.
+exchange GET close HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nhi => done 200 body [hi]
+exchange GET keep HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Length: 2\r\n\r\nhi => done 200 body [hi]
+exchange GET keep HTTP/1.1 200 OK\r\nconnection: Keep-Alive, CLOSE \r\nContent-Length: 2\r\n\r\nhi => done 200 body [hi]
+exchange GET keep HTTP/1.0 200 OK\r\nContent-Length: 2\r\n\r\nhi => done 200 body [hi]
+
+# Bytes after the answer answer no request: done.
+exchange GET keep HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nhiHTTP/1.1 200 => done 200 body [hi]
+
+# A body with no length runs to the close: it waits, and is done when the connection closes.
+exchange GET keep HTTP/1.1 200 OK\r\n\r\nuntil close => waiting 30
+exchange-closed GET keep HTTP/1.1 200 OK\r\n\r\nuntil close => done 200 body [until close]
+exchange GET keep HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\nab => waiting 40
+
+# A close before the answer is complete, before any byte of it, and an answer that cannot
+# be read.
+exchange-closed GET keep HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\nab => broken IncompleteResponse
+exchange-closed GET keep  => unanswered
+exchange GET keep HTTP/2.0 200 OK\r\n\r\n => broken UnsupportedVersion
+exchange GET keep HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n => broken UnsupportedTransferEncoding
+
+# Two GETs on one connection: `again <first answer> | <second answer> => <second exchange>`.
+again HTTP/1.1 200 OK\r\nContent-Length: 1\r\n\r\na | HTTP/1.1 201 Created\r\nContent-Length: 1\r\n\r\nb => reuse 201 body [b] exchanges 2
+again HTTP/1.1 200 OK\r\nContent-Length: 1\r\n\r\na | HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Length: 1\r\n\r\nb => done 200 body [b]
+again HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Length: 1\r\n\r\na | HTTP/1.1 200 OK\r\nContent-Length: 1\r\n\r\nb => not reused: done 200 body [a]
+
+# The cap: GETs answered alike on one connection until one is not freed. The 100th answer
+# ends it, as a `grest` server's would.
+cap HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nhi => 99 then done 200 body [hi]

@@ -301,13 +301,211 @@ feature {ANY}
       end
     end
 
+  -- What an exchange gives, as text.
+  describe_exchange(x: HTTP_EXCHANGE): STRING
+    do
+      match x
+        case Waiting(n) then
+          join("waiting ", NUMBER_TEXT.nat_to_text(n.received.length))
+        case Reuse(n, q) then
+          let head = join(join("reuse ", NUMBER_TEXT.nat_to_text(q.status_code)), join(join(" body [", text_of(q.body)), "]"))
+          join(head, join(" exchanges ", NUMBER_TEXT.nat_to_text(n.exchanges)))
+        case Done(q) then
+          join(join("done ", NUMBER_TEXT.nat_to_text(q.status_code)), join(join(" body [", text_of(q.body)), "]"))
+        case Broken(e) then
+          join("broken ", error_name(e))
+        case Unanswered then
+          "unanswered"
+      end
+    end
+
+  -- A request with the method `m` for `/`, which asks to close when `close`.
+  request_for(m: HTTP_METHOD, close: BOOL): HTTP_REQUEST
+    do
+      let hs = if close then HTTP_HEADERS.default_empty.add(HTTP_HEADER.connection_close) else HTTP_HEADERS.default_empty end
+      HTTP_REQUEST.make(m, "/", Http11, hs, BYTES.empty, 0)
+    end
+
+  -- The exchange of `req` on the free `conn`, its answer read as `first` then `second`, and
+  -- then the close when `closed`. Bytes on a connection that the answer has freed answer no
+  -- request, and the client closes it: the answer is then `Done`.
+  exchange(conn: HTTP_CLIENT_CONNECTION, req: HTTP_REQUEST, first: BYTES, second: BYTES, closed: BOOL): HTTP_EXCHANGE
+    require
+      free: conn.is_free
+    do
+      if not HTTP_REQUEST_WRITER.sendable(req) then
+        Broken(InvalidTarget)
+      else
+        let once = HTTP_CLIENT.receive(conn.sending(req), first)
+        let twice = match once
+          case Waiting(n) then
+            if second.length = 0 then once else HTTP_CLIENT.receive(n, second) end
+          case Reuse(_, q) then
+            if second.length = 0 then once else Done(q) end
+          case _ then
+            once
+        end
+        if closed then
+          match twice
+            case Waiting(n) then HTTP_CLIENT.closed(n)
+            case _ then twice
+          end
+        else
+          twice
+        end
+      end
+    end
+
+  -- 0 if every cut of `raw` at `k` or after gives `whole`, else the first that does not.
+  first_bad_exchange_split(req: HTTP_REQUEST, raw: BYTES, closed: BOOL, whole: STRING, k: NAT): NAT
+    require
+      from_one: k >= 1
+      inside: k <= raw.length
+    variant
+      raw.length - k
+    do
+      let got = describe_exchange(exchange(HTTP_CLIENT_CONNECTION.fresh, req, raw.slice(0, k), raw.slice(k, raw.length), closed))
+      if not got.equals(whole) then
+        k
+      else
+        if k = raw.length then 0 else first_bad_exchange_split(req, raw, closed, whole, k + 1) end
+      end
+    end
+
+  -- 0 if the exchange of `req` on a new connection, with the answer `raw` read whole and cut
+  -- at every byte, says `expected`; else 6.
+  check_exchange_of(req: HTTP_REQUEST, raw: BYTES, expected: STRING, closed: BOOL): NAT
+    do
+      let whole = describe_exchange(exchange(HTTP_CLIENT_CONNECTION.fresh, req, raw, BYTES.empty, closed))
+      if not whole.equals(expected) then
+        6
+      else if raw.length > 0 and first_bad_exchange_split(req, raw, closed, whole, 1) != 0 then
+        6
+      else
+        0
+      end end
+    end
+
+  -- 0 if `<method> <keep|close> <response> => <expected>` holds, as `check_exchange_of` says;
+  -- else 6.
+  check_exchange(rest: STRING, closed: BOOL): NAT
+    do
+      match rest.find(" ", 0)
+        case None then 6
+        case Some(sp) then
+          match rest.find(" ", sp + 1)
+            case None then 6
+            case Some(sp2) then
+              match rest.find(" => ", sp2)
+                case None then 6
+                case Some(i) then
+                  if sp + 1 > sp2 or sp2 + 1 > i or i + 4 > rest.code_point_count then
+                    6
+                  else
+                    match HTTP_HEAD_PARSER.method_of(rest.slice(0, sp).to_utf8)
+                      case Error(_) then 6
+                      case Ok(m) then
+                        let mode = rest.slice(sp + 1, sp2)
+                        if not (mode.equals("keep") or mode.equals("close")) then
+                          6
+                        else
+                          check_exchange_of(request_for(m, mode.equals("close")),
+                            unescape(rest.slice(sp2 + 1, i).to_utf8, 0, BYTES_BUILDER.empty),
+                            rest.slice(i + 4, rest.code_point_count), closed)
+                        end
+                    end
+                  end
+              end
+          end
+      end
+    end
+
+  -- What `GET`s answered `first` and then `second` give on one connection: the second
+  -- exchange, or `not reused` and the first when the first does not free the connection.
+  two_exchanges(first: BYTES, second: BYTES): STRING
+    do
+      let req = request_for(Get, False)
+      let x = exchange(HTTP_CLIENT_CONNECTION.fresh, req, first, BYTES.empty, False)
+      match x
+        case Reuse(n, _) then
+          describe_exchange(exchange(n, req, second, BYTES.empty, False))
+        case _ then
+          join("not reused: ", describe_exchange(x))
+      end
+    end
+
+  -- 0 if `<first> | <second> => <expected>` holds, as `two_exchanges` says; else 7.
+  check_again(rest: STRING): NAT
+    do
+      match rest.find(" | ", 0)
+        case None then 7
+        case Some(bar) then
+          match rest.find(" => ", bar)
+            case None then 7
+            case Some(i) then
+              if bar + 3 > i or i + 4 > rest.code_point_count then
+                7
+              else
+                let got = two_exchanges(unescape(rest.slice(0, bar).to_utf8, 0, BYTES_BUILDER.empty),
+                  unescape(rest.slice(bar + 3, i).to_utf8, 0, BYTES_BUILDER.empty))
+                if got.equals(rest.slice(i + 4, rest.code_point_count)) then 0 else 7 end
+              end
+          end
+      end
+    end
+
+  -- `GET`s answered `raw`, one after another on `conn`, until an answer does not free it:
+  -- the answers the connection had before that one, and what that one gave.
+  run_until_done(conn: HTTP_CLIENT_CONNECTION, raw: BYTES, tries: NAT): STRING
+    require
+      free: conn.is_free
+    variant
+      tries
+    do
+      if tries = 0 then
+        "out of tries"
+      else
+        let x = exchange(conn, request_for(Get, False), raw, BYTES.empty, False)
+        match x
+          case Reuse(n, _) then
+            if n.is_free then run_until_done(n, raw, tries - 1) else "reused but not free" end
+          case _ then
+            join(join(NUMBER_TEXT.nat_to_text(conn.exchanges), " then "), describe_exchange(x))
+        end
+      end
+    end
+
+  -- 0 if `<response> => <expected>` holds, as `run_until_done` says; else 8.
+  check_cap(rest: STRING): NAT
+    do
+      match rest.find(" => ", 0)
+        case None then 8
+        case Some(i) then
+          if i + 4 > rest.code_point_count then
+            8
+          else
+            let got = run_until_done(HTTP_CLIENT_CONNECTION.fresh, unescape(rest.slice(0, i).to_utf8, 0, BYTES_BUILDER.empty), 200)
+            if got.equals(rest.slice(i + 4, rest.code_point_count)) then 0 else 8 end
+          end
+      end
+    end
+
   -- 0 if a line of `cases.txt` holds, or is a comment, else 1 when the whole request gives
   -- something else, 2 when a cut of it does, 3 when a request it accepts, written without its
-  -- framing, does not read back as itself, and 4 when a `write` line does not hold.
+  -- framing, does not read back as itself, 4 when a `write` line does not hold, and 6, 7 or 8
+  -- when an `exchange`, `again` or `cap` line does not.
   check_line(line: STRING): NAT
     do
       if line.code_point_count = 0 or line.starts_with("#") then
         0
+      else if line.starts_with("exchange ") then
+        check_exchange(line.slice(9, line.code_point_count), False)
+      else if line.starts_with("exchange-closed ") then
+        check_exchange(line.slice(16, line.code_point_count), True)
+      else if line.starts_with("again ") then
+        check_again(line.slice(6, line.code_point_count))
+      else if line.starts_with("cap ") then
+        check_cap(line.slice(4, line.code_point_count))
       else if line.starts_with("response ") then
         check_response(line.slice(9, line.code_point_count), False)
       else if line.starts_with("closed ") then
@@ -350,7 +548,7 @@ feature {ANY}
               end end
             end
         end
-      end end end end
+      end end end end end end end end
     end
 
 end
