@@ -56,16 +56,71 @@ feature {ANY}
       def: Result = (match cmd case Send(d, _) then d = c case _ then False end)
     end
 
-  -- `cmd` names no connection.
+  -- The timer of the sweep that closes idle connections.
+  sweep_timer: NAT
+    do
+      0
+    ensure
+      def: Result = 0
+    end
+
+  -- The time between sweeps, in milliseconds. With `HTTP_CONNECTION.max_idle_ticks`, a
+  -- connection that completes no request is closed after 4 to 5 seconds.
+  sweep_millis: U64
+    do
+      1000
+    ensure
+      def: Result = 1000
+    end
+
+  -- The command that sets the next sweep.
+  rearm: COMMAND
+    do
+      SetTimer(REST_COMMANDS.sweep_timer, REST_COMMANDS.sweep_millis)
+    ensure
+      sets: REST_COMMANDS.rearms(Result)
+    end
+
+  -- `cmd` sets the next sweep.
+  rearms(cmd: COMMAND): BOOL
+    do
+      match cmd
+        case SetTimer(id, ms) then id = REST_COMMANDS.sweep_timer and ms = REST_COMMANDS.sweep_millis
+        case _ then False
+      end
+    ensure
+      def: Result = (match cmd case SetTimer(id, ms) then id = REST_COMMANDS.sweep_timer and ms = REST_COMMANDS.sweep_millis case _ then False end)
+    end
+
+  -- `cmd` closes a connection.
+  closes_one(cmd: COMMAND): BOOL
+    do
+      match cmd
+        case Close(_) then True
+        case _ then False
+      end
+    ensure
+      def: Result = (match cmd case Close(_) then True case _ then False end)
+    end
+
+  -- `cmd` names no connection, and leaves the sweep's timer alone.
   quiet(cmd: COMMAND): BOOL
     do
       match cmd
         case Send(_, _) then False
         case Close(_) then False
+        case SetTimer(id, _) then id != REST_COMMANDS.sweep_timer
+        case CancelTimer(id) then id != REST_COMMANDS.sweep_timer
         case _ then True
       end
     ensure
-      def: Result = (match cmd case Send(_, _) then False case Close(_) then False case _ then True end)
+      def: Result = (match cmd
+        case Send(_, _) then False
+        case Close(_) then False
+        case SetTimer(id, _) then id != REST_COMMANDS.sweep_timer
+        case CancelTimer(id) then id != REST_COMMANDS.sweep_timer
+        case _ then True
+      end)
     end
 
   -- What an event about the connection `c` may do: send `c` answers, one per request, and
@@ -106,6 +161,38 @@ feature {ANY}
       at_most: Result <= cmds.length
     end
 
+  -- What a sweep may do: close connections, then set the next sweep, last.
+  for_sweep(cmds: LIST[COMMAND]): BOOL
+    variant
+      cmds.length
+    do
+      if cmds.length = 0 then
+        False
+      else if cmds.length = 1 then
+        REST_COMMANDS.rearms(cmds.head)
+      else
+        REST_COMMANDS.closes_one(cmds.head) and REST_COMMANDS.for_sweep(cmds.tail)
+      end end
+    ensure
+      def: Result = ((cmds.length = 1 and REST_COMMANDS.rearms(cmds.head))
+        or (cmds.length >= 2 and REST_COMMANDS.closes_one(cmds.head) and REST_COMMANDS.for_sweep(cmds.tail)))
+    end
+
+  -- The commands of a sweep that closes `ids`.
+  sweep_commands(ids: LIST[CONN_ID]): LIST[COMMAND]
+    variant
+      ids.length
+    do
+      if ids.length = 0 then
+        LIST.empty.prepend(REST_COMMANDS.rearm)
+      else
+        REST_COMMANDS.sweep_commands(ids.tail).prepend(Close(ids.head))
+      end
+    ensure
+      swept: REST_COMMANDS.for_sweep(Result)
+      count: Result.length = ids.length + 1
+    end
+
   -- What any other event may do: at most one command, which names no connection.
   for_none(cmds: LIST[COMMAND]): BOOL
     do
@@ -128,6 +215,8 @@ feature {ANY}
         case Received(c, _) then REST_COMMANDS.for_conn(cmds, c)
         case SendFailed(c, _) then REST_COMMANDS.for_conn(cmds, c)
         case Closed(c) then REST_COMMANDS.for_conn(cmds, c)
+        case Tick(id) then
+          if id = REST_COMMANDS.sweep_timer then REST_COMMANDS.for_sweep(cmds) else REST_COMMANDS.for_none(cmds) end
         case _ then REST_COMMANDS.for_none(cmds)
       end
     ensure
@@ -136,6 +225,8 @@ feature {ANY}
         case Received(c, _) then REST_COMMANDS.for_conn(cmds, c)
         case SendFailed(c, _) then REST_COMMANDS.for_conn(cmds, c)
         case Closed(c) then REST_COMMANDS.for_conn(cmds, c)
+        case Tick(id) then
+          (if id = REST_COMMANDS.sweep_timer then REST_COMMANDS.for_sweep(cmds) else REST_COMMANDS.for_none(cmds) end)
         case _ then REST_COMMANDS.for_none(cmds)
       end)
     end

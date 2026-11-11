@@ -429,6 +429,51 @@ fn a_connection_stays_open_until_it_closes_or_reaches_its_cap() {
     }
 }
 
+/// The sweep (timer 0) closes a connection on the fifth sweep without a completed request,
+/// counted from when it was accepted or last answered (F.8). Bytes that do not complete a
+/// request do not count as one, and other timers do nothing.
+#[test]
+fn a_connection_that_completes_no_request_is_swept() {
+    let good = service("sweep", "REST_ROUTER.empty.on_get(\"/hi\", hi)");
+    let get = "GET%20/hi%20HTTP/1.1%0D%0A%0D%0A";
+    let sweeps = |n: usize| vec!["Tick:0"; n].join(" ");
+    let events = [
+        "Accepted:1".to_string(),
+        sweeps(3),
+        "Accepted:2".to_string(),
+        "Accepted:3".to_string(),
+        sweeps(1),
+        format!("Received:2:{get}"),
+        "Received:3:GET%20".to_string(),
+        "Received:2:GET%20/hi".to_string(),
+        sweeps(1),
+        "Received:3:/hi".to_string(),
+        vec!["Tick:7"; 10].join(" "),
+        sweeps(1),
+        "Received:3:%20HTTP".to_string(),
+        sweeps(1),
+        "Received:3:/1.1".to_string(),
+        sweeps(1),
+        "Received:2:%20HTTP/1.1%0D%0A%0D%0A".to_string(),
+        sweeps(4),
+        "Accepted:4".to_string(),
+        sweeps(1),
+    ];
+    let run = run_service(&good, &["9004"], &events.join(" "));
+    assert_eq!(run.status.code(), Some(0), "{}", all(&run));
+    let net: Vec<String> = String::from_utf8_lossy(&run.stderr).lines().filter(|l| l.starts_with("net: ")).map(str::to_owned).collect();
+    let hi = "HTTP%2F1%2E1%20200%0D%0AContent%2DType%3A%20text%2Fplain%3B%20charset%3Dutf%2D8%0D%0AContent%2DLength%3A%202%0D%0A%0D%0Ahi";
+    let expected = [
+        "net: Listen 9004".to_string(),
+        format!("net: Send 2 {hi}"),
+        "net: Close 1".to_string(),
+        "net: Close 3".to_string(),
+        format!("net: Send 2 {hi}"),
+        "net: Close 2".to_string(),
+    ];
+    assert_eq!(net, expected, "{}", net.join("\n"));
+}
+
 /// The state a handler gives back is the one the next request sees, in the order the requests
 /// complete, and a request that is not answered by a handler, or that cannot be read, leaves
 /// it as it was.

@@ -101,7 +101,10 @@ closes the connection after a request whose `Connection` field lists `close`, af
 request, and after the connection's 100th request, and that answer says `Connection: close`.
 Bytes after it are not read. An answer to `HEAD` has the `GET`'s `Content-Length` and no body.
 Bytes that cannot be a request are answered with `ghttp`'s status for the error (`400`, `413`,
-`414`, `431`, `501` or `505`, with no body) and the connection is closed.
+`414`, `431`, `501` or `505`, with no body) and the connection is closed. A sweep every second
+closes, unanswered, the connections that have completed no request in the last 4 to 5 seconds,
+counted from when they were accepted or last answered. The sweep is timer 0, which `start`
+sets and each sweep sets again.
 
 `REST_ROUTER.dispatch`:
 
@@ -135,6 +138,9 @@ empty one, so it does not match `/users`. Patterns are written decoded.
     the close, so no connection hears an answer meant for another;
   - no connection gets more than 100 answers: `on_bytes` proves that what a step sends, with
     what was sent before (`answered_on`), is at most 100;
+  - the sweep closes connections and sets the next sweep, last; `start` sets the first, and no
+    other step sets or cancels timer 0, so the sweep comes back for as long as the server runs;
+    every connection is kept or closed, and each kept is counted one sweep older;
   - any other event names no connection, and a `Shutdown` stops the server.
 
   `start` does not start a router with a pattern that is not valid.
@@ -186,7 +192,6 @@ Exit code 0 means every case holds. `cargo test --test grest` does both.
 - A `405` has no `Allow` header, as an `HTTP_RESPONSE` has no headers but `Content-Type` and
   `Content-Length`.
 - A response body is at most 64 KiB, `ghttp`'s limit.
-- A connection that sends nothing stays open: there is no idle timeout yet (F.8, step 2).
 - That a request which asks to close gets its connection closed, and that a `HEAD` answer has
   no body, is checked by the scripted run, not proven.
 - The state is the whole service's: each request sees the state the one before it left, and two

@@ -1,16 +1,22 @@
--- Per-connection parser and lifecycle state (M4), and the requests answered on it. A
--- connection answers at most `max_requests` requests: the last is answered with a close.
+-- Per-connection parser and lifecycle state (M4), the requests answered on it, and the
+-- sweeps it has waited through since its last answer. A connection answers at most
+-- `max_requests` requests: the last is answered with a close. It waits through fewer than
+-- `max_idle_ticks` sweeps for a request: a sweep that would reach it closes the connection
+-- instead.
 module HTTP_CONNECTION
 
 representation {NONE}
   conn_handle: CONN_ID
   p_state: HTTP_PARSER_STATE
   req_count: NAT
+  idle: NAT
   lifecycle: CONNECTION_STATUS
 
 invariant
   -- Below the cap, so that the connection can answer one more.
   bounded_requests: req_count < 100
+  -- Below the limit, so that the connection can wait through one more sweep or be closed.
+  bounded_idle: idle < 5
   closing_no_more_reads: (lifecycle = ConnClosing or lifecycle = ConnClosed) implies not lifecycle.can_accept_bytes
 
 create {ANY}
@@ -24,15 +30,27 @@ create {ANY}
       def: Result = 100
     end
 
+  -- The most sweeps a connection waits through without completing a request, counted from
+  -- when it was accepted or last answered: a client that sends nothing, or sends a request
+  -- too slowly, cannot hold one forever.
+  max_idle_ticks: NAT
+    do
+      5
+    ensure
+      def: Result = 5
+    end
+
   make_reading(c: CONN_ID): HTTP_CONNECTION
     do
       { conn_handle = c,
         p_state = HTTP_PARSER_STATE.make_default,
         req_count = 0,
+        idle = 0,
         lifecycle = ConnReading }
     ensure
       conn_set: Result.connection_id = c
       zero_reqs: Result.completed_requests = 0
+      not_idle: Result.idle_ticks = 0
       is_reading: Result.connection_status = ConnReading
       can_read: Result.connection_status.can_accept_bytes
     end
@@ -56,6 +74,14 @@ feature {ANY}
       below_cap: Result < 100
     end
 
+  -- The sweeps since the connection was accepted or last answered.
+  idle_ticks: NAT
+    do
+      Current.idle
+    ensure
+      below_limit: Result < 5
+    end
+
   connection_status: CONNECTION_STATUS
     do
       Current.lifecycle
@@ -70,20 +96,43 @@ feature {ANY}
       same_conn: Result.connection_id = Current.connection_id
       same_status: Result.connection_status = Current.connection_status
       same_count: Result.completed_requests = Current.completed_requests
+      same_idle: Result.idle_ticks = Current.idle_ticks
     end
 
   -- The connection after one more answer, reading the next request with nothing buffered,
-  -- under the same limits.
+  -- under the same limits, and not idle.
   answered: HTTP_CONNECTION
     require
       room: Current.completed_requests + 1 < 100
     do
-      { Current with req_count = Current.req_count + 1, p_state = Current.p_state.with_received(BYTES.empty) }
+      { Current with req_count = Current.req_count + 1, idle = 0, p_state = Current.p_state.with_received(BYTES.empty) }
     ensure
       same_conn: Result.connection_id = Current.connection_id
       same_status: Result.connection_status = Current.connection_status
       one_more: Result.completed_requests = Current.completed_requests + 1
       nothing_buffered: Result.parser_state.buffered_bytes = 0
+      not_idle: Result.idle_ticks = 0
+    end
+
+  -- Whether the next sweep closes the connection.
+  idle_out: BOOL
+    do
+      Current.idle + 1 >= 5
+    ensure
+      def: Result = (Current.idle_ticks + 1 >= 5)
+    end
+
+  -- The connection after one more sweep without a request.
+  aged: HTTP_CONNECTION
+    require
+      room: not Current.idle_out
+    do
+      { Current with idle = Current.idle + 1 }
+    ensure
+      same_conn: Result.connection_id = Current.connection_id
+      same_status: Result.connection_status = Current.connection_status
+      same_count: Result.completed_requests = Current.completed_requests
+      one_more: Result.idle_ticks = Current.idle_ticks + 1
     end
 
   mark_closing: HTTP_CONNECTION

@@ -1186,6 +1186,24 @@ fn a_service_on_grest_verifies_and_answers() {
     } else {
         vec![]
     };
+    // The idle timeout (F.8): a connection that sends nothing, and one that sends half a
+    // request, are closed after 4 to 5 seconds, unanswered.
+    let swept = if up {
+        let start = std::time::Instant::now();
+        let mut quiet = std::net::TcpStream::connect(("127.0.0.1", 8090)).expect("connect");
+        let mut half = std::net::TcpStream::connect(("127.0.0.1", 8090)).expect("connect");
+        half.write_all(b"GET /hel").expect("half a request");
+        let mut got = Vec::new();
+        for socket in [&mut quiet, &mut half] {
+            socket.set_read_timeout(Some(std::time::Duration::from_secs(10))).expect("timeout");
+            let mut rest = String::new();
+            socket.read_to_string(&mut rest).expect("the close");
+            got.push(rest);
+        }
+        Some((got, start.elapsed()))
+    } else {
+        None
+    };
     drop(server.kill());
     drop(server.wait());
     assert!(up, "the service did not start listening");
@@ -1209,6 +1227,10 @@ fn a_service_on_grest_verifies_and_answers() {
     let head = "HTTP/1.1 200\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: 20\r\n\r\n";
     assert_eq!(kept[2], format!("{}{head}{}", open_text("hello from a package"), json(404, r#"{"error":"not found"}"#)));
     assert_eq!(kept[3], text("hello from a package"));
+
+    let (closed, waited) = swept.expect("the service was up");
+    assert_eq!(closed, ["", ""], "an idle connection is closed unanswered");
+    assert!(waited >= std::time::Duration::from_secs(3) && waited <= std::time::Duration::from_secs(8), "closed after {waited:?}");
 }
 
 /// One answer from `socket`: its head, up to the blank line, and as many body bytes as its

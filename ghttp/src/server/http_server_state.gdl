@@ -114,6 +114,27 @@ create {NONE}
       not_longer: Result.length <= cs.length
     end
 
+  -- Each of `cs` one sweep older, or closed if that sweep makes it idle too long.
+  sweep_conns(cs: LIST[HTTP_CONNECTION]): HTTP_SWEEP
+    variant
+      cs.length
+    do
+      if cs.length = 0 then
+        HTTP_SWEEP.make(LIST.empty, LIST.empty)
+      else
+        let rest = sweep_conns(cs.tail)
+        if cs.head.idle_out then
+          rest.closing(cs.head.connection_id)
+        else
+          rest.keeping(cs.head.aged)
+        end
+      end
+    ensure
+      accounted: Result.kept.length + Result.closed.length = cs.length
+      -- The sweep counted itself on each connection it kept.
+      aged: HTTP_SWEEP.all_waited(Result.kept)
+    end
+
 feature {ANY}
 
   active_connections: NAT
@@ -170,6 +191,27 @@ feature {ANY}
       { Current with conns = update_conn(Current.conns, updated) }
     ensure
       same_count: Result.active_connections = Current.active_connections
+      same_max: Result.max_connections = Current.max_connections
+    end
+
+  -- One sweep of the table: what it keeps and what it closes. Every connection is one or the
+  -- other.
+  sweep: HTTP_SWEEP
+    do
+      sweep_conns(Current.conns)
+    ensure
+      accounted: Result.kept.length + Result.closed.length = Current.active_connections
+      aged: HTTP_SWEEP.all_waited(Result.kept)
+    end
+
+  -- The table with the connections `sw` kept.
+  with_kept(sw: HTTP_SWEEP): HTTP_SERVER_STATE
+    require
+      fits: sw.kept.length <= Current.max_connections
+    do
+      { Current with conns = sw.kept }
+    ensure
+      kept: Result.active_connections = sw.kept.length
       same_max: Result.max_connections = Current.max_connections
     end
 

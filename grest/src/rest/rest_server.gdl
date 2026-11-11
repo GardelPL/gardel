@@ -8,7 +8,9 @@
 --
 -- A connection stays open for the next request (RFC 9112, section 9.3), until a request asks
 -- to close it, an HTTP/1.0 request, or its 100th request. Requests sent before the last was
--- answered are answered in order. Each request is answered once, and the state after it is
+-- answered are answered in order. A sweep every second closes the connections that have
+-- completed no request in the last 4 to 5 seconds, counted from when they were accepted or
+-- last answered. Each request is answered once, and the state after it is
 -- the one its handler gave back. `serve` proves both for every event: see
 -- `REST_SERVER.within` and `moves_to`. The state is an `S`, so whatever `S`'s invariant says
 -- holds of it after every request.
@@ -34,7 +36,7 @@ create {ANY}
     end
 
   -- Starts `api` in the state `s`, on the port the first argument names, or on `p` when there
-  -- is none. An argument that is not a port from 1 to 65535, or a route whose pattern is not
+  -- is none, and sets the first sweep. An argument that is not a port from 1 to 65535, or a route whose pattern is not
   -- valid, stops the program with exit status 2 and a message, before it listens.
   start(args: SEQ[STRING], p: NAT, api: REST_ROUTER[S], s: S): STEP[REST_SERVER[S]]
     require
@@ -46,11 +48,11 @@ create {ANY}
         case None then
           match REST_COMMANDS.first_arg(args)
             case None then
-              Continue(REST_SERVER.make(p, api, s), LIST.empty.prepend(Listen(p)))
+              Continue(REST_SERVER.make(p, api, s), LIST.empty.prepend(REST_COMMANDS.rearm).prepend(Listen(p)))
             case Some(a) then
               match REST_COMMANDS.port_of(a)
                 case Some(q) then
-                  Continue(REST_SERVER.make(q, api, s), LIST.empty.prepend(Listen(q)))
+                  Continue(REST_SERVER.make(q, api, s), LIST.empty.prepend(REST_COMMANDS.rearm).prepend(Listen(q)))
                 case None then
                   Stop(2, LIST.empty.prepend(Print(REST_COMMANDS.complaint("grest: not a port: ", a))))
               end
@@ -58,6 +60,11 @@ create {ANY}
       end
     ensure
       bad_route_stops: api.invalid_route.is_some implies Result.is_stop
+      -- A server that starts listens and sets the first sweep.
+      armed: match Result
+        case Continue(_, cmds) then cmds.length = 2 and REST_COMMANDS.for_sweep(cmds.tail)
+        case Stop(_, _) then True
+      end
     end
 
   -- The commands of a step.
@@ -76,7 +83,9 @@ create {ANY}
   -- * the limit on connections is the same, so the number open stays within it;
   -- * an event about a connection `c` sends `c` answers and then perhaps closes it, and
   --   sends nothing after the close, so no connection hears an answer meant for another;
-  -- * any other event names no connection.
+  -- * the sweep closes connections and then sets the next sweep;
+  -- * any other event names no connection and leaves the sweep's timer alone, so that once
+  --   set, the sweep comes back for as long as the server runs.
   within(s: REST_SERVER[S], e: EVENT, st: STEP[REST_SERVER[S]]): BOOL
     do
       REST_SERVER.limit_kept(s, st) and REST_COMMANDS.shaped(e, REST_SERVER.commands(st))
@@ -235,6 +244,26 @@ feature {ANY}
       capped: REST_COMMANDS.sent_to(REST_SERVER.commands(Result), c) + Current.answered_on(c) <= 100
     end
 
+  -- The sweep: close each connection that has waited through `HTTP_CONNECTION.max_idle_ticks`
+  -- sweeps less one without completing a request, count one more sweep for the others, and
+  -- set the next one.
+  on_sweep: STEP[REST_SERVER[S]]
+    do
+      let sw = Current.conns.sweep
+      Continue(Current.with_conns(Current.conns.with_kept(sw)), REST_COMMANDS.sweep_commands(sw.closed))
+    ensure
+      within: REST_SERVER.within(Current, Tick(REST_COMMANDS.sweep_timer), Result)
+      -- Every connection is kept or closed.
+      accounted: match Result
+        case Continue(n, cmds) then n.open_connections + cmds.length = Current.open_connections + 1
+        case Stop(_, _) then False
+      end
+      same_state: match Result
+        case Continue(n, _) then n.state = Current.state
+        case Stop(_, _) then False
+      end
+    end
+
   -- The step of a REST service for the event `e`.
   serve(e: EVENT): STEP[REST_SERVER[S]]
     do
@@ -251,6 +280,8 @@ feature {ANY}
           Continue(Current.with_conns(Current.conns.release_connection(c)), REST_COMMANDS.close_only(c))
         case Closed(c) then
           Continue(Current.with_conns(Current.conns.release_connection(c)), LIST.empty)
+        case Tick(id) then
+          if id = REST_COMMANDS.sweep_timer then Current.on_sweep else Continue(Current, LIST.empty) end
         case ListenFailed(_, _) then
           Stop(1, LIST.empty.prepend(Print("grest: listen failed")))
         case Shutdown then
