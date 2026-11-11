@@ -1,19 +1,51 @@
 -- What a handler gives back: the service's next state, and the response to send. A handler
 -- that only reads the state gives back the state it was given.
+--
+-- An async handler (F.8, decision 7) may instead wait: it gives back its state, the commands
+-- that start the work its answer needs, such as a `Connect`, the tag it was given, how many
+-- sweeps it waits, and the response sent if no answer comes in that time. The service then
+-- answers the request by its tag, with `REST_WAKE.answering`. A handler that waits with a tag
+-- it was not given is answered at once with that late response, and its commands are not
+-- sent.
 module REST_OUTCOME[S]
 
 representation {NONE}
   next: S
   reply: HTTP_RESPONSE
+  -- The sweeps the request waits, or 0 when it is answered now.
+  sweeps: NAT
+  id: NAT
+  cmds: LIST[COMMAND]
+
+invariant
+  timed: sweeps <= 30
+  few: cmds.length <= 16
 
 create {ANY}
 
   make(s: S, resp: HTTP_RESPONSE): REST_OUTCOME[S]
     do
-      { next = s, reply = resp }
+      { next = s, reply = resp, sweeps = 0, id = 0, cmds = LIST.empty }
     ensure
       state_set: Result.state = s
       status_set: Result.response.response_status_code = resp.response_status_code
+      answered: not Result.waits
+    end
+
+  -- The request waits, in the state `s`, for the answer tagged `t`, through at most `n`
+  -- sweeps of one second, after `cs` is sent; `late` is the answer when the time runs out.
+  -- At most 16 commands are sent: of more, none is.
+  waiting(s: S, t: NAT, cs: LIST[COMMAND], n: NAT, late: HTTP_RESPONSE): REST_OUTCOME[S]
+    require
+      timed: n >= 1 and n <= 30
+    do
+      { next = s, reply = late, sweeps = n, id = t, cmds = if cs.length <= 16 then cs else LIST.empty end }
+    ensure
+      state_set: Result.state = s
+      waits: Result.waits
+      tag_set: Result.wait_tag = t
+      sweeps_set: Result.wait_sweeps = n
+      commands_set: cs.length <= 16 implies Result.commands = cs
     end
 
 feature {ANY}
@@ -23,9 +55,48 @@ feature {ANY}
       Current.next
     end
 
+  -- The response to send now, or, when the request waits, the one sent if it times out.
   response: HTTP_RESPONSE
     do
       Current.reply
+    end
+
+  -- Whether the request waits for an answer.
+  waits: BOOL
+    do
+      Current.sweeps > 0
+    ensure
+      def: Result = (Current.wait_sweeps > 0)
+    end
+
+  -- The tag the request waits under.
+  wait_tag: NAT
+    do
+      Current.id
+    end
+
+  -- The sweeps the request waits, at most 30, or 0 when it is answered now.
+  wait_sweeps: NAT
+    do
+      Current.sweeps
+    ensure
+      timed: Result <= 30
+    end
+
+  -- The commands that start the work the answer needs.
+  commands: LIST[COMMAND]
+    do
+      Current.cmds
+    ensure
+      few: Result.length <= 16
+    end
+
+  -- Whether the outcome waits with the tag `w` offers: then the server holds the request.
+  held_by(w: OPTION[NAT]): BOOL
+    do
+      Current.waits and w = Some(Current.wait_tag)
+    ensure
+      def: Result = (Current.waits and w = Some(Current.wait_tag))
     end
 
 end

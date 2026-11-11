@@ -1,0 +1,77 @@
+-- What a service gives back for an event that is not a server's own (F.8): bytes or a close
+-- on a connection it opened, a `Connected` or `ConnectFailed`, a timer of its own. Its next
+-- state, the commands to send, at most 16 (of more, none is sent), and perhaps the answer to a waiting request, by
+-- its tag. The server sends only the commands that name none of its connections and leave
+-- its sweep alone, and drops an answer whose tag no request waits under.
+module REST_WAKE[S]
+
+representation {NONE}
+  next: S
+  cmds: LIST[COMMAND]
+  ans: OPTION[HTTP_RESPONSE]
+  id: NAT
+
+invariant
+  few: cmds.length <= 16
+
+create {ANY}
+
+  make(s: S, cs: LIST[COMMAND]): REST_WAKE[S]
+    do
+      { next = s, cmds = if cs.length <= 16 then cs else LIST.empty end, ans = None, id = 0 }
+    ensure
+      state_set: Result.state = s
+      commands_set: cs.length <= 16 implies Result.commands = cs
+      no_answer: Result.answer.is_none
+    end
+
+  -- The state `s` and `cs`, and `resp` as the answer to the request tagged `t`.
+  answering(s: S, cs: LIST[COMMAND], t: NAT, resp: HTTP_RESPONSE): REST_WAKE[S]
+    do
+      { next = s, cmds = if cs.length <= 16 then cs else LIST.empty end, ans = Some(resp), id = t }
+    ensure
+      state_set: Result.state = s
+      commands_set: cs.length <= 16 implies Result.commands = cs
+      answered: Result.answer.is_some
+      tag_set: Result.answer_tag = t
+    end
+
+  -- What a service that waits for nothing does: it closes a connection it did not open that
+  -- sends bytes or fails, and keeps its state.
+  unknown(s: S, e: EVENT): REST_WAKE[S]
+    do
+      match e
+        case Received(c, _) then REST_WAKE.make(s, LIST.empty.prepend(Close(c)))
+        case SendFailed(c, _) then REST_WAKE.make(s, LIST.empty.prepend(Close(c)))
+        case _ then REST_WAKE.make(s, LIST.empty)
+      end
+    ensure
+      same_state: Result.state = s
+      no_answer: Result.answer.is_none
+    end
+
+feature {ANY}
+
+  state: S
+    do
+      Current.next
+    end
+
+  commands: LIST[COMMAND]
+    do
+      Current.cmds
+    ensure
+      few: Result.length <= 16
+    end
+
+  answer: OPTION[HTTP_RESPONSE]
+    do
+      Current.ans
+    end
+
+  answer_tag: NAT
+    do
+      Current.id
+    end
+
+end

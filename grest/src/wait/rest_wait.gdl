@@ -1,0 +1,121 @@
+-- A request that waits for its answer (F.8): the connection it came on, the tag the service
+-- answers it by, and its timeout. It waits through fewer than `limit` sweeps: the sweep
+-- that would reach it answers `late` instead. `late` is given with the wait, so no request
+-- waits without the answer it gets when its time runs out.
+module REST_WAIT
+
+representation {NONE}
+  conn: CONN_ID
+  id: NAT
+  age: NAT
+  limit: NAT
+  late: HTTP_RESPONSE
+  head_only: BOOL
+  closing: BOOL
+
+invariant
+  -- Every wait has a timeout, of at most `max_sweeps` sweeps.
+  timed: limit >= 1 and limit <= 30
+  -- Below its limit, so that the wait can go through one more sweep or time out.
+  in_time: age < limit
+
+create {ANY}
+
+  -- The longest a request waits, in sweeps of one second.
+  max_sweeps: NAT
+    do
+      30
+    ensure
+      def: Result = 30
+    end
+
+  -- A wait on `c` for the answer tagged `t`, of `sweeps` sweeps, answered `late` if no
+  -- answer comes in time. The answer has no body when `head`, and says `Connection: close`,
+  -- and the connection closes after it, when `close`.
+  make(c: CONN_ID, t: NAT, sweeps: NAT, lt: HTTP_RESPONSE, head: BOOL, close: BOOL): REST_WAIT
+    require
+      timed: sweeps >= 1 and sweeps <= 30
+    do
+      { conn = c, id = t, age = 0, limit = sweeps, late = lt, head_only = head, closing = close }
+    ensure
+      conn_set: Result.connection = c
+      tag_set: Result.tag = t
+      fresh: Result.sweeps_waited = 0
+      timed: Result.sweeps_allowed = sweeps
+      closing_set: Result.closes = close
+    end
+
+feature {ANY}
+
+  connection: CONN_ID
+    do
+      Current.conn
+    end
+
+  tag: NAT
+    do
+      Current.id
+    end
+
+  -- The sweeps the request has waited through.
+  sweeps_waited: NAT
+    do
+      Current.age
+    ensure
+      in_time: Result < Current.sweeps_allowed
+    end
+
+  -- The sweeps the request may wait through, less one: the last answers it late.
+  sweeps_allowed: NAT
+    do
+      Current.limit
+    ensure
+      timed: Result >= 1 and Result <= 30
+    end
+
+  -- The answer sent when the time runs out.
+  late_answer: HTTP_RESPONSE
+    do
+      Current.late
+    end
+
+  -- The request was a `HEAD`: its answer has no body.
+  is_head: BOOL
+    do
+      Current.head_only
+    end
+
+  -- The connection closes after the answer.
+  closes: BOOL
+    do
+      Current.closing
+    end
+
+  -- Whether the next sweep times the request out.
+  times_out: BOOL
+    do
+      Current.age + 1 >= Current.limit
+    ensure
+      def: Result = (Current.sweeps_waited + 1 >= Current.sweeps_allowed)
+    end
+
+  -- The wait after one more sweep.
+  aged: REST_WAIT
+    require
+      room: not Current.times_out
+    do
+      { Current with age = Current.age + 1 }
+    ensure
+      same_conn: Result.connection = Current.connection
+      same_tag: Result.tag = Current.tag
+      same_limit: Result.sweeps_allowed = Current.sweeps_allowed
+      one_more: Result.sweeps_waited = Current.sweeps_waited + 1
+    end
+
+  -- The bytes of `resp` as the answer to the request.
+  wire(resp: HTTP_RESPONSE): BYTES
+    do
+      HTTP_SERIALIZER.serialize_answer(resp, Current.head_only, Current.closing)
+    end
+
+end

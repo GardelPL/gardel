@@ -161,7 +161,166 @@ feature {ANY}
       at_most: Result <= cmds.length
     end
 
-  -- What a sweep may do: close connections, then set the next sweep, last.
+  -- `cmd` is a `Send`.
+  sends_one(cmd: COMMAND): BOOL
+    do
+      match cmd
+        case Send(_, _) then True
+        case _ then False
+      end
+    ensure
+      def: Result = (match cmd case Send(_, _) then True case _ then False end)
+    end
+
+  -- `cmd` names none of the connections `cs` holds, and leaves the sweep's timer alone: a
+  -- command of the service's own, such as a `Connect` or a `Send` to a connection it opened.
+  foreign(cmd: COMMAND, cs: HTTP_SERVER_STATE): BOOL
+    do
+      match cmd
+        case Send(d, _) then cs.lookup_connection(d).is_none
+        case Close(d) then cs.lookup_connection(d).is_none
+        case SetTimer(id, _) then id != REST_COMMANDS.sweep_timer
+        case CancelTimer(id) then id != REST_COMMANDS.sweep_timer
+        case _ then True
+      end
+    ensure
+      def: Result = (match cmd
+        case Send(d, _) then cs.lookup_connection(d).is_none
+        case Close(d) then cs.lookup_connection(d).is_none
+        case SetTimer(id, _) then id != REST_COMMANDS.sweep_timer
+        case CancelTimer(id) then id != REST_COMMANDS.sweep_timer
+        case _ then True
+      end)
+    end
+
+  -- Every one of `cmds` is the service's own.
+  all_foreign(cmds: LIST[COMMAND], cs: HTTP_SERVER_STATE): BOOL
+    variant
+      cmds.length
+    do
+      if cmds.length = 0 then True else REST_COMMANDS.foreign(cmds.head, cs) and REST_COMMANDS.all_foreign(cmds.tail, cs) end
+    ensure
+      def: Result = (cmds.length = 0 or (REST_COMMANDS.foreign(cmds.head, cs) and REST_COMMANDS.all_foreign(cmds.tail, cs)))
+    end
+
+  -- The commands of `cmds` that are the service's own, in order: the server sends no other
+  -- command a service gives.
+  own(cmds: LIST[COMMAND], cs: HTTP_SERVER_STATE): LIST[COMMAND]
+    variant
+      cmds.length
+    do
+      if cmds.length = 0 then
+        LIST.empty
+      else if REST_COMMANDS.foreign(cmds.head, cs) then
+        REST_COMMANDS.own(cmds.tail, cs).prepend(cmds.head)
+      else
+        REST_COMMANDS.own(cmds.tail, cs)
+      end end
+    ensure
+      all_own: REST_COMMANDS.all_foreign(Result, cs)
+      woken: REST_COMMANDS.for_wake(Result, cs)
+      not_longer: Result.length <= cmds.length
+    end
+
+  -- Commands of the service's own send nothing to `c`, a connection `cs` holds.
+  none_to(cmds: LIST[COMMAND], cs: HTTP_SERVER_STATE, c: CONN_ID): BOOL
+    require
+      held: cs.lookup_connection(c).is_some
+      own: REST_COMMANDS.all_foreign(cmds, cs)
+      bounded: cmds.length <= 1000
+    variant
+      cmds.length
+    do
+      if cmds.length = 0 then True else REST_COMMANDS.none_to(cmds.tail, cs, c) end
+    ensure
+      holds: Result
+      none: REST_COMMANDS.sent_to(cmds, c) = 0
+    end
+
+  -- What bytes from the connection `c`, which `cs` holds, may do: send `c` answers, one per
+  -- request, and then either close it or send commands of the service's own, for a request
+  -- that waits.
+  for_conn_out(cmds: LIST[COMMAND], c: CONN_ID, cs: HTTP_SERVER_STATE): BOOL
+    variant
+      cmds.length
+    do
+      if cmds.length = 0 then
+        True
+      else if REST_COMMANDS.sends(cmds.head, c) then
+        REST_COMMANDS.for_conn_out(cmds.tail, c, cs)
+      else if REST_COMMANDS.closes(cmds.head, c) then
+        cmds.length = 1
+      else
+        REST_COMMANDS.all_foreign(cmds, cs)
+      end end end
+    ensure
+      def: Result = (cmds.length = 0
+        or (cmds.length >= 1 and REST_COMMANDS.sends(cmds.head, c) and REST_COMMANDS.for_conn_out(cmds.tail, c, cs))
+        or (cmds.length >= 1 and not REST_COMMANDS.sends(cmds.head, c) and REST_COMMANDS.closes(cmds.head, c) and cmds.length = 1)
+        or (cmds.length >= 1 and not REST_COMMANDS.sends(cmds.head, c) and not REST_COMMANDS.closes(cmds.head, c) and REST_COMMANDS.all_foreign(cmds, cs)))
+    end
+
+  -- One answer: a `Send`, perhaps followed by the close of the same connection.
+  one_answer(cmds: LIST[COMMAND]): BOOL
+    do
+      if cmds.length = 0 then
+        False
+      else
+        match cmds.head
+          case Send(d, _) then cmds.length = 1 or (cmds.length = 2 and REST_COMMANDS.closes(cmds.tail.head, d))
+          case _ then False
+        end
+      end
+    end
+
+  -- What an event the service handles may do: send commands of the service's own, and then
+  -- perhaps one answer to a request that waited.
+  for_wake(cmds: LIST[COMMAND], cs: HTTP_SERVER_STATE): BOOL
+    variant
+      cmds.length
+    do
+      if cmds.length = 0 then
+        True
+      else if REST_COMMANDS.foreign(cmds.head, cs) then
+        REST_COMMANDS.for_wake(cmds.tail, cs)
+      else
+        REST_COMMANDS.one_answer(cmds)
+      end end
+    ensure
+      def: Result = (cmds.length = 0
+        or (cmds.length >= 1 and REST_COMMANDS.foreign(cmds.head, cs) and REST_COMMANDS.for_wake(cmds.tail, cs))
+        or (cmds.length >= 1 and not REST_COMMANDS.foreign(cmds.head, cs) and REST_COMMANDS.one_answer(cmds)))
+    end
+
+  -- `own` and then `ans`, an answer or nothing.
+  before_answer(own: LIST[COMMAND], ans: LIST[COMMAND], cs: HTTP_SERVER_STATE): LIST[COMMAND]
+    require
+      own: REST_COMMANDS.all_foreign(own, cs)
+      answer: ans.length = 0 or REST_COMMANDS.one_answer(ans)
+    variant
+      own.length
+    do
+      if own.length = 0 then ans else REST_COMMANDS.before_answer(own.tail, ans, cs).prepend(own.head) end
+    ensure
+      woken: REST_COMMANDS.for_wake(Result, cs)
+      count: Result.length = own.length + ans.length
+    end
+
+  -- The answer `wire` to `c`, and its close when `close`.
+  answer_wire(c: CONN_ID, wire: BYTES, close: BOOL): LIST[COMMAND]
+    do
+      if close then
+        LIST.empty.prepend(Close(c)).prepend(Send(c, wire))
+      else
+        LIST.empty.prepend(Send(c, wire))
+      end
+    ensure
+      one: REST_COMMANDS.one_answer(Result)
+      short: Result.length <= 2
+    end
+
+  -- What a sweep may do: close connections and answer requests whose time ran out, then set
+  -- the next sweep, last.
   for_sweep(cmds: LIST[COMMAND]): BOOL
     variant
       cmds.length
@@ -171,11 +330,24 @@ feature {ANY}
       else if cmds.length = 1 then
         REST_COMMANDS.rearms(cmds.head)
       else
-        REST_COMMANDS.closes_one(cmds.head) and REST_COMMANDS.for_sweep(cmds.tail)
+        (REST_COMMANDS.closes_one(cmds.head) or REST_COMMANDS.sends_one(cmds.head)) and REST_COMMANDS.for_sweep(cmds.tail)
       end end
     ensure
       def: Result = ((cmds.length = 1 and REST_COMMANDS.rearms(cmds.head))
-        or (cmds.length >= 2 and REST_COMMANDS.closes_one(cmds.head) and REST_COMMANDS.for_sweep(cmds.tail)))
+        or (cmds.length >= 2 and (REST_COMMANDS.closes_one(cmds.head) or REST_COMMANDS.sends_one(cmds.head)) and REST_COMMANDS.for_sweep(cmds.tail)))
+    end
+
+  -- The closes of `ids`, then `cmds`.
+  closing_all(ids: LIST[CONN_ID], cmds: LIST[COMMAND]): LIST[COMMAND]
+    require
+      swept: REST_COMMANDS.for_sweep(cmds)
+    variant
+      ids.length
+    do
+      if ids.length = 0 then cmds else REST_COMMANDS.closing_all(ids.tail, cmds).prepend(Close(ids.head)) end
+    ensure
+      swept: REST_COMMANDS.for_sweep(Result)
+      count: Result.length = ids.length + cmds.length
     end
 
   -- The commands of a sweep that closes `ids`.
@@ -207,27 +379,34 @@ feature {ANY}
       def: Result = (cmds.length = 0 or (cmds.length = 1 and REST_COMMANDS.quiet(cmds.head)))
     end
 
-  -- `cmds` is what an event `e` may do: see `REST_SERVER.within`.
-  shaped(e: EVENT, cmds: LIST[COMMAND]): BOOL
+  -- `cmds` is what an event `e` may do, from a server whose connections are `cs`: see
+  -- `REST_SERVER.within`.
+  shaped(e: EVENT, cmds: LIST[COMMAND], cs: HTTP_SERVER_STATE): BOOL
     do
       match e
         case Accepted(c) then REST_COMMANDS.for_conn(cmds, c)
-        case Received(c, _) then REST_COMMANDS.for_conn(cmds, c)
-        case SendFailed(c, _) then REST_COMMANDS.for_conn(cmds, c)
-        case Closed(c) then REST_COMMANDS.for_conn(cmds, c)
+        case Received(c, _) then
+          if cs.lookup_connection(c).is_some then REST_COMMANDS.for_conn_out(cmds, c, cs) else REST_COMMANDS.for_wake(cmds, cs) end
+        case SendFailed(c, _) then
+          if cs.lookup_connection(c).is_some then REST_COMMANDS.for_conn(cmds, c) else REST_COMMANDS.for_wake(cmds, cs) end
+        case Closed(c) then
+          if cs.lookup_connection(c).is_some then REST_COMMANDS.for_conn(cmds, c) else REST_COMMANDS.for_wake(cmds, cs) end
         case Tick(id) then
-          if id = REST_COMMANDS.sweep_timer then REST_COMMANDS.for_sweep(cmds) else REST_COMMANDS.for_none(cmds) end
-        case _ then REST_COMMANDS.for_none(cmds)
+          if id = REST_COMMANDS.sweep_timer then REST_COMMANDS.for_sweep(cmds) else REST_COMMANDS.for_wake(cmds, cs) end
+        case _ then REST_COMMANDS.for_wake(cmds, cs)
       end
     ensure
       def: Result = (match e
         case Accepted(c) then REST_COMMANDS.for_conn(cmds, c)
-        case Received(c, _) then REST_COMMANDS.for_conn(cmds, c)
-        case SendFailed(c, _) then REST_COMMANDS.for_conn(cmds, c)
-        case Closed(c) then REST_COMMANDS.for_conn(cmds, c)
+        case Received(c, _) then
+          (if cs.lookup_connection(c).is_some then REST_COMMANDS.for_conn_out(cmds, c, cs) else REST_COMMANDS.for_wake(cmds, cs) end)
+        case SendFailed(c, _) then
+          (if cs.lookup_connection(c).is_some then REST_COMMANDS.for_conn(cmds, c) else REST_COMMANDS.for_wake(cmds, cs) end)
+        case Closed(c) then
+          (if cs.lookup_connection(c).is_some then REST_COMMANDS.for_conn(cmds, c) else REST_COMMANDS.for_wake(cmds, cs) end)
         case Tick(id) then
-          (if id = REST_COMMANDS.sweep_timer then REST_COMMANDS.for_sweep(cmds) else REST_COMMANDS.for_none(cmds) end)
-        case _ then REST_COMMANDS.for_none(cmds)
+          (if id = REST_COMMANDS.sweep_timer then REST_COMMANDS.for_sweep(cmds) else REST_COMMANDS.for_wake(cmds, cs) end)
+        case _ then REST_COMMANDS.for_wake(cmds, cs)
       end)
     end
 

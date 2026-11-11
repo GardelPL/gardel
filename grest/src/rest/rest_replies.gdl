@@ -1,19 +1,49 @@
 -- The answers a `REST_SERVER` sends for a batch of requests on one connection, and the
--- service's state after them.
+-- service's state after them, and the request held to wait for its answer, if one is: the
+-- commands are then the answers before it and the commands its handler gave.
+--
+-- The wait is kept as its parts, not as an `OPTION[REST_WAIT]`: with the verifier's type
+-- encoding, a wait built inside `Some` in the same proof stops the solver from using the
+-- facts of either (F.8, found on the way).
 module REST_REPLIES[S]
 
 representation {NONE}
   next: S
   cmds: LIST[COMMAND]
+  held: BOOL
+  id: NAT
+  sweeps: NAT
+  late: HTTP_RESPONSE
+  for_head: BOOL
+  cut_after: BOOL
+
+invariant
+  timed: held implies (sweeps >= 1 and sweeps <= 30)
 
 create {ANY}
 
   make(s: S, cs: LIST[COMMAND]): REST_REPLIES[S]
     do
-      { next = s, cmds = cs }
+      { next = s, cmds = cs, held = False, id = 0, sweeps = 0, late = REST_RESPONSE.timed_out, for_head = False, cut_after = False }
     ensure
       state_set: Result.state = s
       commands_set: Result.commands = cs
+      none_held: not Result.holds_wait
+    end
+
+  -- The state `s` and the commands `cs`, with a request held to wait under the tag `t`,
+  -- through at most `n` sweeps, answered `lt` if no answer comes; the answer has no body when
+  -- `hd`, and the connection closes after it when `ct`.
+  held_on(s: S, cs: LIST[COMMAND], t: NAT, n: NAT, lt: HTTP_RESPONSE, hd: BOOL, ct: BOOL): REST_REPLIES[S]
+    require
+      timed: n >= 1 and n <= 30
+    do
+      { next = s, cmds = cs, held = True, id = t, sweeps = n, late = lt, for_head = hd, cut_after = ct }
+    ensure
+      state_set: Result.state = s
+      commands_set: Result.commands = cs
+      held_set: Result.holds_wait
+      tag_set: Result.wait_tag = t
     end
 
 feature {ANY}
@@ -28,6 +58,29 @@ feature {ANY}
       Current.cmds
     end
 
+  -- Whether a request is held to wait.
+  holds_wait: BOOL
+    do
+      Current.held
+    end
+
+  -- The tag the held request waits under.
+  wait_tag: NAT
+    do
+      Current.id
+    end
+
+  -- The held request's wait on `c`, closing `c` after its answer too when `more`.
+  wait_on(c: CONN_ID, more: BOOL): REST_WAIT
+    require
+      held: Current.holds_wait
+    do
+      REST_WAIT.make(c, Current.id, Current.sweeps, Current.late, Current.for_head, Current.cut_after or more)
+    ensure
+      conn_set: Result.connection = c
+      tag_set: Result.tag = Current.wait_tag
+    end
+
   -- The same replies, with `cmd` sent before them.
   sent_first(cmd: COMMAND): REST_REPLIES[S]
     do
@@ -35,6 +88,8 @@ feature {ANY}
     ensure
       same_state: Result.state = Current.state
       commands_set: Result.commands = Current.commands.prepend(cmd)
+      same_held: Result.holds_wait = Current.holds_wait
+      same_tag: Result.wait_tag = Current.wait_tag
     end
 
 end

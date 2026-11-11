@@ -1,6 +1,6 @@
--- What a sweep of the connection table leaves: the connections kept, each one sweep older,
--- and the ones it closes, which had waited through `HTTP_CONNECTION.max_idle_ticks` sweeps
--- less one without a request.
+-- What a sweep of the connection table leaves: the connections kept, each one sweep older
+-- unless it waits for its answer, and the ones it closes, which had waited through
+-- `HTTP_CONNECTION.max_idle_ticks` sweeps less one without a request.
 module HTTP_SWEEP
 
 representation {NONE}
@@ -9,14 +9,15 @@ representation {NONE}
 
 create {ANY}
 
-  -- Every one of `ks` has waited through a sweep since its last answer.
+  -- Every one of `ks` has waited through a sweep since its last answer, or waits for its
+  -- answer.
   all_waited(ks: LIST[HTTP_CONNECTION]): BOOL
     variant
       ks.length
     do
-      if ks.length = 0 then True else ks.head.idle_ticks >= 1 and HTTP_SWEEP.all_waited(ks.tail) end
+      if ks.length = 0 then True else (ks.head.is_waiting or ks.head.idle_ticks >= 1) and HTTP_SWEEP.all_waited(ks.tail) end
     ensure
-      def: Result = (ks.length = 0 or (ks.head.idle_ticks >= 1 and HTTP_SWEEP.all_waited(ks.tail)))
+      def: Result = (ks.length = 0 or ((ks.head.is_waiting or ks.head.idle_ticks >= 1) and HTTP_SWEEP.all_waited(ks.tail)))
     end
 
   make(ks: LIST[HTTP_CONNECTION], ids: LIST[CONN_ID]): HTTP_SWEEP

@@ -1,6 +1,7 @@
 -- The server of a REST service whose state is an `S`: `ghttp`'s table of connections, a
--- `REST_ROUTER[S]`, and the state. A client's reactive program is its state, its routes, its
--- handlers and two lines:
+-- `REST_ROUTER[S]`, the state, the requests that wait for their answers, and what the service
+-- does with an event that is not the server's own. A client's reactive program is its state,
+-- its routes, its handlers and two lines:
 --
 --   init(args: SEQ[STRING]): STEP[REST_SERVER[STORE]]
 --     do REST_SERVER.start(args, 8090, routes, STORE.empty) end
@@ -14,31 +15,79 @@
 -- the one its handler gave back. `serve` proves both for every event: see
 -- `REST_SERVER.within` and `moves_to`. The state is an `S`, so whatever `S`'s invariant says
 -- holds of it after every request.
+--
+-- Async handlers (F.8). A route made with `REST_ROUTER.on_await` may wait for its answer: its
+-- handler gives `REST_OUTCOME.waiting`, with the commands that start the work, such as a
+-- `Connect` to another service. The request then waits in a table of at most 32
+-- (`REST_WAITING`), and its connection reads nothing more until it is answered. Every event
+-- that is not the server's own, a `Connected`, bytes from a connection the service opened, a
+-- timer of its own, goes to the service's `wake` handler (`start_waking`), which may answer a
+-- waiting request by its tag (`REST_WAKE.answering`). Each sweep counts once against every
+-- waiting request, and the one that reaches its limit answers it with the late response its
+-- handler gave. A request that cannot wait, as the table is full, is answered `503`. A
+-- request sent after one that waits, on the same connection, is not answered: the
+-- connection closes after the answer, so that the client sends it again; a connection that
+-- sends bytes while its request waits is closed, unanswered. An answer to a request that no
+-- longer waits is dropped. The server sends only the service's commands that name none of
+-- its connections and leave its sweep alone.
 module REST_SERVER[S]
 
 representation {NONE}
   conns: HTTP_SERVER_STATE
   api: REST_ROUTER[S]
   app: S
+  queue: REST_WAITING
+  wake: (s: S, e: EVENT) -> REST_WAKE[S]
 
 create {ANY}
 
-  -- A server for `api` in the state `s`, with no connections, listening on `p`.
+  -- A server for `api` in the state `s`, with no connections, listening on `p`, whose
+  -- service waits for nothing (`REST_WAKE.unknown`).
   make(p: NAT, api: REST_ROUTER[S], s: S): REST_SERVER[S]
     require
       valid_port: p >= 1 and p <= 65535
     do
-      { conns = HTTP_SERVER_STATE.make_on_port(64, p), api = api, app = s }
+      REST_SERVER.make_waking(p, api, fn(x: S, e: EVENT): REST_WAKE[S] do REST_WAKE.unknown(x, e) end, s)
     ensure
       none_open: Result.open_connections = 0
       limit_set: Result.max_connections = 64
       port_set: Result.port = p
+      none_waiting: Result.waiting = 0
+    end
+
+  -- A server for `api` in the state `s`, whose service handles the events that are not the
+  -- server's own with `wk`.
+  make_waking(p: NAT, api: REST_ROUTER[S], wk: (s: S, e: EVENT) -> REST_WAKE[S], s: S): REST_SERVER[S]
+    require
+      valid_port: p >= 1 and p <= 65535
+    do
+      { conns = HTTP_SERVER_STATE.make_on_port(64, p), api = api, app = s, queue = REST_WAITING.empty, wake = wk }
+    ensure
+      none_open: Result.open_connections = 0
+      limit_set: Result.max_connections = 64
+      port_set: Result.port = p
+      none_waiting: Result.waiting = 0
     end
 
   -- Starts `api` in the state `s`, on the port the first argument names, or on `p` when there
-  -- is none, and sets the first sweep. An argument that is not a port from 1 to 65535, or a route whose pattern is not
-  -- valid, stops the program with exit status 2 and a message, before it listens.
+  -- is none, and sets the first sweep. An argument that is not a port from 1 to 65535, or a
+  -- route whose pattern is not valid, stops the program with exit status 2 and a message,
+  -- before it listens.
   start(args: SEQ[STRING], p: NAT, api: REST_ROUTER[S], s: S): STEP[REST_SERVER[S]]
+    require
+      valid_port: p >= 1 and p <= 65535
+    do
+      REST_SERVER.start_waking(args, p, api, fn(x: S, e: EVENT): REST_WAKE[S] do REST_WAKE.unknown(x, e) end, s)
+    ensure
+      bad_route_stops: api.invalid_route.is_some implies Result.is_stop
+      armed: match Result
+        case Continue(_, cmds) then cmds.length = 2 and REST_COMMANDS.for_sweep(cmds.tail)
+        case Stop(_, _) then True
+      end
+    end
+
+  -- `start`, for a service that handles the events that are not the server's own with `wk`.
+  start_waking(args: SEQ[STRING], p: NAT, api: REST_ROUTER[S], wk: (s: S, e: EVENT) -> REST_WAKE[S], s: S): STEP[REST_SERVER[S]]
     require
       valid_port: p >= 1 and p <= 65535
     do
@@ -48,11 +97,11 @@ create {ANY}
         case None then
           match REST_COMMANDS.first_arg(args)
             case None then
-              Continue(REST_SERVER.make(p, api, s), LIST.empty.prepend(REST_COMMANDS.rearm).prepend(Listen(p)))
+              Continue(REST_SERVER.make_waking(p, api, wk, s), LIST.empty.prepend(REST_COMMANDS.rearm).prepend(Listen(p)))
             case Some(a) then
               match REST_COMMANDS.port_of(a)
                 case Some(q) then
-                  Continue(REST_SERVER.make(q, api, s), LIST.empty.prepend(REST_COMMANDS.rearm).prepend(Listen(q)))
+                  Continue(REST_SERVER.make_waking(q, api, wk, s), LIST.empty.prepend(REST_COMMANDS.rearm).prepend(Listen(q)))
                 case None then
                   Stop(2, LIST.empty.prepend(Print(REST_COMMANDS.complaint("grest: not a port: ", a))))
               end
@@ -81,16 +130,20 @@ create {ANY}
   -- What `serve` promises of a step `st` taken on `e` from `s`:
   --
   -- * the limit on connections is the same, so the number open stays within it;
-  -- * an event about a connection `c` sends `c` answers and then perhaps closes it, and
-  --   sends nothing after the close, so no connection hears an answer meant for another;
-  -- * the sweep closes connections and then sets the next sweep;
-  -- * any other event names no connection and leaves the sweep's timer alone, so that once
-  --   set, the sweep comes back for as long as the server runs.
+  -- * bytes from a connection `c` send `c` answers and then perhaps close it, sending
+  --   nothing after the close, or, when a request waits, send commands of the service's own
+  --   after the answers; so no connection hears an answer meant for another;
+  -- * the sweep closes connections and answers requests whose time ran out, then sets the
+  --   next sweep;
+  -- * an event the service handles sends commands of its own, which name none of the
+  --   server's connections and leave the sweep's timer alone, then perhaps one answer to a
+  --   request that waited; so that once set, the sweep comes back for as long as the server
+  --   runs.
   within(s: REST_SERVER[S], e: EVENT, st: STEP[REST_SERVER[S]]): BOOL
     do
-      REST_SERVER.limit_kept(s, st) and REST_COMMANDS.shaped(e, REST_SERVER.commands(st))
+      REST_SERVER.limit_kept(s, st) and REST_COMMANDS.shaped(e, REST_SERVER.commands(st), s.connections)
     ensure
-      def: Result = (REST_SERVER.limit_kept(s, st) and REST_COMMANDS.shaped(e, REST_SERVER.commands(st)))
+      def: Result = (REST_SERVER.limit_kept(s, st) and REST_COMMANDS.shaped(e, REST_SERVER.commands(st), s.connections))
     end
 
   -- `st` keeps the limit on connections of `s`.
@@ -138,6 +191,46 @@ feature {ANY}
       Current.app
     end
 
+  -- The connections the server holds.
+  connections: HTTP_SERVER_STATE
+    do
+      Current.conns
+    end
+
+  -- Whether `c` is a connection the server holds, rather than one the service opened.
+  holds(c: CONN_ID): BOOL
+    do
+      Current.conns.lookup_connection(c).is_some
+    ensure
+      def: Result = Current.connections.lookup_connection(c).is_some
+    end
+
+  -- How many requests wait for their answers.
+  waiting: NAT
+    do
+      Current.queue.count
+    ensure
+      bounded: Result <= 32
+    end
+
+  -- Whether a request on `c` waits for its answer.
+  waits_on(c: CONN_ID): BOOL
+    do
+      Current.queue.waits_on(c)
+    end
+
+  -- The tag offered to the next async handler, or `None` when no more requests can wait.
+  offered: OPTION[NAT]
+    do
+      Current.queue.offered
+    end
+
+  -- What the service gives for the event `e`.
+  woken(e: EVENT): REST_WAKE[S]
+    do
+      Current.wake(Current.app, e)
+    end
+
   -- The requests that `data` completes on `c`, in order, if `c` may still send them.
   completed(c: CONN_ID, data: BYTES): LIST[HTTP_REQUEST]
     do
@@ -163,10 +256,42 @@ feature {ANY}
       below_cap: Result < 100
     end
 
-  -- The answers to `reqs` on `c`, in order, from the state `s`, then `after`. The last
-  -- answer says `Connection: close` when `closing`, and an answer to a `HEAD` has no body.
-  replies(s: S, reqs: LIST[HTTP_REQUEST], c: CONN_ID, closing: BOOL, after: LIST[COMMAND]): REST_REPLIES[S]
+  -- The wait under the tag `t`, if a request waits under it.
+  wait_for(t: NAT): OPTION[REST_WAIT]
+    do
+      Current.queue.get(t)
+    end
+
+  -- The request `req` on `c`, held to wait with the outcome `out` its handler gave: its
+  -- handler's commands of the service's own are sent, and its connection closes after its
+  -- answer when `cut`.
+  held_reply(out: REST_OUTCOME[S], req: HTTP_REQUEST, c: CONN_ID, cut: BOOL): REST_REPLIES[S]
     require
+      held: Current.holds(c)
+      waits: out.waits
+    do
+      let mine = REST_COMMANDS.own(out.commands, Current.conns)
+      check
+        none: REST_COMMANDS.none_to(mine, Current.conns, c)
+      end
+      REST_REPLIES.held_on(out.state, mine, out.wait_tag, out.wait_sweeps, out.response, req.method = Head, cut)
+    ensure
+      shaped: REST_COMMANDS.for_conn_out(Result.commands, c, Current.connections)
+      state: Result.state = out.state
+      count: Result.commands.length <= 16
+      answers: REST_COMMANDS.sent_to(Result.commands, c) = 0
+      held_tag: Result.holds_wait and Result.wait_tag = out.wait_tag
+    end
+
+  -- The answers to `reqs` on `c`, in order, from the state `s`, then `after`, with the tag
+  -- `w` offered to an async handler. The last answer says `Connection: close` when
+  -- `closing`, and an answer to a `HEAD` has no body. A request whose handler waits with the
+  -- tag `w` offers is held: the answers before it are sent, then its handler's commands of
+  -- the service's own, and neither the requests after it nor `after`; its connection closes
+  -- after its answer when `closing`, or when anything came after it.
+  replies(s: S, reqs: LIST[HTTP_REQUEST], c: CONN_ID, closing: BOOL, after: LIST[COMMAND], w: OPTION[NAT]): REST_REPLIES[S]
+    require
+      held: Current.holds(c)
       shaped: REST_COMMANDS.for_conn(after, c)
       few: reqs.length <= 100
       short: after.length <= 2
@@ -176,15 +301,20 @@ feature {ANY}
       if reqs.length = 0 then
         REST_REPLIES.make(s, after)
       else
-        let out = Current.api.dispatch(s, reqs.head)
-        let wire = HTTP_SERIALIZER.serialize_answer(out.response, reqs.head.method = Head, closing and (reqs.length = 1))
-        Current.replies(out.state, reqs.tail, c, closing, after).sent_first(Send(c, wire))
+        let out = Current.api.dispatch_as(s, reqs.head, w)
+        if out.held_by(w) then
+          Current.held_reply(out, reqs.head, c, closing or reqs.length > 1 or after.length > 0)
+        else
+          let wire = HTTP_SERIALIZER.serialize_answer(out.response, reqs.head.method = Head, closing and (reqs.length = 1))
+          Current.replies(out.state, reqs.tail, c, closing, after, w).sent_first(Send(c, wire))
+        end
       end
     ensure
-      shaped: REST_COMMANDS.for_conn(Result.commands, c)
-      state: Result.state = Current.router.run(s, reqs)
-      count: Result.commands.length = reqs.length + after.length
-      answers: REST_COMMANDS.sent_to(Result.commands, c) = reqs.length + REST_COMMANDS.sent_to(after, c)
+      shaped: REST_COMMANDS.for_conn_out(Result.commands, c, Current.connections)
+      state: Result.state = Current.router.run_as(s, reqs, w)
+      count: Result.commands.length <= reqs.length + after.length + 16
+      answers: REST_COMMANDS.sent_to(Result.commands, c) <= reqs.length + REST_COMMANDS.sent_to(after, c)
+      held_tag: Result.holds_wait implies w = Some(Result.wait_tag)
     end
 
   -- The server with its connections replaced.
@@ -195,6 +325,7 @@ feature {ANY}
       { Current with conns = cs }
     ensure
       limit_kept: Result.max_connections = Current.max_connections
+      same_state: Result.state = Current.state
     end
 
   -- The server with its connections and its state replaced.
@@ -205,62 +336,275 @@ feature {ANY}
       { Current with conns = cs, app = s }
     ensure
       limit_kept: Result.max_connections = Current.max_connections
+      state_set: Result.state = s
+    end
+
+  -- The server with its connections and its waiting requests replaced.
+  with_conns_waits(cs: HTTP_SERVER_STATE, ws: REST_WAITING): REST_SERVER[S]
+    require
+      same_limit: cs.max_connections = Current.max_connections
+    do
+      { Current with conns = cs, queue = ws }
+    ensure
+      limit_kept: Result.max_connections = Current.max_connections
+      same_state: Result.state = Current.state
+      waits_set: Result.waiting = ws.count
+    end
+
+  -- The server, in the state `s`, with its connections `cs`, holding `wt` to wait under the
+  -- tag it was offered.
+  holding(cs: HTTP_SERVER_STATE, wt: REST_WAIT, s: S): REST_SERVER[S]
+    require
+      same_limit: cs.max_connections = Current.max_connections
+      tagged: Current.offered = Some(wt.tag)
+    do
+      { Current with conns = cs, queue = Current.queue.holding(wt), app = s }
+    ensure
+      limit_kept: Result.max_connections = Current.max_connections
+      state_set: Result.state = s
+      waits: Result.waits_on(wt.connection)
+    end
+
+  -- The server, in the state `s`.
+  with_state(s: S): REST_SERVER[S]
+    do
+      { Current with app = s }
+    ensure
+      limit_kept: Result.max_connections = Current.max_connections
+      state_set: Result.state = s
+    end
+
+  -- The server without `c`, nor a request of its that waits.
+  without(c: CONN_ID): REST_SERVER[S]
+    do
+      { Current with conns = Current.conns.release_connection(c), queue = Current.queue.dropping(c) }
+    ensure
+      limit_kept: Result.max_connections = Current.max_connections
+      same_state: Result.state = Current.state
+      freed: not Result.waits_on(c)
+    end
+
+  -- After the replies `r` to bytes from `c`: the connections `done` when no request waits;
+  -- or, when one does, `waiter`, the connection that waits, and the request held, closing its
+  -- connection after its answer too when `cut`.
+  settled(c: CONN_ID, r: REST_REPLIES[S], done: HTTP_SERVER_STATE, waiter: HTTP_CONNECTION, cut: BOOL): STEP[REST_SERVER[S]]
+    require
+      same_limit: done.max_connections = Current.max_connections
+      tagged: r.holds_wait implies Current.offered = Some(r.wait_tag)
+    do
+      if r.holds_wait then
+        Continue(Current.holding(Current.conns.save_connection(waiter), r.wait_on(c, cut), r.state), r.commands)
+      else
+        Continue(Current.with_conns_and_state(done, r.state), r.commands)
+      end
+    ensure
+      commands_set: REST_SERVER.commands(Result) = r.commands
+      moved: match Result
+        case Continue(n, _) then n.state = r.state and n.max_connections = Current.max_connections
+        case Stop(_, _) then False
+      end
     end
 
   -- Bytes from `c`: answer the requests they complete, in order, then wait for the next, or
   -- close `c` when the last asked for it or was its last by the cap, or answer the error that
-  -- stops the bytes after them and close `c`. The service moves through the states the
-  -- handlers give back, one request after another.
+  -- stops the bytes after them and close `c`; or hold the first request whose handler waits.
+  -- The service moves through the states the handlers give back, one request after another.
+  -- Bytes from a connection the service opened go to the service.
   on_bytes(c: CONN_ID, data: BYTES): STEP[REST_SERVER[S]]
     do
       match Current.conns.lookup_connection(c)
         case None then
-          Continue(Current, REST_COMMANDS.close_only(c))
+          Current.on_wake(Received(c, data))
         case Some(conn) then
           if not conn.connection_status.can_accept_bytes then
-            Continue(Current.with_conns(Current.conns.release_connection(c)), REST_COMMANDS.close_only(c))
+            Continue(Current.without(c), REST_COMMANDS.close_only(c))
           else
             let b = HTTP_PIPELINE.split(conn, data)
+            let w = Current.queue.offered
             match b.ending
               case ReadOn(n) then
-                let r = Current.replies(Current.app, b.requests, c, False, LIST.empty)
-                Continue(Current.with_conns_and_state(Current.conns.save_connection(n), r.state), r.commands)
+                Current.settled(c, Current.replies(Current.app, b.requests, c, False, LIST.empty, w),
+                  Current.conns.save_connection(n), n.awaiting, n.parser_state.buffered_bytes > 0)
               case CloseAfter then
-                let r = Current.replies(Current.app, b.requests, c, True, REST_COMMANDS.close_only(c))
-                Continue(Current.with_conns_and_state(Current.conns.release_connection(c), r.state), r.commands)
+                Current.settled(c, Current.replies(Current.app, b.requests, c, True, REST_COMMANDS.close_only(c), w),
+                  Current.conns.release_connection(c), conn.awaiting, True)
               case FailAfter(err) then
-                let r = Current.replies(Current.app, b.requests, c, False, REST_COMMANDS.answer(c, HTTP_RESPONSE.from_error(err)))
-                Continue(Current.with_conns_and_state(Current.conns.release_connection(c), r.state), r.commands)
+                Current.settled(c, Current.replies(Current.app, b.requests, c, False, REST_COMMANDS.answer(c, HTTP_RESPONSE.from_error(err)), w),
+                  Current.conns.release_connection(c), conn.awaiting, True)
             end
           end
       end
     ensure
       within: REST_SERVER.within(Current, Received(c, data), Result)
       served: match Result
-        case Continue(n, _) then n.state = Current.router.run(Current.state, Current.completed(c, data))
+        case Continue(n, _) then
+          (if Current.holds(c) then n.state = Current.router.run_as(Current.state, Current.completed(c, data), Current.offered)
+           else n.state = Current.woken(Received(c, data)).state end)
         case Stop(_, _) then False
       end
       -- With the answers sent before, no connection gets more than 100.
       capped: REST_COMMANDS.sent_to(REST_SERVER.commands(Result), c) + Current.answered_on(c) <= 100
     end
 
+  -- The server, in the state `s`, after `mine`, answering `wt` with `resp`: its connection
+  -- reads again, or closes when `wt` closes it.
+  delivered(s: S, mine: LIST[COMMAND], wt: REST_WAIT, resp: HTTP_RESPONSE): STEP[REST_SERVER[S]]
+    require
+      own: REST_COMMANDS.all_foreign(mine, Current.connections)
+      woken: REST_COMMANDS.for_wake(mine, Current.connections)
+      few: mine.length <= 16
+    do
+      let freed = Current.with_conns_waits(Current.conns, Current.queue.taking(wt.tag)).with_state(s)
+      match Current.conns.lookup_connection(wt.connection)
+        case None then
+          Continue(freed, mine)
+        case Some(conn) then
+          if wt.closes then
+            Continue(freed.with_conns(Current.conns.release_connection(wt.connection)),
+              REST_COMMANDS.before_answer(mine, REST_COMMANDS.answer_wire(wt.connection, wt.wire(resp), True), Current.conns))
+          else
+            Continue(freed.with_conns(Current.conns.save_connection(conn.resumed)),
+              REST_COMMANDS.before_answer(mine, REST_COMMANDS.answer_wire(wt.connection, wt.wire(resp), False), Current.conns))
+          end
+      end
+    ensure
+      woken: REST_COMMANDS.for_wake(REST_SERVER.commands(Result), Current.connections)
+      few: REST_SERVER.commands(Result).length <= 18
+      goes_on: match Result
+        case Continue(n, _) then n.state = s and n.max_connections = Current.max_connections
+        case Stop(_, _) then False
+      end
+    end
+
+  -- An event the service handles: its next state, its commands of its own, and the answer it
+  -- gives, sent to the request that waits under its tag, or dropped when none does.
+  on_wake(e: EVENT): STEP[REST_SERVER[S]]
+    do
+      let wk = Current.wake(Current.app, e)
+      let mine = REST_COMMANDS.own(wk.commands, Current.conns)
+      match wk.answer
+        case None then
+          Continue(Current.with_state(wk.state), mine)
+        case Some(resp) then
+          match Current.queue.get(wk.answer_tag)
+            case None then Continue(Current.with_state(wk.state), mine)
+            case Some(wt) then Current.delivered(wk.state, mine, wt, resp)
+          end
+      end
+    ensure
+      woken: REST_COMMANDS.for_wake(REST_SERVER.commands(Result), Current.connections)
+      few: REST_SERVER.commands(Result).length <= 18
+      moved: match Result
+        case Continue(n, _) then n.state = Current.woken(e).state and n.max_connections = Current.max_connections
+        case Stop(_, _) then False
+      end
+      -- An answer to no request that waits reaches none of the server's connections.
+      late_dropped: (Current.woken(e).answer.is_none or Current.wait_for(Current.woken(e).answer_tag).is_none)
+        implies REST_COMMANDS.all_foreign(REST_SERVER.commands(Result), Current.connections)
+    end
+
+  -- The late answers of `ws`, whose time ran out, each to its connection, then the next sweep.
+  lates(ws: LIST[REST_WAIT]): STEP[REST_SERVER[S]]
+    variant
+      ws.length
+    do
+      if ws.length = 0 then
+        Continue(Current, LIST.empty.prepend(REST_COMMANDS.rearm))
+      else
+        let wt = ws.head
+        match Current.conns.lookup_connection(wt.connection)
+          case None then
+            Current.lates(ws.tail)
+          case Some(conn) then
+            if wt.closes then
+              match Current.with_conns(Current.conns.release_connection(wt.connection)).lates(ws.tail)
+                case Continue(n, cs) then
+                  Continue(n, cs.prepend(Close(wt.connection)).prepend(Send(wt.connection, wt.wire(wt.late_answer))))
+                case Stop(x, cs) then Stop(x, cs)
+              end
+            else
+              match Current.with_conns(Current.conns.save_connection(conn.resumed)).lates(ws.tail)
+                case Continue(n, cs) then
+                  Continue(n, cs.prepend(Send(wt.connection, wt.wire(wt.late_answer))))
+                case Stop(x, cs) then Stop(x, cs)
+              end
+            end
+        end
+      end
+    ensure
+      swept: REST_COMMANDS.for_sweep(REST_SERVER.commands(Result))
+      goes_on: match Result
+        case Continue(n, _) then n.max_connections = Current.max_connections and n.state = Current.state
+        case Stop(_, _) then False
+      end
+    end
+
   -- The sweep: close each connection that has waited through `HTTP_CONNECTION.max_idle_ticks`
-  -- sweeps less one without completing a request, count one more sweep for the others, and
-  -- set the next one.
+  -- sweeps less one without completing a request, count one more sweep for the others,
+  -- answer late each request that has waited through its limit less one, count one more
+  -- sweep for the other waiting requests, and set the next sweep.
   on_sweep: STEP[REST_SERVER[S]]
     do
       let sw = Current.conns.sweep
-      Continue(Current.with_conns(Current.conns.with_kept(sw)), REST_COMMANDS.sweep_commands(sw.closed))
+      let ws = Current.queue.sweep
+      match Current.with_conns_waits(Current.conns.with_kept(sw), Current.queue.with_kept(ws)).lates(ws.expired)
+        case Continue(n, cs) then Continue(n, REST_COMMANDS.closing_all(sw.closed, cs))
+        case Stop(x, cs) then Stop(x, cs)
+      end
     ensure
       within: REST_SERVER.within(Current, Tick(REST_COMMANDS.sweep_timer), Result)
-      -- Every connection is kept or closed.
-      accounted: match Result
-        case Continue(n, cmds) then n.open_connections + cmds.length = Current.open_connections + 1
-        case Stop(_, _) then False
-      end
       same_state: match Result
         case Continue(n, _) then n.state = Current.state
         case Stop(_, _) then False
+      end
+    end
+
+  -- A timer: the sweep's, or one of the service's.
+  on_tick(id: NAT): STEP[REST_SERVER[S]]
+    do
+      if id = REST_COMMANDS.sweep_timer then Current.on_sweep else Current.on_wake(Tick(id)) end
+    ensure
+      within: REST_SERVER.within(Current, Tick(id), Result)
+      moved: match Result
+        case Continue(n, _) then
+          (if id = REST_COMMANDS.sweep_timer then n.state = Current.state else n.state = Current.woken(Tick(id)).state end)
+        case Stop(_, _) then False
+      end
+    end
+
+  -- `c` closed: the server's connection, freed with its request that waits, or one the
+  -- service opened.
+  on_closed(c: CONN_ID): STEP[REST_SERVER[S]]
+    do
+      if Current.holds(c) then Continue(Current.without(c), LIST.empty) else Current.on_wake(Closed(c)) end
+    ensure
+      within: REST_SERVER.within(Current, Closed(c), Result)
+      moved: match Result
+        case Continue(n, _) then
+          (if Current.holds(c) then n.state = Current.state else n.state = Current.woken(Closed(c)).state end)
+        case Stop(_, _) then False
+      end
+      freed: match Result
+        case Continue(n, _) then Current.holds(c) implies not n.waits_on(c)
+        case Stop(_, _) then True
+      end
+    end
+
+  -- A send to `c` failed: the server's connection, closed and freed with its request that
+  -- waits, or one the service opened.
+  on_failed(c: CONN_ID, x: IO_ERROR): STEP[REST_SERVER[S]]
+    do
+      if Current.holds(c) then Continue(Current.without(c), REST_COMMANDS.close_only(c)) else Current.on_wake(SendFailed(c, x)) end
+    ensure
+      within: REST_SERVER.within(Current, SendFailed(c, x), Result)
+      moved: match Result
+        case Continue(n, _) then
+          (if Current.holds(c) then n.state = Current.state else n.state = Current.woken(SendFailed(c, x)).state end)
+        case Stop(_, _) then False
+      end
+      freed: match Result
+        case Continue(n, _) then Current.holds(c) implies not n.waits_on(c)
+        case Stop(_, _) then True
       end
     end
 
@@ -276,38 +620,65 @@ feature {ANY}
           end
         case Received(c, data) then
           Current.on_bytes(c, data)
-        case SendFailed(c, _) then
-          Continue(Current.with_conns(Current.conns.release_connection(c)), REST_COMMANDS.close_only(c))
+        case SendFailed(c, x) then
+          Current.on_failed(c, x)
         case Closed(c) then
-          Continue(Current.with_conns(Current.conns.release_connection(c)), LIST.empty)
+          Current.on_closed(c)
         case Tick(id) then
-          if id = REST_COMMANDS.sweep_timer then Current.on_sweep else Continue(Current, LIST.empty) end
+          Current.on_tick(id)
         case ListenFailed(_, _) then
           Stop(1, LIST.empty.prepend(Print("grest: listen failed")))
         case Shutdown then
           Stop(0, LIST.empty)
         case _ then
-          Continue(Current, LIST.empty)
+          Current.on_wake(e)
       end
     ensure
       shutdown_must_stop: e.is_shutdown implies Result.is_stop
       within: REST_SERVER.within(Current, e, Result)
       state: Current.moves_to(e, Result)
+      -- A connection that closes or fails frees its request that waits.
+      freed: Current.frees(e, Result)
     end
 
 specify {ANY}
 
   -- What `serve` promises of the state after `e`: a step that continues has the state the
-  -- handlers of the requests that `e` completes gave back, one after another, or, when `e`
-  -- completes none, the state it had.
+  -- handlers of the requests that `e` completes gave back, one after another, up to one that
+  -- waits; or, for an event the service handles, the state the service gave; or else the
+  -- state it had.
   moves_to(e: EVENT, st: STEP[REST_SERVER[S]]): BOOL
     do
       match st
         case Stop(_, _) then True
         case Continue(n, _) then
           match e
-            case Received(c, data) then n.state = Current.router.run(Current.state, Current.completed(c, data))
-            case _ then n.state = Current.state
+            case Received(c, data) then
+              if Current.holds(c) then n.state = Current.router.run_as(Current.state, Current.completed(c, data), Current.offered)
+              else n.state = Current.woken(e).state end
+            case SendFailed(c, _) then
+              if Current.holds(c) then n.state = Current.state else n.state = Current.woken(e).state end
+            case Closed(c) then
+              if Current.holds(c) then n.state = Current.state else n.state = Current.woken(e).state end
+            case Accepted(_) then n.state = Current.state
+            case Tick(id) then
+              if id = REST_COMMANDS.sweep_timer then n.state = Current.state else n.state = Current.woken(e).state end
+            case _ then n.state = Current.woken(e).state
+          end
+      end
+    end
+
+  -- What `serve` promises of the requests that wait after `e`: when a connection the server
+  -- holds closes or fails, no request of its waits.
+  frees(e: EVENT, st: STEP[REST_SERVER[S]]): BOOL
+    do
+      match st
+        case Stop(_, _) then True
+        case Continue(n, _) then
+          match e
+            case SendFailed(c, _) then Current.holds(c) implies not n.waits_on(c)
+            case Closed(c) then Current.holds(c) implies not n.waits_on(c)
+            case _ then True
           end
       end
     end

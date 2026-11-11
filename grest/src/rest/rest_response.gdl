@@ -117,6 +117,22 @@ feature {ANY}
       status: Result.response_status_code = 405
     end
 
+  -- No room to wait for the answer: `{"error":"busy"}`, a `503`.
+  unavailable: HTTP_RESPONSE
+    do
+      REST_RESPONSE.error(HTTP_STATUS.make(503), "busy")
+    ensure
+      status: Result.response_status_code = 503
+    end
+
+  -- An answer that did not come in time: `{"error":"timed out"}`, a `504`.
+  timed_out: HTTP_RESPONSE
+    do
+      REST_RESPONSE.error(HTTP_STATUS.make(504), "timed out")
+    ensure
+      status: Result.response_status_code = 504
+    end
+
   -- A request target that could not be read: `{"error":"<reason>"}`, a `400`.
   bad_target(e: URL_ERROR): HTTP_RESPONSE
     do
