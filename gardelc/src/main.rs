@@ -8005,7 +8005,8 @@ enum BoogieEmitScope {
 }
 
 pub fn emit_boogie(m: &ModuleDecl, fuel_limit: usize) -> String {
-    boogie_params::scalars_last(&with_fresh_boogie_numbering(|| emit_boogie_numbered(m, fuel_limit)))
+    let bpl = with_fresh_boogie_numbering(|| emit_boogie_numbered(m, fuel_limit));
+    boogie_params::scalars_last(&fill_literal_lemmas_in_module(&bpl))
 }
 
 fn emit_boogie_numbered(m: &ModuleDecl, fuel_limit: usize) -> String {
@@ -9423,7 +9424,7 @@ fn emit_boogie_string_literal_procedures(strings: &[String]) -> String {
             s.escape_debug()
         ));
         // Two lemma procedures, from the same construction: the literal's facts, and its bytes,
-        // which only a procedure that reads bytes calls (see `literal_byte_lemma_calls`).
+        // which only a procedure that reads bytes calls (see `fill_literal_lemmas`).
         for (suffix, facts) in [("", string_literal_facts(idx, s)), ("_bytes", string_literal_byte_facts(idx, s))] {
         let ctx_name = format!("{ctx_name}{suffix}");
         // A lemma procedure: its implementation proves the facts below (no `free` clause),
@@ -9492,15 +9493,163 @@ fn string_literal_byte_facts(idx: usize, s: &str) -> Vec<(&'static str, String)>
     )]
 }
 
-/// Calls of the byte lemmas of every literal, for a procedure whose Boogie text `body` reads
-/// the bytes of a string, or nothing.
-fn literal_byte_lemma_calls(strings: &[String], body: &str) -> String {
-    if !prelude_string_mode() || !(body.contains("fn_to_utf8") || body.contains("fn_byte_model")) {
-        return String::new();
+/// The indices `k` of the literal constants `str_lit_k` that the Boogie text `body` names as
+/// whole identifiers (not a step `str_lit_k_s0`, nor another module's `..._str_lit_k`).
+fn literal_indices_in(body: &str) -> std::collections::BTreeSet<usize> {
+    let word = |b: u8| b == b'_' || b.is_ascii_alphanumeric();
+    let bytes = body.as_bytes();
+    let mut named = std::collections::BTreeSet::new();
+    let mut from = 0;
+    while let Some(at) = body[from..].find("str_lit_") {
+        let start = from + at;
+        let digits_at = start + "str_lit_".len();
+        let digits = bytes[digits_at..].iter().take_while(|b| b.is_ascii_digit()).count();
+        let end = digits_at + digits;
+        let whole = (start == 0 || !word(bytes[start - 1])) && bytes.get(end).map_or(true, |&b| !word(b));
+        if digits > 0 && whole {
+            if let Ok(k) = body[digits_at..end].parse::<usize>() {
+                named.insert(k);
+            }
+        }
+        from = end;
     }
-    (0..strings.len())
-        .map(|idx| format!("  call Verify_string_literal_{idx}_bytes();\n"))
-        .collect()
+    named
+}
+
+/// The names applied in the Boogie text `t`: each identifier followed by `(`.
+fn boogie_applied_names(t: &str) -> HashSet<&str> {
+    let ident = |b: u8| b == b'_' || b == b'.' || b == b'$' || b == b'#' || b.is_ascii_alphanumeric();
+    let bytes = t.as_bytes();
+    let mut out = HashSet::new();
+    let mut i = 0;
+    while i < bytes.len() {
+        if ident(bytes[i]) && (i == 0 || !ident(bytes[i - 1])) {
+            let start = i;
+            while i < bytes.len() && ident(bytes[i]) {
+                i += 1;
+            }
+            if bytes.get(i) == Some(&b'(') && !bytes[start].is_ascii_digit() {
+                out.insert(&t[start..i]);
+            }
+        } else {
+            i += 1;
+        }
+    }
+    out
+}
+
+/// The heads of the trigger terms `{ ... }` right after the first `::` of a quantified axiom:
+/// the outermost function of each term, as `fn_f` in `{ fn_f(SuccFuel(_fuel)) }`, so that a
+/// helper inside a term, such as `SuccFuel`, leads nowhere. `None` for an axiom with none.
+fn boogie_axiom_trigger_heads(line: &str) -> Option<Vec<&str>> {
+    let after = &line[line.find("::")? + 2..];
+    let mut rest = after.trim_start();
+    let mut heads = Vec::new();
+    while let Some(inner) = rest.strip_prefix('{') {
+        let close = inner.find('}')?;
+        let mut depth = 0usize;
+        let mut start = None;
+        for (i, c) in inner[..close].char_indices() {
+            match c {
+                '(' => {
+                    if depth == 0 {
+                        if let Some(st) = start.take() {
+                            heads.push(inner[st..i].trim());
+                        }
+                    }
+                    depth += 1;
+                }
+                ')' => depth = depth.saturating_sub(1),
+                ',' | ' ' if depth == 0 => start = None,
+                _ if depth == 0 && start.is_none() => start = Some(i),
+                _ => {}
+            }
+        }
+        rest = inner[close + 1..].trim_start();
+    }
+    (!heads.is_empty()).then_some(heads)
+}
+
+/// Fills the literal markers of every procedure of the module's Boogie text `bpl`. A procedure
+/// assumes the facts of a literal it may meet: one it names, or one named by an axiom that a
+/// function it names can trigger, and so on. An axiom's trigger heads lead to every function
+/// and literal of its body; an axiom with no trigger, to the same from each function it names.
+/// Each procedure also gets the bytes of those literals when it reads the bytes of a string.
+/// Given every literal of its module, a procedure of `ghttp`'s test module, with 51, passed or
+/// ran out of resources with the solver's seed (Task F.8). Assuming fewer proven facts is sound.
+fn fill_literal_lemmas_in_module(bpl: &str) -> String {
+    const FACTS: &str = "  //LITERAL_LEMMAS_MARKER\n";
+    const BYTES: &str = "  //LITERAL_BYTE_LEMMAS_MARKER\n";
+    if !bpl.contains(FACTS) && !bpl.contains(BYTES) {
+        return bpl.to_string();
+    }
+    let mut leads: HashMap<&str, (HashSet<&str>, std::collections::BTreeSet<usize>)> = HashMap::new();
+    for line in bpl.lines() {
+        let is_axiom = line.starts_with("axiom");
+        let is_defined_function = line.starts_with("function ") && line.contains('{');
+        if !is_axiom && !is_defined_function {
+            continue;
+        }
+        let fns = boogie_applied_names(line);
+        let lits = literal_indices_in(line);
+        if fns.is_empty() && lits.is_empty() {
+            continue;
+        }
+        let heads: Vec<&str> = if is_defined_function {
+            line["function ".len()..].split('(').next().map(str::trim).into_iter().collect()
+        } else if let Some(heads) = boogie_axiom_trigger_heads(line) {
+            heads
+        } else {
+            fns.iter().copied().collect()
+        };
+        for h in heads {
+            let e = leads.entry(h).or_default();
+            e.0.extend(fns.iter().copied());
+            e.1.extend(lits.iter().copied());
+        }
+    }
+    let proven = |k: usize, bytes: bool| {
+        let name = if bytes { format!("procedure Verify_string_literal_{k}_bytes(") } else { format!("procedure Verify_string_literal_{k}(") };
+        bpl.contains(&name)
+    };
+    let mut out = String::with_capacity(bpl.len());
+    let mut chunks = bpl.split_inclusive('\n').peekable();
+    while chunks.peek().is_some() {
+        // One procedure: its first line and every line up to the next procedure.
+        let mut proc_text = String::new();
+        while let Some(l) = chunks.peek() {
+            if !proc_text.is_empty() && l.starts_with("procedure ") {
+                break;
+            }
+            proc_text.push_str(l);
+            chunks.next();
+        }
+        if !proc_text.contains(FACTS) && !proc_text.contains(BYTES) {
+            out.push_str(&proc_text);
+            continue;
+        }
+        let mut lits = literal_indices_in(&proc_text);
+        let mut seen: HashSet<&str> = HashSet::new();
+        let mut todo: Vec<&str> = boogie_applied_names(&proc_text).into_iter().filter_map(|f| leads.get_key_value(f).map(|(k, _)| *k)).collect();
+        while let Some(f) = todo.pop() {
+            if !seen.insert(f) {
+                continue;
+            }
+            if let Some((fns, ls)) = leads.get(f) {
+                lits.extend(ls.iter().copied());
+                todo.extend(fns.iter().copied().filter(|g| !seen.contains(g)));
+            }
+        }
+        let facts: String = lits.iter().filter(|&&k| proven(k, false)).map(|k| format!("  call Verify_string_literal_{k}();\n")).collect();
+        let reads_bytes = proc_text.contains("fn_to_utf8") || proc_text.contains("fn_byte_model");
+        let bytes: String = if reads_bytes {
+            lits.iter().filter(|&&k| proven(k, true)).map(|k| format!("  call Verify_string_literal_{k}_bytes();\n")).collect()
+        } else {
+            String::new()
+        };
+        out.push_str(&proc_text.replace(FACTS, &facts).replace(BYTES, &bytes));
+    }
+    out
 }
 
 /// The proven facts of literal `idx` (`Verify_string_literal_idx` postconditions): the
@@ -9535,16 +9684,11 @@ fn string_literal_facts(idx: usize, s: &str) -> Vec<(&'static str, String)> {
     ]
 }
 
-/// In prelude mode, calls every literal lemma of the module at the start of a procedure
-/// body so the literals' proven facts are available there (Boogie checks each lemma's
-/// implementation separately; calling it only assumes its verified postconditions).
-fn emit_string_literal_lemma_calls(strings: &[String]) -> String {
-    if !prelude_string_mode() {
-        return String::new();
-    }
-    (0..strings.len())
-        .map(|idx| format!("  call Verify_string_literal_{idx}();\n"))
-        .collect()
+/// The place at the start of a procedure body where `fill_literal_lemmas` calls the lemmas of
+/// the literals the procedure names, so their proven facts are available there (Boogie checks
+/// each lemma's implementation separately; calling it only assumes its verified postconditions).
+fn emit_string_literal_lemma_calls() -> String {
+    "  //LITERAL_LEMMAS_MARKER\n".to_string()
 }
 
 /// Whether routine `r` depends on its implicit receiver `Current`.
@@ -9881,7 +10025,7 @@ fn emit_boogie_verify_routine(
 
     let mut locals = Vec::new();
     collect_proc_locals(&r.stmts, &r.body, r, m, &mut locals);
-    let mut code = emit_string_literal_lemma_calls(strings);
+    let mut code = emit_string_literal_lemma_calls();
     code.push_str("  //LITERAL_BYTE_LEMMAS_MARKER\n");
     for (_, req_e) in &r.requires {
         code.push_str(&emit_from_scalar_obligation(
@@ -9937,8 +10081,8 @@ fn emit_boogie_verify_routine(
     }
 
     s.push_str("}\n\n");
-    let calls = literal_byte_lemma_calls(strings, &s);
-    s.replace("  //LITERAL_BYTE_LEMMAS_MARKER\n", &calls)
+    // `emit_boogie` fills the literal markers once the module's axioms are all known.
+    s
 }
 
 fn emit_boogie_verify_law(
@@ -10001,7 +10145,7 @@ fn emit_boogie_verify_law(
         ));
     }
     s.push_str("{\n");
-    s.push_str(&emit_string_literal_lemma_calls(strings));
+    s.push_str(&emit_string_literal_lemma_calls());
     s.push_str("  //LITERAL_BYTE_LEMMAS_MARKER\n");
     let law_ctx = format!("{vis_prefix}{}", law.name);
     for (_, req_e) in &law.requires {
@@ -10105,8 +10249,6 @@ fn emit_boogie_verify_law(
     {
         params.insert(0, format!("Current: {}", map_boogie_type("Current", m)));
     }
-    let calls = literal_byte_lemma_calls(strings, &s);
-    let s = s.replace("  //LITERAL_BYTE_LEMMAS_MARKER\n", &calls);
     if canonical_where_guard(m, vis).is_none() {
         return format!(
             "procedure Verify_law_{vis_prefix}{}{tp_quant}({})\n{s}",
@@ -26583,6 +26725,41 @@ end
             verify_module_phase3(&m, src, file, DEFAULT_FUEL, true, false, false)
         });
         (m, diags)
+    }
+
+    #[test]
+    fn test_f8_literal_indices_in_reads_whole_constants_only() {
+        let body = "str_lit_1 == x && str_lit_10_s2 == y && xstr_lit_3 && f(str_lit_2) && P_str_lit_4 && str_lit_99";
+        assert_eq!(literal_indices_in(body).into_iter().collect::<Vec<_>>(), vec![1, 2, 99]);
+        assert!(literal_indices_in("no literal").is_empty());
+    }
+
+    #[test]
+    fn test_f8_a_procedure_assumes_only_the_literals_it_names() {
+        let src = "functions SCOPE\n\nfeature {ANY}\n\n  first: STRING\n    do\n      \"alpha\"\n    end\n\n  second: NAT\n    do\n      \"beta\".to_utf8.length\n    end\n\n  third: NAT\n    do\n      first.byte_length\n    ensure\n      five: Result = 5\n    end\n\nend\n";
+        let m = parse_user_module_with_prelude(src);
+        let bpl = with_prelude_injection(true, || emit_boogie(&m, DEFAULT_FUEL));
+        let strings = collect_module_strings(&m);
+        let at = |s: &str| strings.iter().position(|x| x == s).expect("literal collected");
+        let (alpha, beta) = (at("alpha"), at("beta"));
+        let proc_of = |name: &str| {
+            let start = bpl.find(&format!("procedure Verify_{name}(")).expect("procedure");
+            let end = bpl[start + 1..].find("\nprocedure ").map_or(bpl.len(), |e| start + 1 + e);
+            bpl[start..end].to_string()
+        };
+        let (first, second) = (proc_of("first"), proc_of("second"));
+        assert!(first.contains(&format!("call Verify_string_literal_{alpha}();")), "{first}");
+        assert!(!first.contains(&format!("call Verify_string_literal_{beta}();")), "{first}");
+        assert!(!first.contains("_bytes();"), "`first` reads no bytes:\n{first}");
+        assert!(second.contains(&format!("call Verify_string_literal_{beta}();")), "{second}");
+        assert!(second.contains(&format!("call Verify_string_literal_{beta}_bytes();")), "{second}");
+        assert!(!second.contains(&format!("call Verify_string_literal_{alpha}")), "{second}");
+        // `third` names no literal, but `first`'s definition, which it may unfold, does.
+        let third = proc_of("third");
+        assert!(third.contains(&format!("call Verify_string_literal_{alpha}();")), "{third}");
+        assert!(!third.contains(&format!("call Verify_string_literal_{beta}")), "{third}");
+        let (_, diags) = verify_with_prelude(src, "scope.gdl");
+        assert!(diags.is_empty(), "must verify, got: {diags:?}");
     }
 
     #[test]

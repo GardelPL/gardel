@@ -177,6 +177,9 @@ feature {ANY}
     ensure
       exact_wire_len: Result.byte_length = Current.wire_byte_length
       at_least_five: Result.byte_length >= 5
+      -- Spelled out, as a client cannot see this module's literals.
+      bytes: Result.byte_model = Current.name.byte_model.append(LIST.empty.prepend(32).prepend(58))
+        .append(Current.value.byte_model).append(LIST.empty.prepend(10).prepend(13))
     end
 
   equals(other: HTTP_HEADER): BOOL

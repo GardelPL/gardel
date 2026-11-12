@@ -47,7 +47,7 @@ feature {ANY}
   -- Parses `buf`, all the bytes received, under the limits of `state`.
   parse_buffer(state: HTTP_PARSER_STATE, buf: BYTES): HTTP_PARSE_RESULT
     do
-      match buf.index_of("\r\n".to_utf8, 0)
+      match buf.index_of(HTTP_HEAD_PARSER.crlf, 0)
         case None then
           if buf.length > state.request_line_limit then
             Failed(RequestLineTooLong)
@@ -71,7 +71,7 @@ feature {ANY}
       line_fits: le <= state.request_line_limit
       in_buf: le <= buf.length
     do
-      match buf.index_of("\r\n\r\n".to_utf8, le)
+      match buf.index_of(HTTP_HEAD_PARSER.blank_line, le)
         case None then
           if buf.length > state.request_line_limit + state.header_limit then
             Failed(HeaderTooLarge)

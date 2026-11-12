@@ -1,0 +1,74 @@
+-- The shape of the head `HTTP_REQUEST_WRITER` writes, for stage C of the round trip: no CR
+-- in the request line, a line break after it, a blank line at the end, and before that no
+-- CR with another two bytes on (`HTTP_HEAD_SHAPE`). Three laws, as one is too much for the
+-- solver.
+functions HTTP_WRITER_HEAD
+
+specify {ANY}
+
+  -- The request line holds no CR, and its line break follows it.
+  law head_line(req: HTTP_REQUEST)
+    require
+      sendable: HTTP_REQUEST_WRITER.sendable(req)
+    do
+      HTTP_REQUEST_WRITER.target_ok(req.target) and
+      HTTP_REQUEST_WRITER.fields_ok(req.headers.fields) and
+      req.headers.fields.length <= 64 and
+      HTTP_WRITER_LINES.request_line(req.method, req.target, req.version) and
+      HTTP_WRITER_FIELDS.fields_lines(req.headers.fields) and
+      HTTP_HEAD_SHAPE.line(
+        HTTP_REQUEST_WRITER.line_text(req.method, req.target, req.version).byte_model,
+        HTTP_REQUEST_WRITER.fields_text(req.headers.fields).byte_model,
+        HTTP_REQUEST_WRITER.length_line(req).byte_model)
+    ensure
+      size: HTTP_REQUEST_WRITER.head_text(req).byte_model.length >= HTTP_REQUEST_WRITER.line_text(req.method, req.target, req.version).byte_length + 4
+      line_no_cr: forall k: NAT. k < HTTP_REQUEST_WRITER.line_text(req.method, req.target, req.version).byte_length implies LIST_OPS.at(HTTP_REQUEST_WRITER.head_text(req).byte_model, k) != 13
+      line_end: LIST_OPS.at(HTTP_REQUEST_WRITER.head_text(req).byte_model, HTTP_REQUEST_WRITER.line_text(req.method, req.target, req.version).byte_length) = 13 and LIST_OPS.at(HTTP_REQUEST_WRITER.head_text(req).byte_model, HTTP_REQUEST_WRITER.line_text(req.method, req.target, req.version).byte_length + 1) = 10
+    end
+
+  -- The head ends with a blank line.
+  law head_blank(req: HTTP_REQUEST)
+    require
+      sendable: HTTP_REQUEST_WRITER.sendable(req)
+    do
+      HTTP_REQUEST_WRITER.target_ok(req.target) and
+      HTTP_REQUEST_WRITER.fields_ok(req.headers.fields) and
+      req.headers.fields.length <= 64 and
+      HTTP_WRITER_FIELDS.fields_ends(req.headers.fields) and
+      HTTP_HEAD_SHAPE.body_ends(
+        HTTP_REQUEST_WRITER.line_text(req.method, req.target, req.version).byte_model,
+        HTTP_REQUEST_WRITER.fields_text(req.headers.fields).byte_model,
+        HTTP_REQUEST_WRITER.length_line(req).byte_model) and
+      -- The head is its body, which ends with a line break, and another.
+      HTTP_REQUEST_WRITER.head_text(req).byte_model = HTTP_REQUEST_WRITER.line_text(req.method, req.target, req.version).byte_model.append(LIST.empty.prepend(10).prepend(13)).append(HTTP_REQUEST_WRITER.fields_text(req.headers.fields).byte_model).append(HTTP_REQUEST_WRITER.length_line(req).byte_model).append(LIST.empty.prepend(10).prepend(13)) and
+      HTTP_REQUEST_WRITER.head_text(req).byte_model.length = HTTP_REQUEST_WRITER.line_text(req.method, req.target, req.version).byte_model.append(LIST.empty.prepend(10).prepend(13)).append(HTTP_REQUEST_WRITER.fields_text(req.headers.fields).byte_model).append(HTTP_REQUEST_WRITER.length_line(req).byte_model).length + 2 and
+      LIST_OPS.at(HTTP_REQUEST_WRITER.head_text(req).byte_model, HTTP_REQUEST_WRITER.line_text(req.method, req.target, req.version).byte_model.append(LIST.empty.prepend(10).prepend(13)).append(HTTP_REQUEST_WRITER.fields_text(req.headers.fields).byte_model).append(HTTP_REQUEST_WRITER.length_line(req).byte_model).length - 2) = LIST_OPS.at(HTTP_REQUEST_WRITER.line_text(req.method, req.target, req.version).byte_model.append(LIST.empty.prepend(10).prepend(13)).append(HTTP_REQUEST_WRITER.fields_text(req.headers.fields).byte_model).append(HTTP_REQUEST_WRITER.length_line(req).byte_model), HTTP_REQUEST_WRITER.line_text(req.method, req.target, req.version).byte_model.append(LIST.empty.prepend(10).prepend(13)).append(HTTP_REQUEST_WRITER.fields_text(req.headers.fields).byte_model).append(HTTP_REQUEST_WRITER.length_line(req).byte_model).length - 2) and
+      LIST_OPS.at(HTTP_REQUEST_WRITER.head_text(req).byte_model, HTTP_REQUEST_WRITER.line_text(req.method, req.target, req.version).byte_model.append(LIST.empty.prepend(10).prepend(13)).append(HTTP_REQUEST_WRITER.fields_text(req.headers.fields).byte_model).append(HTTP_REQUEST_WRITER.length_line(req).byte_model).length - 1) = LIST_OPS.at(HTTP_REQUEST_WRITER.line_text(req.method, req.target, req.version).byte_model.append(LIST.empty.prepend(10).prepend(13)).append(HTTP_REQUEST_WRITER.fields_text(req.headers.fields).byte_model).append(HTTP_REQUEST_WRITER.length_line(req).byte_model), HTTP_REQUEST_WRITER.line_text(req.method, req.target, req.version).byte_model.append(LIST.empty.prepend(10).prepend(13)).append(HTTP_REQUEST_WRITER.fields_text(req.headers.fields).byte_model).append(HTTP_REQUEST_WRITER.length_line(req).byte_model).length - 1) and
+      LIST_OPS.at(HTTP_REQUEST_WRITER.head_text(req).byte_model, HTTP_REQUEST_WRITER.line_text(req.method, req.target, req.version).byte_model.append(LIST.empty.prepend(10).prepend(13)).append(HTTP_REQUEST_WRITER.fields_text(req.headers.fields).byte_model).append(HTTP_REQUEST_WRITER.length_line(req).byte_model).length) = 13 and
+      LIST_OPS.at(HTTP_REQUEST_WRITER.head_text(req).byte_model, HTTP_REQUEST_WRITER.line_text(req.method, req.target, req.version).byte_model.append(LIST.empty.prepend(10).prepend(13)).append(HTTP_REQUEST_WRITER.fields_text(req.headers.fields).byte_model).append(HTTP_REQUEST_WRITER.length_line(req).byte_model).length + 1) = 10
+    ensure
+      size: HTTP_REQUEST_WRITER.head_text(req).byte_model.length >= HTTP_REQUEST_WRITER.line_text(req.method, req.target, req.version).byte_length + 4
+      blank: LIST_OPS.at(HTTP_REQUEST_WRITER.head_text(req).byte_model, HTTP_REQUEST_WRITER.head_text(req).byte_model.length - 4) = 13 and LIST_OPS.at(HTTP_REQUEST_WRITER.head_text(req).byte_model, HTTP_REQUEST_WRITER.head_text(req).byte_model.length - 3) = 10 and
+        LIST_OPS.at(HTTP_REQUEST_WRITER.head_text(req).byte_model, HTTP_REQUEST_WRITER.head_text(req).byte_model.length - 2) = 13 and LIST_OPS.at(HTTP_REQUEST_WRITER.head_text(req).byte_model, HTTP_REQUEST_WRITER.head_text(req).byte_model.length - 1) = 10
+    end
+
+  -- Before its blank line, no CR has another two bytes on.
+  law head_apart(req: HTTP_REQUEST)
+    require
+      sendable: HTTP_REQUEST_WRITER.sendable(req)
+    do
+      HTTP_REQUEST_WRITER.target_ok(req.target) and
+      HTTP_REQUEST_WRITER.fields_ok(req.headers.fields) and
+      req.headers.fields.length <= 64 and
+      HTTP_WRITER_LINES.request_line(req.method, req.target, req.version) and
+      HTTP_WRITER_FIELDS.fields_lines(req.headers.fields) and
+      HTTP_HEAD_SHAPE.body(
+        HTTP_REQUEST_WRITER.line_text(req.method, req.target, req.version).byte_model,
+        HTTP_REQUEST_WRITER.fields_text(req.headers.fields).byte_model,
+        HTTP_REQUEST_WRITER.length_line(req).byte_model)
+    ensure
+      apart: forall k: NAT. forall j: NAT. (k < j and j < HTTP_REQUEST_WRITER.head_text(req).byte_model.length - 2 and
+        LIST_OPS.at(HTTP_REQUEST_WRITER.head_text(req).byte_model, k) = 13 and LIST_OPS.at(HTTP_REQUEST_WRITER.head_text(req).byte_model, j) = 13) implies j != k + 2
+    end
+
+end
