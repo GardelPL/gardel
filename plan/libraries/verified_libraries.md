@@ -1,7 +1,7 @@
 # Phase F: Verified Libraries and Applications
 
 **Date:** November 6, 2026
-**Status:** In progress. Tasks F.0 to F.7 and F.12 are completed (F.7 on Windows only), and the decisions below are taken.
+**Status:** In progress. Tasks F.0 to F.8, F.12 and F.13 are completed (F.7 on Windows only), and the decisions below are taken.
 **Roadmap entry:** [Phase F in Roadmap.md](../Roadmap.md#phase-f-verified-libraries-and-applications)
 **Probed at:** commit `1349cb6`
 
@@ -77,6 +77,7 @@ flowchart TD
     F1 --> F12["F.12 Refined function types"] --> F6
     F1 --> F13["F.13 Fuel guards on recursive functions"]
     F4 --> F14["F.14 Cost model for parallel lets"]
+    F8 --> F15["F.15 Facts over the values of calls"]
     F6 --> F7 --> F8
     F2 --> F9 --> F10 --> F11
     F8 --> F11
@@ -95,6 +96,7 @@ flowchart TD
 | F.12 | Not sized | `require` and `ensure` on function types enforced | Checking a lambda against a contract where it is passed |
 | F.13 | S | Fuel guards that hold when a function is applied within its `require` | Changing every routine axiom; proof time |
 | F.14 | S | Parallel `let`s only where they pay | Keeping `seq_bench`'s speedup |
+| F.15 | M | Facts over a user type that reach a value a call gives back | Changing how every procedure binds its values |
 | F.6 | M | `grest` | Fitting a library around a `reactive program` |
 | F.7 | M | `Connect`, tags | Non-blocking connect on two platforms |
 | F.8 | L | `HTTP_CLIENT`, async handlers | The design of a waiting handler |
@@ -227,11 +229,31 @@ Found during the F.5 follow-up (`ghttp` 0.3.0), and numbered last because it was
 
 Cause: `gardelc` (`main.rs`, the routine axioms) emits each `require` of a routine as a guard on all three of its axioms: the definition at `SuccFuel(_fuel)`, the step from `SuccFuel(SuccFuel(_fuel))` to `SuccFuel(_fuel)`, and the contract. Every guard is evaluated at `_fuel`. When a `require` calls a function, such as `i <= a.length`, that call is at a fuel where nothing is known, so a deeper unfolding is never tied to a shallower one. In `HTTP_HEADER.same_ci`, the lemma `same_ci_equal` could not prove `same_ci(a, b, i)` from `same_ci(a, b, i + 1)` until the `require` was removed. `BYTES.at` has the same guard on its fuel step.
 
-- [ ] Evaluate a guard so that it holds whenever the function is applied within its `require`: at the fuel of the application, or with fuel-free (fuel-insensitive) helpers.
-- [ ] A regression test: a recursive function with `require i <= a.length` and a lemma that unfolds it one step, which fails today.
-- [ ] Put the `require` back on `HTTP_HEADER.same_ci`, and remove the limit from the GUIDE (section 9).
-- [ ] Check that no example, `ghttp` or the prelude gets slower or loses a proof, as F.2's benchmark did.
-- Acceptance: the regression test verifies, and nothing that verified before stops verifying.
+**Status:** ✅ Completed (2026-11-12). The fuel step of a routine now goes from each fuel to the one below it.
+
+- [x] Evaluate a guard so that it holds whenever the function is applied within its `require`. Neither way proposed here was kept: the guards stay where they were, and the step reaches `ZeroFuel`, so that a function a guard calls is known there (see below).
+- [x] A regression test: `tests/fuel_guard.rs`. `SCAN.same_equal` proves `same(a, b, i)` from `same(a, b, i + 1)` under `require i <= SCAN.size(a)`, and a client proves `put(b, x).first = x` through `b.add(x)` one fuel below it. Two claims past the `require` are refused. Both proofs failed before.
+- [x] Put the `require` back on `HTTP_HEADER.same_ci`, and remove the limit from the GUIDE (section 9).
+- [x] Check that no example, `ghttp` or the prelude gets slower or loses a proof. Everything verifies cold, and times stay within the machine's run-to-run spread (the prelude took 33 to 48 s on HEAD across runs, and 45 to 54 s with the fix). Stage C of `ghttp`'s round trip had proofs on the edge, which needed sturdier steps: see below.
+- Acceptance: met.
+
+What was done:
+
+- **The case `BYTES.length` no longer showed.** A routine whose body a module cannot see is one function at every fuel (F.6), so a `require` on `a.length` alone already verified. The limit remained for a guard calling a function whose body is seen, as `size(a)` in the same module, or `has_header_room` under `HTTP_HEADERS.add`.
+- **The cause, precisely.** A definition is guarded one fuel below its application. When that application is itself one fuel below its caller, as `b.add(x)` in the body of `put(b, x)`, its definition is at `SuccFuel(ZeroFuel)` and its guard `room` at `ZeroFuel`. The step went from `SuccFuel(SuccFuel(f))` to `SuccFuel(f)`, never down to `ZeroFuel`, so `room` there was unknown.
+- **The fix.** The step is triggered on `fn(SuccFuel(f), ..)` and states it equal to `fn(f, ..)`, under the guard at `f`, as before. This ties `room` at `ZeroFuel` to `room` where the caller knows it. Triggered on the higher term, it only makes the lower one, so it cannot loop.
+- **Tried and dropped, each measured on every package cold.**
+  - Dropping the step's guard: `HTTP_WRITER_HEAD` lost its proofs.
+  - Also guarding the definition at the fuel of its application: that, and `law_line_end_found` running out of resources in `ghttp`, `grest` and the examples.
+  - The definition guarded at `DefaultFuel`: `head_blank` ran out.
+  - The new step only for the routines a `require` calls: `STRING.find` and `law_fields_lines` ran out, though it adds less than the fix. Those proofs were on the edge.
+- **Stage C made sturdier.** The fix, and F.15's, left `ghttp`'s own proofs verifying, but under seeds 1 to 3 `ghttp/tests` lost `HTTP_WRITER_HEAD`, `HTTP_ROUND_TRIP` and `check_line`. At the commit before, `head_line` already needed 25.7 million of the 30 million resources under seed 2. Nothing they claim changed.
+  - New modules `HTTP_HEAD_WHOLE` (the head as one list), `HTTP_HEAD_PARTS` and `HTTP_WRITER_PARTS` (each part's facts as one named predicate), and `HTTP_WIRE_PREFIX` (the searches over bytes that start with a prefix).
+  - `check_line` moved from `GHTTP_TEXT` to its own test module, `GHTTP_LINE`, where it assumes the facts of the 9 literals it can meet instead of 51.
+  - The heaviest of these proofs went from up to 28 million resources to about 1 million.
+  - Causes seen: `Seq_append` associativity re-matching where an operand may be empty; steps that cost far more together than apart; and the literal facts.
+  - Now `ghttp` and `ghttp/tests` verify under seeds 0 to 3. The heaviest left are `HTTP_WRITER_FIELDS.fields_lines` (up to 11.8 million) and `GHTTP_TEXT.two_exchanges` (11.8 million).
+- **Met again in F.8, stage D of the round trip**, now with a client: one step of `HTTP_HEAD_PARSER.fields` unfolds `HTTP_HEADERS.add` one fuel below its caller, guarded by `has_header_room` at fuel zero. The guards of the defining and step axioms read at `DefaultFuel`, and no guard on the step axiom, which every fuel makes sound, proved the step, and all of `ghttp` verified with them. The prelude was not checked with them, which F.4's attempt says to do first.
 - **Tried in F.4.** Both obvious fixes cost proofs. A guard at `DefaultFuel` on every axiom made `NUMBER_TEXT`'s round-trip laws run out of resources. A guard at the fuel of the application on the defining and step axioms made `STRING.find` run out. A fix must keep the extra unfolding to the routines that need it. `gjson` avoids the limit by keeping its reader total.
 
 #### Task F.14: A Cost Model for Parallel `let`s
@@ -243,6 +265,29 @@ The C backend runs each group of independent `let`s as OpenMP tasks, whatever th
 - [ ] Run a group in parallel only when at least two of its `let`s may be costly, for example a call into a recursive group, or above a size threshold such as `GARDEL_PAR_THRESHOLD`.
 - [ ] A benchmark: a loop with small independent `let`s costs no more with OpenMP than without, and `seq_bench` keeps its parallel speedup.
 - Acceptance: both measurements recorded, and `gjson` can use independent `let`s in its loops again.
+
+#### Task F.15: Facts Over a User Type at the Values of Calls
+
+Found in F.8, stage D of the round-trip proof, and numbered last because it was added last. With F.13, it blocks stage D, which tests cover meanwhile.
+
+Under `/typeEncoding:p`, an axiom quantified over a user type is not instantiated at a term that a call gives back, while it is at a parameter or a local of that type. A Boogie test of `HTTP_READ_FIELDS` showed it three ways: `HTTP_HEADERS`' invariant held for the parameter `acc` and not for `reads(buf, pos, hs.tail, acc)`; a law over an `HTTP_HEADERS` did not apply to that call even with its premises assumed; and both held once the call was assigned to a local. A small file with the same shapes verifies, so the cause is in what `gardelc` emits around it, not yet found. Step 3 met the same gap in a routine (`calling`'s outcome), and a `let` worked around it there; a law has no `let`.
+
+**Status:** The verifier's part is done (2026-11-12): a fact over a type now applies at the value of a call. Stage D of the round trip is still open.
+
+- [x] Find what blocks the instantiation. A bug in Boogie 3.4.3, which `boogie_params` already worked around for generic functions.
+- [x] Fix it where it is emitted: `boogie_params` now moves the scalars of every function last, not only of generic ones.
+- [x] A regression test: `tests/call_value.rs`. A law of another module about a `BOX`, with an invariant, applies at `twice(n, b)`, and the `LIST` facts at `NUMBER_TEXT.digits(n, ys).append(zs)`. A claim past the law is refused. Both proofs failed before.
+- [ ] Then stage D of F.8's round trip, whose lemmas wait outside the tree. With F.13 alone, the step through `HTTP_HEADERS.add` (`HTTP_FIELD_STEP.plain_step`) verifies, which F.13 blocked. `HTTP_READ_FIELDS.reads_back` and `HTTP_READ_STEPS.fields_steps` still fail, and with both fixes they run past the time limit. They need proof work, as stage C did, rather than a fix in the verifier.
+- Acceptance: the regression test verifies and nothing that verified before stops verifying, both met; stage D is not proven yet.
+
+What was done:
+
+- **The cause.** Under `/typeEncoding:p`, Boogie states the type of a function's result with an axiom that guards each argument's type. After an `int` or `bool` argument the guards are shifted by one. For `NUMBER_TEXT__fn_digits(fuel: Fuel, n: int, rest: (Seq int))` the axiom required `type(rest) == int`, so it never applied, and a call's result had no type. Every fact quantified over a type is guarded by the type of its variable, so none reached that result. A local, or a parameter, has its type stated directly, which is why a `let` worked around it.
+  - Shown by `/typeEncoding:a`, under which the same file verifies.
+  - Shown in the SMT log, by the guard on the result-type axiom (`funType:NUMBER_TEXT__fn_digits`).
+  - The small file of F.8 verified because its functions had no scalar before another argument. The GUIDE's second limit, the `LIST` facts at `digits(n, ys).append(zs)`, was the same gap.
+- **The fix, narrowed.** A function that is not generic and gives an `int` or a `bool` is left as written: those are the solver's own sorts, with no type to lose. Reordering them anyway only moved terms. In `HTTP_WRITER_HEAD`, four functions are reordered.
+- **What it cost.** More facts now apply, so proofs that were on the edge tipped under some seeds. The same proofs as F.13's were made sturdier (see F.13).
 
 #### Task F.3: `MAP[K, V]`
 
@@ -517,19 +562,27 @@ What was done:
 
 Needs decisions 7 and 8.
 
-**Status:** In progress. Step 1, the client side of `ghttp` (0.5.0), has its writer and its response reader, and stages A and B of the round-trip proof (2026-11-10). Step 2, persistent connections, is done: the server side (`ghttp` 0.6.0, `grest` 0.5.0), the idle timeout (`ghttp` 0.7.0, `grest` 0.6.0) and the client side (`ghttp` 0.8.0). Step 3, async handlers, is done (`ghttp` 0.9.0, `grest` 0.7.0, 2026-11-11), and step 4, `examples/api_gateway` (2026-11-11). Left: stages C and D of the round-trip proof. Steps: 1, the client in `ghttp`; 2, persistent connections; 3, async handlers in `grest`; 4, `examples/api_gateway`.
+**Status:** ✅ Completed (2026-11-11), with stage D of the round-trip proof covered by tests, its proof left to F.13 and F.15. Step 1, the client side of `ghttp` (0.5.0), has its writer and its response reader, and stages A and B of the round-trip proof (2026-11-10). Step 2, persistent connections, is done: the server side (`ghttp` 0.6.0, `grest` 0.5.0), the idle timeout (`ghttp` 0.7.0, `grest` 0.6.0) and the client side (`ghttp` 0.8.0). Step 3, async handlers, is done (`ghttp` 0.9.0, `grest` 0.7.0, 2026-11-11), and step 4, `examples/api_gateway` (2026-11-11), and stage C of the round-trip proof (2026-11-11). Steps: 1, the client in `ghttp`; 2, persistent connections; 3, async handlers in `grest`; 4, `examples/api_gateway`.
 
 - [x] `HTTP_CLIENT`: serialize a request and parse a response incrementally, reusing F.5's framing. Done as `HTTP_REQUEST_WRITER` and `HTTP_RESPONSE_PARSER`:
   - The writer writes only what `sendable` accepts, so that a request reads back as itself: an origin-form target of printable ASCII; token field names; field values with no control byte but tab and no space or tab at either end, as a parser trims them; and no `Content-Length` or `Transfer-Encoding`, since the writer frames the body itself. It is a test a client makes before sending, not a proof obligation on its callers' data. `HTTP_HEADER.make` still accepts any text, which a server never sends: a field is checked where it would reach the wire.
   - The reader keeps the request parser's contract (`faithful`, `keeps_bytes`). A mutation that hands the body back as remaining bytes fails five obligations. The response is a new type, `HTTP_CLIENT_RESPONSE`, because `HTTP_RESPONSE` holds a UTF-8 body and no fields but its media type, which suits a server building one and not a client receiving one.
   - Chunked transfer coding is refused, as on the server, so the reader serves upstreams that send `Content-Length` or close after the body, which `grest` and `ghttp` do. A 1xx is taken as a whole response with no body: a client that sends no `Expect` should not get one.
   - Tests: every request `cases.txt` accepts is written without its framing and parsed back; a writer that sends the fields in reverse order fails the first case with two fields. 29 response lines, each read whole and cut at every byte.
-- [ ] Prove that parsing a serialized request gives the same request, moved here from F.5. Stages A and B are proven (2026-11-10), in `HTTP_ROUND_TRIP`; C and D are covered by tests:
+- [x] Prove that parsing a serialized request gives the same request, moved here from F.5. Stages A, B and C are proven (A and B 2026-11-10, C 2026-11-11), in `HTTP_ROUND_TRIP`; D is covered by tests, its proof blocked by the verifier (F.13, F.15):
   - A, `request_line_reads_back`: any bytes that start with the line `line_text` writes parse, up to its end, to the same method, target and version. Its proof needed facts the verifier did not have: a literal's bytes, which each literal's lemma now proves with its characters; an item of an append and of a tail, now `Seq` axioms that `LIST_OPS.at_append` and `at_tail` prove by induction; an item of a slice (`BYTES.slice_at`, triggered); and list extensionality (`BYTES.same_items`). The parser compares a method with `HTTP_METHOD.to_string`, so the writer's spelling and the parser's are one, and `wire_distinct` proves no two methods, or versions, alike.
   - B, `body_reads_back`: after a head that declares the length of the body that follows, `HTTP_FRAMING.frame` gives back that body and nothing after it, with the request line and the fields of the head.
-  - C, not proven: that `index_of` finds the writer's line ends, so the request line ends where the writer's does and the head at its blank line. It needs: no CR in the line or the fields.
-  - D, not proven: that `HTTP_HEAD_PARSER.fields` gives back the writer's fields in order, and the `Content-Length` it adds (`NUMBER_TEXT.parse_nat` of `nat_to_text`, already a law).
-  - Mutations: each part of A's and B's claims, changed, fails, and so does B without the hypothesis that the head declares the body's length.
+  - C, `line_end_found` and `head_end_found`: in bytes that start with the head the writer writes for a `sendable` request, the parser's search for the first `\r\n` finds the end of the writer's request line, and its search for `\r\n\r\n` from there finds the writer's blank line, the head's last four bytes. The proof is in layers, each a module, as a law cannot use a law of its own module:
+    - `HTTP_WIRE_FACTS`: a line with no CR, then CR LF, is a "run of lines" (bytes that end with CR LF, in which no CR has another CR two bytes on), and two runs joined are one; where `index_of` and a search for `\r\n\r\n` first find their pattern, from `index_of`'s contract (it has no body); and no CR in a token, a field value or the digits of a number.
+    - `HTTP_WRITER_LINES`: the request line holds no CR (the method's and the version's spellings are printable, `wire_visible`), and a field line the writer accepts is a run of one line. `HTTP_WRITER_FIELDS`: all the field lines are a run, by induction. `HTTP_HEAD_SHAPE`, over plain lists: a head made of those parts has its request line's break after the line, its blank line at the end, and no CR before it with another two bytes on. `HTTP_WRITER_HEAD`: the same, of `head_text`.
+    - What the proof needed of the code, with no change in behaviour: the parser searches for `HTTP_HEAD_PARSER.crlf` and `blank_line`, whose bytes their contracts state, as a client cannot see another module's literals; `serialize_line`, `head_text` and `length_line` state their bytes, spelled out without literals for the same reason; and `length_line` states that it holds no CR but the one of its line break.
+    - Found on the way: the property "no CR two bytes after a CR", stated as `at(k) = 13 implies at(k + 2) != 13`, is a matching loop (each instance makes the term of the next); stated over two positions, `k < j and at(k) = 13 and at(j) = 13 implies j != k + 2`, it only uses terms that are there. A function's ensure that mentions the function at the tail of its argument, as `fields_text(hs)` did of `fields_text(hs.tail)`, is a matching loop too. An ensure or a law weighs on every proof that sees its module, not only on the ones that use it: stage D's facts, added to the writer, made stage C's proofs run out of resources until they were taken out. And z3 4.12.1, the one `gardelc` uses, loops on `head_blank` where z3 4.14.1 proves it in 3 s; its proof states the head's last bytes step by step.
+  - D, not proven: that `HTTP_HEAD_PARSER.fields` gives back the writer's fields in order, and the `Content-Length` it adds. Tried in full, and blocked by the verifier, not by the proof:
+    - What was proven, and kept outside the tree as the start of the next attempt: a field line read back by `field_at` as the writer's name and value; the `Content-Length` line read back, its value parsed to the body's length; and one step of `fields` stated through values that compare by `=` (whether it read, the names and values as bytes, the framing), as a `RESULT` of fields has no canonical equality.
+    - F.13, again: one step of `fields` unfolds `HTTP_HEADERS.add` at one fuel below the caller, whose `require` (`has_header_room`) is then read at fuel zero, where nothing is known, so nothing after an add is known. Reading the guards of the defining and step axioms at `DefaultFuel`, and dropping the guard of the step axiom (every fuel is one function), made the step provable, and all of `ghttp` verified with both. The prelude, `grest` and the examples were not checked with them, which F.13's history says to do.
+    - F.15: under `/typeEncoding:p`, a quantified fact over a user type, such as a law's axiom or "every value keeps the invariant", is not instantiated at a value a call gives back, such as `reads(buf, pos, hs.tail, acc)`, while it is at a local of that type. A routine works around it with `let`; a law has no `let`. Binding the arguments of a law call to locals in `gardelc` made the law usable, but the unfolding of the induction still met the gap inside the solver, where no source can bind it.
+  - Mutations: each part of A's and B's claims, changed, fails, and so does B without the hypothesis that the head declares the body's length. Of C's, six fail: a line break found a byte late; a blank line found two bytes early; bytes that need not start with the head; a blank-line search that ignores what comes before it; a writer that accepts a CR in a field value; and a line-break search that needs no LF after the CR. The first three fail by running out of resources rather than by a counterexample.
+  - Found before committing C, fixed in the compiler: `ghttp/tests` ran out of resources in `check_response`. It did at the commit before too, under seeds 2 and 3, as did `check_exchange` and `two_exchanges`: every procedure of a module called the lemma of each of its literals, 51 in `GHTTP_TEXT`, and C's new axioms moved the default seed onto a failing path. A procedure now calls the lemmas of the literals it may meet: those it names, and those named by an axiom that a function it names can trigger, transitively, from the outermost function of each trigger term (a helper inside one, such as `SuccFuel`, would lead everywhere). Naming alone was not enough: `HTTP_METHOD.wire_visible` meets its literals only through `to_string`'s definition. `ghttp/tests` verifies under seeds 0 to 3. `test_f8_a_procedure_assumes_only_the_literals_it_names` pins the rule. Six mutations fail: a helper inside a trigger term leading on, no transitive step, the names in the procedure ignored, no bytes, every literal as before, and a step constant `str_lit_k_s0` read as the literal.
   - Found on the way: in a law, a call of another law of the same module is checked rather than used, so a law can only build on laws of other modules. That is why the helper laws live in `HTTP_METHOD`, `HTTP_VERSION`, `HTTP_HEAD_PARSER`, `BYTES` and `LIST_OPS`.
 - [x] Persistent connections, moved here from F.5's known limits, on the server and the client. The server serves `Complete`'s remainder as the next request instead of closing. It closes after `Connection: close`, and by default after an HTTP/1.0 request. An idle timeout and a cap on requests per connection keep one client from holding a connection forever. Prove that each connection has at most one answer outstanding and that the cap holds. Stages A and B, the server side, and C, the idle timeout, are done (2026-11-10), and D, the client side (2026-11-11):
   - A, `ghttp` 0.6.0. `HTTP_PERSISTENCE.request_keeps_open`: HTTP/1.1 and no `close` among the options of any `Connection` field, in any case and with spaces around it. HTTP/1.0 closes: taking part in its `keep-alive` would need the answer to say so. `HTTP_SERIALIZER.serialize_answer(resp, head_only, closing)` adds `Connection: close` (RFC 9112, section 9.6) and leaves out a `HEAD` answer's body, which a persistent connection needs, as the bytes after the head would be read as the next answer. `HTTP_SERVER`, `ghttp`'s own sample, still answers one request per connection, and now says so.

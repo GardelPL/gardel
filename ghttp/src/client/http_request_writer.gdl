@@ -89,23 +89,50 @@ feature {ANY}
       end
     ensure
       bounded: Result.byte_length <= 1156 * hs.length
+      none: hs.length = 0 implies Result.byte_model.length = 0
     end
 
   -- `Content-Length: <n>` and its line break, or "" when `req` is sent without one.
   length_line(req: HTTP_REQUEST): STRING
     do
       if needs_length(req) then
-        let digits = NUMBER_TEXT.nat_to_text(req.request_body_length)
-        if digits.byte_length <= 10 then
-          "Content-Length: ".concat(digits).concat("\r\n")
-        else
-          "Content-Length: 0\r\n"
+        let name = "Content-Length: "
+        let digits = length_digits(req)
+        check
+          crlf: "\r\n".byte_model = LIST.empty.prepend(10).prepend(13)
+          name_no_cr: forall k: NAT. k < name.byte_model.length implies LIST_OPS.at(name.byte_model, k) != 13
+          no_cr: forall k: NAT. k < name.byte_model.append(digits.byte_model).length implies
+            LIST_OPS.at(name.byte_model.append(digits.byte_model), k) != 13
+          line: HTTP_WIRE_FACTS.one_line(name.byte_model.append(digits.byte_model))
         end
+        name.concat(digits).concat("\r\n")
       else
         ""
       end
     ensure
       bounded: Result.byte_length <= 28
+      -- Its shape, for stage C of the round trip, which cannot see this module's literals:
+      -- no CR but the one of its line break, which ends it.
+      some: needs_length(req) = (Result.byte_model.length > 0)
+      long: Result.byte_model.length = 0 or Result.byte_model.length >= 18
+      ends: Result.byte_model.length > 0 implies
+        (Result.byte_model.length >= 2 and LIST_OPS.at(Result.byte_model, Result.byte_model.length - 2) = 13 and
+         LIST_OPS.at(Result.byte_model, Result.byte_model.length - 1) = 10)
+      no_cr: forall k: NAT. k + 2 < Result.byte_model.length implies LIST_OPS.at(Result.byte_model, k) != 13
+    end
+
+  -- The digits of `req`'s body length, as `length_line` writes them: `0` for a length of
+  -- more than 10 digits, which no body has.
+  length_digits(req: HTTP_REQUEST): STRING
+    do
+      let digits = NUMBER_TEXT.nat_to_text(req.request_body_length)
+      check
+        no_cr: HTTP_WIRE_FACTS.digits_no_cr(req.request_body_length, LIST.empty)
+      end
+      if digits.byte_length <= 10 then digits else "0" end
+    ensure
+      bounded: Result.byte_length <= 10
+      no_cr: forall k: NAT. k < Result.byte_model.length implies LIST_OPS.at(Result.byte_model, k) != 13
     end
 
   -- The request line without its line break: the method, a space, the target, a space and
@@ -128,6 +155,10 @@ feature {ANY}
       line.concat(fields_text(req.headers.fields)).concat(length_line(req)).concat("\r\n")
     ensure
       bounded: Result.byte_length <= 531 + 73984 + 28 + 2
+      bytes: Result.byte_model =
+        line_text(req.method, req.target, req.version).byte_model.append(LIST.empty.prepend(10).prepend(13))
+          .append(fields_text(req.headers.fields).byte_model).append(length_line(req).byte_model)
+          .append(LIST.empty.prepend(10).prepend(13))
     end
 
   -- `req` on the wire: its head, then its body.

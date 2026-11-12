@@ -1,0 +1,53 @@
+-- Each line `HTTP_REQUEST_WRITER` writes is a run of lines (`HTTP_WIRE_FACTS`): the request
+-- line holds no CR, and a field line and the `Content-Length` line hold none before their
+-- CR LF. For stage C of the round trip.
+functions HTTP_WRITER_LINES
+
+specify {ANY}
+
+  -- The request line, without its line break, holds no CR, and is not empty.
+  law request_line(m: HTTP_METHOD, t: STRING, v: HTTP_VERSION)
+    require
+      target: HTTP_REQUEST_WRITER.target_ok(t)
+      fits: t.byte_length <= 512
+    do
+      HTTP_METHOD.wire_visible(m) and
+      HTTP_VERSION.wire_visible(v) and
+      t.to_utf8.model = t.byte_model and
+      HTTP_HEAD_PARSER.visible_bytes(t.to_utf8, 0, t.byte_length) and
+      HTTP_REQUEST_WRITER.line_text(m, t, v).byte_length = m.to_string.byte_length + t.byte_length + 10
+    ensure
+      some: HTTP_REQUEST_WRITER.line_text(m, t, v).byte_model.length > 0
+      no_cr: forall k: NAT. k < HTTP_REQUEST_WRITER.line_text(m, t, v).byte_model.length implies
+        LIST_OPS.at(HTTP_REQUEST_WRITER.line_text(m, t, v).byte_model, k) != 13
+    end
+
+  -- A field line the writer accepts is a run of one line, and does not start with a CR.
+  law field_line(h: HTTP_HEADER)
+    require
+      ok: HTTP_REQUEST_WRITER.field_ok(h)
+    do
+      h.name.to_utf8.model = h.name.byte_model and
+      h.value.to_utf8.model = h.value.byte_model and
+      HTTP_HEAD_PARSER.is_token(h.name.to_utf8, 0) and
+      HTTP_WIRE_FACTS.token_no_cr(h.name.to_utf8, 0) and
+      HTTP_HEAD_PARSER.all_field_bytes(h.value.to_utf8, 0, h.value.to_utf8.length) and
+      HTTP_WIRE_FACTS.field_bytes_no_cr(h.value.to_utf8, 0, h.value.to_utf8.length) and
+      h.serialize_line.byte_model =
+        h.name.byte_model.append(LIST.empty.prepend(32).prepend(58)).append(h.value.byte_model)
+          .append(LIST.empty.prepend(10).prepend(13)) and
+      (forall k: NAT. k < h.name.byte_model.append(LIST.empty.prepend(32).prepend(58)).append(h.value.byte_model).length implies
+        LIST_OPS.at(h.name.byte_model.append(LIST.empty.prepend(32).prepend(58)).append(h.value.byte_model), k) != 13) and
+      HTTP_WIRE_FACTS.one_line(h.name.byte_model.append(LIST.empty.prepend(32).prepend(58)).append(h.value.byte_model))
+    ensure
+      size: h.serialize_line.byte_model.length >= 2
+      only: forall k: NAT. (k < h.serialize_line.byte_model.length and LIST_OPS.at(h.serialize_line.byte_model, k) = 13) implies
+        k = h.serialize_line.byte_model.length - 2
+      starts: LIST_OPS.at(h.serialize_line.byte_model, 0) != 13
+      ends: LIST_OPS.at(h.serialize_line.byte_model, h.serialize_line.byte_model.length - 2) = 13 and
+        LIST_OPS.at(h.serialize_line.byte_model, h.serialize_line.byte_model.length - 1) = 10
+      apart: forall k: NAT. forall j: NAT. (k < j and j < h.serialize_line.byte_model.length and
+        LIST_OPS.at(h.serialize_line.byte_model, k) = 13 and LIST_OPS.at(h.serialize_line.byte_model, j) = 13) implies j != k + 2
+    end
+
+end

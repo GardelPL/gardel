@@ -81,5 +81,12 @@ specify {ANY}
       spelled_apart: a.to_string.byte_model != b.to_string.byte_model
     end
 
+  -- A version's spelling is printable ASCII with no space, so it holds no line break.
+  law wire_visible(v: HTTP_VERSION)
+    ensure
+      visible: forall k: NAT. k < v.to_string.byte_length implies
+        (LIST_OPS.at(v.to_string.byte_model, k) > 32 and LIST_OPS.at(v.to_string.byte_model, k) < 127)
+    end
+
 end
 

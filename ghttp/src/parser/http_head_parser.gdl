@@ -42,6 +42,23 @@ feature {ANY}
       end
     end
 
+  -- A line break, which ends a line of a head. Its bytes are stated, as a client of this
+  -- module cannot see its literals: stage C of the round trip finds the writer's.
+  crlf: BYTES
+    do
+      "\r\n".to_utf8
+    ensure
+      bytes: Result.model = LIST.empty.prepend(10).prepend(13)
+    end
+
+  -- The blank line that ends a head, after the line break of its last line.
+  blank_line: BYTES
+    do
+      "\r\n\r\n".to_utf8
+    ensure
+      bytes: Result.model = LIST.empty.prepend(10).prepend(13).prepend(10).prepend(13)
+    end
+
   -- The bytes of `m`, as a request line spells it.
   spelling(m: HTTP_METHOD): BYTES
     do
@@ -150,7 +167,7 @@ feature {ANY}
       if pos = he + 2 then
         Ok(ParsedFields(hs, cl, te))
       else
-        match buf.index_of("\r\n".to_utf8, pos)
+        match buf.index_of(HTTP_HEAD_PARSER.crlf, pos)
           case None then
             Error(MalformedHeader)
           case Some(e) then

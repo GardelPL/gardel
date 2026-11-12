@@ -5,10 +5,16 @@
 --   target and version.
 -- * B, `body_reads_back`: after a head that declares the body's length, the framing gives
 --   the same body and nothing after it.
+-- * C, `line_end_found` and `head_end_found`: in bytes that start with the writer's head,
+--   the parser's searches find the end of its request line and its blank line. The bytes'
+--   shape is proven in `HTTP_WIRE_FACTS`, `HTTP_WRITER_LINES`, `HTTP_WRITER_FIELDS`,
+--   `HTTP_HEAD_SHAPE`, `HTTP_HEAD_WHOLE` and `HTTP_WRITER_HEAD`, and carried over to the
+--   bytes searched in `HTTP_WIRE_PREFIX`.
 --
 -- Still covered by tests only (`ghttp/tests/cases.txt`, where every request the parser
--- accepts is written and parsed back): that the parser's searches for the end of the line
--- and of the head find the writer's, and that the field lines give the same fields in order.
+-- accepts is written and parsed back): stage D, that the field lines give the same fields in
+-- order, and the `Content-Length` the writer adds. Its proof is blocked by the verifier
+-- (Tasks F.13 and F.15 in the plan).
 functions HTTP_ROUND_TRIP
 
 specify {ANY}
@@ -52,6 +58,40 @@ specify {ANY}
         case Ok(q) then q.method = m and q.target.equals(t) and q.version = v
         case Error(_) then False
       end
+    end
+
+  -- Stage C, the line break. In bytes that start with the head the writer writes for `req`,
+  -- the parser's search for the first line break finds the end of the writer's request line.
+  law line_end_found(req: HTTP_REQUEST, buf: BYTES)
+    require
+      sendable: HTTP_REQUEST_WRITER.sendable(req)
+      prefix: buf.starts_with(HTTP_REQUEST_WRITER.head_text(req).to_utf8)
+    do
+      HTTP_WRITER_HEAD.head_line(req) and
+      HTTP_REQUEST_WRITER.head_text(req).to_utf8.model = HTTP_REQUEST_WRITER.head_text(req).byte_model and
+      HTTP_WIRE_PREFIX.crlf_found(buf, HTTP_REQUEST_WRITER.head_text(req).to_utf8, HTTP_HEAD_PARSER.crlf,
+        HTTP_REQUEST_WRITER.line_text(req.method, req.target, req.version).byte_length)
+    ensure
+      found: buf.index_of(HTTP_HEAD_PARSER.crlf, 0).is_some and
+        buf.index_of(HTTP_HEAD_PARSER.crlf, 0).get = HTTP_REQUEST_WRITER.line_text(req.method, req.target, req.version).byte_length
+    end
+
+  -- Stage C, the blank line. From the end of the request line, the parser's search for the
+  -- blank line finds the writer's, the last four bytes of the head.
+  law head_end_found(req: HTTP_REQUEST, buf: BYTES)
+    require
+      sendable: HTTP_REQUEST_WRITER.sendable(req)
+      prefix: buf.starts_with(HTTP_REQUEST_WRITER.head_text(req).to_utf8)
+    do
+      HTTP_WRITER_HEAD.head_blank(req) and HTTP_WRITER_HEAD.head_apart(req) and
+      HTTP_REQUEST_WRITER.head_text(req).to_utf8.model = HTTP_REQUEST_WRITER.head_text(req).byte_model and
+      HTTP_WIRE_PREFIX.blank_found(buf, HTTP_REQUEST_WRITER.head_text(req).to_utf8, HTTP_HEAD_PARSER.blank_line,
+        HTTP_REQUEST_WRITER.line_text(req.method, req.target, req.version).byte_length,
+        HTTP_REQUEST_WRITER.head_text(req).byte_length - 4)
+    ensure
+      found: buf.index_of(HTTP_HEAD_PARSER.blank_line, HTTP_REQUEST_WRITER.line_text(req.method, req.target, req.version).byte_length).is_some and
+        buf.index_of(HTTP_HEAD_PARSER.blank_line, HTTP_REQUEST_WRITER.line_text(req.method, req.target, req.version).byte_length).get =
+          HTTP_REQUEST_WRITER.head_text(req).byte_length - 4
     end
 
   -- Stage B. A head `h` that declares the length of the body `b` that follows it, as the

@@ -1,0 +1,74 @@
+-- The shape of a request head as bytes: a line `lt` with no CR, its line break, the field
+-- lines `f`, the framing line `ll`, and the blank line. For stage C of the round trip.
+--
+-- `body` is the head without its blank line's last line break: `lt`, CR LF, `f` and `ll`.
+-- `head` is all of it.
+functions HTTP_HEAD_SHAPE
+
+specify {ANY}
+
+  -- The head without its last line break is a run of lines.
+  law body(lt: LIST[U64], f: LIST[U64], ll: LIST[U64])
+    require
+      line_no_cr: forall k: NAT. k < lt.length implies LIST_OPS.at(lt, k) != 13
+      fields_starts: f.length > 0 implies LIST_OPS.at(f, 0) != 13
+      fields_ends: f.length > 0 implies
+        (f.length >= 2 and LIST_OPS.at(f, f.length - 2) = 13 and LIST_OPS.at(f, f.length - 1) = 10)
+      fields_apart: forall k: NAT. forall j: NAT. (k < j and j < f.length and
+        LIST_OPS.at(f, k) = 13 and LIST_OPS.at(f, j) = 13) implies j != k + 2
+      length_ends: ll.length > 0 implies
+        (ll.length >= 2 and LIST_OPS.at(ll, ll.length - 2) = 13 and LIST_OPS.at(ll, ll.length - 1) = 10)
+      length_no_cr: forall k: NAT. k + 2 < ll.length implies LIST_OPS.at(ll, k) != 13
+      length_size: ll.length = 0 or ll.length >= 3
+    do
+      HTTP_WIRE_FACTS.one_line(lt) and
+      HTTP_WIRE_FACTS.join(lt.append(LIST.empty.prepend(10).prepend(13)), f) and
+      (ll.length > 0 implies LIST_OPS.at(ll, 0) != 13) and
+      (forall k: NAT. forall j: NAT. (k < j and j < ll.length and
+        LIST_OPS.at(ll, k) = 13 and LIST_OPS.at(ll, j) = 13) implies j != k + 2) and
+      HTTP_WIRE_FACTS.join(lt.append(LIST.empty.prepend(10).prepend(13)).append(f), ll)
+    ensure
+      size: lt.append(LIST.empty.prepend(10).prepend(13)).append(f).append(ll).length = lt.length + 2 + f.length + ll.length
+      ends: LIST_OPS.at(lt.append(LIST.empty.prepend(10).prepend(13)).append(f).append(ll), lt.append(LIST.empty.prepend(10).prepend(13)).append(f).append(ll).length - 2) = 13 and LIST_OPS.at(lt.append(LIST.empty.prepend(10).prepend(13)).append(f).append(ll), lt.append(LIST.empty.prepend(10).prepend(13)).append(f).append(ll).length - 1) = 10
+      apart: forall k: NAT. forall j: NAT. (k < j and j < lt.append(LIST.empty.prepend(10).prepend(13)).append(f).append(ll).length and
+        LIST_OPS.at(lt.append(LIST.empty.prepend(10).prepend(13)).append(f).append(ll), k) = 13 and LIST_OPS.at(lt.append(LIST.empty.prepend(10).prepend(13)).append(f).append(ll), j) = 13) implies j != k + 2
+    end
+
+  -- The head without its last line break ends with a line break, whatever its lines hold.
+  law body_ends(lt: LIST[U64], f: LIST[U64], ll: LIST[U64])
+    require
+      fields_ends: f.length > 0 implies
+        (f.length >= 2 and LIST_OPS.at(f, f.length - 2) = 13 and LIST_OPS.at(f, f.length - 1) = 10)
+      length_ends: ll.length > 0 implies
+        (ll.length >= 2 and LIST_OPS.at(ll, ll.length - 2) = 13 and LIST_OPS.at(ll, ll.length - 1) = 10)
+    do
+      lt.append(LIST.empty.prepend(10).prepend(13)).length = lt.length + 2 and
+      LIST_OPS.at(lt.append(LIST.empty.prepend(10).prepend(13)), lt.length) = 13 and
+      LIST_OPS.at(lt.append(LIST.empty.prepend(10).prepend(13)), lt.length + 1) = 10 and
+      lt.append(LIST.empty.prepend(10).prepend(13)).append(f).length = lt.length + 2 + f.length
+    ensure
+      size: lt.append(LIST.empty.prepend(10).prepend(13)).append(f).append(ll).length = lt.length + 2 + f.length + ll.length
+      ends: LIST_OPS.at(lt.append(LIST.empty.prepend(10).prepend(13)).append(f).append(ll), lt.append(LIST.empty.prepend(10).prepend(13)).append(f).append(ll).length - 2) = 13 and LIST_OPS.at(lt.append(LIST.empty.prepend(10).prepend(13)).append(f).append(ll), lt.append(LIST.empty.prepend(10).prepend(13)).append(f).append(ll).length - 1) = 10
+    end
+
+  -- The request line comes first, and its line break after it.
+  law line(lt: LIST[U64], f: LIST[U64], ll: LIST[U64])
+    require
+      line_no_cr: forall k: NAT. k < lt.length implies LIST_OPS.at(lt, k) != 13
+      fields_starts: f.length > 0 implies LIST_OPS.at(f, 0) != 13
+      fields_ends: f.length > 0 implies
+        (f.length >= 2 and LIST_OPS.at(f, f.length - 2) = 13 and LIST_OPS.at(f, f.length - 1) = 10)
+      fields_apart: forall k: NAT. forall j: NAT. (k < j and j < f.length and
+        LIST_OPS.at(f, k) = 13 and LIST_OPS.at(f, j) = 13) implies j != k + 2
+      length_ends: ll.length > 0 implies
+        (ll.length >= 2 and LIST_OPS.at(ll, ll.length - 2) = 13 and LIST_OPS.at(ll, ll.length - 1) = 10)
+      length_no_cr: forall k: NAT. k + 2 < ll.length implies LIST_OPS.at(ll, k) != 13
+      length_size: ll.length = 0 or ll.length >= 3
+    do
+      HTTP_WIRE_FACTS.one_line(lt)
+    ensure
+      line_no_cr: forall k: NAT. k < lt.length implies LIST_OPS.at(lt.append(LIST.empty.prepend(10).prepend(13)).append(f).append(ll), k) != 13
+      line_end: LIST_OPS.at(lt.append(LIST.empty.prepend(10).prepend(13)).append(f).append(ll), lt.length) = 13 and LIST_OPS.at(lt.append(LIST.empty.prepend(10).prepend(13)).append(f).append(ll), lt.length + 1) = 10
+    end
+
+end

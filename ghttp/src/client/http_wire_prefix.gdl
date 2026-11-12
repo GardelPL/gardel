@@ -1,0 +1,60 @@
+-- Where the parser's searches stop in bytes that start with a given text, from where that
+-- text has its line breaks (`HTTP_WIRE_FACTS`, which speaks of the bytes searched). For
+-- stage C of the round trip: `buf` starts with `pre`, the head a writer wrote, and what is
+-- known is known of `pre`.
+--
+-- A proof about a head gives each law what it knows of the head, as it knows it, and gets
+-- the search's answer in one step, with nothing to carry over to `buf` itself.
+functions HTTP_WIRE_PREFIX
+
+specify {ANY}
+
+  -- `\r\n`, `pat`, is first found at `n` in `buf`, where `pre` has it with no CR before.
+  law crlf_found(buf: BYTES, pre: BYTES, pat: BYTES, n: NAT)
+    require
+      crlf: pat.model = LIST.empty.prepend(10).prepend(13)
+      prefix: buf.starts_with(pre)
+      fits: n + 2 <= pre.model.length
+      cr: LIST_OPS.at(pre.model, n) = 13
+      lf: LIST_OPS.at(pre.model, n + 1) = 10
+      none_before: forall k: NAT. k < n implies LIST_OPS.at(pre.model, k) != 13
+    do
+      pre.length = pre.model.length and
+      pre.length <= buf.length and
+      LIST_OPS.at(buf.model, n) = 13 and
+      LIST_OPS.at(buf.model, n + 1) = 10 and
+      (forall k: NAT. k < n implies LIST_OPS.at(buf.model, k) = LIST_OPS.at(pre.model, k)) and
+      (forall k: NAT. k < n implies LIST_OPS.at(buf.model, k) != 13) and
+      HTTP_WIRE_FACTS.crlf_found(buf, pat, 0, n)
+    ensure
+      found: buf.index_of(pat, 0).is_some and buf.index_of(pat, 0).get = n
+    end
+
+  -- `\r\n\r\n`, `pat`, from `from` is first found at `n` in `buf`, where `pre` has it with
+  -- no CR before it that has another two bytes on.
+  law blank_found(buf: BYTES, pre: BYTES, pat: BYTES, from: NAT, n: NAT)
+    require
+      blank: pat.model = LIST.empty.prepend(10).prepend(13).prepend(10).prepend(13)
+      prefix: buf.starts_with(pre)
+      ordered: from <= n
+      fits: n + 4 <= pre.model.length
+      here: LIST_OPS.at(pre.model, n) = 13 and LIST_OPS.at(pre.model, n + 1) = 10 and
+        LIST_OPS.at(pre.model, n + 2) = 13 and LIST_OPS.at(pre.model, n + 3) = 10
+      none_before: forall k: NAT. forall j: NAT. (from <= k and k < j and j < n + 2 and
+        LIST_OPS.at(pre.model, k) = 13 and LIST_OPS.at(pre.model, j) = 13) implies j != k + 2
+    do
+      pre.length = pre.model.length and
+      pre.length <= buf.length and
+      LIST_OPS.at(buf.model, n) = 13 and
+      LIST_OPS.at(buf.model, n + 1) = 10 and
+      LIST_OPS.at(buf.model, n + 2) = 13 and
+      LIST_OPS.at(buf.model, n + 3) = 10 and
+      (forall k: NAT. k < n + 2 implies LIST_OPS.at(buf.model, k) = LIST_OPS.at(pre.model, k)) and
+      (forall k: NAT. forall j: NAT. (from <= k and k < j and j < n + 2 and
+        LIST_OPS.at(buf.model, k) = 13 and LIST_OPS.at(buf.model, j) = 13) implies j != k + 2) and
+      HTTP_WIRE_FACTS.blank_found(buf, pat, from, n)
+    ensure
+      found: buf.index_of(pat, from).is_some and buf.index_of(pat, from).get = n
+    end
+
+end

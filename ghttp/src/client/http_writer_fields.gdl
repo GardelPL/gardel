@@ -1,0 +1,67 @@
+-- The field lines `HTTP_REQUEST_WRITER` writes are a run of lines (`HTTP_WIRE_FACTS`), or
+-- nothing. For stage C of the round trip.
+functions HTTP_WRITER_FIELDS
+
+specify {ANY}
+
+  law fields_lines(hs: LIST[HTTP_HEADER])
+    require
+      ok: HTTP_REQUEST_WRITER.fields_ok(hs)
+      few: hs.length <= 64
+    variant
+      hs.length
+    do
+      if hs.length = 0 then
+        True
+      else
+        HTTP_REQUEST_WRITER.field_ok(hs.head) and
+        HTTP_REQUEST_WRITER.fields_ok(hs.tail) and
+        fields_lines(hs.tail) and
+        HTTP_WRITER_LINES.field_line(hs.head) and
+        HTTP_REQUEST_WRITER.fields_text(hs).byte_model =
+          HTTP_REQUEST_WRITER.fields_text(hs.tail).byte_model.append(hs.head.serialize_line.byte_model) and
+        (if hs.tail.length = 0 then
+          HTTP_REQUEST_WRITER.fields_text(hs.tail).byte_model.length = 0
+        else
+          HTTP_WIRE_FACTS.join(HTTP_REQUEST_WRITER.fields_text(hs.tail).byte_model, hs.head.serialize_line.byte_model)
+        end)
+      end
+    ensure
+      none: hs.length = 0 implies HTTP_REQUEST_WRITER.fields_text(hs).byte_model.length = 0
+      some: hs.length > 0 implies
+        (HTTP_REQUEST_WRITER.fields_text(hs).byte_model.length >= 2 and
+         LIST_OPS.at(HTTP_REQUEST_WRITER.fields_text(hs).byte_model, 0) != 13 and
+         LIST_OPS.at(HTTP_REQUEST_WRITER.fields_text(hs).byte_model, HTTP_REQUEST_WRITER.fields_text(hs).byte_model.length - 2) = 13 and
+         LIST_OPS.at(HTTP_REQUEST_WRITER.fields_text(hs).byte_model, HTTP_REQUEST_WRITER.fields_text(hs).byte_model.length - 1) = 10)
+      apart: forall k: NAT. forall j: NAT. (k < j and j < HTTP_REQUEST_WRITER.fields_text(hs).byte_model.length and
+        LIST_OPS.at(HTTP_REQUEST_WRITER.fields_text(hs).byte_model, k) = 13 and LIST_OPS.at(HTTP_REQUEST_WRITER.fields_text(hs).byte_model, j) = 13) implies j != k + 2
+    end
+
+  -- Only where the field lines end, for a proof that needs no more: `fields_lines` brings
+  -- in what no CR is two bytes after, which costs a proof that does not need it.
+  law fields_ends(hs: LIST[HTTP_HEADER])
+    require
+      ok: HTTP_REQUEST_WRITER.fields_ok(hs)
+      few: hs.length <= 64
+    variant
+      hs.length
+    do
+      if hs.length = 0 then
+        True
+      else
+        HTTP_REQUEST_WRITER.field_ok(hs.head) and
+        HTTP_REQUEST_WRITER.fields_ok(hs.tail) and
+        fields_ends(hs.tail) and
+        HTTP_WRITER_LINES.field_line(hs.head) and
+        HTTP_REQUEST_WRITER.fields_text(hs).byte_model =
+          HTTP_REQUEST_WRITER.fields_text(hs.tail).byte_model.append(hs.head.serialize_line.byte_model)
+      end
+    ensure
+      none: hs.length = 0 implies HTTP_REQUEST_WRITER.fields_text(hs).byte_model.length = 0
+      some: hs.length > 0 implies
+        (HTTP_REQUEST_WRITER.fields_text(hs).byte_model.length >= 2 and
+         LIST_OPS.at(HTTP_REQUEST_WRITER.fields_text(hs).byte_model, HTTP_REQUEST_WRITER.fields_text(hs).byte_model.length - 2) = 13 and
+         LIST_OPS.at(HTTP_REQUEST_WRITER.fields_text(hs).byte_model, HTTP_REQUEST_WRITER.fields_text(hs).byte_model.length - 1) = 10)
+    end
+
+end

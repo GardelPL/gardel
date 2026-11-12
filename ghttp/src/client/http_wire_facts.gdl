@@ -1,0 +1,141 @@
+-- Facts about line breaks in bytes, for stage C of the round trip (`HTTP_ROUND_TRIP`): where
+-- the parser's searches for `\r\n` and `\r\n\r\n` stop, and which bytes hold no CR.
+--
+-- A run of lines, here, is bytes that end with CR LF and in which no CR is two bytes after
+-- another. Its last two bytes followed by another CR LF are the first `\r\n\r\n` in it.
+functions HTTP_WIRE_FACTS
+
+specify {ANY}
+
+  -- A line `c` with no CR, then CR LF, is a run of lines.
+  law one_line(c: LIST[U64])
+    require
+      no_cr: forall k: NAT. k < c.length implies LIST_OPS.at(c, k) != 13
+    do
+      c.append(LIST.empty.prepend(10).prepend(13)).length = c.length + 2 and
+      LIST_OPS.at(c.append(LIST.empty.prepend(10).prepend(13)), c.length) = 13 and
+      LIST_OPS.at(c.append(LIST.empty.prepend(10).prepend(13)), c.length + 1) = 10
+    ensure
+      size: c.append(LIST.empty.prepend(10).prepend(13)).length = c.length + 2
+      ends: LIST_OPS.at(c.append(LIST.empty.prepend(10).prepend(13)), c.length) = 13 and
+        LIST_OPS.at(c.append(LIST.empty.prepend(10).prepend(13)), c.length + 1) = 10
+      starts: c.length > 0 implies LIST_OPS.at(c.append(LIST.empty.prepend(10).prepend(13)), 0) != 13
+      only: forall k: NAT. (k < c.length + 2 and LIST_OPS.at(c.append(LIST.empty.prepend(10).prepend(13)), k) = 13)
+        implies k = c.length
+    end
+
+  -- Two runs of lines, one after the other, are one.
+  law join(a: LIST[U64], b: LIST[U64])
+    require
+      a_ends: a.length >= 2 and LIST_OPS.at(a, a.length - 2) = 13 and LIST_OPS.at(a, a.length - 1) = 10
+      a_apart: forall k: NAT. forall j: NAT. (k < j and j < a.length and
+        LIST_OPS.at(a, k) = 13 and LIST_OPS.at(a, j) = 13) implies j != k + 2
+      b_starts: b.length > 0 implies LIST_OPS.at(b, 0) != 13
+      b_ends: b.length > 0 implies
+        (b.length >= 2 and LIST_OPS.at(b, b.length - 2) = 13 and LIST_OPS.at(b, b.length - 1) = 10)
+      b_apart: forall k: NAT. forall j: NAT. (k < j and j < b.length and
+        LIST_OPS.at(b, k) = 13 and LIST_OPS.at(b, j) = 13) implies j != k + 2
+    do
+      a.append(b).length = a.length + b.length
+    ensure
+      size: a.append(b).length = a.length + b.length
+      ends: LIST_OPS.at(a.append(b), a.length + b.length - 2) = 13 and
+        LIST_OPS.at(a.append(b), a.length + b.length - 1) = 10
+      first: LIST_OPS.at(a.append(b), 0) = LIST_OPS.at(a, 0)
+      apart: forall k: NAT. forall j: NAT. (k < j and j < a.length + b.length and
+        LIST_OPS.at(a.append(b), k) = 13 and LIST_OPS.at(a.append(b), j) = 13) implies j != k + 2
+    end
+
+  -- The digits of a number hold no CR.
+  law digits_no_cr(n: NAT, rest: LIST[U64])
+    require
+      rest_no_cr: forall k: NAT. k < rest.length implies LIST_OPS.at(rest, k) != 13
+    variant
+      n
+    do
+      NUMBER_TEXT.digits_step(n, rest) and
+      rest.prepend(48 + n % 10).tail = rest and
+      rest.prepend(48 + n % 10).length = rest.length + 1 and
+      (forall k: NAT. k < rest.length + 1 implies LIST_OPS.at(rest.prepend(48 + n % 10), k) != 13) and
+      (if n < 10 then True else digits_no_cr(n / 10, rest.prepend(48 + n % 10)) end)
+    ensure
+      no_cr: forall k: NAT. k < NUMBER_TEXT.digits(n, rest).length implies
+        LIST_OPS.at(NUMBER_TEXT.digits(n, rest), k) != 13
+    end
+
+  -- A token holds no CR.
+  law token_no_cr(tok: BYTES, i: NAT)
+    require
+      in_bounds: i <= tok.length
+      token: HTTP_HEAD_PARSER.is_token(tok, i)
+    variant
+      tok.length - i
+    do
+      if i = tok.length then True else token_no_cr(tok, i + 1) end
+    ensure
+      no_cr: forall k: NAT. (i <= k and k < tok.length) implies LIST_OPS.at(tok.model, k) != 13
+    end
+
+  -- A field value holds no CR and no LF.
+  law field_bytes_no_cr(b: BYTES, lo: NAT, hi: NAT)
+    require
+      ordered: lo <= hi
+      in_buf: hi <= b.length
+      field: HTTP_HEAD_PARSER.all_field_bytes(b, lo, hi)
+    variant
+      hi - lo
+    do
+      if lo = hi then True else field_bytes_no_cr(b, lo + 1, hi) end
+    ensure
+      no_cr: forall k: NAT. (lo <= k and k < hi) implies
+        (LIST_OPS.at(b.model, k) != 13 and LIST_OPS.at(b.model, k) != 10)
+    end
+
+  -- `\r\n`, `pat`, from `from` is first found at `n`, where it is, when no CR comes before
+  -- it. The pattern is a parameter, as a module cannot see another's literals.
+  law crlf_found(buf: BYTES, pat: BYTES, from: NAT, n: NAT)
+    require
+      crlf: pat.model = LIST.empty.prepend(10).prepend(13)
+      ordered: from <= n
+      fits: n + 2 <= buf.length
+      cr: LIST_OPS.at(buf.model, n) = 13
+      lf: LIST_OPS.at(buf.model, n + 1) = 10
+      none_before: forall k: NAT. (from <= k and k < n) implies LIST_OPS.at(buf.model, k) != 13
+    do
+      pat.length = 2 and
+      LIST_OPS.at(pat.model, 0) = 13 and
+      buf.matches_at(pat, n, 0) and
+      buf.index_of(pat, from).is_some and
+      buf.index_of(pat, from).get <= n and
+      LIST_OPS.at(buf.model, buf.index_of(pat, from).get) = 13 and
+      buf.index_of(pat, from).get >= n
+    ensure
+      found: buf.index_of(pat, from).is_some and buf.index_of(pat, from).get = n
+    end
+
+  -- `\r\n\r\n`, `pat`, from `from` is first found at `n`, where it is, when no CR before it
+  -- has another two bytes on.
+  law blank_found(buf: BYTES, pat: BYTES, from: NAT, n: NAT)
+    require
+      blank: pat.model = LIST.empty.prepend(10).prepend(13).prepend(10).prepend(13)
+      ordered: from <= n
+      fits: n + 4 <= buf.length
+      here: LIST_OPS.at(buf.model, n) = 13 and LIST_OPS.at(buf.model, n + 1) = 10 and
+        LIST_OPS.at(buf.model, n + 2) = 13 and LIST_OPS.at(buf.model, n + 3) = 10
+      none_before: forall k: NAT. forall j: NAT. (from <= k and k < j and j < n + 2 and
+        LIST_OPS.at(buf.model, k) = 13 and LIST_OPS.at(buf.model, j) = 13) implies j != k + 2
+    do
+      pat.length = 4 and
+      LIST_OPS.at(pat.model, 0) = 13 and
+      LIST_OPS.at(pat.model, 2) = 13 and
+      buf.matches_at(pat, n, 0) and
+      buf.index_of(pat, from).is_some and
+      buf.index_of(pat, from).get <= n and
+      LIST_OPS.at(buf.model, buf.index_of(pat, from).get) = 13 and
+      LIST_OPS.at(buf.model, buf.index_of(pat, from).get + 2) = 13 and
+      buf.index_of(pat, from).get >= n
+    ensure
+      found: buf.index_of(pat, from).is_some and buf.index_of(pat, from).get = n
+    end
+
+end
