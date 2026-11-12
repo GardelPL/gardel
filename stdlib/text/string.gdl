@@ -457,6 +457,9 @@ feature {ANY}
       if j = floor then
         j
       else
+        check
+          char: Current.character_at(j - 1) = LIST_OPS.at(Current.chars, j - 1)
+        end
         if STRING.is_space(Current.character_at(j - 1)) then
           Current.space_start(j - 1, floor)
         else
