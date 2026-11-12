@@ -1,7 +1,7 @@
 # Phase F: Verified Libraries and Applications
 
 **Date:** November 6, 2026
-**Status:** In progress. Tasks F.0 to F.8 and F.12 are completed (F.7 on Windows only), and the decisions below are taken.
+**Status:** In progress. Tasks F.0 to F.8, F.12 and F.13 are completed (F.7 on Windows only), and the decisions below are taken.
 **Roadmap entry:** [Phase F in Roadmap.md](../Roadmap.md#phase-f-verified-libraries-and-applications)
 **Probed at:** commit `1349cb6`
 
@@ -229,11 +229,30 @@ Found during the F.5 follow-up (`ghttp` 0.3.0), and numbered last because it was
 
 Cause: `gardelc` (`main.rs`, the routine axioms) emits each `require` of a routine as a guard on all three of its axioms: the definition at `SuccFuel(_fuel)`, the step from `SuccFuel(SuccFuel(_fuel))` to `SuccFuel(_fuel)`, and the contract. Every guard is evaluated at `_fuel`. When a `require` calls a function, such as `i <= a.length`, that call is at a fuel where nothing is known, so a deeper unfolding is never tied to a shallower one. In `HTTP_HEADER.same_ci`, the lemma `same_ci_equal` could not prove `same_ci(a, b, i)` from `same_ci(a, b, i + 1)` until the `require` was removed. `BYTES.at` has the same guard on its fuel step.
 
-- [ ] Evaluate a guard so that it holds whenever the function is applied within its `require`: at the fuel of the application, or with fuel-free (fuel-insensitive) helpers.
-- [ ] A regression test: a recursive function with `require i <= a.length` and a lemma that unfolds it one step, which fails today.
-- [ ] Put the `require` back on `HTTP_HEADER.same_ci`, and remove the limit from the GUIDE (section 9).
-- [ ] Check that no example, `ghttp` or the prelude gets slower or loses a proof, as F.2's benchmark did.
-- Acceptance: the regression test verifies, and nothing that verified before stops verifying.
+**Status:** ✅ Completed (2026-11-12). The fuel step of a routine now goes from each fuel to the one below it.
+
+- [x] Evaluate a guard so that it holds whenever the function is applied within its `require`. Neither way proposed here was kept: the guards stay where they were, and the step reaches `ZeroFuel`, so that a function a guard calls is known there (see below).
+- [x] A regression test: `tests/fuel_guard.rs`. `SCAN.same_equal` proves `same(a, b, i)` from `same(a, b, i + 1)` under `require i <= SCAN.size(a)`, and a client proves `put(b, x).first = x` through `b.add(x)` one fuel below it. Two claims past the `require` are refused. Both proofs failed before.
+- [x] Put the `require` back on `HTTP_HEADER.same_ci`, and remove the limit from the GUIDE (section 9).
+- [x] Check that no example, `ghttp` or the prelude gets slower or loses a proof. Everything verifies cold, and times stay within the machine's run-to-run spread (the prelude took 33 to 48 s on HEAD across runs, and 45 to 54 s with the fix). Stage C of `ghttp`'s round trip had proofs on the edge, which needed sturdier steps: see below.
+- Acceptance: met.
+
+What was done:
+
+- **The case `BYTES.length` no longer showed.** A routine whose body a module cannot see is one function at every fuel (F.6), so a `require` on `a.length` alone already verified. The limit remained for a guard calling a function whose body is seen, as `size(a)` in the same module, or `has_header_room` under `HTTP_HEADERS.add`.
+- **The cause, precisely.** A definition is guarded one fuel below its application. When that application is itself one fuel below its caller, as `b.add(x)` in the body of `put(b, x)`, its definition is at `SuccFuel(ZeroFuel)` and its guard `room` at `ZeroFuel`. The step went from `SuccFuel(SuccFuel(f))` to `SuccFuel(f)`, never down to `ZeroFuel`, so `room` there was unknown.
+- **The fix.** The step is triggered on `fn(SuccFuel(f), ..)` and states it equal to `fn(f, ..)`, under the guard at `f`, as before. This ties `room` at `ZeroFuel` to `room` where the caller knows it. Triggered on the higher term, it only makes the lower one, so it cannot loop.
+- **Tried and dropped, each measured on every package cold.**
+  - Dropping the step's guard: `HTTP_WRITER_HEAD` lost its proofs.
+  - Also guarding the definition at the fuel of its application: that, and `law_line_end_found` running out of resources in `ghttp`, `grest` and the examples.
+  - The definition guarded at `DefaultFuel`: `head_blank` ran out.
+  - The new step only for the routines a `require` calls: `STRING.find` and `law_fields_lines` ran out, though it adds less than the fix. Those proofs were on the edge.
+- **Stage C made sturdier.** The fix, and F.15's, left `ghttp`'s own proofs verifying, but under seeds 1 to 3 `ghttp/tests` lost `HTTP_WRITER_HEAD`, `HTTP_ROUND_TRIP` and `check_line`. At the commit before, `head_line` already needed 25.7 million of the 30 million resources under seed 2. Nothing they claim changed.
+  - New modules `HTTP_HEAD_WHOLE` (the head as one list), `HTTP_HEAD_PARTS` and `HTTP_WRITER_PARTS` (each part's facts as one named predicate), and `HTTP_WIRE_PREFIX` (the searches over bytes that start with a prefix).
+  - `check_line` moved from `GHTTP_TEXT` to its own test module, `GHTTP_LINE`, where it assumes the facts of the 9 literals it can meet instead of 51.
+  - The heaviest of these proofs went from up to 28 million resources to about 1 million.
+  - Causes seen: `Seq_append` associativity re-matching where an operand may be empty; steps that cost far more together than apart; and the literal facts.
+  - Now `ghttp` and `ghttp/tests` verify under seeds 0 to 3. The heaviest left are `HTTP_WRITER_FIELDS.fields_lines` (up to 11.8 million) and `GHTTP_TEXT.two_exchanges` (11.8 million).
 - **Met again in F.8, stage D of the round trip**, now with a client: one step of `HTTP_HEAD_PARSER.fields` unfolds `HTTP_HEADERS.add` one fuel below its caller, guarded by `has_header_room` at fuel zero. The guards of the defining and step axioms read at `DefaultFuel`, and no guard on the step axiom, which every fuel makes sound, proved the step, and all of `ghttp` verified with them. The prelude was not checked with them, which F.4's attempt says to do first.
 - **Tried in F.4.** Both obvious fixes cost proofs. A guard at `DefaultFuel` on every axiom made `NUMBER_TEXT`'s round-trip laws run out of resources. A guard at the fuel of the application on the defining and step axioms made `STRING.find` run out. A fix must keep the extra unfolding to the routines that need it. `gjson` avoids the limit by keeping its reader total.
 
@@ -253,11 +272,22 @@ Found in F.8, stage D of the round-trip proof, and numbered last because it was 
 
 Under `/typeEncoding:p`, an axiom quantified over a user type is not instantiated at a term that a call gives back, while it is at a parameter or a local of that type. A Boogie test of `HTTP_READ_FIELDS` showed it three ways: `HTTP_HEADERS`' invariant held for the parameter `acc` and not for `reads(buf, pos, hs.tail, acc)`; a law over an `HTTP_HEADERS` did not apply to that call even with its premises assumed; and both held once the call was assigned to a local. A small file with the same shapes verifies, so the cause is in what `gardelc` emits around it, not yet found. Step 3 met the same gap in a routine (`calling`'s outcome), and a `let` worked around it there; a law has no `let`.
 
-- [ ] Find what blocks the instantiation in the emitted file, starting from the `HTTP_READ_FIELDS` VC (`GARDEL_KEEP_BPL=1`).
-- [ ] Fix it where it is emitted, or, failing that, bind a call's value to a local wherever a quantified fact over its type may be needed: a law's arguments (tried in F.8, and enough for a law call), and a routine's `let`-free expressions.
-- [ ] A regression test: a law over a user type with an invariant, used at the value of a call.
-- [ ] Then stage D of F.8's round trip, whose lemmas wait outside the tree, with F.13.
-- Acceptance: the regression test verifies, stage D is proven, and nothing that verified before stops verifying.
+**Status:** The verifier's part is done (2026-11-12): a fact over a type now applies at the value of a call. Stage D of the round trip is still open.
+
+- [x] Find what blocks the instantiation. A bug in Boogie 3.4.3, which `boogie_params` already worked around for generic functions.
+- [x] Fix it where it is emitted: `boogie_params` now moves the scalars of every function last, not only of generic ones.
+- [x] A regression test: `tests/call_value.rs`. A law of another module about a `BOX`, with an invariant, applies at `twice(n, b)`, and the `LIST` facts at `NUMBER_TEXT.digits(n, ys).append(zs)`. A claim past the law is refused. Both proofs failed before.
+- [ ] Then stage D of F.8's round trip, whose lemmas wait outside the tree. With F.13 alone, the step through `HTTP_HEADERS.add` (`HTTP_FIELD_STEP.plain_step`) verifies, which F.13 blocked. `HTTP_READ_FIELDS.reads_back` and `HTTP_READ_STEPS.fields_steps` still fail, and with both fixes they run past the time limit. They need proof work, as stage C did, rather than a fix in the verifier.
+- Acceptance: the regression test verifies and nothing that verified before stops verifying, both met; stage D is not proven yet.
+
+What was done:
+
+- **The cause.** Under `/typeEncoding:p`, Boogie states the type of a function's result with an axiom that guards each argument's type. After an `int` or `bool` argument the guards are shifted by one. For `NUMBER_TEXT__fn_digits(fuel: Fuel, n: int, rest: (Seq int))` the axiom required `type(rest) == int`, so it never applied, and a call's result had no type. Every fact quantified over a type is guarded by the type of its variable, so none reached that result. A local, or a parameter, has its type stated directly, which is why a `let` worked around it.
+  - Shown by `/typeEncoding:a`, under which the same file verifies.
+  - Shown in the SMT log, by the guard on the result-type axiom (`funType:NUMBER_TEXT__fn_digits`).
+  - The small file of F.8 verified because its functions had no scalar before another argument. The GUIDE's second limit, the `LIST` facts at `digits(n, ys).append(zs)`, was the same gap.
+- **The fix, narrowed.** A function that is not generic and gives an `int` or a `bool` is left as written: those are the solver's own sorts, with no type to lose. Reordering them anyway only moved terms. In `HTTP_WRITER_HEAD`, four functions are reordered.
+- **What it cost.** More facts now apply, so proofs that were on the edge tipped under some seeds. The same proofs as F.13's were made sturdier (see F.13).
 
 #### Task F.3: `MAP[K, V]`
 

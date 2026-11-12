@@ -107,7 +107,7 @@ feature {ANY}
           case Error(_) then
             IO.exit(0)
           case Ok(line) then
-            if GHTTP_TEXT.check_line(line) = 0 and n < 10000 then
+            if GHTTP_LINE.check_line(line) = 0 and n < 10000 then
               run_cases(n + 1)
             else
               report(line, n)
@@ -119,7 +119,7 @@ feature {ANY}
   -- Line `n`, `line`, failed, or it is the last line read.
   report(line: STRING, n: NAT): IO[EXIT_CODE]
     do
-      if GHTTP_TEXT.check_line(line) = 0 then
+      if GHTTP_LINE.check_line(line) = 0 then
         IO.exit(0)
       else
         with IO

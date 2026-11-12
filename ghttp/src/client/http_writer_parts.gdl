@@ -1,0 +1,41 @@
+-- The parts of the head `HTTP_REQUEST_WRITER` writes hold what `HTTP_HEAD_PARTS` names: its
+-- request line, its field lines and its framing line. One law for each part, each from the
+-- law about that part's text. For stage C of the round trip.
+functions HTTP_WRITER_PARTS
+
+specify {ANY}
+
+  -- The request line holds no CR.
+  law line(req: HTTP_REQUEST)
+    require
+      sendable: HTTP_REQUEST_WRITER.sendable(req)
+    do
+      HTTP_REQUEST_WRITER.target_ok(req.target) and
+      HTTP_WRITER_LINES.request_line(req.method, req.target, req.version)
+    ensure
+      line: HTTP_HEAD_PARTS.line_part(HTTP_REQUEST_WRITER.line_text(req.method, req.target, req.version).byte_model)
+    end
+
+  -- The field lines are nothing, or a run of lines.
+  law fields(req: HTTP_REQUEST)
+    require
+      sendable: HTTP_REQUEST_WRITER.sendable(req)
+    do
+      HTTP_REQUEST_WRITER.fields_ok(req.headers.fields) and
+      req.headers.fields.length <= 64 and
+      HTTP_WRITER_FIELDS.fields_lines(req.headers.fields)
+    ensure
+      fields: HTTP_HEAD_PARTS.fields_part(HTTP_REQUEST_WRITER.fields_text(req.headers.fields).byte_model)
+    end
+
+  -- The framing line is nothing, or `Content-Length`'s line, which holds no CR but the one
+  -- of its line break (`length_line`'s contract).
+  law framing(req: HTTP_REQUEST)
+    do
+      HTTP_REQUEST_WRITER.length_line(req).byte_model.length = 0 or
+        HTTP_REQUEST_WRITER.length_line(req).byte_model.length >= 3
+    ensure
+      framing: HTTP_HEAD_PARTS.framing_part(HTTP_REQUEST_WRITER.length_line(req).byte_model)
+    end
+
+end

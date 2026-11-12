@@ -52,7 +52,6 @@ This guide is written for two audiences:
   - [Lexicographic Variants](#lexicographic-variants)
   - [Mutual Recursion](#mutual-recursion)
   - [No Recursion Through Function Values](#no-recursion-through-function-values)
-  - [Known Limit: a `require` That Calls a Function](#known-limit-a-require-that-calls-a-function)
   - [Loops That Run Fast in C](#loops-that-run-fast-in-c)
 - [10. Automatic Deterministic Parallelism](#10-automatic-deterministic-parallelism)
   - [Divide-and-Conquer Parallel Fork-Join](#divide-and-conquer-parallel-fork-join)
@@ -893,39 +892,6 @@ g(n: NAT): NAT
 ```
 
 Passing *non-recursive* routines and lambdas to higher-order routines (`map`, `filter`, `apply`, ...) is unrestricted.
-
-### Known Limit: a `require` That Calls a Function
-
-A recursive function is given to the solver a fixed number of unfoldings deep. Each `require` of the function guards every unfolding, and `gardelc` evaluates that guard at the lowest depth, where nothing is known about another function's result. A `require` such as `i <= a.length` therefore stops the solver from unfolding the function one step further, and a proof about it can fail even though it is true. Task F.13 of the [libraries plan](../plan/libraries/verified_libraries.md#task-f13-fuel-guards-on-recursive-functions) fixes it.
-
-Until then, make such a function total: drop the `require`, and give the out-of-range case an answer.
-
-```eiffel
--- Fails to prove `same_ci(a, b, i)` from `same_ci(a, b, i + 1)`:
-same_ci(a: BYTES, b: BYTES, i: NAT): BOOL
-  require
-    in_bounds: i <= a.length
-  ...
-    else if i = a.length then True
-
--- Proves:
-same_ci(a: BYTES, b: BYTES, i: NAT): BOOL
-  variant
-    a.length - i
-  do
-    if a.length != b.length then False
-    else if i >= a.length then True
-    ...
-```
-
-A `require` on plain arguments, such as `n < 100`, is not affected, because its guard calls no function.
-
-A second limit concerns lists: the solver's facts about `LIST` do not apply to a term that holds a prelude routine's result directly, such as `NUMBER_TEXT.digits(n, ys).append(zs)`. Name the result first, and they do:
-
-```eiffel
-let ds = NUMBER_TEXT.digits(n, ys)
-ds.append(zs)
-```
 
 ### Loops That Run Fast in C
 

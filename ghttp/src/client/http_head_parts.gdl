@@ -1,0 +1,56 @@
+-- What each part of a request head must hold for the head to have its shape, each as one
+-- fact: the request line `lt`, the field lines `f` and the framing line `ll`. For stage C
+-- of the round trip.
+--
+-- `HTTP_HEAD_SHAPE` and `HTTP_HEAD_WHOLE` ask for these part by part, with a clause for an
+-- empty part and one over every position. A proof that knows how each text is made
+-- (`HTTP_WRITER_HEAD`) would have to prove each clause again, and wanders into the cases.
+-- Here a part's facts are one name, proven once where the part is made
+-- (`HTTP_WRITER_PARTS`) and passed on as it is.
+functions HTTP_HEAD_PARTS
+
+specify {ANY}
+
+  -- A request line: it holds no CR.
+  line_part(lt: LIST[U64]): BOOL
+    do
+      forall k: NAT. k < lt.length implies LIST_OPS.at(lt, k) != 13
+    end
+
+  -- The field lines: nothing, or a run of lines (`HTTP_WIRE_FACTS`) that does not start
+  -- with a CR.
+  fields_part(f: LIST[U64]): BOOL
+    do
+      (f.length > 0 implies LIST_OPS.at(f, 0) != 13) and
+      (f.length > 0 implies
+        (f.length >= 2 and LIST_OPS.at(f, f.length - 2) = 13 and LIST_OPS.at(f, f.length - 1) = 10)) and
+      (forall k: NAT. forall j: NAT. (k < j and j < f.length and
+        LIST_OPS.at(f, k) = 13 and LIST_OPS.at(f, j) = 13) implies j != k + 2)
+    end
+
+  -- The framing line: nothing, or at least three bytes that end with a line break and hold
+  -- no other CR.
+  framing_part(ll: LIST[U64]): BOOL
+    do
+      (ll.length > 0 implies
+        (ll.length >= 2 and LIST_OPS.at(ll, ll.length - 2) = 13 and LIST_OPS.at(ll, ll.length - 1) = 10)) and
+      (forall k: NAT. k + 2 < ll.length implies LIST_OPS.at(ll, k) != 13) and
+      (ll.length = 0 or ll.length >= 3)
+    end
+
+  -- A head `h` made of such parts: before its blank line's last line break, no CR has
+  -- another two bytes on (`HTTP_HEAD_WHOLE.apart`, from the parts' facts by name).
+  law apart(h: LIST[U64], lt: LIST[U64], f: LIST[U64], ll: LIST[U64])
+    require
+      whole: h = lt.append(LIST.empty.prepend(10).prepend(13)).append(f).append(ll).append(LIST.empty.prepend(10).prepend(13))
+      line: HTTP_HEAD_PARTS.line_part(lt)
+      fields: HTTP_HEAD_PARTS.fields_part(f)
+      framing: HTTP_HEAD_PARTS.framing_part(ll)
+    do
+      HTTP_HEAD_WHOLE.apart(h, lt, f, ll)
+    ensure
+      apart: forall k: NAT. forall j: NAT. (k < j and j < h.length - 2 and
+        LIST_OPS.at(h, k) = 13 and LIST_OPS.at(h, j) = 13) implies j != k + 2
+    end
+
+end

@@ -864,8 +864,8 @@ flowchart TD
 | | [F.1](libraries/verified_libraries.md#task-f1-compiler-gaps) | Generic bounds, match binders, function fields in C ✅ |
 | 2. Core libraries | [F.2](libraries/verified_libraries.md#task-f2-bytes-string-and-number-text) | `BYTES`, `STRING` and number text ✅ |
 | | [F.3](libraries/verified_libraries.md#task-f3-mapk-v) | `MAP[K, V]` ✅ |
-| | [F.13](libraries/verified_libraries.md#task-f13-fuel-guards-on-recursive-functions) | Fuel guards on recursive functions, found in F.5 |
-| | [F.15](libraries/verified_libraries.md#task-f15-facts-over-a-user-type-at-the-values-of-calls) | Facts over a user type at the values of calls, found in F.8 |
+| | [F.13](libraries/verified_libraries.md#task-f13-fuel-guards-on-recursive-functions) | Fuel guards on recursive functions, found in F.5 ✅ |
+| | [F.15](libraries/verified_libraries.md#task-f15-facts-over-a-user-type-at-the-values-of-calls) | Facts over a user type at the values of calls, found in F.8: fixed in the verifier ✅, stage D of the round trip still open |
 | | [F.14](libraries/verified_libraries.md#task-f14-a-cost-model-for-parallel-lets) | A cost model for parallel `let`s, found in F.4 |
 | 3. JSON | [F.4](libraries/verified_libraries.md#task-f4-the-gjson-package) | The `gjson` package, with the round trip proven for scalars and strings ✅ |
 | 4. REST | [F.5](libraries/verified_libraries.md#task-f5-a-parser-that-means-what-the-bytes-say) | A correct `ghttp` parser ✅ |
@@ -902,7 +902,7 @@ flowchart TD
 
 ## 6. Immediate Next Step
 
-**Phase F: Verified Libraries and Applications** is in progress, and Tasks F.0 to F.8 and F.12 are completed (F.7 on Windows only). `grest` serves `todo_api` over real sockets, and its async handlers let `api_gateway` wait for another service with proven limits. The round trip of a request through `ghttp` is proven up to its field lines, which tests cover. Their proof waits on F.13 and F.15, the next tasks; after them comes F.9, the terminal host.
+**Phase F: Verified Libraries and Applications** is in progress, and Tasks F.0 to F.8, F.12 and F.13 are completed (F.7 on Windows only). `grest` serves `todo_api` over real sockets, and its async handlers let `api_gateway` wait for another service with proven limits. The round trip of a request through `ghttp` is proven up to its field lines, which tests cover. F.13 and F.15's verifier fixes removed what blocked their proof, and what is left is proof work on `HTTP_READ_FIELDS` and `HTTP_READ_STEPS`, the rest of F.15; after it comes F.9, the terminal host.
 
 **Phase E: Projects and Packages:** Tasks E.0 to E.5 and E.7 are completed, so Phase E is complete. Fetching dependencies and a lockfile were dropped, as a path dependency on a git submodule already pins a commit.
 

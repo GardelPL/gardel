@@ -74,12 +74,14 @@ create {ANY}
 
   -- Whether `a` and `b` agree from `i` on, ignoring the case of ASCII letters.
   same_ci(a: BYTES, b: BYTES, i: NAT): BOOL
+    require
+      in_bounds: i <= a.length
     variant
       a.length - i
     do
       if a.length != b.length then
         False
-      else if i >= a.length then
+      else if i = a.length then
         True
       else if HTTP_HEADER.fold_byte(a.at(i)) = HTTP_HEADER.fold_byte(b.at(i)) then
         HTTP_HEADER.same_ci(a, b, i + 1)
@@ -93,6 +95,7 @@ create {ANY}
   -- Bytes that are the same are the same ignoring case.
   same_ci_equal(a: BYTES, b: BYTES, i: NAT): BOOL
     require
+      in_bounds: i <= a.length
       same: a.model = b.model
     variant
       a.length - i

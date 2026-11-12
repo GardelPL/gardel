@@ -8808,7 +8808,6 @@ fn emit_boogie_parts_with_options(
         let uses_curr = *has_current && !current_indep.contains(&r.name);
         let mut sig_params = vec!["fuel: Fuel".to_string()];
         let mut q_params = vec!["_fuel: Fuel".to_string()];
-        let mut call_args_step_two = vec!["SuccFuel(SuccFuel(_fuel))".to_string()];
         let mut call_args_succ = vec!["SuccFuel(_fuel)".to_string()];
         let mut call_args_f = vec!["_fuel".to_string()];
         let mut pre_guards = Vec::new();
@@ -8816,7 +8815,6 @@ fn emit_boogie_parts_with_options(
         if *has_current {
             sig_params.push(format!("Current: {mod_bpl_ty}"));
             q_params.push(format!("Current: {mod_bpl_ty}"));
-            call_args_step_two.push("Current".to_string());
             call_args_succ.push("Current".to_string());
             call_args_f.push("Current".to_string());
             if uses_curr {
@@ -8827,7 +8825,6 @@ fn emit_boogie_parts_with_options(
             let bty = map_boogie_type(pt, m);
             sig_params.push(format!("{pn}: {bty}"));
             q_params.push(format!("{pn}: {bty}"));
-            call_args_step_two.push(pn.clone());
             call_args_succ.push(pn.clone());
             call_args_f.push(pn.clone());
             if pt == "NAT" || pt == "U64" {
@@ -8860,7 +8857,6 @@ fn emit_boogie_parts_with_options(
             sig_params.join(", ")
         ));
 
-        let fn_step_two_app = format!("fn_{}({})", r.name, call_args_step_two.join(", "));
         let fn_succ_app = format!("fn_{}({})", r.name, call_args_succ.join(", "));
         let fn_f_app = format!("fn_{}({})", r.name, call_args_f.join(", "));
         // A routine whose type parameters no argument mentions, such as `ROUTER[S].empty`, is
@@ -8889,11 +8885,6 @@ fn emit_boogie_parts_with_options(
             String::new()
         } else {
             format!("{} ==> ", pre_guards.join(" && "))
-        };
-        let fn_step_two_trigger = if r_all_tps.is_empty() {
-            format!("{{ {fn_step_two_app} }}")
-        } else {
-            format!("{{ ({fn_step_two_app} : {ret_bty}) }}")
         };
         let fn_succ_trigger = if r_all_tps.is_empty() {
             format!("{{ {fn_succ_app} }}")
@@ -8928,9 +8919,18 @@ fn emit_boogie_parts_with_options(
         }
         // Where the body is hidden, the axiom below makes every fuel one, so this step would
         // only add a term one fuel lower for each call, and its facts again.
+        // The step goes from each fuel to the one below it, down to `ZeroFuel`, where no
+        // definition applies. A `require` that calls a function, such as `i <= size(a)` or
+        // `room`, guards the definition one fuel below its application, and when that
+        // application is itself one fuel below its caller, the guard is read at `ZeroFuel`.
+        // Stepping from `SuccFuel(ZeroFuel)` to `ZeroFuel` ties `room` there to `room` where the
+        // caller knows it, so the definition applies (F.13). The step is triggered on the
+        // higher term and only makes the lower one, so it cannot loop. Guarding the definition
+        // at the fuel of its application instead, or dropping the step's guard, unfolded more,
+        // and stage C of `ghttp`'s round trip ran out of resources with either.
         if !binds_io && scope == BoogieEmitScope::Full {
             out.push_str(&format!(
-                "axiom (forall{r_tp_quant} {} :: {fn_step_two_trigger} {guard_str}{fn_step_two_app} == {fn_succ_app});\n",
+                "axiom (forall{r_tp_quant} {} :: {fn_succ_trigger} {guard_str}{fn_succ_app} == {fn_f_app});\n",
                 q_params.join(", ")
             ));
         }

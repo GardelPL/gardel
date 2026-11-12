@@ -8,7 +8,8 @@
 -- * C, `line_end_found` and `head_end_found`: in bytes that start with the writer's head,
 --   the parser's searches find the end of its request line and its blank line. The bytes'
 --   shape is proven in `HTTP_WIRE_FACTS`, `HTTP_WRITER_LINES`, `HTTP_WRITER_FIELDS`,
---   `HTTP_HEAD_SHAPE` and `HTTP_WRITER_HEAD`.
+--   `HTTP_HEAD_SHAPE`, `HTTP_HEAD_WHOLE` and `HTTP_WRITER_HEAD`, and carried over to the
+--   bytes searched in `HTTP_WIRE_PREFIX`.
 --
 -- Still covered by tests only (`ghttp/tests/cases.txt`, where every request the parser
 -- accepts is written and parsed back): stage D, that the field lines give the same fields in
@@ -68,7 +69,7 @@ specify {ANY}
     do
       HTTP_WRITER_HEAD.head_line(req) and
       HTTP_REQUEST_WRITER.head_text(req).to_utf8.model = HTTP_REQUEST_WRITER.head_text(req).byte_model and
-      HTTP_WIRE_FACTS.crlf_found(buf, HTTP_HEAD_PARSER.crlf, 0,
+      HTTP_WIRE_PREFIX.crlf_found(buf, HTTP_REQUEST_WRITER.head_text(req).to_utf8, HTTP_HEAD_PARSER.crlf,
         HTTP_REQUEST_WRITER.line_text(req.method, req.target, req.version).byte_length)
     ensure
       found: buf.index_of(HTTP_HEAD_PARSER.crlf, 0).is_some and
@@ -84,7 +85,7 @@ specify {ANY}
     do
       HTTP_WRITER_HEAD.head_blank(req) and HTTP_WRITER_HEAD.head_apart(req) and
       HTTP_REQUEST_WRITER.head_text(req).to_utf8.model = HTTP_REQUEST_WRITER.head_text(req).byte_model and
-      HTTP_WIRE_FACTS.blank_found(buf, HTTP_HEAD_PARSER.blank_line,
+      HTTP_WIRE_PREFIX.blank_found(buf, HTTP_REQUEST_WRITER.head_text(req).to_utf8, HTTP_HEAD_PARSER.blank_line,
         HTTP_REQUEST_WRITER.line_text(req.method, req.target, req.version).byte_length,
         HTTP_REQUEST_WRITER.head_text(req).byte_length - 4)
     ensure
