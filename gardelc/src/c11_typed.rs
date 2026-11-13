@@ -2900,6 +2900,7 @@ static struct SEQ_STRING* gardel_main_args(int argc, char** argv) {
                  static {evt} gardel_event_value(struct gardel_host_event ev) {{\n    switch (ev.kind) {{\n{make}        default: abort();\n    }}\n}}\n\n\
                  int gardel_reactive_main(int argc, char** argv) {{\n\
                  \x20   gardel_host_install();\n\
+                 \x20   gardel_term_start();\n\
                  \x20   gardel_timer_count = 0;\n\
                  \x20   const char* script = getenv(\"GARDEL_EVENTS\");\n\
                  \x20   if (script) gardel_host_script = script;\n\
@@ -3025,30 +3026,33 @@ const REACTIVE_RUNTIME: &str = r#"/* Reactive host (spec 11.6). */
 enum gardel_host_kind {
     GARDEL_HOST_SHUTDOWN, GARDEL_HOST_TICK, GARDEL_HOST_LINE, GARDEL_HOST_KEY, GARDEL_HOST_ACCEPTED,
     GARDEL_HOST_LISTEN_FAILED, GARDEL_HOST_RECEIVED, GARDEL_HOST_SEND_FAILED, GARDEL_HOST_CLOSED,
-    GARDEL_HOST_CONNECTED, GARDEL_HOST_CONNECT_FAILED
+    GARDEL_HOST_CONNECTED, GARDEL_HOST_CONNECT_FAILED, GARDEL_HOST_RESIZED
 };
 enum gardel_host_key {
     GARDEL_KEY_CHAR, GARDEL_KEY_UP, GARDEL_KEY_DOWN, GARDEL_KEY_LEFT, GARDEL_KEY_RIGHT,
     GARDEL_KEY_ENTER, GARDEL_KEY_ESCAPE, GARDEL_KEY_BACKSPACE, GARDEL_KEY_TAB,
-    GARDEL_KEY_OTHER, GARDEL_KEY_END_OF_INPUT
+    GARDEL_KEY_OTHER, GARDEL_KEY_END_OF_INPUT, GARDEL_KEY_HOME, GARDEL_KEY_END,
+    GARDEL_KEY_PAGE_UP, GARDEL_KEY_PAGE_DOWN, GARDEL_KEY_DELETE, GARDEL_KEY_CTRL
 };
 struct gardel_host_event {
     enum gardel_host_kind kind;
     uint64_t id;                /* Tick: the timer. Sockets: the connection, or the port. ConnectFailed: none */
     void* line;                 /* Line: an owned RESULT[IO_ERROR, STRING] */
     enum gardel_host_key key;   /* Key */
-    uint32_t ch;                /* Key: a Unicode scalar, for GARDEL_KEY_CHAR */
+    uint32_t ch;                /* Key: a Unicode scalar for GARDEL_KEY_CHAR, a letter for GARDEL_KEY_CTRL */
     GardelBytes data;           /* Received: owned */
     int64_t err;                /* ListenFailed, SendFailed, Line: the OS error code */
     int line_state;             /* Line: a GARDEL_LINE_* */
     char* raw;                  /* Line: the bytes read, kept only when recording */
     size_t raw_len;
     uint64_t tag;               /* Connected, ConnectFailed: the tag of the Connect */
+    uint64_t width, height;     /* Resized: in cells */
 };
 
 /* Scripted events, from GARDEL_EVENTS: names separated by spaces. NULL reads the OS. */
 static const char* gardel_host_script = NULL;
 static const char* gardel_event_source = "GARDEL_EVENTS";
+static void gardel_decode_control(uint32_t c, struct gardel_host_event* ev);
 /* Set before any thread starts. A line's bytes are gone once it is a RESULT, and a bad line has
    no text to log, so the reader keeps them for a recording. */
 static bool gardel_log_capture = false;
@@ -3071,6 +3075,14 @@ __declspec(dllimport) int __stdcall GetConsoleMode(void*, unsigned long*);
 __declspec(dllimport) int __stdcall SetConsoleMode(void*, unsigned long);
 __declspec(dllimport) int __stdcall ReadFile(void*, void*, unsigned long, unsigned long*, void*);
 __declspec(dllimport) int __stdcall ReadConsoleInputW(void*, void*, unsigned long, unsigned long*);
+__declspec(dllimport) int __stdcall GetConsoleScreenBufferInfo(void*, void*);
+__declspec(dllimport) int __stdcall SetConsoleOutputCP(unsigned int);
+__declspec(dllimport) unsigned int __stdcall GetConsoleOutputCP(void);
+__declspec(dllimport) unsigned long __stdcall GetFileType(void*);
+__declspec(dllimport) int __stdcall PeekNamedPipe(void*, void*, unsigned long, unsigned long*, unsigned long*, unsigned long*);
+__declspec(dllimport) void __stdcall Sleep(unsigned long);
+#include <fcntl.h>
+#include <io.h>
 
 /* Sockets: WS2_32, so a program links with -lws2_32. All sockets share one event: it only says
    that a socket changed, and WSAPoll says which. Levels are read again after each reset, so a
@@ -3231,7 +3243,69 @@ static int gardel_read_byte(void) {
     if (!ReadFile(gardel_term_in, &b, 1, &got, NULL) || got == 0) return -1;
     return b;
 }
-static bool gardel_byte_soon(void) { return false; }
+
+/* The terminal's output. Bytes go out as written, so a run writes the same bytes as on POSIX,
+   and a console takes VT sequences and UTF-8 while the program runs. Its modes come back after. */
+static void* gardel_term_out = NULL;
+static unsigned long gardel_out_saved = 0;
+static unsigned int gardel_out_cp_saved = 0;
+static bool gardel_out_changed = false;
+static void gardel_term_out_open(void) {
+    _setmode(_fileno(stdout), _O_BINARY);
+    gardel_term_out = GetStdHandle((unsigned long)-11);
+    if (!GetConsoleMode(gardel_term_out, &gardel_out_saved)) return;
+    gardel_out_cp_saved = GetConsoleOutputCP();
+    /* ENABLE_PROCESSED_OUTPUT | ENABLE_VIRTUAL_TERMINAL_PROCESSING */
+    SetConsoleMode(gardel_term_out, gardel_out_saved | 1UL | 4UL);
+    SetConsoleOutputCP(65001);
+    gardel_out_changed = true;
+}
+static void gardel_term_out_restore(void) {
+    if (!gardel_out_changed) return;
+    fflush(stdout);
+    SetConsoleMode(gardel_term_out, gardel_out_saved);
+    SetConsoleOutputCP(gardel_out_cp_saved);
+    gardel_out_changed = false;
+}
+/* CONSOLE_SCREEN_BUFFER_INFO: the visible window is srWindow. */
+struct gardel_console_info { short size_x, size_y, cur_x, cur_y; unsigned short attr; short left, top, right, bottom, max_x, max_y; };
+static bool gardel_term_size(uint64_t* w, uint64_t* h) {
+    struct gardel_console_info i;
+    if (!gardel_term_out || !GetConsoleScreenBufferInfo(gardel_term_out, &i)) return false;
+    *w = (uint64_t)(i.right - i.left + 1);
+    *h = (uint64_t)(i.bottom - i.top + 1);
+    return true;
+}
+/* A console says nothing about a resize unless a read takes it, and the reader reads only for a
+   ReadKey, so the loop looks at the size this often instead. */
+#define GARDEL_RESIZE_LOOK_MS 100
+static uint64_t gardel_resize_next = 0;
+static void gardel_resize_watch(void) {}
+static bool gardel_resize_seen(void) {
+    uint64_t now = gardel_host_now_ms();
+    if (now < gardel_resize_next) return false;
+    gardel_resize_next = now + GARDEL_RESIZE_LOOK_MS;
+    return true;
+}
+static uint64_t gardel_resize_wait_limit(uint64_t ms) {
+    uint64_t now = gardel_host_now_ms();
+    uint64_t left = gardel_resize_next > now ? gardel_resize_next - now : 0;
+    return left < ms ? left : ms;
+}
+/* An escape sequence arrives at once; a lone Escape is followed by nothing. Bytes that do not
+   come from a console are read as on POSIX, so a pipe is given the same 50 ms. */
+static bool gardel_byte_soon(void) {
+    unsigned long type = GetFileType(gardel_term_in);
+    if (type == 1) return true; /* FILE_TYPE_DISK: the bytes are there, or the end is */
+    if (type != 3) return false; /* not FILE_TYPE_PIPE */
+    for (uint64_t start = gardel_host_now_ms(); gardel_host_now_ms() - start < 50;) {
+        unsigned long avail = 0;
+        if (!PeekNamedPipe(gardel_term_in, NULL, 0, NULL, &avail, NULL)) return true; /* its end */
+        if (avail > 0) return true;
+        Sleep(1);
+    }
+    return false;
+}
 struct gardel_console_key {
     unsigned short type, pad;
     int down;
@@ -3258,9 +3332,19 @@ static void gardel_read_console_key(struct gardel_host_event* ev) {
             case 0x1B: ev->key = GARDEL_KEY_ESCAPE; return;
             case 0x08: ev->key = GARDEL_KEY_BACKSPACE; return;
             case 0x09: ev->key = GARDEL_KEY_TAB; return;
+            case 0x24: ev->key = GARDEL_KEY_HOME; return;
+            case 0x23: ev->key = GARDEL_KEY_END; return;
+            case 0x21: ev->key = GARDEL_KEY_PAGE_UP; return;
+            case 0x22: ev->key = GARDEL_KEY_PAGE_DOWN; return;
+            case 0x2E: ev->key = GARDEL_KEY_DELETE; return;
             default: break;
         }
         uint32_t c = (uint32_t)k.ch;
+        if ((c > 0 && c < 32) || c == 127) {
+            /* A Ctrl chord, named as a POSIX terminal would send it. */
+            gardel_decode_control(c, ev);
+            return;
+        }
         if (c == 0) {
             /* Shift, Ctrl, Alt and Caps Lock alone are not keys of their own. */
             if ((k.vk >= 0x10 && k.vk <= 0x12) || k.vk == 0x14 || (k.vk >= 0xA0 && k.vk <= 0xA5)) continue;
@@ -3278,7 +3362,7 @@ static void gardel_read_console_key(struct gardel_host_event* ev) {
             }
             c = 0x10000 + ((high - 0xD800) << 10) + (c - 0xDC00);
         }
-        ev->key = c < 32 ? GARDEL_KEY_OTHER : GARDEL_KEY_CHAR;
+        ev->key = GARDEL_KEY_CHAR;
         ev->ch = c;
         return;
     }
@@ -3291,6 +3375,7 @@ static void gardel_read_console_key(struct gardel_host_event* ev) {
 #include <poll.h>
 #include <pthread.h>
 #include <signal.h>
+#include <sys/ioctl.h>
 #include <sys/socket.h>
 #include <termios.h>
 #include <time.h>
@@ -3300,7 +3385,7 @@ typedef int gardel_sock;
 #define GARDEL_NO_SOCK (-1)
 #define GARDEL_POLLIN POLLIN
 #define GARDEL_POLLOUT POLLOUT
-#define GARDEL_POLL_BASE 2 /* the wake pipes come first */
+#define GARDEL_POLL_BASE 3 /* the wake pipes come first */
 #define GARDEL_ERR_INVALID EINVAL
 #define GARDEL_ERR_NO_BUFFERS ENOBUFS
 #define GARDEL_ERR_TIMED_OUT ETIMEDOUT
@@ -3361,6 +3446,8 @@ static void gardel_sock_rearm(void) {}
 /* A self-pipe: the handler only writes a byte, and the loop waits with poll. */
 static int gardel_signal_pipe[2] = {-1, -1};
 static int gardel_input_pipe[2] = {-1, -1};
+/* Written on SIGWINCH, and drained by the loop. -1 until a TerminalSize, which poll skips. */
+static int gardel_resize_pipe[2] = {-1, -1};
 static void gardel_on_signal(int sig) {
     int saved = errno;
     char c = (char)sig;
@@ -3390,13 +3477,16 @@ static uint64_t gardel_host_now_ms(void) {
 }
 /* The pipe is never read, so a shutdown request stays visible and cannot be lost. */
 static void gardel_host_wait(uint64_t ms) {
-    struct pollfd wake[2] = { { gardel_signal_pipe[0], POLLIN, 0 }, { gardel_input_pipe[0], POLLIN, 0 } };
+    struct pollfd wake[3] = {
+        { gardel_signal_pipe[0], POLLIN, 0 }, { gardel_input_pipe[0], POLLIN, 0 }, { gardel_resize_pipe[0], POLLIN, 0 }
+    };
     int timeout = ms > 0x3FFFFFFFULL ? 0x3FFFFFFF : (int)ms;
     struct pollfd* p = wake;
-    size_t n = 2;
+    size_t n = 3;
     if (gardel_poll_count > 0) {
         gardel_pfds[0] = wake[0];
         gardel_pfds[1] = wake[1];
+        gardel_pfds[2] = wake[2];
         p = gardel_pfds;
         n = GARDEL_POLL_BASE + gardel_poll_count;
     }
@@ -3442,7 +3532,9 @@ static void gardel_reader_start(void) {
     pthread_sigmask(SIG_SETMASK, &old, NULL);
 }
 
-/* The terminal. Ctrl-C stays a signal in raw mode (ISIG is kept). */
+/* The terminal. Ctrl-C stays a signal in raw mode (ISIG is kept), and is the only one: the other
+   chords are keys, as on Windows, so Ctrl-Z cannot stop the program with the terminal raw,
+   Ctrl-\ cannot kill it, and Ctrl-S and Ctrl-Q do not hold the output. */
 static struct termios gardel_term_saved;
 static bool gardel_term_is_console = false, gardel_term_is_raw = false;
 static void gardel_term_open(void) {
@@ -3452,9 +3544,17 @@ static void gardel_term_set_raw(bool raw) {
     if (!gardel_term_is_console || raw == gardel_term_is_raw) return;
     struct termios t = gardel_term_saved;
     if (raw) {
-        t.c_lflag &= ~(tcflag_t)(ICANON | ECHO);
+        t.c_lflag &= ~(tcflag_t)(ICANON | ECHO | IEXTEN);
+        t.c_iflag &= ~(tcflag_t)IXON;
         t.c_cc[VMIN] = 1;
         t.c_cc[VTIME] = 0;
+#ifdef _POSIX_VDISABLE
+        t.c_cc[VSUSP] = _POSIX_VDISABLE;
+        t.c_cc[VQUIT] = _POSIX_VDISABLE;
+#ifdef VDSUSP
+        t.c_cc[VDSUSP] = _POSIX_VDISABLE;
+#endif
+#endif
     }
     tcsetattr(0, TCSANOW, &t);
     gardel_term_is_raw = raw;
@@ -3470,6 +3570,48 @@ static bool gardel_byte_soon(void) {
     struct pollfd p = { 0, POLLIN, 0 };
     return poll(&p, 1, 50) > 0;
 }
+
+/* The terminal's output: bytes go out as written, and a terminal needs no mode for VT. */
+static void gardel_term_out_open(void) {}
+static void gardel_term_out_restore(void) {}
+static bool gardel_term_size(uint64_t* w, uint64_t* h) {
+    struct winsize ws;
+    if (ioctl(1, TIOCGWINSZ, &ws) != 0) return false;
+    *w = ws.ws_col;
+    *h = ws.ws_row;
+    return true;
+}
+static void gardel_on_resize(int sig) {
+    (void)sig;
+    int saved = errno;
+    char c = 1;
+    ssize_t ignored = write(gardel_resize_pipe[1], &c, 1);
+    (void)ignored;
+    errno = saved;
+}
+/* Non-blocking at both ends: the handler must not wait on a full pipe, and one byte says as much
+   as many. */
+static void gardel_resize_watch(void) {
+    if (pipe(gardel_resize_pipe) != 0
+        || fcntl(gardel_resize_pipe[0], F_SETFL, O_NONBLOCK) != 0
+        || fcntl(gardel_resize_pipe[1], F_SETFL, O_NONBLOCK) != 0) {
+        perror("gardel: pipe");
+        exit(2);
+    }
+    struct sigaction sa;
+    memset(&sa, 0, sizeof sa);
+    sa.sa_handler = gardel_on_resize;
+    sigemptyset(&sa.sa_mask);
+    sa.sa_flags = SA_RESTART;
+    sigaction(SIGWINCH, &sa, NULL);
+}
+static bool gardel_resize_seen(void) {
+    char buf[64];
+    bool any = false;
+    while (read(gardel_resize_pipe[0], buf, sizeof buf) > 0) any = true;
+    return any;
+}
+static uint64_t gardel_resize_wait_limit(uint64_t ms) { return ms; }
 #endif
 
 /* Pending one-shot timers. Fired in deadline order, and in setting order on a tie. */
@@ -3529,7 +3671,48 @@ static void gardel_keep_line(struct gardel_host_event* ev, const char* buf, size
 }
 
 /* Every exit path: after Stop, after a shutdown, and through exit(). */
-static void gardel_term_restore(void) { gardel_term_set_raw(false); }
+static void gardel_term_restore(void) {
+    gardel_term_set_raw(false);
+    gardel_term_out_restore();
+}
+
+/* Before anything is written. A frame goes out in one write rather than in pieces. */
+static void gardel_term_start(void) {
+    setvbuf(stdout, NULL, _IOFBF, 65536);
+    gardel_term_out_open();
+    atexit(gardel_term_restore);
+}
+
+/* The terminal's size (spec 11.6). Each TerminalSize is owed a Resized, and from the first one
+   on, a change of size is reported as well. Output that is not a terminal is 80 by 24. */
+static bool gardel_size_watching = false, gardel_size_owed = false;
+static uint64_t gardel_size_w = 0, gardel_size_h = 0;
+static void gardel_host_terminal_size(void) {
+    if (gardel_host_script) return;
+    if (!gardel_size_watching) {
+        gardel_size_watching = true;
+        gardel_resize_watch();
+    }
+    gardel_size_owed = true;
+}
+static bool gardel_size_take(struct gardel_host_event* ev) {
+    if (!gardel_size_watching) return false;
+    /* Seen first, so that a resize already answered is not reported again. */
+    if (!gardel_resize_seen() && !gardel_size_owed) return false;
+    uint64_t w, h;
+    if (!gardel_term_size(&w, &h) || w == 0 || h == 0) {
+        w = 80;
+        h = 24;
+    }
+    if (!gardel_size_owed && w == gardel_size_w && h == gardel_size_h) return false;
+    gardel_size_owed = false;
+    gardel_size_w = w;
+    gardel_size_h = h;
+    ev->kind = GARDEL_HOST_RESIZED;
+    ev->width = w;
+    ev->height = h;
+    return true;
+}
 
 static void gardel_host_request_input(bool is_key) {
     if (gardel_host_script) return;
@@ -3540,7 +3723,6 @@ static void gardel_host_request_input(bool is_key) {
     if (!gardel_reader_started) {
         gardel_reader_started = true;
         gardel_term_open();
-        atexit(gardel_term_restore);
         gardel_reader_start();
     }
     gardel_lock();
@@ -3552,31 +3734,67 @@ static void gardel_host_request_input(bool is_key) {
 
 /* One Unicode scalar from its lead byte. A malformed sequence is Other, so that a Char always
    holds a valid CHAR (spec 3): these bytes are untrusted. */
+/* A control byte, or 127. Ctrl-H, Ctrl-I, Ctrl-J, Ctrl-M and Ctrl-[ are the bytes of keys of
+   their own, so they are those keys; any other Ctrl with a letter is Ctrl and the letter. */
+static void gardel_decode_control(uint32_t c, struct gardel_host_event* ev) {
+    ev->key = GARDEL_KEY_OTHER;
+    if (c == '\n' || c == '\r') ev->key = GARDEL_KEY_ENTER;
+    else if (c == '\t') ev->key = GARDEL_KEY_TAB;
+    else if (c == 8 || c == 127) ev->key = GARDEL_KEY_BACKSPACE;
+    else if (c == 27) ev->key = GARDEL_KEY_ESCAPE;
+    else if (c >= 1 && c <= 26) {
+        ev->key = GARDEL_KEY_CTRL;
+        ev->ch = 'a' + c - 1;
+    }
+}
+
+/* What follows ESC [ or ESC O: parameters, then a final byte. A modifier, as in ESC [ 1 ; 5 C for
+   Ctrl-Right, is left out, as Windows reports the key alone. */
+static void gardel_decode_sequence(struct gardel_host_event* ev) {
+    uint64_t first = 0;
+    bool past_first = false;
+    int c = gardel_read_byte();
+    while (c >= '0' && c <= ';') {
+        if (c > '9') past_first = true;
+        else if (!past_first && first < 1000) first = first * 10 + (uint64_t)(c - '0');
+        c = gardel_read_byte();
+    }
+    ev->key = GARDEL_KEY_OTHER;
+    switch (c) {
+        case 'A': ev->key = GARDEL_KEY_UP; return;
+        case 'B': ev->key = GARDEL_KEY_DOWN; return;
+        case 'C': ev->key = GARDEL_KEY_RIGHT; return;
+        case 'D': ev->key = GARDEL_KEY_LEFT; return;
+        case 'H': ev->key = GARDEL_KEY_HOME; return;
+        case 'F': ev->key = GARDEL_KEY_END; return;
+        case '~': break;
+        default: return;
+    }
+    switch (first) {
+        case 1: case 7: ev->key = GARDEL_KEY_HOME; return;
+        case 4: case 8: ev->key = GARDEL_KEY_END; return;
+        case 3: ev->key = GARDEL_KEY_DELETE; return;
+        case 5: ev->key = GARDEL_KEY_PAGE_UP; return;
+        case 6: ev->key = GARDEL_KEY_PAGE_DOWN; return;
+        default: return;
+    }
+}
+
 static void gardel_decode_key_byte(int b, struct gardel_host_event* ev) {
     ev->key = GARDEL_KEY_OTHER;
     if (b < 0) { ev->key = GARDEL_KEY_END_OF_INPUT; return; }
-    if (b == '\n' || b == '\r') { ev->key = GARDEL_KEY_ENTER; return; }
-    if (b == '\t') { ev->key = GARDEL_KEY_TAB; return; }
-    if (b == 8 || b == 127) { ev->key = GARDEL_KEY_BACKSPACE; return; }
     if (b == 27) {
         ev->key = GARDEL_KEY_ESCAPE;
         if (!gardel_byte_soon()) return;
         int c = gardel_read_byte();
         ev->key = GARDEL_KEY_OTHER;
-        if (c != '[' && c != 'O') return;
-        c = gardel_read_byte();
-        switch (c) {
-            case 'A': ev->key = GARDEL_KEY_UP; return;
-            case 'B': ev->key = GARDEL_KEY_DOWN; return;
-            case 'C': ev->key = GARDEL_KEY_RIGHT; return;
-            case 'D': ev->key = GARDEL_KEY_LEFT; return;
-            default: break;
-        }
-        /* Skip the rest of a longer sequence, such as ESC [ 3 ~. */
-        while (c >= '0' && c <= ';') c = gardel_read_byte();
+        if (c == '[' || c == 'O') gardel_decode_sequence(ev);
         return;
     }
-    if (b < 32) return;
+    if (b < 32 || b == 127) {
+        gardel_decode_control((uint32_t)b, ev);
+        return;
+    }
     if (b < 128) { ev->key = GARDEL_KEY_CHAR; ev->ch = (uint32_t)b; return; }
     int extra = b >= 0xF0 ? 3 : b >= 0xE0 ? 2 : b >= 0xC0 ? 1 : -1;
     if (extra < 0 || b > 0xF4) return;
@@ -4219,7 +4437,8 @@ static const struct { const char* name; enum gardel_host_key key; } gardel_key_n
     {"Up", GARDEL_KEY_UP}, {"Down", GARDEL_KEY_DOWN}, {"Left", GARDEL_KEY_LEFT},
     {"Right", GARDEL_KEY_RIGHT}, {"Enter", GARDEL_KEY_ENTER}, {"Escape", GARDEL_KEY_ESCAPE},
     {"Backspace", GARDEL_KEY_BACKSPACE}, {"Tab", GARDEL_KEY_TAB}, {"Other", GARDEL_KEY_OTHER},
-    {"KeysEnded", GARDEL_KEY_END_OF_INPUT},
+    {"KeysEnded", GARDEL_KEY_END_OF_INPUT}, {"Home", GARDEL_KEY_HOME}, {"End", GARDEL_KEY_END},
+    {"PageUp", GARDEL_KEY_PAGE_UP}, {"PageDown", GARDEL_KEY_PAGE_DOWN}, {"Delete", GARDEL_KEY_DELETE},
 };
 
 /* The event log (spec 11.6). GARDEL_RECORD writes one, and GARDEL_REPLAY runs one through the
@@ -4458,6 +4677,10 @@ static void gardel_log_event(struct gardel_host_event* ev) {
             gardel_log_word("Key:");
             if (ev->key == GARDEL_KEY_CHAR) {
                 gardel_log_number(ev->ch);
+            } else if (ev->key == GARDEL_KEY_CTRL) {
+                char letter[2] = { (char)ev->ch, '\0' };
+                gardel_log_word("Ctrl:");
+                gardel_log_word(letter);
             } else {
                 size_t k = 0;
                 while (gardel_key_names[k].key != ev->key) k++;
@@ -4490,6 +4713,12 @@ static void gardel_log_event(struct gardel_host_event* ev) {
             gardel_log_number(ev->tag);
             gardel_log_word(":");
             gardel_log_number((uint64_t)ev->err);
+            break;
+        case GARDEL_HOST_RESIZED:
+            gardel_log_word("Resized:");
+            gardel_log_number(ev->width);
+            gardel_log_word(":");
+            gardel_log_number(ev->height);
             break;
         default: abort();
         }
@@ -4615,9 +4844,25 @@ static struct gardel_host_event gardel_next_scripted_event(void) {
             return ev;
         }
     }
-    /* Key:<name>, or Key:<scalar> for a character. */
+    if (n > 8 && memcmp(name, "Resized:", 8) == 0) {
+        size_t i = 8;
+        if (gardel_script_number(name, n, &i, &ev.width) && i < n && name[i] == ':') {
+            i++;
+            if (gardel_script_number(name, n, &i, &ev.height) && i == n) {
+                ev.kind = GARDEL_HOST_RESIZED;
+                return ev;
+            }
+        }
+    }
+    /* Key:<name>, Key:Ctrl:<letter>, or Key:<scalar> for a character. */
     if (n > 4 && memcmp(name, "Key:", 4) == 0) {
         ev.kind = GARDEL_HOST_KEY;
+        /* Not h, i, j or m: those chords are Backspace, Tab and Enter, and never arrive as Ctrl. */
+        if (n == 10 && memcmp(name + 4, "Ctrl:", 5) == 0 && name[9] >= 'a' && name[9] <= 'z' && !strchr("hijm", name[9])) {
+            ev.key = GARDEL_KEY_CTRL;
+            ev.ch = (uint32_t)name[9];
+            return ev;
+        }
         for (size_t k = 0; k < sizeof gardel_key_names / sizeof gardel_key_names[0]; k++) {
             if (strlen(gardel_key_names[k].name) == n - 4 && memcmp(name + 4, gardel_key_names[k].name, n - 4) == 0) {
                 ev.key = gardel_key_names[k].key;
@@ -4643,6 +4888,9 @@ static struct gardel_host_event gardel_next_event(void) {
         /* Before anything else: a program re-arming a zero timer cannot starve a shutdown. */
         struct gardel_host_event ev = { GARDEL_HOST_SHUTDOWN, 0, NULL, GARDEL_KEY_OTHER, 0, {NULL, 0, NULL}, 0 };
         if (gardel_host_stop_pending()) return ev;
+        /* Before input: the answer to a TerminalSize is owed from the moment it ran, and a key
+           read since must not overtake it. */
+        if (gardel_size_take(&ev)) return ev;
         if (gardel_take_answer(&ev)) return ev;
         /* Sockets and timers take turns going first, so neither can starve the other. */
         gardel_net_turn = !gardel_net_turn;
@@ -4665,6 +4913,7 @@ static struct gardel_host_event gardel_next_event(void) {
             wait = gardel_timers[first].deadline - now;
         }
         if (!gardel_net_turn && gardel_net_take(&ev)) return ev;
+        if (gardel_size_watching) wait = gardel_resize_wait_limit(wait);
         gardel_host_wait(gardel_net_wait_limit(wait));
     }
 }
@@ -4683,6 +4932,8 @@ pub(crate) fn host_command_code(variant: &str) -> Option<&'static str> {
         "Close" => Some("gardel_host_close(c->Close.conn->id);"),
         "Connect" => Some("gardel_host_connect(c->Connect.tag, c->Connect.host, c->Connect.port);"),
         "CancelTimer" => Some("gardel_host_cancel_timer(c->CancelTimer.id);"),
+        "Write" => Some("gardel_io_print(c->Write.text);"),
+        "TerminalSize" => Some("gardel_host_terminal_size();"),
         _ => None,
     }
 }
@@ -4701,6 +4952,8 @@ pub(crate) fn host_command_log(variant: &str) -> Option<&'static str> {
         "Close" => Some("gardel_log_word(\"Close:\"); gardel_log_number(c->Close.conn->id);"),
         "Connect" => Some("gardel_log_word(\"Connect:\"); gardel_log_number(c->Connect.tag); gardel_log_word(\":\"); gardel_log_text(c->Connect.host.data, c->Connect.host.len); gardel_log_word(\":\"); gardel_log_number(c->Connect.port);"),
         "CancelTimer" => Some("gardel_log_word(\"CancelTimer:\"); gardel_log_number(c->CancelTimer.id);"),
+        "Write" => Some("gardel_log_word(\"Write:\"); gardel_log_text(c->Write.text.data, c->Write.text.len);"),
+        "TerminalSize" => Some("gardel_log_word(\"TerminalSize\");"),
         _ => None,
     }
 }
@@ -4719,6 +4972,7 @@ pub(crate) fn host_event_code(variant: &str) -> Option<&'static str> {
         "Closed" => Some("case GARDEL_HOST_CLOSED: return make_EVENT_Closed(make_CONN_ID(ev.id));"),
         "Connected" => Some("case GARDEL_HOST_CONNECTED: return make_EVENT_Connected(ev.tag, make_CONN_ID(ev.id));"),
         "ConnectFailed" => Some("case GARDEL_HOST_CONNECT_FAILED: return make_EVENT_ConnectFailed(ev.tag, make_IO_ERROR_OsError(ev.err));"),
+        "Resized" => Some("case GARDEL_HOST_RESIZED: return make_EVENT_Resized(ev.width, ev.height);"),
         _ => None,
     }
 }
@@ -4737,6 +4991,12 @@ pub(crate) fn host_key_code(variant: &str) -> Option<&'static str> {
         "Tab" => Some("case GARDEL_KEY_TAB: return make_KEY_Tab();"),
         "Other" => Some("case GARDEL_KEY_OTHER: return make_KEY_Other();"),
         "KeysEnded" => Some("case GARDEL_KEY_END_OF_INPUT: return make_KEY_KeysEnded();"),
+        "Home" => Some("case GARDEL_KEY_HOME: return make_KEY_Home();"),
+        "End" => Some("case GARDEL_KEY_END: return make_KEY_End();"),
+        "PageUp" => Some("case GARDEL_KEY_PAGE_UP: return make_KEY_PageUp();"),
+        "PageDown" => Some("case GARDEL_KEY_PAGE_DOWN: return make_KEY_PageDown();"),
+        "Delete" => Some("case GARDEL_KEY_DELETE: return make_KEY_Delete();"),
+        "Ctrl" => Some("case GARDEL_KEY_CTRL: return make_KEY_Ctrl(ev.ch);"),
         _ => None,
     }
 }

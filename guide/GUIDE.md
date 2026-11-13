@@ -1350,9 +1350,9 @@ The runtime calls `init`, performs the commands it returns, waits for an event, 
 | Prelude type | Contents |
 | :--- | :--- |
 | `STEP[S]` | `Continue(next, cmds)` or `Stop(code, cmds)` |
-| `COMMAND` | `Print`, `SetTimer`, `CancelTimer`, `ReadLine`, `ReadKey`, `Listen`, `Connect`, `Send`, `Close` |
-| `EVENT` | `Tick`, `Line`, `Key`, `Accepted`, `ListenFailed`, `Connected`, `ConnectFailed`, `Received`, `SendFailed`, `Closed`, `Shutdown` |
-| `KEY` | `Char(c)`, arrows, `Enter`, `Escape`, `Backspace`, `Tab`, `Other`, `KeysEnded` |
+| `COMMAND` | `Print`, `Write`, `TerminalSize`, `SetTimer`, `CancelTimer`, `ReadLine`, `ReadKey`, `Listen`, `Connect`, `Send`, `Close` |
+| `EVENT` | `Tick`, `Line`, `Key`, `Resized`, `Accepted`, `ListenFailed`, `Connected`, `ConnectFailed`, `Received`, `SendFailed`, `Closed`, `Shutdown` |
+| `KEY` | `Char(c)`, arrows, `Enter`, `Escape`, `Backspace`, `Tab`, `Home`, `End`, `PageUp`, `PageDown`, `Delete`, `Ctrl(c)`, `Other`, `KeysEnded` |
 | `CONN_ID` | An opaque connection handle: it can be compared and stored, never forged |
 
 Rules worth knowing:
@@ -1362,6 +1362,8 @@ Rules worth knowing:
 - `Connect(tag, host, port)` is answered by `Connected(tag, conn)` or `ConnectFailed(tag, err)`, with the tag you chose. `host` is an IPv4 address or `localhost`: names are not looked up. A connection you made works like an accepted one.
 - `CancelTimer(id)` clears a pending timer, so a stale `Tick` cannot reach a later use of the id.
 - A command never blocks the loop. One that can fail reports it as a later event.
+- To draw a screen, `Write` text with no newline, VT sequences included: a step's output goes out together, and the bytes are the same on Linux and Windows. `TerminalSize` answers with `Resized(width, height)`, and every later resize arrives the same way. Output that is not a terminal is 80 by 24.
+- `Ctrl(c)` is Ctrl with a letter, given lowercase. Ctrl-H, Ctrl-I, Ctrl-J and Ctrl-M are `Backspace`, `Tab` and `Enter`, and Ctrl-C is always a `Shutdown`, so a program in raw mode can still be stopped and leaves the terminal as it found it.
 - The compiler adds `e.is_shutdown implies Result.is_stop` to every `step`, tagged `shutdown_must_stop`, and a clause you write cannot replace it.
 
 ### The State Proves Itself
@@ -1424,7 +1426,7 @@ A reactive program is a pure function of its arguments and its events, so a run 
 
 | Variable | Effect |
 | :--- | :--- |
-| `GARDEL_EVENTS=<script>` | Run from a script, such as `Tick:1 Key:Up Line:hello%20there Shutdown`. The end of the script is a `Shutdown`. |
+| `GARDEL_EVENTS=<script>` | Run from a script, such as `Resized:80:24 Tick:1 Key:Up Key:Ctrl:s Line:hello%20there Shutdown`. The end of the script is a `Shutdown`. |
 | `GARDEL_RECORD=<file>` | Write a log of the run |
 | `GARDEL_REPLAY=<file>` | Run from a log, with no timers, reads or sockets |
 | `GARDEL_LISTEN_ADDR=<ip>` | Bind `Listen` to an address other than loopback |
@@ -1999,7 +2001,7 @@ There are no import statements. Before anything is verified, `gardelc` resolves 
 | `E0110: unknown_variable` | A name that is not a parameter, local, field or routine |
 | `E0111: wrong_argument_count` | A call with the wrong number of arguments |
 | `E0105: ambiguous_module_reference` | A bare module, type or concept that two dependencies, or a dependency and the prelude, provide. The message gives the qualified spellings |
-| `E0112: ambiguous_constructor` | A constructor declared by two other modules, or provided by two dependencies, with no known type to choose. The message gives the qualified spellings. A module's own constructor always wins. |
+| `E0112: ambiguous_constructor` | A constructor declared by two other modules, or provided by two dependencies, with no known type to choose. The message gives the qualified spellings. A module's own constructor always wins, and a dependency's wins over the prelude's, so the prelude can grow without breaking your code: with `ghttp`, a bare `Delete` is `HTTP_METHOD.Delete`, and `GARDEL::KEY.Delete` is the key. |
 | `E0113: hidden_member` | A member another module does not export: a private routine, a hidden field, or a constructor of a hidden representation, which can be neither built nor matched |
 | `E0114: export_outside_package` | An export list naming a module outside the package. `{EQ}`, naming a concept, stays allowed |
 | `E0115: reserved_name` | A declared name of the form `PK<n>_...`, which is how a dependency's names are held internally |

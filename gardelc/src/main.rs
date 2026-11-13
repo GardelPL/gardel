@@ -24278,6 +24278,123 @@ int main(void) {
         }
     }
 
+    /// F.9: writes a VT sequence with no newline, asks for the size, and names each key.
+    const F9_KEYS: &str = "reactive program TERM_KEYS
+
+feature {ANY}
+
+  init(args: SEQ[STRING]): STEP[NAT]
+    do
+      Continue(0, LIST.empty.prepend(ReadKey).prepend(TerminalSize).prepend(Write(\"\\u{1b}[?25l\")))
+    end
+
+  name(k: KEY): STRING
+    do
+      match k
+        case Char(c) then if c = '\\u{e9}' then \"e-acute\" else \"char\" end
+        case Up then \"up\"
+        case Enter then \"enter\"
+        case Escape then \"esc\"
+        case Backspace then \"bs\"
+        case Tab then \"tab\"
+        case Home then \"home\"
+        case End then \"end\"
+        case PageUp then \"pgup\"
+        case PageDown then \"pgdn\"
+        case Delete then \"del\"
+        case Ctrl(c) then if c = 'a' then \"ctrl-a\" else if c = 'z' then \"ctrl-z\" else \"ctrl\" end end
+        case _ then \"other\"
+      end
+    end
+
+  step(s: NAT, e: EVENT): STEP[NAT]
+    do
+      match e
+        case Resized(w, h) then
+          Continue(s, LIST.empty.prepend(Write(\" \")).prepend(Write(NUMBER_TEXT.nat_to_text(h))).prepend(Write(\"x\")).prepend(Write(NUMBER_TEXT.nat_to_text(w))))
+        case Key(k) then
+          match k
+            case KeysEnded then Stop(0, LIST.empty.prepend(Print(\"done\")).prepend(Write(\"\\u{1b}[?25h\")))
+            case _ then Continue(s, LIST.empty.prepend(ReadKey).prepend(Write(\" \")).prepend(Write(name(k))))
+          end
+        case Shutdown then Stop(1, LIST.empty.prepend(Write(\"\\u{1b}[?25h\")))
+        case _ then Continue(s, LIST.empty)
+      end
+    end
+
+end
+";
+
+    /// Runs with raw bytes on stdout, as they were written: (exit code, stdout, stderr).
+    fn f9_run(exe: &std::path::Path, envs: &[(&str, &std::ffi::OsStr)], input: &[u8]) -> (i32, Vec<u8>, String) {
+        use std::io::Write;
+        let mut cmd = Command::new(exe);
+        for name in ["GARDEL_EVENTS", "GARDEL_RECORD", "GARDEL_REPLAY", "GARDEL_LISTEN_ADDR"] {
+            cmd.env_remove(name);
+        }
+        let mut child = cmd
+            .envs(envs.iter().copied())
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let _ = child.stdin.take().unwrap().write_all(input);
+        let o = child.wait_with_output().unwrap();
+        (o.status.code().unwrap_or(-1), o.stdout, String::from_utf8_lossy(&o.stderr).into_owned())
+    }
+
+    /// The acceptance of F.9: a scripted run writes exactly these bytes, with no `\r` added on
+    /// Windows, which is what a POSIX build writes for the same script.
+    #[test]
+    fn test_f9_a_scripted_terminal_run_writes_exact_bytes() {
+        let c = d4_c(&[("term_keys.gdl", F9_KEYS)]);
+        let Some((dir, exe)) = c3_compile(&c, "f9keys") else { return };
+        let script = "Resized:120:40 Key:Home Key:End Key:PageUp Key:PageDown Key:Delete Key:Ctrl:a Key:Ctrl:z Key:233 Key:Up Resized:80:24 Key:KeysEnded";
+        let run = f9_run(&exe, &[("GARDEL_EVENTS", script.as_ref())], b"");
+        assert_eq!(run.0, 0, "{}", run.2);
+        let want = b"\x1b[?25l120x40 home end pgup pgdn del ctrl-a ctrl-z e-acute up 80x24 \x1b[?25hdone\n";
+        assert_eq!(String::from_utf8_lossy(&run.1), String::from_utf8_lossy(want));
+        assert_eq!(run.1, want);
+
+        // Every new command and event survives the log, and a replay checks it.
+        let log = dir.join("run.log");
+        let live = d8_run(&exe, &[("GARDEL_EVENTS", script.as_ref()), ("GARDEL_RECORD", log.as_os_str())], b"", &[]);
+        let text = fs::read_to_string(&log).unwrap();
+        for line in ["command Write:%1B%5B%3F25l\n", "command TerminalSize\n", "event Resized:120:40\n", "event Key:Ctrl:a\n", "event Key:PageDown\n", "command Write:pgdn\n"] {
+            assert!(text.contains(line), "{line} in\n{text}");
+        }
+        assert_eq!(d8_script(&text), script);
+        d8_check_replay(&exe, &log, &live);
+
+        // Only what a terminal can send: Ctrl-H, Ctrl-I, Ctrl-J and Ctrl-M are other keys.
+        for bad in ["Key:Ctrl:h", "Key:Ctrl:m", "Key:Ctrl:A", "Key:Ctrl:", "Key:Ctrl:ab", "Resized:1", "Resized:1:", "Resized:1:x", "Resized::2"] {
+            let r = f9_run(&exe, &[("GARDEL_EVENTS", bad.as_ref())], b"");
+            assert_eq!(r.0, 2, "{bad}: {}", r.2);
+            assert!(r.2.contains("unknown event"), "{bad}: {}", r.2);
+        }
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Keys from bytes, as a terminal sends them, and the same on both platforms: input that is
+    /// not a console is decoded as on POSIX.
+    #[test]
+    fn test_f9_keys_are_decoded_from_terminal_bytes() {
+        let c = d4_c(&[("term_keys.gdl", F9_KEYS)]);
+        let Some((dir, exe)) = c3_compile(&c, "f9bytes") else { return };
+        let log = dir.join("run.log");
+        let input: &[u8] = b"\x1b[H\x1b[F\x1bOH\x1bOF\x1b[1~\x1b[4~\x1b[7~\x1b[8~\x1b[5~\x1b[6~\x1b[3~\x1b[2~\x1b[1;5A\x1b[3;2~\x01\x1a\x13\x11\x1c\x08\x7f\t\r\n\xc3\xa9";
+        let live = d8_run(&exe, &[("GARDEL_RECORD", log.as_os_str())], input, &[]);
+        assert_eq!(live.0, 0, "{}", live.2);
+        let keys = "home end home end home end home end pgup pgdn del other up del ctrl-a ctrl-z ctrl ctrl other bs bs tab enter enter e-acute ";
+        assert_eq!(live.1, format!("\u{1b}[?25l80x24 {keys}\u{1b}[?25hdone\n"));
+        let text = fs::read_to_string(&log).unwrap();
+        assert!(text.contains("event Resized:80:24\n"), "output that is not a terminal is 80 by 24:\n{text}");
+        assert!(text.contains("event Key:Ctrl:s\n") && text.contains("event Key:Ctrl:q\n"), "{text}");
+        d8_check_replay(&exe, &log, &live);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
     const D5_BEAT_STATE: &str = include_str!("../tests/reactive/beat_state.gdl");
     const D5_BEAT: &str = include_str!("../tests/reactive/beat.gdl");
 

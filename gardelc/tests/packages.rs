@@ -1593,7 +1593,8 @@ representation {ANY}
 end
 ";
 
-/// The Roadmap's acceptance: a type known for certain breaks a tie, and nothing else does.
+/// The Roadmap's acceptance: a type known for certain breaks a tie. With no type, a dependency's
+/// constructor is nearer than the prelude's.
 #[test]
 fn a_known_type_breaks_a_constructor_tie() {
     let world = World::new("tie", &[]);
@@ -1699,13 +1700,14 @@ end
     world.package("root", &dep, &[("tie.gdl", known)]);
     assert_ok(&world.run("root", &["--strict"]));
 
-    let unknown = "functions NO_TYPE\n\nfeature {ANY}\n\n  v: U64\n    do\n      let x = Error(1)\n      0\n    end\n\nend\n";
+    // With no type, the dependency's constructor is nearer than the prelude's: the prelude can
+    // grow without making a name a program uses ambiguous. Only `OUTCOME` has `Fine`.
+    let unknown = "functions NO_TYPE\n\nfeature {ANY}\n\n  v: U64\n    do\n      let x = Error(1)\n      match x\n        case Fine then 0\n        case Error(c) then c\n      end\n    ensure\n      dep: Result = 1\n    end\n\nend\n";
     world.package("root", &dep, &[("no_type.gdl", unknown)]);
-    let out = world.run("root", &[]);
-    assert_refused(&out, "E0112: ambiguous_constructor");
-    assert!(all(&out).contains("`GARDEL::RESULT.Error`") && all(&out).contains("`DEP::OUTCOME.Error`"), "{}", all(&out));
+    assert_ok(&world.run("root", &["--strict"]));
 
-    // The type of a `match` is its scrutinee's, and says nothing of a nested pattern's.
+    // The type of a `match` is its scrutinee's, and says nothing of a nested pattern's, so this
+    // `Error` is the dependency's, and the pattern does not fit.
     let nested = "functions NESTED
 
 feature {ANY}
@@ -1721,7 +1723,11 @@ feature {ANY}
 end
 ";
     world.package("root", &dep, &[("nested.gdl", nested)]);
-    assert_refused(&world.run("root", &[]), "E0112: ambiguous_constructor");
+    // Refused, though only when the verifier translates it: a constructor of the wrong type
+    // nested in another is not caught before (a known gap, not one of this rule).
+    let out = world.run("root", &[]);
+    assert!(!out.status.success(), "{}", all(&out));
+    assert!(all(&out).contains("OUTCOME"), "{}", all(&out));
 }
 
 /// A tie-break only breaks a tie: a module's own constructor wins even against the type, so

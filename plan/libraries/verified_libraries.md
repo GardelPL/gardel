@@ -1,7 +1,7 @@
 # Phase F: Verified Libraries and Applications
 
 **Date:** November 6, 2026
-**Status:** In progress. Tasks F.0 to F.8, F.12, F.13 and F.14 are completed (F.7 on Windows only), and the decisions below are taken.
+**Status:** In progress. Tasks F.0 to F.9, F.12, F.13 and F.14 are completed (F.7 on Windows only), and the decisions below are taken.
 **Roadmap entry:** [Phase F in Roadmap.md](../Roadmap.md#phase-f-verified-libraries-and-applications)
 **Probed at:** commit `1349cb6`
 
@@ -42,7 +42,7 @@ Small programs shaped like the plan were run through the compiler and the built 
 | 8 | **A record with a function field verifies but does not build.** The C backend stops with `equality on function type`. A closure passed as a parameter works, which is what `hello_api` does. | A route cannot hold its handler today, so `ghttp` uses numeric ids. Task F.1. |
 | 9 | **`BYTES` has no concat, slice or search,** only `at`, `length`, `to_list` and `equals`. `STRING` has no find, split, trim or slice. Nothing in the stdlib turns a number into text or back. | Task F.2 is required by every later task. |
 | 10 | **These core proofs work today.** A `find` over `character_at` with an exact postcondition verified 0/0. Digits least significant first, with `value_of(digits(n)) = n`, verified 0/0. | Tasks F.2 and F.4 are feasible, and the order of digits is settled: most significant first needs an extra lemma. |
-| 11 | **`Print` always adds a newline** (`gardel_io_print_line`). The host does not turn on VT mode on Windows, and has no terminal size. `KEY` has no Home, End, Page keys, Delete or Ctrl chords. | `gtui` cannot draw a screen yet. Task F.9. |
+| 11 | **`Print` always adds a newline** (`gardel_io_print_line`). The host does not turn on VT mode on Windows, and has no terminal size. `KEY` has no Home, End, Page keys, Delete or Ctrl chords. | `gtui` cannot draw a screen yet. Task F.9, done. |
 | 12 | **The host has no outgoing connection, file or process command.** `COMMAND` has `Print`, `SetTimer`, `ReadLine`, `ReadKey`, `Listen`, `Send` and `Close`. Timers cannot be cancelled. | Tasks F.7 and F.11. Each new command also needs the scripted source and the event log (D.8). |
 
 Each finding except 7 is a behaviour seen in a run. The causes given for 5 and 6 are not yet confirmed, and F.1 confirms them.
@@ -663,12 +663,25 @@ Needs decisions 7 and 8.
 
 #### Task F.9: Terminal Host
 
-- [ ] `Write(text)`, with no newline, and a flush at the end of a step.
-- [ ] VT mode on Windows, restored on exit, like raw mode today.
-- [ ] `TerminalSize`, answered by `Resized(width, height)`, which also arrives on a resize.
-- [ ] `KEY` gains Home, End, PageUp, PageDown, Delete and Ctrl chords.
-- [ ] Scripted and log forms.
-- Acceptance: the same scripted run gives the same bytes on both platforms, and the terminal is restored after a Ctrl-C.
+**Status:** ✅ Completed (2026-11-12).
+
+- [x] `Write(text)`, with no newline, and a flush at the end of a step. Standard output is fully buffered (64 KiB) and flushed after each list of commands, so a frame goes out together. On Windows it is binary, so no `\r` is added.
+- [x] VT mode on Windows, restored on exit, like raw mode today. VT processing and the UTF-8 code page are set on a console at start, and restored through the same path as raw mode: after `Stop`, after a `Shutdown`, and through `exit`.
+- [x] `TerminalSize`, answered by `Resized(width, height)`, which also arrives on a resize. The answer comes before input that is waiting. On POSIX a resize is a `SIGWINCH`, written to a third wake pipe. On Windows the console reports a resize only to a read of its input, which happens only for a `ReadKey`, so the loop looks at the size every 100 ms once a `TerminalSize` was asked. Output that is not a terminal is 80 by 24.
+- [x] `KEY` gains Home, End, PageUp, PageDown, Delete and Ctrl chords. `Ctrl(c)` holds the lowercase letter. Ctrl-H, Ctrl-I, Ctrl-J and Ctrl-M send the bytes of `Backspace`, `Tab` and `Enter`, so on both platforms they are those keys. A modifier, as in `ESC [ 1 ; 5 C`, is dropped, as Windows reports the key alone.
+- [x] Scripted and log forms: `Write:<text>`, `TerminalSize`, `Resized:<w>:<h>`, `Key:Home` and the like, and `Key:Ctrl:<letter>`. A script cannot give `Ctrl` for h, i, j or m, which no terminal sends.
+- Acceptance: met. The same C, built on Windows and on Linux (Debian bookworm, gcc, in Docker), writes the same bytes for the same script, and for the same bytes on standard input, and the two event logs are byte for byte the same. In a real pty on Linux (`script`), Ctrl-Z and Ctrl-\ arrive as keys, Ctrl-C ends the run through `Shutdown`, and `stty -g` after the run equals `stty -g` before; with the restore removed, it differs.
+
+What was done beyond the list:
+
+- **Raw mode on POSIX makes Ctrl-C the only signal.** It also turns off the suspend and quit characters (`VSUSP`, `VQUIT`, `VDSUSP`), `IXON` and `IEXTEN`. Before, Ctrl-Z stopped a program with the terminal raw, Ctrl-\ killed it with no restore, and Ctrl-S froze its output. They are now keys, as on Windows.
+- **Input that is not a console is decoded the same way on Windows as on POSIX.** `gardel_byte_soon` was always false on Windows, so `ESC [ H` from a pipe was Escape, `[` and `H`. It now waits up to 50 ms on a pipe, as `poll` does on POSIX, and a file has its bytes at once.
+- **A dependency's constructor resolves before the prelude's** (spec §4.1). Adding `KEY.Delete` made a bare `Delete` ambiguous with `ghttp`'s `HTTP_METHOD.Delete` in `grest`, `todo_api` and both test packages (`E0112`). The prelude now comes last for constructors, so it can grow without breaking a program, which F.11 needs too. A type known for certain still chooses among all of them, the prelude's included. Module names keep their one level: bare `COMMAND` can only be the prelude's.
+- **Found, not fixed: a constructor of the wrong type nested in another is refused only by the verifier.** `Some(Fine)` where `OPTION[RESULT[U64, U64]]` is expected, or a pattern `Some(Error(e))` whose `Error` is another module's, is `E0199` (`verifier_translation_failed`), which blames `gardelc`, rather than a type error at the constructor. This holds within one package too, so it predates the new rule, which only makes it easier to meet. It belongs with the type checking of constructor arguments.
+
+Tests: `test_f9_a_scripted_terminal_run_writes_exact_bytes` compares stdout byte for byte, round-trips every new form through a log and a replay, and refuses nine malformed tokens. `test_f9_keys_are_decoded_from_terminal_bytes` gives 25 keys as raw bytes, the new ones and the Ctrl mapping included, and replays the run. `a_known_type_breaks_a_constructor_tie` (`tests/packages.rs`) now pins the prelude coming last. Ten mutations, each run on a private copy after a baseline that passes, all turn a test red: `Write` adding a newline, stdout left in text mode, PageUp and PageDown swapped, no Ctrl chords, a script taking Ctrl-H, the log dropping a height, a pipe given no time for a sequence, Ctrl-Z read as Escape, no fallback size, and the prelude put back on the dependencies' level.
+
+Not done: the Windows console's own restore after Ctrl-C was not seen in a real console, as no console is available here. It runs through the same code as raw mode, which `Stop` and `Shutdown` take; the Linux pty run checks that path.
 
 #### Task F.10: The `gtui` Package
 

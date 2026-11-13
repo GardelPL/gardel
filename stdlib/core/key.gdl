@@ -1,5 +1,7 @@
 -- One key press, answering `ReadKey` (spec §11.6). A sum type, so that a program handles keys
 -- by name and `match` checks it. Malformed input is `Other`, so `Char` is always a valid CHAR.
+-- `Ctrl(c)` is Ctrl with a letter, given as the lowercase letter, apart from the chords that are
+-- keys of their own: Ctrl-H is Backspace, Ctrl-I Tab, Ctrl-J and Ctrl-M Enter.
 module KEY
 
 representation {ANY}
@@ -12,6 +14,12 @@ representation {ANY}
   | Escape
   | Backspace
   | Tab
+  | Home
+  | End
+  | PageUp
+  | PageDown
+  | Delete
+  | Ctrl(c: CHAR)
   | Other
   | KeysEnded
 

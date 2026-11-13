@@ -10,5 +10,7 @@ representation {ANY}
   | Close(conn: CONN_ID)
   | Connect(tag: NAT, host: STRING, port: NAT)
   | CancelTimer(id: NAT)
+  | Write(text: STRING)
+  | TerminalSize
 
 end

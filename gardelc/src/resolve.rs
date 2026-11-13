@@ -15,7 +15,9 @@
 //! Each package is resolved against what its own manifest lists, nearest first: the package's
 //! own names, then the prelude and its direct dependencies on one level. Several providers
 //! on that level are an error, never a choice, unless a type known for certain picks one of
-//! several constructors (decision 9). A transitive dependency provides no name.
+//! several constructors (decision 9). A constructor is the exception to the one level: a
+//! dependency's comes before the prelude's, so that the prelude can grow without breaking a
+//! program. A transitive dependency provides no name.
 //!
 //! This is the only pass that sees `ALIAS::NAME` and `MODULE.Ctor`: it runs on every build,
 //! and what it leaves behind is a plain internal name. The internal name can be read back, so
@@ -390,15 +392,17 @@ impl<'a> Resolver<'a> {
         }
     }
 
-    /// The modules of this package and the sources of others that declare `name`.
-    fn outside_ctors(&self, name: &str) -> Vec<Candidate> {
-        let mut found: Vec<Candidate> = Vec::new();
+    /// The constructors named `name` that other packages and the prelude declare, and whether
+    /// each is the prelude's.
+    fn outside_ctors(&self, name: &str) -> Vec<(Candidate, bool)> {
+        let mut found: Vec<(Candidate, bool)> = Vec::new();
         for s in self.sources {
             for owner in s.naming.provided.ctors.get(name).into_iter().flatten() {
                 let internal = s.naming.ctor(owner, name);
-                if !found.iter().any(|c| c.internal == internal) {
+                if !found.iter().any(|(c, _)| c.internal == internal) {
                     let spelling = format!("{}::{owner}.{name}", s.alias);
-                    found.push(Candidate { internal, owner: s.naming.top(owner), spelling });
+                    let prelude = s.naming.package.is_none();
+                    found.push((Candidate { internal, owner: s.naming.top(owner), spelling }, prelude));
                 }
             }
         }
@@ -424,7 +428,10 @@ impl<'a> Resolver<'a> {
         name.to_string()
     }
 
-    /// Nearest first: the module's own, then its package's, then the rest on one level.
+    /// Nearest first: the module's own, then its package's, then its dependencies', then the
+    /// prelude's. The prelude comes last so that a constructor added to it cannot make a name
+    /// that a program already uses ambiguous. A type known for certain still picks among all of
+    /// them, since any other choice would not type-check.
     fn ctor(&mut self, name: &str) -> String {
         let own = self.own;
         if let Some(owners) = own.provided.ctors.get(name) {
@@ -442,12 +449,19 @@ impl<'a> Resolver<'a> {
                 .collect();
             return self.choose(name, candidates);
         }
-        let candidates = self.outside_ctors(name);
-        if candidates.is_empty() {
+        let mut found = self.outside_ctors(name);
+        if found.is_empty() {
             self.hint = None;
             return name.to_string();
         }
-        self.choose(name, candidates)
+        if let Some((c, _)) = found.iter().find(|(c, _)| self.hint.as_deref() == Some(c.owner.as_str())) {
+            self.hint = None;
+            return c.internal.clone();
+        }
+        if found.iter().any(|(_, prelude)| !prelude) {
+            found.retain(|(_, prelude)| !prelude);
+        }
+        self.choose(name, found.into_iter().map(|(c, _)| c).collect())
     }
 
     /// The package and bare name of the module `module` spells here, reporting what `top`
