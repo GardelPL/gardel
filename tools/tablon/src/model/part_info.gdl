@@ -1,0 +1,46 @@
+-- One part of a module's short form, as `--inspect` gives it: a creator, a feature, a law or
+-- an invariant clause, the line shown for it, and the line of the source it is declared on,
+-- from 1, or 0 when none is known.
+module PART_INFO
+
+representation {NONE}
+  part_section: STRING
+  part_name: STRING
+  shown: STRING
+  spot: NAT
+
+create {ANY}
+
+  make(section: STRING, name: STRING, text: STRING, line: NAT): PART_INFO
+    do
+      { part_section = section, part_name = name, shown = text, spot = line }
+    ensure
+      kept_section: Result.section.equals(section)
+      kept_line: Result.line = line
+    end
+
+feature {ANY}
+
+  -- `create`, `feature`, `law` or `invariant`.
+  section: STRING
+    do
+      Current.part_section
+    end
+
+  name: STRING
+    do
+      Current.part_name
+    end
+
+  -- A feature's or a law's signature, or an invariant clause as `tag: expr`.
+  text: STRING
+    do
+      Current.shown
+    end
+
+  line: NAT
+    do
+      Current.spot
+    end
+
+end

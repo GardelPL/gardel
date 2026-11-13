@@ -1,0 +1,27 @@
+-- A command as `PALETTE` lists it: its name, typed after `/`, and what it does.
+module PALETTE_ENTRY
+
+representation {NONE}
+  word: STRING
+  about: STRING
+
+create {ANY}
+
+  make(name: STRING, help: STRING): PALETTE_ENTRY
+    do
+      { word = name, about = help }
+    end
+
+feature {ANY}
+
+  name: STRING
+    do
+      Current.word
+    end
+
+  help: STRING
+    do
+      Current.about
+    end
+
+end

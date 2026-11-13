@@ -1,6 +1,8 @@
 -- Lines of text shown from line `top` on, scrolled by keys. `rows` is how many lines the
 -- view shows, which the keys scroll by a page of, and which `update` does not know: the
--- application passes the height of the rectangle it draws the view in.
+-- application passes the height of the rectangle it draws the view in. `draw` shows the
+-- lines alone; `draw_code` shows them as source: with line numbers, one line marked, and each
+-- line's `SPAN`s in their styles.
 module TEXT_VIEW
 
 representation {NONE}
@@ -45,6 +47,7 @@ feature {ANY}
       if Current.body.length > rows then Current.body.length - rows else 0 end
     ensure
       in_range: Result <= Current.line_count
+      def: Result = (if Current.line_count > rows then Current.line_count - rows else 0 end)
     end
 
   -- The same lines from line `t`, or from the last page when `t` is past it.
@@ -54,6 +57,20 @@ feature {ANY}
       { Current with topmost = if t <= last then t else last end }
     ensure
       top_set: Result.top <= Current.last_top(rows)
+      top_def: Result.top = (if t <= Current.last_top(rows) then t else Current.last_top(rows) end)
+      same_lines: Result.line_count = Current.line_count
+    end
+
+  -- Scrolled as little as shows line `n`, counted from 0, with `rows` lines shown.
+  showing(n: NAT, rows: NAT): TEXT_VIEW
+    do
+      let t = if n < Current.topmost then n
+        else if rows > 0 and n - Current.topmost >= rows then n - rows + 1
+        else Current.topmost
+        end end
+      Current.scrolled_to(t, rows)
+    ensure
+      shown: (n < Current.line_count and rows > 0) implies (Result.top <= n and n < Result.top + rows)
       same_lines: Result.line_count = Current.line_count
     end
 
@@ -99,7 +116,88 @@ feature {ANY}
       same_height: Result.height = s.height
     end
 
+  -- The view drawn in `r` as source. Each line's number, from 1, is in `gutter`, right-aligned
+  -- in a column as wide as the last line's number and a space. Its text is in `st`, with the
+  -- spans that `spans` gives for it, from its index and its text, drawn over it in their own
+  -- styles. The line `marked`, when it is shown, is drawn across its row in `mark`, and its
+  -- spans on the mark's background. Rows below the last line are left as they are.
+  draw_code(s: SCREEN, r: RECT, st: STYLE, gutter: STYLE, marked: OPTION[NAT], mark: STYLE,
+            spans: (i: NAT, line: STRING) -> LIST[SPAN]): SCREEN
+    do
+      let d = NUMBER_TEXT.nat_to_text(Current.body.length).byte_length
+      let digits = if d <= 20 then d else 20 end
+      let numbers = r.take_left(digits + 1)
+      let text = r.drop_left(digits + 1)
+      TEXT_VIEW.draw_code_lines(s, numbers, text, LIST_CUT.drop(Current.body, Current.topmost),
+        Current.topmost, r.y, digits, st, gutter, marked, mark, spans)
+    ensure
+      same_width: Result.width = s.width
+      same_height: Result.height = s.height
+    end
+
 create {ANY}
+
+  -- `lines`, the first of which is line `i`, drawn as source from row `y` on: numbers in
+  -- `numbers`, `digits` wide, and text in `text`.
+  draw_code_lines(s: SCREEN, numbers: RECT, text: RECT, lines: LIST[STRING], i: NAT, y: NAT,
+                  digits: NAT, st: STYLE, gutter: STYLE, marked: OPTION[NAT], mark: STYLE,
+                  spans: (i: NAT, line: STRING) -> LIST[SPAN]): SCREEN
+    require
+      narrow: digits <= 20
+    variant
+      lines.length
+    do
+      if lines.length = 0 or y >= text.bottom or y >= numbers.bottom or i = 18446744073709551615 then
+        s
+      else
+        let hit = match marked case Some(m) then m = i case None then False end
+        let line = lines.head
+        let filled = if hit then
+            s.fill(RECT.make(numbers.x, y, numbers.width, 1), ' ', mark).fill(RECT.make(text.x, y, text.width, 1), ' ', mark)
+          else
+            s
+          end
+        let label = NUMBER_TEXT.nat_to_text(i + 1)
+        let n = label.byte_length
+        let lx = if n <= digits then numbers.x + (digits - n) else numbers.x end
+        let numbered = filled.text(numbers, lx, y, label, if hit then mark else gutter end)
+        let written = numbered.text(text, text.x, y, line, if hit then mark else st end)
+        let styled = TEXT_VIEW.draw_spans(written, text, y, GLYPHS.of_text(line), spans(i, line), hit, mark)
+        TEXT_VIEW.draw_code_lines(styled, numbers, text, lines.tail, i + 1, y + 1, digits, st, gutter, marked, mark, spans)
+      end
+    ensure
+      same_width: Result.width = s.width
+      same_height: Result.height = s.height
+    end
+
+  -- `sps` drawn over the characters `chars` of the line on row `y` of `area`.
+  draw_spans(s: SCREEN, area: RECT, y: NAT, chars: LIST[CHAR], sps: LIST[SPAN], marked: BOOL, mark: STYLE): SCREEN
+    variant
+      sps.length
+    do
+      if sps.length = 0 then
+        s
+      else
+        let sp = sps.head
+        let look = if marked then TEXT_VIEW.on_mark(sp.style, mark) else sp.style end
+        let drawn = if sp.start <= 65535 then
+            s.glyphs(area, area.x + sp.start, y, LIST_CUT.take(LIST_CUT.drop(chars, sp.start), sp.length), look)
+          else
+            s
+          end
+        TEXT_VIEW.draw_spans(drawn, area, y, chars, sps.tail, marked, mark)
+      end
+    ensure
+      same_width: Result.width = s.width
+      same_height: Result.height = s.height
+    end
+
+  -- `st` on the background of `mark`, and reversed when `mark` is.
+  on_mark(st: STYLE, mark: STYLE): STYLE
+    do
+      let b = st.bg(mark.background)
+      if mark.is_reversed then b.reversed else b end
+    end
 
   -- `lines` drawn in `r` from row `y` on, one per row, until either runs out.
   draw_lines(s: SCREEN, r: RECT, lines: LIST[STRING], y: NAT, st: STYLE): SCREEN

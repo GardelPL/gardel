@@ -1032,46 +1032,133 @@ pub fn tokenize_with_lines(src: &str) -> Result<(Vec<Token>, Vec<usize>), LexErr
     Ok((tokens, lines))
 }
 
+/// The Boogie function that holds one clause of a module's invariant, with the ranges of its
+/// fields: the clauses' functions together are `M_Invariant`.
+pub fn invariant_clause_fn(module: &str, tag: &str) -> String {
+    format!("{module}_Invariant__{tag}")
+}
+
+/// The code of a source line: the line up to a `--` comment that is not inside a string.
+pub fn code_of_line(line: &str) -> &str {
+    let bytes = line.as_bytes();
+    let mut in_string = false;
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'\\' if in_string => i += 1,
+            b'"' => in_string = !in_string,
+            b'-' if !in_string && bytes.get(i + 1) == Some(&b'-') => return &line[..i],
+            _ => {}
+        }
+        i += 1;
+    }
+    line
+}
+
+fn indent_of(line: &str) -> usize {
+    line.len() - line.trim_start().len()
+}
+
+/// The lines of the routine `name`, as a range of 0-based line indexes from its header to the
+/// last line indented deeper than it. A header starts its line with the name and then `(`, `:`
+/// or `[`; of the lines that do, the least indented one with lines under it is taken, so a
+/// contract tag or a call of the same name inside a routine is not.
+pub fn routine_lines(lines: &[&str], name: &str) -> Option<std::ops::Range<usize>> {
+    if name.is_empty() {
+        return None;
+    }
+    let extent = |start: usize| {
+        let indent = indent_of(lines[start]);
+        let mut end = start + 1;
+        while end < lines.len() {
+            let code = code_of_line(lines[end]);
+            if !code.trim().is_empty() && indent_of(code) <= indent {
+                break;
+            }
+            end += 1;
+        }
+        start..end
+    };
+    let mut best: Option<(usize, bool, std::ops::Range<usize>)> = None;
+    for (idx, line) in lines.iter().enumerate() {
+        let code = code_of_line(line);
+        let Some(rest) = code.trim_start().strip_prefix(name) else {
+            continue;
+        };
+        if !matches!(rest.trim_start().chars().next(), Some('(' | ':' | '[')) {
+            continue;
+        }
+        let range = extent(idx);
+        let has_body = range.len() > 1;
+        let indent = indent_of(code);
+        let better = match &best {
+            None => true,
+            Some((bi, bb, _)) => (has_body && !bb) || (has_body == *bb && indent < *bi),
+        };
+        if better {
+            best = Some((indent, has_body, range));
+        }
+    }
+    best.map(|(_, _, r)| r)
+}
+
+/// The first place in `range` where `needle` is in a line's code, never in its comment.
+fn find_in_code(lines: &[&str], range: std::ops::Range<usize>, needle: &str) -> Option<(usize, usize)> {
+    range
+        .into_iter()
+        .find_map(|idx| code_of_line(lines[idx]).find(needle).map(|col0| (idx, col0)))
+}
+
 /// Locates a 1-based line and column `Span` for a contract tag, routine, or expression snippet in `src`.
+///
+/// The routine's own lines are searched first, from its header on, then the whole file; a
+/// comment is never a match. An obligation whose tag is in no line, such as an overflow, is
+/// placed at the routine's header.
 pub fn locate_span(src: &str, file: &str, primary_needle: &str, fallback_routine: &str) -> Span {
     let primary_needle = resolve::source_spelling(primary_needle);
     let lines: Vec<&str> = src.lines().collect();
+    let whole = 0..lines.len();
+    let routine = routine_lines(&lines, fallback_routine);
+    let tagged_span = |(idx, col0): (usize, usize)| Span {
+        file: file.to_string(),
+        line: idx + 1,
+        column: col0 + 1,
+        end_line: idx + 1,
+        end_column: code_of_line(lines[idx]).trim_end().len().max(col0 + 1),
+    };
+    let word_span = |(idx, col0): (usize, usize), len: usize| Span {
+        file: file.to_string(),
+        line: idx + 1,
+        column: col0 + 1,
+        end_line: idx + 1,
+        end_column: col0 + len,
+    };
     if !primary_needle.is_empty() {
         let tagged = format!("{primary_needle}:");
-        for (idx, line) in lines.iter().enumerate() {
-            if let Some(col0) = line.find(&tagged) {
-                return Span {
-                    file: file.to_string(),
-                    line: idx + 1,
-                    column: col0 + 1,
-                    end_line: idx + 1,
-                    end_column: line.len().max(col0 + 1),
-                };
+        if let Some(r) = &routine {
+            if let Some(at) = find_in_code(&lines, r.clone(), &tagged) {
+                return tagged_span(at);
+            }
+            if let Some(at) = find_in_code(&lines, r.clone(), primary_needle) {
+                return word_span(at, primary_needle.len());
             }
         }
-        for (idx, line) in lines.iter().enumerate() {
-            if let Some(col0) = line.find(primary_needle) {
-                return Span {
-                    file: file.to_string(),
-                    line: idx + 1,
-                    column: col0 + 1,
-                    end_line: idx + 1,
-                    end_column: col0 + primary_needle.len(),
-                };
-            }
+        if let Some(at) = find_in_code(&lines, whole.clone(), &tagged) {
+            return tagged_span(at);
+        }
+    }
+    if let Some(r) = &routine {
+        let col0 = indent_of(lines[r.start]);
+        return word_span((r.start, col0), fallback_routine.len());
+    }
+    if !primary_needle.is_empty() {
+        if let Some(at) = find_in_code(&lines, whole.clone(), primary_needle) {
+            return word_span(at, primary_needle.len());
         }
     }
     if !fallback_routine.is_empty() {
-        for (idx, line) in lines.iter().enumerate() {
-            if let Some(col0) = line.find(fallback_routine) {
-                return Span {
-                    file: file.to_string(),
-                    line: idx + 1,
-                    column: col0 + 1,
-                    end_line: idx + 1,
-                    end_column: col0 + fallback_routine.len(),
-                };
-            }
+        if let Some(at) = find_in_code(&lines, whole, fallback_routine) {
+            return word_span(at, fallback_routine.len());
         }
     }
     Span::unknown(file)
@@ -5221,8 +5308,14 @@ fn boogie_builtin_method<'a>(recv: &Expr, mname: &'a str, m: &ModuleDecl) -> &'a
     if mname == "code" {
         return if ty.as_deref() == Some("CHAR") { mname } else { "" };
     }
-    let own = ty.is_some_and(|t| type_head(&t) == m.name)
-        && find_module_routine(m, mname).is_some_and(|(_, has_current)| has_current);
+    let own_type = ty.is_some_and(|t| type_head(&t) == m.name);
+    // A field of the module's own named like a built-in, `Current.at`, is read as the field
+    // (F.11d): the built-in arms take an argument it has not.
+    let own_field = own_type && matches!(&m.repr, ReprKind::Product(fs) if fs.iter().any(|(f, _)| f == mname));
+    if own_field {
+        return "";
+    }
+    let own = own_type && find_module_routine(m, mname).is_some_and(|(_, has_current)| has_current);
     // `SEQ` and `BYTES` declare the routines the preamble arms already call.
     if own && m.name != "SEQ" && m.name != "BYTES" {
         ""
@@ -7237,6 +7330,9 @@ fn infer_gardel_type(e: &Expr, m: &ModuleDecl, ctx: &BoogiePreludeCtx) -> Option
         Expr::MethodCall(recv, r, _) if conversion_result(recv, r).is_some() => {
             conversion_result(recv, r).map(str::to_string)
         }
+        // A record is of the module's own type (F.11d): `let h = { Current with .. }` then
+        // `h.rest.length` read `rest` as a list's, and `.length` became `Seq_length`.
+        Expr::RecordLit(_) | Expr::RecordUpdate(_, _) => Some(module_self_type(m)),
         Expr::Bool(_) | Expr::UnaryNot(_) => Some("BOOL".to_string()),
         Expr::BinOp(op, l, rhs) => {
             if matches!(
@@ -8495,7 +8591,7 @@ fn emit_boogie_parts_with_options(
                 let params: Vec<String> = v
                     .fields
                     .iter()
-                    .map(|(fnm, fty)| format!("{fnm}: {}", map_boogie_type(fty, m)))
+                    .map(|(fnm, fty)| format!("{}: {}", boogie_reserved::field_binder(fnm), map_boogie_type(fty, m)))
                     .collect();
                 out.push_str(&format!(
                     "function {}{tp_quant}({}) returns ({mod_bpl_ty});\n",
@@ -8524,7 +8620,7 @@ fn emit_boogie_parts_with_options(
                 }
 
                 // Constructor discriminator & field projection axioms
-                let arg_names: Vec<String> = v.fields.iter().map(|(fnm, _)| fnm.clone()).collect();
+                let arg_names: Vec<String> = v.fields.iter().map(|(fnm, _)| boogie_reserved::field_binder(fnm)).collect();
                 let ctor_call = format!("{}({})", v.name, arg_names.join(", "));
                 let ctor_trig = if m.type_params.is_empty() {
                     format!("{{ {ctor_call} }}")
@@ -8544,14 +8640,16 @@ fn emit_boogie_parts_with_options(
                     };
                     let mut proj_conj = vec![format!("is_{}({ctor_app})", v.name)];
                     for (fnm, fty) in &v.fields {
-                        proj_conj.push(format!("{}_{}({ctor_app}) == {fnm}", v.name, fnm));
+                        proj_conj.push(format!("{}_{}({ctor_app}) == {}", v.name, fnm, boogie_reserved::field_binder(fnm)));
                         if fty == &m.name
                             || fty == "Current"
                             || fty.starts_with(&format!("{}[", m.name))
                         {
                             proj_conj.push(format!(
-                                "{}_adt_size({fnm}) < {}_adt_size({ctor_app})",
-                                m.name, m.name
+                                "{}_adt_size({}) < {}_adt_size({ctor_app})",
+                                m.name,
+                                boogie_reserved::field_binder(fnm),
+                                m.name
                             ));
                         }
                     }
@@ -8665,7 +8763,7 @@ fn emit_boogie_parts_with_options(
         ReprKind::Product(fields) => {
             let params: Vec<String> = fields
                 .iter()
-                .map(|(fnm, fty)| format!("{fnm}: {}", map_boogie_type(fty, m)))
+                .map(|(fnm, fty)| format!("{}: {}", boogie_reserved::field_binder(fnm), map_boogie_type(fty, m)))
                 .collect();
             out.push_str(&format!(
                 "function {}_Ctor{tp_quant}({}) returns ({mod_bpl_ty});\n",
@@ -8689,11 +8787,11 @@ fn emit_boogie_parts_with_options(
                 }
             }
             if !fields.is_empty() {
-                let arg_names: Vec<String> = fields.iter().map(|(fnm, _)| fnm.clone()).collect();
+                let arg_names: Vec<String> = fields.iter().map(|(fnm, _)| boogie_reserved::field_binder(fnm)).collect();
                 let ctor_call = format!("{}_Ctor({})", m.name, arg_names.join(", "));
                 let projs: Vec<String> = fields
                     .iter()
-                    .map(|(fnm, _)| format!("{}_{}({ctor_call}) == {fnm}", m.name, fnm))
+                    .map(|(fnm, _)| format!("{}_{}({ctor_call}) == {}", m.name, fnm, boogie_reserved::field_binder(fnm)))
                     .collect();
                 out.push_str(&format!(
                     "axiom (forall{tp_quant} {} :: {{ {ctor_call} }} {});\n",
@@ -8729,30 +8827,28 @@ fn emit_boogie_parts_with_options(
         "// --- 4. Module Refinement Invariant ({}_Invariant) ---\n",
         m.name
     ));
-    out.push_str(&format!(
-        "function {{:inline}} {}_Invariant{tp_quant}(Current: {mod_bpl_ty}) returns (bool)\n{{\n",
-        m.name
-    ));
     let empty_revealed = HashSet::new();
-    if m.invariants.is_empty() {
-        out.push_str("  true\n");
-    } else {
-        let mut clauses = Vec::new();
-        if !hide_repr {
-            if let ReprKind::Product(fields) = &m.repr {
-                for (fnm, fty) in fields {
-                    if fty == "NAT" || fty == "U64" {
-                        clauses.push(format!("  in_u64({}_{}(Current))", m.name, fnm));
-                    } else if fty == "INT" || fty == "I64" {
-                        clauses.push(format!("  in_i64({}_{}(Current))", m.name, fnm));
-                    } else if fty == "CHAR" {
-                        clauses.push(format!("  in_char({}_{}(Current))", m.name, fnm));
-                    }
+    // The ranges of the representation's fields, which every clause's own function holds as
+    // well, so that the clauses together are the invariant.
+    let mut ranges = Vec::new();
+    if !hide_repr {
+        if let ReprKind::Product(fields) = &m.repr {
+            for (fnm, fty) in fields {
+                if fty == "NAT" || fty == "U64" {
+                    ranges.push(format!("  in_u64({}_{}(Current))", m.name, fnm));
+                } else if fty == "INT" || fty == "I64" {
+                    ranges.push(format!("  in_i64({}_{}(Current))", m.name, fnm));
+                } else if fty == "CHAR" {
+                    ranges.push(format!("  in_char({}_{}(Current))", m.name, fnm));
                 }
             }
         }
-        for (tag, expr) in &m.invariants {
-            clauses.push(format!(
+    }
+    let invariant_clauses: Vec<String> = m
+        .invariants
+        .iter()
+        .map(|(tag, expr)| {
+            format!(
                 "  ({}) /* invariant:{} */",
                 emit_boogie_expr_with_strings(
                     expr,
@@ -8763,8 +8859,29 @@ fn emit_boogie_parts_with_options(
                     &strings
                 ),
                 tag
-            ));
-        }
+            )
+        })
+        .collect();
+    // Each clause has a function of its own, so that a value that breaks one is reported
+    // under that clause's tag, not the first's.
+    for ((tag, _), clause) in m.invariants.iter().zip(&invariant_clauses) {
+        let mut parts = ranges.clone();
+        parts.push(clause.clone());
+        out.push_str(&format!(
+            "function {{:inline}} {}{tp_quant}(Current: {mod_bpl_ty}) returns (bool)\n{{\n{}\n}}\n",
+            invariant_clause_fn(&m.name, tag),
+            parts.join(" &&\n")
+        ));
+    }
+    out.push_str(&format!(
+        "function {{:inline}} {}_Invariant{tp_quant}(Current: {mod_bpl_ty}) returns (bool)\n{{\n",
+        m.name
+    ));
+    if m.invariants.is_empty() {
+        out.push_str("  true\n");
+    } else {
+        let mut clauses = ranges.clone();
+        clauses.extend(invariant_clauses.iter().cloned());
         out.push_str(&clauses.join(" &&\n"));
         out.push('\n');
     }
@@ -10077,8 +10194,9 @@ fn emit_boogie_verify_routine(
     if returns_mod && m.kind == ModuleKind::Module && !m.invariants.is_empty() {
         for (tag, _) in &m.invariants {
             s.push_str(&format!(
-                "  assert {{:msg \"{}::invariant::{tag}\"}} {}_Invariant(Result);\n",
-                r.name, m.name
+                "  assert {{:msg \"{}::invariant::{tag}\"}} {}(Result);\n",
+                r.name,
+                invariant_clause_fn(&m.name, tag)
             ));
         }
     }
@@ -12365,8 +12483,9 @@ fn emit_boogie_expr_obligations(
             if !m.invariants.is_empty() {
                 for (tag, _) in &m.invariants {
                     s.push_str(&format!(
-                        "{pad}assert {{:msg \"{}::invariant::{tag}\"}} {}_Invariant({val_bpl});\n",
-                        r.name, m.name
+                        "{pad}assert {{:msg \"{}::invariant::{tag}\"}} {}({val_bpl});\n",
+                        r.name,
+                        invariant_clause_fn(&m.name, tag)
                     ));
                 }
             }
@@ -12468,7 +12587,11 @@ fn emit_boogie_expr_obligations(
                     strings,
                 ));
             }
-            if mname == &r.name {
+            // A call of another module's routine of the same name, `OTHER.f(..)` or `x.f(..)`
+            // with `x` of another type, is no recursive call (F.11d).
+            let elsewhere = matches!(&**recv, Expr::Var(v) if v != &m.name && is_static_receiver_name(v, m))
+                || elem_receiver_type(recv, m).is_some_and(|t| t != module_self_type(m) && t != m.name);
+            if mname == &r.name && !elsewhere {
                 let mut substs = vec![("Current".to_string(), (**recv).clone())];
                 for ((pname, _), arg) in r.params.iter().zip(args.iter()) {
                     substs.push((pname.clone(), arg.clone()));

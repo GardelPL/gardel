@@ -1,0 +1,127 @@
+-- Tablon's lexer for Gardel's text, one line at a time: keywords, strings, characters,
+-- numbers and comments, each a `SPAN` in a colour of its own. It knows nothing of a line
+-- before, which serves Gardel, whose comments and strings end with their line.
+functions GARDEL_LEXER
+
+feature {ANY}
+
+  keyword_style: STYLE
+    do
+      STYLE.plain.fg(COLOR.bright_blue).bold
+    end
+
+  string_style: STYLE
+    do
+      STYLE.plain.fg(COLOR.yellow)
+    end
+
+  number_style: STYLE
+    do
+      STYLE.plain.fg(COLOR.magenta)
+    end
+
+  comment_style: STYLE
+    do
+      STYLE.plain.fg(COLOR.green)
+    end
+
+  -- The spans of line `i`, whose text is `line`.
+  spans(i: NAT, line: STRING): LIST[SPAN]
+    do
+      GARDEL_LEXER.scan(GLYPHS.of_text(line), 0, LIST.empty)
+    end
+
+  -- `acc` with the spans of `cs`, the first of which is character `at` of its line.
+  scan(cs: LIST[CHAR], at: NAT, acc: LIST[SPAN]): LIST[SPAN]
+    variant
+      cs.length
+    do
+      if cs.length = 0 or cs.length > 65535 or at > 65535 then
+        acc
+      else
+        let c = cs.head
+        if c = '-' and cs.tail.length > 0 and cs.tail.head = '-' then
+          acc.prepend(SPAN.make(at, cs.length, GARDEL_LEXER.comment_style))
+        else if c = '"' then
+          let n = GARDEL_LEXER.quoted(cs.tail)
+          let k = if n < cs.tail.length then n + 2 else cs.length end
+          GARDEL_LEXER.scan(LIST_CUT.drop(cs, k), at + k, acc.prepend(SPAN.make(at, k, GARDEL_LEXER.string_style)))
+        else if c.code = 39 and cs.tail.length >= 2 then
+          -- A character, `'a'` or `'\n'`: an apostrophe, one character or a backslash and one,
+          -- and an apostrophe.
+          let k = if cs.tail.head.code = 92 and cs.tail.length >= 3 then 4 else 3 end
+          let n = if k <= cs.length then k else cs.length end
+          GARDEL_LEXER.scan(LIST_CUT.drop(cs, n), at + n, acc.prepend(SPAN.make(at, n, GARDEL_LEXER.string_style)))
+        else if GARDEL_LEXER.is_digit(c) then
+          let n = GARDEL_LEXER.word_length(cs)
+          let k = if n >= 1 then n else 1 end
+          GARDEL_LEXER.scan(LIST_CUT.drop(cs, k), at + k, acc.prepend(SPAN.make(at, k, GARDEL_LEXER.number_style)))
+        else if GARDEL_LEXER.is_letter(c) then
+          let n = GARDEL_LEXER.word_length(cs)
+          let w = GLYPHS.text_of(LIST_CUT.take(cs, n))
+          let more = if GARDEL_LEXER.is_keyword(w) then acc.prepend(SPAN.make(at, n, GARDEL_LEXER.keyword_style)) else acc end
+          GARDEL_LEXER.scan(LIST_CUT.drop(cs, n), at + n, more)
+        else
+          GARDEL_LEXER.scan(cs.tail, at + 1, acc)
+        end end end end end
+      end
+    end
+
+  -- How many of `cs` come before the first `"`, or all of them.
+  quoted(cs: LIST[CHAR]): NAT
+    variant
+      cs.length
+    do
+      if cs.length = 0 or cs.head = '"' then
+        0
+      else
+        let n = GARDEL_LEXER.quoted(cs.tail)
+        if n < 18446744073709551615 then n + 1 else n end
+      end
+    ensure
+      within: Result <= cs.length
+    end
+
+  -- How many of `cs` from the first are letters, digits or `_`, the first a letter.
+  word_length(cs: LIST[CHAR]): NAT
+    variant
+      cs.length
+    do
+      if cs.length = 0 then
+        0
+      else if GARDEL_LEXER.is_letter(cs.head) or GARDEL_LEXER.is_digit(cs.head) then
+        let n = GARDEL_LEXER.word_length(cs.tail)
+        if n < 18446744073709551615 then n + 1 else n end
+      else
+        0
+      end end
+    ensure
+      within: Result <= cs.length
+      some: (cs.length > 0 and GARDEL_LEXER.is_letter(cs.head)) implies Result >= 1
+    end
+
+  is_digit(c: CHAR): BOOL
+    do
+      c.code >= 48 and c.code <= 57
+    end
+
+  is_letter(c: CHAR): BOOL
+    do
+      (c.code >= 97 and c.code <= 122) or (c.code >= 65 and c.code <= 90) or c = '_'
+    end
+
+  is_keyword(w: STRING): BOOL
+    do
+      w.equals("module") or w.equals("functions") or w.equals("program") or w.equals("reactive") or
+        w.equals("concept") or w.equals("refines") or w.equals("satisfies") or
+        w.equals("feature") or w.equals("create") or w.equals("representation") or
+        w.equals("invariant") or w.equals("require") or w.equals("ensure") or w.equals("do") or
+        w.equals("end") or w.equals("if") or w.equals("then") or w.equals("else") or
+        w.equals("let") or w.equals("match") or w.equals("case") or w.equals("variant") or
+        w.equals("specify") or w.equals("law") or w.equals("check") or w.equals("fn") or
+        w.equals("with") or w.equals("and") or w.equals("or") or w.equals("not") or
+        w.equals("implies") or w.equals("forall") or w.equals("exists") or w.equals("trigger") or
+        w.equals("True") or w.equals("False") or w.equals("Current") or w.equals("Result")
+    end
+
+end

@@ -1,0 +1,67 @@
+-- A process Tablon awaits: from the command that starts it, when it has no id yet, until it
+-- ends. Its standard output is kept when it is read at the end, as a JSON document is.
+module PROC_SLOT
+
+representation {NONE}
+  live: BOOL
+  id: OPTION[PROC_ID]
+  out: BYTES
+
+create {ANY}
+
+  -- No process.
+  idle: PROC_SLOT
+    do
+      { live = False, id = None, out = BYTES.empty }
+    ensure
+      not_running: not Result.running
+    end
+
+  -- A process asked for, not yet started.
+  asked: PROC_SLOT
+    do
+      { live = True, id = None, out = BYTES.empty }
+    ensure
+      running: Result.running
+    end
+
+feature {ANY}
+
+  running: BOOL
+    do
+      Current.live
+    end
+
+  -- Whether it is the process `p`.
+  holds(p: PROC_ID): BOOL
+    do
+      match Current.id
+        case Some(q) then Current.live and q.equals(p)
+        case None then False
+      end
+    end
+
+  -- Its id, once it started.
+  process: OPTION[PROC_ID]
+    do
+      if Current.live then Current.id else None end
+    end
+
+  output: BYTES
+    do
+      Current.out
+    end
+
+  -- Started as `p`, when it was asked for.
+  started(p: PROC_ID): PROC_SLOT
+    do
+      if Current.live then { Current with id = Some(p) } else Current end
+    end
+
+  -- `d` kept after its output so far.
+  kept(d: BYTES): PROC_SLOT
+    do
+      if Current.out.length <= 18446744073709551615 - d.length then { Current with out = Current.out.concat(d) } else Current end
+    end
+
+end

@@ -41,6 +41,19 @@ feature {ANY}
       length_def: Result.length = acc.length + (if n <= xs.length then n else xs.length end)
     end
 
+  -- `xs` with item `i` replaced by `x`, or `xs` itself when it has no item `i`.
+  put_at[A](xs: LIST[A], i: NAT, x: A): LIST[A]
+    variant
+      i
+    do
+      if xs.length = 0 then xs
+      else if i = 0 then xs.tail.prepend(x)
+      else LIST_CUT.put_at(xs.tail, i - 1, x).prepend(xs.head)
+      end end
+    ensure
+      length_same: Result.length = xs.length
+    end
+
   -- `n` copies of `x` in front of `acc`.
   repeat[A](x: A, n: NAT, acc: LIST[A]): LIST[A]
     variant

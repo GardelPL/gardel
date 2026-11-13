@@ -15,7 +15,9 @@ build/
 *.o
 
 # External tools and binaries
-tools/
+tools/*
+!tools/tablon/
+tools/tablon/build/
 
 # Editor and IDE directories
 .vscode/

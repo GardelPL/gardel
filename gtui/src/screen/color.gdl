@@ -1,0 +1,90 @@
+-- A colour of a cell: the terminal's own (`default`), or one of the 16 standard colours that
+-- every VT terminal has, the 8 normal ones and their bright forms. What each looks like is
+-- the terminal's choice, so a program that uses them follows the user's theme.
+module COLOR
+
+representation {NONE}
+  tone: NAT
+
+invariant
+  standard: tone <= 16
+
+create {ANY}
+
+  -- The terminal's own colour.
+  default: COLOR
+    do
+      { tone = 0 }
+    ensure
+      is_default: Result.is_default
+    end
+
+  -- Standard colour `n`, from 0 to 15: black, red, green, yellow, blue, magenta, cyan and
+  -- white, then the same bright. Past 15, the terminal's own.
+  standard(n: NAT): COLOR
+    do
+      { tone = if n < 16 then n + 1 else 0 end }
+    ensure
+      numbered: n < 16 implies Result.number = n
+      or_default: n >= 16 implies Result.is_default
+    end
+
+  black: COLOR do { tone = 1 } end
+  red: COLOR do { tone = 2 } end
+  green: COLOR do { tone = 3 } end
+  yellow: COLOR do { tone = 4 } end
+  blue: COLOR do { tone = 5 } end
+  magenta: COLOR do { tone = 6 } end
+  cyan: COLOR do { tone = 7 } end
+  white: COLOR do { tone = 8 } end
+  gray: COLOR do { tone = 9 } end
+  bright_red: COLOR do { tone = 10 } end
+  bright_green: COLOR do { tone = 11 } end
+  bright_yellow: COLOR do { tone = 12 } end
+  bright_blue: COLOR do { tone = 13 } end
+  bright_magenta: COLOR do { tone = 14 } end
+  bright_cyan: COLOR do { tone = 15 } end
+  bright_white: COLOR do { tone = 16 } end
+
+feature {ANY}
+
+  is_default: BOOL
+    do
+      Current.tone = 0
+    end
+
+  -- The colour's number from 0 to 15, or 16 for the terminal's own.
+  number: NAT
+    do
+      if Current.tone = 0 then 16 else Current.tone - 1 end
+    ensure
+      bounded: Result <= 16
+    end
+
+  -- The SGR parameter that sets it as the foreground: 39, 30 to 37, or 90 to 97.
+  foreground_code: NAT
+    do
+      if Current.tone = 0 then 39
+      else if Current.tone <= 8 then 29 + Current.tone
+      else 81 + Current.tone
+      end end
+    ensure
+      named: Result = 39 or (30 <= Result and Result <= 37) or (90 <= Result and Result <= 97)
+    end
+
+  -- The SGR parameter that sets it as the background: 49, 40 to 47, or 100 to 107.
+  background_code: NAT
+    do
+      Current.foreground_code + 10
+    ensure
+      named: Result = 49 or (40 <= Result and Result <= 47) or (100 <= Result and Result <= 107)
+    end
+
+  same(other: COLOR): BOOL
+    do
+      Current.tone = other.tone
+    ensure
+      def: Result = (Current.number = other.number)
+    end
+
+end

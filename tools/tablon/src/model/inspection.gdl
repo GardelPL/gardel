@@ -1,0 +1,159 @@
+-- The modules of a project, read from the object that `gardelc --inspect --json-diagnostics`
+-- prints (spec §12): each module's name, kind, package, file and line, its concepts and
+-- suppliers, its creators, features, laws and invariant clauses, and its short form. A field
+-- that is missing or of another type reads as empty, so a newer compiler that adds fields is
+-- read the same.
+functions INSPECTION
+
+feature {ANY}
+
+  -- The modules of the object in `b`, or none when `b` is not one.
+  modules(b: BYTES): OPTION[LIST[MODULE_INFO]]
+    do
+      match JSON.parse(b)
+        case Ok(j) then
+          match j.field("modules")
+            case Some(ms) then Some(INSPECTION.modules_from(ms, 0))
+            case None then None
+          end
+        case Error(_) then None
+      end
+    end
+
+  -- The text under `key` in `j`, or "".
+  text(j: JSON, key: STRING): STRING
+    do
+      match j.field(key)
+        case Some(v) then
+          match v.as_string
+            case Some(s) then s
+            case None then ""
+          end
+        case None then ""
+      end
+    end
+
+  -- The whole number under `key` in `j`, or 0 when it is none or negative.
+  number(j: JSON, key: STRING): NAT
+    do
+      match j.field(key)
+        case Some(v) then
+          match v.as_int
+            case Some(i) then if i >= 0 then NAT.from_i64(i) else 0 end
+            case None then 0
+          end
+        case None then 0
+      end
+    end
+
+  -- The texts of the array under `key` in `j`.
+  texts(j: JSON, key: STRING): LIST[STRING]
+    do
+      match j.field(key)
+        case Some(a) then INSPECTION.texts_from(a, 0)
+        case None then LIST.empty
+      end
+    end
+
+  -- The texts among the items of `a` from item `i` on.
+  texts_from(a: JSON, i: NAT): LIST[STRING]
+    variant
+      a.count - i
+    do
+      if i >= a.count then
+        LIST.empty
+      else
+        let rest = INSPECTION.texts_from(a, i + 1)
+        match a.item(i)
+          case Some(v) then
+            match v.as_string
+              case Some(s) then rest.prepend(s)
+              case None then rest
+            end
+          case None then rest
+        end
+      end
+    end
+
+  -- The modules among the items of `a` from item `i` on.
+  modules_from(a: JSON, i: NAT): LIST[MODULE_INFO]
+    variant
+      a.count - i
+    do
+      if i >= a.count then
+        LIST.empty
+      else
+        let rest = INSPECTION.modules_from(a, i + 1)
+        match a.item(i)
+          case Some(m) then rest.prepend(INSPECTION.module_of(m))
+          case None then rest
+        end
+      end
+    end
+
+  module_of(m: JSON): MODULE_INFO
+    do
+      let creators_and_features = INSPECTION.features_of(m)
+      let laws = INSPECTION.laws_of(m)
+      let clauses = INSPECTION.invariants_of(m)
+      MODULE_INFO.make(INSPECTION.text(m, "name"), INSPECTION.text(m, "kind"), INSPECTION.text(m, "package"),
+        INSPECTION.text(m, "file"), INSPECTION.number(m, "line"), INSPECTION.texts(m, "concepts"),
+        INSPECTION.texts(m, "suppliers"), creators_and_features.append(laws).append(clauses),
+        TEXT_LINES.of_text(INSPECTION.text(m, "short")))
+    end
+
+  features_of(m: JSON): LIST[PART_INFO]
+    do
+      match m.field("features")
+        case Some(a) then INSPECTION.parts_from(a, 0, "")
+        case None then LIST.empty
+      end
+    end
+
+  laws_of(m: JSON): LIST[PART_INFO]
+    do
+      match m.field("laws")
+        case Some(a) then INSPECTION.parts_from(a, 0, "law")
+        case None then LIST.empty
+      end
+    end
+
+  invariants_of(m: JSON): LIST[PART_INFO]
+    do
+      match m.field("invariants")
+        case Some(a) then INSPECTION.parts_from(a, 0, "invariant")
+        case None then LIST.empty
+      end
+    end
+
+  -- The parts among the items of `a` from item `i` on, each in `section`, or in the section
+  -- it names itself when `section` is "".
+  parts_from(a: JSON, i: NAT, section: STRING): LIST[PART_INFO]
+    variant
+      a.count - i
+    do
+      if i >= a.count then
+        LIST.empty
+      else
+        let rest = INSPECTION.parts_from(a, i + 1, section)
+        match a.item(i)
+          case Some(p) then rest.prepend(INSPECTION.part_of(p, section))
+          case None then rest
+        end
+      end
+    end
+
+  -- A feature or a law shows its signature, and an invariant clause its tag and expression.
+  part_of(p: JSON, section: STRING): PART_INFO
+    do
+      if section.equals("invariant") then
+        let tag = INSPECTION.text(p, "tag")
+        PART_INFO.make(section, tag, GLYPHS.join(GLYPHS.join(tag, ": "), INSPECTION.text(p, "expr")),
+          INSPECTION.number(p, "line"))
+      else
+        PART_INFO.make(if section.is_empty then INSPECTION.text(p, "section") else section end,
+          INSPECTION.text(p, "name"), INSPECTION.text(p, "signature"), INSPECTION.number(p, "line"))
+      end
+    end
+
+end

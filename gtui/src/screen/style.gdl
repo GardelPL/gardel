@@ -1,5 +1,6 @@
--- How a cell is drawn: any of bold, dim, underlined and reversed, on the terminal's own
--- colours. `plain` has none, and each of the others adds one.
+-- How a cell is drawn: any of bold, dim, underlined and reversed, and a foreground and a
+-- background `COLOR`. `plain` has none of them and the terminal's own colours; each of the
+-- others changes one.
 module STYLE
 
 representation {NONE}
@@ -7,14 +8,17 @@ representation {NONE}
   faint: BOOL
   under: BOOL
   inverse: BOOL
+  ink: COLOR
+  paper: COLOR
 
 create {ANY}
 
   plain: STYLE
     do
-      { strong = False, faint = False, under = False, inverse = False }
+      { strong = False, faint = False, under = False, inverse = False, ink = COLOR.default, paper = COLOR.default }
     ensure
       nothing: not Result.is_bold and not Result.is_dim and not Result.is_underlined and not Result.is_reversed
+      own_colours: Result.foreground.is_default and Result.background.is_default
     end
 
 feature {ANY}
@@ -37,6 +41,16 @@ feature {ANY}
   is_reversed: BOOL
     do
       Current.inverse
+    end
+
+  foreground: COLOR
+    do
+      Current.ink
+    end
+
+  background: COLOR
+    do
+      Current.paper
     end
 
   bold: STYLE
@@ -67,10 +81,29 @@ feature {ANY}
       set: Result.is_reversed
     end
 
+  -- The same, in the foreground colour `c`.
+  fg(c: COLOR): STYLE
+    do
+      { Current with ink = c }
+    ensure
+      set: Result.foreground.same(c)
+      bold_same: Result.is_bold = Current.is_bold
+    end
+
+  -- The same, on the background colour `c`.
+  bg(c: COLOR): STYLE
+    do
+      { Current with paper = c }
+    ensure
+      set: Result.background.same(c)
+      bold_same: Result.is_bold = Current.is_bold
+    end
+
   same(other: STYLE): BOOL
     do
       Current.strong = other.strong and Current.faint = other.faint and
-        Current.under = other.under and Current.inverse = other.inverse
+        Current.under = other.under and Current.inverse = other.inverse and
+        Current.ink.same(other.ink) and Current.paper.same(other.paper)
     end
 
 end

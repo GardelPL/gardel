@@ -1,7 +1,7 @@
 # Phase F: Verified Libraries and Applications
 
 **Date:** November 6, 2026
-**Status:** In progress. Tasks F.0 to F.10, F.12, F.13 and F.14 are completed (F.7 on Windows only), and the decisions below are taken.
+**Status:** In progress. Tasks F.0 to F.14 are completed (F.7 on Windows only), and the decisions below are taken.
 **Roadmap entry:** [Phase F in Roadmap.md](../Roadmap.md#phase-f-verified-libraries-and-applications)
 **Probed at:** commit `1349cb6`
 
@@ -793,15 +793,47 @@ Mutations, each on a private copy: ten, all red after a baseline that passes. No
 
 Packages and examples: `--stdlib --strict`, `gjson`, `ghttp`, `grest`, `gtui` and every example verify with 0 errors and 0 warnings under `--strict`, and build as before.
 
-**F.11c: what `gtui` needs for it** (version 0.2.0).
+**F.11c: what `gtui` needs for it** (version 0.2.0). ✅ Completed on 2026-11-13. No compiler change.
 
-- [ ] `TABS`: a row of titles, one chosen, each with its key (`Text(t)`), chosen by key or by Tab.
-- [ ] `TREE_VIEW`: nodes that open and close, drawn with `▸` and `▾`, on `LIST_VIEW`'s selection and paging.
-- [ ] `TEXT_VIEW` with line numbers, a marked line, and styled spans per line, so a view can colour what a lexer found.
-- [ ] Colours: `STYLE` gains a foreground from the 16 standard ones, and `VT_TEXT` writes them.
-- [ ] `FRAME`: a box with a title in its top edge, which shows which pane has the keys.
-- [ ] `PALETTE`: a list drawn over the screen, narrowed as one types after `/`, each entry a command and what it does.
-- [ ] `FOCUS`: which pane gets the keys; Tab moves it to the next. `KEY` has no Shift-Tab yet (F.16).
+- [x] `TABS`: a row of titles, one chosen, each with its key (`Text(t)`), chosen by key or by Tab.
+- [x] `TREE_VIEW`: nodes that open and close, drawn with `▸` and `▾`, on `LIST_VIEW`'s selection and paging.
+- [x] `TEXT_VIEW` with line numbers, a marked line, and styled spans per line, so a view can colour what a lexer found.
+- [x] Colours: `STYLE` gains a foreground from the 16 standard ones, and `VT_TEXT` writes them.
+- [x] `FRAME`: a box with a title in its top edge, which shows which pane has the keys.
+- [x] `PALETTE`: a list drawn over the screen, narrowed as one types after `/`, each entry a command and what it does.
+- [x] `FOCUS`: which pane gets the keys; Tab moves it to the next. `KEY` has no Shift-Tab yet (F.16).
+- [x] From F.11a: `TUI` leaves the alternate screen before a `RunAttached` and takes it again after.
+
+What each is:
+
+- **`COLOR`**: the terminal's own, or one of the 16 standard colours (`COLOR.cyan`, `COLOR.standard(n)`), so a program follows the user's theme. `STYLE` gains `fg(c)` and `bg(c)`, and `same` compares them; `VT_TEXT.add_sgr` writes 30 to 37, 90 to 97, and 40 to 47 and 100 to 107 for the background, after the attributes. A plain cell writes `ESC [ 0 m` as before, so `todo_tui`'s bytes are unchanged.
+- **`FRAME`**: `draw(s, r, title, edge, title_style)` draws the edge of `r` with rounded corners and the title in the top edge. `inner(r)` is where the pane's content goes, and `title_area(r)` the top edge less its corners, where a row of `TABS` goes; both are proven inside `r`.
+- **`FOCUS`**: which of `n` panes has the keys, proven a pane; `on_key` moves it on Tab, wrapping.
+- **`TABS`**: `TABS.empty.with("Text", 't')`, drawn as `Text(t) | Short(s)`, the chosen title in a style of its own. A key of a tab chooses it, and Tab the next; `takes(k)` says whether a key is the tabs', so an application can give Tab to `FOCUS` instead. A tab given a space has no key. `retitled(i, t)` keeps a tab's key and place while its title changes, as `Problems (3)` does. Proven: one key per title, and the choice is a tab.
+- **`TREE_VIEW`**: a list of `TREE_NODE`s, each a label at a depth, open or closed; a node's children are the deeper nodes after it. The rows shown (`TREE_ROW`: the node's index, depth, whether it has children and is open, and its line) are a `LIST_VIEW`, so paging and the selection are the list's, and the invariant `one_row_each` ties them. Right opens a node or goes to its first child, Left closes it or goes to its parent; `toggled`, `set_open`, `select_node` and `with_nodes` are there for the application, which finds what a node stands for by `selected_node`, its index.
+- **`TEXT_VIEW`**: `draw_code(s, r, st, gutter, marked, mark, spans)` draws line numbers right-aligned in a column as wide as the last one, the line `marked` across its row in `mark`, and over each line the `SPAN`s that `spans(i, line)` gives, a function from the application, such as a lexer. On the marked line a span takes the mark's background. `showing(n, rows)` scrolls as little as shows line `n`, proven.
+- **`PALETTE`**: `PALETTE_ENTRY.make("shell", "what it does")`. Typing after `/` narrows the list to the commands whose name starts with the first word; the rest is `arguments`. The arrows and the page keys move in the list, other keys edit the line, and Enter and Escape are the application's. `place(area, width, height)` puts it at the bottom of `area`, proven inside it.
+- **`TUI` and attached children**: a `RunAttached` among `update`'s commands is preceded by `VT_TEXT.leave`. Until every child sent has ended (`TUI.attached` counts them) nothing is drawn, a `Resized` included; the `AttachedEnded` of the last one takes the alternate screen again, and the host's `Resized` after it draws the screen whole.
+- **`examples/gtui_tour`**: a workbench laid out as Tablon's will be, with fixed content: a project tree under `Modules(m) | Files(f)`, a source with line numbers and its keywords, strings and comments coloured by a small lexer written in Gardel (`TOUR_LEXER`), and `Output(o) | Problems (3)(p)`, where Enter marks a problem's line in the source. `/` opens the commands, and `/shell` runs the program given to the tour, attached.
+
+Changed from the list above, each for a reason:
+
+- **A background as well as a foreground.** A palette's selected command, and a marked line, read better on a colour than reversed, and the cost is one more field per `STYLE`.
+- **A tree is a list.** A recursive type through `LIST` cannot be measured (F.10, finding 3), so a node's place in the list gives its children, and the application keeps what each node stands for in a list beside it.
+- **Spans are a function of the line.** `draw_code` asks for the spans of the lines it draws and of no others, so a lexer runs on the rows shown, not the file.
+
+Found on the way, none fixed, as each has a workaround:
+
+- **An overflow takes a routine's whole contract with it.** `1 + TABS.key_index(keys.tail, c)` fails `overflow_add`, as a list's length is not bounded by 2^64 in the encoding. A routine with a failed obligation other than a postcondition is not trusted, so its contract axiom is withheld, and its own `within` then fails as well: the second error points away from the cause. Guarding the sum (`if r < 18446744073709551615 then r + 1 else r end`) fixes both.
+- **A `NAT` inside an `OPTION[NAT]` is not known to be a `NAT`.** Passing `i` from `case Some(i)` to a routine with a precondition made the caller's postcondition fail: the callee's contract axiom is guarded by `in_u64` of its `NAT` arguments. `draw_code` passes the `OPTION` itself down.
+- **A Boogie error is placed at the first match of its name, comments included.** An overflow in `TABS.next` was reported at `tabs.gdl:2:66`, the word "next" in the header comment, and one in `PALETTE.line` at `1:45`. `locate_span` searches the whole file for the tag and then the routine's name. Tablon's Problems view sends the user to these lines, so F.11d fixes it, from the routine's header on.
+- **A proof that was stable became unstable.** `LIST_VIEW.on_key`, unchanged, failed `chosen_item` on every run once `COLOR` joined its context. It is now one `select` of a computed target (`target`, `moves`), which behaves the same and proves at once.
+- **In a scripted run, keys do not wait for an attached child.** The script's keys keep coming while the child runs, so a session that runs one quits before it ends. Keys through a pipe wait, as F.11a's own test does, and the test of the tour uses a pipe.
+- **A broken invariant is reported under the name of the first.** Each invariant tag asserts the whole of `TABS_Invariant`, so a `choose` that breaks `a_tab` was reported as `one_key_each`, the first clause. F.11d fixes it with the error's line, as Problems shows the obligation.
+
+Tests: `tests/gtui.rs`. `the_tour_draws_every_widget_in_colour_inside_the_screen` runs a session of `gtui_tour` through the VT terminal, with a resize to the same size after each step it looks at, so that the cells the diffs left are kept: a node opened (`▾`, its children indented) and one closed whose children are not shown; the Files tab chosen by its key; a problem's line marked across its row on blue, its keywords on the same blue, after a page down; the palette narrowed to `/shell` by `s`, the command selected on blue; `/clear` and `/top` run. It checks the SGR parameters of cells: the frame of the pane with the keys in bold cyan and the others gray, the chosen tab in bold underlined bright yellow and its key plain, line numbers gray, keywords bold bright blue, a comment green, a name plain. At the end the cells equal a full redraw, colours included, after the focus moved, which changes only colours. `an_attached_child_gets_the_terminal_and_the_tour_comes_back` runs a child from the palette, keys through a pipe: the screen is put back before it, only the child's output lies between that and the alternate screen taken again, and the screen after shows the child's exit code, drawn whole. `a_client_proves_the_widget_facts_through_the_contracts` proves twelve facts of `TABS`, `FOCUS`, `TEXT_VIEW.showing`, `TREE_VIEW`, `FRAME` and `PALETTE` in a client, and refuses a tab chosen past the last and a line shown in no rows. The tests of F.10 pass unchanged, `todo_tui`'s bytes included, and the bench of a 200 by 60 redraw stays under 16 ms with colours compared.
+
+Mutations, each on a private copy: fifteen, after a baseline that passes; fourteen are red. The verifier caught bright colours one too low (`named`), a tab chosen past the last, `showing` that scrolls nothing down (`shown`), a palette that keeps its list when narrowed (`one_row_each`) and a focus past the last pane (`a_pane`). The session caught no foreground written, a style compared without its colours, a closed node that shows its children, a marked row not filled, a span one cell late, a frame whose inside is all of it, and a palette not narrowed; the attached run caught no leave before the child and no enter after it. The fifteenth, frames drawn while a child runs by keeping the size known, survived as an equivalent mutant: every event while a child is attached takes the branch that draws nothing, and the last end forgets the size anyway. The line it changed was dead and is removed. Not tested: an event that arrives while a child runs, as the tour has no timer or process to send one.
 
 **F.11d: Tablon**, `tools/tablon`, a reactive program on `gtui`, `gjson`, files and processes. Its layout follows `issues/image.png`, with three panes:
 
@@ -818,9 +850,80 @@ Packages and examples: `--stdlib --strict`, `gjson`, `ghttp`, `grest`, `gtui` an
   - Run: an ordinary program's output streams in, with an input line for its standard input and a key to stop it. A reactive program, which needs the terminal, is run attached.
   - Output: what each `gardelc` run printed, as it came.
 - **Commands:** `/` opens the palette: `/check`, `/build`, `/run [ARGS]`, `/stop`, `/edit` (the source in `$EDITOR`, attached, then a check), `/open DIR`, `/quit`. The common ones have keys too, shown in the status bar.
-- [ ] A long run shows that it is running, and keys still work: every process is a command, never a wait.
+- [x] A long run shows that it is running, and keys still work: every process is a command, never a wait. The status bar says `inspecting...`, `checking...`, `building...` or `running...`; `tests/tablon.rs` takes keys while a check and a program run (part two, below).
+- [x] A Boogie error placed from its routine's header on, never at a word in a comment (`locate_span`, found in F.11c), so Problems opens the right line. `routine_lines` finds the header, the least indented line that starts with the name and `(`, `:` or `[` and has lines under it; a tag is looked for there, then in the file; an overflow is placed at the header; `code_of_line` leaves comments out.
+- [x] A broken invariant reported under its own name, each tag asserting its own clause (found in F.11c). Each clause is `M_Invariant__tag`, which holds the fields' ranges too, so the clauses together are `M_Invariant`. Tests: `tests/error_place.rs`, with the name of the routine in a comment, a call and a tag before its header, and a tag two routines share. Mutations on a private copy: five, after a baseline that passes, all red: each tag asserting the whole invariant, comments searched, the whole file searched before the routine, no header for a tag in no line, and the first line that starts with the name taken as the header.
 - Left out: editing in place, which is Task F.16 (`/edit` stands in until then), a debugger, a terminal pane and an AI pane.
 - Acceptance: Tablon verifies under `--strict`. On a broken project it browses the failures to their lines; it shows every view of a module of `gtui`; it builds and runs `examples/todo_tui` attached and an ordinary example with its output captured. A replay of a session reproduces its screen with no process run.
+
+**F.11d, part one: the layout and browsing.** ✅ Completed on 2026-11-13. `tools/tablon`, 14 modules, verifies with 0 errors and 0 warnings under `--strict` and builds.
+
+- [x] The three panes and a status bar, the pane with the keys framed in cyan, Tab between them.
+- [x] Modules: the project's package (the one whose files are under the project, `./src/...`), then each dependency in the inspection's order, under each its kinds (`reactive programs`, `programs`, `modules`, `functions`) and their modules. The project's package starts open.
+- [x] Files: `src`, each directory listed when its parent's listing comes in and put under its node, directories first, then by name.
+- [x] The right pane's ten views. Text: the source with line numbers, coloured by `GARDEL_LEXER` (keywords, strings, characters, numbers, comments). Short: the short form. Features, Creators, Laws and Invariants: one part a line; Enter shows its line in Text, marked, three lines from the top. Concepts; Instances, each concept the module satisfies with the other modules that satisfy it; Clients and Suppliers, where Enter chooses that module, and a supplier the inspection does not list is marked `(prelude)`.
+- [x] Every process and every read is a command: the inspection and the listings start with Tablon, and the status bar says `inspecting...` while the keys work. A read is tagged, so one answered after another was sent is dropped.
+- [x] The palette: `/inspect`, `/open DIR`, `/quit`.
+
+How it works:
+
+- **The inspection is one process.** `gardelc --project . --inspect --json-diagnostics --no-verify`, in the project's directory, so the short forms come while proofs fail. Its standard output is kept until it ends and read by `INSPECTION`, its standard error goes to Output line by line. For `gtui`'s 29 modules the object is 106 KB, and reading it and computing a view of each module takes 0.24 s in the built program; the run itself takes about 16 s, which is why it must never be waited on.
+- **What each node stands for is a list beside the tree.** `TREE_ENTRY`, a module's name, a file's path, or a group; `MODULE_TREE` builds the Modules tree's nodes and entries from one list of `TREE_ITEM`s, so they cannot fall out of step. The Files tree's nodes and entries are spliced together as listings come, so a node keeps whether it is open.
+- **A view's lines carry where Enter goes.** `VIEW_LINES` holds, per line, a source line and a module to choose, with an invariant that the three lists have one length.
+- **The tabs of the views scroll.** Ten tabs take about 120 columns, so `MODULE_VIEWS.window` draws them from the first one from which the chosen tab fits.
+
+Changed from the plan above:
+
+- **No prelude in the Modules tree.** The inspection gives the project's and its dependencies' modules, not the prelude's, and no concepts that the prelude declares. A supplier that is the prelude's is marked as such in Suppliers instead.
+- **Instances lists the modules that share a concept.** A concept is not a module in the tree, so for a module Instances lists, under each concept it satisfies, the other modules that satisfy it.
+- **Problems, Build and Run showed a placeholder** until part two, and Output showed what Tablon and `gardelc` printed.
+
+Found on the way, in the compiler, fixed:
+
+- **A call of another module's routine of the same name was taken for recursion.** In `MODULE_VIEWS.named`, the call `MODULE_TREE.named(..)` had to decrease `named`'s variant, and `variant_decrease` failed: a method call counted as recursive by its name alone. It now counts when its receiver is the module or a value of its type. `tests/variant_scope.rs`, with a call to another module's `named`, a value of another type's `size`, and a real recursive call that does not decrease, still refused.
+- **A field named `at` made `gardelc` panic.** `Current.at` was taken for `LIST.at`, which reads an argument it has not, and a field `head` became `Seq_head(Current)`. A field of the module's own is read as the field.
+- **A field named `uses` was `E0199`.** It is a word Boogie reserves, and a field is bound by its name in its constructor's axioms. Such a field is bound as `uses__f`, and the reserved words gain `assume`, `uses`, `true`, `false`, `reveal`, `hide`, `hideable` and `pure`. `tests/field_names.rs` has both, in a record and in variants, and runs the program.
+
+Found on the way, not fixed:
+
+- **A method call on a record literal does not parse.** `{ Current with x = 1 }.refreshed` is a parse error (`Expected keyword 'end', got RBrace`), so the record goes in a `let` first.
+- **A conversion from `I64` to `NAT` is `NAT.from_i64`.** `NUMBER_TEXT.magnitude` reads like one and is for negative numbers only; its `require` says so, and caught the slip.
+
+Tests: `tests/tablon.rs`, six, each a scripted session on the fixture of `tests/inspect/` in which the inspection's output is the fixture's expected object and each read the fixture's file, read by a VT terminal, with a resize to the same size at the end whose full redraw must equal the cells the diffs left. `the_inspection_fills_the_trees_and_enter_goes_from_a_feature_to_its_line` checks the commands sent (the inspection in the project's directory, `src` and `src/sub` listed, the module's file read), the tree, Output, the status bar, and `measure`'s line marked on blue across its row with lines before it. `every_view_of_a_module_shows_its_parts` takes each of the nine other views of `CELL` and the tab row scrolled to Suppliers. `enter_on_a_supplier_chooses_it_and_reads_its_file`, `the_files_tree_lists_directories_first_and_opens_a_file_as_text` (a CR dropped), `keys_work_while_the_inspection_runs_and_a_read_no_longer_awaited_is_dropped` (the views and the palette answer before the inspection ends; the first of two reads answered last is not shown), and `a_replay_reproduces_the_screen_with_no_process_run`.
+
+Mutations, each on a private copy: nine of Tablon, after a baseline that passes, all red: a read no longer awaited shown, a jump that marks no line, files before directories, subdirectories not listed, Enter on a supplier going nowhere, the tabs always drawn from the first, a CR kept at a line end, a part shown under every section, and clients that are the suppliers. The first survived the first round, as the stale read came before the one awaited and the last screen was right either way; the test now sends it last, and it is red. Three of the compiler fixes, after a baseline that passes, all red: any call of the routine's name taken for recursion, a field named like a built-in read as the built-in, and a reserved field bound by its own name.
+
+**F.11d, part two: check, build, run and edit.** ✅ Completed on 2026-11-13. `tools/tablon`, 19 modules, verifies with 0 errors and 0 warnings under `--strict` (about 4.5 minutes) and builds. With it, F.11d is complete: every acceptance item above holds (see the live checks below). `tools/tablon/README.md` tells how to build, run and use it.
+
+- [x] `/check` (Ctrl-K): `gardelc --project . --inspect --json-diagnostics`. Its errors and warnings go to Problems, titled `Problems (n)` and chosen when there is an error; Enter shows the line in Text, marked, and chooses its module. The modules are read again from the same run.
+- [x] `/build` (Ctrl-B): `gardelc --project . --json-diagnostics`. Its steps go to Build, then `Built EXE` or why there is none; its errors go to Problems.
+- [x] `/run [ARGS]` (Ctrl-R): a build, then the executable the build names, with `ARGS` split at spaces. An ordinary program runs with its output read into Run as it comes and the keys on an input line: Enter sends the line, Ctrl-D closes the input, Escape gives the keys back, Ctrl-X stops it. A reactive program runs attached, and Tablon draws again when it ends. Either way Run ends with the exit code. A failed build runs nothing.
+- [x] `/edit [EDITOR]` (Ctrl-E): the editor (Tablon's third argument, `vi` when not given) runs attached on the file shown; when it ends the file is read again and the project checked.
+- [x] `/stop` (Ctrl-X): the program run, else the build, else the check.
+- [x] The status bar's help is cut to the room what runs leaves, so `checking...` and the counts always show.
+
+How it works:
+
+- **One slot per process.** `PROC_SLOT` is idle, asked (the command is sent, no id yet) or running with its id and the output kept so far. The check, the build and the run each have one, and every process event is routed by the slot that holds its id, so a late line of a stopped build is dropped.
+- **Output is cut into lines as it comes.** `STREAM_LINES` keeps the last 500 lines and the bytes after the last line end; a line split across two pieces stays one line, and a rest longer than 4096 bytes is ended as a line.
+- **`gardelc`'s diagnostics are read by `DIAGNOSTICS`**, from the inspection's `diagnostics` field or the build's top-level array, into `PROBLEM`s (grade, rule, owner, routine, label, path, line, text). The build's note that names the executable, and the program's kind, come from the same list.
+- **The run follows the build.** `/run` sets `run_next` and starts a build; when the build ends with an executable, `start_run` runs it, attached when its kind is `reactive program`.
+
+Found on the way, in the compiler, fixed:
+
+- **A record bound by `let` had no type.** `let h = { Current with .. }` then `h.rest.length` was `E0199` (`invalid type for argument 0 in application of Seq_length: BYTES`): the local type inference gave a record literal or update no type, so the call went to the list's `length`. Both now have the module's own type. `tests/field_names.rs` gains a field `rest: BYTES` read through such a `let`.
+
+Found on the way, not fixed:
+
+- **A list's length has no upper bound in the proofs,** so `LIST_CUT.drop(ls, ls.length - 500)` cannot use an `ensure` guarded by `in_u64(n)`. Bounding it would be unsound, as `prepend` always adds one. `STREAM_LINES` counts its lines instead.
+- **A `let` that binds a name again at another type is `E0199`** (`cannot assign STRING to int`), the family already in the Roadmap.
+- **A program's standard output to a pipe is buffered,** so a prompt with no line end shows only when the buffer fills or the program ends. The README says so; flushing is the program's runtime's to do, not Tablon's.
+
+Tests: `tests/tablon.rs`, ten, the six of part one and four new. `a_check_lists_the_problems_and_enter_goes_to_the_line` (an error and a warning, the tab titled and chosen, the counts in the status bar, Enter to the line). `a_run_builds_then_streams_the_output_and_sends_the_input` (the build's command, the run's command from the build's note, output in pieces cut mid-line, a line typed and sent with its end, Ctrl-D, the exit code). `a_reactive_program_runs_attached_and_an_edit_is_read_again_and_checked`. `a_failed_build_runs_nothing_and_its_errors_go_to_problems`.
+
+Live checks, in a real console: on a scratch project with an ordinary program and a failing `require`, `/check` took 2.5 s and showed `Problems (1)`; Enter opened the line; after the fix Ctrl-R built and ran it, took a typed name and showed the greeting and `The program ended with code 0`. On `examples/todo_tui` (winpty, 110×30), Ctrl-R built it and gave it the terminal; `q` left it, and Tablon drew again with `The program ended with code 0`.
+
+Mutations, each on a private copy: thirteen, after a baseline that passes, all red. Twelve of Tablon: no diagnostics read, Enter on a problem going to the first line, each piece of output cut as its own lines, a run that does not follow its build, a reactive program not attached, a line sent without its end, keys not typed to the program, an edit not checked, warnings counted as errors, a failed build that runs, Ctrl-D ending nothing, and the Problems tab not chosen on an error. One of the compiler: a record literal with no type. Not tested: the help cut at narrow widths, seen only live.
 
 #### Task F.16: Editing in `gtui`
 

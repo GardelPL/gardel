@@ -1,0 +1,68 @@
+-- The lines of a list view of a module, each with where Enter takes it: a line of the module's
+-- source, from 1, or 0 for none, and a module to choose, or "" for none.
+module VIEW_LINES
+
+representation {NONE}
+  shown: LIST[STRING]
+  spots: LIST[NAT]
+  to: LIST[STRING]
+
+invariant
+  lines_each: spots.length = shown.length
+  targets_each: to.length = shown.length
+
+create {ANY}
+
+  empty: VIEW_LINES
+    do
+      { shown = LIST.empty, spots = LIST.empty, to = LIST.empty }
+    ensure
+      none: Result.count = 0
+    end
+
+  -- One line, which Enter takes nowhere.
+  note(text: STRING): VIEW_LINES
+    do
+      VIEW_LINES.empty.with(text, 0, "")
+    end
+
+feature {ANY}
+
+  count: NAT
+    do
+      Current.shown.length
+    end
+
+  lines: LIST[STRING]
+    do
+      Current.shown
+    end
+
+  -- A line after the last.
+  with(text: STRING, line: NAT, target: STRING): VIEW_LINES
+    do
+      { shown = Current.shown.append(LIST.empty.prepend(text)), spots = Current.spots.append(LIST.empty.prepend(line)),
+        to = Current.to.append(LIST.empty.prepend(target)) }
+    ensure
+      one_more: Result.count = Current.count + 1
+    end
+
+  -- The source line of line `i`, or 0.
+  line_of(i: NAT): NAT
+    do
+      if i < Current.spots.length then LIST_OPS.at(Current.spots, i) else 0 end
+    end
+
+  -- The module line `i` takes Enter to, or "".
+  target_of(i: NAT): STRING
+    do
+      if i < Current.to.length then LIST_OPS.at(Current.to, i) else "" end
+    end
+
+  -- These lines, or `text` alone when there are none.
+  or_note(text: STRING): VIEW_LINES
+    do
+      if Current.shown.length = 0 then VIEW_LINES.note(text) else Current end
+    end
+
+end

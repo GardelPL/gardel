@@ -1,0 +1,54 @@
+-- A row that a `TREE_VIEW` shows: the node's index in the tree's list, its depth, whether it
+-- has children and is open, and the line drawn for it.
+module TREE_ROW
+
+representation {NONE}
+  index: NAT
+  level: NAT
+  parent: BOOL
+  unfolded: BOOL
+  shown: STRING
+
+create {ANY}
+
+  make(node: NAT, depth: NAT, has_children: BOOL, open: BOOL, label: STRING): TREE_ROW
+    do
+      let marker = if has_children then (if open then "▾ " else "▸ " end) else "  " end
+      { index = node, level = depth, parent = has_children, unfolded = open,
+        shown = GLYPHS.join(GLYPHS.join(GLYPHS.spaces(if depth <= 32000 then 2 * depth else 64000 end), marker), label) }
+    ensure
+      node_set: Result.node = node
+      depth_set: Result.depth = depth
+      children_set: Result.has_children = has_children
+      open_set: Result.is_open = open
+    end
+
+feature {ANY}
+
+  node: NAT
+    do
+      Current.index
+    end
+
+  depth: NAT
+    do
+      Current.level
+    end
+
+  has_children: BOOL
+    do
+      Current.parent
+    end
+
+  is_open: BOOL
+    do
+      Current.unfolded
+    end
+
+  -- The label, after two spaces a level and `▸` or `▾` when the node has children.
+  line: STRING
+    do
+      Current.shown
+    end
+
+end

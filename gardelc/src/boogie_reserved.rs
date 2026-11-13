@@ -14,8 +14,20 @@ const RESERVED: &[&str] = &[
     "old", "var", "procedure", "function", "axiom", "type", "const", "requires", "ensures",
     "modifies", "returns", "call", "havoc", "assert", "while", "lambda", "int", "bool", "real",
     "break", "goto", "return", "free", "where", "unique", "complete", "extends", "finite",
-    "implementation", "div", "mod", "yield", "par", "async", "invariant",
+    "implementation", "div", "mod", "yield", "par", "async", "invariant", "assume", "uses",
+    "true", "false", "reveal", "hide", "hideable", "pure",
 ];
+
+/// The name a field takes where it is bound in the emitted Boogie, as a parameter of its
+/// constructor and in the constructor's axioms: the field's own, or, for one that Boogie
+/// reserves, such as `uses`, that name with `__f` after it, which no Gardel name holds (F.11d).
+pub(crate) fn field_binder(name: &str) -> String {
+    if is_reserved(name) {
+        format!("{name}__f")
+    } else {
+        name.to_string()
+    }
+}
 
 pub(crate) fn is_reserved(name: &str) -> bool {
     RESERVED.contains(&name)

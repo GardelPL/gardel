@@ -1,0 +1,47 @@
+-- A node of a `TREE_VIEW`: a label at a depth, open or closed. Whether it has children is
+-- where it stands in the tree's list, not a part of it.
+module TREE_NODE
+
+representation {NONE}
+  name: STRING
+  level: NAT
+  unfolded: BOOL
+
+create {ANY}
+
+  -- A closed node.
+  make(label: STRING, depth: NAT): TREE_NODE
+    do
+      { name = label, level = depth, unfolded = False }
+    ensure
+      depth_set: Result.depth = depth
+      closed: not Result.is_open
+    end
+
+feature {ANY}
+
+  label: STRING
+    do
+      Current.name
+    end
+
+  depth: NAT
+    do
+      Current.level
+    end
+
+  is_open: BOOL
+    do
+      Current.unfolded
+    end
+
+  -- Open when `open` is set, and closed otherwise.
+  set_open(open: BOOL): TREE_NODE
+    do
+      { Current with unfolded = open }
+    ensure
+      set: Result.is_open = open
+      depth_same: Result.depth = Current.depth
+    end
+
+end

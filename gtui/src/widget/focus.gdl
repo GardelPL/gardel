@@ -1,0 +1,86 @@
+-- Which of `count` panes has the keys, numbered from 0. Tab moves to the next, and from the
+-- last back to the first. An application gives each key to the pane that has them, and draws
+-- that pane's `FRAME` in a style of its own.
+module FOCUS
+
+representation {NONE}
+  panes: NAT
+  holder: NAT
+
+invariant
+  a_pane: holder < panes
+
+create {ANY}
+
+  -- `n` panes, at least one, the first with the keys.
+  make(n: NAT): FOCUS
+    do
+      { panes = if n > 0 then n else 1 end, holder = 0 }
+    ensure
+      first: Result.current = 0
+      count_set: n > 0 implies Result.count = n
+    end
+
+feature {ANY}
+
+  count: NAT
+    do
+      Current.panes
+    ensure
+      some: Result >= 1
+    end
+
+  -- The pane that has the keys.
+  current: NAT
+    do
+      Current.holder
+    ensure
+      a_pane: Result < Current.count
+    end
+
+  -- Whether pane `i` has the keys.
+  has(i: NAT): BOOL
+    do
+      Current.holder = i
+    ensure
+      def: Result = (Current.current = i)
+    end
+
+  -- The keys to the next pane, or from the last to the first.
+  next: FOCUS
+    do
+      { Current with holder = if Current.holder + 1 < Current.panes then Current.holder + 1 else 0 end }
+    ensure
+      same_count: Result.count = Current.count
+      moved: Result.current = (if Current.current + 1 < Current.count then Current.current + 1 else 0 end)
+    end
+
+  -- The keys to the pane before, or from the first to the last.
+  previous: FOCUS
+    do
+      { Current with holder = if Current.holder > 0 then Current.holder - 1 else Current.panes - 1 end }
+    ensure
+      same_count: Result.count = Current.count
+    end
+
+  -- The keys to pane `i`, or where they are when there is no pane `i`.
+  moved_to(i: NAT): FOCUS
+    do
+      if i < Current.panes then { Current with holder = i } else Current end
+    ensure
+      same_count: Result.count = Current.count
+      moved: i < Current.count implies Result.current = i
+    end
+
+  -- Tab gives the keys to the next pane; other keys change nothing.
+  on_key(k: KEY): FOCUS
+    do
+      match k
+        case Tab then Current.next
+        case _ then Current
+      end
+    ensure
+      same_count: Result.count = Current.count
+    end
+
+end

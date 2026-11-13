@@ -24,6 +24,24 @@ feature {ANY}
       end
     end
 
+  -- How many of `cmds` run a child attached.
+  attaching(cmds: LIST[COMMAND]): NAT
+    variant
+      cmds.length
+    do
+      if cmds.length = 0 then
+        0
+      else
+        let n = TUI_COMMANDS.attaching(cmds.tail)
+        match cmds.head
+          case RunAttached(_, _, _, _) then if n < 18446744073709551615 then n + 1 else n end
+          case _ then n
+        end
+      end
+    ensure
+      not_more: Result <= cmds.length
+    end
+
   -- A read of the next key after a key, until keys end; nothing after any other event.
   reads_after(e: EVENT): LIST[COMMAND]
     do

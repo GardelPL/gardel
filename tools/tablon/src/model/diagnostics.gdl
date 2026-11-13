@@ -1,0 +1,111 @@
+-- The diagnostics of a `gardelc` run, read from its JSON: under `diagnostics` in the object of
+-- `--inspect --json-diagnostics`, or the array a build prints with `--json-diagnostics`. As in
+-- `INSPECTION`, a field that is missing or of another type reads as empty.
+functions DIAGNOSTICS
+
+feature {ANY}
+
+  -- The diagnostics of the inspection's object in `b`, or none when `b` is not one.
+  of_inspection(b: BYTES): OPTION[LIST[PROBLEM]]
+    do
+      match JSON.parse(b)
+        case Ok(j) then
+          match j.field("diagnostics")
+            case Some(a) then Some(DIAGNOSTICS.problems_from(a, 0))
+            case None then Some(LIST.empty)
+          end
+        case Error(_) then None
+      end
+    end
+
+  -- The diagnostics of a build's array in `b`, or none when `b` is not one.
+  of_build(b: BYTES): OPTION[LIST[PROBLEM]]
+    do
+      match JSON.parse(b)
+        case Ok(a) then Some(DIAGNOSTICS.problems_from(a, 0))
+        case Error(_) then None
+      end
+    end
+
+  -- The diagnostics among the items of `a` from item `i` on.
+  problems_from(a: JSON, i: NAT): LIST[PROBLEM]
+    variant
+      a.count - i
+    do
+      if i >= a.count then
+        LIST.empty
+      else
+        let rest = DIAGNOSTICS.problems_from(a, i + 1)
+        match a.item(i)
+          case Some(d) then rest.prepend(DIAGNOSTICS.problem_of(d))
+          case None then rest
+        end
+      end
+    end
+
+  problem_of(d: JSON): PROBLEM
+    do
+      let file = match d.field("span")
+        case Some(sp) then INSPECTION.text(sp, "file")
+        case None then ""
+      end
+      let line = match d.field("span")
+        case Some(sp) then INSPECTION.number(sp, "line")
+        case None then 0
+      end
+      PROBLEM.make(INSPECTION.text(d, "level"), INSPECTION.text(d, "rule"), INSPECTION.text(d, "module"),
+        INSPECTION.text(d, "routine"), INSPECTION.text(d, "tag"), file, line, INSPECTION.text(d, "message"))
+    end
+
+  -- The executable a build's note names, or "" when there is none.
+  executable(ps: LIST[PROBLEM]): STRING
+    variant
+      ps.length
+    do
+      if ps.length = 0 then ""
+      else if ps.head.names_executable then ps.head.file
+      else DIAGNOSTICS.executable(ps.tail)
+      end end
+    end
+
+  -- The module of the program a build's note names, or "".
+  program(ps: LIST[PROBLEM]): STRING
+    variant
+      ps.length
+    do
+      if ps.length = 0 then ""
+      else if ps.head.names_executable then ps.head.module_name
+      else DIAGNOSTICS.program(ps.tail)
+      end end
+    end
+
+  -- `ps` without notes: what Problems lists.
+  problems(ps: LIST[PROBLEM]): LIST[PROBLEM]
+    do
+      LIST_OPS.filter(ps, fn(p: PROBLEM): BOOL do not p.level.equals("note") end)
+    end
+
+  errors(ps: LIST[PROBLEM]): NAT
+    do
+      LIST_OPS.filter(ps, fn(p: PROBLEM): BOOL do p.is_error end).length
+    end
+
+  warnings(ps: LIST[PROBLEM]): NAT
+    do
+      LIST_OPS.filter(ps, fn(p: PROBLEM): BOOL do p.is_warning end).length
+    end
+
+  -- `n` and `word`, with an `s` when `n` is not 1: `1 error`, `2 errors`.
+  counted(n: NAT, word: STRING): STRING
+    do
+      GLYPHS.join(GLYPHS.join(NUMBER_TEXT.nat_to_text(n), " "), if n = 1 then word else GLYPHS.join(word, "s") end)
+    end
+
+  -- How many errors and warnings `ps` has, as text: `2 errors, 1 warning`.
+  tally(ps: LIST[PROBLEM]): STRING
+    do
+      GLYPHS.join(GLYPHS.join(DIAGNOSTICS.counted(DIAGNOSTICS.errors(ps), "error"), ", "),
+        DIAGNOSTICS.counted(DIAGNOSTICS.warnings(ps), "warning"))
+    end
+
+end

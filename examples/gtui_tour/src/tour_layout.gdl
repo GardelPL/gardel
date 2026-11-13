@@ -1,0 +1,47 @@
+-- Where the tour's panes are on a screen: the project on the left, the source on the right,
+-- and the output at the bottom, eight rows high. `update` asks it for the heights it pages by,
+-- and `view` for where to draw, so both agree.
+functions TOUR_LAYOUT
+
+feature {ANY}
+
+  -- The left, right and bottom panes of `area`.
+  panes(area: RECT): LIST[RECT]
+    do
+      let down: LIST[SIZE] = LIST.empty.prepend(SIZE.fixed(8)).prepend(SIZE.flex(1))
+      let parts = LAYOUT.rows(area, down)
+      let across: LIST[SIZE] = LIST.empty.prepend(SIZE.flex(1)).prepend(SIZE.fixed(30))
+      let columns = LAYOUT.columns(LIST_OPS.at(parts, 0), across)
+      LIST.empty.prepend(LIST_OPS.at(parts, 1)).prepend(LIST_OPS.at(columns, 1)).prepend(LIST_OPS.at(columns, 0))
+    ensure
+      three: Result.length = 3
+    end
+
+  left(area: RECT): RECT
+    do
+      LIST_OPS.at(TOUR_LAYOUT.panes(area), 0)
+    end
+
+  right(area: RECT): RECT
+    do
+      LIST_OPS.at(TOUR_LAYOUT.panes(area), 1)
+    end
+
+  bottom(area: RECT): RECT
+    do
+      LIST_OPS.at(TOUR_LAYOUT.panes(area), 2)
+    end
+
+  -- The rows inside a pane's frame.
+  rows_in(r: RECT): NAT
+    do
+      FRAME.inner(r).height
+    end
+
+  -- Where the palette goes: over the bottom of the screen, at most 64 wide and 12 high.
+  palette(area: RECT, p: PALETTE): RECT
+    do
+      p.place(area, 64, 12)
+    end
+
+end

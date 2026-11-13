@@ -1,0 +1,143 @@
+-- The Modules tree: the project's package first, then each dependency in the order the
+-- inspection names them, under each the kinds of module it declares, and under each kind its
+-- modules. The project's package starts open, and the dependencies closed.
+functions MODULE_TREE
+
+feature {ANY}
+
+  -- The nodes of the tree of `ms`.
+  nodes(ms: LIST[MODULE_INFO]): LIST[TREE_NODE]
+    do
+      LIST_OPS.map(MODULE_TREE.items(ms), fn(x: TREE_ITEM): TREE_NODE do x.node end)
+    end
+
+  -- What each node of the tree of `ms` stands for: a module's name, or a group.
+  entries(ms: LIST[MODULE_INFO]): LIST[TREE_ENTRY]
+    do
+      LIST_OPS.map(MODULE_TREE.items(ms), fn(x: TREE_ITEM): TREE_ENTRY do x.entry end)
+    end
+
+  items(ms: LIST[MODULE_INFO]): LIST[TREE_ITEM]
+    do
+      let own = MODULE_TREE.own_package(ms)
+      let first: LIST[STRING] = LIST.empty
+      let ps = MODULE_TREE.distinct(ms, if own.is_empty then first else first.prepend(own) end)
+      MODULE_TREE.package_items(ms, ps, own)
+    end
+
+  -- The package of the first of `ms` that is the project's own, or "".
+  own_package(ms: LIST[MODULE_INFO]): STRING
+    variant
+      ms.length
+    do
+      if ms.length = 0 then ""
+      else if ms.head.is_own then ms.head.package
+      else MODULE_TREE.own_package(ms.tail)
+      end end
+    end
+
+  -- `acc` followed by the packages of `ms` that are not in it, each once, in order.
+  distinct(ms: LIST[MODULE_INFO], acc: LIST[STRING]): LIST[STRING]
+    variant
+      ms.length
+    do
+      if ms.length = 0 then
+        acc
+      else
+        let p = ms.head.package
+        MODULE_TREE.distinct(ms.tail, if MODULE_TREE.has(acc, p) then acc else acc.append(LIST.empty.prepend(p)) end)
+      end
+    end
+
+  has(xs: LIST[STRING], s: STRING): BOOL
+    variant
+      xs.length
+    do
+      if xs.length = 0 then False
+      else if xs.head.equals(s) then True
+      else MODULE_TREE.has(xs.tail, s)
+      end end
+    end
+
+  kinds: LIST[STRING]
+    do
+      LIST.empty.prepend("functions").prepend("module").prepend("program").prepend("reactive program")
+    end
+
+  -- The label of the group of modules of kind `k`.
+  group_label(k: STRING): STRING
+    do
+      if k.equals("reactive program") then "reactive programs"
+      else if k.equals("program") then "programs"
+      else if k.equals("module") then "modules"
+      else k
+      end end end
+    end
+
+  -- The nodes of the packages `ps`, the package `own` open.
+  package_items(ms: LIST[MODULE_INFO], ps: LIST[STRING], own: STRING): LIST[TREE_ITEM]
+    variant
+      ps.length
+    do
+      if ps.length = 0 then
+        LIST.empty
+      else
+        let p = ps.head
+        let open = p.equals(own)
+        let label = if p.is_empty then "project" else p end
+        LIST.empty.prepend(TREE_ITEM.make(label, 0, open, TREE_ENTRY.group))
+          .append(MODULE_TREE.kind_items(ms, p, MODULE_TREE.kinds, open))
+          .append(MODULE_TREE.package_items(ms, ps.tail, own))
+      end
+    end
+
+  -- The groups of the package `p`, one for each of the kinds `ks` it has modules of.
+  kind_items(ms: LIST[MODULE_INFO], p: STRING, ks: LIST[STRING], open: BOOL): LIST[TREE_ITEM]
+    variant
+      ks.length
+    do
+      if ks.length = 0 then
+        LIST.empty
+      else
+        let these = MODULE_TREE.of_kind(ms, p, ks.head)
+        let rest = MODULE_TREE.kind_items(ms, p, ks.tail, open)
+        if these.length = 0 then
+          rest
+        else
+          LIST.empty.prepend(TREE_ITEM.make(MODULE_TREE.group_label(ks.head), 1, open, TREE_ENTRY.group))
+            .append(LIST_OPS.map(these, fn(m: MODULE_INFO): TREE_ITEM do
+              TREE_ITEM.make(m.name, 2, False, TREE_ENTRY.make(m.name, False)) end))
+            .append(rest)
+        end
+      end
+    end
+
+  -- The modules of `ms` in package `p` of kind `k`.
+  of_kind(ms: LIST[MODULE_INFO], p: STRING, k: STRING): LIST[MODULE_INFO]
+    do
+      LIST_OPS.filter(ms, fn(m: MODULE_INFO): BOOL do m.package.equals(p) and m.kind.equals(k) end)
+    end
+
+  -- The module of `ms` named `name`.
+  named(ms: LIST[MODULE_INFO], name: STRING): OPTION[MODULE_INFO]
+    variant
+      ms.length
+    do
+      if ms.length = 0 then None
+      else if ms.head.name.equals(name) then Some(ms.head)
+      else MODULE_TREE.named(ms.tail, name)
+      end end
+    end
+
+  -- The module of `ms` whose file is `file`.
+  of_file(ms: LIST[MODULE_INFO], file: STRING): OPTION[MODULE_INFO]
+    variant
+      ms.length
+    do
+      if ms.length = 0 then None
+      else if ms.head.file.equals(file) then Some(ms.head)
+      else MODULE_TREE.of_file(ms.tail, file)
+      end end
+    end
+
+end

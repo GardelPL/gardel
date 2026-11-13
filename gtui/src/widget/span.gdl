@@ -1,0 +1,38 @@
+-- A run of a line's characters drawn in a style of their own: `length` characters from
+-- character `start`, both counted in characters from 0. A lexer gives the spans of a line,
+-- and `TEXT_VIEW.draw_code` draws them over its text, a later span over an earlier one.
+module SPAN
+
+representation {NONE}
+  offset: NAT
+  size: NAT
+  look: STYLE
+
+create {ANY}
+
+  make(start: NAT, length: NAT, style: STYLE): SPAN
+    do
+      { offset = start, size = length, look = style }
+    ensure
+      start_set: Result.start = start
+      length_set: Result.length = length
+    end
+
+feature {ANY}
+
+  start: NAT
+    do
+      Current.offset
+    end
+
+  length: NAT
+    do
+      Current.size
+    end
+
+  style: STYLE
+    do
+      Current.look
+    end
+
+end

@@ -1,0 +1,312 @@
+-- The tour's state: which pane has the keys, the project's two trees under their tabs, the
+-- source with its marked line, the output and the problems under theirs, the command palette,
+-- and the screen's size, from which the panes' heights are found.
+module TOUR_STATE
+
+representation {NONE}
+  wide: NAT
+  high: NAT
+  keys_at: FOCUS
+  left_tabs: TABS
+  module_tree: TREE_VIEW
+  file_tree: TREE_VIEW
+  source: TEXT_VIEW
+  mark_line: OPTION[NAT]
+  low_tabs: TABS
+  issues: LIST_VIEW
+  issue_lines: LIST[NAT]
+  log: LIST[STRING]
+  commands: PALETTE
+  commands_open: BOOL
+  child: STRING
+
+create {ANY}
+
+  -- The tour, with `program` as the program `/shell` runs attached, none when it is "".
+  make(program: STRING): TOUR_STATE
+    do
+      { wide = 80, high = 24, keys_at = FOCUS.make(3),
+        left_tabs = TABS.empty.with("Modules", 'm').with("Files", 'f'),
+        module_tree = TREE_VIEW.make(TOUR_STATE.module_nodes),
+        file_tree = TREE_VIEW.make(TOUR_STATE.file_nodes),
+        source = TEXT_VIEW.make(TOUR_STATE.sample),
+        mark_line = None,
+        low_tabs = TABS.empty.with("Output", 'o').with("Problems (3)", 'p'),
+        issues = LIST_VIEW.make(LIST.empty
+          .prepend("tabs.gdl:32  within may fail in key_index")
+          .prepend("tabs.gdl:29  overflow_add in key_index")
+          .prepend("tabs.gdl:11  a_tab may fail in on_key")),
+        issue_lines = LIST.empty.prepend(31).prepend(28).prepend(10),
+        log = LIST.empty.prepend("Tab moves between panes; / opens the commands; q quits."),
+        commands = PALETTE.make(TOUR_STATE.palette_entries),
+        commands_open = False,
+        child = program }
+    end
+
+  palette_entries: LIST[PALETTE_ENTRY]
+    do
+      LIST.empty
+        .prepend(PALETTE_ENTRY.make("top", "the source from its first line"))
+        .prepend(PALETTE_ENTRY.make("shell", "[ARGS] run the program given to the tour, attached"))
+        .prepend(PALETTE_ENTRY.make("quit", "leave the tour"))
+        .prepend(PALETTE_ENTRY.make("clear", "empty the output"))
+    end
+
+  module_nodes: LIST[TREE_NODE]
+    do
+      LIST.empty
+        .prepend(TREE_NODE.make("EVENT", 1))
+        .prepend(TREE_NODE.make("KEY", 1))
+        .prepend(TREE_NODE.make("prelude", 0))
+        .prepend(TREE_NODE.make("TREE_VIEW", 2))
+        .prepend(TREE_NODE.make("TABS", 2))
+        .prepend(TREE_NODE.make("FRAME", 2))
+        .prepend(TREE_NODE.make("widget", 1))
+        .prepend(TREE_NODE.make("STYLE", 2))
+        .prepend(TREE_NODE.make("SCREEN", 2))
+        .prepend(TREE_NODE.make("COLOR", 2))
+        .prepend(TREE_NODE.make("CELL", 2))
+        .prepend(TREE_NODE.make("screen", 1))
+        .prepend(TREE_NODE.make("gtui", 0).set_open(True))
+    end
+
+  file_nodes: LIST[TREE_NODE]
+    do
+      LIST.empty
+        .prepend(TREE_NODE.make("tabs.gdl", 2))
+        .prepend(TREE_NODE.make("frame.gdl", 2))
+        .prepend(TREE_NODE.make("widget", 1))
+        .prepend(TREE_NODE.make("color.gdl", 2))
+        .prepend(TREE_NODE.make("screen", 1))
+        .prepend(TREE_NODE.make("src", 0).set_open(True))
+    end
+
+  sample: LIST[STRING]
+    do
+      LIST.empty
+        .prepend("end")
+        .prepend("")
+        .prepend("    end")
+        .prepend("      within: Result <= keys.length")
+        .prepend("    ensure")
+        .prepend("      end end")
+        .prepend("      else 1 + TABS.key_index(keys.tail, c)")
+        .prepend("      else if keys.head = c then 0")
+        .prepend("      if keys.length = 0 then 0")
+        .prepend("    do")
+        .prepend("      keys.length")
+        .prepend("    variant")
+        .prepend("  key_index(keys: LIST[CHAR], c: CHAR): NAT")
+        .prepend("  -- The index of the first of `keys` that is `c`.")
+        .prepend("")
+        .prepend("    end")
+        .prepend("      none: Result.count = 0")
+        .prepend("    ensure")
+        .prepend("      { names = LIST.empty, hot = LIST.empty, picked = 0 }")
+        .prepend("    do")
+        .prepend("  empty: TABS")
+        .prepend("")
+        .prepend("create {ANY}")
+        .prepend("")
+        .prepend("  a_tab: picked < names.length or (names.length = 0 and picked = 0)")
+        .prepend("  one_key_each: hot.length = names.length")
+        .prepend("invariant")
+        .prepend("")
+        .prepend("  picked: NAT")
+        .prepend("  hot: LIST[CHAR]")
+        .prepend("  names: LIST[STRING]")
+        .prepend("representation {NONE}")
+        .prepend("")
+        .prepend("module TABS")
+        .prepend("-- A row of titles, one of them chosen, each with a key that chooses it.")
+    end
+
+  -- Line `i` of `ns`, or 0 when there is none.
+  nth(ns: LIST[NAT], i: NAT): NAT
+    do
+      if i < ns.length then LIST_OPS.at(ns, i) else 0 end
+    end
+
+feature {ANY}
+
+  focus: FOCUS
+    do
+      Current.keys_at
+    end
+
+  project_tabs: TABS
+    do
+      Current.left_tabs
+    end
+
+  output_tabs: TABS
+    do
+      Current.low_tabs
+    end
+
+  -- The tree under the tab chosen on the left.
+  tree: TREE_VIEW
+    do
+      if Current.left_tabs.selected = 0 then Current.module_tree else Current.file_tree end
+    end
+
+  text: TEXT_VIEW
+    do
+      Current.source
+    end
+
+  marked: OPTION[NAT]
+    do
+      Current.mark_line
+    end
+
+  problems: LIST_VIEW
+    do
+      Current.issues
+    end
+
+  output: LIST[STRING]
+    do
+      Current.log
+    end
+
+  palette: PALETTE
+    do
+      Current.commands
+    end
+
+  palette_open: BOOL
+    do
+      Current.commands_open
+    end
+
+  area: RECT
+    do
+      RECT.sized(Current.wide, Current.high)
+    end
+
+  -- The title of the source's frame: the node chosen in the tree, and the view.
+  title: STRING
+    do
+      match Current.module_tree.selected
+        case Some(r) then GLYPHS.join(TOUR_STATE.label_of(Current.module_tree, r.node), " Text")
+        case None then "Text"
+      end
+    end
+
+  -- Of a size `w` by `h`.
+  sized(w: NAT, h: NAT): TOUR_STATE
+    do
+      { Current with wide = w, high = h }
+    end
+
+  -- `line` added to the output, the last 200 lines kept.
+  logged(line: STRING): TOUR_STATE
+    do
+      { Current with log = LIST_CUT.take(Current.log.append(LIST.empty.prepend(line)), 200) }
+    end
+
+  -- A key, when the palette is closed.
+  browse(k: KEY): TUI_NEXT[TOUR_STATE]
+    do
+      match k
+        case Char(c) then
+          if c = 'q' then TUI_NEXT.quit(0)
+          else if c = '/' then TUI_NEXT.next({ Current with commands = PALETTE.make(TOUR_STATE.palette_entries), commands_open = True })
+          else TUI_NEXT.next(Current.in_pane(k))
+          end end
+        case Tab then TUI_NEXT.next({ Current with keys_at = Current.keys_at.next })
+        case KeysEnded then TUI_NEXT.quit(0)
+        case _ then TUI_NEXT.next(Current.in_pane(k))
+      end
+    end
+
+  -- A key given to the pane that has the keys.
+  in_pane(k: KEY): TOUR_STATE
+    do
+      let a = Current.area
+      if Current.keys_at.current = 0 then
+        let rows = TOUR_LAYOUT.rows_in(TOUR_LAYOUT.left(a))
+        if Current.left_tabs.takes(k) then
+          { Current with left_tabs = Current.left_tabs.on_key(k) }
+        else if Current.left_tabs.selected = 0 then
+          match k
+            case Enter then { Current with module_tree = Current.module_tree.toggled(rows) }
+            case _ then { Current with module_tree = Current.module_tree.on_key(k, rows) }
+          end
+        else
+          match k
+            case Enter then { Current with file_tree = Current.file_tree.toggled(rows) }
+            case _ then { Current with file_tree = Current.file_tree.on_key(k, rows) }
+          end
+        end end
+      else if Current.keys_at.current = 1 then
+        { Current with source = Current.source.on_key(k, TOUR_LAYOUT.rows_in(TOUR_LAYOUT.right(a))) }
+      else
+        let rows = TOUR_LAYOUT.rows_in(TOUR_LAYOUT.bottom(a))
+        if Current.low_tabs.takes(k) then
+          { Current with low_tabs = Current.low_tabs.on_key(k) }
+        else if Current.low_tabs.selected = 1 then
+          match k
+            case Enter then
+              let line = TOUR_STATE.nth(Current.issue_lines, Current.issues.selected)
+              let text_rows = TOUR_LAYOUT.rows_in(TOUR_LAYOUT.right(a))
+              { Current with mark_line = Some(line), source = Current.source.showing(line, text_rows),
+                keys_at = Current.keys_at.moved_to(1) }
+            case _ then { Current with issues = Current.issues.on_key(k, rows) }
+          end
+        else
+          Current
+        end end
+      end end
+    end
+
+  -- A key, when the palette is open: Escape closes it, Enter runs the command chosen, and
+  -- the rest go to the palette.
+  in_palette(k: KEY): TUI_NEXT[TOUR_STATE]
+    do
+      match k
+        case Escape then TUI_NEXT.next({ Current with commands_open = False })
+        case Enter then
+          let closed = { Current with commands_open = False }
+          match Current.commands.chosen
+            case Some(e) then closed.run(e.name, Current.commands.arguments)
+            case None then TUI_NEXT.next(closed.logged(GLYPHS.join("No command named ", Current.commands.command)))
+          end
+        case KeysEnded then TUI_NEXT.quit(0)
+        case _ then
+          let p = TOUR_LAYOUT.palette(Current.area, Current.commands)
+          TUI_NEXT.next({ Current with commands = Current.commands.on_key(k, if p.height >= 3 then p.height - 3 else 0 end) })
+      end
+    end
+
+  -- The command `name` run with `args`.
+  run(name: STRING, args: STRING): TUI_NEXT[TOUR_STATE]
+    do
+      if name.equals("quit") then
+        TUI_NEXT.quit(0)
+      else if name.equals("clear") then
+        TUI_NEXT.next({ Current with log = LIST.empty })
+      else if name.equals("top") then
+        TUI_NEXT.next({ Current with source = Current.source.scrolled_to(0, 1) })
+      else if name.equals("shell") then
+        if Current.child.is_empty then
+          TUI_NEXT.next(Current.logged("No program was given to the tour to run."))
+        else
+          let argv: LIST[STRING] = if args.is_empty then LIST.empty else LIST.empty.prepend(args) end
+          Next(Current.logged(GLYPHS.join("Running ", Current.child)), LIST.empty.prepend(RunAttached(1, Current.child, argv, "")))
+        end
+      else
+        TUI_NEXT.next(Current.logged(GLYPHS.join("Unknown command ", name)))
+      end end end end
+    end
+
+create {ANY}
+
+  -- The label of node `i` of the tree `t`, or "".
+  label_of(t: TREE_VIEW, i: NAT): STRING
+    do
+      if i < t.nodes.length then LIST_OPS.at(t.nodes, i).label else "" end
+    end
+
+end

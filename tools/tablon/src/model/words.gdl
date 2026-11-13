@@ -1,0 +1,23 @@
+-- Text cut into words at spaces, as the arguments of `/run` and the editor's command line are:
+-- no quoting, and no empty word.
+functions WORDS
+
+feature {ANY}
+
+  of(s: STRING): LIST[STRING]
+    do
+      LIST_OPS.filter(s.split(' '), fn(w: STRING): BOOL do not w.is_empty end)
+    end
+
+  -- The words joined by one space.
+  joined(ws: LIST[STRING]): STRING
+    variant
+      ws.length
+    do
+      if ws.length = 0 then ""
+      else if ws.length = 1 then ws.head
+      else GLYPHS.join(GLYPHS.join(ws.head, " "), WORDS.joined(ws.tail))
+      end end
+    end
+
+end

@@ -85,6 +85,31 @@ feature {ANY}
       if out.length > 1000000000000 or s.byte_length > 1000000000000 then out else out.add_text(s) end
     end
 
+  -- `n` spaces, or 65535 when `n` is more.
+  spaces(n: NAT): STRING
+    do
+      let k = if n <= 65535 then n else 65535 end
+      let none: LIST[CHAR] = LIST.empty
+      GLYPHS.text_of(LIST_CUT.repeat(' ', k, none))
+    end
+
+  -- The text of the characters `cs`.
+  text_of(cs: LIST[CHAR]): STRING
+    do
+      match STRING.from_utf8(GLYPHS.encode(cs, BYTES_BUILDER.empty).to_bytes)
+        case Ok(s) then s
+        case Error(_) then ""
+      end
+    end
+
+  -- `out` with the UTF-8 bytes of `cs`.
+  encode(cs: LIST[CHAR], out: BYTES_BUILDER): BYTES_BUILDER
+    variant
+      cs.length
+    do
+      if cs.length = 0 then out else GLYPHS.encode(cs.tail, GLYPHS.add_char(out, cs.head)) end
+    end
+
   -- `a` followed by `b`, or `a` alone when together they would not fit a `STRING`.
   join(a: STRING, b: STRING): STRING
     do
