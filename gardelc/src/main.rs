@@ -4,7 +4,7 @@
 )]
 #![expect(missing_debug_implementations, reason = "Internal compiler types")]
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::env;
 use std::fmt;
 use std::fs;
@@ -4902,6 +4902,11 @@ pub fn prelude_mode_enabled(stdlib_only: bool, no_prelude: bool) -> bool {
 
 /// Span of the declaration header `<kw> <name>` (e.g. `module STACK`) in `src`.
 fn locate_decl_header(src: &str, input_path: &str, kw: &str, name: &str) -> Span {
+    find_decl_header(src, input_path, kw, name).unwrap_or_else(|| Span::unknown(input_path))
+}
+
+/// The line that declares `kw name`, if the source has one.
+fn find_decl_header(src: &str, input_path: &str, kw: &str, name: &str) -> Option<Span> {
     let header = format!("{kw} {}", resolve::source_spelling(name));
     for (idx, line) in src.lines().enumerate() {
         let t = line.trim_start();
@@ -4912,16 +4917,16 @@ fn locate_decl_header(src: &str, input_path: &str, kw: &str, name: &str) -> Span
                 .is_some_and(|c| c.is_ascii_alphanumeric() || c == '_')
         {
             let col = line.len() - t.len() + 1;
-            return Span {
+            return Some(Span {
                 file: input_path.to_string(),
                 line: idx + 1,
                 column: col,
                 end_line: idx + 1,
                 end_column: line.len().max(col),
-            };
+            });
         }
     }
-    Span::unknown(input_path)
+    None
 }
 
 /// Top-level declarations of a file: `(name, keyword)` for concepts and modules.
@@ -14401,6 +14406,41 @@ impl GardelVal {
     }
 }
 /// Translates raw Z3 / Boogie model text into Gardel record and variant syntax (§12).
+/// The names a counterexample of `routine` can give values to: its parameters, `Current`,
+/// `Result` and the names it binds with `let`. Empty when `m` has no such routine or law.
+fn routine_scope_names(m: &ModuleDecl, routine: &str) -> HashSet<String> {
+    let mut names: HashSet<String> = HashSet::new();
+    let lets = |stmts: &[Stmt], body: Option<&Expr>, names: &mut HashSet<String>| {
+        for s in stmts {
+            if let Stmt::Let(n, _) = s {
+                names.insert(n.clone());
+            }
+        }
+        // `let`s inside branches, as the body prints them.
+        if let Some(text) = body.map(format_gardel_expr) {
+            for part in text.split("let ").skip(1) {
+                let n: String = part.chars().take_while(|c| c.is_ascii_alphanumeric() || *c == '_').collect();
+                if !n.is_empty() {
+                    names.insert(n);
+                }
+            }
+        }
+    };
+    let routines = m.create_routines.iter().chain(&m.feature_routines).chain(&m.specify_routines);
+    if let Some((_, r)) = routines.into_iter().find(|(_, r)| r.name == routine) {
+        names.extend(r.params.iter().map(|(n, _)| n.clone()));
+        lets(&r.stmts, Some(&r.body), &mut names);
+    } else if let Some((_, law)) = m.specify_laws.iter().find(|(_, l)| l.name == routine || routine.ends_with(&format!("_{}", l.name))) {
+        names.extend(law.params.iter().map(|(n, _)| n.clone()));
+        lets(&law.stmts, law.body.as_ref(), &mut names);
+    } else {
+        return names;
+    }
+    names.insert("Current".to_string());
+    names.insert("Result".to_string());
+    names
+}
+
 pub fn translate_z3_model_to_gardel(raw_model: &str, m: &ModuleDecl) -> BTreeMap<String, String> {
     let mut out = BTreeMap::new();
     for line in raw_model.lines() {
@@ -14672,6 +14712,10 @@ fn verify_unless_cached(
     input_path: &str,
 ) -> Result<Vec<Diagnostic>, String> {
     let run = || run_boogie_verification(m, fuel_limit, boogie_path, z3_path, src, input_path);
+    // A type check proves nothing, so it must never be stored as a proof.
+    if TYPES_ONLY.with(|t| t.get()) {
+        return run();
+    }
     let Some(cache) = PROOF_CACHE.with(|c| c.borrow().clone()) else {
         return run();
     };
@@ -14782,6 +14826,16 @@ thread_local! {
     static BOOGIE_Z3_SEED: std::cell::RefCell<Option<u32>> = const { std::cell::RefCell::new(None) };
     /// Z3 resource limit override for Boogie verification.
     static BOOGIE_Z3_RLIMIT: std::cell::RefCell<Option<u64>> = const { std::cell::RefCell::new(None) };
+    /// `--no-verify`: Boogie resolves and type checks each module and proves nothing.
+    static TYPES_ONLY: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Runs `f` with Boogie type checking only (`--no-verify`), proving nothing.
+pub fn with_types_only<R>(on: bool, f: impl FnOnce() -> R) -> R {
+    let prev = TYPES_ONLY.with(|t| t.replace(on));
+    let res = f();
+    TYPES_ONLY.with(|t| t.set(prev));
+    res
 }
 
 /// Z3 resources allowed per Boogie procedure. Unlike a time limit it counts solver work, so
@@ -14930,6 +14984,9 @@ fn run_boogie_verification_once(
     cmd.arg(format!("/timeLimit:{backstop}"));
     cmd.arg("/mv:-");
     cmd.arg("/errorTrace:0");
+    if TYPES_ONLY.with(|t| t.get()) {
+        cmd.arg("/noVerify");
+    }
     cmd.arg(&temp_path);
 
     let output = output_within(&mut cmd, std::time::Duration::from_secs(backstop.into()))
@@ -15091,7 +15148,15 @@ pub fn parse_boogie_output(
             }
 
             let (routine, rule_kind, tag) = parse_msg_tag(msg_line);
-            let cex = translate_z3_model_to_gardel(&raw_model, m);
+            let mut cex = translate_z3_model_to_gardel(&raw_model, m);
+            // Z3's model also holds every function of the encoding; a reader wants the values
+            // of the routine's own names.
+            let scope = routine_scope_names(m, &routine);
+            // A refutation always carries a counterexample (§12), so a model with none of those
+            // names is given whole.
+            if cex.keys().any(|k| scope.contains(k)) {
+                cex.retain(|k, _| scope.contains(k));
+            }
             let sp = locate_span(src, input_path, &tag, &routine);
             let lemmas = find_relevant_lemmas_for_tag(m, &routine, &tag);
             let pcs = collect_routine_path_conditions(m, &routine, &tag);
@@ -18814,6 +18879,267 @@ pub fn format_module_interface(raw_m: &ModuleDecl) -> String {
     out
 }
 
+/// The keyword that opens a module of `kind`.
+fn module_keyword(kind: &ModuleKind) -> &'static str {
+    match kind {
+        ModuleKind::Module => "module",
+        ModuleKind::Functions => "functions",
+        ModuleKind::Program => "program",
+        ModuleKind::ReactiveProgram => "reactive program",
+    }
+}
+
+/// The source line of each declaration of the module whose header is on line `header`
+/// (1-based): routines by `(section, name)`, laws by `("law", name)` and invariants by
+/// `("invariant", tag)`. A declaration is a line at the indentation of the first one after
+/// its section's keyword, so a contract tag deeper in, `size: ...`, is never taken for one.
+fn declaration_lines(src: &str, header: usize) -> HashMap<(&'static str, String), usize> {
+    let mut found = HashMap::new();
+    let mut section: Option<&'static str> = None;
+    let mut indent: Option<usize> = None;
+    let ident = |t: &str| -> String {
+        t.chars().take_while(|c| c.is_ascii_alphanumeric() || *c == '_').collect()
+    };
+    for (idx, line) in src.lines().enumerate().skip(header) {
+        let t = line.trim_start();
+        if t.is_empty() || t.starts_with("--") {
+            continue;
+        }
+        let depth = line.len() - t.len();
+        let word = ident(t);
+        // The module's closing `end` or the next top-level declaration.
+        if depth == 0 && (word == "end" || ["module", "functions", "program", "reactive", "concept", "group"].contains(&word.as_str())) {
+            break;
+        }
+        let opened = match word.as_str() {
+            "create" => Some("create"),
+            "feature" => Some("feature"),
+            "specify" => Some("specify"),
+            "invariant" => Some("invariant"),
+            "representation" => Some("representation"),
+            _ => None,
+        };
+        if let Some(s) = opened.filter(|_| indent.is_none_or(|i| depth < i)) {
+            section = Some(s);
+            indent = None;
+            continue;
+        }
+        let Some(s) = section else { continue };
+        let at = *indent.get_or_insert(depth);
+        if depth != at {
+            continue;
+        }
+        let key = if s == "specify" && word == "law" {
+            ("law", ident(t["law".len()..].trim_start()))
+        } else {
+            (s, word)
+        };
+        if !key.1.is_empty() {
+            found.entry(key).or_insert(idx + 1);
+        }
+    }
+    found
+}
+
+fn json_str(s: &str) -> String {
+    format!("\"{}\"", escape_json(s))
+}
+
+fn json_list(items: impl IntoIterator<Item = String>) -> String {
+    format!("[{}]", items.into_iter().collect::<Vec<_>>().join(", "))
+}
+
+fn json_line(line: Option<&usize>) -> String {
+    line.map_or("null".to_string(), |l| l.to_string())
+}
+
+/// What `--inspect --json-diagnostics` knows of the modules of a run, beyond each module.
+pub struct InspectContext<'a> {
+    pub concepts: &'a HashMap<String, ConceptDecl>,
+    /// Every module a module can use: the run's and the prelude's.
+    pub modules: Vec<&'a ModuleDecl>,
+}
+
+/// The modules `m` uses, by name or through a constructor, in name order.
+fn module_suppliers(m: &ModuleDecl, ctx: &InspectContext<'_>) -> Vec<String> {
+    let idents = module_source_idents(m);
+    let mut out: Vec<String> = ctx
+        .modules
+        .iter()
+        .filter(|n| n.name != m.name)
+        .filter(|n| {
+            idents.contains(&n.name)
+                || matches!(&n.repr, ReprKind::Sum(vs) if vs.iter().any(|v| {
+                    idents.contains(&v.name) && !module_has_variant(m, &v.name)
+                }))
+        })
+        .map(|n| resolve::readable(&n.name))
+        .collect();
+    out.sort();
+    out.dedup();
+    out
+}
+
+/// The identifiers of `m` as Gardel text: its types, contracts, bodies and invariants. Unlike
+/// `module_referenced_idents`, which reads the syntax tree's debug text, it holds no name of
+/// the compiler's own, such as the `None` of a module with no `satisfies`.
+fn module_source_idents(m: &ModuleDecl) -> HashSet<String> {
+    let mut text: Vec<String> = Vec::new();
+    let exprs = |cs: &[(String, Expr)], text: &mut Vec<String>| {
+        text.extend(cs.iter().map(|(_, e)| format_gardel_expr(e)));
+    };
+    let stmts = |ss: &[Stmt], text: &mut Vec<String>| {
+        for s in ss {
+            match s {
+                Stmt::Let(_, e) | Stmt::Check(_, e) | Stmt::Assume(_, e) => text.push(format_gardel_expr(e)),
+                Stmt::LetType(_, t) => text.push(t.clone()),
+                Stmt::Reveal(_) => {}
+            }
+        }
+    };
+    match &m.repr {
+        ReprKind::Product(fs) => text.extend(fs.iter().map(|(_, t)| t.clone())),
+        ReprKind::Sum(vs) => text.extend(vs.iter().flat_map(|v| v.fields.iter().map(|(_, t)| t.clone()))),
+    }
+    if let Some(s) = &m.satisfies {
+        text.extend(s.concepts.iter().cloned());
+    }
+    for (_, r) in m.create_routines.iter().chain(&m.feature_routines).chain(&m.specify_routines) {
+        text.extend(r.params.iter().map(|(_, t)| t.clone()));
+        text.push(r.ret_type.clone());
+        exprs(&r.requires, &mut text);
+        exprs(&r.ensures, &mut text);
+        text.extend(r.variant.iter().map(format_gardel_expr));
+        stmts(&r.stmts, &mut text);
+        text.push(format_gardel_expr(&r.body));
+    }
+    for (_, law) in &m.specify_laws {
+        text.extend(law.params.iter().map(|(_, t)| t.clone()));
+        exprs(&law.requires, &mut text);
+        exprs(&law.ensures, &mut text);
+        text.extend(law.triggers.iter().map(format_gardel_expr));
+        stmts(&law.stmts, &mut text);
+        text.extend(law.body.iter().map(format_gardel_expr));
+    }
+    exprs(&m.invariants, &mut text);
+    let mut idents: HashSet<String> = text
+        .iter()
+        .flat_map(|t| t.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_')))
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .collect();
+    for tp in &m.type_params {
+        idents.remove(tp);
+    }
+    idents
+}
+
+/// The concepts `m` satisfies, with those they refine, in name order.
+fn module_concepts(m: &ModuleDecl, concepts: &HashMap<String, ConceptDecl>) -> Vec<String> {
+    let mut seen: BTreeSet<String> = BTreeSet::new();
+    let mut queue: Vec<String> = m.satisfies.as_ref().map(|s| s.concepts.clone()).unwrap_or_default();
+    while let Some(c) = queue.pop() {
+        if seen.insert(c.clone()) {
+            if let Some(decl) = concepts.get(&c) {
+                queue.extend(decl.refines.iter().cloned());
+            }
+        }
+    }
+    seen.into_iter().map(|c| resolve::readable(&c)).collect()
+}
+
+/// A module's short form as one JSON object (spec §12): the contract view of
+/// `format_module_interface`, split into its parts, with the source line of each.
+pub fn module_interface_json(raw_m: &ModuleDecl, src: &str, path: &str, package: &str, ctx: &InspectContext<'_>) -> String {
+    let cm = contract_only_module(raw_m);
+    let m = &cm;
+    let r = |s: &str| resolve::readable(s);
+    let kw = module_keyword(&m.kind);
+    let header = find_decl_header(src, path, kw, &m.name).map(|sp| sp.line);
+    let lines = header.map_or_else(HashMap::new, |l| declaration_lines(src, l));
+    let clauses = |cs: &[(String, Expr)]| {
+        json_list(cs.iter().map(|(tag, e)| {
+            format!("{{\"tag\": {}, \"expr\": {}}}", json_str(tag), json_str(&r(&format_gardel_expr(e))))
+        }))
+    };
+    let params = |ps: &[(String, String)]| ps.iter().map(|(n, t)| format!("{n}: {t}")).collect::<Vec<_>>().join(", ");
+    let routine = |section: &'static str, vis: &Visibility, rd: &RoutineDecl| {
+        let tp = if rd.type_params.is_empty() { String::new() } else { format!("[{}]", rd.type_params.join(", ")) };
+        let ps = if rd.params.is_empty() { String::new() } else { format!("({})", params(&rd.params)) };
+        format!(
+            "{{\"section\": {}, \"name\": {}, \"visibility\": {}, \"signature\": {}, \"require\": {}, \"ensure\": {}, \"line\": {}}}",
+            json_str(section),
+            json_str(&rd.name),
+            json_str(&r(&vis.to_string())),
+            json_str(&r(&format!("{}{tp}{ps}: {}", rd.name, rd.ret_type))),
+            clauses(&rd.requires),
+            clauses(&rd.ensures),
+            json_line(lines.get(&(section, rd.name.clone()))),
+        )
+    };
+    let features = m
+        .create_routines
+        .iter()
+        .map(|(v, rd)| routine("create", v, rd))
+        .chain(m.feature_routines.iter().map(|(v, rd)| routine("feature", v, rd)))
+        .chain(m.specify_routines.iter().map(|(v, rd)| routine("specify", v, rd)));
+    let laws = m.specify_laws.iter().map(|(vis, law)| {
+        let tp = if law.type_params.is_empty() { String::new() } else { format!("[{}]", law.type_params.join(", ")) };
+        format!(
+            "{{\"name\": {}, \"visibility\": {}, \"signature\": {}, \"require\": {}, \"trigger\": {}, \"ensure\": {}, \"line\": {}}}",
+            json_str(&law.name),
+            json_str(&r(&vis.to_string())),
+            json_str(&r(&format!("{}{tp}({})", law.name, params(&law.params)))),
+            clauses(&law.requires),
+            json_list(law.triggers.iter().map(|e| json_str(&r(&format_gardel_expr(e))))),
+            clauses(&law.ensures),
+            json_line(lines.get(&("law", law.name.clone()))),
+        )
+    });
+    let invariants = m.invariants.iter().map(|(tag, e)| {
+        format!(
+            "{{\"tag\": {}, \"expr\": {}, \"line\": {}}}",
+            json_str(tag),
+            json_str(&r(&format_gardel_expr(e))),
+            json_line(lines.get(&("invariant", tag.clone()))),
+        )
+    });
+    let fields = |fs: &[(String, String)]| {
+        json_list(fs.iter().map(|(n, t)| format!("{{\"name\": {}, \"type\": {}}}", json_str(n), json_str(&r(t)))))
+    };
+    let representation = match (&m.kind, &m.repr_vis, &m.repr) {
+        (ModuleKind::Module, Visibility::None, _) => "{\"visibility\": \"{NONE}\"}".to_string(),
+        (ModuleKind::Module, vis, ReprKind::Product(fs)) => {
+            format!("{{\"visibility\": {}, \"fields\": {}}}", json_str(&r(&vis.to_string())), fields(fs))
+        }
+        (ModuleKind::Module, vis, ReprKind::Sum(vs)) => format!(
+            "{{\"visibility\": {}, \"variants\": {}}}",
+            json_str(&r(&vis.to_string())),
+            json_list(vs.iter().map(|v| format!("{{\"name\": {}, \"fields\": {}}}", json_str(&v.name), fields(&v.fields))))
+        ),
+        _ => "null".to_string(),
+    };
+    let type_params = json_list(m.type_params.iter().map(|t| {
+        let bound = m.type_bounds.get(t).map_or("null".to_string(), |b| json_str(&r(b)));
+        format!("{{\"name\": {}, \"bound\": {bound}}}", json_str(t))
+    }));
+    format!(
+        "{{\"name\": {}, \"kind\": {}, \"package\": {}, \"file\": {}, \"line\": {}, \"type_params\": {type_params}, \"satisfies\": {}, \"concepts\": {}, \"suppliers\": {}, \"representation\": {representation}, \"features\": {}, \"laws\": {}, \"invariants\": {}, \"short\": {}}}",
+        json_str(&r(&m.name)),
+        json_str(kw),
+        json_str(package),
+        json_str(path),
+        json_line(header.as_ref()),
+        json_list(m.satisfies.iter().flat_map(|s| s.concepts.iter()).map(|c| json_str(&r(c)))),
+        json_list(module_concepts(raw_m, ctx.concepts).iter().map(|c| json_str(c))),
+        json_list(module_suppliers(raw_m, ctx).iter().map(|c| json_str(c))),
+        json_list(features),
+        json_list(laws),
+        json_list(invariants),
+        json_str(&r(&format_module_interface(raw_m))),
+    )
+}
+
 /// Default output directory of `gardelc --emit-stdlib` (inside `build/`, which directory
 /// scans skip, so the copy is never mistaken for the stdlib sources).
 pub const EMIT_STDLIB_DEFAULT_DIR: &str = "build/stdlib";
@@ -19274,6 +19600,7 @@ const PLAIN_FLAGS: &[&str] = &[
     "--bounded-check",
     "--verify-deps",
     "--run",
+    "--no-verify",
 ];
 
 /// The first command-line word that looks like a flag and is not one. A mistyped `--strict`
@@ -19527,12 +19854,8 @@ fn verify_embedded_prelude(cache: Option<Rc<ProofCache>>) -> Vec<Diagnostic> {
 /// Prints fatal diagnostics (E0102, E0103 and the resolver's) and exits with status 1.
 fn exit_with_fatal(diags: &[Diagnostic], json_mode: bool, default_path: &str) -> ! {
     if json_mode {
-        println!("[");
-        for (i, d) in diags.iter().enumerate() {
-            let comma = if i + 1 < diags.len() { "," } else { "" };
-            println!("{}{comma}", d.to_json(&d.routine, default_path));
-        }
-        println!("]");
+        let items: Vec<String> = diags.iter().map(|d| d.to_json(&d.routine, default_path)).collect();
+        print_json_diagnostics(&items);
     } else {
         for d in diags {
             let sp = d
@@ -19581,18 +19904,58 @@ fn exit_with_frontend_error_at_line(
             end_line: line,
             end_column: 1,
         });
-        println!("[\n{}\n]", diag.to_json("UNKNOWN", path));
+        print_json_diagnostics(&[diag.to_json("UNKNOWN", path)]);
     } else {
         eprintln!("[ERROR] {message}");
     }
     std::process::exit(1);
 }
 
+/// `--inspect --json-diagnostics`: standard output is one object rather than an array of
+/// diagnostics, also when the run stops before any short form is made.
+static INSPECT_JSON: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Prints rendered diagnostics as the run's JSON document: the array, or under
+/// `--inspect` the object with no modules.
+fn print_json_diagnostics(items: &[String]) {
+    if INSPECT_JSON.load(std::sync::atomic::Ordering::Relaxed) {
+        print_inspect_json(false, &[], &[], items);
+    } else {
+        println!("[");
+        for (i, d) in items.iter().enumerate() {
+            let comma = if i + 1 < items.len() { "," } else { "" };
+            println!("{d}{comma}");
+        }
+        println!("]");
+    }
+}
+
+/// The object of `--inspect --json-diagnostics` (spec §12).
+fn print_inspect_json(verified: bool, modules: &[String], concepts: &[String], diags: &[String]) {
+    let block = |items: &[String], indent: &str| {
+        if items.is_empty() {
+            "[]".to_string()
+        } else {
+            let body: Vec<String> = items.iter().map(|i| format!("{indent}{i}")).collect();
+            format!("[\n{}\n  ]", body.join(",\n"))
+        }
+    };
+    println!("{{");
+    println!("  \"verified\": {verified},");
+    println!("  \"modules\": {},", block(modules, "    "));
+    println!("  \"concepts\": {},", block(concepts, "    "));
+    println!("  \"diagnostics\": {}", block(diags, ""));
+    println!("}}");
+}
+
 fn main() {
     let args: Vec<String> = env::args().collect();
     if args.len() < 2 && !std::path::Path::new("Gardel.toml").is_file() {
         eprintln!(
-            "Usage: gardelc <input.gdl ... | DIR | --project <DIR> | --stdlib> [--no-prelude] [--inspect [MODULE]] [--emit-stdlib [DIR]] [--json-diagnostics] [--fuel <N>] [--z3-seed <N>] [--z3-rlimit <N>] [--audit] [--strict] [--bounded-check] [--verify-deps] [--run]"
+            "Usage: gardelc <input.gdl ... | DIR | --project <DIR> | --stdlib> [--no-prelude] [--inspect [MODULE]] [--emit-stdlib [DIR]] [--json-diagnostics] [--fuel <N>] [--z3-seed <N>] [--z3-rlimit <N>] [--audit] [--strict] [--bounded-check] [--verify-deps] [--run] [--no-verify]"
+        );
+        eprintln!(
+            "  --no-verify  with --inspect: show the short forms after type checking, proving nothing"
         );
         eprintln!(
             "  --no-prelude  bootstrap mode: do not inject the Standard Prelude (implied by --stdlib and when compiling the prelude source itself, §4.1)"
@@ -19613,6 +19976,11 @@ fn main() {
     }
 
     let json_mode = args.iter().any(|a| a == "--json-diagnostics");
+    let no_verify = args.iter().any(|a| a == "--no-verify");
+    INSPECT_JSON.store(
+        json_mode && args.iter().any(|a| a == "--inspect"),
+        std::sync::atomic::Ordering::Relaxed,
+    );
 
     if let Some(flag) = first_unknown_flag(&args) {
         exit_with_frontend_error(
@@ -19702,6 +20070,21 @@ fn main() {
             format!("--compare-with cannot be combined with {flag}"),
             "",
         );
+    }
+
+    // A build or a run rests on proofs, so only the short forms can do without them.
+    let no_verify_error = if !no_verify {
+        None
+    } else if !args.iter().any(|a| a == "--inspect") {
+        Some("--no-verify only goes with --inspect: a build rests on its proofs".to_string())
+    } else {
+        ["--bounded-check", "--compare-with", "--run", "--verify-deps"]
+            .into_iter()
+            .find(|f| args.iter().any(|a| a == f))
+            .map(|f| format!("--no-verify cannot be combined with {f}"))
+    };
+    if let Some(e) = no_verify_error {
+        exit_with_frontend_error(json_mode, "Command Line", "gardelc", "invalid_arguments", e, "");
     }
 
     let mut ops = input_operands(&args);
@@ -20017,7 +20400,7 @@ fn main() {
 
     let verify_deps = args.iter().any(|a| a == "--verify-deps");
     // Sampling proves nothing, so it neither reads the cache nor adds to it.
-    let proof_cache = if bounded_check {
+    let proof_cache = if bounded_check || no_verify {
         None
     } else {
         match ProofCache::open(verifier_id(), !verify_deps) {
@@ -20041,7 +20424,7 @@ fn main() {
         packages: packages.clone(),
         cache: proof_cache.clone(),
     };
-    let mut checked = check_and_verify_project(&mut units, opts);
+    let mut checked = with_types_only(no_verify, || check_and_verify_project(&mut units, opts));
     if verify_deps && prelude_mode && !bounded_check {
         let cache = ProofCache::open(verifier_id(), false).ok().map(Rc::new);
         let failed = verify_embedded_prelude(cache);
@@ -20109,13 +20492,26 @@ fn main() {
 
     if inspect_mode {
         // An interface states what was proven, so a run with errors or only samples has none
-        // to show.
-        let errors: Vec<Diagnostic> = diags
-            .iter()
-            .filter(|(_, d)| d.level == "error" || d.tag == NOT_PROVEN_TAG)
-            .map(|(_, d)| d.clone())
-            .collect();
-        if !errors.is_empty() {
+        // to show. Under `--no-verify` nothing was proven, and the short forms say so.
+        let failed = |d: &Diagnostic| d.level == "error" || d.tag == NOT_PROVEN_TAG;
+        let has_failures = diags.iter().any(|(_, d)| failed(d));
+        let rendered = |only_failures: bool| -> Vec<String> {
+            diags
+                .iter()
+                .filter(|(_, d)| !only_failures || failed(d))
+                .map(|(ui, d)| {
+                    let u = &units[*ui];
+                    let name = u.ast.modules.last().map_or_else(String::new, |m| resolve::readable(&m.name));
+                    d.to_json(&name, &u.path)
+                })
+                .collect()
+        };
+        if has_failures && !no_verify {
+            if json_mode {
+                print_inspect_json(false, &[], &[], &rendered(true));
+                std::process::exit(1);
+            }
+            let errors: Vec<Diagnostic> = diags.iter().filter(|(_, d)| failed(d)).map(|(_, d)| d.clone()).collect();
             exit_with_fatal(&errors, json_mode, &first_path);
         }
         let filter_mod = args
@@ -20124,23 +20520,66 @@ fn main() {
             .and_then(|idx| args.get(idx + 1))
             .filter(|val| !val.starts_with("--") && !looks_like_input(val))
             .cloned();
-        // A dependency has its own project to inspect it from.
+        // In text, a dependency has its own project to inspect it from; the JSON form gives
+        // every package, each module marked with its own.
         let root_units = package_list.last().map_or(0, |(_, count)| units.len() - count);
-        for u in &units[root_units..] {
+        let root_package = package_list.last().map_or(String::new(), |(m, _)| m.project.name.clone());
+        let prelude = standard_prelude();
+        let ctx = InspectContext {
+            concepts: &concept_map,
+            modules: units
+                .iter()
+                .flat_map(|u| u.ast.modules.iter())
+                .chain(prelude.modules.iter().filter(|_| prelude_mode))
+                .collect(),
+        };
+        let mut shown_json: Vec<String> = Vec::new();
+        let mut concepts_json: Vec<String> = Vec::new();
+        for (ui, u) in units.iter().enumerate() {
+            if ui < root_units && !json_mode {
+                continue;
+            }
             let requested = requested_stdlib_files.is_empty()
                 || filter_mod.is_some()
                 || fs::canonicalize(&u.path).is_ok_and(|p| requested_stdlib_files.contains(&p));
             if !requested {
                 continue;
             }
+            for c in &u.ast.concepts {
+                let line = find_decl_header(&u.src, &u.path, "concept", &c.name).map(|sp| sp.line);
+                concepts_json.push(format!(
+                    "{{\"name\": {}, \"refines\": {}, \"file\": {}, \"line\": {}}}",
+                    json_str(&resolve::readable(&c.name)),
+                    json_list(c.refines.iter().map(|r| json_str(&resolve::readable(r)))),
+                    json_str(&u.path),
+                    json_line(line.as_ref()),
+                ));
+            }
             for m in &u.ast.modules {
-                if filter_mod
-                    .as_ref()
-                    .is_none_or(|f| f.eq_ignore_ascii_case(&m.name))
-                {
+                if filter_mod.as_ref().is_some_and(|f| !f.eq_ignore_ascii_case(&resolve::readable(&m.name))) {
+                    continue;
+                }
+                if json_mode {
+                    let package = packages.get(&m.name).cloned().unwrap_or_else(|| root_package.clone());
+                    shown_json.push(module_interface_json(m, &u.src, &u.path, &package, &ctx));
+                } else {
+                    if no_verify {
+                        println!("-- not verified: --no-verify checked the types only");
+                    }
                     println!("{}", resolve::readable(&format_module_interface(m)));
                 }
             }
+        }
+        if json_mode {
+            print_inspect_json(!no_verify, &shown_json, &concepts_json, &rendered(false));
+        } else if has_failures {
+            for (ui, d) in diags.iter().filter(|(_, d)| failed(d)) {
+                let sp = d.span.clone().unwrap_or_else(|| Span::unknown(&units[*ui].path));
+                eprintln!("[ERROR] {} at {}:{}:{}: {}", d.rule, sp.file, sp.line, sp.column, d.message);
+            }
+        }
+        if has_failures {
+            std::process::exit(1);
         }
         return;
     }
@@ -20178,21 +20617,23 @@ fn main() {
         )
     });
 
+    let rendered: Vec<String> = diags
+        .iter()
+        .map(|(ui, d)| {
+            let (dm, df) = unit_default(*ui);
+            d.to_json(&dm, &df)
+        })
+        .collect();
     if json_mode {
         if let Some(line) = &cache_line {
             eprintln!("{line}");
         }
-        println!("[");
-        for (i, (ui, d)) in diags.iter().enumerate() {
-            let comma = if i + 1 < diags.len() { "," } else { "" };
-            let (dm, df) = unit_default(*ui);
-            println!("{}{comma}", d.to_json(&dm, &df));
-        }
-        println!("]");
+        // What failed has nothing to build. Otherwise the build's own diagnostics join the
+        // array once it is done.
         if has_errors {
+            print_json_diagnostics(&rendered);
             std::process::exit(1);
         }
-        return;
     } else {
         if prelude_mode {
             let p = standard_prelude();
@@ -20390,73 +20831,148 @@ fn main() {
         }
     }
 
+    // The build's own diagnostics: a C compiler that fails or is missing (Task F.11b).
+    let mut build_diags: Vec<Diagnostic> = Vec::new();
     let gcc_compiled = if module.kind.is_entry_point() {
-        Command::new("gcc")
+        let gcc = Command::new("gcc")
             .args(["-O3", "-fopenmp", &primary_c, "-o", &primary_exe])
-                .args(GCC_NET_LIBS)
-            .status()
-            .is_ok_and(|s| s.success())
+            .args(GCC_NET_LIBS)
+            .output();
+        match gcc {
+            Ok(out) if out.status.success() => {
+                // Its warnings, if any, are the C compiler's to show, not a result of the run.
+                std::io::Write::write_all(&mut std::io::stderr(), &out.stderr).ok();
+                true
+            }
+            Ok(out) => {
+                build_diags.push(c_compile_failure(&module.name, &primary_c, &out, &c_backend_errors));
+                false
+            }
+            Err(e) => {
+                build_diags.push(
+                    Diagnostic::basic(
+                        "warning",
+                        "W0401: c_compiler_missing",
+                        "gcc".to_string(),
+                        "c_compiler_missing".to_string(),
+                        format!("W0401: c_compiler_missing: `gcc` could not be started ({e}), so `{primary_c}` was not compiled and there is no executable. The proofs stand"),
+                    )
+                    .with_module(&resolve::readable(&module.name))
+                    .with_ai_context(Span::unknown(&primary_c), Vec::new(), BTreeMap::new(), Vec::new()),
+                );
+                false
+            }
+        }
     } else {
         false
     };
+    let build_failed = build_diags.iter().any(|d| d.level == "error");
 
-    if !json_mode {
-        if project_mode {
-            println!(
-                "[3/5] Emitted direct Boogie VCs & fuel axioms -> {} (one per module; primary `{}`)",
-                emitted_bpl.join(", "),
-                module.name
-            );
-        } else {
-            println!("[3/5] Emitted direct Boogie VCs & fuel axioms -> {primary_bpl}");
-        }
-        println!("[4/5] Emitted monomorphized Bend v2 target    -> {primary_bend}");
-        println!("[5/5] Emitted C11 runtime target              -> {primary_c}");
-        for e in &c_backend_errors {
-            println!("      [C backend] {e} (the C file starts with #error)");
-        }
+    if project_mode {
+        say(&format!(
+            "[3/5] Emitted direct Boogie VCs & fuel axioms -> {} (one per module; primary `{}`)",
+            emitted_bpl.join(", "),
+            module.name
+        ));
+    } else {
+        say(&format!("[3/5] Emitted direct Boogie VCs & fuel axioms -> {primary_bpl}"));
+    }
+    say(&format!("[4/5] Emitted monomorphized Bend v2 target    -> {primary_bend}"));
+    say(&format!("[5/5] Emitted C11 runtime target              -> {primary_c}"));
+    for e in &c_backend_errors {
+        say(&format!("      [C backend] {e} (the C file starts with #error)"));
+    }
+    if gcc_compiled {
+        say(&format!("      Compiled native executable              -> {primary_exe}"));
+    }
+
+    if json_mode {
+        let mut items = rendered;
+        let default_name = resolve::readable(&module.name);
+        items.extend(build_diags.iter().map(|d| d.to_json(&default_name, &primary_c)));
         if gcc_compiled {
-            println!("      Compiled native executable              -> {primary_exe}");
+            // Where the executable is, so a tool need not know how it is named.
+            let note = Diagnostic::basic(
+                "note",
+                "Build",
+                "gcc".to_string(),
+                "executable".to_string(),
+                format!("Compiled native executable -> {primary_exe}"),
+            )
+            .with_module(&default_name)
+            .with_ai_context(Span::unknown(&primary_exe), Vec::new(), BTreeMap::new(), Vec::new());
+            items.push(note.to_json(&default_name, &primary_exe));
+        }
+        print_json_diagnostics(&items);
+    } else {
+        for d in &build_diags {
+            let sp = d.span.clone().unwrap_or_else(|| Span::unknown(&primary_c));
+            println!(
+                "      [{}] {} at {}:{}:{}: {}",
+                d.level.to_uppercase(),
+                d.rule,
+                sp.file,
+                sp.line,
+                sp.column,
+                d.message.replace('\n', "\n            ")
+            );
         }
     }
-
-    if args.iter().any(|a| a == "--run") {
-        let solver_candidates = [
-            "../tools/dafny/z3/bin/z3-4.12.1.exe",
-            "tools/dafny/z3/bin/z3-4.12.1.exe",
-            "../tools/dafny/z3/bin/z3.exe",
-            "tools/dafny/z3/bin/z3.exe",
-        ];
-        let found_solver = solver_candidates
-            .iter()
-            .find(|cand| std::path::Path::new(cand).exists());
-
-        let mut boogie_cmd = Command::new("boogie");
-        boogie_cmd.args([BOOGIE_TYPE_ENCODING, "/mv:-", &primary_bpl]);
-        if let Some(solver) = found_solver {
-            boogie_cmd.arg(format!("/proverOpt:PROVER_PATH={solver}"));
-        }
-        if let Some(seed) = z3_seed {
-            boogie_cmd.args(boogie_seed_args(seed));
-        }
-
-        if let Ok(output) = boogie_cmd.output() {
-            println!("\n=== [0] Direct Boogie + Z3 Verification ({primary_bpl}) ===");
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            print!("{stdout}");
-            if stdout.contains("*** MODEL") {
-                let translated = translate_z3_model_to_gardel(&stdout, &module);
-                if !translated.is_empty() {
-                    println!("Translated Gardel Counterexample: {translated:?}");
-                }
-            }
-        }
-
-        if gcc_compiled && std::path::Path::new(&primary_exe).exists() {
-            println!("\n=== [1] Executing Native Executable ({primary_exe}) ===");
-            let _ = Command::new(&primary_exe).status();
-        }
+    if build_failed {
+        std::process::exit(1);
     }
+
+    // The proofs were checked above, so a run only runs the executable.
+    if args.iter().any(|a| a == "--run") && gcc_compiled && std::path::Path::new(&primary_exe).exists() {
+        say(&format!("\n=== Executing Native Executable ({primary_exe}) ==="));
+        let _ = Command::new(&primary_exe).status();
+    }
+}
+
+/// How many lines of the C compiler's output a failure quotes.
+const C_COMPILE_QUOTED_LINES: usize = 20;
+
+/// `E0401: c_compile_failed`: the C compiler refused the C file of a program that verified.
+/// The span is the first place the compiler names in that file, else its first line.
+fn c_compile_failure(module: &str, c_path: &str, out: &std::process::Output, backend_errors: &[String]) -> Diagnostic {
+    let text = format!("{}{}", String::from_utf8_lossy(&out.stderr), String::from_utf8_lossy(&out.stdout));
+    let lines: Vec<&str> = text.lines().filter(|l| !l.trim().is_empty()).collect();
+    let prefix = format!("{c_path}:");
+    let place = lines.iter().find_map(|l| {
+        let rest = l.strip_prefix(&prefix)?;
+        let mut parts = rest.splitn(3, ':');
+        let line: usize = parts.next()?.trim().parse().ok()?;
+        let column: usize = parts.next().and_then(|c| c.trim().parse().ok()).unwrap_or(1);
+        Some((line, column))
+    });
+    let (line, column) = place.unwrap_or((1, 1));
+    let mut quoted: Vec<&str> = lines.iter().take(C_COMPILE_QUOTED_LINES).copied().collect();
+    if lines.len() > C_COMPILE_QUOTED_LINES {
+        quoted.push("...");
+    }
+    let cause = if backend_errors.is_empty() {
+        "This is a limit of `gardelc`'s C backend or of the C compiler, not a fault of the program, whose proofs stand".to_string()
+    } else {
+        format!("The C backend could not lower the program: {}", backend_errors.join("; "))
+    };
+    let code = out.status.code().map_or("a signal".to_string(), |c| c.to_string());
+    Diagnostic::basic(
+        "error",
+        "E0401: c_compile_failed",
+        "gcc".to_string(),
+        "c_compile_failed".to_string(),
+        format!(
+            "E0401: c_compile_failed: `gcc` could not compile `{c_path}` (exit {code}), so there is no executable. {cause}.\n{}",
+            quoted.join("\n")
+        ),
+    )
+    .with_module(&resolve::readable(module))
+    .with_ai_context(
+        Span { file: c_path.to_string(), line, column, end_line: line, end_column: column },
+        Vec::new(),
+        BTreeMap::new(),
+        Vec::new(),
+    )
 }
 
 // ============================================================================

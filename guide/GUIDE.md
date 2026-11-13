@@ -2099,7 +2099,8 @@ gardelc                        # when ./Gardel.toml is present
 # Verify the Standard Prelude sources (stdlib/) as one linked project
 gardelc --stdlib --strict
 
-# Run verification with structured JSON diagnostics for AI agents
+# Run verification with structured JSON diagnostics for AI agents. A program that verifies is
+# built as without the flag: a C compiler that fails is `E0401`, and a `note` names the executable
 gardelc <file.gdl> --json-diagnostics
 
 # Fix the solver seed, to check that a proof is stable, or its work limit per procedure
@@ -2116,6 +2117,13 @@ gardelc <file.gdl> --strict
 gardelc --inspect <file.gdl>
 gardelc --stdlib --inspect [MODULE]
 
+# The same as one JSON object, for a tool: each module's features, laws, invariants, source
+# lines, suppliers and concepts (spec §12)
+gardelc --inspect --json-diagnostics
+
+# Short forms while proofs fail: types checked, nothing proven, marked as not verified
+gardelc --inspect --no-verify
+
 # Unfold recursive definitions to depth N for the solver (default 2)
 gardelc <file.gdl> --fuel <N>
 
@@ -2130,7 +2138,7 @@ gardelc <file.gdl> --bounded-check
 # Run the solver on every module and prove the prelude, ignoring the local verification cache (for CI)
 gardelc <file.gdl> --verify-deps
 
-# Compile, verify, and run immediately via the backend
+# Compile, verify, and run the executable
 gardelc <file.gdl> --run
 
 # Report what would break a client of an older version of this package

@@ -1,0 +1,11 @@
+concept SIZED
+
+  size: NAT
+
+end
+
+concept MEASURED refines SIZED
+
+  measure: NAT
+
+end

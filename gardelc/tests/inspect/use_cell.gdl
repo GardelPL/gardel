@@ -1,0 +1,12 @@
+functions USE_CELL
+
+feature {ANY}
+
+  first_size: NAT
+    do
+      CELL.make(3).size
+    ensure
+      three: Result = 3
+    end
+
+end

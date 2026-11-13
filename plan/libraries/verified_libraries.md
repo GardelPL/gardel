@@ -759,13 +759,39 @@ Mutations, each on a private copy: ten, all red after a baseline that passes. `P
 
 Open: once in about 27 runs of the baseline, `a_script_gives_file_and_process_events` found a line of the program's standard error trace missing, while its standard output was exact. The mutation script kept only the panic's first line, and 26 further runs did not repeat it, so the cause is not known.
 
-**F.11b: what the compiler gives Tablon.** Today `--inspect` prints text and refuses a project with errors, `gcc`'s errors are not reported, and `--run` also runs Boogie a second time.
+**F.11b: what the compiler gives Tablon.** ✅ Completed on 2026-11-13. Before it, `--inspect` printed text and refused a project with errors, `gcc`'s errors were not reported, `--json-diagnostics` built nothing, and `--run` also ran Boogie a second time.
 
-- [ ] `--inspect --json-diagnostics` gives each module's short form as JSON: name, kind, and per feature its signature, `require` and `ensure`, and its source line.
-- [ ] `--inspect` with `--no-verify` shows short forms after type checking only, marked as not verified, so the Modules view works while proofs fail.
-- [ ] A failed `gcc` is a diagnostic (`E` code, its first lines, the C file), and the executable's path is in the JSON summary, so Build can show both.
-- [ ] `--inspect --json-diagnostics` also gives each module's suppliers and the concepts it satisfies, from which Tablon derives clients and instances.
-- [ ] Spec §12 and the GUIDE describe the JSON forms. A `gardelc` test pins them, as Tablon depends on them.
+- [x] `--inspect --json-diagnostics` gives each module's short form as JSON: name, kind, and per feature its signature, `require` and `ensure`, and its source line.
+- [x] `--inspect` with `--no-verify` shows short forms after type checking only, marked as not verified, so the Modules view works while proofs fail.
+- [x] A failed `gcc` is a diagnostic (`E0401`, its first 20 lines, the C file and the line it names), and the executable's path is in the JSON, so Build can show both.
+- [x] `--inspect --json-diagnostics` also gives each module's suppliers and the concepts it satisfies, from which Tablon derives clients and instances.
+- [x] Spec §12 and the GUIDE describe the JSON forms. `tests/inspect_json.rs` pins them, as Tablon depends on them.
+
+Changed from the list above, each for a reason:
+
+- **One object under `--inspect`.** `--inspect --json-diagnostics` prints `{ "verified", "modules", "concepts", "diagnostics" }`, also when the run stops early (a parse error, a name that does not resolve), so Tablon reads one shape. Without `--inspect` the document stays the array of diagnostics that agents read.
+- **No summary object for a build.** The array of `--json-diagnostics` has always been a list of diagnostics, and a test pins `[]` for a clean run, so the executable is a diagnostic of level `note` (rule `Build`, tag `executable`, its path in `span.file`) rather than a second document. A missing `gcc` is `W0401`.
+- **`--json-diagnostics` now builds.** It used to stop after the proofs, so a tool had no way to build and read the result. It now does what the text mode does; the steps go to standard error, and standard output stays one document.
+- **`--no-verify` is Boogie's `/noVerify`.** Most of Gardel's type checking is Boogie's, so a run without Boogie would check less than a type check. With `/noVerify` Boogie resolves and type checks each module and proves nothing: 10 s for `todo_tui`'s 22 modules, against 48 s for proofs with an empty cache. A type check is never stored in the cache, and `--no-verify` goes only with `--inspect`.
+- **The JSON gives every package.** Text `--inspect` shows the project's modules; the object shows a dependency's as well, each with its `package`, as Tablon's tree lists each dependency.
+- **The concepts declared in the run** are in the object too, with what each refines, as Instances lists a concept that no module satisfies yet.
+- **`--run` runs the executable only.** The proofs are checked before the build, so the second Boogie run, which also ignored the cache and `--z3-rlimit`, is gone.
+
+How it works:
+
+- A short form in JSON is built from the same contract-only module as the text one, so what is hidden from clients is in neither, and `short` holds the text.
+- The AST has no source positions, so a declaration's line is found in the source: from the module's header, a declaration is a line at the indentation of the first line after its section's keyword (`create`, `feature`, `specify`, `invariant`). A contract tag named like a feature, `size: ...`, sits deeper and is never taken for it.
+- Suppliers are read from the module's Gardel text (types, contracts, bodies, invariants), not from the debug text of its syntax tree, which the linker reads and which holds names of the compiler's own: `satisfies: None` made every module a client of `OPTION`, whose constructor is `None`.
+
+Found on the way:
+
+- A counterexample listed every function of Z3's model, about 90 entries such as `"Fn1Type": "{"`, besides the routine's own values. It now keeps the names in the failing routine's scope: its parameters, `Current`, `Result` and its `let`s. A model with none of them is given whole, as a refutation always carries a counterexample.
+
+Tests: `tests/inspect_json.rs`, with the fixture `tests/inspect/` (a module with a representation, an invariant, a creator with a contract, a hidden feature, a law, a contract tag named like the feature after it, and a concept that refines another; a module that uses it) and its expected object, `expected.json`, which the first test compares byte for byte and reads with a small JSON reader. `no_verify_gives_the_short_forms_of_a_module_whose_proof_fails` (also with an `assume` that `--strict` refuses, and the counterexample's names), `a_type_check_is_never_kept_as_a_proof`, `an_inspection_that_stops_early_is_still_the_object`, `no_verify_goes_only_with_inspect`, and `a_build_names_its_executable_and_a_failed_c_compiler_is_a_diagnostic`, which puts a C compiler that fails first in `PATH`.
+
+Mutations, each on a private copy: ten, all red after a baseline that passes. No `/noVerify`; a line deeper than a declaration taken for one; suppliers from the debug text; a failed `gcc` that is no diagnostic; the whole model as counterexample; an early stop that prints the array; the `gcc` span always on line 1; JSON mode building nothing; `--no-verify` withholding the short forms on a failure; and the cache used under `--no-verify`. The cache has two guards, `main` opening none and `verify_unless_cached` storing nothing, and each alone survives, so the mutation removes both. `--no-verify` withholding the short forms survived the first round, as no check failed under it; the `assume` case was added and it turned red. A baseline once failed because the copy's refreshed sources kept their old times, so cargo reused the last mutation's build; it passed in three runs after.
+
+Packages and examples: `--stdlib --strict`, `gjson`, `ghttp`, `grest`, `gtui` and every example verify with 0 errors and 0 warnings under `--strict`, and build as before.
 
 **F.11c: what `gtui` needs for it** (version 0.2.0).
 

@@ -1,0 +1,53 @@
+-- The fixture of tests/inspect_json.rs: one of each part of a short form.
+module CELL satisfies MEASURED
+
+representation {ANY}
+  value: NAT
+
+invariant
+  bounded: Current.value <= 1000
+
+create {ANY}
+
+  make(v: NAT): CELL
+    require
+      small: v <= 1000
+    do
+      { value = v }
+    ensure
+      kept: Result.value = v
+    end
+
+feature {ANY}
+
+  size: NAT
+    do
+      Current.value
+    ensure
+      -- A tag named like the feature after it, deeper than a declaration.
+      measure: Result <= 1000
+    end
+
+  measure: NAT
+    do
+      Current.value
+    ensure
+      same: Result = Current.size
+    end
+
+feature {NONE}
+
+  -- Not part of the short form.
+  hidden_double: NAT
+    do
+      Current.value + Current.value
+    end
+
+specify {ANY}
+
+  law size_bounded(c: CELL)
+    ensure
+      at_most: c.size <= 1000
+    end
+
+end
