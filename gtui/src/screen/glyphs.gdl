@@ -1,0 +1,94 @@
+-- Characters in and out of UTF-8, as a screen needs them at run time: the characters of a
+-- `STRING`, and the bytes of a `CHAR`. A `STRING` is always well-formed, so the `?` that
+-- `decode` gives for a malformed sequence is never seen; it keeps `decode` total.
+functions GLYPHS
+
+feature {ANY}
+
+  -- The characters of `s`, in order.
+  of_text(s: STRING): LIST[CHAR]
+    do
+      LIST_CUT.reverse(GLYPHS.decode(s.to_utf8.to_list, LIST.empty), LIST.empty)
+    end
+
+  -- `n` as a character when it is a Unicode scalar value, and `?` otherwise.
+  scalar(n: NAT): CHAR
+    do
+      if n < 1114112 and (n < 55296 or n > 57343) then CHAR.from_scalar(n) else '?' end
+    end
+
+  -- The low six bits of the item `k` of `bs`, and 64 when it is not a continuation byte or
+  -- there is none.
+  low_at(bs: LIST[U64], k: NAT): NAT
+    do
+      if k < bs.length then
+        let b = LIST_OPS.at(bs, k)
+        if b >= 128 and b < 192 then b - 128 else 64 end
+      else
+        64
+      end
+    ensure
+      bounded: Result <= 64
+    end
+
+  -- `acc` with the characters of the UTF-8 bytes `bs` in front of it, the last first.
+  decode(bs: LIST[U64], acc: LIST[CHAR]): LIST[CHAR]
+    variant
+      bs.length
+    do
+      if bs.length = 0 then
+        acc
+      else
+        let b0 = bs.head
+        let t = bs.tail
+        let c1 = GLYPHS.low_at(t, 0)
+        let c2 = GLYPHS.low_at(t, 1)
+        let c3 = GLYPHS.low_at(t, 2)
+        if b0 < 128 then
+          GLYPHS.decode(t, acc.prepend(GLYPHS.scalar(b0)))
+        else if b0 >= 192 and b0 < 224 and c1 < 64 then
+          GLYPHS.decode(t.tail, acc.prepend(GLYPHS.scalar((b0 - 192) * 64 + c1)))
+        else if b0 >= 224 and b0 < 240 and c1 < 64 and c2 < 64 then
+          GLYPHS.decode(t.tail.tail, acc.prepend(GLYPHS.scalar((b0 - 224) * 4096 + c1 * 64 + c2)))
+        else if b0 >= 240 and b0 < 248 and c1 < 64 and c2 < 64 and c3 < 64 then
+          GLYPHS.decode(t.tail.tail.tail, acc.prepend(GLYPHS.scalar((b0 - 240) * 262144 + c1 * 4096 + c2 * 64 + c3)))
+        else
+          GLYPHS.decode(t, acc.prepend('?'))
+        end end end end
+      end
+    end
+
+  -- `out` with the UTF-8 bytes of `c`, or `out` itself when it holds a terabyte already.
+  add_char(out: BYTES_BUILDER, c: CHAR): BYTES_BUILDER
+    do
+      let n = c.code
+      if out.length > 1000000000000 then
+        out
+      else if n < 128 then
+        out.add_byte(n)
+      else if n < 2048 then
+        out.add_byte(192 + n / 64).add_byte(128 + n % 64)
+      else if n < 65536 then
+        out.add_byte(224 + n / 4096).add_byte(128 + n / 64 % 64).add_byte(128 + n % 64)
+      else if n < 2097152 then
+        out.add_byte(240 + n / 262144).add_byte(128 + n / 4096 % 64).add_byte(128 + n / 64 % 64).add_byte(128 + n % 64)
+      else
+        out.add_byte(63)
+      end end end end end
+    ensure
+      bounded: Result.length <= out.length + 4
+    end
+
+  -- `out` with `s`, or `out` itself when it holds a terabyte already.
+  add_text(out: BYTES_BUILDER, s: STRING): BYTES_BUILDER
+    do
+      if out.length > 1000000000000 or s.byte_length > 1000000000000 then out else out.add_text(s) end
+    end
+
+  -- `a` followed by `b`, or `a` alone when together they would not fit a `STRING`.
+  join(a: STRING, b: STRING): STRING
+    do
+      if a.byte_length <= 18446744073709551615 - b.byte_length then a.concat(b) else a end
+    end
+
+end

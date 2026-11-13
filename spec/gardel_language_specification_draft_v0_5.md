@@ -32,7 +32,7 @@ Gardel is a pure, total, deterministic, statically verified language designed fo
 | Entry points | Nothing may refer to a `program` or `reactive program` (`E0104`, §4). |
 | `EXIT_CODE` | Defined in §3. |
 
-**Implementation status:** the `match` rule, the solver limit and the entry-point rule are implemented. Reactive programs run, with timers, console input, sockets and replay (§16.5).
+**Implementation status:** the `match` rule, the solver limit and the entry-point rule are implemented. Reactive programs run, with timers, console input, sockets, the terminal, files, processes and replay (§16.5, §11.6).
 
 ---
 
@@ -312,7 +312,7 @@ The Standard Prelude provides an irreducible core of verified concepts, algebrai
   - `module NUMBER_TEXT` & `module NUMBER_ERROR`: Decimal and hex text of `NAT` and `I64`, with proven round trips, and why a parse failed (§3.1).
   - `module STRING_ERROR` & `module IO_ERROR`: Standard boundary error sum types for text decoding (`STRING.from_utf8`) and external I/O operations (§11).
   - `module BIGNAT`: Arbitrary-precision natural numbers represented as little-endian limbs in `LIST[U64]` with ghost model `specify model: MATH_INT` (§3, §6.4.B).
-  - `module STEP[S]`, `module COMMAND`, `module EVENT`, `module KEY`: The result of a reactive step, the effects a step requests, the outside events it receives, and a key press (§11.6). `module CONN_ID`: An opaque connection handle (§11.6). Their variants are added with the runtime that can deliver them (§16.5).
+  - `module STEP[S]`, `module COMMAND`, `module EVENT`, `module KEY`: The result of a reactive step, the effects a step requests, the outside events it receives, and a key press (§11.6). `module CONN_ID` and `module PROC_ID`: Opaque connection and process handles (§11.6). `module DIR_ENTRY`: An entry of a directory listing (§11.6). Their variants are added with the runtime that can deliver them (§16.5).
 
 - **Mathematical Ghost Types & Specification Modules (§2, §6, §8):**
   - `LIST[A]`: The canonical inductive sequence ADT (`Nil | Cons(head: A, tail: LIST[A])`). `LIST` has **dual status**: it is the canonical ghost model of Dual-Layer Model Refinement (§2) *and* an ordinary sequential runtime structure that may appear in `representation` sections (e.g., `BOUNDED_STACK.items`, `BIGNAT.limbs`, `STRING.bytes`) and in runtime `do` bodies. Only its use as a model (inside `specify` queries and contracts) is erased.
@@ -2278,7 +2278,7 @@ representation {ANY}
 end
 ```
 
-`STEP.is_stop` and `EVENT.is_shutdown` are prelude queries. The complete variant sets are below. `CONN_ID` is opaque (`representation {NONE}`, `satisfies CANONICAL_EQ, ORD`): a program can compare and store a handle but never forge one.
+`STEP.is_stop` and `EVENT.is_shutdown` are prelude queries. The complete variant sets are below. `CONN_ID` and `PROC_ID` are opaque (`representation {NONE}`, `satisfies CANONICAL_EQ, ORD`): a program can compare and store a handle but never forge one. `DIR_ENTRY` is a record of `name: STRING` and `is_dir: BOOL`.
 
 ```eiffel
 module COMMAND
@@ -2294,6 +2294,15 @@ representation {ANY}
   | CancelTimer(id: NAT)              -- the pending Tick(id), if any, never comes
   | Write(text: STRING)               -- text on standard output, with no newline
   | TerminalSize                      -- answered by Resized, and then by each resize
+  | ReadFile(tag: NAT, path: STRING)  -- answered by FileRead
+  | ListDir(tag: NAT, path: STRING)   -- answered by DirListed
+  | RunProcess(tag: NAT, program: STRING, args: LIST[STRING], dir: STRING)
+                                      -- answered by ProcessStarted / ProcessFailed
+  | WriteProcess(proc: PROC_ID, data: BYTES)  -- to its standard input
+  | CloseInput(proc: PROC_ID)         -- its standard input ends
+  | StopProcess(proc: PROC_ID)        -- it is killed, and ProcessExited follows
+  | RunAttached(tag: NAT, program: STRING, args: LIST[STRING], dir: STRING)
+                                      -- answered by AttachedEnded
 end
 
 module EVENT
@@ -2310,6 +2319,14 @@ representation {ANY}
   | Connected(tag: NAT, conn: CONN_ID)
   | ConnectFailed(tag: NAT, err: IO_ERROR)
   | Resized(width: NAT, height: NAT)  -- in cells
+  | FileRead(tag: NAT, res: RESULT[IO_ERROR, BYTES])
+  | DirListed(tag: NAT, res: RESULT[IO_ERROR, LIST[DIR_ENTRY]])
+  | ProcessStarted(tag: NAT, proc: PROC_ID)
+  | ProcessFailed(tag: NAT, err: IO_ERROR)
+  | ProcessOutput(proc: PROC_ID, data: BYTES)       -- from its standard output
+  | ProcessErrorOutput(proc: PROC_ID, data: BYTES)  -- from its standard error
+  | ProcessExited(proc: PROC_ID, code: I64)
+  | AttachedEnded(tag: NAT, res: RESULT[IO_ERROR, I64])
 end
 
 module KEY
@@ -2342,7 +2359,7 @@ Rules:
 4. **Shutdown must stop.** `step` has the implicit postcondition `e.is_shutdown implies Result.is_stop`, tagged `shutdown_must_stop`. It is always added, so a clause the programmer writes cannot replace it. Constructor queries are used because `EVENT` is not `CANONICAL_EQ` (§9).
 5. **Commands never block.** Commands in one `cmds` list run in order. A command that can fail reports the failure as a later event, never as a crash (§7.2). Output is flushed after each list, before the program waits. The commands of a `Stop` run before the process exits, and its `code` is the exit status. If `init` returns `Stop`, `step` is never called.
 6. **Events are untrusted.** The verifier assumes nothing about a payload beyond its type. Payloads become invariant-carrying values only through `RESULT`-returning boundary routines (§7.2, §11.4).
-7. **Handles.** Each `CONN_ID` comes from exactly one `Accepted` or `Connected` event, and an id is never used again. After `Close(c)` runs, at most one more event mentions `c`, and it is `Closed(c)`. No event mentions `c` after `Closed(c)`, and a command naming a closed connection does nothing.
+7. **Handles.** Each `CONN_ID` comes from exactly one `Accepted` or `Connected` event, and an id is never used again. After `Close(c)` runs, at most one more event mentions `c`, and it is `Closed(c)`. No event mentions `c` after `Closed(c)`, and a command naming a closed connection does nothing. Likewise each `PROC_ID` comes from exactly one `ProcessStarted`, every `ProcessOutput` and `ProcessErrorOutput` of a process comes before its one `ProcessExited`, no event mentions it after that, and a command naming a process that has exited does nothing.
 8. **Closed types.** `COMMAND` and `EVENT` are closed, and adding a variant is a prelude change. A program should end a `match` on `EVENT` with `case _` (§5.1).
 
 **Timers.** A timer fires once: `SetTimer(id, millis)` is answered by one `Tick(id)` after at least `millis` milliseconds, on a monotonic clock. A repeating timer sets the next one in `step`. Setting an id that is pending replaces it, and `CancelTimer(id)` removes it, so no `Tick(id)` comes for it, even when the id is set again later; cancelling an id with no pending timer does nothing. Timers fire in deadline order, and in the order they were set on a tie. A pending `Shutdown` comes before any timer that is due, so a program that keeps setting a zero timer can still be stopped. Timers end with the program.
@@ -2361,13 +2378,23 @@ A connection ends in one way, with `Closed`. It comes after `Close`, once the qu
 
 Every ready socket gets one event per pass, and sockets and timers take turns, so no client, and no zero timer, starves the rest. A pending `Shutdown` comes first.
 
-For tests and replay, `GARDEL_EVENTS` replaces the outside world with a script: event names separated by spaces, such as `Tick:1 Key:Up Key:113 Line:hello%20there LineEnd LineFailed:5 Accepted:1 Received:1:hi%20there SendFailed:1:32 ListenFailed:8888:98 Closed:1 Connected:5:2 ConnectFailed:6:111 Shutdown`. `Connected:<tag>:<id>` and `ConnectFailed:<tag>:<code>` give the tag first. `Resized:<width>:<height>` is a size. `Key:<n>` is a `Char` by scalar value, `Key:Ctrl:<letter>` a `Ctrl` chord, and `Key:Home`, `Key:PageUp` and the like name the other keys, and `%XX` in a line or in received data is a byte, so a script can hold a space or malformed input. `LineEnd` is the end of input, and `LineFailed:<code>` a read that failed. Timers, reads, sockets and the terminal's size do not run in a script, so it does not depend on the clock, the terminal or the network; `Listen`, `Connect`, `Send` and `Close` are written to standard error as lines such as `net: Send 1 hi%20there` or `net: Connect 5 127%2E0%2E0%2E1 8080`. An unknown name stops the program with exit status 2. The end of a script is a `Shutdown`, so a scripted run always ends.
+**Files and processes.** Each runs on a helper thread of its own, so a slow disk or a child that never ends holds up nothing, and its answer comes as an event like any other.
+
+`ReadFile(tag, path)` is answered by one `FileRead(tag, res)`: the whole file as `BYTES`, or the system's error. A file longer than 256 MiB fails. `ListDir(tag, path)` is answered by one `DirListed(tag, res)`: the entries of the directory, without `.` and `..`, in byte order of their names, so a listing is the same on every system. An entry whose name is not UTF-8, which only POSIX allows, is left out, as it has no `STRING`. An empty path lists the current directory. A path with a NUL fails.
+
+`RunProcess(tag, program, args, dir)` starts a program with these arguments, in directory `dir`, or in the program's own when `dir` is empty. There is no shell: the arguments reach the child as given, so no character in them has a meaning. A program with no path separator is looked up in `PATH` only, never first in the current directory; a path is taken from the current directory of the running program, not from `dir`. On Windows the arguments are quoted so that the child's C runtime reads them back unchanged, `.exe` is added to a name with no extension, and a batch file (`.bat`, `.cmd`) is refused with `ERROR_BAD_EXE_FORMAT`, since `cmd.exe` would read its arguments as a shell does. The command is answered by `ProcessStarted(tag, proc)`, or by `ProcessFailed(tag, err)` when the program cannot be started, for example when it does not exist. The child's standard output and standard error arrive as `ProcessOutput` and `ProcessErrorOutput`, each carrying what one read returned, and its end as `ProcessExited(proc, code)`. On POSIX a child killed by a signal ends with `128 +` the signal's number, as a shell reports it. While 8 MiB of output, or 1024 events, wait to be delivered, the host stops reading the child's output, so a child that writes without end waits instead of filling the memory.
+
+`WriteProcess(proc, data)` writes to the child's standard input, in order, on a helper thread, so a child that does not read cannot block the program; what a child that no longer reads is sent is dropped. `CloseInput(proc)` ends that input once what was queued is written. `StopProcess(proc)` kills the child and what it started: on Windows every child is in a job object, which `TerminateJobObject` ends, with exit code 1; on POSIX every child leads a process group of its own, which `SIGKILL` ends, and so Ctrl-C at the terminal is not sent to it. A captured child has no console on Windows. When the program ends, every child still running is killed.
+
+`RunAttached(tag, program, args, dir)` starts a program the same way, with the terminal: its standard input, output and error are the program's own. The host first restores the terminal as the program found it, as at exit, and the reader stops reading keys, so a `ReadKey` waiting gets none of the child's input; Ctrl-C is the child's. When the child ends, the host takes the terminal back and answers `AttachedEnded(tag, Ok(code))`, and, once `TerminalSize` has run, a `Resized` follows, since the child may have changed the size or the screen. A program that drew a screen draws it again then. It fails at once, with `AttachedEnded(tag, Error(err))`, when the program cannot be started, when another attached child runs, or when a `ReadLine` is waiting, since a line being read cannot be called back. One attached child runs at a time; captured children run alongside it.
+
+For tests and replay, `GARDEL_EVENTS` replaces the outside world with a script: event names separated by spaces, such as `Tick:1 Key:Up Key:113 Line:hello%20there LineEnd LineFailed:5 Accepted:1 Received:1:hi%20there SendFailed:1:32 ListenFailed:8888:98 Closed:1 Connected:5:2 ConnectFailed:6:111 Shutdown`. `Connected:<tag>:<id>` and `ConnectFailed:<tag>:<code>` give the tag first. `Resized:<width>:<height>` is a size. Files and processes are `FileRead:<tag>:<text>`, `FileReadFailed:<tag>:<code>`, `DirListed:<tag>:<entries>`, `DirListFailed:<tag>:<code>`, `ProcessStarted:<tag>:<id>`, `ProcessFailed:<tag>:<code>`, `ProcessOutput:<id>:<text>`, `ProcessErrorOutput:<id>:<text>`, `ProcessExited:<id>:<code>`, `AttachedEnded:<tag>:<code>` and `AttachFailed:<tag>:<code>`, where the entries of a listing are each `d` for a directory or `f` for anything else, the name and a `/`, which no name holds, as in `DirListed:1:dsrc/fGardel.toml/`. `Key:<n>` is a `Char` by scalar value, `Key:Ctrl:<letter>` a `Ctrl` chord, and `Key:Home`, `Key:PageUp` and the like name the other keys, and `%XX` in a line or in received data is a byte, so a script can hold a space or malformed input. `LineEnd` is the end of input, and `LineFailed:<code>` a read that failed. Timers, reads, sockets, files, processes and the terminal's size do not run in a script, so it does not depend on the clock, the terminal, the disk or the network; `Listen`, `Connect`, `Send` and `Close` are written to standard error as lines such as `net: Send 1 hi%20there` or `net: Connect 5 127%2E0%2E0%2E1 8080`, and the file and process commands as `file: ReadFile 2 notes%2Etxt` or `proc: RunProcess 3 gcc %2D%2Dversion in src`. An unknown name stops the program with exit status 2. The end of a script is a `Shutdown`, so a scripted run always ends.
 
 **Event log and replay.** With `GARDEL_RECORD=<file>` a run writes a log, and with `GARDEL_REPLAY=<file>` the program runs from one. These are environment variables, as `GARDEL_EVENTS` is, because the command line belongs to the program: a flag taken from it would change `args`, and `args` is an input to the run.
 
-A log is text, with one line for each thing that happened, in order: a `gardel-log 1 <PROGRAM>` header, an `arg <text>` line per argument, an `event <token>` line per delivered event, in the script syntax above, a `command <token>` line per command, as `Print:<text>`, `SetTimer:<id>:<millis>`, `ReadLine`, `ReadKey`, `Listen:<port>`, `Send:<id>:<text>`, `Close:<id>`, `Connect:<tag>:<host>:<port>`, `CancelTimer:<id>`, `Write:<text>` or `TerminalSize`, and finally `exit <code>`. Texts use `%XX`. Each event reaches the file before `step` runs, so a run that dies leaves the event that killed it, and a command is logged before it is performed.
+A log is text, with one line for each thing that happened, in order: a `gardel-log 1 <PROGRAM>` header, an `arg <text>` line per argument, an `event <token>` line per delivered event, in the script syntax above, a `command <token>` line per command, as `Print:<text>`, `SetTimer:<id>:<millis>`, `ReadLine`, `ReadKey`, `Listen:<port>`, `Send:<id>:<text>`, `Close:<id>`, `Connect:<tag>:<host>:<port>`, `CancelTimer:<id>`, `Write:<text>`, `TerminalSize`, `ReadFile:<tag>:<path>`, `ListDir:<tag>:<path>`, `RunProcess:<tag>:<program>:<dir>` followed by `:<arg>` for each argument, `RunAttached` in the same form, `WriteProcess:<id>:<text>`, `CloseInput:<id>` or `StopProcess:<id>`, and finally `exit <code>`. Texts use `%XX`. Each event reaches the file before `step` runs, so a run that dies leaves the event that killed it, and a command is logged before it is performed.
 
-A replay is a scripted run: arguments and events come from the log, and timers, reads and sockets do not run. Each command, and the exit code, is compared with the log before it takes effect. The first difference stops the program with exit status 3 and a message giving the log line, what the log says and what the program did. A log that is not for this program, malformed text, arguments on the command line, or `GARDEL_REPLAY` with `GARDEL_RECORD` or `GARDEL_EVENTS` stop it with exit status 2.
+A replay is a scripted run: arguments and events come from the log, and timers, reads, sockets, files and processes do not run, so a replay needs none of the files the run read and starts none of its processes. Each command, and the exit code, is compared with the log before it takes effect. The first difference stops the program with exit status 3 and a message giving the log line, what the log says and what the program did. A log that is not for this program, malformed text, arguments on the command line, or `GARDEL_REPLAY` with `GARDEL_RECORD` or `GARDEL_EVENTS` stop it with exit status 2.
 
 A log with no `exit` line is a run that was cut short, by a kill or a full disk. A last line with no line break is dropped, and the replay checks what is there, gets the `Shutdown` of a script's end, says on standard error that the rest was not checked, and exits with the program's own code. If the log cannot be written, the run continues without one and warns once: a recording does not end a server.
 

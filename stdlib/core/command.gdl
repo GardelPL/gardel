@@ -12,5 +12,12 @@ representation {ANY}
   | CancelTimer(id: NAT)
   | Write(text: STRING)
   | TerminalSize
+  | ReadFile(tag: NAT, path: STRING)
+  | ListDir(tag: NAT, path: STRING)
+  | RunProcess(tag: NAT, program: STRING, args: LIST[STRING], dir: STRING)
+  | WriteProcess(proc: PROC_ID, data: BYTES)
+  | CloseInput(proc: PROC_ID)
+  | StopProcess(proc: PROC_ID)
+  | RunAttached(tag: NAT, program: STRING, args: LIST[STRING], dir: STRING)
 
 end

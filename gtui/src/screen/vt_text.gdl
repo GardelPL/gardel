@@ -1,0 +1,100 @@
+-- The bytes a VT terminal is sent for a list of writes: for each write, a cursor move
+-- (`ESC [ row ; col H`, from 1) and its cells, with an SGR sequence wherever the style
+-- changes. The pen is reset first, so a frame does not depend on what came before it. These
+-- are the only control sequences a frame holds, as a cell holds no control character.
+functions VT_TEXT
+
+feature {ANY}
+
+  -- The text of a frame: `writes`, after clearing the screen when `clear` is set.
+  frame(writes: LIST[SCREEN_WRITE], clear: BOOL): STRING
+    do
+      let start = GLYPHS.add_text(BYTES_BUILDER.empty, if clear then "\u{1b}[0m\u{1b}[2J" else "\u{1b}[0m" end)
+      let out = VT_TEXT.writes(writes, STYLE.plain, start)
+      match STRING.from_utf8(out.to_bytes)
+        case Ok(s) then s
+        case Error(_) then ""
+      end
+    end
+
+  -- Entering a full-screen interface: the alternate screen, cleared, with the cursor hidden.
+  enter: STRING
+    do
+      "\u{1b}[?1049h\u{1b}[0m\u{1b}[2J\u{1b}[?25l"
+    end
+
+  -- Leaving it: the pen reset, the cursor shown, and the screen that was there before.
+  leave: STRING
+    do
+      "\u{1b}[0m\u{1b}[?25h\u{1b}[?1049l"
+    end
+
+  -- `out` with `ws`, drawn from the pen `pen`.
+  writes(ws: LIST[SCREEN_WRITE], pen: STYLE, out: BYTES_BUILDER): BYTES_BUILDER
+    variant
+      ws.length
+    do
+      if ws.length = 0 then
+        out
+      else
+        let w = ws.head
+        let moved = VT_TEXT.move(out, w.x, w.y)
+        VT_TEXT.writes(ws.tail, VT_TEXT.last_style(w.content, pen), VT_TEXT.cells(w.content, pen, moved))
+      end
+    end
+
+  -- `out` with the cursor moved to column `x`, row `y`, counted from 0. A write lies inside
+  -- a screen of at most 65535 by 65535, so neither is ever more than 65534.
+  move(out: BYTES_BUILDER, x: NAT, y: NAT): BYTES_BUILDER
+    do
+      let row = if y < 65535 then y + 1 else 65535 end
+      let col = if x < 65535 then x + 1 else 65535 end
+      let a = GLYPHS.add_text(out, "\u{1b}[")
+      let b = GLYPHS.add_text(a, NUMBER_TEXT.nat_to_text(row))
+      let c = GLYPHS.add_text(b, ";")
+      let d = GLYPHS.add_text(c, NUMBER_TEXT.nat_to_text(col))
+      GLYPHS.add_text(d, "H")
+    end
+
+  -- `out` with `cs`, each preceded by its style when it differs from the one before.
+  cells(cs: LIST[CELL], pen: STYLE, out: BYTES_BUILDER): BYTES_BUILDER
+    variant
+      cs.length
+    do
+      if cs.length = 0 then
+        out
+      else
+        let c = cs.head
+        let styled = if c.style.same(pen) then out else GLYPHS.add_text(out, VT_TEXT.sgr(c.style)) end
+        VT_TEXT.cells(cs.tail, c.style, GLYPHS.add_char(styled, c.char))
+      end
+    end
+
+  -- The style of the last of `cs`, or `pen` when there is none.
+  last_style(cs: LIST[CELL], pen: STYLE): STYLE
+    variant
+      cs.length
+    do
+      if cs.length = 0 then pen else VT_TEXT.last_style(cs.tail, cs.head.style) end
+    end
+
+  -- The SGR sequence that sets `s` from any pen.
+  sgr(s: STYLE): STRING
+    do
+      if s.is_bold then
+        if s.is_dim then VT_TEXT.sgr_tail(s, "\u{1b}[0;1;2") else VT_TEXT.sgr_tail(s, "\u{1b}[0;1") end
+      else
+        if s.is_dim then VT_TEXT.sgr_tail(s, "\u{1b}[0;2") else VT_TEXT.sgr_tail(s, "\u{1b}[0") end
+      end
+    end
+
+  sgr_tail(s: STYLE, head: STRING): STRING
+    require
+      short: head.byte_length <= 16
+    do
+      let u = if s.is_underlined then ";4" else "" end
+      let r = if s.is_reversed then ";7m" else "m" end
+      head.concat(u).concat(r)
+    end
+
+end

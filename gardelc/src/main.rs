@@ -16,6 +16,7 @@ use proof_cache::ProofCache;
 mod boogie_params;
 mod boogie_reserved;
 mod c11_typed;
+mod host_files;
 mod compat;
 pub mod manifest;
 mod names;
@@ -3927,6 +3928,14 @@ pub const STDLIB_SOURCES: &[(&str, &str)] = &[
         include_str!("../../stdlib/core/conn_id.gdl"),
     ),
     (
+        "stdlib/core/proc_id.gdl",
+        include_str!("../../stdlib/core/proc_id.gdl"),
+    ),
+    (
+        "stdlib/core/dir_entry.gdl",
+        include_str!("../../stdlib/core/dir_entry.gdl"),
+    ),
+    (
         "stdlib/core/command.gdl",
         include_str!("../../stdlib/core/command.gdl"),
     ),
@@ -3984,6 +3993,10 @@ pub fn phase4_stdlib_source() -> &'static str {
         include_str!("../../stdlib/functional/function_ops.gdl"),
         "\n",
         include_str!("../../stdlib/core/conn_id.gdl"),
+        "\n",
+        include_str!("../../stdlib/core/proc_id.gdl"),
+        "\n",
+        include_str!("../../stdlib/core/dir_entry.gdl"),
         "\n",
         include_str!("../../stdlib/core/command.gdl"),
         "\n",
@@ -5115,7 +5128,7 @@ pub const GCC_NET_LIBS: &[&str] = if cfg!(windows) { &["-lws2_32"] } else { &[] 
 /// `STRING` is injected for modules that mention it, contain string literals or use `IO`
 /// (Task B.3: literals denote prelude `STRING` values); `LIST_OPS` / `FUNCTION_OPS` are realized by the built-in
 /// `Seq_*` / `Fn1_*` preamble theories already present in every Boogie file.
-const BOOGIE_INJECTED_PRELUDE: [&str; 18] = [
+const BOOGIE_INJECTED_PRELUDE: [&str; 20] = [
     "OPTION",
     "RESULT",
     "SEQ",
@@ -5128,6 +5141,8 @@ const BOOGIE_INJECTED_PRELUDE: [&str; 18] = [
     "NUMBER_TEXT",
     "IO_ERROR",
     "CONN_ID",
+    "PROC_ID",
+    "DIR_ENTRY",
     "COMMAND",
     "KEY",
     "EVENT",
@@ -14516,6 +14531,7 @@ const VERIFIER_SOURCES: &[(&str, &str)] = &[
     ("boogie_reserved.rs", include_str!("boogie_reserved.rs")),
     ("c11_typed.rs", include_str!("c11_typed.rs")),
     ("compat.rs", include_str!("compat.rs")),
+    ("host_files.rs", include_str!("host_files.rs")),
     ("main.rs", include_str!("main.rs")),
     ("manifest.rs", include_str!("manifest.rs")),
     ("names.rs", include_str!("names.rs")),
@@ -20627,7 +20643,7 @@ end
         let stdlib = parse_phase4_stdlib().expect("Phase 4 stdlib should parse");
         assert_eq!(stdlib.group, None);
         assert_eq!(stdlib.concepts.len(), 3);
-        assert_eq!(stdlib.modules.len(), 20);
+        assert_eq!(stdlib.modules.len(), 22);
         for m in &stdlib.modules {
             let mut diags = check_visibility_and_semantics(m);
             diags.extend(verify_module_phase3(
@@ -21119,7 +21135,7 @@ end
     #[test]
     fn test_plan3_multi_module_stdlib_pipeline() {
         let ast = parse_phase4_stdlib().expect("stdlib parses cleanly");
-        assert_eq!(ast.modules.len(), 20);
+        assert_eq!(ast.modules.len(), 22);
         let mut prog_env = ProgramEnv {
             modules: HashMap::new(),
             concepts: HashMap::new(),

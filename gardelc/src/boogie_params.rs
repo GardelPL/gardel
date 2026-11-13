@@ -37,6 +37,16 @@ fn is_scalar(ty: &str) -> bool {
     matches!(ty.trim(), "int" | "bool" | "real")
 }
 
+/// The index just past the quoted text that starts at `open`. A backslash escapes the next
+/// character, as in a comment quoting a Gardel literal such as `"c\"d"`.
+fn quoted_end(s: &[char], open: usize) -> usize {
+    let mut i = open + 1;
+    while i < s.len() && s[i] != '"' {
+        i += if s[i] == '\\' { 2 } else { 1 };
+    }
+    (i + 1).min(s.len())
+}
+
 /// The index of the bracket that closes the one at `open`, counting `(`, `[`, `{` and `<`
 /// only when `angle` is set, and skipping quoted text.
 fn closing(s: &[char], open: usize, angle: bool) -> Option<usize> {
@@ -45,10 +55,8 @@ fn closing(s: &[char], open: usize, angle: bool) -> Option<usize> {
     while i < s.len() {
         let c = s[i];
         if c == '"' {
-            i += 1;
-            while i < s.len() && s[i] != '"' {
-                i += 1;
-            }
+            i = quoted_end(s, i);
+            continue;
         } else if c == '(' || c == '[' || c == '{' || (angle && c == '<') {
             depth += 1;
         } else if c == ')' || c == ']' || c == '}' || (angle && c == '>') {
@@ -68,9 +76,11 @@ fn split_top(s: &[char]) -> Vec<String> {
     let mut depth = 0i32;
     let mut cur = String::new();
     let mut quoted = false;
+    let mut escaped = false;
     for &c in s {
         if quoted {
-            quoted = c != '"';
+            quoted = escaped || c != '"';
+            escaped = !escaped && c == '\\';
             cur.push(c);
             continue;
         }
@@ -166,7 +176,14 @@ fn rewrite(text: &[char], funs: &HashMap<String, Vec<usize>>) -> String {
     while i < text.len() {
         let c = text[i];
         if c == '"' {
-            let end = text[i + 1..].iter().position(|c| *c == '"').map_or(text.len(), |p| i + 2 + p);
+            let end = quoted_end(text, i);
+            out.extend(&text[i..end]);
+            i = end;
+            continue;
+        }
+        // A comment is copied as it is: what it quotes is not code.
+        if c == '/' && text.get(i + 1) == Some(&'/') {
+            let end = text[i..].iter().position(|c| *c == '\n').map_or(text.len(), |p| i + p);
             out.extend(&text[i..end]);
             i = end;
             continue;
@@ -271,5 +288,17 @@ mod tests {
                    axiom on_x(1, y) == on(1, y) && Pon(2, y) == 0;\n";
         let out = scalars_last(bpl);
         assert!(out.contains("on_x(1, y) == on(y, 1) && Pon(2, y)"), "{out}");
+    }
+
+    /// A comment quoting a Gardel literal with an escaped quote, `"c\"d"`, once left the rest
+    /// of the file read as quoted, so no call after it was rewritten (F.11a).
+    #[test]
+    fn an_escaped_quote_in_a_comment_ends_nothing() {
+        let bpl = "function on<S>(k: int, x: R S) returns (R S);\n\
+                   // str_lit_3 = \"c\\\"d\" and on(1, z)\n\
+                   axiom on(1, y) == on(2, y) && f(\"a\\\"(\", on(3, y));\n";
+        let out = scalars_last(bpl);
+        assert!(out.contains("// str_lit_3 = \"c\\\"d\" and on(1, z)\n"), "{out}");
+        assert!(out.contains("axiom on(y, 1) == on(y, 2) && f(\"a\\\"(\", on(y, 3));"), "{out}");
     }
 }

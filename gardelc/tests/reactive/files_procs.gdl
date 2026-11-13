@@ -1,0 +1,121 @@
+-- Files and processes (Task F.11a): lists a directory, reads a file and a missing one, runs a
+-- child with arguments in a directory and feeds it a line, stops a child that would run for ever,
+-- tries a program that does not exist, and runs a child attached. It stops when all seven have
+-- ended.
+--
+--   files_procs <dir> <file> <child>
+reactive program FILES_PROCS
+
+feature {ANY}
+
+  -- The `i`th argument, or "".
+  arg(xs: LIST[STRING], i: NAT): STRING
+    variant
+      i
+    do
+      if xs.length = 0 then
+        ""
+      else if i = 0 then
+        xs.head
+      else
+        arg(xs.tail, i - 1)
+      end end
+    end
+
+  -- `label` and `t`, when they fit in a line.
+  joined(label: STRING, t: STRING): STRING
+    do
+      if label.byte_length <= 100 and t.byte_length <= 100000 then label.concat(t) else label end
+    end
+
+  -- A line per entry, in order, before `acc`.
+  entries(xs: LIST[DIR_ENTRY], acc: LIST[COMMAND]): LIST[COMMAND]
+    variant
+      xs.length
+    do
+      if xs.length = 0 then
+        acc
+      else
+        entries(xs.tail, acc).prepend(Print(joined(if xs.head.is_dir then "dir " else "file " end, xs.head.name)))
+      end
+    end
+
+  text(data: BYTES): STRING
+    do
+      match STRING.from_utf8(data)
+        case Ok(t) then t
+        case Error(_) then "(not UTF-8)"
+      end
+    end
+
+  -- An exit code as text.
+  code_text(c: I64): STRING
+    do
+      if c >= 0 then NUMBER_TEXT.nat_to_text(NAT.from_i64(c)) else joined("-", NUMBER_TEXT.nat_to_text(NUMBER_TEXT.magnitude(c))) end
+    end
+
+  -- One more of the seven ended.
+  ended(s: NAT, cmds: LIST[COMMAND]): STEP[NAT]
+    do
+      if s >= 6 then Stop(0, cmds.prepend(Print("done"))) else Continue(s + 1, cmds) end
+    end
+
+  init(args: SEQ[STRING]): STEP[NAT]
+    do
+      let xs = args.to_list
+      let child = arg(xs, 2)
+      Continue(0, LIST.empty
+        .prepend(RunAttached(7, child, LIST.empty.prepend("attached"), ""))
+        .prepend(RunProcess(5, "gardel-no-such-program", LIST.empty, ""))
+        .prepend(RunProcess(4, child, LIST.empty.prepend("sleep"), ""))
+        .prepend(RunProcess(3, child, LIST.empty.prepend("").prepend("e\\").prepend("c\"d").prepend("a b"), arg(xs, 0)))
+        .prepend(ReadFile(6, "gardel-no-such-file"))
+        .prepend(ReadFile(2, arg(xs, 1)))
+        .prepend(ListDir(1, arg(xs, 0))))
+    end
+
+  step(s: NAT, e: EVENT): STEP[NAT]
+    do
+      match e
+        case DirListed(tag, r) then
+          match r
+            case Ok(xs) then ended(s, entries(xs, LIST.empty))
+            case Error(_) then ended(s, LIST.empty.prepend(Print("list failed")))
+          end
+        case FileRead(tag, r) then
+          match r
+            case Ok(data) then ended(s, LIST.empty.prepend(Print(joined("read ", text(data)))))
+            case Error(_) then ended(s, LIST.empty.prepend(Print(joined("read failed ", NUMBER_TEXT.nat_to_text(tag)))))
+          end
+        case ProcessStarted(tag, p) then
+          if tag = 3 then
+            Continue(s, LIST.empty
+              .prepend(WriteProcess(p, "hello child\n".to_utf8))
+              .prepend(Print("started 3")))
+          else if tag = 4 then
+            Continue(s, LIST.empty.prepend(StopProcess(p)).prepend(Print("started 4")))
+          else
+            Continue(s, LIST.empty)
+          end end
+        case ProcessFailed(tag, err) then
+          ended(s, LIST.empty.prepend(Print(joined("failed ", NUMBER_TEXT.nat_to_text(tag)))))
+        case ProcessOutput(p, data) then
+          -- Its input ends once it has answered, when the writer has long been idle.
+          Continue(s, LIST.empty.prepend(CloseInput(p)).prepend(Print(joined("out ", text(data)))))
+        case ProcessErrorOutput(p, data) then
+          Continue(s, LIST.empty.prepend(Print(joined("err ", text(data)))))
+        case ProcessExited(p, code) then
+          ended(s, LIST.empty.prepend(Print(joined("exited ", code_text(code)))))
+        case AttachedEnded(tag, r) then
+          match r
+            case Ok(code) then ended(s, LIST.empty.prepend(Print(joined("attached ended ", code_text(code)))))
+            case Error(_) then ended(s, LIST.empty.prepend(Print("attach failed")))
+          end
+        case Shutdown then
+          Stop(9, LIST.empty)
+        case _ then
+          Continue(s, LIST.empty)
+      end
+    end
+
+end

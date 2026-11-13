@@ -1,0 +1,24 @@
+-- What an application's `update` gives for an event: its next state and the commands it
+-- sends, or the end of the run with an exit status and the commands sent after the screen is
+-- put back.
+module TUI_NEXT[S]
+
+representation {ANY}
+  | Next(state: S, cmds: LIST[COMMAND])
+  | Quit(code: NAT, after: LIST[COMMAND])
+
+create {ANY}
+
+  -- The next state, with no command.
+  next(s: S): TUI_NEXT[S]
+    do
+      Next(s, LIST.empty)
+    end
+
+  -- The end of the run, with exit status `code` and nothing printed after.
+  quit(code: NAT): TUI_NEXT[S]
+    do
+      Quit(code, LIST.empty)
+    end
+
+end

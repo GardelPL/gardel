@@ -1,0 +1,57 @@
+-- Redraws every cell of the screen on every key, for `tests/gtui.rs` to time: each frame
+-- fills every row with letters, and the next with other letters in reverse video, so every
+-- cell changes and the diff writes the whole screen. `q` quits.
+reactive program GTUI_BENCH
+
+feature {ANY}
+
+  -- `n` copies of `c` after `acc`.
+  line(c: STRING, n: NAT, acc: STRING): STRING
+    variant
+      n
+    do
+      if n = 0 then acc else line(c, n - 1, GLYPHS.join(acc, c)) end
+    end
+
+  update(k: NAT, e: EVENT): TUI_NEXT[NAT]
+    do
+      match e
+        case Key(key) then
+          match key
+            case Char(c) then if c = 'q' then TUI_NEXT.quit(0) else TUI_NEXT.next(if k < 1000000 then k + 1 else 0 end) end
+            case KeysEnded then TUI_NEXT.quit(0)
+            case _ then TUI_NEXT.next(if k < 1000000 then k + 1 else 0 end)
+          end
+        case _ then TUI_NEXT.next(k)
+      end
+    end
+
+  -- Every row of `r` from `y` on with `text`.
+  rows(s: SCREEN, r: RECT, y: NAT, text: STRING, st: STYLE): SCREEN
+    variant
+      r.bottom - y
+    do
+      if y >= r.bottom then s else rows(s.text(r, r.x, y, text, st), r, y + 1, text, st) end
+    end
+
+  view(k: NAT, blank: SCREEN): SCREEN
+    do
+      let area = blank.area
+      if k % 2 = 0 then
+        rows(blank, area, 0, line("abcdefghij", area.width / 10 + 1, ""), STYLE.plain)
+      else
+        rows(blank, area, 0, line("KLMNOPQRST", area.width / 10 + 1, ""), STYLE.plain.reversed)
+      end
+    end
+
+  init(args: SEQ[STRING]): STEP[TUI[NAT]]
+    do
+      TUI.start(0, update, view)
+    end
+
+  step(t: TUI[NAT], e: EVENT): STEP[TUI[NAT]]
+    do
+      t.step(e)
+    end
+
+end

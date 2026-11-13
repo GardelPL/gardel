@@ -1,0 +1,286 @@
+-- A rectangle of cells: the columns from `x` up to, not including, `right`, and the rows from
+-- `y` up to, not including, `bottom`. Every corner fits in 65535, so arithmetic on two
+-- rectangles cannot overflow. A rectangle may be empty, with no width or no height.
+--
+-- The cuts split a rectangle in two along one side: `take_top(n)` is its first `n` rows, or
+-- all of them when it has fewer, and `drop_top(n)` the rest. Each piece lies inside the
+-- rectangle, and the two pieces do not overlap (`cut_top` and the like).
+module RECT
+
+representation {NONE}
+  left: NAT
+  top: NAT
+  wide: NAT
+  high: NAT
+
+invariant
+  fits_across: left + wide <= 65535
+  fits_down: top + high <= 65535
+
+create {ANY}
+
+  make(x: NAT, y: NAT, w: NAT, h: NAT): RECT
+    require
+      across: x <= 65535 and w <= 65535 - x
+      down: y <= 65535 and h <= 65535 - y
+    do
+      { left = x, top = y, wide = w, high = h }
+    ensure
+      x_set: Result.x = x
+      y_set: Result.y = y
+      width_set: Result.width = w
+      height_set: Result.height = h
+    end
+
+  -- A rectangle at the top left corner, at most 65535 by 65535.
+  sized(w: NAT, h: NAT): RECT
+    do
+      let cw = if w <= 65535 then w else 65535 end
+      let ch = if h <= 65535 then h else 65535 end
+      { left = 0, top = 0, wide = cw, high = ch }
+    ensure
+      at_origin: Result.x = 0 and Result.y = 0
+      width_set: w <= 65535 implies Result.width = w
+      height_set: h <= 65535 implies Result.height = h
+    end
+
+feature {ANY}
+
+  x: NAT
+    do
+      Current.left
+    ensure
+    end
+
+  y: NAT
+    do
+      Current.top
+    ensure
+    end
+
+  width: NAT
+    do
+      Current.wide
+    ensure
+      fits: Current.x + Result <= 65535
+    end
+
+  height: NAT
+    do
+      Current.high
+    ensure
+      fits: Current.y + Result <= 65535
+    end
+
+  right: NAT
+    do
+      Current.left + Current.wide
+    ensure
+      def: Result = Current.x + Current.width
+      fits: Result <= 65535
+    end
+
+  bottom: NAT
+    do
+      Current.top + Current.high
+    ensure
+      def: Result = Current.y + Current.height
+      fits: Result <= 65535
+    end
+
+  is_empty: BOOL
+    do
+      Current.wide = 0 or Current.high = 0
+    ensure
+      def: Result = (Current.width = 0 or Current.height = 0)
+    end
+
+  -- Whether the cell at column `cx`, row `cy` is in the rectangle.
+  has(cx: NAT, cy: NAT): BOOL
+    do
+      Current.left <= cx and cx < Current.left + Current.wide and Current.top <= cy and cy < Current.top + Current.high
+    ensure
+      def: Result = (Current.x <= cx and cx < Current.right and Current.y <= cy and cy < Current.bottom)
+    end
+
+  -- Whether every cell of this rectangle is in `outer`.
+  inside(outer: RECT): BOOL
+    do
+      outer.left <= Current.left and outer.top <= Current.top and
+        Current.left + Current.wide <= outer.left + outer.wide and
+        Current.top + Current.high <= outer.top + outer.high
+    ensure
+      def: Result = (outer.x <= Current.x and outer.y <= Current.y and
+        Current.right <= outer.right and Current.bottom <= outer.bottom)
+    end
+
+  -- Whether no cell is in both rectangles: one ends before the other starts, across or down.
+  disjoint(other: RECT): BOOL
+    do
+      Current.left + Current.wide <= other.left or other.left + other.wide <= Current.left or
+        Current.top + Current.high <= other.top or other.top + other.high <= Current.top
+    ensure
+      def: Result = (Current.right <= other.x or other.right <= Current.x or
+        Current.bottom <= other.y or other.bottom <= Current.y)
+    end
+
+  -- The first `n` rows, or all of them.
+  take_top(n: NAT): RECT
+    do
+      let k = if n <= Current.high then n else Current.high end
+      { left = Current.left, top = Current.top, wide = Current.wide, high = k }
+    ensure
+      x_same: Result.x = Current.x
+      y_same: Result.y = Current.y
+      width_same: Result.width = Current.width
+      height_def: Result.height = (if n <= Current.height then n else Current.height end)
+    end
+
+  -- The rows after the first `n`.
+  drop_top(n: NAT): RECT
+    do
+      let k = if n <= Current.high then n else Current.high end
+      { left = Current.left, top = Current.top + k, wide = Current.wide, high = Current.high - k }
+    ensure
+      x_same: Result.x = Current.x
+      bottom_same: Result.bottom = Current.bottom
+      width_same: Result.width = Current.width
+      y_def: Result.y = Current.y + (if n <= Current.height then n else Current.height end)
+    end
+
+  -- The last `n` rows, or all of them.
+  take_bottom(n: NAT): RECT
+    do
+      let k = if n <= Current.high then n else Current.high end
+      { left = Current.left, top = Current.top + (Current.high - k), wide = Current.wide, high = k }
+    ensure
+      x_same: Result.x = Current.x
+      bottom_same: Result.bottom = Current.bottom
+      width_same: Result.width = Current.width
+      height_def: Result.height = (if n <= Current.height then n else Current.height end)
+    end
+
+  -- The rows before the last `n`.
+  drop_bottom(n: NAT): RECT
+    do
+      let k = if n <= Current.high then n else Current.high end
+      { left = Current.left, top = Current.top, wide = Current.wide, high = Current.high - k }
+    ensure
+      x_same: Result.x = Current.x
+      y_same: Result.y = Current.y
+      width_same: Result.width = Current.width
+      height_def: Result.height = Current.height - (if n <= Current.height then n else Current.height end)
+    end
+
+  -- The first `n` columns, or all of them.
+  take_left(n: NAT): RECT
+    do
+      let k = if n <= Current.wide then n else Current.wide end
+      { left = Current.left, top = Current.top, wide = k, high = Current.high }
+    ensure
+      x_same: Result.x = Current.x
+      y_same: Result.y = Current.y
+      height_same: Result.height = Current.height
+      width_def: Result.width = (if n <= Current.width then n else Current.width end)
+    end
+
+  -- The columns after the first `n`.
+  drop_left(n: NAT): RECT
+    do
+      let k = if n <= Current.wide then n else Current.wide end
+      { left = Current.left + k, top = Current.top, wide = Current.wide - k, high = Current.high }
+    ensure
+      y_same: Result.y = Current.y
+      right_same: Result.right = Current.right
+      height_same: Result.height = Current.height
+      x_def: Result.x = Current.x + (if n <= Current.width then n else Current.width end)
+    end
+
+  -- The last `n` columns, or all of them.
+  take_right(n: NAT): RECT
+    do
+      let k = if n <= Current.wide then n else Current.wide end
+      { left = Current.left + (Current.wide - k), top = Current.top, wide = k, high = Current.high }
+    ensure
+      y_same: Result.y = Current.y
+      right_same: Result.right = Current.right
+      height_same: Result.height = Current.height
+      width_def: Result.width = (if n <= Current.width then n else Current.width end)
+    end
+
+  -- The columns before the last `n`.
+  drop_right(n: NAT): RECT
+    do
+      let k = if n <= Current.wide then n else Current.wide end
+      { left = Current.left, top = Current.top, wide = Current.wide - k, high = Current.high }
+    ensure
+      x_same: Result.x = Current.x
+      y_same: Result.y = Current.y
+      height_same: Result.height = Current.height
+      width_def: Result.width = Current.width - (if n <= Current.width then n else Current.width end)
+    end
+
+  -- `n` cells less on every side, or nothing left when it is too small.
+  inset(n: NAT): RECT
+    do
+      Current.drop_top(n).drop_bottom(n).drop_left(n).drop_right(n)
+    ensure
+      within: Result.inside(Current)
+    end
+
+specify {ANY}
+
+  -- A cut across the rows gives two pieces inside the rectangle that do not overlap, with
+  -- all of its rows between them.
+  law cut_top(r: RECT, n: NAT)
+    ensure
+      top_inside: r.take_top(n).inside(r)
+      rest_inside: r.drop_top(n).inside(r)
+      apart: r.take_top(n).disjoint(r.drop_top(n))
+      all_rows: r.take_top(n).height + r.drop_top(n).height = r.height
+    end
+
+  law cut_bottom(r: RECT, n: NAT)
+    ensure
+      bottom_inside: r.take_bottom(n).inside(r)
+      rest_inside: r.drop_bottom(n).inside(r)
+      apart: r.take_bottom(n).disjoint(r.drop_bottom(n))
+      all_rows: r.take_bottom(n).height + r.drop_bottom(n).height = r.height
+    end
+
+  law cut_left(r: RECT, n: NAT)
+    ensure
+      left_inside: r.take_left(n).inside(r)
+      rest_inside: r.drop_left(n).inside(r)
+      apart: r.take_left(n).disjoint(r.drop_left(n))
+      all_columns: r.take_left(n).width + r.drop_left(n).width = r.width
+    end
+
+  law cut_right(r: RECT, n: NAT)
+    ensure
+      right_inside: r.take_right(n).inside(r)
+      rest_inside: r.drop_right(n).inside(r)
+      apart: r.take_right(n).disjoint(r.drop_right(n))
+      all_columns: r.take_right(n).width + r.drop_right(n).width = r.width
+    end
+
+  -- Inside is transitive, so a layout nested in a piece stays inside the whole.
+  law inside_trans(a: RECT, b: RECT, c: RECT)
+    require
+      ab: a.inside(b)
+      bc: b.inside(c)
+    ensure
+      ac: a.inside(c)
+    end
+
+  -- Pieces of two rectangles that do not overlap do not overlap either.
+  law disjoint_inside(a: RECT, b: RECT, p: RECT, q: RECT)
+    require
+      pa: p.inside(a)
+      qb: q.inside(b)
+      ab: a.disjoint(b)
+    ensure
+      pq: p.disjoint(q)
+    end
+
+end

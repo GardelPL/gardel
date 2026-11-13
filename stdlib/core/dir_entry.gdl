@@ -1,0 +1,9 @@
+-- One entry of a directory, answering `ListDir` (spec 11.6): its name, without the directory's
+-- path, and whether it is a directory itself.
+module DIR_ENTRY
+
+representation {ANY}
+  name: STRING
+  is_dir: BOOL
+
+end

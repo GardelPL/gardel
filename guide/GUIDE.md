@@ -1,6 +1,7 @@
 # The Gardel Programming Guide
 
-Welcome to the definitive guide to **Gardel**, a pure, total, statically verified programming language built on **Tony Hoare's axiomatic semantics**. Every routine is a triple $\{P\}\;C\;\{Q\}$, proved at compile time by Boogie and Z3 and then erased. Gardel's contract syntax comes from Eiffel, its style of automated proof from Dafny, and its model of parallelism from Bend.
+Welcome to the definitive 
+   - [A Package for Terminal Interfaces: `gtui`](#a-package-for-terminal-interfaces-gtui)guide to **Gardel**, a pure, total, statically verified programming language built on **Tony Hoare's axiomatic semantics**. Every routine is a triple $\{P\}\;C\;\{Q\}$, proved at compile time by Boogie and Z3 and then erased. Gardel's contract syntax comes from Eiffel, its style of automated proof from Dafny, and its model of parallelism from Bend.
 
 This guide is written for two audiences:
 1. **Software engineers** seeking mathematical certainty, zero-cost static contracts, and automatic lock-free parallelism.
@@ -1350,10 +1351,11 @@ The runtime calls `init`, performs the commands it returns, waits for an event, 
 | Prelude type | Contents |
 | :--- | :--- |
 | `STEP[S]` | `Continue(next, cmds)` or `Stop(code, cmds)` |
-| `COMMAND` | `Print`, `Write`, `TerminalSize`, `SetTimer`, `CancelTimer`, `ReadLine`, `ReadKey`, `Listen`, `Connect`, `Send`, `Close` |
-| `EVENT` | `Tick`, `Line`, `Key`, `Resized`, `Accepted`, `ListenFailed`, `Connected`, `ConnectFailed`, `Received`, `SendFailed`, `Closed`, `Shutdown` |
+| `COMMAND` | `Print`, `Write`, `TerminalSize`, `SetTimer`, `CancelTimer`, `ReadLine`, `ReadKey`, `Listen`, `Connect`, `Send`, `Close`, `ReadFile`, `ListDir`, `RunProcess`, `WriteProcess`, `CloseInput`, `StopProcess`, `RunAttached` |
+| `EVENT` | `Tick`, `Line`, `Key`, `Resized`, `Accepted`, `ListenFailed`, `Connected`, `ConnectFailed`, `Received`, `SendFailed`, `Closed`, `FileRead`, `DirListed`, `ProcessStarted`, `ProcessFailed`, `ProcessOutput`, `ProcessErrorOutput`, `ProcessExited`, `AttachedEnded`, `Shutdown` |
 | `KEY` | `Char(c)`, arrows, `Enter`, `Escape`, `Backspace`, `Tab`, `Home`, `End`, `PageUp`, `PageDown`, `Delete`, `Ctrl(c)`, `Other`, `KeysEnded` |
-| `CONN_ID` | An opaque connection handle: it can be compared and stored, never forged |
+| `CONN_ID`, `PROC_ID` | Opaque connection and process handles: they can be compared and stored, never forged |
+| `DIR_ENTRY` | An entry of a listing: `name` and `is_dir` |
 
 Rules worth knowing:
 - There is no `main`, no `IO` type and no `with IO`. `Stop` is the only way out, and its `code` is the exit status.
@@ -1362,7 +1364,10 @@ Rules worth knowing:
 - `Connect(tag, host, port)` is answered by `Connected(tag, conn)` or `ConnectFailed(tag, err)`, with the tag you chose. `host` is an IPv4 address or `localhost`: names are not looked up. A connection you made works like an accepted one.
 - `CancelTimer(id)` clears a pending timer, so a stale `Tick` cannot reach a later use of the id.
 - A command never blocks the loop. One that can fail reports it as a later event.
-- To draw a screen, `Write` text with no newline, VT sequences included: a step's output goes out together, and the bytes are the same on Linux and Windows. `TerminalSize` answers with `Resized(width, height)`, and every later resize arrives the same way. Output that is not a terminal is 80 by 24.
+- To draw a screen, `Write` text with no newline, VT sequences included: a step's output goes out together, and the bytes are the same on Linux and Windows. `TerminalSize` answers with `Resized(width, height)`, and every later resize arrives the same way. Output that is not a terminal is 80 by 24. The `gtui` package draws a screen this way, writing only the cells that change: see [A Package for Terminal Interfaces](#a-package-for-terminal-interfaces-gtui).
+- `ReadFile(tag, path)` answers with `FileRead(tag, res)`, the whole file as `BYTES`, and `ListDir(tag, path)` with `DirListed(tag, res)`, the entries sorted by name. Both run on a thread of their own.
+- `RunProcess(tag, program, args, dir)` starts a program, with no shell: each argument reaches it as you wrote it. It answers with `ProcessStarted(tag, proc)` or `ProcessFailed(tag, err)`. Then `ProcessOutput(proc, data)` and `ProcessErrorOutput(proc, data)` bring what it writes, and `ProcessExited(proc, code)` comes last. `WriteProcess(proc, data)` and `CloseInput(proc)` feed its input, and `StopProcess(proc)` kills it and whatever it started.
+- `RunAttached(tag, program, args, dir)` gives a program the terminal, say an editor or another full-screen program, and answers with `AttachedEnded(tag, res)` when it ends. Your keys go to it meanwhile. After it, `Resized` comes again, so a screen is drawn anew.
 - `Ctrl(c)` is Ctrl with a letter, given lowercase. Ctrl-H, Ctrl-I, Ctrl-J and Ctrl-M are `Backspace`, `Tab` and `Enter`, and Ctrl-C is always a `Shutdown`, so a program in raw mode can still be stopped and leaves the terminal as it found it.
 - The compiler adds `e.is_shutdown implies Result.is_stop` to every `step`, tagged `shutdown_must_stop`, and a clause you write cannot replace it.
 
@@ -1428,7 +1433,7 @@ A reactive program is a pure function of its arguments and its events, so a run 
 | :--- | :--- |
 | `GARDEL_EVENTS=<script>` | Run from a script, such as `Resized:80:24 Tick:1 Key:Up Key:Ctrl:s Line:hello%20there Shutdown`. The end of the script is a `Shutdown`. |
 | `GARDEL_RECORD=<file>` | Write a log of the run |
-| `GARDEL_REPLAY=<file>` | Run from a log, with no timers, reads or sockets |
+| `GARDEL_REPLAY=<file>` | Run from a log, with no timers, reads, sockets, files or processes |
 | `GARDEL_LISTEN_ADDR=<ip>` | Bind `Listen` to an address other than loopback |
 | `GARDEL_CONNECT_TIMEOUT_MS=<n>` | How long a `Connect` may take before it fails, 10000 by default |
 
@@ -1921,6 +1926,26 @@ back(i: I64, s: STRING): BOOL
 
 The round trip of arrays and objects is tested (`gjson/tests/cases.txt`) but not proven. `gjson/README.md` lists the errors, the costs and what is proven.
 
+### A Package for Terminal Interfaces: `gtui`
+
+`gtui/` is a verified library for full-screen terminal programs, in the style of Elm. Add `gtui = { path = "../gtui" }`, give `TUI` an `update` and a `view`, and the reactive program is two lines:
+
+```eiffel
+update(s: TODO_STATE, e: EVENT): TUI_NEXT[TODO_STATE]    -- Next(state, cmds) or Quit(code, after)
+view(s: TODO_STATE, blank: SCREEN): SCREEN                -- draws on a blank screen of the terminal's size
+
+init(args: SEQ[STRING]): STEP[TUI[TODO_STATE]] do TUI.start(TODO_STATE.empty, update, view) end
+step(t: TUI[TODO_STATE], e: EVENT): STEP[TUI[TODO_STATE]] do t.step(e) end
+```
+
+- **The loop.** `start` takes the alternate screen, hides the cursor, asks the size and reads a key. Every event but `Shutdown` goes to `update`, and the screen is drawn again from `view`: whole after a resize, and otherwise only the cells that changed, in one `Write`. `update`'s commands that would write on the screen or read the terminal are dropped. `Quit` and `Shutdown` put the terminal's screen back.
+- **Drawing.** `SCREEN.text(clip, x, y, text, style)` and `fill(clip, c, style)` change only cells inside `clip` and the screen. A cell holds no control character, and one code point is one cell, so wide characters are not accounted for.
+- **Layout.** `RECT`'s cuts (`take_top(n)`, `drop_top(n)` and the like) and `LAYOUT.rows(r, sizes)` and `columns(r, sizes)`, with `SIZE.fixed(n)` and `SIZE.flex(weight)`. Take a child with `LIST_OPS.at(parts, i)`: the contract gives one per size.
+- **Widgets.** `TEXT_VIEW`, `LIST_VIEW` (with a selection), `STATUS_BAR` and `INPUT_LINE`. Each draws in a rectangle and takes keys with `on_key`.
+- **What is proven.** Every write of a frame lies inside the screen (`SCREEN_DIFF.changes`'s `within`). A layout's children lie inside their parent and no two overlap: `LAYOUT.across_inside` and `LAYOUT_APART.columns_apart` reach a client, as `tests/gtui.rs` shows. That a diff's writes give the new screen is tested, not proven.
+
+`examples/todo_tui` uses all of it. A full redraw of 200 by 60 takes about 7 ms. `gtui/README.md` has the details.
+
 ### Checking a New Version
 
 Before releasing a package, compare it with the version your clients use:
@@ -2018,7 +2043,7 @@ The prelude's source code lives in the repository's `stdlib/` folder, one module
 stdlib/
 ├── concepts/      eq.gdl, canonical_eq.gdl, ord.gdl
 ├── core/          option.gdl, result.gdl, io_error.gdl, step.gdl,
-│                  command.gdl, event.gdl, key.gdl, conn_id.gdl
+│                  command.gdl, event.gdl, key.gdl, conn_id.gdl, proc_id.gdl, dir_entry.gdl
 ├── collections/   list_ops.gdl, seq.gdl
 ├── numeric/       bignat.gdl
 ├── text/          string.gdl, bytes.gdl, string_error.gdl

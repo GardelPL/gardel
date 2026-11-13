@@ -1,0 +1,63 @@
+-- RunAttached while a key is being waited for (Task F.11a): after `r`, a key read is asked for
+-- and a timer runs a child attached. The child reads a line of the terminal's input, and the
+-- program, whose reader waits parked meanwhile, gets the key after it. A `ReadLine` waiting
+-- refuses a RunAttached, as its read cannot be called back.
+--
+--   attach_keys <child>
+reactive program ATTACH_KEYS
+
+feature {ANY}
+
+  -- `label` and `t`, when they fit in a line.
+  joined(label: STRING, t: STRING): STRING
+    do
+      if label.byte_length <= 100 and t.byte_length <= 1000 then label.concat(t) else label end
+    end
+
+  init(args: SEQ[STRING]): STEP[STRING]
+    do
+      let xs = args.to_list
+      Continue(if xs.length > 0 then xs.head else "" end, LIST.empty.prepend(ReadKey))
+    end
+
+  step(child: STRING, e: EVENT): STEP[STRING]
+    do
+      match e
+        case Key(k) then
+          match k
+            case Char(c) then
+              if c = 'r' then
+                Continue(child, LIST.empty.prepend(SetTimer(1, 150)).prepend(ReadKey).prepend(Print("got r")))
+              else if c = 'l' then
+                Continue(child, LIST.empty
+                  .prepend(RunAttached(3, child, LIST.empty.prepend("readline"), ""))
+                  .prepend(ReadLine)
+                  .prepend(Print("got l")))
+              else
+                Stop(0, LIST.empty.prepend(Print(joined("got ", NUMBER_TEXT.nat_to_text(c.code)))))
+              end end
+            case KeysEnded then Stop(1, LIST.empty.prepend(Print("keys ended")))
+            case _ then Continue(child, LIST.empty.prepend(ReadKey))
+          end
+        case Tick(id) then
+          Continue(child, LIST.empty
+            .prepend(RunAttached(2, child, LIST.empty.prepend("readline"), ""))
+            .prepend(Print("attaching")))
+        case AttachedEnded(tag, r) then
+          match r
+            case Ok(code) then Continue(child, LIST.empty.prepend(Print(joined("attached ended ", NUMBER_TEXT.nat_to_text(tag)))))
+            case Error(_) then Continue(child, LIST.empty.prepend(Print(joined("attach refused ", NUMBER_TEXT.nat_to_text(tag)))))
+          end
+        case Line(r) then
+          match r
+            case Ok(t) then Continue(child, LIST.empty.prepend(ReadKey).prepend(Print(joined("line ", t))))
+            case Error(_) then Stop(1, LIST.empty.prepend(Print("line ended")))
+          end
+        case Shutdown then
+          Stop(9, LIST.empty)
+        case _ then
+          Continue(child, LIST.empty)
+      end
+    end
+
+end

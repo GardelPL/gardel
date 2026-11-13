@@ -1,0 +1,184 @@
+-- A grid of cells, `width` by `height`, each at most 65535, which a view draws on. Drawing
+-- is clipped: `text` and `fill` change only the cells inside both the rectangle they are
+-- given and the screen, so a widget given a rectangle cannot draw outside it.
+module SCREEN
+
+representation {NONE}
+  wide: NAT
+  high: NAT
+  lines: LIST[LIST[CELL]]
+
+invariant
+  fits: wide <= 65535 and high <= 65535
+
+create {ANY}
+
+  -- A screen of blank cells, at most 65535 by 65535.
+  blank(w: NAT, h: NAT): SCREEN
+    do
+      let cw = if w <= 65535 then w else 65535 end
+      let ch = if h <= 65535 then h else 65535 end
+      let row: LIST[CELL] = LIST_CUT.repeat(CELL.blank, cw, LIST.empty)
+      let none: LIST[LIST[CELL]] = LIST.empty
+      { wide = cw, high = ch, lines = LIST_CUT.repeat(row, ch, none) }
+    ensure
+      width_set: w <= 65535 implies Result.width = w
+      height_set: h <= 65535 implies Result.height = h
+    end
+
+  -- Row `y` of `rows`, or no cells past the last row.
+  nth_row(rows: LIST[LIST[CELL]], y: NAT): LIST[CELL]
+    variant
+      y
+    do
+      if rows.length = 0 then LIST.empty
+      else if y = 0 then rows.head
+      else SCREEN.nth_row(rows.tail, y - 1)
+      end end
+    end
+
+  -- `rows` with `cells` put on row `y` from column `x`.
+  put_in(rows: LIST[LIST[CELL]], y: NAT, x: NAT, cells: LIST[CELL]): LIST[LIST[CELL]]
+    require
+      left: x <= 65535
+      short: cells.length <= 65535
+    variant
+      y
+    do
+      if rows.length = 0 then rows
+      else if y = 0 then rows.tail.prepend(SCREEN.splice(rows.head, x, cells))
+      else SCREEN.put_in(rows.tail, y - 1, x, cells).prepend(rows.head)
+      end end
+    end
+
+  -- `row` with `cells` from column `x`, padded with blanks when it is shorter than `x`.
+  splice(row: LIST[CELL], x: NAT, cells: LIST[CELL]): LIST[CELL]
+    require
+      left: x <= 65535
+      short: cells.length <= 65535
+    do
+      let before = LIST_CUT.take(row, x)
+      let pad = if row.length < x then LIST_CUT.repeat(CELL.blank, x - row.length, LIST.empty) else LIST.empty end
+      before.append(pad).append(cells).append(LIST_CUT.drop(row, x + cells.length))
+    end
+
+  -- `acc` with a cell of style `st` for each of `chars` in front of it, the last first.
+  styled_into(chars: LIST[CHAR], st: STYLE, acc: LIST[CELL]): LIST[CELL]
+    variant
+      chars.length
+    do
+      if chars.length = 0 then acc
+      else SCREEN.styled_into(chars.tail, st, acc.prepend(CELL.make(chars.head, st)))
+      end
+    ensure
+      length_def: Result.length = chars.length + acc.length
+    end
+
+  -- `drawn`, when it is the size of `blank`, and `blank` otherwise.
+  fitted(drawn: SCREEN, blank: SCREEN): SCREEN
+    do
+      if drawn.width = blank.width and drawn.height = blank.height then drawn else blank end
+    ensure
+      same_width: Result.width = blank.width
+      same_height: Result.height = blank.height
+    end
+
+feature {ANY}
+
+  width: NAT
+    do
+      Current.wide
+    ensure
+      fits: Result <= 65535
+    end
+
+  height: NAT
+    do
+      Current.high
+    ensure
+      fits: Result <= 65535
+    end
+
+  -- The whole screen as a rectangle.
+  area: RECT
+    do
+      RECT.make(0, 0, Current.wide, Current.high)
+    ensure
+      at_origin: Result.x = 0 and Result.y = 0
+      width_same: Result.width = Current.width
+      height_same: Result.height = Current.height
+    end
+
+  -- The cells of row `y`, none past the bottom.
+  row(y: NAT): LIST[CELL]
+    do
+      if y < Current.high then SCREEN.nth_row(Current.lines, y) else LIST.empty end
+    end
+
+  -- `cells` on row `y` from column `x`, those past the right edge left out.
+  put(x: NAT, y: NAT, cells: LIST[CELL]): SCREEN
+    do
+      if y >= Current.high or x >= Current.wide then
+        Current
+      else
+        { Current with lines = SCREEN.put_in(Current.lines, y, x, LIST_CUT.take(cells, Current.wide - x)) }
+      end
+    ensure
+      same_width: Result.width = Current.width
+      same_height: Result.height = Current.height
+    end
+
+  -- `s` in style `st` on row `y` from column `x`, only where it is inside `clip`.
+  text(clip: RECT, x: NAT, y: NAT, s: STRING, st: STYLE): SCREEN
+    do
+      Current.glyphs(clip, x, y, GLYPHS.of_text(s), st)
+    ensure
+      same_width: Result.width = Current.width
+      same_height: Result.height = Current.height
+    end
+
+  -- `cs` in style `st` on row `y` from column `x`, only where it is inside `clip`.
+  glyphs(clip: RECT, x: NAT, y: NAT, cs: LIST[CHAR], st: STYLE): SCREEN
+    do
+      let edge = if clip.right < Current.wide then clip.right else Current.wide end
+      let start = if x < clip.x then clip.x else x end
+      if y < clip.y or y >= clip.bottom or start >= edge then
+        Current
+      else
+        let chars = LIST_CUT.drop(cs, start - x)
+        let shown = LIST_CUT.take_into(chars, edge - start, LIST.empty)
+        Current.put(start, y, SCREEN.styled_into(shown, st, LIST.empty))
+      end
+    ensure
+      same_width: Result.width = Current.width
+      same_height: Result.height = Current.height
+    end
+
+  -- Every cell inside `clip` set to `c` in style `st`.
+  fill(clip: RECT, c: CHAR, st: STYLE): SCREEN
+    do
+      let edge = if clip.right < Current.wide then clip.right else Current.wide end
+      let last = if clip.bottom < Current.high then clip.bottom else Current.high end
+      if clip.x >= edge or clip.y >= last then
+        Current
+      else
+        let cells = LIST_CUT.repeat(CELL.make(c, st), edge - clip.x, LIST.empty)
+        Current.fill_rows(clip.x, clip.y, last, cells)
+      end
+    ensure
+      same_width: Result.width = Current.width
+      same_height: Result.height = Current.height
+    end
+
+  -- `cells` from column `x` on every row from `y` up to `last`.
+  fill_rows(x: NAT, y: NAT, last: NAT, cells: LIST[CELL]): SCREEN
+    variant
+      last - y
+    do
+      if y >= last then Current else Current.put(x, y, cells).fill_rows(x, y + 1, last, cells) end
+    ensure
+      same_width: Result.width = Current.width
+      same_height: Result.height = Current.height
+    end
+
+end

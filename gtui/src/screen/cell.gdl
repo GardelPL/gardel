@@ -1,0 +1,64 @@
+-- One cell of a screen: a character and its style. A cell never holds a control character
+-- (`printable`), so text drawn on a screen cannot move the terminal's cursor: a control
+-- character becomes `?`, and a tab a space. One code point is one cell; characters that a
+-- terminal shows two cells wide, or none, are not accounted for.
+module CELL
+
+representation {NONE}
+  glyph: CHAR
+  look: STYLE
+
+invariant
+  printable: glyph.code >= 32 and (glyph.code < 127 or glyph.code >= 160)
+
+create {ANY}
+
+  make(c: CHAR, s: STYLE): CELL
+    do
+      { glyph = CELL.shown(c), look = s }
+    ensure
+      style_set: Result.style.same(s)
+    end
+
+  blank: CELL
+    do
+      { glyph = ' ', look = STYLE.plain }
+    end
+
+create {ANY}
+
+  -- Not a C0 or C1 control character, nor DEL.
+  is_printable(c: CHAR): BOOL
+    do
+      c.code >= 32 and (c.code < 127 or c.code >= 160)
+    end
+
+  -- `c`, or what is shown for it when it is a control character.
+  shown(c: CHAR): CHAR
+    do
+      if CELL.is_printable(c) then c else if c.code = 9 then ' ' else '?' end end
+    ensure
+      printable: CELL.is_printable(Result)
+    end
+
+feature {ANY}
+
+  char: CHAR
+    do
+      Current.glyph
+    ensure
+      printable: CELL.is_printable(Result)
+    end
+
+  style: STYLE
+    do
+      Current.look
+    end
+
+  same(other: CELL): BOOL
+    do
+      Current.glyph = other.glyph and Current.look.same(other.look)
+    end
+
+
+end

@@ -1,0 +1,40 @@
+-- The commands an application may send while `TUI` owns the terminal.
+functions TUI_COMMANDS
+
+feature {ANY}
+
+  -- `cmds` without those that write on the screen or read from the terminal: `Print`,
+  -- `Write`, `TerminalSize`, `ReadLine` and `ReadKey`. `TUI` sends those itself.
+  own(cmds: LIST[COMMAND]): LIST[COMMAND]
+    do
+      LIST_OPS.filter(cmds, fn(c: COMMAND): BOOL do TUI_COMMANDS.allowed(c) end)
+    ensure
+      not_longer: Result.length <= cmds.length
+    end
+
+  allowed(c: COMMAND): BOOL
+    do
+      match c
+        case Print(_) then False
+        case Write(_) then False
+        case TerminalSize then False
+        case ReadLine then False
+        case ReadKey then False
+        case _ then True
+      end
+    end
+
+  -- A read of the next key after a key, until keys end; nothing after any other event.
+  reads_after(e: EVENT): LIST[COMMAND]
+    do
+      match e
+        case Key(k) then
+          match k
+            case KeysEnded then LIST.empty
+            case _ then LIST.empty.prepend(ReadKey)
+          end
+        case _ then LIST.empty
+      end
+    end
+
+end

@@ -1,0 +1,76 @@
+-- How a cell is drawn: any of bold, dim, underlined and reversed, on the terminal's own
+-- colours. `plain` has none, and each of the others adds one.
+module STYLE
+
+representation {NONE}
+  strong: BOOL
+  faint: BOOL
+  under: BOOL
+  inverse: BOOL
+
+create {ANY}
+
+  plain: STYLE
+    do
+      { strong = False, faint = False, under = False, inverse = False }
+    ensure
+      nothing: not Result.is_bold and not Result.is_dim and not Result.is_underlined and not Result.is_reversed
+    end
+
+feature {ANY}
+
+  is_bold: BOOL
+    do
+      Current.strong
+    end
+
+  is_dim: BOOL
+    do
+      Current.faint
+    end
+
+  is_underlined: BOOL
+    do
+      Current.under
+    end
+
+  is_reversed: BOOL
+    do
+      Current.inverse
+    end
+
+  bold: STYLE
+    do
+      { Current with strong = True }
+    ensure
+      set: Result.is_bold
+    end
+
+  dim: STYLE
+    do
+      { Current with faint = True }
+    ensure
+      set: Result.is_dim
+    end
+
+  underlined: STYLE
+    do
+      { Current with under = True }
+    ensure
+      set: Result.is_underlined
+    end
+
+  reversed: STYLE
+    do
+      { Current with inverse = True }
+    ensure
+      set: Result.is_reversed
+    end
+
+  same(other: STYLE): BOOL
+    do
+      Current.strong = other.strong and Current.faint = other.faint and
+        Current.under = other.under and Current.inverse = other.inverse
+    end
+
+end

@@ -1,0 +1,54 @@
+-- Cutting and joining lists, with their lengths stated. Each one is a loop.
+functions LIST_CUT
+
+feature {ANY}
+
+  -- The first `n` items, or all of them.
+  take[A](xs: LIST[A], n: NAT): LIST[A]
+    do
+      LIST_CUT.reverse(LIST_CUT.take_into(xs, n, LIST.empty), LIST.empty)
+    ensure
+      length_def: Result.length = (if n <= xs.length then n else xs.length end)
+    end
+
+  -- The items after the first `n`, or none.
+  drop[A](xs: LIST[A], n: NAT): LIST[A]
+    variant
+      n
+    do
+      if n = 0 or xs.length = 0 then xs else LIST_CUT.drop(xs.tail, n - 1) end
+    ensure
+      length_def: Result.length = (if n <= xs.length then xs.length - n else 0 end)
+    end
+
+  -- `acc` with the items of `xs` in front of it, last first.
+  reverse[A](xs: LIST[A], acc: LIST[A]): LIST[A]
+    variant
+      xs.length
+    do
+      if xs.length = 0 then acc else LIST_CUT.reverse(xs.tail, acc.prepend(xs.head)) end
+    ensure
+      length_def: Result.length = xs.length + acc.length
+    end
+
+  -- `acc` with the first `n` items of `xs` in front of it, last first.
+  take_into[A](xs: LIST[A], n: NAT, acc: LIST[A]): LIST[A]
+    variant
+      n
+    do
+      if n = 0 or xs.length = 0 then acc else LIST_CUT.take_into(xs.tail, n - 1, acc.prepend(xs.head)) end
+    ensure
+      length_def: Result.length = acc.length + (if n <= xs.length then n else xs.length end)
+    end
+
+  -- `n` copies of `x` in front of `acc`.
+  repeat[A](x: A, n: NAT, acc: LIST[A]): LIST[A]
+    variant
+      n
+    do
+      if n = 0 then acc else LIST_CUT.repeat(x, n - 1, acc.prepend(x)) end
+    ensure
+      length_def: Result.length = acc.length + n
+    end
+
+end

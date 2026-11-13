@@ -2865,6 +2865,19 @@ static struct SEQ_STRING* gardel_main_args(int argc, char** argv) {
         let evt = self.ctype("EVENT")?;
         let cmd = self.ctype("COMMAND")?;
         let cmds = self.ctype("LIST[COMMAND]")?;
+        // Files and processes: their values are built by the host (`host_files::typed_runtime`).
+        let file_types = ["RESULT[IO_ERROR, BYTES]", "RESULT[IO_ERROR, LIST[DIR_ENTRY]]", "RESULT[IO_ERROR, I64]", "LIST[DIR_ENTRY]", "LIST[STRING]"];
+        for t in file_types {
+            self.ctype(t)?;
+        }
+        let files_typed = crate::host_files::typed_runtime(
+            &c_instance_name(file_types[0]),
+            &c_instance_name(file_types[1]),
+            &c_instance_name(file_types[2]),
+            &c_instance_name(file_types[3]),
+            &c_instance_name(file_types[4]),
+        );
+        let files_rt = crate::host_files::HOST_FILES_RUNTIME;
         self.drain();
 
         // One case per variant, so a variant with no host code cannot be ignored at run time.
@@ -2894,7 +2907,7 @@ static struct SEQ_STRING* gardel_main_args(int argc, char** argv) {
         let drop_args = self.drop_stmt("SEQ[STRING]", "args")?;
         Ok((
             format!(
-                "{REACTIVE_RUNTIME}\n\
+                "{REACTIVE_RUNTIME}\n{files_rt}\n{files_typed}\
                  static void gardel_run_commands({cmds} p) {{\n    for (; p; p = p->tail) {{\n        {cmd} c = p->head;\n        switch (c->tag) {{\n{run}        default: abort();\n        }}\n    }}\n    gardel_log_flush();\n    /* The program may now wait for days: what it printed must already be out. */\n    fflush(stdout);\n}}\n\n\
                  static {keyt} gardel_key_value(struct gardel_host_event ev) {{\n    switch (ev.key) {{\n{make_key}        default: abort();\n    }}\n}}\n\n\
                  static {evt} gardel_event_value(struct gardel_host_event ev) {{\n    switch (ev.kind) {{\n{make}        default: abort();\n    }}\n}}\n\n\
@@ -2935,6 +2948,7 @@ static struct SEQ_STRING* gardel_main_args(int argc, char** argv) {
                  \x20       {drop_step}\
                  \x20   }}\n\
                  \x20   gardel_net_finish();\n\
+                 \x20   gardel_proc_finish();\n\
                  \x20   gardel_term_restore();\n\
                  \x20   gardel_host_finished();\n\
                  \x20   return code;\n\
@@ -2942,7 +2956,7 @@ static struct SEQ_STRING* gardel_main_args(int argc, char** argv) {
                  int main(int argc, char** argv) {{\n\
                  \x20   int code = gardel_reactive_main(argc, argv);\n\
                  \x20   /* The reader may be blocked on stdin, and exit() would wait for that stream. */\n\
-                 \x20   if (gardel_reader_started) {{\n\
+                 \x20   if (gardel_reader_started || gardel_workers_started) {{\n\
                  \x20       fflush(stdout);\n\
                  \x20       fflush(stderr);\n\
                  \x20       _Exit(code);\n\
@@ -3026,7 +3040,9 @@ const REACTIVE_RUNTIME: &str = r#"/* Reactive host (spec 11.6). */
 enum gardel_host_kind {
     GARDEL_HOST_SHUTDOWN, GARDEL_HOST_TICK, GARDEL_HOST_LINE, GARDEL_HOST_KEY, GARDEL_HOST_ACCEPTED,
     GARDEL_HOST_LISTEN_FAILED, GARDEL_HOST_RECEIVED, GARDEL_HOST_SEND_FAILED, GARDEL_HOST_CLOSED,
-    GARDEL_HOST_CONNECTED, GARDEL_HOST_CONNECT_FAILED, GARDEL_HOST_RESIZED
+    GARDEL_HOST_CONNECTED, GARDEL_HOST_CONNECT_FAILED, GARDEL_HOST_RESIZED, GARDEL_HOST_FILE_READ,
+    GARDEL_HOST_DIR_LISTED, GARDEL_HOST_PROC_STARTED, GARDEL_HOST_PROC_FAILED, GARDEL_HOST_PROC_OUT,
+    GARDEL_HOST_PROC_ERR, GARDEL_HOST_PROC_EXITED, GARDEL_HOST_ATTACHED_ENDED
 };
 enum gardel_host_key {
     GARDEL_KEY_CHAR, GARDEL_KEY_UP, GARDEL_KEY_DOWN, GARDEL_KEY_LEFT, GARDEL_KEY_RIGHT,
@@ -3045,9 +3061,27 @@ struct gardel_host_event {
     int line_state;             /* Line: a GARDEL_LINE_* */
     char* raw;                  /* Line: the bytes read, kept only when recording */
     size_t raw_len;
-    uint64_t tag;               /* Connected, ConnectFailed: the tag of the Connect */
+    uint64_t tag;               /* Connected, ConnectFailed: the tag of the Connect; files, ProcessStarted,
+                                   ProcessFailed and AttachedEnded: the tag of the command */
     uint64_t width, height;     /* Resized: in cells */
+    bool ok;                    /* FileRead, DirListed, AttachedEnded: an answer, not `err` */
+    int64_t code;               /* ProcessExited, AttachedEnded: the exit code */
+    char* buf;                  /* FileRead, process output: malloc'd bytes from a helper thread, made
+                                   `data` by the loop as it takes them */
+    size_t buf_len;
+    struct gardel_dir_item* items; /* DirListed: malloc'd, sorted by name */
+    size_t item_count;
 };
+struct gardel_dir_item { char* name; size_t len; bool is_dir; };
+
+/* Files and processes (Task F.11a), defined after the log. */
+static volatile int gardel_attached_now = 0; /* a RunAttached child has the terminal: Ctrl-C is its own */
+static bool gardel_workers_started = false;
+static bool gardel_reader_gate(void);
+static void gardel_reader_gate_open(void);
+static void gardel_answer_taken(struct gardel_host_event* ev);
+static bool gardel_log_host_event(struct gardel_host_event* ev);
+static bool gardel_script_host(const char* name, size_t n, struct gardel_host_event* ev);
 
 /* Scripted events, from GARDEL_EVENTS: names separated by spaces. NULL reads the OS. */
 static const char* gardel_host_script = NULL;
@@ -3178,6 +3212,9 @@ static void* gardel_stop_requested = NULL;
 static void* gardel_stop_finished = NULL;
 static void* gardel_input_ready = NULL;
 static int __stdcall gardel_console_ctrl(unsigned long kind) {
+    /* Ctrl-C and Ctrl-Break reach every process of the console: while a child has it, they are
+       the child's. */
+    if (kind < 2 && gardel_attached_now) return 1;
     SetEvent(gardel_stop_requested);
     /* 0 is Ctrl-C, 1 Ctrl-Break. For a closing console, a logoff or a shutdown, Windows ends
        the process when this handler returns, so let the Stop commands finish first. */
@@ -3222,6 +3259,37 @@ static unsigned long __stdcall gardel_reader_entry(void* unused) {
 }
 static void gardel_reader_start(void) {
     if (!CreateThread(NULL, 0, gardel_reader_entry, NULL, 0, NULL)) abort();
+}
+__declspec(dllimport) void __stdcall WakeAllConditionVariable(void**);
+__declspec(dllimport) int __stdcall CloseHandle(void*);
+typedef void* gardel_cond;
+#define GARDEL_COND_INIT NULL
+/* Under the lock. */
+static void gardel_cond_wait(gardel_cond* cv, uint64_t ms) {
+    SleepConditionVariableSRW(cv, &gardel_lock_word, ms >= 0xFFFFFFFFULL ? 0xFFFFFFFFUL : (unsigned long)ms, 0);
+}
+static void gardel_cond_wake(gardel_cond* cv) { WakeAllConditionVariable(cv); }
+static void gardel_cond_init(gardel_cond* cv) { *cv = NULL; }
+static void gardel_cond_free(gardel_cond* cv) { (void)cv; }
+static gardel_cond gardel_space_cv = GARDEL_COND_INIT;
+static void gardel_space_wake(void) { gardel_cond_wake(&gardel_space_cv); }
+/* A helper thread for a file or a process. It owns `arg`. */
+struct gardel_thread_job { void (*fn)(void*); void* arg; };
+static unsigned long __stdcall gardel_thread_entry(void* p) {
+    struct gardel_thread_job j = *(struct gardel_thread_job*)p;
+    free(p);
+    j.fn(j.arg);
+    return 0;
+}
+static void gardel_thread_run(void (*fn)(void*), void* arg) {
+    struct gardel_thread_job* j = (struct gardel_thread_job*)malloc(sizeof *j);
+    if (!j) abort();
+    j->fn = fn;
+    j->arg = arg;
+    void* h = CreateThread(NULL, 0, gardel_thread_entry, j, 0, NULL);
+    if (!h) abort();
+    CloseHandle(h);
+    gardel_workers_started = true;
 }
 
 /* The terminal. Ctrl-C stays a signal in raw mode (ENABLE_PROCESSED_INPUT). */
@@ -3318,6 +3386,7 @@ static void gardel_read_console_key(struct gardel_host_event* ev) {
     for (;;) {
         struct gardel_console_key k;
         unsigned long got = 0;
+        if (!high) gardel_reader_gate();
         if (!ReadConsoleInputW(gardel_term_in, &k, 1, &got) || got == 0) {
             ev->key = GARDEL_KEY_END_OF_INPUT;
             return;
@@ -3449,6 +3518,8 @@ static int gardel_input_pipe[2] = {-1, -1};
 /* Written on SIGWINCH, and drained by the loop. -1 until a TerminalSize, which poll skips. */
 static int gardel_resize_pipe[2] = {-1, -1};
 static void gardel_on_signal(int sig) {
+    /* Ctrl-C reaches the whole foreground group: while a child has the terminal, it is the child's. */
+    if (sig == SIGINT && gardel_attached_now) return;
     int saved = errno;
     char c = (char)sig;
     ssize_t ignored = write(gardel_signal_pipe[1], &c, 1);
@@ -3530,6 +3601,54 @@ static void gardel_reader_start(void) {
     pthread_sigmask(SIG_BLOCK, &all, &old);
     if (pthread_create(&t, NULL, gardel_reader_entry, NULL) != 0) abort();
     pthread_sigmask(SIG_SETMASK, &old, NULL);
+}
+typedef pthread_cond_t gardel_cond;
+#define GARDEL_COND_INIT PTHREAD_COND_INITIALIZER
+/* Under the lock. */
+static void gardel_cond_wait(gardel_cond* cv, uint64_t ms) {
+    if (ms == UINT64_MAX) {
+        pthread_cond_wait(cv, &gardel_mutex);
+        return;
+    }
+    struct timespec t;
+    clock_gettime(CLOCK_REALTIME, &t);
+    t.tv_sec += (time_t)(ms / 1000);
+    t.tv_nsec += (long)(ms % 1000) * 1000000L;
+    if (t.tv_nsec >= 1000000000L) {
+        t.tv_sec++;
+        t.tv_nsec -= 1000000000L;
+    }
+    pthread_cond_timedwait(cv, &gardel_mutex, &t);
+}
+static void gardel_cond_wake(gardel_cond* cv) { pthread_cond_broadcast(cv); }
+static void gardel_cond_init(gardel_cond* cv) { pthread_cond_init(cv, NULL); }
+static void gardel_cond_free(gardel_cond* cv) { pthread_cond_destroy(cv); }
+static gardel_cond gardel_space_cv = GARDEL_COND_INIT;
+static void gardel_space_wake(void) { gardel_cond_wake(&gardel_space_cv); }
+/* A helper thread for a file or a process. It owns `arg`, and takes no signal. */
+struct gardel_thread_job { void (*fn)(void*); void* arg; };
+static void* gardel_thread_entry(void* p) {
+    struct gardel_thread_job j = *(struct gardel_thread_job*)p;
+    free(p);
+    j.fn(j.arg);
+    return NULL;
+}
+static void gardel_thread_run(void (*fn)(void*), void* arg) {
+    struct gardel_thread_job* j = (struct gardel_thread_job*)malloc(sizeof *j);
+    if (!j) abort();
+    j->fn = fn;
+    j->arg = arg;
+    pthread_t t;
+    pthread_attr_t attr;
+    pthread_attr_init(&attr);
+    pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
+    sigset_t all, old;
+    sigfillset(&all);
+    pthread_sigmask(SIG_BLOCK, &all, &old);
+    if (pthread_create(&t, &attr, gardel_thread_entry, j) != 0) abort();
+    pthread_sigmask(SIG_SETMASK, &old, NULL);
+    pthread_attr_destroy(&attr);
+    gardel_workers_started = true;
 }
 
 /* The terminal. Ctrl-C stays a signal in raw mode (ISIG is kept), and is the only one: the other
@@ -3661,6 +3780,22 @@ static struct gardel_answer* gardel_answers = NULL;
 static struct gardel_answer** gardel_answers_end = &gardel_answers;
 static bool gardel_reader_started = false;
 static int gardel_pending_answers = 0;
+/* Under the lock: line reads asked for and not yet answered. A line is read from stdin, which a
+   RunAttached child would share, so it waits for none. */
+static uint64_t gardel_lines_owed = 0;
+/* Under the lock: bytes of process output waiting in answers. A helper thread waits while there
+   are too many, so a child that writes without end cannot fill the memory. */
+static uint64_t gardel_proc_queued = 0;
+#define GARDEL_PROC_QUEUE_MAX (8u * 1024u * 1024u)
+#define GARDEL_ANSWERS_MAX 1024
+
+/* An answer for the loop, from any thread, under the lock. */
+static void gardel_answer_push(struct gardel_answer* a) {
+    *gardel_answers_end = a;
+    gardel_answers_end = &a->next;
+    gardel_pending_answers++;
+    gardel_input_signal();
+}
 
 static void gardel_keep_line(struct gardel_host_event* ev, const char* buf, size_t len) {
     if (!gardel_log_capture) return;
@@ -3723,11 +3858,13 @@ static void gardel_host_request_input(bool is_key) {
     if (!gardel_reader_started) {
         gardel_reader_started = true;
         gardel_term_open();
+        gardel_reader_gate_open();
         gardel_reader_start();
     }
     gardel_lock();
     *gardel_requests_end = r;
     gardel_requests_end = &r->next;
+    if (!is_key) gardel_lines_owed++;
     gardel_request_wake();
     gardel_unlock();
 }
@@ -3817,6 +3954,7 @@ static void gardel_read_key(struct gardel_host_event* ev) {
         return;
     }
 #endif
+    gardel_reader_gate();
     gardel_decode_key_byte(gardel_read_byte(), ev);
 }
 
@@ -3830,7 +3968,8 @@ static void gardel_reader_main(void) {
         gardel_unlock();
         struct gardel_answer* a = (struct gardel_answer*)calloc(1, sizeof *a);
         if (!a) abort();
-        gardel_term_set_raw(r->is_key);
+        /* A key read sets raw mode in its gate, once no RunAttached child has the terminal. */
+        if (!r->is_key) gardel_term_set_raw(false);
         if (r->is_key) {
             a->ev.kind = GARDEL_HOST_KEY;
             gardel_read_key(&a->ev);
@@ -3842,23 +3981,23 @@ static void gardel_reader_main(void) {
             if (a->ev.line_state == GARDEL_LINE_READ) gardel_keep_line(&a->ev, buf, len);
             a->ev.line = gardel_line_value(a->ev.line_state, buf, len, a->ev.err);
         }
-        free(r);
         gardel_lock();
-        *gardel_answers_end = a;
-        gardel_answers_end = &a->next;
-        gardel_pending_answers++;
-        gardel_input_signal();
+        if (!r->is_key) gardel_lines_owed--;
+        gardel_answer_push(a);
         gardel_unlock();
+        free(r);
     }
 }
 
 static bool gardel_take_answer(struct gardel_host_event* ev) {
-    if (!gardel_reader_started) return false;
+    if (!gardel_reader_started && !gardel_workers_started) return false;
     gardel_lock();
     struct gardel_answer* a = gardel_answers;
     if (a) {
         gardel_answers = a->next;
         if (!gardel_answers) gardel_answers_end = &gardel_answers;
+        if (a->ev.kind == GARDEL_HOST_PROC_OUT || a->ev.kind == GARDEL_HOST_PROC_ERR) gardel_proc_queued -= a->ev.buf_len;
+        gardel_space_wake();
 #ifdef _WIN32
         if (--gardel_pending_answers == 0) gardel_input_clear();
 #else
@@ -3870,6 +4009,7 @@ static bool gardel_take_answer(struct gardel_host_event* ev) {
     if (!a) return false;
     *ev = a->ev;
     free(a);
+    gardel_answer_taken(ev);
     return true;
 }
 
@@ -4720,7 +4860,8 @@ static void gardel_log_event(struct gardel_host_event* ev) {
             gardel_log_word(":");
             gardel_log_number(ev->height);
             break;
-        default: abort();
+        default:
+            if (!gardel_log_host_event(ev)) abort();
         }
         gardel_log_finish(true);
     }
@@ -4810,6 +4951,7 @@ static struct gardel_host_event gardel_next_scripted_event(void) {
     }
     if (n == 8 && memcmp(name, "Shutdown", 8) == 0) return ev;
     if (gardel_script_net(name, n, &ev)) return ev;
+    if (gardel_script_host(name, n, &ev)) return ev;
     if (n > 5 && memcmp(name, "Tick:", 5) == 0) {
         size_t i = 5;
         if (gardel_script_number(name, n, &i, &ev.id) && i == n) {
@@ -4934,6 +5076,13 @@ pub(crate) fn host_command_code(variant: &str) -> Option<&'static str> {
         "CancelTimer" => Some("gardel_host_cancel_timer(c->CancelTimer.id);"),
         "Write" => Some("gardel_io_print(c->Write.text);"),
         "TerminalSize" => Some("gardel_host_terminal_size();"),
+        "ReadFile" => Some("gardel_host_file(c->ReadFile.tag, c->ReadFile.path, false);"),
+        "ListDir" => Some("gardel_host_file(c->ListDir.tag, c->ListDir.path, true);"),
+        "RunProcess" => Some("gardel_host_run_list(c->RunProcess.tag, c->RunProcess.program, c->RunProcess.args, c->RunProcess.dir, false);"),
+        "WriteProcess" => Some("gardel_host_proc_write(c->WriteProcess.proc->id, c->WriteProcess.data);"),
+        "CloseInput" => Some("gardel_host_proc_close_input(c->CloseInput.proc->id);"),
+        "StopProcess" => Some("gardel_host_proc_stop(c->StopProcess.proc->id);"),
+        "RunAttached" => Some("gardel_host_run_list(c->RunAttached.tag, c->RunAttached.program, c->RunAttached.args, c->RunAttached.dir, true);"),
         _ => None,
     }
 }
@@ -4954,6 +5103,13 @@ pub(crate) fn host_command_log(variant: &str) -> Option<&'static str> {
         "CancelTimer" => Some("gardel_log_word(\"CancelTimer:\"); gardel_log_number(c->CancelTimer.id);"),
         "Write" => Some("gardel_log_word(\"Write:\"); gardel_log_text(c->Write.text.data, c->Write.text.len);"),
         "TerminalSize" => Some("gardel_log_word(\"TerminalSize\");"),
+        "ReadFile" => Some("gardel_log_word(\"ReadFile:\"); gardel_log_number(c->ReadFile.tag); gardel_log_word(\":\"); gardel_log_text(c->ReadFile.path.data, c->ReadFile.path.len);"),
+        "ListDir" => Some("gardel_log_word(\"ListDir:\"); gardel_log_number(c->ListDir.tag); gardel_log_word(\":\"); gardel_log_text(c->ListDir.path.data, c->ListDir.path.len);"),
+        "RunProcess" => Some("gardel_log_word(\"RunProcess:\"); gardel_log_run(c->RunProcess.tag, c->RunProcess.program, c->RunProcess.args, c->RunProcess.dir);"),
+        "WriteProcess" => Some("gardel_log_word(\"WriteProcess:\"); gardel_log_number(c->WriteProcess.proc->id); gardel_log_word(\":\"); gardel_log_text(c->WriteProcess.data.data, c->WriteProcess.data.len);"),
+        "CloseInput" => Some("gardel_log_word(\"CloseInput:\"); gardel_log_number(c->CloseInput.proc->id);"),
+        "StopProcess" => Some("gardel_log_word(\"StopProcess:\"); gardel_log_number(c->StopProcess.proc->id);"),
+        "RunAttached" => Some("gardel_log_word(\"RunAttached:\"); gardel_log_run(c->RunAttached.tag, c->RunAttached.program, c->RunAttached.args, c->RunAttached.dir);"),
         _ => None,
     }
 }
@@ -4973,6 +5129,14 @@ pub(crate) fn host_event_code(variant: &str) -> Option<&'static str> {
         "Connected" => Some("case GARDEL_HOST_CONNECTED: return make_EVENT_Connected(ev.tag, make_CONN_ID(ev.id));"),
         "ConnectFailed" => Some("case GARDEL_HOST_CONNECT_FAILED: return make_EVENT_ConnectFailed(ev.tag, make_IO_ERROR_OsError(ev.err));"),
         "Resized" => Some("case GARDEL_HOST_RESIZED: return make_EVENT_Resized(ev.width, ev.height);"),
+        "FileRead" => Some("case GARDEL_HOST_FILE_READ: return make_EVENT_FileRead(ev.tag, gardel_file_value(ev));"),
+        "DirListed" => Some("case GARDEL_HOST_DIR_LISTED: return make_EVENT_DirListed(ev.tag, gardel_dir_value(ev));"),
+        "ProcessStarted" => Some("case GARDEL_HOST_PROC_STARTED: return make_EVENT_ProcessStarted(ev.tag, make_PROC_ID(ev.id));"),
+        "ProcessFailed" => Some("case GARDEL_HOST_PROC_FAILED: return make_EVENT_ProcessFailed(ev.tag, make_IO_ERROR_OsError(ev.err));"),
+        "ProcessOutput" => Some("case GARDEL_HOST_PROC_OUT: return make_EVENT_ProcessOutput(make_PROC_ID(ev.id), ev.data);"),
+        "ProcessErrorOutput" => Some("case GARDEL_HOST_PROC_ERR: return make_EVENT_ProcessErrorOutput(make_PROC_ID(ev.id), ev.data);"),
+        "ProcessExited" => Some("case GARDEL_HOST_PROC_EXITED: return make_EVENT_ProcessExited(make_PROC_ID(ev.id), ev.code);"),
+        "AttachedEnded" => Some("case GARDEL_HOST_ATTACHED_ENDED: return make_EVENT_AttachedEnded(ev.tag, gardel_attached_value(ev));"),
         _ => None,
     }
 }

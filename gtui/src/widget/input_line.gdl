@@ -1,0 +1,172 @@
+-- A line of text being typed, with a cursor: the characters before the cursor, nearest
+-- first, and those after it. Keys insert at the cursor, delete on either side of it and move
+-- it. At most 4096 characters, past which typing inserts nothing.
+module INPUT_LINE
+
+representation {NONE}
+  before: LIST[CHAR]
+  after: LIST[CHAR]
+
+invariant
+  bounded: before.length + after.length <= 4096
+
+create {ANY}
+
+  empty: INPUT_LINE
+    do
+      { before = LIST.empty, after = LIST.empty }
+    ensure
+      none: Result.length = 0
+    end
+
+  -- `s`, with the cursor at its end, cut at 4096 characters.
+  of_text(s: STRING): INPUT_LINE
+    do
+      let none: LIST[CHAR] = LIST.empty
+      { before = LIST_CUT.take_into(GLYPHS.of_text(s), 4096, none), after = none }
+    end
+
+feature {ANY}
+
+  length: NAT
+    do
+      Current.before.length + Current.after.length
+    ensure
+      bounded: Result <= 4096
+    end
+
+  -- The characters before the cursor.
+  cursor: NAT
+    do
+      Current.before.length
+    ensure
+      within: Result <= Current.length
+    end
+
+  is_empty: BOOL
+    do
+      Current.before.length = 0 and Current.after.length = 0
+    end
+
+  -- The characters, in order.
+  chars: LIST[CHAR]
+    do
+      LIST_CUT.reverse(Current.before, Current.after)
+    ensure
+      length_def: Result.length = Current.length
+    end
+
+  -- The text typed.
+  text: STRING
+    do
+      let out = INPUT_LINE.encode(Current.chars, BYTES_BUILDER.empty)
+      match STRING.from_utf8(out.to_bytes)
+        case Ok(s) then s
+        case Error(_) then ""
+      end
+    end
+
+  insert(c: CHAR): INPUT_LINE
+    do
+      if Current.before.length + Current.after.length < 4096 then
+        { Current with before = Current.before.prepend(c) }
+      else
+        Current
+      end
+    end
+
+  -- The character before the cursor removed.
+  backspace: INPUT_LINE
+    do
+      if Current.before.length = 0 then Current else { Current with before = Current.before.tail } end
+    end
+
+  -- The character after the cursor removed.
+  delete: INPUT_LINE
+    do
+      if Current.after.length = 0 then Current else { Current with after = Current.after.tail } end
+    end
+
+  left: INPUT_LINE
+    do
+      if Current.before.length = 0 then Current
+      else { before = Current.before.tail, after = Current.after.prepend(Current.before.head) }
+      end
+    end
+
+  right: INPUT_LINE
+    do
+      if Current.after.length = 0 then Current
+      else { before = Current.before.prepend(Current.after.head), after = Current.after.tail }
+      end
+    end
+
+  home: INPUT_LINE
+    do
+      let none: LIST[CHAR] = LIST.empty
+      { before = none, after = Current.chars }
+    end
+
+  finish: INPUT_LINE
+    do
+      let none: LIST[CHAR] = LIST.empty
+      { before = LIST_CUT.reverse(Current.after, Current.before), after = none }
+    end
+
+  -- Edited by a key: a character is typed, Backspace and Delete remove one, and the arrows,
+  -- Home and End move the cursor. Other keys change nothing.
+  on_key(k: KEY): INPUT_LINE
+    do
+      match k
+        case Char(c) then Current.insert(c)
+        case Backspace then Current.backspace
+        case Delete then Current.delete
+        case Left then Current.left
+        case Right then Current.right
+        case Home then Current.home
+        case End then Current.finish
+        case _ then Current
+      end
+    end
+
+  -- The line drawn on the first row of `r` after `prompt`, in style `st`, the cursor's cell
+  -- in `cursor_style`. When it is too long, the part around the cursor is shown.
+  draw(s: SCREEN, r: RECT, prompt: STRING, st: STYLE, cursor_style: STYLE): SCREEN
+    do
+      let bar = r.take_top(1)
+      let shown = s.fill(bar, ' ', st).text(bar, bar.x, bar.y, prompt, st)
+      let p = prompt.code_point_count
+      if p >= bar.width then
+        shown
+      else
+        let cx = bar.x + p
+        let room = bar.right - cx
+        let pos = Current.before.length
+        let skip = if pos >= room then pos - room + 1 else 0 end
+        let all = LIST_CUT.drop(Current.chars, skip)
+        let typed = shown.glyphs(bar, cx, bar.y, all, st)
+        let under = LIST_CUT.drop(Current.after, 0)
+        let mark = if under.length > 0 then under.head else ' ' end
+        let at = pos - skip
+        if at < room then
+          typed.glyphs(bar, cx + at, bar.y, LIST.empty.prepend(mark), cursor_style)
+        else
+          typed
+        end
+      end
+    ensure
+      same_width: Result.width = s.width
+      same_height: Result.height = s.height
+    end
+
+create {ANY}
+
+  -- `out` with the UTF-8 bytes of `cs`.
+  encode(cs: LIST[CHAR], out: BYTES_BUILDER): BYTES_BUILDER
+    variant
+      cs.length
+    do
+      if cs.length = 0 then out else INPUT_LINE.encode(cs.tail, GLYPHS.add_char(out, cs.head)) end
+    end
+
+end
