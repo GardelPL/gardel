@@ -1,0 +1,12 @@
+{
+  "verified": true,
+  "modules": [
+    {"name": "CELL", "kind": "module", "package": "", "file": "./cell.gdl", "line": 2, "type_params": [], "satisfies": ["MEASURED"], "concepts": ["MEASURED", "SIZED"], "suppliers": [], "representation": {"visibility": "{ANY}", "fields": [{"name": "value", "type": "NAT"}]}, "features": [{"section": "create", "name": "make", "visibility": "{ANY}", "signature": "make(v: NAT): CELL", "require": [{"tag": "small", "expr": "(v <= 1000)"}], "ensure": [{"tag": "kept", "expr": "(Result.value = v)"}], "line": 12}, {"section": "feature", "name": "size", "visibility": "{ANY}", "signature": "size: NAT", "require": [], "ensure": [{"tag": "measure", "expr": "(Result <= 1000)"}], "line": 23}, {"section": "feature", "name": "measure", "visibility": "{ANY}", "signature": "measure: NAT", "require": [], "ensure": [{"tag": "same", "expr": "(Result = Current.size)"}], "line": 31}], "laws": [{"name": "size_bounded", "visibility": "{ANY}", "signature": "size_bounded(c: CELL)", "require": [], "trigger": [], "ensure": [{"tag": "at_most", "expr": "(c.size <= 1000)"}], "line": 48}], "invariants": [{"tag": "bounded", "expr": "(Current.value <= 1000)", "line": 8}], "short": "module CELL\n  satisfies MEASURED\n  representation {ANY}\n    value: NAT\n  create\n    {ANY} make(v: NAT): CELL\n      require small: (v <= 1000)\n      ensure  kept: (Result.value = v)\n  feature\n    {ANY} size: NAT\n      ensure  measure: (Result <= 1000)\n    {ANY} measure: NAT\n      ensure  same: (Result = Current.size)\n  specify\n    {ANY} law size_bounded(c: CELL)\n      ensure  at_most: (c.size <= 1000)\n  invariant\n    bounded: (Current.value <= 1000)\nend\n"},
+    {"name": "USE_CELL", "kind": "functions", "package": "", "file": "./use_cell.gdl", "line": 1, "type_params": [], "satisfies": [], "concepts": [], "suppliers": ["CELL"], "representation": null, "features": [{"section": "feature", "name": "first_size", "visibility": "{ANY}", "signature": "first_size: NAT", "require": [], "ensure": [{"tag": "three", "expr": "(Result = 3)"}], "line": 5}], "laws": [], "invariants": [], "short": "functions USE_CELL\n  feature\n    {ANY} first_size: NAT\n      ensure  three: (Result = 3)\nend\n"}
+  ],
+  "concepts": [
+    {"name": "SIZED", "refines": [], "file": "./sized.gdl", "line": 1},
+    {"name": "MEASURED", "refines": ["SIZED"], "file": "./sized.gdl", "line": 7}
+  ],
+  "diagnostics": []
+}
