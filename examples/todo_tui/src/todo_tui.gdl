@@ -1,0 +1,74 @@
+-- A to-do list in the terminal, built on the `gtui` package.
+--
+--   gardelc examples/todo_tui --strict
+--   ./examples/todo_tui/build/todo_tui_bin
+--
+-- The arrows, Page Up, Page Down, Home and End move in the list; Space or Enter marks an item
+-- done or not; `a` adds an item, typed on the bottom line and ended with Enter, or given up
+-- with Escape; `d` or Delete removes one; `q` or Escape quits.
+--
+-- The screen is a title bar, the list beside a column of help, and a bottom bar, laid out
+-- by `LAYOUT`. `TUI` draws what `view` gives after every event, writing only the cells that
+-- changed.
+reactive program TODO_TUI
+
+feature {ANY}
+
+  help: LIST[STRING]
+    do
+      LIST.empty
+        .prepend("q       quit")
+        .prepend("d, Del  remove")
+        .prepend("a       add")
+        .prepend("Space   done or not")
+        .prepend("arrows  move")
+    end
+
+  update(s: TODO_STATE, e: EVENT): TUI_NEXT[TODO_STATE]
+    do
+      match e
+        case Resized(w, h) then TUI_NEXT.next(s.sized(if h > 2 then h - 2 else 1 end))
+        case Key(k) then if s.is_typing then s.type_key(k) else s.browse(k) end
+        case _ then TUI_NEXT.next(s)
+      end
+    end
+
+  view(s: TODO_STATE, blank: SCREEN): SCREEN
+    do
+      let sizes: LIST[SIZE] = LIST.empty.prepend(SIZE.fixed(1)).prepend(SIZE.flex(1)).prepend(SIZE.fixed(1))
+      let parts = LAYOUT.rows(blank.area, sizes)
+      let title = LIST_OPS.at(parts, 0)
+      let body = LIST_OPS.at(parts, 1)
+      let bottom = LIST_OPS.at(parts, 2)
+      let across: LIST[SIZE] = LIST.empty.prepend(SIZE.fixed(24)).prepend(SIZE.flex(1))
+      let columns = LAYOUT.columns(body, across)
+      let items = LIST_OPS.at(columns, 0)
+      let side = LIST_OPS.at(columns, 1)
+      let bar = STYLE.plain.reversed
+      let counts = GLYPHS.join(GLYPHS.join(GLYPHS.join(NUMBER_TEXT.nat_to_text(s.done), " of "), NUMBER_TEXT.nat_to_text(s.count)), " done")
+      let top = STATUS_BAR.draw(blank, title, "To do", counts, bar.bold)
+      let listed = if s.count = 0 then
+          let inner = items.drop_left(1)
+          top.text(inner, inner.x, inner.y, "Nothing to do. Press a to add.", STYLE.plain.dim)
+        else
+          s.list.draw(top, items, STYLE.plain, bar)
+        end
+      let helped = TEXT_VIEW.make(help).draw(listed, side.drop_left(1), STYLE.plain.dim)
+      if s.is_typing then
+        s.input.draw(helped, bottom, "New: ", STYLE.plain, bar)
+      else
+        STATUS_BAR.draw(helped, bottom, "a add  d remove  Space done  q quit", "", bar)
+      end
+    end
+
+  init(args: SEQ[STRING]): STEP[TUI[TODO_STATE]]
+    do
+      TUI.start(TODO_STATE.empty, update, view)
+    end
+
+  step(t: TUI[TODO_STATE], e: EVENT): STEP[TUI[TODO_STATE]]
+    do
+      t.step(e)
+    end
+
+end

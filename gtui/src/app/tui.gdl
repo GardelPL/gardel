@@ -1,0 +1,118 @@
+-- A full-screen application whose state is an `S`, in the style of Elm: `update` gives the
+-- next state for each event, and `view` draws a state on a blank screen of the terminal's
+-- size. A client's reactive program is its state, the two routines, and two lines:
+--
+--   init(args: SEQ[STRING]): STEP[TUI[TODO]] do TUI.start(TODO.empty, update, view) end
+--   step(t: TUI[TODO], e: EVENT): STEP[TUI[TODO]] do t.step(e) end
+--
+-- `start` takes the alternate screen, hides the cursor, asks the terminal's size and reads
+-- a key. Every event but `Shutdown` goes to `update`, a `Resized` included, and the screen
+-- is drawn again from `view` after it: the first frame and every resize clear the screen and
+-- draw it whole, and any other step writes only the cells that changed (`SCREEN_DIFF`), in
+-- one `Write`. Each key is followed by a read of the next, until keys end. `update`'s
+-- commands are sent before the frame, except those that would write on the screen or read
+-- from the terminal, which are dropped (`TUI_COMMANDS.own`). `Quit`, or a `Shutdown` (with
+-- status 1), puts the terminal's screen back and stops.
+--
+-- Proven: every write of a frame lies inside the terminal's last known size
+-- (`frame_writes`). A view that gives back a screen of another size than the blank one it was
+-- given is not drawn: the blank one is (`fitted`). `SCREEN`'s routines keep the size.
+module TUI[S]
+
+representation {NONE}
+  app: S
+  shown: SCREEN
+  sized: BOOL
+  on_event: (s: S, e: EVENT) -> TUI_NEXT[S]
+  draw: (s: S, blank: SCREEN) -> SCREEN
+
+create {ANY}
+
+  make(s: S, update: (s: S, e: EVENT) -> TUI_NEXT[S],
+       view: (s: S, blank: SCREEN) -> SCREEN): TUI[S]
+    do
+      { app = s, shown = SCREEN.blank(0, 0), sized = False, on_event = update, draw = view }
+    ensure
+      unsized: not Result.has_size
+    end
+
+  -- The first step of an application in the state `s`.
+  start(s: S, update: (s: S, e: EVENT) -> TUI_NEXT[S],
+        view: (s: S, blank: SCREEN) -> SCREEN): STEP[TUI[S]]
+    do
+      Continue(TUI.make(s, update, view), LIST.empty.prepend(ReadKey).prepend(TerminalSize).prepend(Write(VT_TEXT.enter)))
+    end
+
+feature {ANY}
+
+  -- The application's state.
+  state: S
+    do
+      Current.app
+    end
+
+  -- Whether a size was reported, and so a frame drawn.
+  has_size: BOOL
+    do
+      Current.sized
+    end
+
+  -- The screen as the terminal shows it.
+  screen: SCREEN
+    do
+      Current.shown
+    end
+
+  -- The writes that turn the terminal's screen into `next`: the cells that changed when the
+  -- size is the same, and all of `next` otherwise.
+  frame_writes(next: SCREEN): LIST[SCREEN_WRITE]
+    do
+      if Current.sized and next.width = Current.shown.width and next.height = Current.shown.height then
+        SCREEN_DIFF.changes(Current.shown, next)
+      else
+        SCREEN_DIFF.whole(next)
+      end
+    ensure
+      within: SCREEN_WRITE.all_within(Result, next.width, next.height)
+    end
+
+  step(e: EVENT): STEP[TUI[S]]
+    do
+      match e
+        case Shutdown then
+          Stop(1, LIST.empty.prepend(Write(VT_TEXT.leave)))
+        case _ then
+          let reading = TUI_COMMANDS.reads_after(e)
+          match Current.on_event(Current.app, e)
+            case Quit(code, after) then
+              Stop(code, after.prepend(Write(VT_TEXT.leave)))
+            case Next(s, cmds) then
+              let own = TUI_COMMANDS.own(cmds)
+              match e
+                case Resized(w, h) then
+                  let blank = SCREEN.blank(w, h)
+                  let next = SCREEN.fitted(Current.draw(s, blank), blank)
+                  let text = VT_TEXT.frame(SCREEN_DIFF.whole(next), True)
+                  Continue({ Current with app = s, shown = next, sized = True }, own.append(reading.prepend(Write(text))))
+                case _ then
+                  if Current.sized then
+                    let blank = SCREEN.blank(Current.shown.width, Current.shown.height)
+                    let next = SCREEN.fitted(Current.draw(s, blank), blank)
+                    let writes = Current.frame_writes(next)
+                    if writes.length = 0 then
+                      Continue({ Current with app = s, shown = next }, own.append(reading))
+                    else
+                      let text = VT_TEXT.frame(writes, False)
+                      Continue({ Current with app = s, shown = next }, own.append(reading.prepend(Write(text))))
+                    end
+                  else
+                    Continue({ Current with app = s }, own.append(reading))
+                  end
+              end
+          end
+      end
+    ensure
+      shutdown_stops: e.is_shutdown implies Result.is_stop
+    end
+
+end

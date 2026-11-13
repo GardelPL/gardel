@@ -1,0 +1,43 @@
+-- One thing to do, and whether it is done.
+module TODO_ITEM
+
+representation {NONE}
+  what: STRING
+  finished: BOOL
+
+create {ANY}
+
+  make(text: STRING): TODO_ITEM
+    do
+      { what = text, finished = False }
+    ensure
+      not_done: not Result.is_done
+    end
+
+feature {ANY}
+
+  text: STRING
+    do
+      Current.what
+    end
+
+  is_done: BOOL
+    do
+      Current.finished
+    end
+
+  toggled: TODO_ITEM
+    do
+      { Current with finished = (not Current.finished) }
+    ensure
+      flipped: Result.is_done != Current.is_done
+    end
+
+  -- The item as the list shows it: `[x] text` or `[ ] text`.
+  label: STRING
+    do
+      let mark = if Current.finished then "[x] " else "[ ] " end
+      if Current.what.byte_length <= 1000000 then mark.concat(Current.what) else mark end
+    end
+
+end

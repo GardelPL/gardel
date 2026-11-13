@@ -1,0 +1,158 @@
+-- The state of the to-do list: its items, the list view of them, the line being typed when
+-- one is added, and the height of the list on the screen, which paging needs. The list view
+-- always shows one label per item (`one_label_each`).
+module TODO_STATE
+
+representation {NONE}
+  todo: LIST[TODO_ITEM]
+  shown: LIST_VIEW
+  typed: INPUT_LINE
+  typing: BOOL
+  rows: NAT
+
+invariant
+  one_label_each: shown.count = todo.length
+
+create {ANY}
+
+  empty: TODO_STATE
+    do
+      let none: LIST[TODO_ITEM] = LIST.empty
+      let labels: LIST[STRING] = LIST.empty
+      { todo = none, shown = LIST_VIEW.make(labels), typed = INPUT_LINE.empty, typing = False, rows = 1 }
+    ensure
+      none: Result.count = 0
+    end
+
+  labels(items: LIST[TODO_ITEM]): LIST[STRING]
+    do
+      LIST_OPS.map(items, fn(i: TODO_ITEM): STRING do i.label end)
+    ensure
+      one_each: Result.length = items.length
+    end
+
+  -- `items` with item `i` toggled.
+  toggle_at(items: LIST[TODO_ITEM], i: NAT): LIST[TODO_ITEM]
+    variant
+      i
+    do
+      if items.length = 0 then items
+      else if i = 0 then items.tail.prepend(items.head.toggled)
+      else TODO_STATE.toggle_at(items.tail, i - 1).prepend(items.head)
+      end end
+    ensure
+      same_length: Result.length = items.length
+    end
+
+  -- `items` without item `i`.
+  remove_at(items: LIST[TODO_ITEM], i: NAT): LIST[TODO_ITEM]
+    variant
+      i
+    do
+      if items.length = 0 then items
+      else if i = 0 then items.tail
+      else TODO_STATE.remove_at(items.tail, i - 1).prepend(items.head)
+      end end
+    ensure
+      one_less: i < items.length implies Result.length = items.length - 1
+      same: i >= items.length implies Result.length = items.length
+    end
+
+  done_count(items: LIST[TODO_ITEM], acc: NAT): NAT
+    require
+      bounded: acc + items.length <= 18446744073709551615
+    variant
+      items.length
+    do
+      if items.length = 0 then acc
+      else TODO_STATE.done_count(items.tail, if items.head.is_done then acc + 1 else acc end)
+      end
+    end
+
+feature {ANY}
+
+  count: NAT
+    do
+      Current.todo.length
+    end
+
+  done: NAT
+    do
+      TODO_STATE.done_count(Current.todo, 0)
+    end
+
+  list: LIST_VIEW
+    do
+      Current.shown
+    end
+
+  input: INPUT_LINE
+    do
+      Current.typed
+    end
+
+  is_typing: BOOL
+    do
+      Current.typing
+    end
+
+  -- The state with other items, the selection kept where it can be.
+  with_items(items: LIST[TODO_ITEM]): TODO_STATE
+    do
+      let view = Current.shown.with_items(TODO_STATE.labels(items), Current.rows)
+      { Current with todo = items, shown = view }
+    end
+
+  -- The list `h` rows high.
+  sized(h: NAT): TODO_STATE
+    do
+      { Current with rows = if h > 0 then h else 1 end }
+    end
+
+  -- A key while the list is browsed.
+  browse(k: KEY): TUI_NEXT[TODO_STATE]
+    do
+      match k
+        case Char(c) then
+          if c = 'q' then TUI_NEXT.quit(0)
+          else if c = 'a' then TUI_NEXT.next({ Current with typing = True, typed = INPUT_LINE.empty })
+          else if c = ' ' then TUI_NEXT.next(Current.toggle)
+          else if c = 'd' then TUI_NEXT.next(Current.remove)
+          else TUI_NEXT.next(Current)
+          end end end end
+        case Enter then TUI_NEXT.next(Current.toggle)
+        case Delete then TUI_NEXT.next(Current.remove)
+        case Escape then TUI_NEXT.quit(0)
+        case KeysEnded then TUI_NEXT.quit(0)
+        case _ then TUI_NEXT.next({ Current with shown = Current.shown.on_key(k, Current.rows) })
+      end
+    end
+
+  -- A key while an item is typed: Enter adds it, Escape gives it up.
+  type_key(k: KEY): TUI_NEXT[TODO_STATE]
+    do
+      match k
+        case Enter then
+          let back = { Current with typing = False }
+          if Current.typed.is_empty then TUI_NEXT.next(back)
+          else
+            let added = back.with_items(Current.todo.append(LIST.empty.prepend(TODO_ITEM.make(Current.typed.text))))
+            TUI_NEXT.next({ added with shown = added.shown.select(added.todo.length, added.rows) })
+          end
+        case Escape then TUI_NEXT.next({ Current with typing = False })
+        case KeysEnded then TUI_NEXT.quit(0)
+        case _ then TUI_NEXT.next({ Current with typed = Current.typed.on_key(k) })
+      end
+    end
+
+  toggle: TODO_STATE
+    do
+      Current.with_items(TODO_STATE.toggle_at(Current.todo, Current.shown.selected))
+    end
+
+  remove: TODO_STATE
+    do
+      Current.with_items(TODO_STATE.remove_at(Current.todo, Current.shown.selected))
+    end
+
+end

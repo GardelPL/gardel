@@ -1,0 +1,117 @@
+-- Lines of text shown from line `top` on, scrolled by keys. `rows` is how many lines the
+-- view shows, which the keys scroll by a page of, and which `update` does not know: the
+-- application passes the height of the rectangle it draws the view in.
+module TEXT_VIEW
+
+representation {NONE}
+  body: LIST[STRING]
+  topmost: NAT
+
+invariant
+  in_range: topmost <= body.length
+
+create {ANY}
+
+  make(lines: LIST[STRING]): TEXT_VIEW
+    do
+      { body = lines, topmost = 0 }
+    ensure
+      at_top: Result.top = 0
+    end
+
+feature {ANY}
+
+  lines: LIST[STRING]
+    do
+      Current.body
+    end
+
+  line_count: NAT
+    do
+      Current.body.length
+    end
+
+  -- The first line shown.
+  top: NAT
+    do
+      Current.topmost
+    ensure
+      in_range: Result <= Current.line_count
+    end
+
+  -- The highest `top` with `rows` lines shown: the last page.
+  last_top(rows: NAT): NAT
+    do
+      if Current.body.length > rows then Current.body.length - rows else 0 end
+    ensure
+      in_range: Result <= Current.line_count
+    end
+
+  -- The same lines from line `t`, or from the last page when `t` is past it.
+  scrolled_to(t: NAT, rows: NAT): TEXT_VIEW
+    do
+      let last = Current.last_top(rows)
+      { Current with topmost = if t <= last then t else last end }
+    ensure
+      top_set: Result.top <= Current.last_top(rows)
+      same_lines: Result.line_count = Current.line_count
+    end
+
+  -- Other lines, from the top.
+  with_lines(lines: LIST[STRING]): TEXT_VIEW
+    do
+      { body = lines, topmost = 0 }
+    end
+
+  down(n: NAT, rows: NAT): TEXT_VIEW
+    do
+      Current.scrolled_to(if Current.topmost <= 18446744073709551615 - n then Current.topmost + n else Current.topmost end, rows)
+    end
+
+  up(n: NAT, rows: NAT): TEXT_VIEW
+    do
+      Current.scrolled_to(if Current.topmost >= n then Current.topmost - n else 0 end, rows)
+    end
+
+  -- Scrolled by a key: a line for an arrow, a page for Page Up and Page Down, and to either
+  -- end for Home and End. Other keys change nothing.
+  on_key(k: KEY, rows: NAT): TEXT_VIEW
+    do
+      let page = if rows > 1 then rows - 1 else 1 end
+      match k
+        case Down then Current.down(1, rows)
+        case Up then Current.up(1, rows)
+        case PageDown then Current.down(page, rows)
+        case PageUp then Current.up(page, rows)
+        case Home then Current.scrolled_to(0, rows)
+        case End then Current.scrolled_to(Current.last_top(rows), rows)
+        case _ then Current
+      end
+    end
+
+  -- The view drawn in `r`, each line in style `st`, cut at the right edge. Rows below the
+  -- last line are left as they are.
+  draw(s: SCREEN, r: RECT, st: STYLE): SCREEN
+    do
+      TEXT_VIEW.draw_lines(s, r, LIST_CUT.drop(Current.body, Current.topmost), r.y, st)
+    ensure
+      same_width: Result.width = s.width
+      same_height: Result.height = s.height
+    end
+
+create {ANY}
+
+  -- `lines` drawn in `r` from row `y` on, one per row, until either runs out.
+  draw_lines(s: SCREEN, r: RECT, lines: LIST[STRING], y: NAT, st: STYLE): SCREEN
+    variant
+      lines.length
+    do
+      if lines.length = 0 or y >= r.bottom then s
+      else TEXT_VIEW.draw_lines(s.text(r, r.x, y, lines.head, st), r, lines.tail, y + 1, st)
+      end
+    ensure
+      same_width: Result.width = s.width
+      same_height: Result.height = s.height
+    end
+
+end

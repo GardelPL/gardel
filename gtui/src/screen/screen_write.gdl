@@ -1,0 +1,62 @@
+-- A run of cells to write on row `y` from column `x`. `within(w, h)` holds when the run lies
+-- inside a screen `w` by `h`: on one of its rows, and ending at or before its right edge.
+module SCREEN_WRITE
+
+representation {NONE}
+  col: NAT
+  line: NAT
+  cells: LIST[CELL]
+
+create {ANY}
+
+  make(x: NAT, y: NAT, cs: LIST[CELL]): SCREEN_WRITE
+    do
+      { col = x, line = y, cells = cs }
+    ensure
+      x_set: Result.x = x
+      y_set: Result.y = y
+      length_set: Result.length = cs.length
+    end
+
+  -- Whether every write of `ws` lies inside a screen `w` by `h`.
+  all_within(ws: LIST[SCREEN_WRITE], w: NAT, h: NAT): BOOL
+    variant
+      ws.length
+    do
+      if ws.length = 0 then True
+      else ws.head.within(w, h) and SCREEN_WRITE.all_within(ws.tail, w, h)
+      end
+    end
+
+feature {ANY}
+
+  x: NAT
+    do
+      Current.col
+    end
+
+  y: NAT
+    do
+      Current.line
+    end
+
+  content: LIST[CELL]
+    do
+      Current.cells
+    ensure
+      length_def: Result.length = Current.length
+    end
+
+  length: NAT
+    do
+      Current.cells.length
+    end
+
+  within(w: NAT, h: NAT): BOOL
+    do
+      Current.line < h and Current.col <= w and Current.cells.length <= w - Current.col
+    ensure
+      def: Result = (Current.y < h and Current.x + Current.length <= w)
+    end
+
+end

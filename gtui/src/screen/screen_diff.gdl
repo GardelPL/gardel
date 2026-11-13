@@ -1,0 +1,108 @@
+-- The writes that turn one screen into another of the same size. Each row is read once, left
+-- to right: a write covers a run of changed cells, and runs closer than four unchanged cells
+-- are joined into one, as moving the cursor costs more bytes than writing a few cells again.
+--
+-- Proven: every write lies inside the new screen (`within`), so applying them cannot reach
+-- a cell outside it. That they turn the old screen into the new one is tested
+-- (`tests/gtui.rs`), not proven.
+functions SCREEN_DIFF
+
+feature {ANY}
+
+  changes(old: SCREEN, new: SCREEN): LIST[SCREEN_WRITE]
+    require
+      same_width: old.width = new.width
+      same_height: old.height = new.height
+    do
+      SCREEN_DIFF.rows_from(old, new, new.height, LIST.empty)
+    ensure
+      within: SCREEN_WRITE.all_within(Result, new.width, new.height)
+    end
+
+  -- The writes that draw `new` on a blank screen.
+  whole(new: SCREEN): LIST[SCREEN_WRITE]
+    do
+      SCREEN_DIFF.changes(SCREEN.blank(new.width, new.height), new)
+    ensure
+      within: SCREEN_WRITE.all_within(Result, new.width, new.height)
+    end
+
+  -- `acc` with the writes of the rows above `y`, the top row's first.
+  rows_from(old: SCREEN, new: SCREEN, y: NAT, acc: LIST[SCREEN_WRITE]): LIST[SCREEN_WRITE]
+    require
+      rows: y <= new.height
+      before: SCREEN_WRITE.all_within(acc, new.width, new.height)
+    variant
+      y
+    do
+      if y = 0 then
+        acc
+      else
+        let none: LIST[CELL] = LIST.empty
+        let row = SCREEN_DIFF.scan(old.row(y - 1), new.row(y - 1), y - 1, 0, new.width, new.height, 0, none, 0, acc)
+        SCREEN_DIFF.rows_from(old, new, y - 1, row)
+      end
+    ensure
+      within: SCREEN_WRITE.all_within(Result, new.width, new.height)
+    end
+
+  -- `acc` with the writes of row `y` from column `i`, whose cells from there are `olds` and
+  -- `news` (a missing cell is blank). `run` holds the cells of the open run, last first,
+  -- starting at column `start` and ending with `gap` unchanged cells; it is empty when no run
+  -- is open.
+  scan(olds: LIST[CELL], news: LIST[CELL], y: NAT, i: NAT, w: NAT, h: NAT,
+       start: NAT, run: LIST[CELL], gap: NAT, acc: LIST[SCREEN_WRITE]): LIST[SCREEN_WRITE]
+    require
+      row: y < h
+      column: i <= w
+      open: run.length = 0 or start + run.length = i
+      gapped: gap <= run.length
+      before: SCREEN_WRITE.all_within(acc, w, h)
+    variant
+      w - i
+    do
+      if i >= w then
+        SCREEN_DIFF.closed(start, run, gap, y, acc)
+      else
+        let o = if olds.length > 0 then olds.head else CELL.blank end
+        let n = if news.length > 0 then news.head else CELL.blank end
+        let ot = if olds.length > 0 then olds.tail else olds end
+        let nt = if news.length > 0 then news.tail else news end
+        if not o.same(n) then
+          if run.length = 0 then
+            SCREEN_DIFF.scan(ot, nt, y, i + 1, w, h, i, run.prepend(n), 0, acc)
+          else
+            SCREEN_DIFF.scan(ot, nt, y, i + 1, w, h, start, run.prepend(n), 0, acc)
+          end
+        else if run.length = 0 then
+          SCREEN_DIFF.scan(ot, nt, y, i + 1, w, h, start, run, 0, acc)
+        else if gap + 1 >= 4 then
+          let none: LIST[CELL] = LIST.empty
+          SCREEN_DIFF.scan(ot, nt, y, i + 1, w, h, start, none, 0, SCREEN_DIFF.closed(start, run, gap, y, acc))
+        else
+          SCREEN_DIFF.scan(ot, nt, y, i + 1, w, h, start, run.prepend(n), gap + 1, acc)
+        end end end
+      end
+    ensure
+      within: SCREEN_WRITE.all_within(Result, w, h)
+    end
+
+  -- `acc` with the write of the open run, without its last `gap` unchanged cells, if any are
+  -- left.
+  closed(start: NAT, run: LIST[CELL], gap: NAT, y: NAT, acc: LIST[SCREEN_WRITE]): LIST[SCREEN_WRITE]
+    require
+      gapped: gap <= run.length
+    do
+      if run.length > gap then
+        acc.prepend(SCREEN_WRITE.make(start, y, LIST_CUT.reverse(LIST_CUT.drop(run, gap), LIST.empty)))
+      else
+        acc
+      end
+    ensure
+      one_more: run.length > gap implies Result.length = acc.length + 1 and
+        Result.head.x = start and Result.head.y = y and Result.head.length = run.length - gap and
+        Result.tail = acc
+      none: run.length <= gap implies Result = acc
+    end
+
+end

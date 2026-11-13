@@ -874,7 +874,7 @@ flowchart TD
 | 5. Async | [F.7](libraries/verified_libraries.md#task-f7-connect-and-correlation-ids) | `Connect`, correlation ids, `CancelTimer` ✅ (Windows) |
 | | [F.8](libraries/verified_libraries.md#task-f8-http-client-and-async-handlers) | HTTP client, async handlers, `api_gateway` ✅ |
 | 6. TUI | [F.9](libraries/verified_libraries.md#task-f9-terminal-host) | Terminal host commands: `Write`, `TerminalSize`/`Resized`, VT mode, the new keys ✅ (same bytes on Windows and Linux); constructors of dependencies now resolve before the prelude's |
-| | [F.10](libraries/verified_libraries.md#task-f10-the-gtui-package) | The `gtui` package |
+| | [F.10](libraries/verified_libraries.md#task-f10-the-gtui-package) | The `gtui` package ✅: screen, diff, layout, widgets and an Elm-style loop; every write proven inside the screen, children inside their parent and apart; `examples/todo_tui`; a 200 by 60 redraw in about 7 ms |
 | | [F.11](libraries/verified_libraries.md#task-f11-files-processes-and-the-tool) | Files, processes, and a tool written in Gardel |
 
 ---
@@ -902,7 +902,7 @@ flowchart TD
 
 ## 6. Immediate Next Step
 
-**Phase F: Verified Libraries and Applications** is in progress, and Tasks F.0 to F.8, F.12 and F.13 are completed (F.7 on Windows only). `grest` serves `todo_api` over real sockets, and its async handlers let `api_gateway` wait for another service with proven limits. The round trip of a request through `ghttp` is proven up to its field lines, which tests cover. F.13 and F.15's verifier fixes removed what blocked their proof, and what is left is proof work on `HTTP_READ_FIELDS` and `HTTP_READ_STEPS`, the rest of F.15; after it comes F.9, the terminal host.
+**Phase F: Verified Libraries and Applications** is in progress, and Tasks F.0 to F.10, F.12, F.13 and F.14 are completed (F.7 on Windows only). `grest` serves `todo_api` over real sockets, and its async handlers let `api_gateway` wait for another service with proven limits. The round trip of a request through `ghttp` is proven up to its field lines, which tests cover; what is left there is proof work on `HTTP_READ_FIELDS` and `HTTP_READ_STEPS`, the rest of F.15. The terminal host (F.9) writes the same bytes on Windows and Linux, and `gtui` (F.10) draws full-screen programs on it, such as `examples/todo_tui`. Next is F.11: files, processes, and a tool written in Gardel.
 
 **Phase E: Projects and Packages:** Tasks E.0 to E.5 and E.7 are completed, so Phase E is complete. Fetching dependencies and a lockfile were dropped, as a path dependency on a git submodule already pins a commit.
 

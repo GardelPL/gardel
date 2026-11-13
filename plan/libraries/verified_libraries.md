@@ -1,7 +1,7 @@
 # Phase F: Verified Libraries and Applications
 
 **Date:** November 6, 2026
-**Status:** In progress. Tasks F.0 to F.9, F.12, F.13 and F.14 are completed (F.7 on Windows only), and the decisions below are taken.
+**Status:** In progress. Tasks F.0 to F.10, F.12, F.13 and F.14 are completed (F.7 on Windows only), and the decisions below are taken.
 **Roadmap entry:** [Phase F in Roadmap.md](../Roadmap.md#phase-f-verified-libraries-and-applications)
 **Probed at:** commit `1349cb6`
 
@@ -687,13 +687,36 @@ Not done: the Windows console's own restore after Ctrl-C was not seen in a real 
 
 Client: the tool in F.11.
 
-- [ ] `SCREEN`: a grid of cells, and a diff of two screens to the fewest writes. Prove every write stays within the grid.
-- [ ] Layout: rows, columns and fixed or flexible sizes. Prove that children stay inside their parent and do not overlap.
-- [ ] Widgets: text view, list with selection, status bar and input line. Each one is a pure function of its state.
-- [ ] Elm-style loop: `update(state, event)` and `view(state)`, wrapped in a `reactive program`.
-- [ ] `examples/todo_tui`.
-- Acceptance: the layout proofs hold, and no output is written outside the screen in a scripted run. A full redraw of a 200 by 60 screen fits inside one 16 ms frame, measured.
+**Status:** ✅ Completed (2026-11-13). `gtui` 0.1.0, `gtui/tests` (a bench) and `examples/todo_tui` 0.1.0. No compiler change.
 
+- [x] `SCREEN`: a grid of cells, and a diff of two screens to the fewest writes. Prove every write stays within the grid.
+  - `SCREEN` holds rows of `CELL`s, at most 65535 by 65535. `text(clip, x, y, s, style)` and `fill(clip, c, style)` change only cells inside both `clip` and the screen. A cell is a character and a `STYLE` (bold, dim, underlined, reversed), and never holds a control character (`CELL`'s invariant): one becomes `?`, a tab a space, so drawn text cannot move the cursor. One code point is one cell, as section 1 says.
+  - `SCREEN_DIFF.changes(old, new)` reads each row once and writes runs of changed cells, joining runs closer than four unchanged cells, since a cursor move costs more bytes than a few cells written again. That is fewer bytes rather than strictly fewer writes: one write per changed row would be fewer writes and more bytes. Proven: `within`, every write is on a row of the new screen and ends at or before its right edge. Not proven, tested: that the writes turn the old screen into the new one.
+  - `VT_TEXT.frame` writes a cursor move per write and an SGR sequence where the style changes, from a reset pen.
+- [x] Layout: rows, columns and fixed or flexible sizes. Prove that children stay inside their parent and do not overlap.
+  - `RECT`, with every corner within 65535, and cuts along each side (`take_top(n)`, `drop_top(n)` and so on). `cut_top`, `cut_bottom`, `cut_left` and `cut_right`: both pieces inside, disjoint, and holding all the rows or columns. `inside_trans` and `disjoint_inside` carry this through nesting.
+  - `LAYOUT.rows(r, sizes)` and `columns(r, sizes)`, with `SIZE.fixed(n)` and `SIZE.flex(w)`, `w` from 1 to 1000: the flexible children share what the fixed ones leave, by weight, the last taking what rounding leaves, and children are cut short in order when the sizes ask for more than there is. Proven: one child per size, laid along the axis in order (`across`, `down`); each inside the parent (`across_inside`, `down_inside`); and any two disjoint (`LAYOUT_APART.columns_apart`, `rows_apart`). A client proves all of these through the contracts.
+  - Nested layouts are calls on a child, not a tree of layouts, as a tree through `LIST` cannot be measured (finding 3).
+- [x] Widgets: text view, list with selection, status bar and input line. Each one is a pure function of its state. `TEXT_VIEW` (its first line is one of its lines), `LIST_VIEW` (the selection is an item, or 0 when empty, and on the page shown), `STATUS_BAR`, and `INPUT_LINE` (a cursor, at most 4096 characters, the part around the cursor shown when it is too long). Each has a `draw(screen, rect, ...)`, and an `on_key` that gives a new value. `update` does not know the layout, so a list or a text view is given the height it is drawn in.
+- [x] Elm-style loop: `update(state, event)` and `view(state)`, wrapped in a `reactive program`. `TUI[S]`: `update` gives `Next(state, cmds)` or `Quit(code, after)` (`TUI_NEXT`), and `view(state, blank)` draws on a blank screen of the terminal's size. The first frame and every resize clear and draw whole, other steps write only the changed cells, in one `Write`, and a key is followed by a read of the next. `update`'s `Print`, `Write`, `TerminalSize`, `ReadLine` and `ReadKey` are dropped (`TUI_COMMANDS.own`). `Quit` and `Shutdown` put the screen and cursor back. A client's program is two lines, as with `grest`.
+- [x] `examples/todo_tui`: a title bar, the list beside a column of help, and a bottom bar that becomes an input line while an item is added, laid out with `LAYOUT.rows` and `columns`. Its state keeps one label per item by its invariant.
+- Acceptance: met. The layout proofs hold, and a client uses them. In a scripted run of `todo_tui`, read by a VT terminal in `tests/gtui.rs`, every character lands inside the size the script last gave, and no other control byte appears; the cells the diffs leave equal those of a full redraw, styles included. A full redraw of 200 by 60, every cell changed, takes about 7.3 ms (300 frames in 2.19 s over a baseline run), measured with `gtui/tests`'s bench, against 16 ms; the test takes the best of three runs and fails at 16 ms.
+
+What was done beyond the list:
+
+- **The size of a view is checked, not proven.** `view` was first given a refined type, `ensure same_size: Result.width = blank.width and ...`, so that `TUI` could rely on it. A generic module's function field of that type did not take a parameter of the same type: `make` failed the field's invariant (`draw_same_size`) and `start`'s call `view_same_size`. Not looked into further. `TUI` now draws the blank screen when a view gives back one of another size (`SCREEN.fitted`), which asks nothing of clients; `SCREEN`'s routines keep the size.
+- **Writes inside the screen do not rest on the rows' lengths.** The diff walks columns 0 to the width and reads a missing cell as blank, so `within` follows from the walk, and `SCREEN` needs no invariant over its rows.
+
+Found on the way, none fixed, as each has a workaround:
+
+- A law's call of itself written with its module, `LAYOUT.across_after(...)`, is taken as a proof step to assert, not the induction hypothesis, and fails as `proof_step`. Written bare, it works. A diagnostic, or accepting the qualified form, would save the search.
+- A routine of a generic module that does not mention its type parameter is `E0199` ("type variable must occur in function arguments"). `reads_after` moved to `TUI_COMMANDS` and `fitted` to `SCREEN`.
+- A query in a `feature` section called with its module, as in `CELL.is_printable(glyph)` from an invariant, is `E0199` (an argument too few), where it could be a resolution error. Such helpers belong in a `create` section, as `STRING.is_space` does.
+- A field named `first` is taken for a tuple's projection (`E0199`), as `head` was in F.8: `topmost`.
+- `a = not b` does not parse; `a != b` does.
+- A fact of a `RECT` that `LIST_OPS.at` gives back, such as `x <= 65535`, is not known, so `items.x + 1` could not be proven not to overflow (F.15's gap). `todo_tui` cuts the rectangle instead.
+
+Tests: `tests/gtui.rs`. `a_session_draws_only_inside_the_screen` verifies `todo_tui` and runs 220 events through the VT terminal: twelve items in a list five rows high, one too long for the screen, one holding a tab, an escape and a bell, a line typed past the width, paging, marking, removing, two resizes, and a last resize to the same size, against which the cells are compared. `a_shutdown_puts_the_terminal_back_and_a_replay_repeats_the_run` checks the alternate screen taken and given back, and that a replay of the log writes the same bytes. `a_full_redraw_of_200_by_60_fits_a_frame` times the bench. `a_client_proves_the_layout_through_the_contracts` proves the cuts, `inside` and `apart` in a client, and refuses a child as wide as its parent and a child apart from itself. Ten mutations, each on a private copy after baselines that pass, all turn red. The verifier caught a child not cut to the room left, the next child starting where the last one did, a run opened a column late, a row read past its last column, a control character kept in a cell, and a list that does not scroll down to its selection; the VT session caught a run that writes the old cell, a pen compared on bold alone, and a resize drawn without a clear, and the shutdown test a shutdown that keeps the alternate screen.
 #### Task F.11: Files, Processes and the Tool
 
 Needs decisions 10 and 11.

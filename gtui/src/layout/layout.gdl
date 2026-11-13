@@ -1,0 +1,227 @@
+-- Rows and columns: a rectangle split along one axis into one child per `SIZE`, in order.
+--
+-- A fixed size gets its cells, and the flexible ones share what the fixed sizes leave, in
+-- proportion to their weights, the last one taking what rounding leaves. When the sizes ask
+-- for more than there is, the children are cut short in order, so the last get nothing.
+--
+-- Proven: there is one child per size, and the children are laid along the axis in order
+-- (`across` and `down`): each lies inside the parent, spans all of it on the other axis, and
+-- starts where the one before it ends or later. So no two children overlap
+-- (`LAYOUT_APART.columns_apart` and `rows_apart`).
+functions LAYOUT
+
+feature {ANY}
+
+  -- The children of `r` side by side, left to right.
+  columns(r: RECT, sizes: LIST[SIZE]): LIST[RECT]
+    do
+      let fixed = LAYOUT.fixed_total(sizes)
+      let spare = if fixed < r.width then r.width - fixed else 0 end
+      LAYOUT.lay_across(sizes, r.x, spare, r)
+    ensure
+      one_each: Result.length = sizes.length
+      placed: LAYOUT.across(Result, r.x, r)
+    end
+
+  -- The children of `r` one below another, top to bottom.
+  rows(r: RECT, sizes: LIST[SIZE]): LIST[RECT]
+    do
+      let fixed = LAYOUT.fixed_total(sizes)
+      let spare = if fixed < r.height then r.height - fixed else 0 end
+      LAYOUT.lay_down(sizes, r.y, spare, r)
+    ensure
+      one_each: Result.length = sizes.length
+      placed: LAYOUT.down(Result, r.y, r)
+    end
+
+  -- Whether `rs` are laid left to right in `r` from column `from`: each inside `r`, as tall
+  -- as `r`, and starting at or after the end of the one before.
+  across(rs: LIST[RECT], from: NAT, r: RECT): BOOL
+    variant
+      rs.length
+    do
+      if rs.length = 0 then
+        True
+      else
+        rs.head.inside(r) and from <= rs.head.x and rs.head.y = r.y and
+          rs.head.height = r.height and LAYOUT.across(rs.tail, rs.head.right, r)
+      end
+    end
+
+  -- Whether `rs` are laid top to bottom in `r` from row `from`.
+  down(rs: LIST[RECT], from: NAT, r: RECT): BOOL
+    variant
+      rs.length
+    do
+      if rs.length = 0 then
+        True
+      else
+        rs.head.inside(r) and from <= rs.head.y and rs.head.x = r.x and
+          rs.head.width = r.width and LAYOUT.down(rs.tail, rs.head.bottom, r)
+      end
+    end
+
+  -- The cells the fixed sizes ask for, at most 65535.
+  fixed_total(sizes: LIST[SIZE]): NAT
+    variant
+      sizes.length
+    do
+      if sizes.length = 0 then
+        0
+      else
+        let rest = LAYOUT.fixed_total(sizes.tail)
+        let c = sizes.head.fixed_cells
+        if c >= 65535 - rest then 65535 else rest + c end
+      end
+    ensure
+      bounded: Result <= 65535
+    end
+
+  -- The weights of the flexible sizes, at most a billion.
+  weight_total(sizes: LIST[SIZE]): NAT
+    variant
+      sizes.length
+    do
+      if sizes.length = 0 then
+        0
+      else
+        let rest = LAYOUT.weight_total(sizes.tail)
+        let w = sizes.head.weight
+        if rest >= 1000000000 - w then 1000000000 else rest + w end
+      end
+    ensure
+      bounded: Result <= 1000000000
+    end
+
+  -- The cells a size takes when `spare` cells are left for the flexible sizes from it on.
+  wanted(sizes: LIST[SIZE], spare: NAT): NAT
+    require
+      some: sizes.length > 0
+      small: spare <= 65535
+    do
+      let s = sizes.head
+      if s.is_flex then
+        let total = LAYOUT.weight_total(sizes)
+        if total <= s.weight then spare
+        else
+          let share = spare * s.weight / total
+          if share <= spare then share else spare end
+        end
+      else
+        s.fixed_cells
+      end
+    ensure
+      flex_within: sizes.head.is_flex implies Result <= spare
+    end
+
+  lay_across(sizes: LIST[SIZE], pos: NAT, spare: NAT, r: RECT): LIST[RECT]
+    require
+      started: r.x <= pos
+      within: pos <= r.right
+      small: spare <= 65535
+    variant
+      sizes.length
+    do
+      if sizes.length = 0 then
+        LIST.empty
+      else
+        let want = LAYOUT.wanted(sizes, spare)
+        let room = r.right - pos
+        let take = if want <= room then want else room end
+        let child = RECT.make(pos, r.y, take, r.height)
+        let left = if sizes.head.is_flex then spare - want else spare end
+        LAYOUT.lay_across(sizes.tail, pos + take, left, r).prepend(child)
+      end
+    ensure
+      one_each: Result.length = sizes.length
+      placed: LAYOUT.across(Result, pos, r)
+    end
+
+  lay_down(sizes: LIST[SIZE], pos: NAT, spare: NAT, r: RECT): LIST[RECT]
+    require
+      started: r.y <= pos
+      within: pos <= r.bottom
+      small: spare <= 65535
+    variant
+      sizes.length
+    do
+      if sizes.length = 0 then
+        LIST.empty
+      else
+        let want = LAYOUT.wanted(sizes, spare)
+        let room = r.bottom - pos
+        let take = if want <= room then want else room end
+        let child = RECT.make(r.x, pos, r.width, take)
+        let left = if sizes.head.is_flex then spare - want else spare end
+        LAYOUT.lay_down(sizes.tail, pos + take, left, r).prepend(child)
+      end
+    ensure
+      one_each: Result.length = sizes.length
+      placed: LAYOUT.down(Result, pos, r)
+    end
+
+specify {ANY}
+
+  -- Every child laid from `from` starts at or after it.
+  law across_after(rs: LIST[RECT], from: NAT, r: RECT, j: NAT)
+    require
+      laid: LAYOUT.across(rs, from, r)
+      index: j < rs.length
+    variant
+      rs.length
+    do
+      if j = 0 then True
+      else
+        across_after(rs.tail, rs.head.right, r, j - 1)
+      end
+    ensure
+      after: from <= LIST_OPS.at(rs, j).x
+    end
+
+  law down_after(rs: LIST[RECT], from: NAT, r: RECT, j: NAT)
+    require
+      laid: LAYOUT.down(rs, from, r)
+      index: j < rs.length
+    variant
+      rs.length
+    do
+      if j = 0 then True
+      else
+        down_after(rs.tail, rs.head.bottom, r, j - 1)
+      end
+    ensure
+      after: from <= LIST_OPS.at(rs, j).y
+    end
+
+  -- Every child laid in `r` is inside it.
+  law across_inside(rs: LIST[RECT], from: NAT, r: RECT, j: NAT)
+    require
+      laid: LAYOUT.across(rs, from, r)
+      index: j < rs.length
+    variant
+      rs.length
+    do
+      if j = 0 then True
+      else
+        across_inside(rs.tail, rs.head.right, r, j - 1)
+      end
+    ensure
+      within: LIST_OPS.at(rs, j).inside(r)
+    end
+
+  law down_inside(rs: LIST[RECT], from: NAT, r: RECT, j: NAT)
+    require
+      laid: LAYOUT.down(rs, from, r)
+      index: j < rs.length
+    variant
+      rs.length
+    do
+      if j = 0 then True
+      else
+        down_inside(rs.tail, rs.head.bottom, r, j - 1)
+      end
+    ensure
+      within: LIST_OPS.at(rs, j).inside(r)
+    end
+
+end

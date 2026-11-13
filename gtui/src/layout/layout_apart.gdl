@@ -1,0 +1,41 @@
+-- No two children of a layout overlap. Its own module, as a law builds only on the laws of
+-- other modules, here `LAYOUT.across_after` and `down_after`.
+functions LAYOUT_APART
+
+specify {ANY}
+
+  law columns_apart(rs: LIST[RECT], from: NAT, r: RECT, i: NAT, j: NAT)
+    require
+      laid: LAYOUT.across(rs, from, r)
+      ordered: i < j
+      index: j < rs.length
+    variant
+      rs.length
+    do
+      if i = 0 then
+        LAYOUT.across_after(rs.tail, rs.head.right, r, j - 1)
+      else
+        columns_apart(rs.tail, rs.head.right, r, i - 1, j - 1)
+      end
+    ensure
+      apart: LIST_OPS.at(rs, i).disjoint(LIST_OPS.at(rs, j))
+    end
+
+  law rows_apart(rs: LIST[RECT], from: NAT, r: RECT, i: NAT, j: NAT)
+    require
+      laid: LAYOUT.down(rs, from, r)
+      ordered: i < j
+      index: j < rs.length
+    variant
+      rs.length
+    do
+      if i = 0 then
+        LAYOUT.down_after(rs.tail, rs.head.bottom, r, j - 1)
+      else
+        rows_apart(rs.tail, rs.head.bottom, r, i - 1, j - 1)
+      end
+    ensure
+      apart: LIST_OPS.at(rs, i).disjoint(LIST_OPS.at(rs, j))
+    end
+
+end

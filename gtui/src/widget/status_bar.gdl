@@ -1,0 +1,18 @@
+-- A one-row bar: text on the left and text on the right, on the first row of a rectangle
+-- filled in one style. The right text is drawn last, so it stays when the two meet.
+functions STATUS_BAR
+
+feature {ANY}
+
+  draw(s: SCREEN, r: RECT, left: STRING, right: STRING, st: STYLE): SCREEN
+    do
+      let bar = r.take_top(1)
+      let n = right.code_point_count
+      let rx = if n <= bar.width then bar.right - n else bar.x end
+      s.fill(bar, ' ', st).text(bar, bar.x, bar.y, left, st).text(bar, rx, bar.y, right, st)
+    ensure
+      same_width: Result.width = s.width
+      same_height: Result.height = s.height
+    end
+
+end
