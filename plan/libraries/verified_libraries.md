@@ -856,6 +856,43 @@ Mutations, each on a private copy: fifteen, after a baseline that passes; fourte
 - Left out: editing in place, which is Task F.16 (`/edit` stands in until then), a debugger, a terminal pane and an AI pane.
 - Acceptance: Tablon verifies under `--strict`. On a broken project it browses the failures to their lines; it shows every view of a module of `gtui`; it builds and runs `examples/todo_tui` attached and an ordinary example with its output captured. A replay of a session reproduces its screen with no process run.
 
+**F.11d, part one: the layout and browsing.** ✅ Completed on 2026-11-13. `tools/tablon`, 14 modules, verifies with 0 errors and 0 warnings under `--strict` and builds.
+
+- [x] The three panes and a status bar, the pane with the keys framed in cyan, Tab between them.
+- [x] Modules: the project's package (the one whose files are under the project, `./src/...`), then each dependency in the inspection's order, under each its kinds (`reactive programs`, `programs`, `modules`, `functions`) and their modules. The project's package starts open.
+- [x] Files: `src`, each directory listed when its parent's listing comes in and put under its node, directories first, then by name.
+- [x] The right pane's ten views. Text: the source with line numbers, coloured by `GARDEL_LEXER` (keywords, strings, characters, numbers, comments). Short: the short form. Features, Creators, Laws and Invariants: one part a line; Enter shows its line in Text, marked, three lines from the top. Concepts; Instances, each concept the module satisfies with the other modules that satisfy it; Clients and Suppliers, where Enter chooses that module, and a supplier the inspection does not list is marked `(prelude)`.
+- [x] Every process and every read is a command: the inspection and the listings start with Tablon, and the status bar says `inspecting...` while the keys work. A read is tagged, so one answered after another was sent is dropped.
+- [x] The palette: `/inspect`, `/open DIR`, `/quit`.
+
+How it works:
+
+- **The inspection is one process.** `gardelc --project . --inspect --json-diagnostics --no-verify`, in the project's directory, so the short forms come while proofs fail. Its standard output is kept until it ends and read by `INSPECTION`, its standard error goes to Output line by line. For `gtui`'s 29 modules the object is 106 KB, and reading it and computing a view of each module takes 0.24 s in the built program; the run itself takes about 16 s, which is why it must never be waited on.
+- **What each node stands for is a list beside the tree.** `TREE_ENTRY`, a module's name, a file's path, or a group; `MODULE_TREE` builds the Modules tree's nodes and entries from one list of `TREE_ITEM`s, so they cannot fall out of step. The Files tree's nodes and entries are spliced together as listings come, so a node keeps whether it is open.
+- **A view's lines carry where Enter goes.** `VIEW_LINES` holds, per line, a source line and a module to choose, with an invariant that the three lists have one length.
+- **The tabs of the views scroll.** Ten tabs take about 120 columns, so `MODULE_VIEWS.window` draws them from the first one from which the chosen tab fits.
+
+Changed from the plan above:
+
+- **No prelude in the Modules tree.** The inspection gives the project's and its dependencies' modules, not the prelude's, and no concepts that the prelude declares. A supplier that is the prelude's is marked as such in Suppliers instead.
+- **Instances lists the modules that share a concept.** A concept is not a module in the tree, so for a module Instances lists, under each concept it satisfies, the other modules that satisfy it.
+- **Problems, Build and Run show a placeholder** until part two, and Output shows what Tablon and `gardelc` printed.
+
+Found on the way, in the compiler, fixed:
+
+- **A call of another module's routine of the same name was taken for recursion.** In `MODULE_VIEWS.named`, the call `MODULE_TREE.named(..)` had to decrease `named`'s variant, and `variant_decrease` failed: a method call counted as recursive by its name alone. It now counts when its receiver is the module or a value of its type. `tests/variant_scope.rs`, with a call to another module's `named`, a value of another type's `size`, and a real recursive call that does not decrease, still refused.
+- **A field named `at` made `gardelc` panic.** `Current.at` was taken for `LIST.at`, which reads an argument it has not, and a field `head` became `Seq_head(Current)`. A field of the module's own is read as the field.
+- **A field named `uses` was `E0199`.** It is a word Boogie reserves, and a field is bound by its name in its constructor's axioms. Such a field is bound as `uses__f`, and the reserved words gain `assume`, `uses`, `true`, `false`, `reveal`, `hide`, `hideable` and `pure`. `tests/field_names.rs` has both, in a record and in variants, and runs the program.
+
+Found on the way, not fixed:
+
+- **A method call on a record literal does not parse.** `{ Current with x = 1 }.refreshed` is a parse error (`Expected keyword 'end', got RBrace`), so the record goes in a `let` first.
+- **A conversion from `I64` to `NAT` is `NAT.from_i64`.** `NUMBER_TEXT.magnitude` reads like one and is for negative numbers only; its `require` says so, and caught the slip.
+
+Tests: `tests/tablon.rs`, six, each a scripted session on the fixture of `tests/inspect/` in which the inspection's output is the fixture's expected object and each read the fixture's file, read by a VT terminal, with a resize to the same size at the end whose full redraw must equal the cells the diffs left. `the_inspection_fills_the_trees_and_enter_goes_from_a_feature_to_its_line` checks the commands sent (the inspection in the project's directory, `src` and `src/sub` listed, the module's file read), the tree, Output, the status bar, and `measure`'s line marked on blue across its row with lines before it. `every_view_of_a_module_shows_its_parts` takes each of the nine other views of `CELL` and the tab row scrolled to Suppliers. `enter_on_a_supplier_chooses_it_and_reads_its_file`, `the_files_tree_lists_directories_first_and_opens_a_file_as_text` (a CR dropped), `keys_work_while_the_inspection_runs_and_a_read_no_longer_awaited_is_dropped` (the views and the palette answer before the inspection ends; the first of two reads answered last is not shown), and `a_replay_reproduces_the_screen_with_no_process_run`.
+
+Mutations, each on a private copy: nine of Tablon, after a baseline that passes, all red: a read no longer awaited shown, a jump that marks no line, files before directories, subdirectories not listed, Enter on a supplier going nowhere, the tabs always drawn from the first, a CR kept at a line end, a part shown under every section, and clients that are the suppliers. The first survived the first round, as the stale read came before the one awaited and the last screen was right either way; the test now sends it last, and it is red. Three of the compiler fixes, after a baseline that passes, all red: any call of the routine's name taken for recursion, a field named like a built-in read as the built-in, and a reserved field bound by its own name.
+
 #### Task F.16: Editing in `gtui`
 
 Needs F.11. Makes Tablon's Text view an editor, so a failure can be fixed where it is shown. `tui_dev` is the reference: its `TEXT_AREA_STATE`, `UNICODE_WIDTH`, bracketed paste, cursor shape and OSC 52 clipboard, and what it found about terminals. Its findings that bear on this task: most terminals do not answer a clipboard read (Windows Terminal and conhost not at all), so paste comes from the terminal's own paste; and undo works best in steps, one per typed word or run of deletes.

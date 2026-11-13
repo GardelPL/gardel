@@ -1,0 +1,31 @@
+-- A node of a tree being built: its label, depth and whether it starts open, and what it
+-- stands for. `MODULE_TREE` builds a list of them, from which come the tree's nodes and the
+-- entries kept beside it, in the same order.
+module TREE_ITEM
+
+representation {NONE}
+  shown: STRING
+  level: NAT
+  unfolded: BOOL
+  stands_for: TREE_ENTRY
+
+create {ANY}
+
+  make(label: STRING, depth: NAT, open: BOOL, entry: TREE_ENTRY): TREE_ITEM
+    do
+      { shown = label, level = depth, unfolded = open, stands_for = entry }
+    end
+
+feature {ANY}
+
+  node: TREE_NODE
+    do
+      TREE_NODE.make(Current.shown, Current.level).set_open(Current.unfolded)
+    end
+
+  entry: TREE_ENTRY
+    do
+      Current.stands_for
+    end
+
+end

@@ -5308,8 +5308,14 @@ fn boogie_builtin_method<'a>(recv: &Expr, mname: &'a str, m: &ModuleDecl) -> &'a
     if mname == "code" {
         return if ty.as_deref() == Some("CHAR") { mname } else { "" };
     }
-    let own = ty.is_some_and(|t| type_head(&t) == m.name)
-        && find_module_routine(m, mname).is_some_and(|(_, has_current)| has_current);
+    let own_type = ty.is_some_and(|t| type_head(&t) == m.name);
+    // A field of the module's own named like a built-in, `Current.at`, is read as the field
+    // (F.11d): the built-in arms take an argument it has not.
+    let own_field = own_type && matches!(&m.repr, ReprKind::Product(fs) if fs.iter().any(|(f, _)| f == mname));
+    if own_field {
+        return "";
+    }
+    let own = own_type && find_module_routine(m, mname).is_some_and(|(_, has_current)| has_current);
     // `SEQ` and `BYTES` declare the routines the preamble arms already call.
     if own && m.name != "SEQ" && m.name != "BYTES" {
         ""
@@ -8582,7 +8588,7 @@ fn emit_boogie_parts_with_options(
                 let params: Vec<String> = v
                     .fields
                     .iter()
-                    .map(|(fnm, fty)| format!("{fnm}: {}", map_boogie_type(fty, m)))
+                    .map(|(fnm, fty)| format!("{}: {}", boogie_reserved::field_binder(fnm), map_boogie_type(fty, m)))
                     .collect();
                 out.push_str(&format!(
                     "function {}{tp_quant}({}) returns ({mod_bpl_ty});\n",
@@ -8611,7 +8617,7 @@ fn emit_boogie_parts_with_options(
                 }
 
                 // Constructor discriminator & field projection axioms
-                let arg_names: Vec<String> = v.fields.iter().map(|(fnm, _)| fnm.clone()).collect();
+                let arg_names: Vec<String> = v.fields.iter().map(|(fnm, _)| boogie_reserved::field_binder(fnm)).collect();
                 let ctor_call = format!("{}({})", v.name, arg_names.join(", "));
                 let ctor_trig = if m.type_params.is_empty() {
                     format!("{{ {ctor_call} }}")
@@ -8631,14 +8637,16 @@ fn emit_boogie_parts_with_options(
                     };
                     let mut proj_conj = vec![format!("is_{}({ctor_app})", v.name)];
                     for (fnm, fty) in &v.fields {
-                        proj_conj.push(format!("{}_{}({ctor_app}) == {fnm}", v.name, fnm));
+                        proj_conj.push(format!("{}_{}({ctor_app}) == {}", v.name, fnm, boogie_reserved::field_binder(fnm)));
                         if fty == &m.name
                             || fty == "Current"
                             || fty.starts_with(&format!("{}[", m.name))
                         {
                             proj_conj.push(format!(
-                                "{}_adt_size({fnm}) < {}_adt_size({ctor_app})",
-                                m.name, m.name
+                                "{}_adt_size({}) < {}_adt_size({ctor_app})",
+                                m.name,
+                                boogie_reserved::field_binder(fnm),
+                                m.name
                             ));
                         }
                     }
@@ -8752,7 +8760,7 @@ fn emit_boogie_parts_with_options(
         ReprKind::Product(fields) => {
             let params: Vec<String> = fields
                 .iter()
-                .map(|(fnm, fty)| format!("{fnm}: {}", map_boogie_type(fty, m)))
+                .map(|(fnm, fty)| format!("{}: {}", boogie_reserved::field_binder(fnm), map_boogie_type(fty, m)))
                 .collect();
             out.push_str(&format!(
                 "function {}_Ctor{tp_quant}({}) returns ({mod_bpl_ty});\n",
@@ -8776,11 +8784,11 @@ fn emit_boogie_parts_with_options(
                 }
             }
             if !fields.is_empty() {
-                let arg_names: Vec<String> = fields.iter().map(|(fnm, _)| fnm.clone()).collect();
+                let arg_names: Vec<String> = fields.iter().map(|(fnm, _)| boogie_reserved::field_binder(fnm)).collect();
                 let ctor_call = format!("{}_Ctor({})", m.name, arg_names.join(", "));
                 let projs: Vec<String> = fields
                     .iter()
-                    .map(|(fnm, _)| format!("{}_{}({ctor_call}) == {fnm}", m.name, fnm))
+                    .map(|(fnm, _)| format!("{}_{}({ctor_call}) == {}", m.name, fnm, boogie_reserved::field_binder(fnm)))
                     .collect();
                 out.push_str(&format!(
                     "axiom (forall{tp_quant} {} :: {{ {ctor_call} }} {});\n",
@@ -12576,7 +12584,11 @@ fn emit_boogie_expr_obligations(
                     strings,
                 ));
             }
-            if mname == &r.name {
+            // A call of another module's routine of the same name, `OTHER.f(..)` or `x.f(..)`
+            // with `x` of another type, is no recursive call (F.11d).
+            let elsewhere = matches!(&**recv, Expr::Var(v) if v != &m.name && is_static_receiver_name(v, m))
+                || elem_receiver_type(recv, m).is_some_and(|t| t != module_self_type(m) && t != m.name);
+            if mname == &r.name && !elsewhere {
                 let mut substs = vec![("Current".to_string(), (**recv).clone())];
                 for ((pname, _), arg) in r.params.iter().zip(args.iter()) {
                     substs.push((pname.clone(), arg.clone()));

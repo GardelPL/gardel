@@ -1,0 +1,75 @@
+-- The Files tree, built as listings come in: `src` first, and the entries of each directory
+-- listed put right after its node, directories first, each kind in the order of its names.
+-- The tree's nodes and the entries beside it are changed together, so a node keeps whether it
+-- is open as the tree grows.
+functions FILE_TREE
+
+feature {ANY}
+
+  -- The index of the first of `es` whose key is `key`, counting from `i`, or `i` plus the
+  -- length of `es` when none is.
+  index_of(es: LIST[TREE_ENTRY], key: STRING, i: NAT): NAT
+    variant
+      es.length
+    do
+      if es.length = 0 or i = 18446744073709551615 then i
+      else if es.head.key.equals(key) then i
+      else FILE_TREE.index_of(es.tail, key, i + 1)
+      end end
+    end
+
+  -- Whether `a` goes before `b`: a directory before a file, and otherwise by name.
+  before(a: DIR_ENTRY, b: DIR_ENTRY): BOOL
+    do
+      (a.is_dir and not b.is_dir) or (a.is_dir = b.is_dir and a.name.less_than(b.name))
+    end
+
+  -- `sorted`, in order, with `e` in its place.
+  insert(e: DIR_ENTRY, sorted: LIST[DIR_ENTRY]): LIST[DIR_ENTRY]
+    variant
+      sorted.length
+    do
+      if sorted.length = 0 then LIST.empty.prepend(e)
+      else if FILE_TREE.before(e, sorted.head) then sorted.prepend(e)
+      else FILE_TREE.insert(e, sorted.tail).prepend(sorted.head)
+      end end
+    end
+
+  sorted(es: LIST[DIR_ENTRY]): LIST[DIR_ENTRY]
+    variant
+      es.length
+    do
+      if es.length = 0 then LIST.empty else FILE_TREE.insert(es.head, FILE_TREE.sorted(es.tail)) end
+    end
+
+  -- The path of entry `e` of the directory `dir`.
+  path(dir: STRING, e: DIR_ENTRY): STRING
+    do
+      GLYPHS.join(GLYPHS.join(dir, "/"), e.name)
+    end
+
+  -- The nodes of the entries `es` of `dir`, `depth` deep.
+  nodes_of(es: LIST[DIR_ENTRY], depth: NAT): LIST[TREE_NODE]
+    do
+      LIST_OPS.map(es, fn(e: DIR_ENTRY): TREE_NODE do TREE_NODE.make(e.name, depth) end)
+    end
+
+  entries_of(dir: STRING, es: LIST[DIR_ENTRY]): LIST[TREE_ENTRY]
+    do
+      LIST_OPS.map(es, fn(e: DIR_ENTRY): TREE_ENTRY do TREE_ENTRY.make(FILE_TREE.path(dir, e), e.is_dir) end)
+    end
+
+  -- `xs` with `ys` after its first `n`.
+  spliced[A](xs: LIST[A], n: NAT, ys: LIST[A]): LIST[A]
+    do
+      LIST_CUT.take(xs, n).append(ys).append(LIST_CUT.drop(xs, n))
+    end
+
+  -- The directories of `es`, as paths under `dir`.
+  dirs_of(dir: STRING, es: LIST[DIR_ENTRY]): LIST[STRING]
+    do
+      LIST_OPS.map(LIST_OPS.filter(es, fn(e: DIR_ENTRY): BOOL do e.is_dir end),
+        fn(e: DIR_ENTRY): STRING do FILE_TREE.path(dir, e) end)
+    end
+
+end

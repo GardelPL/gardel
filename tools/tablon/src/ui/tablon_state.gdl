@@ -1,0 +1,566 @@
+-- Tablon's state: the project and the compiler that inspects it, which pane has the keys, the
+-- Modules and Files trees with what each node stands for, the modules the inspection gave,
+-- the module chosen and its views, the source shown with its marked line, the output, the
+-- palette, and the processes and reads awaited. Every process and every read is a command,
+-- and its answer an event, so the keys keep working while one runs.
+--
+-- Tags: 1 is the inspection, 100 and on the listings of directories, in the order asked, and
+-- 1000 and on the reads of files, so an answer to a read no longer awaited is dropped.
+module TABLON_STATE
+
+representation {NONE}
+  wide: NAT
+  high: NAT
+  project: STRING
+  compiler: STRING
+  keys_at: FOCUS
+  left_tabs: TABS
+  module_tree: TREE_VIEW
+  module_entries: LIST[TREE_ENTRY]
+  file_tree: TREE_VIEW
+  file_entries: LIST[TREE_ENTRY]
+  dirs_asked: LIST[STRING]
+  infos: LIST[MODULE_INFO]
+  chosen: STRING
+  views: TABS
+  source_file: STRING
+  source: TEXT_VIEW
+  mark_line: OPTION[NAT]
+  reading: NAT
+  reads: NAT
+  go_to: NAT
+  go_mark: BOOL
+  short_view: TEXT_VIEW
+  part_lines: VIEW_LINES
+  parts_view: LIST_VIEW
+  low_tabs: TABS
+  log: LIST[STRING]
+  inspecting: OPTION[PROC_ID]
+  inspect_running: BOOL
+  inspect_out: BYTES
+  commands: PALETTE
+  commands_open: BOOL
+
+create {ANY}
+
+  -- Tablon on the project in `dir`, inspected by the program `gardelc`, before the
+  -- commands of `starting` are sent.
+  make(dir: STRING, gardelc: STRING): TABLON_STATE
+    do
+      let none: LIST[STRING] = LIST.empty
+      { wide = 80, high = 24, project = dir, compiler = gardelc, keys_at = FOCUS.make(3),
+        left_tabs = TABS.empty.with("Modules", 'm').with("Files", 'f'),
+        module_tree = TREE_VIEW.make(LIST.empty.prepend(TREE_NODE.make("inspecting...", 0))),
+        module_entries = LIST.empty.prepend(TREE_ENTRY.group),
+        file_tree = TREE_VIEW.make(LIST.empty.prepend(TREE_NODE.make("src", 0).set_open(True))),
+        file_entries = LIST.empty.prepend(TREE_ENTRY.make("./src", True)),
+        dirs_asked = none.prepend("./src"),
+        infos = LIST.empty, chosen = "", views = MODULE_VIEWS.tabs,
+        source_file = "", source = TEXT_VIEW.make(TABLON_STATE.welcome), mark_line = None,
+        reading = 0, reads = 0, go_to = 0, go_mark = False,
+        short_view = TEXT_VIEW.make(none), part_lines = VIEW_LINES.empty, parts_view = LIST_VIEW.make(none),
+        low_tabs = TABS.empty.with("Output", 'o').with("Problems", 'p').with("Build", 'b').with("Run", 'r'),
+        log = none.prepend(GLYPHS.join("Tablon on ", dir)),
+        inspecting = None, inspect_running = True, inspect_out = BYTES.empty,
+        commands = PALETTE.make(TABLON_STATE.palette_entries), commands_open = False }
+    end
+
+  welcome: LIST[STRING]
+    do
+      LIST.empty
+        .prepend("Tab moves between the panes; / opens the commands; q quits.")
+        .prepend("")
+        .prepend("Choose a module on the left, under Modules, or a file under Files, and press Enter.")
+        .prepend("Tablon: a workbench for a Gardel project.")
+    end
+
+  palette_entries: LIST[PALETTE_ENTRY]
+    do
+      LIST.empty
+        .prepend(PALETTE_ENTRY.make("quit", "leave Tablon"))
+        .prepend(PALETTE_ENTRY.make("open", "DIR  browse the project in DIR"))
+        .prepend(PALETTE_ENTRY.make("inspect", "read the project's modules again"))
+    end
+
+  -- The arguments that make `gardelc` give the project's short forms, type checked only.
+  inspect_args: LIST[STRING]
+    do
+      LIST.empty.prepend("--no-verify").prepend("--json-diagnostics").prepend("--inspect").prepend(".").prepend("--project")
+    end
+
+  -- The listing of each of `dirs`, under `project`, the first tagged `tag`.
+  listings(project: STRING, dirs: LIST[STRING], tag: NAT): LIST[COMMAND]
+    variant
+      dirs.length
+    do
+      if dirs.length = 0 or tag >= 900 then
+        LIST.empty
+      else
+        TABLON_STATE.listings(project, dirs.tail, tag + 1).prepend(ListDir(tag, TABLON_STATE.under(project, dirs.head)))
+      end
+    end
+
+  -- The path of `rel`, a path from the project, under the project's directory `project`.
+  under(project: STRING, rel: STRING): STRING
+    do
+      GLYPHS.join(GLYPHS.join(project, "/"), rel)
+    end
+
+  -- `rel` without a leading `./`.
+  shown_path(rel: STRING): STRING
+    do
+      if rel.starts_with("./") and rel.code_point_count >= 2 then rel.slice(2, rel.code_point_count) else rel end
+    end
+
+  -- Entry `i` of `es`, or a group when there is none.
+  entry_at(es: LIST[TREE_ENTRY], i: NAT): TREE_ENTRY
+    do
+      if i < es.length then LIST_OPS.at(es, i) else TREE_ENTRY.group end
+    end
+
+  -- The text lines of `d`, without empty ones.
+  text_of(d: BYTES): LIST[STRING]
+    do
+      LIST_OPS.filter(TEXT_LINES.of_bytes(d), fn(l: STRING): BOOL do not l.is_empty end)
+    end
+
+feature {ANY}
+
+  -- The commands that start Tablon: the inspection and the listing of `src`.
+  starting: LIST[COMMAND]
+    do
+      LIST.empty
+        .prepend(ListDir(100, TABLON_STATE.under(Current.project, "./src")))
+        .prepend(RunProcess(1, Current.compiler, TABLON_STATE.inspect_args, Current.project))
+    end
+
+  focus: FOCUS
+    do
+      Current.keys_at
+    end
+
+  project_tabs: TABS
+    do
+      Current.left_tabs
+    end
+
+  -- The tree under the tab chosen on the left.
+  tree: TREE_VIEW
+    do
+      if Current.left_tabs.selected = 0 then Current.module_tree else Current.file_tree end
+    end
+
+
+  view: NAT
+    do
+      Current.views.selected
+    end
+
+  text: TEXT_VIEW
+    do
+      Current.source
+    end
+
+  marked: OPTION[NAT]
+    do
+      Current.mark_line
+    end
+
+  short: TEXT_VIEW
+    do
+      Current.short_view
+    end
+
+  parts: LIST_VIEW
+    do
+      Current.parts_view
+    end
+
+  has_module: BOOL
+    do
+      not Current.chosen.is_empty
+    end
+
+  output_tabs: TABS
+    do
+      Current.low_tabs
+    end
+
+  output: LIST[STRING]
+    do
+      Current.log
+    end
+
+  palette: PALETTE
+    do
+      Current.commands
+    end
+
+  palette_open: BOOL
+    do
+      Current.commands_open
+    end
+
+  area: RECT
+    do
+      RECT.sized(Current.wide, Current.high)
+    end
+
+  -- The title of the right pane's frame: the module and the view, or the file shown.
+  title: STRING
+    do
+      if Current.chosen.is_empty then
+        if Current.source_file.is_empty then "Tablon" else TABLON_STATE.shown_path(Current.source_file) end
+      else
+        GLYPHS.join(GLYPHS.join(Current.chosen, " - "), Current.views.selected_title)
+      end
+    end
+
+  -- What the status bar shows on its right: a run going on, or the modules found.
+  activity: STRING
+    do
+      if Current.inspect_running then "inspecting..."
+      else GLYPHS.join(NUMBER_TEXT.nat_to_text(Current.infos.length), " modules")
+      end
+    end
+
+  -- Of a size `w` by `h`.
+  sized(w: NAT, h: NAT): TABLON_STATE
+    do
+      { Current with wide = w, high = h }
+    end
+
+  -- `line` added to the output, the last 500 lines kept.
+  logged(line: STRING): TABLON_STATE
+    do
+      let all = Current.log.append(LIST.empty.prepend(line))
+      { Current with log = if all.length > 500 then LIST_CUT.drop(all, all.length - 500) else all end }
+    end
+
+  -- `lines` added to the output.
+  logged_all(lines: LIST[STRING]): TABLON_STATE
+    variant
+      lines.length
+    do
+      if lines.length = 0 then Current else Current.logged(lines.head).logged_all(lines.tail) end
+    end
+
+  -- A key, when the palette is closed.
+  browse(k: KEY): TUI_NEXT[TABLON_STATE]
+    do
+      match k
+        case Char(c) then
+          if c = 'q' then TUI_NEXT.quit(0)
+          else if c = '/' then TUI_NEXT.next({ Current with commands = PALETTE.make(TABLON_STATE.palette_entries), commands_open = True })
+          else Current.in_pane(k)
+          end end
+        case Tab then TUI_NEXT.next({ Current with keys_at = Current.keys_at.next })
+        case KeysEnded then TUI_NEXT.quit(0)
+        case _ then Current.in_pane(k)
+      end
+    end
+
+  -- A key given to the pane that has the keys.
+  in_pane(k: KEY): TUI_NEXT[TABLON_STATE]
+    do
+      if Current.keys_at.current = 0 then Current.in_project(k)
+      else if Current.keys_at.current = 1 then Current.in_module(k)
+      else TUI_NEXT.next(Current.in_output(k))
+      end end
+    end
+
+  -- A key in the project's pane: a tab's key, or one for the tree under it.
+  in_project(k: KEY): TUI_NEXT[TABLON_STATE]
+    do
+      let rows = TABLON_LAYOUT.rows_in(TABLON_LAYOUT.left(Current.area))
+      if Current.left_tabs.takes(k) then
+        TUI_NEXT.next({ Current with left_tabs = Current.left_tabs.on_key(k) })
+      else if Current.left_tabs.selected = 0 then
+        match k
+          case Enter then
+            match Current.module_tree.selected_node
+              case Some(n) then
+                let e = TABLON_STATE.entry_at(Current.module_entries, n)
+                if e.key.is_empty then TUI_NEXT.next({ Current with module_tree = Current.module_tree.toggled(rows) })
+                else Current.choose(e.key)
+                end
+              case None then TUI_NEXT.next(Current)
+            end
+          case _ then TUI_NEXT.next({ Current with module_tree = Current.module_tree.on_key(k, rows) })
+        end
+      else
+        match k
+          case Enter then
+            match Current.file_tree.selected_node
+              case Some(n) then
+                let e = TABLON_STATE.entry_at(Current.file_entries, n)
+                if e.is_dir or e.key.is_empty then TUI_NEXT.next({ Current with file_tree = Current.file_tree.toggled(rows) })
+                else Current.open_file(e.key)
+                end
+              case None then TUI_NEXT.next(Current)
+            end
+          case _ then TUI_NEXT.next({ Current with file_tree = Current.file_tree.on_key(k, rows) })
+        end
+      end end
+    end
+
+  -- A key in the module's pane: a view's key, or one for the view shown.
+  in_module(k: KEY): TUI_NEXT[TABLON_STATE]
+    do
+      let rows = TABLON_LAYOUT.view_rows(Current.area)
+      if Current.views.takes(k) then
+        let switched = { Current with views = Current.views.on_key(k) }
+        TUI_NEXT.next(switched.refreshed)
+      else if Current.views.selected = MODULE_VIEWS.text_view then
+        TUI_NEXT.next({ Current with source = Current.source.on_key(k, rows) })
+      else if Current.views.selected = MODULE_VIEWS.short_view then
+        TUI_NEXT.next({ Current with short_view = Current.short_view.on_key(k, rows) })
+      else
+        match k
+          case Enter then Current.follow(Current.parts_view.selected)
+          case _ then TUI_NEXT.next({ Current with parts_view = Current.parts_view.on_key(k, rows) })
+        end
+      end end end
+    end
+
+  -- A key in the output's pane.
+  in_output(k: KEY): TABLON_STATE
+    do
+      if Current.low_tabs.takes(k) then { Current with low_tabs = Current.low_tabs.on_key(k) } else Current end
+    end
+
+  -- The lines of the list view shown, for the module chosen.
+  refreshed: TABLON_STATE
+    do
+      match MODULE_TREE.named(Current.infos, Current.chosen)
+        case Some(m) then
+          let ls = MODULE_VIEWS.lines(m, Current.infos, Current.views.selected)
+          { Current with part_lines = ls, parts_view = LIST_VIEW.make(ls.lines) }
+        case None then
+          let ls = VIEW_LINES.note("Choose a module on the left.")
+          { Current with part_lines = ls, parts_view = LIST_VIEW.make(ls.lines) }
+      end
+    end
+
+  -- Enter on line `i` of a list view: to the module it names, or to its line in the source.
+  follow(i: NAT): TUI_NEXT[TABLON_STATE]
+    do
+      let target = Current.part_lines.target_of(i)
+      let line = Current.part_lines.line_of(i)
+      if not target.is_empty then
+        Current.choose(target)
+      else if line > 0 then
+        match MODULE_TREE.named(Current.infos, Current.chosen)
+          case Some(m) then
+            let as_text = { Current with views = Current.views.choose(MODULE_VIEWS.text_view) }
+            as_text.open_source(m.file, line - 1, True)
+          case None then TUI_NEXT.next(Current)
+        end
+      else
+        TUI_NEXT.next(Current)
+      end end
+    end
+
+  -- The module `name` chosen, its views made, and its source shown from its header.
+  choose(name: STRING): TUI_NEXT[TABLON_STATE]
+    do
+      match MODULE_TREE.named(Current.infos, name)
+        case Some(m) then
+          let named = { Current with chosen = name, short_view = TEXT_VIEW.make(m.short) }
+          named.refreshed.open_source(m.file, if m.line > 0 then m.line - 1 else 0 end, False)
+        case None then TUI_NEXT.next(Current.logged(GLYPHS.join("No module named ", name)))
+      end
+    end
+
+  -- The file `rel` shown: its module chosen when it has one, and as text otherwise.
+  open_file(rel: STRING): TUI_NEXT[TABLON_STATE]
+    do
+      let as_text = { Current with views = Current.views.choose(MODULE_VIEWS.text_view) }
+      match MODULE_TREE.of_file(Current.infos, rel)
+        case Some(m) then as_text.choose(m.name)
+        case None then
+          let plain = { as_text with chosen = "" }
+          plain.refreshed.open_source(rel, 0, False)
+      end
+    end
+
+  -- The source `rel` shown from line `line`, from 0, marked when `mark` is set: at once when
+  -- it is the one shown, and otherwise once it is read.
+  open_source(rel: STRING, line: NAT, mark: BOOL): TUI_NEXT[TABLON_STATE]
+    do
+      if rel.equals(Current.source_file) and Current.reading = 0 then
+        TUI_NEXT.next(Current.at_line(line, mark))
+      else
+        let n = if Current.reads < 1000000 then Current.reads + 1 else 1 end
+        let tag = 1000 + n
+        Next({ Current with source_file = rel, reading = tag, reads = n, go_to = line, go_mark = mark,
+                 source = TEXT_VIEW.make(LIST.empty.prepend(GLYPHS.join("Reading ", TABLON_STATE.shown_path(rel)))),
+                 mark_line = None },
+             LIST.empty.prepend(ReadFile(tag, TABLON_STATE.under(Current.project, rel))))
+      end
+    end
+
+  -- The source shown from line `line`, which is marked when `mark` is set.
+  at_line(line: NAT, mark: BOOL): TABLON_STATE
+    do
+      let rows = TABLON_LAYOUT.view_rows(Current.area)
+      let n = Current.source.line_count
+      let l = if line < n then line else (if n > 0 then n - 1 else 0 end) end
+      -- A few lines of what comes before, as a jump lands on a declaration or a clause.
+      let top = Current.source.scrolled_to(if l >= 3 then l - 3 else 0 end, rows)
+      { Current with source = top, mark_line = if mark then Some(l) else None end }
+    end
+
+  -- A file read: the source awaited, or one no longer awaited, which is dropped.
+  file_read(tag: NAT, r: RESULT[IO_ERROR, BYTES]): TABLON_STATE
+    do
+      if tag = Current.reading and tag > 0 then
+        match r
+          case Ok(b) then
+            let got = { Current with source = TEXT_VIEW.make(TEXT_LINES.of_bytes(b)), reading = 0 }
+            got.at_line(Current.go_to, Current.go_mark)
+          case Error(_) then
+            let failed = { Current with source = TEXT_VIEW.make(LIST.empty.prepend("The file could not be read.")), reading = 0 }
+            failed.logged(GLYPHS.join("Could not read ", Current.source_file))
+        end
+      else
+        Current
+      end
+    end
+
+  -- A directory listed: its entries put under its node, and its directories listed in turn.
+  listed(tag: NAT, r: RESULT[IO_ERROR, LIST[DIR_ENTRY]]): TUI_NEXT[TABLON_STATE]
+    do
+      if tag < 100 or tag - 100 >= Current.dirs_asked.length then
+        TUI_NEXT.next(Current)
+      else
+        let dir = LIST_OPS.at(Current.dirs_asked, tag - 100)
+        match r
+          case Ok(es) then
+            let k = FILE_TREE.index_of(Current.file_entries, dir, 0)
+            let nodes = Current.file_tree.nodes
+            if k < 1000000 and k < nodes.length and k < Current.file_entries.length and LIST_OPS.at(nodes, k).depth < 1000 then
+              let depth = LIST_OPS.at(nodes, k).depth + 1
+              let sorted = FILE_TREE.sorted(es)
+              let rows = TABLON_LAYOUT.rows_in(TABLON_LAYOUT.left(Current.area))
+              let grown = FILE_TREE.spliced(nodes, k + 1, FILE_TREE.nodes_of(sorted, depth))
+              let entries = FILE_TREE.spliced(Current.file_entries, k + 1, FILE_TREE.entries_of(dir, sorted))
+              let more = FILE_TREE.dirs_of(dir, sorted)
+              let first = if Current.dirs_asked.length < 800 then 100 + Current.dirs_asked.length else 900 end
+              Next({ Current with file_tree = Current.file_tree.with_nodes(grown, rows), file_entries = entries,
+                       dirs_asked = Current.dirs_asked.append(more) },
+                   TABLON_STATE.listings(Current.project, more, first))
+            else
+              TUI_NEXT.next(Current)
+            end
+          case Error(_) then TUI_NEXT.next(Current.logged(GLYPHS.join("Could not list ", dir)))
+        end
+      end
+    end
+
+  -- Whether `p` is the inspection running.
+  is_inspection(p: PROC_ID): BOOL
+    do
+      match Current.inspecting
+        case Some(q) then q.equals(p)
+        case None then False
+      end
+    end
+
+  -- A process started: the inspection, when it has tag 1.
+  started(tag: NAT, p: PROC_ID): TABLON_STATE
+    do
+      if tag = 1 then { Current with inspecting = Some(p) } else Current end
+    end
+
+  -- A process that could not be started.
+  start_failed(tag: NAT): TABLON_STATE
+    do
+      if tag = 1 then
+        let stopped = { Current with inspect_running = False }
+        stopped.logged(GLYPHS.join(GLYPHS.join("Could not run ", Current.compiler), "; give its path as Tablon's second argument."))
+      else
+        Current
+      end
+    end
+
+  -- Output of a process: the inspection's is kept until it ends.
+  printed(p: PROC_ID, d: BYTES): TABLON_STATE
+    do
+      if Current.is_inspection(p) and Current.inspect_out.length <= 18446744073709551615 - d.length then
+        { Current with inspect_out = Current.inspect_out.concat(d) }
+      else
+        Current
+      end
+    end
+
+  -- Error output of a process, which `gardelc` writes its steps to: shown in Output.
+  complained(p: PROC_ID, d: BYTES): TABLON_STATE
+    do
+      Current.logged_all(TABLON_STATE.text_of(d))
+    end
+
+  -- A process ended: the inspection's output read into the modules and their tree.
+  exited(p: PROC_ID, code: I64): TABLON_STATE
+    do
+      if Current.is_inspection(p) then
+        let done = { Current with inspecting = None, inspect_running = False, inspect_out = BYTES.empty }
+        match INSPECTION.modules(Current.inspect_out)
+          case Some(ms) then
+            let rows = TABLON_LAYOUT.rows_in(TABLON_LAYOUT.left(Current.area))
+            let tree = TREE_VIEW.make(MODULE_TREE.nodes(ms))
+            let read = { done with infos = ms, module_tree = tree, module_entries = MODULE_TREE.entries(ms) }
+            read.refreshed.logged(GLYPHS.join(GLYPHS.join("Inspected: ", NUMBER_TEXT.nat_to_text(ms.length)), " modules."))
+          case None then
+            done.logged(GLYPHS.join("The inspection gave no modules; gardelc ended with ", NUMBER_TEXT.i64_to_text(code)))
+        end
+      else
+        Current
+      end
+    end
+
+  -- A key, when the palette is open: Escape closes it, Enter runs the command chosen, and
+  -- the rest go to the palette.
+  in_palette(k: KEY): TUI_NEXT[TABLON_STATE]
+    do
+      match k
+        case Escape then TUI_NEXT.next({ Current with commands_open = False })
+        case Enter then
+          let closed = { Current with commands_open = False }
+          match Current.commands.chosen
+            case Some(e) then closed.run(e.name, Current.commands.arguments)
+            case None then TUI_NEXT.next(closed.logged(GLYPHS.join("No command named ", Current.commands.command)))
+          end
+        case KeysEnded then TUI_NEXT.quit(0)
+        case _ then
+          let p = TABLON_LAYOUT.palette(Current.area, Current.commands)
+          TUI_NEXT.next({ Current with commands = Current.commands.on_key(k, if p.height >= 3 then p.height - 3 else 0 end) })
+      end
+    end
+
+  -- The command `name` run with `args`.
+  run(name: STRING, args: STRING): TUI_NEXT[TABLON_STATE]
+    do
+      if name.equals("quit") then
+        TUI_NEXT.quit(0)
+      else if name.equals("open") then
+        if args.is_empty then
+          TUI_NEXT.next(Current.logged("/open needs a directory."))
+        else
+          let fresh = TABLON_STATE.make(args, Current.compiler).sized(Current.wide, Current.high)
+          Next(fresh, fresh.starting)
+        end
+      else if name.equals("inspect") then
+        if Current.inspect_running then
+          TUI_NEXT.next(Current.logged("An inspection is running already."))
+        else
+          let again = { Current with inspect_running = True, inspect_out = BYTES.empty }
+          Next(again.logged("Inspecting again."),
+               LIST.empty.prepend(RunProcess(1, Current.compiler, TABLON_STATE.inspect_args, Current.project)))
+        end
+      else
+        TUI_NEXT.next(Current.logged(GLYPHS.join("Unknown command ", name)))
+      end end end
+    end
+
+end

@@ -1,0 +1,53 @@
+-- Text cut into lines: at each LF, a CR before it dropped, so a file written on Windows reads
+-- as one written elsewhere. Bytes that are not UTF-8 make a line of their own empty.
+functions TEXT_LINES
+
+feature {ANY}
+
+  -- The lines of `b`. A last line that ends with LF is followed by no empty one.
+  of_bytes(b: BYTES): LIST[STRING]
+    do
+      TEXT_LINES.lines_from(b, 0)
+    end
+
+  -- The lines of `s`.
+  of_text(s: STRING): LIST[STRING]
+    do
+      TEXT_LINES.of_bytes(s.to_utf8)
+    end
+
+  -- The lines of `b` from byte `from` on.
+  lines_from(b: BYTES, from: NAT): LIST[STRING]
+    variant
+      b.length - from
+    do
+      if from >= b.length then
+        LIST.empty
+      else
+        match b.index_of_byte(10, from)
+          case Some(i) then
+            if i >= from and i < b.length then
+              TEXT_LINES.lines_from(b, i + 1).prepend(TEXT_LINES.line(b, from, i))
+            else
+              LIST.empty.prepend(TEXT_LINES.line(b, from, b.length))
+            end
+          case None then LIST.empty.prepend(TEXT_LINES.line(b, from, b.length))
+        end
+      end
+    end
+
+  -- The bytes of `b` from `lo` up to `hi`, less a CR at the end, as text.
+  line(b: BYTES, lo: NAT, hi: NAT): STRING
+    do
+      let end_at = if hi > lo and hi <= b.length and b.at(hi - 1) = 13 then hi - 1 else hi end
+      if lo <= end_at and end_at <= b.length then
+        match STRING.from_utf8(b.slice(lo, end_at))
+          case Ok(s) then s
+          case Error(_) then ""
+        end
+      else
+        ""
+      end
+    end
+
+end

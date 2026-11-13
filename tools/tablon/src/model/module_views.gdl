@@ -1,0 +1,160 @@
+-- The views of a module on the right, after `Text` and `Short`, which show text: its
+-- features, creators, laws and invariant clauses, one per line, each taking Enter to its line
+-- in the source; the concepts it satisfies; the modules that satisfy the same concepts (its
+-- concepts' instances); the modules that use it (clients); and those it uses (suppliers),
+-- each taking Enter to that module. A supplier the inspection does not list is the prelude's.
+functions MODULE_VIEWS
+
+feature {ANY}
+
+  -- The tabs of the views, each with its key.
+  tabs: TABS
+    do
+      MODULE_VIEWS.tabs_of(MODULE_VIEWS.titles, MODULE_VIEWS.keys, TABS.empty)
+    end
+
+  titles: LIST[STRING]
+    do
+      LIST.empty.prepend("Suppliers").prepend("Clients").prepend("Instances").prepend("Concepts")
+        .prepend("Invariants").prepend("Laws").prepend("Creators").prepend("Features").prepend("Short").prepend("Text")
+    end
+
+  keys: LIST[CHAR]
+    do
+      LIST.empty.prepend('u').prepend('c').prepend('d').prepend('a').prepend('i').prepend('l').prepend('n')
+        .prepend('f').prepend('s').prepend('t')
+    end
+
+  -- The tabs from `ts` and `ks` after `acc`'s.
+  tabs_of(ts: LIST[STRING], ks: LIST[CHAR], acc: TABS): TABS
+    variant
+      ts.length
+    do
+      if ts.length = 0 or ks.length = 0 then acc else MODULE_VIEWS.tabs_of(ts.tail, ks.tail, acc.with(ts.head, ks.head)) end
+    end
+
+  -- The cells the tabs `ts` take, each with its key and ` | `, at most 65535.
+  width_of(ts: LIST[STRING]): NAT
+    variant
+      ts.length
+    do
+      if ts.length = 0 then
+        0
+      else
+        let n = ts.head.code_point_count
+        let rest = MODULE_VIEWS.width_of(ts.tail)
+        if n <= 1000 and rest <= 64000 then n + 6 + rest else 65535 end
+      end
+    end
+
+  -- The first tab shown when tab `sel` is chosen and `width` cells are free: the first from
+  -- which the tabs up to `sel` fit, counting from `f`, or `sel` itself.
+  first_shown(sel: NAT, width: NAT, f: NAT): NAT
+    variant
+      sel - f
+    do
+      if f >= sel or sel >= 100 then f
+      else if MODULE_VIEWS.width_of(LIST_CUT.take(LIST_CUT.drop(MODULE_VIEWS.titles, f), sel - f + 1)) <= width then f
+      else MODULE_VIEWS.first_shown(sel, width, f + 1)
+      end end
+    end
+
+  -- The tabs drawn in `width` cells with tab `sel` chosen: from the first, or from one late
+  -- enough that the chosen tab shows.
+  window(sel: NAT, width: NAT): TABS
+    do
+      let f = MODULE_VIEWS.first_shown(sel, width, 0)
+      let tabs = MODULE_VIEWS.tabs_of(LIST_CUT.drop(MODULE_VIEWS.titles, f), LIST_CUT.drop(MODULE_VIEWS.keys, f), TABS.empty)
+      tabs.choose(if sel >= f then sel - f else 0 end)
+    end
+
+  text_view: NAT do 0 end
+  short_view: NAT do 1 end
+
+  -- The lines of view `v` of `m`, among the modules `ms`.
+  lines(m: MODULE_INFO, ms: LIST[MODULE_INFO], v: NAT): VIEW_LINES
+    do
+      if v = 2 then MODULE_VIEWS.parts(m.parts, "feature", VIEW_LINES.empty).or_note("No features.")
+      else if v = 3 then MODULE_VIEWS.parts(m.parts, "create", VIEW_LINES.empty).or_note("No creators.")
+      else if v = 4 then MODULE_VIEWS.parts(m.parts, "law", VIEW_LINES.empty).or_note("No laws.")
+      else if v = 5 then MODULE_VIEWS.parts(m.parts, "invariant", VIEW_LINES.empty).or_note("No invariant.")
+      else if v = 6 then MODULE_VIEWS.plain(m.concepts, VIEW_LINES.empty).or_note("Satisfies no concept.")
+      else if v = 7 then MODULE_VIEWS.instances(m, ms, m.concepts, VIEW_LINES.empty).or_note("Satisfies no concept, so it shares none.")
+      else if v = 8 then MODULE_VIEWS.modules_named(MODULE_VIEWS.clients(m.name, ms), ms, VIEW_LINES.empty).or_note("No module uses it.")
+      else if v = 9 then MODULE_VIEWS.modules_named(m.suppliers, ms, VIEW_LINES.empty).or_note("Uses no other module.")
+      else VIEW_LINES.empty
+      end end end end end end end end
+    end
+
+  -- `acc` with a line for each of `ps` in `section`.
+  parts(ps: LIST[PART_INFO], section: STRING, acc: VIEW_LINES): VIEW_LINES
+    variant
+      ps.length
+    do
+      if ps.length = 0 then
+        acc
+      else
+        let p = ps.head
+        MODULE_VIEWS.parts(ps.tail, section, if p.section.equals(section) then acc.with(p.text, p.line, "") else acc end)
+      end
+    end
+
+  -- `acc` with a line for each of `xs`, which Enter takes nowhere.
+  plain(xs: LIST[STRING], acc: VIEW_LINES): VIEW_LINES
+    variant
+      xs.length
+    do
+      if xs.length = 0 then acc else MODULE_VIEWS.plain(xs.tail, acc.with(xs.head, 0, "")) end
+    end
+
+  -- `acc` with a line for each of the modules `names`, which Enter takes to it, or, for one
+  -- that `ms` does not list, marked as the prelude's.
+  modules_named(names: LIST[STRING], ms: LIST[MODULE_INFO], acc: VIEW_LINES): VIEW_LINES
+    variant
+      names.length
+    do
+      if names.length = 0 then
+        acc
+      else
+        let n = names.head
+        let line = match MODULE_TREE.named(ms, n)
+            case Some(_) then acc.with(n, 0, n)
+            case None then acc.with(GLYPHS.join(n, "  (prelude)"), 0, "")
+          end
+        MODULE_VIEWS.modules_named(names.tail, ms, line)
+      end
+    end
+
+  -- The names of the modules of `ms` that use `name`.
+  clients(name: STRING, ms: LIST[MODULE_INFO]): LIST[STRING]
+    do
+      LIST_OPS.map(LIST_OPS.filter(ms, fn(c: MODULE_INFO): BOOL do MODULE_TREE.has(c.suppliers, name) end),
+        fn(c: MODULE_INFO): STRING do c.name end)
+    end
+
+  -- `acc` with, for each of the concepts `cs`, its name, and under it the other modules of `ms`
+  -- that satisfy it.
+  instances(m: MODULE_INFO, ms: LIST[MODULE_INFO], cs: LIST[STRING], acc: VIEW_LINES): VIEW_LINES
+    variant
+      cs.length
+    do
+      if cs.length = 0 then
+        acc
+      else
+        let c = cs.head
+        let others = LIST_OPS.filter(ms, fn(o: MODULE_INFO): BOOL do (not o.name.equals(m.name)) and MODULE_TREE.has(o.concepts, c) end)
+        let headed = acc.with(c, 0, "")
+        let listed = MODULE_VIEWS.indented(LIST_OPS.map(others, fn(o: MODULE_INFO): STRING do o.name end), headed)
+        MODULE_VIEWS.instances(m, ms, cs.tail, if others.length = 0 then headed.with("  none other", 0, "") else listed end)
+      end
+    end
+
+  -- `acc` with a line for each of the modules `names`, indented, which Enter takes to it.
+  indented(names: LIST[STRING], acc: VIEW_LINES): VIEW_LINES
+    variant
+      names.length
+    do
+      if names.length = 0 then acc else MODULE_VIEWS.indented(names.tail, acc.with(GLYPHS.join("  ", names.head), 0, names.head)) end
+    end
+
+end

@@ -1,0 +1,37 @@
+-- What a node of one of Tablon's trees stands for, kept beside the tree in a list of the same
+-- order (a tree is a list, F.11c): a module's name, a file's path from the project, or "" for
+-- a node that only groups others, and whether it is a directory to list.
+module TREE_ENTRY
+
+representation {NONE}
+  what: STRING
+  folder: BOOL
+
+create {ANY}
+
+  make(key: STRING, is_dir: BOOL): TREE_ENTRY
+    do
+      { what = key, folder = is_dir }
+    ensure
+      kept: Result.key.equals(key)
+    end
+
+  -- A node that groups others and stands for nothing itself.
+  group: TREE_ENTRY
+    do
+      { what = "", folder = False }
+    end
+
+feature {ANY}
+
+  key: STRING
+    do
+      Current.what
+    end
+
+  is_dir: BOOL
+    do
+      Current.folder
+    end
+
+end

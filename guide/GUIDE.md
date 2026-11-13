@@ -1947,6 +1947,8 @@ step(t: TUI[TODO_STATE], e: EVENT): STEP[TUI[TODO_STATE]] do t.step(e) end
 
 `examples/todo_tui` is a small program, and `examples/gtui_tour` a workbench of three panes that uses every widget. A full redraw of 200 by 60 takes about 7 ms. `gtui/README.md` has the details.
 
+`tools/tablon` is a workbench for a Gardel project, written in Gardel on `gtui` and `gjson`. Build it with `gardelc --project tools/tablon --strict`, and run `tools/tablon/build/tablon_bin DIR [GARDELC]` in a terminal, where `DIR` is a project and `GARDELC` the compiler, `gardelc` on the `PATH` when it is not given. It reads the project's modules from `gardelc --inspect --json-diagnostics --no-verify`, so it browses a project whose proofs fail. Tab moves between the panes; `m` and `f` choose Modules or Files on the left; `t`, `s`, `f`, `n`, `l`, `i`, `a`, `d`, `c` and `u` choose a view on the right (text, short form, features, creators, laws, invariants, concepts, instances, clients, suppliers); Enter opens a node, a part's line or a module; `/` opens the commands; `q` quits.
+
 ### Checking a New Version
 
 Before releasing a package, compare it with the version your clients use:

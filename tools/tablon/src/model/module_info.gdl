@@ -1,0 +1,84 @@
+-- What `--inspect` says of one module: its name, its kind (`module`, `functions`, `program`
+-- or `reactive program`), the package that declares it, its file relative to the project and
+-- the line of its header, the concepts it satisfies with their ancestors, the modules it
+-- uses, its parts and its short form, one line each.
+module MODULE_INFO
+
+representation {NONE}
+  title: STRING
+  sort: STRING
+  owner: STRING
+  path: STRING
+  spot: NAT
+  ancestors: LIST[STRING]
+  supplied: LIST[STRING]
+  all_parts: LIST[PART_INFO]
+  short_lines: LIST[STRING]
+
+create {ANY}
+
+  make(name: STRING, kind: STRING, package: STRING, file: STRING, line: NAT, concepts: LIST[STRING],
+       suppliers: LIST[STRING], parts: LIST[PART_INFO], short: LIST[STRING]): MODULE_INFO
+    do
+      { title = name, sort = kind, owner = package, path = file, spot = line, ancestors = concepts,
+        supplied = suppliers, all_parts = parts, short_lines = short }
+    ensure
+      kept_name: Result.name.equals(name)
+      kept_file: Result.file.equals(file)
+    end
+
+feature {ANY}
+
+  name: STRING
+    do
+      Current.title
+    end
+
+  kind: STRING
+    do
+      Current.sort
+    end
+
+  package: STRING
+    do
+      Current.owner
+    end
+
+  file: STRING
+    do
+      Current.path
+    end
+
+  line: NAT
+    do
+      Current.spot
+    end
+
+  concepts: LIST[STRING]
+    do
+      Current.ancestors
+    end
+
+  suppliers: LIST[STRING]
+    do
+      Current.supplied
+    end
+
+  parts: LIST[PART_INFO]
+    do
+      Current.all_parts
+    end
+
+  short: LIST[STRING]
+    do
+      Current.short_lines
+    end
+
+  -- Whether the module is the project's own, not a dependency's: its file is under the
+  -- project's directory, as `--inspect` gives a dependency's from `./..`.
+  is_own: BOOL
+    do
+      Current.path.starts_with("./") and not Current.path.starts_with("./..")
+    end
+
+end

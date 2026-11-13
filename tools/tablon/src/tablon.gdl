@@ -1,0 +1,121 @@
+-- Tablon, a workbench for a Gardel project (Task F.11d), laid out after `issues/image.png`:
+-- the project on the left, under the tabs Modules and Files, each a tree; the module chosen on
+-- the right, under the tabs of its views; and the output at the bottom.
+--
+--   gardelc tools/tablon --strict
+--   ./tools/tablon/build/tablon_bin [DIR] [GARDELC]
+--
+-- DIR is the project, `.` when it is not given, and GARDELC the compiler, `gardelc` on the
+-- `PATH` when it is not given. Tablon runs `gardelc --inspect --json-diagnostics --no-verify`
+-- on the project and lists its `src` as it starts; neither waits, so the keys work at once.
+--
+-- Tab moves the keys between the panes, and the pane that has them is framed in cyan. A tab's
+-- key chooses it: `m` and `f` on the left; `t`ext, `s`hort, `f`eatures, creators (`n`),
+-- `l`aws, `i`nvariants, concepts (`a`), instances (`d`), `c`lients and s`u`ppliers on the
+-- right. In a tree, the arrows move, Right opens a node and Left closes it, and Enter opens a
+-- module or a file. In a list view, Enter goes to the line of a part in Text, or to the
+-- module a line names. `/` opens the commands: `/inspect`, `/open DIR` and `/quit`. `q` quits.
+reactive program TABLON
+
+feature {ANY}
+
+  update(s: TABLON_STATE, e: EVENT): TUI_NEXT[TABLON_STATE]
+    do
+      match e
+        case Resized(w, h) then TUI_NEXT.next(s.sized(w, h))
+        case Key(k) then if s.palette_open then s.in_palette(k) else s.browse(k) end
+        case ProcessStarted(tag, p) then TUI_NEXT.next(s.started(tag, p))
+        case ProcessFailed(tag, _) then TUI_NEXT.next(s.start_failed(tag))
+        case ProcessOutput(p, d) then TUI_NEXT.next(s.printed(p, d))
+        case ProcessErrorOutput(p, d) then TUI_NEXT.next(s.complained(p, d))
+        case ProcessExited(p, code) then TUI_NEXT.next(s.exited(p, code))
+        case DirListed(tag, r) then s.listed(tag, r)
+        case FileRead(tag, r) then TUI_NEXT.next(s.file_read(tag, r))
+        case _ then TUI_NEXT.next(s)
+      end
+    end
+
+  -- The edge of pane `i`: cyan when it has the keys, and gray otherwise.
+  edge(s: TABLON_STATE, i: NAT): STYLE
+    do
+      if s.focus.has(i) then STYLE.plain.fg(COLOR.cyan).bold else STYLE.plain.fg(COLOR.gray) end
+    end
+
+  -- The selected row's style in pane `i`: on blue when it has the keys, and reversed otherwise.
+  mark(s: TABLON_STATE, i: NAT): STYLE
+    do
+      if s.focus.has(i) then STYLE.plain.bg(COLOR.blue) else STYLE.plain.reversed end
+    end
+
+  -- The view chosen of the module on the right, drawn in `r`.
+  module_view(s: TABLON_STATE, scr: SCREEN, r: RECT): SCREEN
+    do
+      if s.view = MODULE_VIEWS.text_view then
+        s.text.draw_code(scr, r, STYLE.plain, STYLE.plain.fg(COLOR.gray), s.marked,
+          STYLE.plain.bg(COLOR.blue), fn(i: NAT, line: STRING): LIST[SPAN] do GARDEL_LEXER.spans(i, line) end)
+      else if s.view = MODULE_VIEWS.short_view then
+        if s.has_module then s.short.draw(scr, r, STYLE.plain)
+        else TEXT_VIEW.make(LIST.empty.prepend("Choose a module on the left.")).draw(scr, r, STYLE.plain)
+        end
+      else
+        s.parts.draw(scr, r, STYLE.plain, mark(s, 1))
+      end end
+    end
+
+  -- What the bottom pane shows under its tab.
+  output_view(s: TABLON_STATE, scr: SCREEN, r: RECT): SCREEN
+    do
+      let t = s.output_tabs.selected
+      let lines = if t = 0 then s.output
+        else if t = 1 then LIST.empty.prepend("No check run yet.")
+        else if t = 2 then LIST.empty.prepend("Nothing built yet.")
+        else LIST.empty.prepend("Nothing run yet.")
+        end end end
+      let out = TEXT_VIEW.make(lines)
+      out.scrolled_to(out.last_top(r.height), r.height).draw(scr, r, STYLE.plain)
+    end
+
+  view(s: TABLON_STATE, blank: SCREEN): SCREEN
+    do
+      let area = blank.area
+      let left = TABLON_LAYOUT.left(area)
+      let right = TABLON_LAYOUT.right(area)
+      let bottom = TABLON_LAYOUT.bottom(area)
+      let chosen = STYLE.plain.fg(COLOR.bright_yellow).bold.underlined
+      let a = FRAME.draw(blank, left, "", edge(s, 0), edge(s, 0))
+      let b = s.project_tabs.draw(a, FRAME.title_area(left), STYLE.plain, chosen)
+      let c = s.tree.draw(b, FRAME.inner(left), STYLE.plain, mark(s, 0))
+      let d = FRAME.draw(c, right, s.title, edge(s, 1), edge(s, 1).reversed)
+      let tabs_row = TABLON_LAYOUT.view_tabs(right)
+      let e = MODULE_VIEWS.window(s.view, tabs_row.width).draw(d, tabs_row, STYLE.plain, chosen)
+      let f = module_view(s, e, TABLON_LAYOUT.view_body(right))
+      let g = FRAME.draw(f, bottom, "", edge(s, 2), edge(s, 2))
+      let h = s.output_tabs.draw(g, FRAME.title_area(bottom), STYLE.plain, chosen)
+      let i = output_view(s, h, FRAME.inner(bottom))
+      let j = STATUS_BAR.draw(i, TABLON_LAYOUT.status(area), " Tab panes  / commands  Enter open  q quit",
+        GLYPHS.join(s.activity, " "), STYLE.plain.reversed)
+      if s.palette_open then
+        s.palette.draw(j, TABLON_LAYOUT.palette(area, s.palette), STYLE.plain, STYLE.plain.bg(COLOR.blue), STYLE.plain.fg(COLOR.cyan))
+      else
+        j
+      end
+    end
+
+  init(args: SEQ[STRING]): STEP[TUI[TABLON_STATE]]
+    do
+      let xs = args.to_list
+      let dir = if xs.length > 0 then xs.head else "." end
+      let gardelc = if xs.length > 1 then xs.tail.head else "gardelc" end
+      let s = TABLON_STATE.make(dir, gardelc)
+      match TUI.start(s, update, view)
+        case Continue(t, cmds) then Continue(t, cmds.append(s.starting))
+        case Stop(code, cmds) then Stop(code, cmds)
+      end
+    end
+
+  step(t: TUI[TABLON_STATE], e: EVENT): STEP[TUI[TABLON_STATE]]
+    do
+      t.step(e)
+    end
+
+end
