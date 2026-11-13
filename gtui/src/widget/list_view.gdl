@@ -109,18 +109,25 @@ feature {ANY}
   -- for Home and End. Other keys change nothing.
   on_key(k: KEY, rows: NAT): LIST_VIEW
     do
-      let page = if rows > 1 then rows - 1 else 1 end
-      match k
-        case Down then Current.down(1, rows)
-        case Up then Current.up(1, rows)
-        case PageDown then Current.down(page, rows)
-        case PageUp then Current.up(page, rows)
-        case Home then Current.select(0, rows)
-        case End then Current.select(if Current.entries.length > 0 then Current.entries.length - 1 else 0 end, rows)
-        case _ then Current
-      end
+      if LIST_VIEW.moves(k) then Current.select(Current.target(k, rows), rows) else Current end
     ensure
       same_count: Result.count = Current.count
+    end
+
+  -- The item a key moves the selection to, `rows` items shown.
+  target(k: KEY, rows: NAT): NAT
+    do
+      let page = if rows > 1 then rows - 1 else 1 end
+      let c = Current.chosen
+      match k
+        case Down then if c < 18446744073709551615 then c + 1 else c end
+        case Up then if c >= 1 then c - 1 else 0 end
+        case PageDown then if c <= 18446744073709551615 - page then c + page else c end
+        case PageUp then if c >= page then c - page else 0 end
+        case Home then 0
+        case End then if Current.entries.length > 0 then Current.entries.length - 1 else 0 end
+        case _ then c
+      end
     end
 
   -- The list drawn in `r`, in style `st`, the selected item across the whole row in `mark`.
@@ -133,6 +140,20 @@ feature {ANY}
     end
 
 create {ANY}
+
+  -- Whether `k` moves the selection: the arrows up and down, Page Up, Page Down, Home, End.
+  moves(k: KEY): BOOL
+    do
+      match k
+        case Down then True
+        case Up then True
+        case PageDown then True
+        case PageUp then True
+        case Home then True
+        case End then True
+        case _ then False
+      end
+    end
 
   -- `items`, the first of which is item `i`, drawn in `r` from row `y` on.
   draw_items(s: SCREEN, r: RECT, items: LIST[STRING], i: NAT, chosen: NAT, y: NAT, st: STYLE, mark: STYLE): SCREEN

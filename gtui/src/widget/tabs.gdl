@@ -1,0 +1,175 @@
+-- A row of titles, one of them chosen, each with a key that chooses it, drawn after it:
+-- `Text(t)` is the title `Text`, chosen by `t`. Tab chooses the next, and from the last the
+-- first. A title given a space for its key has none. A title can change, as a count in
+-- `Problems (3)` does, and keeps its key and place.
+--
+--   TABS.empty.with("Text", 't').with("Short", 's').with("Clients", 'c')
+module TABS
+
+representation {NONE}
+  names: LIST[STRING]
+  hot: LIST[CHAR]
+  picked: NAT
+
+invariant
+  one_key_each: hot.length = names.length
+  a_tab: picked < names.length or (names.length = 0 and picked = 0)
+
+create {ANY}
+
+  empty: TABS
+    do
+      { names = LIST.empty, hot = LIST.empty, picked = 0 }
+    ensure
+      none: Result.count = 0
+    end
+
+  -- The index of the first of `keys` that is `c`, or the length of `keys` when none is.
+  key_index(keys: LIST[CHAR], c: CHAR): NAT
+    variant
+      keys.length
+    do
+      if keys.length = 0 then 0
+      else if keys.head = c then 0
+      else
+        let r = TABS.key_index(keys.tail, c)
+        if r < 18446744073709551615 then r + 1 else r end
+      end end
+    ensure
+      within: Result <= keys.length
+    end
+
+  -- `names` from tab `i` on, drawn on the row `row` from column `x`, separated by ` | `, the
+  -- tab `picked` in `chosen` and the others in `st`, each key after its title in `st`.
+  draw_tabs(s: SCREEN, row: RECT, names: LIST[STRING], keys: LIST[CHAR], i: NAT, picked: NAT,
+            x: NAT, st: STYLE, chosen: STYLE): SCREEN
+    variant
+      names.length
+    do
+      if names.length = 0 or keys.length = 0 or x >= row.right or i = 18446744073709551615 then
+        s
+      else
+        let title = names.head
+        let k = keys.head
+        let n = title.code_point_count
+        let titled = s.text(row, x, row.y, title, if i = picked then chosen else st end)
+        if n > 65535 then
+          titled
+        else
+          let kx = x + n
+          let keyed = if k = ' ' then titled
+            else titled.glyphs(row, kx, row.y, LIST.empty.prepend(')').prepend(k).prepend('('), st)
+            end
+          let after = if k = ' ' then kx else kx + 3 end
+          if names.tail.length = 0 then
+            keyed
+          else
+            let parted = keyed.text(row, after, row.y, " | ", st)
+            TABS.draw_tabs(parted, row, names.tail, keys.tail, i + 1, picked, after + 3, st, chosen)
+          end
+        end
+      end
+    ensure
+      same_width: Result.width = s.width
+      same_height: Result.height = s.height
+    end
+
+feature {ANY}
+
+  count: NAT
+    do
+      Current.names.length
+    end
+
+  titles: LIST[STRING]
+    do
+      Current.names
+    end
+
+  -- The index of the tab chosen.
+  selected: NAT
+    do
+      Current.picked
+    ensure
+      a_tab: Result < Current.count or (Current.count = 0 and Result = 0)
+    end
+
+  -- The title of the tab chosen, or "" when there is none.
+  selected_title: STRING
+    do
+      if Current.picked < Current.names.length then LIST_OPS.at(Current.names, Current.picked) else "" end
+    end
+
+  -- Another tab, last, with the key `key`.
+  with(title: STRING, key: CHAR): TABS
+    do
+      { names = Current.names.append(LIST.empty.prepend(title)),
+        hot = Current.hot.append(LIST.empty.prepend(key)),
+        picked = Current.picked }
+    ensure
+      one_more: Result.count = Current.count + 1
+      same_choice: Result.selected = Current.selected
+    end
+
+  -- Tab `i` titled `title`, or the same tabs when there is no tab `i`.
+  retitled(i: NAT, title: STRING): TABS
+    do
+      { Current with names = LIST_CUT.put_at(Current.names, i, title) }
+    ensure
+      same_count: Result.count = Current.count
+      same_choice: Result.selected = Current.selected
+    end
+
+  -- Tab `i` chosen, or the same one when there is no tab `i`.
+  choose(i: NAT): TABS
+    do
+      if i < Current.names.length then { Current with picked = i } else Current end
+    ensure
+      same_count: Result.count = Current.count
+      chosen: i < Current.count implies Result.selected = i
+    end
+
+  -- The next tab chosen, or the first after the last.
+  next: TABS
+    do
+      let n = Current.names.length
+      let p = Current.picked
+      Current.choose(if p < 18446744073709551615 and p + 1 < n then p + 1 else 0 end)
+    ensure
+      same_count: Result.count = Current.count
+    end
+
+  -- Whether `k` chooses a tab: Tab, or the key of a tab.
+  takes(k: KEY): BOOL
+    do
+      match k
+        case Tab then True
+        case Char(c) then c != ' ' and TABS.key_index(Current.hot, c) < Current.hot.length
+        case _ then False
+      end
+    end
+
+  -- Chosen by a key: a tab's own key chooses it, and Tab the next. Other keys change nothing.
+  on_key(k: KEY): TABS
+    do
+      match k
+        case Tab then Current.next
+        case Char(c) then if c = ' ' then Current else Current.choose(TABS.key_index(Current.hot, c)) end
+        case _ then Current
+      end
+    ensure
+      same_count: Result.count = Current.count
+    end
+
+  -- The tabs drawn on the first row of `r`, the chosen one in `chosen` and the rest in `st`,
+  -- cut at its right edge.
+  draw(s: SCREEN, r: RECT, st: STYLE, chosen: STYLE): SCREEN
+    do
+      let row = r.take_top(1)
+      TABS.draw_tabs(s, row, Current.names, Current.hot, 0, Current.picked, row.x, st, chosen)
+    ensure
+      same_width: Result.width = s.width
+      same_height: Result.height = s.height
+    end
+
+end

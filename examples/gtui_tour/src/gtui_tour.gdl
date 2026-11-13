@@ -1,0 +1,78 @@
+-- A tour of `gtui`'s widgets, laid out as a workbench: a project on the left, under the tabs
+-- Modules and Files, each a tree; a source on the right, with line numbers and its keywords,
+-- strings and comments coloured; and at the bottom the tabs Output and Problems.
+--
+--   gardelc examples/gtui_tour --strict
+--   ./examples/gtui_tour/build/gtui_tour_bin [PROGRAM]
+--
+-- Tab moves the keys between the panes, and the pane that has them is framed in cyan. In a
+-- pane with tabs, a tab's key chooses it. In a tree, the arrows move, Right opens a node and
+-- Left closes it, and Enter does either. In Problems, Enter marks the problem's line in the
+-- source. `/` opens the commands, narrowed as one types: `/shell` runs PROGRAM with the
+-- terminal its own, and the tour comes back when it ends. `q` quits.
+reactive program GTUI_TOUR
+
+feature {ANY}
+
+  update(s: TOUR_STATE, e: EVENT): TUI_NEXT[TOUR_STATE]
+    do
+      match e
+        case Resized(w, h) then TUI_NEXT.next(s.sized(w, h))
+        case Key(k) then if s.palette_open then s.in_palette(k) else s.browse(k) end
+        case AttachedEnded(tag, r) then
+          match r
+            case Ok(code) then TUI_NEXT.next(s.logged(GLYPHS.join("The program ended with ", NUMBER_TEXT.i64_to_text(code))))
+            case Error(_) then TUI_NEXT.next(s.logged("The program could not be run."))
+          end
+        case _ then TUI_NEXT.next(s)
+      end
+    end
+
+  -- The edge of pane `i`: cyan when it has the keys, and gray otherwise.
+  edge(s: TOUR_STATE, i: NAT): STYLE
+    do
+      if s.focus.has(i) then STYLE.plain.fg(COLOR.cyan).bold else STYLE.plain.fg(COLOR.gray) end
+    end
+
+  view(s: TOUR_STATE, blank: SCREEN): SCREEN
+    do
+      let area = blank.area
+      let left = TOUR_LAYOUT.left(area)
+      let right = TOUR_LAYOUT.right(area)
+      let bottom = TOUR_LAYOUT.bottom(area)
+      let chosen = STYLE.plain.fg(COLOR.bright_yellow).bold.underlined
+      let mark = STYLE.plain.reversed
+      let a = FRAME.draw(blank, left, "", edge(s, 0), edge(s, 0))
+      let b = s.project_tabs.draw(a, FRAME.title_area(left), STYLE.plain, chosen)
+      let c = s.tree.draw(b, FRAME.inner(left), STYLE.plain, mark)
+      let d = FRAME.draw(c, right, s.title, edge(s, 1), edge(s, 1).reversed)
+      let e = s.text.draw_code(d, FRAME.inner(right), STYLE.plain, STYLE.plain.fg(COLOR.gray), s.marked,
+        STYLE.plain.bg(COLOR.blue), fn(i: NAT, line: STRING): LIST[SPAN] do TOUR_LEXER.spans(i, line) end)
+      let f = FRAME.draw(e, bottom, "", edge(s, 2), edge(s, 2))
+      let g = s.output_tabs.draw(f, FRAME.title_area(bottom), STYLE.plain, chosen)
+      let inner = FRAME.inner(bottom)
+      let h = if s.output_tabs.selected = 0 then
+          let out = TEXT_VIEW.make(s.output)
+          out.scrolled_to(out.last_top(inner.height), inner.height).draw(g, inner, STYLE.plain)
+        else
+          s.problems.draw(g, inner, STYLE.plain, mark)
+        end
+      if s.palette_open then
+        s.palette.draw(h, TOUR_LAYOUT.palette(area, s.palette), STYLE.plain, STYLE.plain.bg(COLOR.blue), STYLE.plain.fg(COLOR.cyan))
+      else
+        h
+      end
+    end
+
+  init(args: SEQ[STRING]): STEP[TUI[TOUR_STATE]]
+    do
+      let xs = args.to_list
+      TUI.start(TOUR_STATE.make(if xs.length > 0 then xs.head else "" end), update, view)
+    end
+
+  step(t: TUI[TOUR_STATE], e: EVENT): STEP[TUI[TOUR_STATE]]
+    do
+      t.step(e)
+    end
+
+end

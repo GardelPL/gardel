@@ -14,6 +14,10 @@
 -- from the terminal, which are dropped (`TUI_COMMANDS.own`). `Quit`, or a `Shutdown` (with
 -- status 1), puts the terminal's screen back and stops.
 --
+-- A `RunAttached` gives the terminal to a child: the screen is put back before it, and nothing
+-- is drawn until every child sent has ended (`AttachedEnded`). Then the alternate screen is
+-- taken again, and the `Resized` the host sends after it draws the screen whole.
+--
 -- Proven: every write of a frame lies inside the terminal's last known size
 -- (`frame_writes`). A view that gives back a screen of another size than the blank one it was
 -- given is not drawn: the blank one is (`fitted`). `SCREEN`'s routines keep the size.
@@ -23,6 +27,7 @@ representation {NONE}
   app: S
   shown: SCREEN
   sized: BOOL
+  away: NAT
   on_event: (s: S, e: EVENT) -> TUI_NEXT[S]
   draw: (s: S, blank: SCREEN) -> SCREEN
 
@@ -31,7 +36,7 @@ create {ANY}
   make(s: S, update: (s: S, e: EVENT) -> TUI_NEXT[S],
        view: (s: S, blank: SCREEN) -> SCREEN): TUI[S]
     do
-      { app = s, shown = SCREEN.blank(0, 0), sized = False, on_event = update, draw = view }
+      { app = s, shown = SCREEN.blank(0, 0), sized = False, away = 0, on_event = update, draw = view }
     ensure
       unsized: not Result.has_size
     end
@@ -55,6 +60,13 @@ feature {ANY}
   has_size: BOOL
     do
       Current.sized
+    end
+
+  -- How many children sent by `RunAttached` have not ended: while any has not, the terminal
+  -- is theirs and nothing is drawn.
+  attached: NAT
+    do
+      Current.away
     end
 
   -- The screen as the terminal shows it.
@@ -88,6 +100,18 @@ feature {ANY}
               Stop(code, after.prepend(Write(VT_TEXT.leave)))
             case Next(s, cmds) then
               let own = TUI_COMMANDS.own(cmds)
+              let sent = TUI_COMMANDS.attaching(own)
+              let ended = match e case AttachedEnded(_, _) then (if Current.away > 0 then 1 else 0 end) case _ then 0 end
+              let left = Current.away - ended
+              if sent > 0 or left > 0 then
+                -- A child has the terminal, or is about to: nothing is drawn until the last one
+                -- has ended, whose end takes the size as unknown until the `Resized` after it.
+                let away = if left <= 18446744073709551615 - sent then left + sent else left end
+                let back = if Current.away = 0 then own.prepend(Write(VT_TEXT.leave)) else own end
+                Continue({ Current with app = s, away = away }, back.append(reading))
+              else if ended > 0 then
+                Continue({ Current with app = s, sized = False, away = 0 }, own.prepend(Write(VT_TEXT.enter)).append(reading))
+              else
               match e
                 case Resized(w, h) then
                   let blank = SCREEN.blank(w, h)
@@ -109,6 +133,7 @@ feature {ANY}
                     Continue({ Current with app = s }, own.append(reading))
                   end
               end
+              end end
           end
       end
     ensure

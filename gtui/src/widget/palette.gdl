@@ -1,0 +1,170 @@
+-- Commands listed over the screen, under a line on which one types after `/`. The commands
+-- shown are those whose name starts with the first word typed, and the rest of the line is
+-- their arguments: `/run a b` names `run`, with `a b`. Up, Down, Page Up and Page Down move
+-- in the list; other keys edit the line, and when its first word changes the list shows the
+-- commands it names, the first selected. Enter and Escape are left to the application, which
+-- reads `chosen` and `arguments`, and closes the palette by no longer drawing it.
+module PALETTE
+
+representation {NONE}
+  entries: LIST[PALETTE_ENTRY]
+  typed: INPUT_LINE
+  hits: LIST[PALETTE_ENTRY]
+  view: LIST_VIEW
+  column: NAT
+
+invariant
+  one_row_each: view.count = hits.length
+
+create {ANY}
+
+  -- Every one of `commands` shown, nothing typed.
+  make(commands: LIST[PALETTE_ENTRY]): PALETTE
+    do
+      let w = PALETTE.widest(commands, 0)
+      { entries = commands, typed = INPUT_LINE.empty, hits = commands,
+        view = LIST_VIEW.make(PALETTE.lines(commands, w)), column = w }
+    ensure
+      all_shown: Result.count = commands.length
+    end
+
+  -- The longest name of `es`, or `w` when it is longer, at most 40.
+  widest(es: LIST[PALETTE_ENTRY], w: NAT): NAT
+    variant
+      es.length
+    do
+      if es.length = 0 then
+        w
+      else
+        let n = es.head.name.code_point_count
+        PALETTE.widest(es.tail, if n > w and n <= 40 then n else if n > 40 then 40 else w end end)
+      end
+    end
+
+  -- The line shown for each of `es`, its name in a column `w` wide.
+  lines(es: LIST[PALETTE_ENTRY], w: NAT): LIST[STRING]
+    variant
+      es.length
+    do
+      if es.length = 0 then LIST.empty else PALETTE.lines(es.tail, w).prepend(PALETTE.line(es.head, w)) end
+    ensure
+      same_length: Result.length = es.length
+    end
+
+  -- `/`, the name, and what it does after the name's column, `w` wide, and two spaces.
+  line(e: PALETTE_ENTRY, w: NAT): STRING
+    do
+      let n = e.name.code_point_count
+      let pad = if n < w and w <= 65535 then w - n + 2 else 2 end
+      GLYPHS.join(GLYPHS.join(GLYPHS.join("/", e.name), GLYPHS.spaces(pad)), e.help)
+    end
+
+  -- Those of `es` whose name starts with `word`.
+  matching(es: LIST[PALETTE_ENTRY], word: STRING): LIST[PALETTE_ENTRY]
+    variant
+      es.length
+    do
+      if es.length = 0 then
+        es
+      else if es.head.name.starts_with(word) then
+        PALETTE.matching(es.tail, word).prepend(es.head)
+      else
+        PALETTE.matching(es.tail, word)
+      end end
+    end
+
+  -- `t` up to its first space.
+  first_word(t: STRING): STRING
+    do
+      match t.find_char(' ', 0)
+        case Some(i) then t.slice(0, i)
+        case None then t
+      end
+    end
+
+  -- `t` after its first space, without white space at either end.
+  after_word(t: STRING): STRING
+    do
+      match t.find_char(' ', 0)
+        case Some(i) then t.slice(i + 1, t.code_point_count).trim
+        case None then ""
+      end
+    end
+
+feature {ANY}
+
+  -- How many commands are shown.
+  count: NAT
+    do
+      Current.hits.length
+    end
+
+  -- What was typed after `/`.
+  query: STRING
+    do
+      Current.typed.text
+    end
+
+  -- The first word typed.
+  command: STRING
+    do
+      PALETTE.first_word(Current.typed.text)
+    end
+
+  -- What was typed after the first word.
+  arguments: STRING
+    do
+      PALETTE.after_word(Current.typed.text)
+    end
+
+  -- The command selected, none when none is shown.
+  chosen: OPTION[PALETTE_ENTRY]
+    do
+      if Current.view.selected < Current.hits.length then Some(LIST_OPS.at(Current.hits, Current.view.selected)) else None end
+    ensure
+      some_unless_empty: Result.is_some = (Current.count > 0)
+    end
+
+  on_key(k: KEY, rows: NAT): PALETTE
+    do
+      match k
+        case Up then { Current with view = Current.view.on_key(k, rows) }
+        case Down then { Current with view = Current.view.on_key(k, rows) }
+        case PageUp then { Current with view = Current.view.on_key(k, rows) }
+        case PageDown then { Current with view = Current.view.on_key(k, rows) }
+        case _ then
+          let t = Current.typed.on_key(k)
+          let w = PALETTE.first_word(t.text)
+          if w.equals(Current.command) then
+            { Current with typed = t }
+          else
+            let h = PALETTE.matching(Current.entries, w)
+            { Current with typed = t, hits = h, view = LIST_VIEW.make(PALETTE.lines(h, Current.column)) }
+          end
+      end
+    end
+
+  -- Where to draw it in `area`: at its bottom left, at most `width` wide, and as high as its
+  -- line, the commands shown and the edge, at most `height`.
+  place(area: RECT, width: NAT, height: NAT): RECT
+    do
+      let want = if Current.hits.length <= 65532 then Current.hits.length + 3 else 65535 end
+      area.take_bottom(if want <= height then want else height end).take_left(width)
+    ensure
+      within: Result.inside(area)
+    end
+
+  -- The palette drawn in `r`, cleared first: its edge in `edge`, the line typed and the
+  -- commands in `st`, the one selected in `mark`.
+  draw(s: SCREEN, r: RECT, st: STYLE, mark: STYLE, edge: STYLE): SCREEN
+    do
+      let framed = FRAME.draw(s.fill(r, ' ', st), r, "Commands", edge, edge)
+      let inner = FRAME.inner(r)
+      let lined = Current.typed.draw(framed, inner.take_top(1), "/", st, st.reversed)
+      Current.view.draw(lined, inner.drop_top(1), st, mark)
+    ensure
+      same_width: Result.width = s.width
+      same_height: Result.height = s.height
+    end
+
+end

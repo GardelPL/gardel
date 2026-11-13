@@ -65,7 +65,7 @@ feature {ANY}
         out
       else
         let c = cs.head
-        let styled = if c.style.same(pen) then out else GLYPHS.add_text(out, VT_TEXT.sgr(c.style)) end
+        let styled = if c.style.same(pen) then out else VT_TEXT.add_sgr(out, c.style) end
         VT_TEXT.cells(cs.tail, c.style, GLYPHS.add_char(styled, c.char))
       end
     end
@@ -78,23 +78,24 @@ feature {ANY}
       if cs.length = 0 then pen else VT_TEXT.last_style(cs.tail, cs.head.style) end
     end
 
-  -- The SGR sequence that sets `s` from any pen.
-  sgr(s: STYLE): STRING
+  -- `out` with the SGR sequence that sets `s` from any pen: a reset, then each attribute,
+  -- then the colours that are not the terminal's own.
+  add_sgr(out: BYTES_BUILDER, s: STYLE): BYTES_BUILDER
     do
-      if s.is_bold then
-        if s.is_dim then VT_TEXT.sgr_tail(s, "\u{1b}[0;1;2") else VT_TEXT.sgr_tail(s, "\u{1b}[0;1") end
-      else
-        if s.is_dim then VT_TEXT.sgr_tail(s, "\u{1b}[0;2") else VT_TEXT.sgr_tail(s, "\u{1b}[0") end
-      end
+      let a = GLYPHS.add_text(out, "\u{1b}[0")
+      let b = if s.is_bold then GLYPHS.add_text(a, ";1") else a end
+      let c = if s.is_dim then GLYPHS.add_text(b, ";2") else b end
+      let d = if s.is_underlined then GLYPHS.add_text(c, ";4") else c end
+      let e = if s.is_reversed then GLYPHS.add_text(d, ";7") else d end
+      let f = if s.foreground.is_default then e else VT_TEXT.add_param(e, s.foreground.foreground_code) end
+      let g = if s.background.is_default then f else VT_TEXT.add_param(f, s.background.background_code) end
+      GLYPHS.add_text(g, "m")
     end
 
-  sgr_tail(s: STYLE, head: STRING): STRING
-    require
-      short: head.byte_length <= 16
+  -- `out` with `;` and the number `n`.
+  add_param(out: BYTES_BUILDER, n: NAT): BYTES_BUILDER
     do
-      let u = if s.is_underlined then ";4" else "" end
-      let r = if s.is_reversed then ";7m" else "m" end
-      head.concat(u).concat(r)
+      GLYPHS.add_text(GLYPHS.add_text(out, ";"), NUMBER_TEXT.nat_to_text(n))
     end
 
 end

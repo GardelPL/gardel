@@ -1939,12 +1939,13 @@ step(t: TUI[TODO_STATE], e: EVENT): STEP[TUI[TODO_STATE]] do t.step(e) end
 ```
 
 - **The loop.** `start` takes the alternate screen, hides the cursor, asks the size and reads a key. Every event but `Shutdown` goes to `update`, and the screen is drawn again from `view`: whole after a resize, and otherwise only the cells that changed, in one `Write`. `update`'s commands that would write on the screen or read the terminal are dropped. `Quit` and `Shutdown` put the terminal's screen back.
-- **Drawing.** `SCREEN.text(clip, x, y, text, style)` and `fill(clip, c, style)` change only cells inside `clip` and the screen. A cell holds no control character, and one code point is one cell, so wide characters are not accounted for.
+- **Drawing.** `SCREEN.text(clip, x, y, text, style)` and `fill(clip, c, style)` change only cells inside `clip` and the screen. A cell holds no control character, and one code point is one cell, so wide characters are not accounted for. A style has bold, dim, underlined and reversed, and a foreground and a background from the terminal's 16 colours: `STYLE.plain.fg(COLOR.cyan).bold`.
 - **Layout.** `RECT`'s cuts (`take_top(n)`, `drop_top(n)` and the like) and `LAYOUT.rows(r, sizes)` and `columns(r, sizes)`, with `SIZE.fixed(n)` and `SIZE.flex(weight)`. Take a child with `LIST_OPS.at(parts, i)`: the contract gives one per size.
-- **Widgets.** `TEXT_VIEW`, `LIST_VIEW` (with a selection), `STATUS_BAR` and `INPUT_LINE`. Each draws in a rectangle and takes keys with `on_key`.
+- **Widgets.** `TEXT_VIEW`, `LIST_VIEW` (with a selection), `STATUS_BAR` and `INPUT_LINE`; `FRAME`, a box with a title, and `FOCUS`, which pane has the keys; `TABS` (`Text(t) | Short(s)`), `TREE_VIEW`, nodes that open and close, and `PALETTE`, commands narrowed as one types after `/`. `TEXT_VIEW.draw_code` shows source: line numbers, a marked line, and the `SPAN`s a function of each line gives, such as a lexer's. Each draws in a rectangle and takes keys with `on_key`.
+- **Running a child.** A `RunAttached` from `update` gives the terminal to the child: `TUI` puts the screen back first, draws nothing while it runs, and takes the screen again when it ends.
 - **What is proven.** Every write of a frame lies inside the screen (`SCREEN_DIFF.changes`'s `within`). A layout's children lie inside their parent and no two overlap: `LAYOUT.across_inside` and `LAYOUT_APART.columns_apart` reach a client, as `tests/gtui.rs` shows. That a diff's writes give the new screen is tested, not proven.
 
-`examples/todo_tui` uses all of it. A full redraw of 200 by 60 takes about 7 ms. `gtui/README.md` has the details.
+`examples/todo_tui` is a small program, and `examples/gtui_tour` a workbench of three panes that uses every widget. A full redraw of 200 by 60 takes about 7 ms. `gtui/README.md` has the details.
 
 ### Checking a New Version
 

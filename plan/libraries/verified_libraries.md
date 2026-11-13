@@ -793,15 +793,47 @@ Mutations, each on a private copy: ten, all red after a baseline that passes. No
 
 Packages and examples: `--stdlib --strict`, `gjson`, `ghttp`, `grest`, `gtui` and every example verify with 0 errors and 0 warnings under `--strict`, and build as before.
 
-**F.11c: what `gtui` needs for it** (version 0.2.0).
+**F.11c: what `gtui` needs for it** (version 0.2.0). ✅ Completed on 2026-11-13. No compiler change.
 
-- [ ] `TABS`: a row of titles, one chosen, each with its key (`Text(t)`), chosen by key or by Tab.
-- [ ] `TREE_VIEW`: nodes that open and close, drawn with `▸` and `▾`, on `LIST_VIEW`'s selection and paging.
-- [ ] `TEXT_VIEW` with line numbers, a marked line, and styled spans per line, so a view can colour what a lexer found.
-- [ ] Colours: `STYLE` gains a foreground from the 16 standard ones, and `VT_TEXT` writes them.
-- [ ] `FRAME`: a box with a title in its top edge, which shows which pane has the keys.
-- [ ] `PALETTE`: a list drawn over the screen, narrowed as one types after `/`, each entry a command and what it does.
-- [ ] `FOCUS`: which pane gets the keys; Tab moves it to the next. `KEY` has no Shift-Tab yet (F.16).
+- [x] `TABS`: a row of titles, one chosen, each with its key (`Text(t)`), chosen by key or by Tab.
+- [x] `TREE_VIEW`: nodes that open and close, drawn with `▸` and `▾`, on `LIST_VIEW`'s selection and paging.
+- [x] `TEXT_VIEW` with line numbers, a marked line, and styled spans per line, so a view can colour what a lexer found.
+- [x] Colours: `STYLE` gains a foreground from the 16 standard ones, and `VT_TEXT` writes them.
+- [x] `FRAME`: a box with a title in its top edge, which shows which pane has the keys.
+- [x] `PALETTE`: a list drawn over the screen, narrowed as one types after `/`, each entry a command and what it does.
+- [x] `FOCUS`: which pane gets the keys; Tab moves it to the next. `KEY` has no Shift-Tab yet (F.16).
+- [x] From F.11a: `TUI` leaves the alternate screen before a `RunAttached` and takes it again after.
+
+What each is:
+
+- **`COLOR`**: the terminal's own, or one of the 16 standard colours (`COLOR.cyan`, `COLOR.standard(n)`), so a program follows the user's theme. `STYLE` gains `fg(c)` and `bg(c)`, and `same` compares them; `VT_TEXT.add_sgr` writes 30 to 37, 90 to 97, and 40 to 47 and 100 to 107 for the background, after the attributes. A plain cell writes `ESC [ 0 m` as before, so `todo_tui`'s bytes are unchanged.
+- **`FRAME`**: `draw(s, r, title, edge, title_style)` draws the edge of `r` with rounded corners and the title in the top edge. `inner(r)` is where the pane's content goes, and `title_area(r)` the top edge less its corners, where a row of `TABS` goes; both are proven inside `r`.
+- **`FOCUS`**: which of `n` panes has the keys, proven a pane; `on_key` moves it on Tab, wrapping.
+- **`TABS`**: `TABS.empty.with("Text", 't')`, drawn as `Text(t) | Short(s)`, the chosen title in a style of its own. A key of a tab chooses it, and Tab the next; `takes(k)` says whether a key is the tabs', so an application can give Tab to `FOCUS` instead. A tab given a space has no key. `retitled(i, t)` keeps a tab's key and place while its title changes, as `Problems (3)` does. Proven: one key per title, and the choice is a tab.
+- **`TREE_VIEW`**: a list of `TREE_NODE`s, each a label at a depth, open or closed; a node's children are the deeper nodes after it. The rows shown (`TREE_ROW`: the node's index, depth, whether it has children and is open, and its line) are a `LIST_VIEW`, so paging and the selection are the list's, and the invariant `one_row_each` ties them. Right opens a node or goes to its first child, Left closes it or goes to its parent; `toggled`, `set_open`, `select_node` and `with_nodes` are there for the application, which finds what a node stands for by `selected_node`, its index.
+- **`TEXT_VIEW`**: `draw_code(s, r, st, gutter, marked, mark, spans)` draws line numbers right-aligned in a column as wide as the last one, the line `marked` across its row in `mark`, and over each line the `SPAN`s that `spans(i, line)` gives, a function from the application, such as a lexer. On the marked line a span takes the mark's background. `showing(n, rows)` scrolls as little as shows line `n`, proven.
+- **`PALETTE`**: `PALETTE_ENTRY.make("shell", "what it does")`. Typing after `/` narrows the list to the commands whose name starts with the first word; the rest is `arguments`. The arrows and the page keys move in the list, other keys edit the line, and Enter and Escape are the application's. `place(area, width, height)` puts it at the bottom of `area`, proven inside it.
+- **`TUI` and attached children**: a `RunAttached` among `update`'s commands is preceded by `VT_TEXT.leave`. Until every child sent has ended (`TUI.attached` counts them) nothing is drawn, a `Resized` included; the `AttachedEnded` of the last one takes the alternate screen again, and the host's `Resized` after it draws the screen whole.
+- **`examples/gtui_tour`**: a workbench laid out as Tablon's will be, with fixed content: a project tree under `Modules(m) | Files(f)`, a source with line numbers and its keywords, strings and comments coloured by a small lexer written in Gardel (`TOUR_LEXER`), and `Output(o) | Problems (3)(p)`, where Enter marks a problem's line in the source. `/` opens the commands, and `/shell` runs the program given to the tour, attached.
+
+Changed from the list above, each for a reason:
+
+- **A background as well as a foreground.** A palette's selected command, and a marked line, read better on a colour than reversed, and the cost is one more field per `STYLE`.
+- **A tree is a list.** A recursive type through `LIST` cannot be measured (F.10, finding 3), so a node's place in the list gives its children, and the application keeps what each node stands for in a list beside it.
+- **Spans are a function of the line.** `draw_code` asks for the spans of the lines it draws and of no others, so a lexer runs on the rows shown, not the file.
+
+Found on the way, none fixed, as each has a workaround:
+
+- **An overflow takes a routine's whole contract with it.** `1 + TABS.key_index(keys.tail, c)` fails `overflow_add`, as a list's length is not bounded by 2^64 in the encoding. A routine with a failed obligation other than a postcondition is not trusted, so its contract axiom is withheld, and its own `within` then fails as well: the second error points away from the cause. Guarding the sum (`if r < 18446744073709551615 then r + 1 else r end`) fixes both.
+- **A `NAT` inside an `OPTION[NAT]` is not known to be a `NAT`.** Passing `i` from `case Some(i)` to a routine with a precondition made the caller's postcondition fail: the callee's contract axiom is guarded by `in_u64` of its `NAT` arguments. `draw_code` passes the `OPTION` itself down.
+- **A Boogie error is placed at the first match of its name, comments included.** An overflow in `TABS.next` was reported at `tabs.gdl:2:66`, the word "next" in the header comment, and one in `PALETTE.line` at `1:45`. `locate_span` searches the whole file for the tag and then the routine's name. Tablon's Problems view sends the user to these lines, so F.11d fixes it, from the routine's header on.
+- **A proof that was stable became unstable.** `LIST_VIEW.on_key`, unchanged, failed `chosen_item` on every run once `COLOR` joined its context. It is now one `select` of a computed target (`target`, `moves`), which behaves the same and proves at once.
+- **In a scripted run, keys do not wait for an attached child.** The script's keys keep coming while the child runs, so a session that runs one quits before it ends. Keys through a pipe wait, as F.11a's own test does, and the test of the tour uses a pipe.
+- **A broken invariant is reported under the name of the first.** Each invariant tag asserts the whole of `TABS_Invariant`, so a `choose` that breaks `a_tab` was reported as `one_key_each`, the first clause. F.11d fixes it with the error's line, as Problems shows the obligation.
+
+Tests: `tests/gtui.rs`. `the_tour_draws_every_widget_in_colour_inside_the_screen` runs a session of `gtui_tour` through the VT terminal, with a resize to the same size after each step it looks at, so that the cells the diffs left are kept: a node opened (`▾`, its children indented) and one closed whose children are not shown; the Files tab chosen by its key; a problem's line marked across its row on blue, its keywords on the same blue, after a page down; the palette narrowed to `/shell` by `s`, the command selected on blue; `/clear` and `/top` run. It checks the SGR parameters of cells: the frame of the pane with the keys in bold cyan and the others gray, the chosen tab in bold underlined bright yellow and its key plain, line numbers gray, keywords bold bright blue, a comment green, a name plain. At the end the cells equal a full redraw, colours included, after the focus moved, which changes only colours. `an_attached_child_gets_the_terminal_and_the_tour_comes_back` runs a child from the palette, keys through a pipe: the screen is put back before it, only the child's output lies between that and the alternate screen taken again, and the screen after shows the child's exit code, drawn whole. `a_client_proves_the_widget_facts_through_the_contracts` proves twelve facts of `TABS`, `FOCUS`, `TEXT_VIEW.showing`, `TREE_VIEW`, `FRAME` and `PALETTE` in a client, and refuses a tab chosen past the last and a line shown in no rows. The tests of F.10 pass unchanged, `todo_tui`'s bytes included, and the bench of a 200 by 60 redraw stays under 16 ms with colours compared.
+
+Mutations, each on a private copy: fifteen, after a baseline that passes; fourteen are red. The verifier caught bright colours one too low (`named`), a tab chosen past the last, `showing` that scrolls nothing down (`shown`), a palette that keeps its list when narrowed (`one_row_each`) and a focus past the last pane (`a_pane`). The session caught no foreground written, a style compared without its colours, a closed node that shows its children, a marked row not filled, a span one cell late, a frame whose inside is all of it, and a palette not narrowed; the attached run caught no leave before the child and no enter after it. The fifteenth, frames drawn while a child runs by keeping the size known, survived as an equivalent mutant: every event while a child is attached takes the branch that draws nothing, and the last end forgets the size anyway. The line it changed was dead and is removed. Not tested: an event that arrives while a child runs, as the tour has no timer or process to send one.
 
 **F.11d: Tablon**, `tools/tablon`, a reactive program on `gtui`, `gjson`, files and processes. Its layout follows `issues/image.png`, with three panes:
 
@@ -819,6 +851,8 @@ Packages and examples: `--stdlib --strict`, `gjson`, `ghttp`, `grest`, `gtui` an
   - Output: what each `gardelc` run printed, as it came.
 - **Commands:** `/` opens the palette: `/check`, `/build`, `/run [ARGS]`, `/stop`, `/edit` (the source in `$EDITOR`, attached, then a check), `/open DIR`, `/quit`. The common ones have keys too, shown in the status bar.
 - [ ] A long run shows that it is running, and keys still work: every process is a command, never a wait.
+- [ ] A Boogie error placed from its routine's header on, never at a word in a comment (`locate_span`, found in F.11c), so Problems opens the right line.
+- [ ] A broken invariant reported under its own name, each tag asserting its own clause (found in F.11c).
 - Left out: editing in place, which is Task F.16 (`/edit` stands in until then), a debugger, a terminal pane and an AI pane.
 - Acceptance: Tablon verifies under `--strict`. On a broken project it browses the failures to their lines; it shows every view of a module of `gtui`; it builds and runs `examples/todo_tui` attached and an ordinary example with its output captured. A replay of a session reproduces its screen with no process run.
 

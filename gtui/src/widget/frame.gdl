@@ -1,0 +1,52 @@
+-- A box drawn on the edge of a rectangle, with rounded corners and a title in its top edge.
+-- Its style is how a pane shows that it has the keys: an application draws the frame of the
+-- pane that `FOCUS` names in a style of its own. What the pane holds is drawn in `inner`, and
+-- what goes in the top edge besides a title, such as a row of `TABS`, in `title_area`.
+functions FRAME
+
+feature {ANY}
+
+  -- The rectangle inside the edge.
+  inner(r: RECT): RECT
+    do
+      r.inset(1)
+    ensure
+      within: Result.inside(r)
+    end
+
+  -- The top edge less two cells at each end, where the title goes: one row, or none when
+  -- `r` has no rows.
+  title_area(r: RECT): RECT
+    do
+      r.take_top(1).drop_left(2).drop_right(2)
+    ensure
+      within: Result.inside(r)
+      one_row: Result.height <= 1
+    end
+
+  -- The edge of `r` in style `edge`, and `title`, when it is not empty, in its top edge in
+  -- `title_style`, cut at the corner. A rectangle less than two cells wide or high is left as
+  -- it is.
+  draw(s: SCREEN, r: RECT, title: STRING, edge: STYLE, title_style: STYLE): SCREEN
+    do
+      if r.width < 2 or r.height < 2 then
+        s
+      else
+        let sides = r.drop_top(1).drop_bottom(1)
+        let a = s.fill(r.take_top(1), '─', edge).fill(r.take_bottom(1), '─', edge)
+        let b = a.fill(sides.take_left(1), '│', edge).fill(sides.take_right(1), '│', edge)
+        let c = b.text(r, r.x, r.y, "╭", edge).text(r, r.right - 1, r.y, "╮", edge)
+        let d = c.text(r, r.x, r.bottom - 1, "╰", edge).text(r, r.right - 1, r.bottom - 1, "╯", edge)
+        if title.is_empty then
+          d
+        else
+          let t = FRAME.title_area(r)
+          d.text(t, t.x, t.y, GLYPHS.join(GLYPHS.join(" ", title), " "), title_style)
+        end
+      end
+    ensure
+      same_width: Result.width = s.width
+      same_height: Result.height = s.height
+    end
+
+end

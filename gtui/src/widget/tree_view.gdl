@@ -1,0 +1,225 @@
+-- A tree, held as its nodes in order, each at its depth (`TREE_NODE`): a node's children are
+-- the nodes after it that are deeper, up to the next one that is not. A node with children is
+-- drawn with `▸` when it is closed and `▾` when it is open, and what is inside a closed node
+-- is not shown. The rows shown are a `LIST_VIEW`, so the selection and the paging are its
+-- own: the selection is always a row shown, or 0 when none is.
+--
+-- The right arrow opens the node selected, or moves to its first child when it is open; the
+-- left arrow closes it, or moves to its parent when it is closed or has no children. Other
+-- keys move as in a list. Opening or closing a node keeps the selection on it.
+--
+-- The tree is a list rather than a recursive type, as a type nested through `LIST` cannot be
+-- measured (F.10, finding 3). The application keeps whatever each node stands for in a list
+-- beside it, and finds it by the index `selected_node` gives.
+module TREE_VIEW
+
+representation {NONE}
+  all: LIST[TREE_NODE]
+  visible: LIST[TREE_ROW]
+  view: LIST_VIEW
+
+invariant
+  one_row_each: view.count = visible.length
+
+create {ANY}
+
+  -- The tree of `nodes`, its first row selected.
+  make(nodes: LIST[TREE_NODE]): TREE_VIEW
+    do
+      let vis = TREE_VIEW.rows_of(nodes)
+      { all = nodes, visible = vis, view = LIST_VIEW.make(TREE_VIEW.lines_of(vis)) }
+    ensure
+      first_selected: Result.selected_row = 0
+    end
+
+  -- The rows shown of `nodes`.
+  rows_of(nodes: LIST[TREE_NODE]): LIST[TREE_ROW]
+    do
+      let none: LIST[TREE_ROW] = LIST.empty
+      LIST_CUT.reverse(TREE_VIEW.walk(nodes, 0, False, 0, none), none)
+    end
+
+  -- The line of each of `rs`.
+  lines_of(rs: LIST[TREE_ROW]): LIST[STRING]
+    do
+      LIST_OPS.map(rs, fn(r: TREE_ROW): STRING do r.line end)
+    ensure
+      same_length: Result.length = rs.length
+    end
+
+  -- `acc` with a row in front of it, the last first, for each of `nodes` that is shown, the
+  -- first of them node `i`. While `hiding`, the nodes deeper than `cut` are inside a closed
+  -- node, and not shown.
+  walk(nodes: LIST[TREE_NODE], i: NAT, hiding: BOOL, cut: NAT, acc: LIST[TREE_ROW]): LIST[TREE_ROW]
+    variant
+      nodes.length
+    do
+      if nodes.length = 0 or i = 18446744073709551615 then
+        acc
+      else
+        let n = nodes.head
+        if hiding and n.depth > cut then
+          TREE_VIEW.walk(nodes.tail, i + 1, hiding, cut, acc)
+        else
+          let kids = nodes.tail.length > 0 and nodes.tail.head.depth > n.depth
+          let row = TREE_ROW.make(i, n.depth, kids, n.is_open, n.label)
+          TREE_VIEW.walk(nodes.tail, i + 1, kids and not n.is_open, n.depth, acc.prepend(row))
+        end
+      end
+    end
+
+  -- `nodes` with node `i` open when `open` is set and closed otherwise, or `nodes` itself
+  -- when there is no node `i`.
+  opening(nodes: LIST[TREE_NODE], i: NAT, open: BOOL): LIST[TREE_NODE]
+    variant
+      i
+    do
+      if nodes.length = 0 then nodes
+      else if i = 0 then nodes.tail.prepend(nodes.head.set_open(open))
+      else TREE_VIEW.opening(nodes.tail, i - 1, open).prepend(nodes.head)
+      end end
+    ensure
+      length_same: Result.length = nodes.length
+    end
+
+  -- The index of the first of `rs` that shows node `n`, counting from `k`, or `k` plus the
+  -- length of `rs` when none does.
+  row_of(rs: LIST[TREE_ROW], n: NAT, k: NAT): NAT
+    variant
+      rs.length
+    do
+      if rs.length = 0 or k = 18446744073709551615 then k
+      else if rs.head.node = n then k
+      else TREE_VIEW.row_of(rs.tail, n, k + 1)
+      end end
+    end
+
+  -- The last of `rs` before row `sel`, counting from `k`, that is shallower than `level`, or
+  -- `found` when none is.
+  parent_of(rs: LIST[TREE_ROW], k: NAT, sel: NAT, level: NAT, found: NAT): NAT
+    variant
+      rs.length
+    do
+      if rs.length = 0 or k >= sel then found
+      else TREE_VIEW.parent_of(rs.tail, k + 1, sel, level, if rs.head.depth < level then k else found end)
+      end
+    end
+
+feature {ANY}
+
+  nodes: LIST[TREE_NODE]
+    do
+      Current.all
+    end
+
+  -- The rows shown, in order.
+  shown_rows: LIST[TREE_ROW]
+    do
+      Current.visible
+    end
+
+  -- How many rows are shown.
+  count: NAT
+    do
+      Current.visible.length
+    end
+
+  selected_row: NAT
+    do
+      Current.view.selected
+    ensure
+      a_row: Result < Current.count or (Current.count = 0 and Result = 0)
+    end
+
+  -- The first row drawn.
+  top: NAT
+    do
+      Current.view.top
+    end
+
+  -- The row selected, none when no row is shown.
+  selected: OPTION[TREE_ROW]
+    do
+      if Current.view.selected < Current.visible.length then Some(LIST_OPS.at(Current.visible, Current.view.selected)) else None end
+    ensure
+      some_unless_empty: Result.is_some = (Current.count > 0)
+    end
+
+  -- The index in `nodes` of the node selected, none when no row is shown.
+  selected_node: OPTION[NAT]
+    do
+      match Current.selected
+        case Some(r) then Some(r.node)
+        case None then None
+      end
+    end
+
+  -- Other nodes, with the selection kept on the same row, or the last, `rows` rows shown.
+  with_nodes(nodes: LIST[TREE_NODE], rows: NAT): TREE_VIEW
+    do
+      let vis = TREE_VIEW.rows_of(nodes)
+      { all = nodes, visible = vis, view = Current.view.with_items(TREE_VIEW.lines_of(vis), rows) }
+    end
+
+  -- The node selected opened when `open` is set, and closed otherwise, when it has children.
+  set_open(open: BOOL, rows: NAT): TREE_VIEW
+    do
+      match Current.selected
+        case Some(r) then if r.has_children then Current.with_nodes(TREE_VIEW.opening(Current.all, r.node, open), rows) else Current end
+        case None then Current
+      end
+    end
+
+  -- The node selected opened when it is closed, and closed when it is open.
+  toggled(rows: NAT): TREE_VIEW
+    do
+      match Current.selected
+        case Some(r) then Current.set_open(not r.is_open, rows)
+        case None then Current
+      end
+    end
+
+  -- The row of node `n` selected, when it is shown, and the selection kept otherwise.
+  select_node(n: NAT, rows: NAT): TREE_VIEW
+    do
+      let k = TREE_VIEW.row_of(Current.visible, n, 0)
+      if k < Current.visible.length then { Current with view = Current.view.select(k, rows) } else Current end
+    end
+
+  on_key(k: KEY, rows: NAT): TREE_VIEW
+    do
+      match k
+        case Right then
+          match Current.selected
+            case Some(r) then
+              if r.has_children and not r.is_open then Current.set_open(True, rows)
+              else if r.has_children then { Current with view = Current.view.down(1, rows) }
+              else Current
+              end end
+            case None then Current
+          end
+        case Left then
+          match Current.selected
+            case Some(r) then
+              if r.has_children and r.is_open then
+                Current.set_open(False, rows)
+              else
+                let sel = Current.view.selected
+                { Current with view = Current.view.select(TREE_VIEW.parent_of(Current.visible, 0, sel, r.depth, sel), rows) }
+              end
+            case None then Current
+          end
+        case _ then { Current with view = Current.view.on_key(k, rows) }
+      end
+    end
+
+  -- The rows drawn in `r`, in style `st`, the selected one across its row in `mark`.
+  draw(s: SCREEN, r: RECT, st: STYLE, mark: STYLE): SCREEN
+    do
+      Current.view.draw(s, r, st, mark)
+    ensure
+      same_width: Result.width = s.width
+      same_height: Result.height = s.height
+    end
+
+end
