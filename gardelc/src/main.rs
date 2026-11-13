@@ -22494,6 +22494,142 @@ end
     }
 
     #[test]
+    fn test_f14_let_groups_fork_only_when_two_lets_may_be_costly() {
+        // Task F.14: a task costs far more than a constructor or a call that returns at once.
+        // A group forks only when two of its `let`s reach a recursive routine (directly or
+        // through another routine) or apply a function value.
+        let src = r#"
+program FORK_COST
+
+feature {ANY}
+
+  larger(a: U64, b: U64): U64
+    do
+      if a < b then b else a end
+    end
+
+  depth(n: U64): U64
+    variant
+      n
+    do
+      if n = 0 then 0 else depth(n - 1) +% 1 end
+    end
+
+  via(n: U64): U64
+    do
+      depth(n)
+    end
+
+  cheap(i: U64): U64
+    do
+      let m = larger(i, 3)
+      let o = Some(i)
+      match o
+        case Some(x) then m +% x
+        case None then m
+      end
+    end
+
+  one_costly(i: U64): U64
+    do
+      let m = depth(i)
+      let k = larger(i, 3)
+      m +% k
+    end
+
+  two_costly(i: U64): U64
+    do
+      let a = depth(i)
+      let b = via(i)
+      a +% b
+    end
+
+  applied(f: (x: U64) -> U64, i: U64): U64
+    do
+      let a = f(i)
+      let b = f(i +% 1)
+      a +% b
+    end
+
+  closure(i: U64): U64
+    do
+      let g = fn(x: U64): U64 do depth(x) end
+      let a = depth(i)
+      applied(g, a)
+    end
+
+  steps(i: U64, n: U64, acc: U64): U64
+    variant
+      n - i
+    do
+      if i >= n then
+        acc
+      else
+        let a = depth(i)
+        let b = via(i)
+        steps(i + 1, n, acc +% a +% b)
+      end
+    end
+
+  halves(n: U64): U64
+    variant
+      n
+    do
+      if n < 2 then
+        n
+      else
+        let a = halves(n / 2)
+        let b = depth(n)
+        halves(a)
+      end
+    end
+
+  main(args: SEQ[STRING]): IO[EXIT_CODE]
+    do
+      with IO
+        IO.exit(if cheap(1) +% one_costly(2) +% two_costly(3) +% applied(fn(x: U64): U64 do x end, 4) +% closure(2) +% steps(0, 3, 0) +% halves(4) = 36 then 0 else 1 end)
+      end
+    end
+
+end
+"#;
+        let m = parse_user_module_with_prelude(src);
+        let (c, errs) = emit_c11_typed(&m, &[]);
+        assert!(errs.is_empty(), "C backend errors {errs:?}");
+        let body = |name: &str| -> String {
+            let head = format!("static uint64_t FORK_COST__{name}(");
+            let mut lines = c.lines().skip_while(|l| !(l.starts_with(&head) && l.trim_end().ends_with('{')));
+            let mut out = String::new();
+            for l in lines.by_ref() {
+                out.push_str(l);
+                out.push('\n');
+                if l == "}" {
+                    break;
+                }
+            }
+            assert!(!out.is_empty(), "no definition of {name}");
+            out
+        };
+        // Making a closure costs nothing, whatever its body does when applied. A routine
+        // that calls itself only in tail position is a loop and never forks; one that also
+        // calls itself elsewhere is divide-and-conquer and does.
+        for (f, forks) in [
+            ("cheap", false),
+            ("one_costly", false),
+            ("two_costly", true),
+            ("applied", true),
+            ("closure", false),
+            ("steps", false),
+            ("halves", true),
+        ] {
+            assert_eq!(body(f).contains("#pragma omp task"), forks, "{f}:\n{}", body(f));
+        }
+        if let Some(runs) = c3_native_runs(&c, "forkcost", &[b""]) {
+            assert_eq!(runs[0].0, 0, "wrong result");
+        }
+    }
+
+    #[test]
     fn test_c3_typed_backend_runs_text_program() {
         // The C.2 text program through the typed backend (what the CLI now uses), with the
         // same inputs and expectations as the untyped emitter's test.

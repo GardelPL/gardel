@@ -866,7 +866,7 @@ flowchart TD
 | | [F.3](libraries/verified_libraries.md#task-f3-mapk-v) | `MAP[K, V]` ✅ |
 | | [F.13](libraries/verified_libraries.md#task-f13-fuel-guards-on-recursive-functions) | Fuel guards on recursive functions, found in F.5 ✅ |
 | | [F.15](libraries/verified_libraries.md#task-f15-facts-over-a-user-type-at-the-values-of-calls) | Facts over a user type at the values of calls, found in F.8: fixed in the verifier ✅, stage D of the round trip still open |
-| | [F.14](libraries/verified_libraries.md#task-f14-a-cost-model-for-parallel-lets) | A cost model for parallel `let`s, found in F.4 |
+| | [F.14](libraries/verified_libraries.md#task-f14-a-cost-model-for-parallel-lets) | A cost model for parallel `let`s, found in F.4 ✅; explicit parallelism in the language to evaluate (pros and cons in the task) |
 | 3. JSON | [F.4](libraries/verified_libraries.md#task-f4-the-gjson-package) | The `gjson` package, with the round trip proven for scalars and strings ✅ |
 | 4. REST | [F.5](libraries/verified_libraries.md#task-f5-a-parser-that-means-what-the-bytes-say) | A correct `ghttp` parser ✅ |
 | | [F.12](libraries/verified_libraries.md#task-f12-refined-function-types) | `require` and `ensure` on function types enforced ✅ |
