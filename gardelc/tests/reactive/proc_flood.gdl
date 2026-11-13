@@ -1,0 +1,64 @@
+-- A child that writes more than the host keeps queued (Task F.11a): its output arrives whole,
+-- in order, while the host holds the child back.
+--
+--   proc_flood <child> <bytes>
+reactive program PROC_FLOOD
+
+feature {ANY}
+
+  -- The `i`th argument, or "".
+  arg(xs: LIST[STRING], i: NAT): STRING
+    variant
+      i
+    do
+      if xs.length = 0 then
+        ""
+      else if i = 0 then
+        xs.head
+      else
+        arg(xs.tail, i - 1)
+      end end
+    end
+
+  -- Whether `data` is the alphabet, again and again, from `start`.
+  alphabet(data: BYTES, start: NAT, i: NAT): BOOL
+    require
+      a_letter: start < 26
+    variant
+      data.length - i
+    do
+      if i >= data.length then True
+      else if data.at(i) != 97 + (start + i % 26) % 26 then False
+      else alphabet(data, start, i + 1)
+      end end
+    end
+
+  init(args: SEQ[STRING]): STEP[NAT]
+    do
+      let xs = args.to_list
+      Continue(0, LIST.empty.prepend(RunProcess(1, arg(xs, 0), LIST.empty.prepend(arg(xs, 1)).prepend("flood"), "")))
+    end
+
+  step(s: NAT, e: EVENT): STEP[NAT]
+    do
+      match e
+        case ProcessOutput(p, data) then
+          if s > 1000000000000 or data.length > 1000000000000 then
+            Stop(2, LIST.empty.prepend(Print("too much")))
+          else if alphabet(data, s % 26, 0) then
+            Continue(s + data.length, LIST.empty)
+          else
+            Stop(3, LIST.empty.prepend(Print("out of order")))
+          end end
+        case ProcessExited(p, code) then
+          Stop(0, LIST.empty.prepend(Print(NUMBER_TEXT.nat_to_text(s))))
+        case ProcessFailed(tag, err) then
+          Stop(4, LIST.empty.prepend(Print("failed")))
+        case Shutdown then
+          Stop(9, LIST.empty)
+        case _ then
+          Continue(s, LIST.empty)
+      end
+    end
+
+end

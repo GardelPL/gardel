@@ -1,0 +1,84 @@
+-- A process handle (spec 11.6). Only the runtime makes one: there is no creator, and the
+-- representation is hidden, so a program can compare and store a handle but never forge one.
+module PROC_ID satisfies ORD, CANONICAL_EQ
+
+representation {NONE}
+  id: U64
+
+feature {ANY}
+
+  equals(other: PROC_ID): BOOL
+    do
+      Current.id = other.id
+    end
+
+  less_than(other: PROC_ID): BOOL
+    do
+      Current.id < other.id
+    end
+
+specify {EQ}
+
+  law reflexive(a: PROC_ID)
+    do
+      True
+    ensure
+      refl: a.equals(a)
+    end
+
+  law symmetric(a: PROC_ID, b: PROC_ID)
+    require
+      ab: a.equals(b)
+    do
+      True
+    ensure
+      ba: b.equals(a)
+    end
+
+  law transitive(a: PROC_ID, b: PROC_ID, c: PROC_ID)
+    require
+      ab: a.equals(b)
+      bc: b.equals(c)
+    do
+      True
+    ensure
+      ac: a.equals(c)
+    end
+
+specify {CANONICAL_EQ}
+
+  law agrees_with_structural(a: PROC_ID, b: PROC_ID)
+    do
+      -- A record is its fields: these two steps put that fact in reach of the prover.
+      ({ id = a.id } = a) and ({ id = b.id } = b)
+    ensure
+      sound: a.equals(b) = (a = b)
+    end
+
+specify {ORD}
+
+  law irreflexive(a: PROC_ID)
+    do
+      True
+    ensure
+      not_less_than_self: not a.less_than(a)
+    end
+
+  law transitive(a: PROC_ID, b: PROC_ID, c: PROC_ID)
+    require
+      a_lt_b: a.less_than(b)
+      b_lt_c: b.less_than(c)
+    do
+      True
+    ensure
+      a_lt_c: a.less_than(c)
+    end
+
+  law total(a: PROC_ID, b: PROC_ID)
+    do
+      True
+    ensure
+      comparable: a.less_than(b) or a.equals(b) or b.less_than(a)
+    end
+
+end

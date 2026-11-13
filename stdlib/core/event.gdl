@@ -13,6 +13,14 @@ representation {ANY}
   | Connected(tag: NAT, conn: CONN_ID)
   | ConnectFailed(tag: NAT, err: IO_ERROR)
   | Resized(width: NAT, height: NAT)
+  | FileRead(tag: NAT, res: RESULT[IO_ERROR, BYTES])
+  | DirListed(tag: NAT, res: RESULT[IO_ERROR, LIST[DIR_ENTRY]])
+  | ProcessStarted(tag: NAT, proc: PROC_ID)
+  | ProcessFailed(tag: NAT, err: IO_ERROR)
+  | ProcessOutput(proc: PROC_ID, data: BYTES)
+  | ProcessErrorOutput(proc: PROC_ID, data: BYTES)
+  | ProcessExited(proc: PROC_ID, code: I64)
+  | AttachedEnded(tag: NAT, res: RESULT[IO_ERROR, I64])
 
 feature {ANY}
 

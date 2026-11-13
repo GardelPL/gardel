@@ -64,7 +64,8 @@ flowchart TD
     F8["F.8 HTTP client and async handlers"]
     F9["F.9 Terminal host"]
     F10["F.10 gtui"]
-    F11["F.11 Files, processes and the tool"]
+    F11["F.11 Files, processes and Tablon"]
+    F16["F.16 Editing in gtui"]
     F0 --> F1 --> F2
     F1 --> F3
     F2 --> F3
@@ -81,6 +82,7 @@ flowchart TD
     F6 --> F7 --> F8
     F2 --> F9 --> F10 --> F11
     F8 --> F11
+    F11 --> F16
 ```
 
 `F.5` could ship before `gjson`, as it depends only on F.2. It is the one correctness bug in published code, so do it as soon as F.2 allows.
@@ -97,12 +99,13 @@ flowchart TD
 | F.13 | S | Fuel guards that hold when a function is applied within its `require` | Changing every routine axiom; proof time |
 | F.14 | S | Parallel `let`s only where they pay | Keeping `seq_bench`'s speedup |
 | F.15 | M | Facts over a user type that reach a value a call gives back | Changing how every procedure binds its values |
+| F.16 | L | A text editor in `gtui` and in Tablon | Key modifiers on the Windows console; a key's cost on a long file |
 | F.6 | M | `grest` | Fitting a library around a `reactive program` |
 | F.7 | M | `Connect`, tags | Non-blocking connect on two platforms |
 | F.8 | L | `HTTP_CLIENT`, async handlers | The design of a waiting handler |
 | F.9 | M | Raw output, size, more keys | Console differences on Windows |
 | F.10 | L | Screen, layout, widgets | Redraw performance |
-| F.11 | L | Files, processes, the tool | Keeping replay exact |
+| F.11 | XL | Files, processes, Tablon | Keeping replay exact; handing the terminal to a child |
 
 ---
 
@@ -119,7 +122,7 @@ All twelve were taken on 2026-11-07, each as proposed here. Each task lists the 
 7. **What an async handler returns.** Taken: a sum type, `Reply(response)` or `Await(state, commands)`. A sync handler is a pure function wrapped in `Reply`. A waiting request lives in a bounded table in the server state, keyed by tag. Hidden continuations are rejected: state must stay visible to the verifier.
 8. **What "every request gets an answer" means.** Taken: a safety property, not liveness. Every entry in the waiting table has an armed timeout, and proven invariants say each entry leaves the table on its answer or its timeout. The proof assumes the host delivers the timer. This narrows what was first suggested, because Phase D has no liveness proofs.
 9. **Addresses for `Connect`.** Taken: IPv4 literals and `localhost` first. Name lookup blocks, so it would need a helper thread (Phase D decision 5). Add it when a program needs it.
-10. **What the tool is.** Taken: a verification browser. It runs `gardelc --json-diagnostics` on a project, lists failed obligations, and shows each one in its source. It suits the project and it needs files, a process, a list view and a text view, so it tests all of `gtui`.
+10. **What the tool is.** Taken: a verification browser. It runs `gardelc --json-diagnostics` on a project, lists failed obligations, and shows each one in its source. It suits the project and it needs files, a process, a list view and a text view, so it tests all of `gtui`. Widened on 2026-11-13: Tablon, a tool for a Gardel project, with four views. **Check** verifies and browses the failures, as above. **Modules** lists the project's modules and shows each one's short form (its contracts without bodies). **Build** compiles the entry point and shows the compiler's errors. **Run** runs what was built. It is not an editor: a file is opened in `$EDITOR` (or `GARDEL_EDITOR`), with the terminal handed over, and checked again on return. The screen is three panes, after `issues/image.png`: the project's modules and files on the left, the chosen module's views on the right, and problems, build and run output below (F.11d).
 11. **Reach of file and process commands.** Taken: a process takes a program and an argument list, never a shell string, and its output arrives as events. A replay reads every result from the log and runs nothing.
 12. **Clauses on a refined function type.** Taken: enforce them, as §8 of the spec already promises, in a task of their own before F.6 (Task F.12). If that proves too large, remove the syntax instead. Leaving them inert is rejected: a reader would trust clauses that do nothing.
 
@@ -717,16 +720,109 @@ Found on the way, none fixed, as each has a workaround:
 - A fact of a `RECT` that `LIST_OPS.at` gives back, such as `x <= 65535`, is not known, so `items.x + 1` could not be proven not to overflow (F.15's gap). `todo_tui` cuts the rectangle instead.
 
 Tests: `tests/gtui.rs`. `a_session_draws_only_inside_the_screen` verifies `todo_tui` and runs 220 events through the VT terminal: twelve items in a list five rows high, one too long for the screen, one holding a tab, an escape and a bell, a line typed past the width, paging, marking, removing, two resizes, and a last resize to the same size, against which the cells are compared. `a_shutdown_puts_the_terminal_back_and_a_replay_repeats_the_run` checks the alternate screen taken and given back, and that a replay of the log writes the same bytes. `a_full_redraw_of_200_by_60_fits_a_frame` times the bench. `a_client_proves_the_layout_through_the_contracts` proves the cuts, `inside` and `apart` in a client, and refuses a child as wide as its parent and a child apart from itself. Ten mutations, each on a private copy after baselines that pass, all turn red. The verifier caught a child not cut to the room left, the next child starting where the last one did, a run opened a column late, a row read past its last column, a control character kept in a cell, and a list that does not scroll down to its selection; the VT session caught a run that writes the old cell, a pen compared on bold alone, and a resize drawn without a clear, and the shutdown test a shutdown that keeps the alternate screen.
-#### Task F.11: Files, Processes and the Tool
+#### Task F.11: Files, Processes and Tablon
 
-Needs decisions 10 and 11.
+Needs decisions 10 and 11. Done in four steps, each of which ships alone.
 
-- [ ] `ReadFile(tag, path)` and `FileRead(tag, RESULT[IO_ERROR, BYTES])`, on a helper thread.
-- [ ] `RunProcess(tag, program, args)`, with output events and an exit event, on a helper thread.
-- [ ] Scripted and log forms, so a replay runs nothing.
-- [ ] Parse `--json-diagnostics` with `gjson`.
-- [ ] The tool, a reactive program using `gtui`, `gjson`, files and a process.
-- Acceptance: the tool, written in Gardel, verifies under `--strict` and browses the failures of a broken project. A replay of a session reproduces its screen with no process run.
+**F.11a: host commands.** ✅ Completed on 2026-11-13. Each is scripted and logged, so a replay reads every result from the log and runs nothing.
+
+- [x] `ReadFile(tag, path)` and `FileRead(tag, RESULT[IO_ERROR, BYTES])`, on a helper thread. At most 256 MiB.
+- [x] `ListDir(tag, path)` and `DirListed(tag, RESULT[IO_ERROR, LIST[DIR_ENTRY]])`, so Tablon finds `src/` and `Gardel.toml` without a process. Sorted by the bytes of the names, so a listing is the same on every system; a name that is not UTF-8 is left out.
+- [x] `RunProcess(tag, program, args, dir)`, answered by `ProcessStarted(tag, proc)` or `ProcessFailed(tag, err)`, then `ProcessOutput(proc, bytes)`, `ProcessErrorOutput(proc, bytes)` and, last, `ProcessExited(proc, code)`, read and waited for on helper threads. `WriteProcess(proc, bytes)` and `CloseInput(proc)` feed its standard input through a writer thread, and `StopProcess(proc)` ends it and what it started.
+- [x] `RunAttached(tag, program, args, dir)`: the host gives the terminal back as it found it and parks its key reader, the child owns the terminal, and on its exit the host takes them back and sends `AttachedEnded(tag, res)` and then `Resized`. The alternate screen is not the host's: `TUI` leaves it before and enters it after (F.11c).
+- [x] Program and arguments only, never a shell string (decision 11). A program not found is `ProcessFailed`, not a crash.
+- Acceptance: every command runs for real, from a script and from a log; a replay with the files gone gives the same output and runs no process; an attached child gets the keys the program was waiting for; on Windows, and on Linux in a container.
+
+Changed from the list above, each for a reason:
+
+- **A process handle.** A tag names the start, as `Connect`'s does, and `PROC_ID`, opaque like `CONN_ID`, names the running process. With tags alone, a `RunProcess` on a tag still running would have two `ProcessExited`s or none. The handle gets spec §11.6's guarantees: every output of a process comes before its one `ProcessExited`, and nothing after it.
+- **Two output events**, rather than one with a stream field, so that a `match` names what it handles and no prelude type is added for the stream.
+- **`dir`** on `RunProcess` and `RunAttached`, since `gardelc` writes `build/` in its current directory.
+- **`AttachedEnded`**, not `ProcessExited`: an attached child has no handle, as nothing can be written to it or read from it.
+
+How it works:
+
+- Everything that blocks runs on a helper thread: one per file command, and for a captured child a reader each for its output and its errors, a waiter, and a writer once something is written. Their answers join the reader's queue. A helper builds no Gardel value: it hands over malloc'd bytes, which the loop turns into values as it takes them, so the allocator stays the loop's.
+- While 8 MiB of output, or 1024 events, wait in the queue, the readers wait, so a child that writes without end is held back instead of filling the memory.
+- **Windows.** A child is created suspended, put in a job object that kills what it started when it is stopped or when the program ends, and then resumed. A captured child has no console (`CREATE_NO_WINDOW`), so Ctrl-C and the screen stay the program's. The program is looked up in `PATH` with `SearchPathW`, never first in the current directory, as `CreateProcessW` would. The arguments are quoted for the C runtime's rules. A `.bat` or `.cmd` is refused, since `cmd.exe` would read the arguments as a shell does.
+- **POSIX.** `fork` and `execvp`, with a pipe closed on `exec` that brings back an `exec` that failed. A captured child leads a process group of its own, which `StopProcess` kills with `SIGKILL`. The exit is seen with `waitid(WNOWAIT)` before the child is reaped, so a stop under the lock cannot reach a pid that was reused.
+- **Attached.** The reader waits for a key in a gate: on a Windows console, on the console's handle and an event; on a Windows pipe, by looking every 5 ms; on POSIX, with `poll` on standard input and a wake pipe. `RunAttached` wakes it and waits for it to park, then gives the terminal back. While a child is attached, Ctrl-C is the child's (the console handler and the `SIGINT` handler pass it by). A `ReadLine` waiting refuses a `RunAttached`, as a line being read cannot be called back.
+
+Found on the way:
+
+- A Gardel string literal holding `\"`, such as `"c\"d"`, made any program `E0199`. `boogie_params.rs`, which moves scalar parameters last in the Boogie text, took the escaped quote in the comment `// str_lit_3 = "c\"d"` for the end of the quoted text, and rewrote no call after it. Fixed: comments are copied as they are, and escapes are honoured. A unit test covers it.
+- A program named `A` is `E0199`: Boogie already uses `A` as a type variable (not fixed).
+
+Tests: `tests/files_procs.rs`, with `tests/reactive/files_procs.gdl`, `attach_keys.gdl`, `proc_flood.gdl`, `proc_order.gdl` and a child in C, `files_child.c`. `files_and_processes_give_their_events_and_a_replay_runs_none` lists a directory, whose order NTFS would give differently, reads a file and a missing one, runs a child with an argument holding a space, one a quote, one ending in a backslash and an empty one, in a directory, writes it a line and closes its input, stops a child that sleeps for ever, runs a program that does not exist and a child attached, checks the log, and replays it with the files deleted. `a_script_gives_file_and_process_events` covers every token and refuses seven malformed ones. `an_attached_child_gets_the_keys_the_program_was_waiting_for` runs a child attached while a key read waits, and has a `ReadLine` refuse one. `a_flood_of_output_arrives_whole_and_in_order` reads 30 MB. `a_process_ends_after_all_its_output` runs a child that ends at once and leaves a child of its own to write half a second later, and gets that output before `ProcessExited`. Every run has a time limit, so a child never stopped fails the test instead of hanging it. The same programs, compiled from the same C on Debian 13 in Docker, give the same output, a stopped child ending with 137. That is the first run of the reactive host's POSIX code on Linux beyond F.9's terminal checks.
+
+Mutations, each on a private copy: ten, all red after a baseline that passes. `ProcessExited` sent when the waiter alone is done, the writer dropping what it is given, `CloseInput` not waking the writer, the reader not parked while a child is attached, backslashes before the closing quote not doubled, a listing in the disk's order, a `ReadLine` waiting not counted, a scripted listing reading `d` as a file, `StopProcess` killing nothing, and a replay reading its files. The first and the third survived the first round, as the tests closed the input before the writer waited and read all output before the child ended; the tests were changed (`CloseInput` after the child answers, and `proc_order.gdl`) and both turned red.
+
+Open: once in about 27 runs of the baseline, `a_script_gives_file_and_process_events` found a line of the program's standard error trace missing, while its standard output was exact. The mutation script kept only the panic's first line, and 26 further runs did not repeat it, so the cause is not known.
+
+**F.11b: what the compiler gives Tablon.** Today `--inspect` prints text and refuses a project with errors, `gcc`'s errors are not reported, and `--run` also runs Boogie a second time.
+
+- [ ] `--inspect --json-diagnostics` gives each module's short form as JSON: name, kind, and per feature its signature, `require` and `ensure`, and its source line.
+- [ ] `--inspect` with `--no-verify` shows short forms after type checking only, marked as not verified, so the Modules view works while proofs fail.
+- [ ] A failed `gcc` is a diagnostic (`E` code, its first lines, the C file), and the executable's path is in the JSON summary, so Build can show both.
+- [ ] `--inspect --json-diagnostics` also gives each module's suppliers and the concepts it satisfies, from which Tablon derives clients and instances.
+- [ ] Spec §12 and the GUIDE describe the JSON forms. A `gardelc` test pins them, as Tablon depends on them.
+
+**F.11c: what `gtui` needs for it** (version 0.2.0).
+
+- [ ] `TABS`: a row of titles, one chosen, each with its key (`Text(t)`), chosen by key or by Tab.
+- [ ] `TREE_VIEW`: nodes that open and close, drawn with `▸` and `▾`, on `LIST_VIEW`'s selection and paging.
+- [ ] `TEXT_VIEW` with line numbers, a marked line, and styled spans per line, so a view can colour what a lexer found.
+- [ ] Colours: `STYLE` gains a foreground from the 16 standard ones, and `VT_TEXT` writes them.
+- [ ] `FRAME`: a box with a title in its top edge, which shows which pane has the keys.
+- [ ] `PALETTE`: a list drawn over the screen, narrowed as one types after `/`, each entry a command and what it does.
+- [ ] `FOCUS`: which pane gets the keys; Tab moves it to the next. `KEY` has no Shift-Tab yet (F.16).
+
+**F.11d: Tablon**, `tools/tablon`, a reactive program on `gtui`, `gjson`, files and processes. Its layout follows `issues/image.png`, with three panes:
+
+- **Left, the project:** tabs `Modules | Files`. Modules is a tree: the project, each dependency, the prelude, and under each its modules by kind. Files is `src/` as a tree.
+- **Right, the module chosen:** a frame titled with the module and the view, and a row of views, each with its key:
+  - `Text(t)`: the source, with line numbers and Gardel's keywords, strings and comments coloured by a small lexer written in Gardel.
+  - `Short(s)`: the contract view, from `--inspect`.
+  - `Features(f)`, `Creators(n)`, `Laws(l)`, `Invariants(i)`: the parts of the short form, one per line; Enter opens the source at that feature.
+  - `Concepts(a)` and `Instances(d)`: the concepts the module satisfies, and the modules that satisfy a concept (Gardel's ancestors and descendants).
+  - `Clients(c)` and `Suppliers(u)`: the modules that use it, and those it uses.
+- **Bottom, the output:** tabs `Output | Problems (n) | Build | Run`.
+  - Problems: the failures of the last check, file, line, kind and obligation. Enter shows the line in Text, marked.
+  - Build: the compiler's steps and `gcc`'s errors, then the executable.
+  - Run: an ordinary program's output streams in, with an input line for its standard input and a key to stop it. A reactive program, which needs the terminal, is run attached.
+  - Output: what each `gardelc` run printed, as it came.
+- **Commands:** `/` opens the palette: `/check`, `/build`, `/run [ARGS]`, `/stop`, `/edit` (the source in `$EDITOR`, attached, then a check), `/open DIR`, `/quit`. The common ones have keys too, shown in the status bar.
+- [ ] A long run shows that it is running, and keys still work: every process is a command, never a wait.
+- Left out: editing in place, which is Task F.16 (`/edit` stands in until then), a debugger, a terminal pane and an AI pane.
+- Acceptance: Tablon verifies under `--strict`. On a broken project it browses the failures to their lines; it shows every view of a module of `gtui`; it builds and runs `examples/todo_tui` attached and an ordinary example with its output captured. A replay of a session reproduces its screen with no process run.
+
+#### Task F.16: Editing in `gtui`
+
+Needs F.11. Makes Tablon's Text view an editor, so a failure can be fixed where it is shown. `tui_dev` is the reference: its `TEXT_AREA_STATE`, `UNICODE_WIDTH`, bracketed paste, cursor shape and OSC 52 clipboard, and what it found about terminals. Its findings that bear on this task: most terminals do not answer a clipboard read (Windows Terminal and conhost not at all), so paste comes from the terminal's own paste; and undo works best in steps, one per typed word or run of deletes.
+
+A decision to take first: **how modifiers enter `KEY`.** A `Mod(key, shift, alt, ctrl)` constructor keeps every `match` on `KEY` working, as a client that does not list it falls to `case _`. A field on every key breaks every client. Proposed: the constructor.
+
+**F.16a: the host.**
+
+- [ ] Keys: Shift with the arrows, Home and End (selection), Ctrl with the arrows (by word), Shift-Tab, Insert and F1 to F12, decoded from VT and from Windows key records alike, as F.9 did.
+- [ ] Bracketed paste: `Pasted(text)`, one event, sanitised like a cell, rather than a key per character.
+- [ ] `WriteFile(tag, path, bytes)` and `FileWritten(tag, RESULT[IO_ERROR, UNIT])`, written to a file beside it and renamed over it, so a crash leaves the old file or the new one.
+- [ ] The cursor: a frame may end by placing the terminal's cursor, shown, in a bar shape; `leave` gives the default back.
+- [ ] Copy through OSC 52 (write only). No clipboard read.
+- [ ] Logged and scripted like every command, so a replay writes no file.
+
+**F.16b: `gtui` 0.3.0.**
+
+- [ ] Display width: a table of wide and zero-width code points generated from the Unicode data, so a CJK character takes two cells and a combining mark none. This lifts F.10's one-cell limit for every widget, and `SCREEN`'s proofs keep holding with a continuation cell.
+- [ ] `TEXT_AREA`: lines held as a zipper (lines above, the line being edited, lines below), so a key costs the length of one line, not of the file. Cursor, both scrolls, selection by an anchor, cut, copy, paste, go to line, find, and undo and redo in bounded steps.
+- [ ] Proven: the cursor is in the text and on the page shown; `TEXT_AREA.of_text(t).text = t` for text with LF line ends; undo after an edit gives back the text and cursor before it; the selection is inside the text.
+- [ ] Highlighting by line, each line lexed from the state the line before ends in (inside a string or a comment), so an edit relexes only to where the state stops changing.
+
+**F.16c: Tablon edits.**
+
+- [ ] Text is editable; the frame's title marks an unsaved file. Ctrl-S saves and checks again, and Problems moves to the new lines.
+- [ ] Quitting with unsaved files asks first. `/edit` stays, for those who want their own editor.
+- Acceptance: in Tablon, a failure of a broken project is fixed and saved, and the check that follows is clean. A session that types, selects, pastes, undoes and saves replays to the same screen and the same file bytes with no file written. A key on a 5000-line file draws within one 16 ms frame.
 
 ---
 
@@ -738,7 +834,7 @@ Needs decisions 10 and 11.
 | **JSON** | F.4 | A package proven against its own format |
 | **A real REST service** | F.6 | `todo_api` over real sockets, with split requests and bodies |
 | **Services that call services** | F.8 | Concurrent waiting with proven limits and no thread per request |
-| **A tool written in Gardel** | F.11 | The language used to work on itself |
+| **A tool written in Gardel** | F.11 | The language used to work on itself: Tablon, which checks, shows contracts, builds and runs |
 
 Each milestone can ship alone, so the phase can stop at any of them with something finished.
 
