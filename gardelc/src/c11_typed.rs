@@ -363,6 +363,17 @@ pub(crate) struct TypedC<'a> {
     /// Inside the argument of `IO.exit`: the process ends right after, so scopes do not
     /// release what they own (Task C.4.1).
     exiting: bool,
+    /// The expression being lowered may do unbounded work: it reaches a recursive routine,
+    /// applies a function value or does IO (Task F.14). A `let` group forks only when at
+    /// least two of its `let`s set it.
+    cost_hit: bool,
+    /// `routine_costly`, by (module, routine); `cost_stack` holds the walks in progress.
+    cost_memo: HashMap<(String, String), bool>,
+    cost_stack: HashSet<(String, String)>,
+    /// The routine being emitted calls itself other than in tail position.
+    nontail_self: bool,
+    /// Costly `let` groups of the routine being emitted: (marker, in order, forked).
+    pending_groups: Vec<(String, String, String)>,
     pub(crate) errors: Vec<String>,
 }
 
@@ -399,6 +410,11 @@ impl<'a> TypedC<'a> {
             tail_used: false,
             exiting: false,
             needs_from_utf8: false,
+            cost_hit: false,
+            cost_memo: HashMap::new(),
+            cost_stack: HashSet::new(),
+            nontail_self: false,
+            pending_groups: Vec::new(),
             errors: Vec::new(),
         }
     }
@@ -1015,6 +1031,109 @@ static bool {inst}__has(struct {inst}* xs, {ce} x) {{\n\
         None
     }
 
+    /// Whether a call of `md.r` may do unbounded work (Task F.14): its body reaches a
+    /// recursive routine, applies a function value, does IO, or calls what cannot be
+    /// resolved. A routine on a cycle of calls is costly. The walk resolves calls by name,
+    /// and when in doubt says costly, which only keeps a fork that was there before.
+    fn routine_costly(&mut self, md: &'a ModuleDecl, r: &str) -> bool {
+        let key = (md.name.clone(), r.to_string());
+        if let Some(&c) = self.cost_memo.get(&key) {
+            return c;
+        }
+        if self.cost_stack.contains(&key) {
+            return true;
+        }
+        let Some((rd, kind)) = Self::find_routine(md, r) else { return true };
+        if kind == "specify" {
+            return false;
+        }
+        self.cost_stack.insert(key.clone());
+        let c = self.stmts_costly(md, &rd.stmts) || self.expr_costly(md, &rd.body);
+        self.cost_stack.remove(&key);
+        self.cost_memo.insert(key, c);
+        c
+    }
+
+    fn stmts_costly(&mut self, md: &'a ModuleDecl, stmts: &[Stmt]) -> bool {
+        stmts.iter().any(|s| matches!(s, Stmt::Let(_, e) if self.expr_costly(md, e)))
+    }
+
+    fn expr_costly(&mut self, md: &'a ModuleDecl, e: &Expr) -> bool {
+        match e {
+            Expr::Int(_) | Expr::Float(_) | Expr::Char(_) | Expr::Unit | Expr::Bool(_) | Expr::Str(_) | Expr::Var(_) => false,
+            // Ghost, and a closure is paid for where it is applied.
+            Expr::Forall(..) | Expr::Exists(..) | Expr::Lambda(..) => false,
+            Expr::WithIo(..) => true,
+            Expr::UnaryNot(a) | Expr::UnaryNeg(a) => self.expr_costly(md, a),
+            Expr::BinOp(_, a, b) => self.expr_costly(md, a) || self.expr_costly(md, b),
+            Expr::TupleLit(xs) => xs.iter().any(|x| self.expr_costly(md, x)),
+            Expr::RecordLit(fs) => fs.iter().any(|(_, x)| self.expr_costly(md, x)),
+            Expr::RecordUpdate(b, fs) => self.expr_costly(md, b) || fs.iter().any(|(_, x)| self.expr_costly(md, x)),
+            Expr::If(c, ts, te, es, ee) => {
+                self.expr_costly(md, c)
+                    || self.stmts_costly(md, ts)
+                    || self.expr_costly(md, te)
+                    || self.stmts_costly(md, es)
+                    || self.expr_costly(md, ee)
+            }
+            Expr::Match(s, cases) => {
+                self.expr_costly(md, s)
+                    || cases.iter().any(|k| self.stmts_costly(md, &k.stmts) || self.expr_costly(md, &k.body))
+            }
+            Expr::Call(f, args) => {
+                if args.iter().any(|a| self.expr_costly(md, a)) {
+                    return true;
+                }
+                if Self::find_routine(md, f).is_some() {
+                    return self.routine_costly(md, f);
+                }
+                // A constructor; anything else here is a function value being applied.
+                !f.starts_with(|c: char| c.is_ascii_uppercase())
+            }
+            Expr::MethodCall(recv, m, args) => {
+                if args.iter().any(|a| self.expr_costly(md, a)) {
+                    return true;
+                }
+                if let Expr::Var(v) = &**recv {
+                    if v != "Current" {
+                        if let Some(owner) = self.module(v) {
+                            // `M.r(..)`; a name no module routine has is a runtime one.
+                            return Self::find_routine(owner, m).is_some() && self.routine_costly(owner, m);
+                        }
+                    }
+                } else if self.expr_costly(md, recv) {
+                    return true;
+                }
+                if m == "apply" {
+                    return true;
+                }
+                // The receiver's type is not known here: every module routine of that name
+                // could be the one called.
+                let mut found = false;
+                for owner in self.mods.clone() {
+                    if Self::find_routine(owner, m).is_some_and(|(_, k)| k != "specify") {
+                        found = true;
+                        if self.routine_costly(owner, m) {
+                            return true;
+                        }
+                    }
+                }
+                // Not a routine: a field read, a runtime method, or a field of function type
+                // being applied.
+                !found && !args.is_empty() && self.is_fn_field(m)
+            }
+        }
+    }
+
+    /// Some record or variant has a field `f` of function type.
+    fn is_fn_field(&self, f: &str) -> bool {
+        let fn_typed = |fs: &[(String, String)]| fs.iter().any(|(n, t)| n == f && t.contains("->"));
+        self.mods.iter().any(|md| match &md.repr {
+            ReprKind::Product(fs) => fn_typed(fs),
+            ReprKind::Sum(vs) => vs.iter().any(|v| fn_typed(&v.fields)),
+        })
+    }
+
     fn has_current(md: &ModuleDecl, kind: &str) -> bool {
         md.kind == ModuleKind::Module && kind == "feature"
     }
@@ -1113,6 +1232,8 @@ static bool {inst}__has(struct {inst}* xs, {ce} x) {{\n\
             params: Vec::new(),
         };
         self.tail_used = false;
+        self.nontail_self = false;
+        self.pending_groups.clear();
         cx.used.insert("Current".into());
         let mut params = Vec::new();
         if has_cur {
@@ -1133,6 +1254,7 @@ static bool {inst}__has(struct {inst}* xs, {ce} x) {{\n\
         let cret = self.ctype(&ret)?;
         let body = self.lower_block(&mut cx, &rd.stmts, &rd.body, Some(&ret), has_cur)?;
         let body = self.own(body)?;
+        let body = self.settle_groups(body);
         if req.sink && self.tail_used {
             return Err("a routine that owns its parameters cannot be a loop".into());
         }
@@ -1156,6 +1278,20 @@ static bool {inst}__has(struct {inst}* xs, {ce} x) {{\n\
             if req.rtargs.is_empty() { String::new() } else { format!("[{}]", req.rtargs.join(", ")) }
         ));
         Ok(())
+    }
+
+    /// Puts each costly `let` group of the routine just lowered in its final form (Task
+    /// F.14). A routine that calls itself only in tail position is a loop: a fork in it would
+    /// make a task on every iteration, and the depth cutoff never stops it, since a loop does
+    /// not get deeper. Its groups run in order. A routine with a non-tail self call is
+    /// divide-and-conquer, and its groups fork. Outer groups hold the markers of the groups
+    /// nested in them, so they are settled first.
+    fn settle_groups(&mut self, mut body: String) -> String {
+        let is_loop = self.tail_used && !self.nontail_self;
+        for (marker, in_order, par) in std::mem::take(&mut self.pending_groups).into_iter().rev() {
+            body = body.replace(&marker, if is_loop { &in_order } else { &par });
+        }
+        body
     }
 
     fn param_drops(&mut self, cx: &Ctx) -> Result<String, String> {
@@ -1286,10 +1422,15 @@ static bool {inst}__has(struct {inst}* xs, {ce} x) {{\n\
             } else {
                 let mut lowered = Vec::new();
                 let mut soft = Vec::new();
+                let mut costly = 0;
                 for (v, e) in group {
                     let want = declared.next().flatten();
                     soft.push(want.is_none() && !retyped.contains_key(v) && cx.untyped_num(e));
-                    let x = self.lower(cx, e, want.or(retyped.get(v).map(String::as_str)), has_cur)?;
+                    let outer = std::mem::replace(&mut self.cost_hit, false);
+                    let x = self.lower(cx, e, want.or(retyped.get(v).map(String::as_str)), has_cur);
+                    costly += self.cost_hit as usize;
+                    self.cost_hit |= outer;
+                    let x = x?;
                     Self::check_declared(v, want, &x.ty)?;
                     let t = x.ty.clone();
                     let c = self.own(x)?;
@@ -1303,6 +1444,18 @@ static bool {inst}__has(struct {inst}* xs, {ce} x) {{\n\
                     owned_locals.push((cn.clone(), t.clone()));
                     names.push(cn);
                 }
+                // Cost model (Task F.14): a task costs far more than a constructor or a call
+                // that returns at once, and in a loop every iteration would pay for one. Fork
+                // only when at least two `let`s may do unbounded work.
+                let mut in_order = String::new();
+                for ((_, c, _, _), cn) in lowered.iter().zip(names.iter()) {
+                    in_order.push_str(&format!("{cn} = {c};\n"));
+                }
+                if costly < 2 {
+                    code.push_str(&in_order);
+                    continue;
+                }
+                let mut par = String::new();
                 // Fork-join (spec §10). Every branch of the group, including the one the
                 // current thread runs inline, executes one level deeper, so the depth
                 // cutoff bounds the number of tasks (about 2^GARDEL_TASK_DEPTH for a binary
@@ -1320,24 +1473,31 @@ static bool {inst}__has(struct {inst}* xs, {ce} x) {{\n\
                 }
                 forked.push_str("#pragma omp taskwait\n");
                 let small = lowered.iter().map(|(_, c, _, _)| c.len()).sum::<usize>() <= 4096;
-                code.push_str("{\nint _pd = gardel_task_depth + 1;\n");
+                par.push_str("{\nint _pd = gardel_task_depth + 1;\n");
                 if small {
                     // Past the cutoff, run the group sequentially without calling the
                     // OpenMP runtime at all (the expressions appear twice in the C).
-                    code.push_str(&format!("if (_pd <= GARDEL_TASK_DEPTH) {{\n{forked}}} else {{\n"));
-                    for ((_, c, _, _), cn) in lowered.iter().zip(names.iter()) {
-                        code.push_str(&format!("{cn} = {c};\n"));
-                    }
-                    code.push_str("}\n");
+                    par.push_str(&format!("if (_pd <= GARDEL_TASK_DEPTH) {{\n{forked}}} else {{\n{in_order}}}\n"));
                 } else {
                     // Large expressions are not duplicated: undeferred tasks past the cutoff.
-                    code.push_str(&forked.replacen(
+                    par.push_str(&forked.replacen(
                         "firstprivate(_pd)\n",
                         "firstprivate(_pd) if(_pd <= GARDEL_TASK_DEPTH)\n",
                         usize::MAX,
                     ));
                 }
-                code.push_str("}\n");
+                par.push_str("}\n");
+                if cx.fn_cname.is_empty() {
+                    // A lambda is never a loop.
+                    code.push_str(&par);
+                } else {
+                    // Whether the routine is a loop is known once all of it is lowered:
+                    // `emit_fn` puts one of the two forms here (`settle_groups`).
+                    let k = self.next();
+                    let marker = format!("/*gardel_group_{k}*/\n");
+                    code.push_str(&marker);
+                    self.pending_groups.push((marker, in_order, par));
+                }
             }
         }
         if tail {
@@ -1655,6 +1815,9 @@ static bool {inst}__has(struct {inst}* xs, {ce} x) {{\n\
         let mod_targs: Vec<String> = md.type_params.iter().map(|t| map[t].clone()).collect();
         let rtargs: Vec<String> = rd.type_params.iter().map(|t| map[t].clone()).collect();
         self.check_bounds(md, &mod_targs)?;
+        if self.routine_costly(md, r) {
+            self.cost_hit = true;
+        }
         let cname = self.request_fn(&md.name, &mod_targs, r, &rtargs);
         if tail_site && cname == cx.fn_cname {
             let self_ty = Self::self_type(md, &mod_targs);
@@ -1667,6 +1830,9 @@ static bool {inst}__has(struct {inst}* xs, {ce} x) {{\n\
             let ret = subst(&rd.ret_type, &map);
             let code = self.tail_jump(cx, vals, &ret)?;
             return Ok(owned(code, ret));
+        }
+        if cname == cx.fn_cname {
+            self.nontail_self = true;
         }
         let takes_current = Self::has_current(md, kind);
         if Self::is_sink(md, rd) && (!takes_current || recv.is_some() || (hc && md.name == cx.owner)) {
@@ -1945,6 +2111,8 @@ static bool {inst}__has(struct {inst}* xs, {ce} x) {{\n\
 
     /// Calls a function value `f` (borrowed) with borrowed arguments.
     fn call_value(&mut self, cx: &mut Ctx, f: V, args: &[Expr], hc: bool) -> Lowered {
+        // Any function may be applied here, so its cost is unknown (Task F.14).
+        self.cost_hit = true;
         let (ps, r) = cfn_parts(&f.ty).ok_or_else(|| format!("`{}` is not a function", f.code))?;
         let mut t = Temps::default();
         let fc = self.borrow(f, &mut t)?;
@@ -2366,6 +2534,7 @@ static bool {inst}__has(struct {inst}* xs, {ce} x) {{\n\
                 Ok(owned(self.with_temps(t, call, &bt)?, bt))
             }
             Expr::WithIo(stmts, fin) => {
+                self.cost_hit = true;
                 let mark = cx.locals.len();
                 let mut s = String::from("({\n");
                 let mut owned_locals = Vec::new();
@@ -2409,7 +2578,13 @@ static bool {inst}__has(struct {inst}* xs, {ce} x) {{\n\
                 s.push_str(&format!("_io{k};\n}})"));
                 Ok(owned(s, t))
             }
-            Expr::Lambda(ps, rt, stmts, body) => self.lower_lambda(cx, ps, rt, stmts, body),
+            // Making a closure is cheap: what its body costs is paid where it is applied.
+            Expr::Lambda(ps, rt, stmts, body) => {
+                let saved = self.cost_hit;
+                let r = self.lower_lambda(cx, ps, rt, stmts, body);
+                self.cost_hit = saved;
+                r
+            }
             Expr::TupleLit(xs) => {
                 if xs.len() != 2 {
                     return Err("only pairs are supported by the C backend".into());

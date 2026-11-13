@@ -1,7 +1,7 @@
 # Phase F: Verified Libraries and Applications
 
 **Date:** November 6, 2026
-**Status:** In progress. Tasks F.0 to F.8, F.12 and F.13 are completed (F.7 on Windows only), and the decisions below are taken.
+**Status:** In progress. Tasks F.0 to F.8, F.12, F.13 and F.14 are completed (F.7 on Windows only), and the decisions below are taken.
 **Roadmap entry:** [Phase F in Roadmap.md](../Roadmap.md#phase-f-verified-libraries-and-applications)
 **Probed at:** commit `1349cb6`
 
@@ -252,6 +252,7 @@ What was done:
   - `check_line` moved from `GHTTP_TEXT` to its own test module, `GHTTP_LINE`, where it assumes the facts of the 9 literals it can meet instead of 51.
   - The heaviest of these proofs went from up to 28 million resources to about 1 million.
   - Causes seen: `Seq_append` associativity re-matching where an operand may be empty; steps that cost far more together than apart; and the literal facts.
+  - In the prelude, `STRING.space_start` ran out of resources under the default seed when `STRING` was verified alone, as two unit tests do. That was `BYTES.decode_injective`, whose trigger is a pair of decodings, at 29,000 instances. A `check` that `character_at(j - 1)` is the character at `j - 1` takes it to 0.4 to 3.5 million under seeds 0 to 7.
   - Now `ghttp` and `ghttp/tests` verify under seeds 0 to 3. The heaviest left are `HTTP_WRITER_FIELDS.fields_lines` (up to 11.8 million) and `GHTTP_TEXT.two_exchanges` (11.8 million).
 - **Met again in F.8, stage D of the round trip**, now with a client: one step of `HTTP_HEAD_PARSER.fields` unfolds `HTTP_HEADERS.add` one fuel below its caller, guarded by `has_header_room` at fuel zero. The guards of the defining and step axioms read at `DefaultFuel`, and no guard on the step axiom, which every fuel makes sound, proved the step, and all of `ghttp` verified with them. The prelude was not checked with them, which F.4's attempt says to do first.
 - **Tried in F.4.** Both obvious fixes cost proofs. A guard at `DefaultFuel` on every axiom made `NUMBER_TEXT`'s round-trip laws run out of resources. A guard at the fuel of the application on the defining and step axioms made `STRING.find` run out. A fix must keep the extra unfolding to the routines that need it. `gjson` avoids the limit by keeping its reader total.
@@ -262,9 +263,43 @@ Found in F.4, and numbered last because it was added last. It blocks nothing.
 
 The C backend runs each group of independent `let`s as OpenMP tasks, whatever they cost. In `gjson`, a `let` of `larger(a, b)` beside a `let` of a constructor, in a loop over 200,000 items, took 36 s against 0.65 s without OpenMP.
 
-- [ ] Run a group in parallel only when at least two of its `let`s may be costly, for example a call into a recursive group, or above a size threshold such as `GARDEL_PAR_THRESHOLD`.
-- [ ] A benchmark: a loop with small independent `let`s costs no more with OpenMP than without, and `seq_bench` keeps its parallel speedup.
-- Acceptance: both measurements recorded, and `gjson` can use independent `let`s in its loops again.
+**Status:** ✅ Completed (2026-11-12).
+
+- [x] Run a group in parallel only when at least two of its `let`s may be costly, for example a call into a recursive group, or above a size threshold such as `GARDEL_PAR_THRESHOLD`. The first: no size threshold was needed.
+- [x] A benchmark: a loop with small independent `let`s costs no more with OpenMP than without, and `seq_bench` keeps its parallel speedup.
+- Acceptance: met. Both measurements are below, and `gjson` can use independent `let`s in its loops again.
+
+What was done:
+
+- **What counts as costly.** A `let` may do unbounded work when lowering it reaches a call of a routine on a cycle of calls, directly or through routines that are not, applies a function value, or does IO. `TypedC::routine_costly` walks a callee's body once and keeps the answer. Where it cannot tell which routine a method names, because the receiver's type is not known in the walk, every module routine of that name counts. A constructor, arithmetic, a field, a runtime method such as `LIST.length`, and a lambda made but not applied are cheap. When in doubt the walk says costly, which keeps a fork that was there before.
+- **The rule.** A group of independent `let`s forks only when two or more are costly; otherwise its `let`s run in order, with no OpenMP call. The depth cutoff of C.3 (`GARDEL_TASK_DEPTH`) still applies to the groups that fork.
+- **No fork inside a loop.** A routine that calls itself only in tail position compiles to a `while` loop. A fork in its step makes a task on every iteration, and the depth cutoff never stops it, since a loop does not get deeper. Whether a recursive call does a little work (`digits`, about 20 steps) or a lot (`sum` over a big `SEQ`) cannot be seen, so a loop's groups run in order, costly or not. A routine that also calls itself other than in tail position is divide-and-conquer, and its groups still fork. This is known only once the whole routine is lowered, so each costly group leaves a marker, and `TypedC::settle_groups` puts the forked or the sequential form there. Lambdas are never loops and decide at once. This is not about mutual recursion: plain self-recursion in the callee was enough, and forbidding mutual recursion would not have changed it.
+- **Measured** (i9-12900HK, 20 logical cores, wall clock with process start, one run each for the loop, best of 3 for `seq_bench`):
+  - A loop of 1,000,000 steps with `let m = larger(acc, i % 7)` and `let o = Some(i)`: 255 ms on 1 thread and 4,478 ms on 20 before; 139 ms and 82 ms after.
+  - `seq_bench`, n = 4,000,000: 238 and 123 ms before, 235 and 126 ms after (x1.9 both). Its C is byte-identical, as `from_range` and `sum` fork two recursive calls.
+  - A loop of 1,000,000 steps with `let a = depth(i % 8)` and `let b = depth(i % 5)`, where `depth` is recursive (best of 3): 182 ms on 1 thread and 4,514 ms on 20 before; 61 ms and 57 ms after.
+- **Test.** `test_f14_let_groups_fork_only_when_two_lets_may_be_costly`: two cheap `let`s, one costly beside one cheap, a closure made beside a recursive call, and a loop whose step has two recursive calls, do not fork; two recursive calls, one of them through a non-recursive routine, two applications of a function parameter, and a routine with both a tail and a non-tail self call do. The program runs natively and gives the expected result. Mutations, each on a private worktree, 7 of 7 red: forking on one costly `let`, a function value counted as cheap, a cycle counted as cheap, a lambda's body counted where it is made, a callee's body not walked, loops allowed to fork, and a non-tail self call ignored.
+- **Every package and example**, compiled by the compiler before and after: each verifies 0/0 under `--strict` with both and builds. The C of `seq_bench`, `echo_server`, `json_reader`, `json_writer` and most `ghttp` modules is byte-identical. Elsewhere only forks go: for example `HTTP_SERIALIZER` from 6 to 0, `REST_SERVER` from 11 to 4 and `JSON_ROUND_TRIP` from 27 to 7. The forks removed are around cheap calls such as `NUMBER_TEXT.hex_value`; those left are around recursive ones such as `NUMBER_TEXT.digits`. The loop rule changes none of these counts: no package has a loop whose step holds two costly `let`s. No file gains a fork.
+- **Result.** `cargo test --release` passes every suite, 230 unit tests among them.
+- **Known limits.** A loop whose step does two heavy calls, such as summing two large `SEQ`s, runs them in order: write it as divide-and-conquer to get them in parallel. A loop through mutual recursion (`f` tail-calls `g`, which tail-calls `f`) is not a C loop and keeps its forks. The walk does not know a receiver's type, so a cheap method that shares its name with a recursive one elsewhere counts as costly. A runtime method that is linear, such as `BYTES.concat`, counts as cheap.
+
+**To evaluate: explicit parallelism in the language.** F.14 makes the compiler guess where a fork pays, from the shape of the code. The alternative is to let the programmer say so, for example `par let a = ...` or a `par` block, and never fork anything else. Not decided; to weigh before the cost model grows further.
+
+- For:
+  - Predictable: what runs in parallel is written in the source, and a change elsewhere (a helper that becomes recursive) cannot add or remove a fork.
+  - The programmer knows the sizes the compiler cannot: that `sum(seq)` is large and `digits(n)` is small.
+  - The cost model, the loop rule and their heuristics (`routine_costly`, `settle_groups`) could go, or be kept only as a lint (`par` on two cheap `let`s, or on a loop's step).
+  - Nothing changes for the verifier: a `par let` has the meaning of a `let`, as evaluation order cannot change a pure, total result (§10, item 1).
+- Against:
+  - It reverses a v0.4 decision: `fork` was removed so that parallelism falls out of divide-and-conquer code with no syntax (§10, §16), and the README and spec promise automatic fork-join.
+  - Every program that relies on it today (`SEQ.map`, `filter`, `from_range`, `seq_bench`) would need `par`, and code that forgets it silently runs on one core.
+  - It is a target hint inside a language about meaning; Bend v2, the intended GPU route, parallelises on its own and would ignore it.
+  - It moves a performance question onto every author, including AI agents that write Gardel, who have no better view of sizes than the compiler has.
+- Middle ways to compare:
+  - Keep the automatic rule and add `par` only as an override that forces a fork the cost model would not make, such as two heavy calls in a loop's step.
+  - Use the size the `variant` gives: a callee whose variant halves (`hi - lo`, `n / 2`) does logarithmic work, one that decreases by one does linear work.
+  - A runtime check, for example a task only while fewer than about two tasks per thread are waiting. It bounds how many tasks wait, not what each costs, so it would not have saved the loops above, where idle threads take every task at once.
+- What would decide it: a program from Phase F or later that loses real speed under the automatic rule. None does yet.
 
 #### Task F.15: Facts Over a User Type at the Values of Calls
 
@@ -353,7 +388,7 @@ What was done:
 - **Found on the way, and not fixed.**
   - `LIST.length` walks the list in C, so a loop that tests `bs.length` is quadratic. `gjson` tests `bs = LIST.empty`, which is constant. `MAP` and `NUMBER_TEXT.parse_digits` test `length`, and are quadratic in C. Fixed in F.6, step 0: `length` is constant time.
   - A call that is not a tail call takes a stack frame in C, and a 1 MB stack holds 30,000 to 60,000 of them. A loop over an input must be a tail call.
-  - Independent `let`s run as OpenMP tasks, with no cost model. In a loop over 200,000 items this took 36 s against 0.65 s without OpenMP. `gjson` avoids independent `let`s in its loops. Task F.14 is a cost model.
+  - Independent `let`s ran as OpenMP tasks, with no cost model: in a loop over 200,000 items this took 36 s against 0.65 s without OpenMP, so `gjson` avoids independent `let`s in its loops. Task F.14 added the cost model, and such `let`s now run in order.
   - Under `/typeEncoding:p`, the list axioms do not fire on a term that holds a prelude routine's result, such as `digits(n, ys).append(zs)`. Naming the result with `let` first works around it.
   - Two arms of one `match` that bind the same name at different types are `E0199`.
   - A call such as `b.to_bytes`, in a module that has a routine named `to_bytes`, counts as recursion in the call graph.
