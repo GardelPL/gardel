@@ -12,6 +12,7 @@ representation {ANY}
   | Shutdown
   | Connected(tag: NAT, conn: CONN_ID)
   | ConnectFailed(tag: NAT, err: IO_ERROR)
+  | Resized(width: NAT, height: NAT)
 
 feature {ANY}
 

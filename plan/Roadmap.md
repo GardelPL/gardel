@@ -873,7 +873,7 @@ flowchart TD
 | | [F.6](libraries/verified_libraries.md#task-f6-grest-sync-rest) | `grest`, sync handlers, `todo_api` ✅ |
 | 5. Async | [F.7](libraries/verified_libraries.md#task-f7-connect-and-correlation-ids) | `Connect`, correlation ids, `CancelTimer` ✅ (Windows) |
 | | [F.8](libraries/verified_libraries.md#task-f8-http-client-and-async-handlers) | HTTP client, async handlers, `api_gateway` ✅ |
-| 6. TUI | [F.9](libraries/verified_libraries.md#task-f9-terminal-host) | Terminal host commands |
+| 6. TUI | [F.9](libraries/verified_libraries.md#task-f9-terminal-host) | Terminal host commands: `Write`, `TerminalSize`/`Resized`, VT mode, the new keys ✅ (same bytes on Windows and Linux); constructors of dependencies now resolve before the prelude's |
 | | [F.10](libraries/verified_libraries.md#task-f10-the-gtui-package) | The `gtui` package |
 | | [F.11](libraries/verified_libraries.md#task-f11-files-processes-and-the-tool) | Files, processes, and a tool written in Gardel |
 
