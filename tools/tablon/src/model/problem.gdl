@@ -1,0 +1,99 @@
+-- One diagnostic of `gardelc --json-diagnostics` (spec §12): its level (`error`, `warning` or
+-- `note`), rule, module, routine and tag, the file and line it is placed at, from 1, and its
+-- message. A build's last note names the executable, in `file`.
+module PROBLEM
+
+representation {NONE}
+  grade: STRING
+  rule_name: STRING
+  owner: STRING
+  routine_name: STRING
+  label: STRING
+  path: STRING
+  spot: NAT
+  text: STRING
+
+create {ANY}
+
+  make(level: STRING, rule: STRING, owner: STRING, routine: STRING, tag: STRING, file: STRING, line: NAT,
+       message: STRING): PROBLEM
+    do
+      { grade = level, rule_name = rule, owner = owner, routine_name = routine, label = tag, path = file,
+        spot = line, text = message }
+    end
+
+  -- The first line of `s`.
+  first_line(s: STRING): STRING
+    do
+      let parts = s.split('\n')
+      if parts.length > 0 then parts.head else s end
+    end
+
+feature {ANY}
+
+  level: STRING
+    do
+      Current.grade
+    end
+
+  rule: STRING
+    do
+      Current.rule_name
+    end
+
+  module_name: STRING
+    do
+      Current.owner
+    end
+
+  routine: STRING
+    do
+      Current.routine_name
+    end
+
+  tag: STRING
+    do
+      Current.label
+    end
+
+  file: STRING
+    do
+      Current.path
+    end
+
+  line: NAT
+    do
+      Current.spot
+    end
+
+  message: STRING
+    do
+      Current.text
+    end
+
+  is_error: BOOL
+    do
+      Current.grade.equals("error")
+    end
+
+  is_warning: BOOL
+    do
+      Current.grade.equals("warning")
+    end
+
+  -- Whether it is the note of a build that names the executable.
+  names_executable: BOOL
+    do
+      Current.grade.equals("note") and Current.label.equals("executable")
+    end
+
+  -- Its line in Problems: where, the level, and the first line of the message.
+  summary: STRING
+    do
+      let file = if Current.path.starts_with("./") and Current.path.code_point_count >= 2 then
+        Current.path.slice(2, Current.path.code_point_count) else Current.path end
+      let at = GLYPHS.join(GLYPHS.join(file, ":"), NUMBER_TEXT.nat_to_text(Current.spot))
+      GLYPHS.join(GLYPHS.join(GLYPHS.join(GLYPHS.join(at, "  "), Current.grade), "  "), PROBLEM.first_line(Current.text))
+    end
+
+end

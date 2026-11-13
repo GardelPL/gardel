@@ -2,7 +2,9 @@
 //! (F.11d). `Current.at` was taken for `LIST.at`, whose argument it has not, and `gardelc`
 //! panicked; `Current.head` became `Seq_head(Current)`, which Boogie refused (`E0199`). A field
 //! named like a word Boogie reserves, `uses` or `type`, was a parameter of its constructor by
-//! that name, and Boogie refused it (`E0199`).
+//! that name, and Boogie refused it (`E0199`). A field read through a record bound by `let`,
+//! `let h = { Current with .. }` then `h.rest.length`, took `rest` for a list's and `.length` for
+//! `Seq_length` (`E0199`).
 
 use std::fs;
 use std::process::Command;
@@ -13,12 +15,13 @@ representation {NONE}
   at: NAT
   head: NAT
   uses: MARK
+  rest: BYTES
 
 create {ANY}
 
   make(line: NAT, first: NAT): SPOT
     do
-      { at = line, head = first, uses = Used(first) }
+      { at = line, head = first, uses = Used(first), rest = BYTES.empty }
     ensure
       kept_line: Result.line = line
       kept_first: Result.first = first
@@ -35,6 +38,13 @@ feature {ANY}
   first: NAT
     do
       Current.head
+    end
+
+  -- A field read through a record bound by `let`, whose type is the module's own.
+  waiting: NAT
+    do
+      let moved = { Current with at = 1 }
+      moved.rest.length
     end
 
   marked: NAT
@@ -68,6 +78,7 @@ feature {ANY}
         IO.print_line(NUMBER_TEXT.nat_to_text(s.line))
         IO.print_line(NUMBER_TEXT.nat_to_text(s.first))
         IO.print_line(NUMBER_TEXT.nat_to_text(s.marked))
+        IO.print_line(NUMBER_TEXT.nat_to_text(s.waiting))
         IO.exit(0)
       end
     end
@@ -93,5 +104,5 @@ fn a_field_named_like_a_built_in_or_a_boogie_word_is_the_field() {
     let text = format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
     drop(fs::remove_dir_all(&dir));
     assert!(text.contains("0 errors, 0 warnings"), "{text}");
-    assert!(String::from_utf8_lossy(&out.stdout).lines().map(str::trim).collect::<Vec<_>>().ends_with(&["7", "3", "3"]), "{text}");
+    assert!(String::from_utf8_lossy(&out.stdout).lines().map(str::trim).collect::<Vec<_>>().ends_with(&["7", "3", "3", "0"]), "{text}");
 }

@@ -1,7 +1,7 @@
 # Phase F: Verified Libraries and Applications
 
 **Date:** November 6, 2026
-**Status:** In progress. Tasks F.0 to F.10, F.12, F.13 and F.14 are completed (F.7 on Windows only), and the decisions below are taken.
+**Status:** In progress. Tasks F.0 to F.14 are completed (F.7 on Windows only), and the decisions below are taken.
 **Roadmap entry:** [Phase F in Roadmap.md](../Roadmap.md#phase-f-verified-libraries-and-applications)
 **Probed at:** commit `1349cb6`
 
@@ -850,7 +850,7 @@ Mutations, each on a private copy: fifteen, after a baseline that passes; fourte
   - Run: an ordinary program's output streams in, with an input line for its standard input and a key to stop it. A reactive program, which needs the terminal, is run attached.
   - Output: what each `gardelc` run printed, as it came.
 - **Commands:** `/` opens the palette: `/check`, `/build`, `/run [ARGS]`, `/stop`, `/edit` (the source in `$EDITOR`, attached, then a check), `/open DIR`, `/quit`. The common ones have keys too, shown in the status bar.
-- [ ] A long run shows that it is running, and keys still work: every process is a command, never a wait.
+- [x] A long run shows that it is running, and keys still work: every process is a command, never a wait. The status bar says `inspecting...`, `checking...`, `building...` or `running...`; `tests/tablon.rs` takes keys while a check and a program run (part two, below).
 - [x] A Boogie error placed from its routine's header on, never at a word in a comment (`locate_span`, found in F.11c), so Problems opens the right line. `routine_lines` finds the header, the least indented line that starts with the name and `(`, `:` or `[` and has lines under it; a tag is looked for there, then in the file; an overflow is placed at the header; `code_of_line` leaves comments out.
 - [x] A broken invariant reported under its own name, each tag asserting its own clause (found in F.11c). Each clause is `M_Invariant__tag`, which holds the fields' ranges too, so the clauses together are `M_Invariant`. Tests: `tests/error_place.rs`, with the name of the routine in a comment, a call and a tag before its header, and a tag two routines share. Mutations on a private copy: five, after a baseline that passes, all red: each tag asserting the whole invariant, comments searched, the whole file searched before the routine, no header for a tag in no line, and the first line that starts with the name taken as the header.
 - Left out: editing in place, which is Task F.16 (`/edit` stands in until then), a debugger, a terminal pane and an AI pane.
@@ -876,7 +876,7 @@ Changed from the plan above:
 
 - **No prelude in the Modules tree.** The inspection gives the project's and its dependencies' modules, not the prelude's, and no concepts that the prelude declares. A supplier that is the prelude's is marked as such in Suppliers instead.
 - **Instances lists the modules that share a concept.** A concept is not a module in the tree, so for a module Instances lists, under each concept it satisfies, the other modules that satisfy it.
-- **Problems, Build and Run show a placeholder** until part two, and Output shows what Tablon and `gardelc` printed.
+- **Problems, Build and Run showed a placeholder** until part two, and Output showed what Tablon and `gardelc` printed.
 
 Found on the way, in the compiler, fixed:
 
@@ -892,6 +892,38 @@ Found on the way, not fixed:
 Tests: `tests/tablon.rs`, six, each a scripted session on the fixture of `tests/inspect/` in which the inspection's output is the fixture's expected object and each read the fixture's file, read by a VT terminal, with a resize to the same size at the end whose full redraw must equal the cells the diffs left. `the_inspection_fills_the_trees_and_enter_goes_from_a_feature_to_its_line` checks the commands sent (the inspection in the project's directory, `src` and `src/sub` listed, the module's file read), the tree, Output, the status bar, and `measure`'s line marked on blue across its row with lines before it. `every_view_of_a_module_shows_its_parts` takes each of the nine other views of `CELL` and the tab row scrolled to Suppliers. `enter_on_a_supplier_chooses_it_and_reads_its_file`, `the_files_tree_lists_directories_first_and_opens_a_file_as_text` (a CR dropped), `keys_work_while_the_inspection_runs_and_a_read_no_longer_awaited_is_dropped` (the views and the palette answer before the inspection ends; the first of two reads answered last is not shown), and `a_replay_reproduces_the_screen_with_no_process_run`.
 
 Mutations, each on a private copy: nine of Tablon, after a baseline that passes, all red: a read no longer awaited shown, a jump that marks no line, files before directories, subdirectories not listed, Enter on a supplier going nowhere, the tabs always drawn from the first, a CR kept at a line end, a part shown under every section, and clients that are the suppliers. The first survived the first round, as the stale read came before the one awaited and the last screen was right either way; the test now sends it last, and it is red. Three of the compiler fixes, after a baseline that passes, all red: any call of the routine's name taken for recursion, a field named like a built-in read as the built-in, and a reserved field bound by its own name.
+
+**F.11d, part two: check, build, run and edit.** ✅ Completed on 2026-11-13. `tools/tablon`, 19 modules, verifies with 0 errors and 0 warnings under `--strict` (about 4.5 minutes) and builds. With it, F.11d is complete: every acceptance item above holds (see the live checks below). `tools/tablon/README.md` tells how to build, run and use it.
+
+- [x] `/check` (Ctrl-K): `gardelc --project . --inspect --json-diagnostics`. Its errors and warnings go to Problems, titled `Problems (n)` and chosen when there is an error; Enter shows the line in Text, marked, and chooses its module. The modules are read again from the same run.
+- [x] `/build` (Ctrl-B): `gardelc --project . --json-diagnostics`. Its steps go to Build, then `Built EXE` or why there is none; its errors go to Problems.
+- [x] `/run [ARGS]` (Ctrl-R): a build, then the executable the build names, with `ARGS` split at spaces. An ordinary program runs with its output read into Run as it comes and the keys on an input line: Enter sends the line, Ctrl-D closes the input, Escape gives the keys back, Ctrl-X stops it. A reactive program runs attached, and Tablon draws again when it ends. Either way Run ends with the exit code. A failed build runs nothing.
+- [x] `/edit [EDITOR]` (Ctrl-E): the editor (Tablon's third argument, `vi` when not given) runs attached on the file shown; when it ends the file is read again and the project checked.
+- [x] `/stop` (Ctrl-X): the program run, else the build, else the check.
+- [x] The status bar's help is cut to the room what runs leaves, so `checking...` and the counts always show.
+
+How it works:
+
+- **One slot per process.** `PROC_SLOT` is idle, asked (the command is sent, no id yet) or running with its id and the output kept so far. The check, the build and the run each have one, and every process event is routed by the slot that holds its id, so a late line of a stopped build is dropped.
+- **Output is cut into lines as it comes.** `STREAM_LINES` keeps the last 500 lines and the bytes after the last line end; a line split across two pieces stays one line, and a rest longer than 4096 bytes is ended as a line.
+- **`gardelc`'s diagnostics are read by `DIAGNOSTICS`**, from the inspection's `diagnostics` field or the build's top-level array, into `PROBLEM`s (grade, rule, owner, routine, label, path, line, text). The build's note that names the executable, and the program's kind, come from the same list.
+- **The run follows the build.** `/run` sets `run_next` and starts a build; when the build ends with an executable, `start_run` runs it, attached when its kind is `reactive program`.
+
+Found on the way, in the compiler, fixed:
+
+- **A record bound by `let` had no type.** `let h = { Current with .. }` then `h.rest.length` was `E0199` (`invalid type for argument 0 in application of Seq_length: BYTES`): the local type inference gave a record literal or update no type, so the call went to the list's `length`. Both now have the module's own type. `tests/field_names.rs` gains a field `rest: BYTES` read through such a `let`.
+
+Found on the way, not fixed:
+
+- **A list's length has no upper bound in the proofs,** so `LIST_CUT.drop(ls, ls.length - 500)` cannot use an `ensure` guarded by `in_u64(n)`. Bounding it would be unsound, as `prepend` always adds one. `STREAM_LINES` counts its lines instead.
+- **A `let` that binds a name again at another type is `E0199`** (`cannot assign STRING to int`), the family already in the Roadmap.
+- **A program's standard output to a pipe is buffered,** so a prompt with no line end shows only when the buffer fills or the program ends. The README says so; flushing is the program's runtime's to do, not Tablon's.
+
+Tests: `tests/tablon.rs`, ten, the six of part one and four new. `a_check_lists_the_problems_and_enter_goes_to_the_line` (an error and a warning, the tab titled and chosen, the counts in the status bar, Enter to the line). `a_run_builds_then_streams_the_output_and_sends_the_input` (the build's command, the run's command from the build's note, output in pieces cut mid-line, a line typed and sent with its end, Ctrl-D, the exit code). `a_reactive_program_runs_attached_and_an_edit_is_read_again_and_checked`. `a_failed_build_runs_nothing_and_its_errors_go_to_problems`.
+
+Live checks, in a real console: on a scratch project with an ordinary program and a failing `require`, `/check` took 2.5 s and showed `Problems (1)`; Enter opened the line; after the fix Ctrl-R built and ran it, took a typed name and showed the greeting and `The program ended with code 0`. On `examples/todo_tui` (winpty, 110×30), Ctrl-R built it and gave it the terminal; `q` left it, and Tablon drew again with `The program ended with code 0`.
+
+Mutations, each on a private copy: thirteen, after a baseline that passes, all red. Twelve of Tablon: no diagnostics read, Enter on a problem going to the first line, each piece of output cut as its own lines, a run that does not follow its build, a reactive program not attached, a line sent without its end, keys not typed to the program, an edit not checked, warnings counted as errors, a failed build that runs, Ctrl-D ending nothing, and the Problems tab not chosen on an error. One of the compiler: a record literal with no type. Not tested: the help cut at narrow widths, seen only live.
 
 #### Task F.16: Editing in `gtui`
 

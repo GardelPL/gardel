@@ -1,11 +1,13 @@
--- Tablon's state: the project and the compiler that inspects it, which pane has the keys, the
--- Modules and Files trees with what each node stands for, the modules the inspection gave,
--- the module chosen and its views, the source shown with its marked line, the output, the
--- palette, and the processes and reads awaited. Every process and every read is a command,
--- and its answer an event, so the keys keep working while one runs.
+-- Tablon's state: the project, the compiler that inspects, checks and builds it, and the editor
+-- that edits it; which pane has the keys; the Modules and Files trees with what each node stands
+-- for; the modules the inspection gave; the module chosen and its views; the source shown with
+-- its marked line; the bottom pane's Output, Problems, Build and Run; the palette; and the
+-- processes and reads awaited. Every process and every read is a command, and its answer an
+-- event, so the keys keep working while one runs.
 --
--- Tags: 1 is the inspection, 100 and on the listings of directories, in the order asked, and
--- 1000 and on the reads of files, so an answer to a read no longer awaited is dropped.
+-- Tags: 1 is the inspection, 2 the check, 3 the build, 4 a program run with its output read, 5
+-- one run attached, 6 the editor; 100 and on the listings of directories, in the order asked;
+-- and 1000 and on the reads of files, so an answer to a read no longer awaited is dropped.
 module TABLON_STATE
 
 representation {NONE}
@@ -13,6 +15,7 @@ representation {NONE}
   high: NAT
   project: STRING
   compiler: STRING
+  editor: LIST[STRING]
   keys_at: FOCUS
   left_tabs: TABS
   module_tree: TREE_VIEW
@@ -34,21 +37,34 @@ representation {NONE}
   part_lines: VIEW_LINES
   parts_view: LIST_VIEW
   low_tabs: TABS
-  log: LIST[STRING]
-  inspecting: OPTION[PROC_ID]
-  inspect_running: BOOL
-  inspect_out: BYTES
+  log: STREAM_LINES
+  inspection: PROC_SLOT
+  verifying: BOOL
+  found: LIST[PROBLEM]
+  found_view: LIST_VIEW
+  checked_by: STRING
+  builder: PROC_SLOT
+  build_log: STREAM_LINES
+  run_next: BOOL
+  run_words: LIST[STRING]
+  runner: PROC_SLOT
+  attached_run: BOOL
+  run_log: STREAM_LINES
+  run_input: INPUT_LINE
+  typing: BOOL
+  editing: BOOL
   commands: PALETTE
   commands_open: BOOL
 
 create {ANY}
 
-  -- Tablon on the project in `dir`, inspected by the program `gardelc`, before the
-  -- commands of `starting` are sent.
-  make(dir: STRING, gardelc: STRING): TABLON_STATE
+  -- Tablon on the project in `dir`, inspected, checked and built by the program `gardelc`, its
+  -- files edited by the command line `editor`, before the commands of `starting` are sent.
+  make(dir: STRING, gardelc: STRING, editor: STRING): TABLON_STATE
     do
       let none: LIST[STRING] = LIST.empty
-      { wide = 80, high = 24, project = dir, compiler = gardelc, keys_at = FOCUS.make(3),
+      let no_problems: LIST[PROBLEM] = LIST.empty
+      { wide = 80, high = 24, project = dir, compiler = gardelc, editor = WORDS.of(editor), keys_at = FOCUS.make(3),
         left_tabs = TABS.empty.with("Modules", 'm').with("Files", 'f'),
         module_tree = TREE_VIEW.make(LIST.empty.prepend(TREE_NODE.make("inspecting...", 0))),
         module_entries = LIST.empty.prepend(TREE_ENTRY.group),
@@ -60,8 +76,12 @@ create {ANY}
         reading = 0, reads = 0, go_to = 0, go_mark = False,
         short_view = TEXT_VIEW.make(none), part_lines = VIEW_LINES.empty, parts_view = LIST_VIEW.make(none),
         low_tabs = TABS.empty.with("Output", 'o').with("Problems", 'p').with("Build", 'b').with("Run", 'r'),
-        log = none.prepend(GLYPHS.join("Tablon on ", dir)),
-        inspecting = None, inspect_running = True, inspect_out = BYTES.empty,
+        log = STREAM_LINES.empty.with_line(GLYPHS.join("Tablon on ", dir)),
+        inspection = PROC_SLOT.asked, verifying = False,
+        found = no_problems, found_view = LIST_VIEW.make(none), checked_by = "",
+        builder = PROC_SLOT.idle, build_log = STREAM_LINES.empty, run_next = False, run_words = none,
+        runner = PROC_SLOT.idle, attached_run = False, run_log = STREAM_LINES.empty, run_input = INPUT_LINE.empty,
+        typing = False, editing = False,
         commands = PALETTE.make(TABLON_STATE.palette_entries), commands_open = False }
     end
 
@@ -69,6 +89,7 @@ create {ANY}
     do
       LIST.empty
         .prepend("Tab moves between the panes; / opens the commands; q quits.")
+        .prepend("^K checks the project, ^B builds it, ^R runs it, ^E edits the file shown.")
         .prepend("")
         .prepend("Choose a module on the left, under Modules, or a file under Files, and press Enter.")
         .prepend("Tablon: a workbench for a Gardel project.")
@@ -79,13 +100,30 @@ create {ANY}
       LIST.empty
         .prepend(PALETTE_ENTRY.make("quit", "leave Tablon"))
         .prepend(PALETTE_ENTRY.make("open", "DIR  browse the project in DIR"))
-        .prepend(PALETTE_ENTRY.make("inspect", "read the project's modules again"))
+        .prepend(PALETTE_ENTRY.make("inspect", "read the project's modules again, unverified"))
+        .prepend(PALETTE_ENTRY.make("edit", "[EDITOR]  edit the file shown, then check  ^E"))
+        .prepend(PALETTE_ENTRY.make("stop", "stop the program, the build or the check  ^X"))
+        .prepend(PALETTE_ENTRY.make("run", "[ARGS]  build, then run the program  ^R"))
+        .prepend(PALETTE_ENTRY.make("build", "verify and compile the project  ^B"))
+        .prepend(PALETTE_ENTRY.make("check", "verify the project; failures go to Problems  ^K"))
     end
 
   -- The arguments that make `gardelc` give the project's short forms, type checked only.
   inspect_args: LIST[STRING]
     do
       LIST.empty.prepend("--no-verify").prepend("--json-diagnostics").prepend("--inspect").prepend(".").prepend("--project")
+    end
+
+  -- The arguments that make `gardelc` verify the project and give its short forms too.
+  check_args: LIST[STRING]
+    do
+      LIST.empty.prepend("--json-diagnostics").prepend("--inspect").prepend(".").prepend("--project")
+    end
+
+  -- The arguments that make `gardelc` verify and compile the project.
+  build_args: LIST[STRING]
+    do
+      LIST.empty.prepend("--json-diagnostics").prepend(".").prepend("--project")
     end
 
   -- The listing of each of `dirs`, under `project`, the first tagged `tag`.
@@ -118,10 +156,20 @@ create {ANY}
       if i < es.length then LIST_OPS.at(es, i) else TREE_ENTRY.group end
     end
 
-  -- The text lines of `d`, without empty ones.
-  text_of(d: BYTES): LIST[STRING]
+  -- Whether `a` and `b` name the same modules, in the same order.
+  same_modules(a: LIST[MODULE_INFO], b: LIST[MODULE_INFO]): BOOL
+    variant
+      a.length
     do
-      LIST_OPS.filter(TEXT_LINES.of_bytes(d), fn(l: STRING): BOOL do not l.is_empty end)
+      if a.length = 0 or b.length = 0 then a.length = b.length
+      else a.head.name.equals(b.head.name) and TABLON_STATE.same_modules(a.tail, b.tail)
+      end
+    end
+
+  -- `text` and a line end, as bytes, for a program's standard input.
+  input_line(text: STRING): BYTES
+    do
+      GLYPHS.join(text, "\n").to_utf8
     end
 
 feature {ANY}
@@ -149,7 +197,6 @@ feature {ANY}
     do
       if Current.left_tabs.selected = 0 then Current.module_tree else Current.file_tree end
     end
-
 
   view: NAT
     do
@@ -188,7 +235,54 @@ feature {ANY}
 
   output: LIST[STRING]
     do
-      Current.log
+      Current.log.lines
+    end
+
+  problems: LIST_VIEW
+    do
+      Current.found_view
+    end
+
+  has_problems: BOOL
+    do
+      Current.found.length > 0
+    end
+
+  -- What Problems shows when there are none.
+  no_problems: STRING
+    do
+      if Current.checked_by.equals("check") or Current.checked_by.equals("build") then "No problems: the project verifies."
+      else if Current.checked_by.equals("inspection") then "No problems in the type check. ^K verifies the project."
+      else "No check run yet. ^K verifies the project."
+      end end
+    end
+
+  build_output: LIST[STRING]
+    do
+      Current.build_log.lines
+    end
+
+  run_output: LIST[STRING]
+    do
+      Current.run_log.lines
+    end
+
+  -- Whether a program runs whose standard input Tablon writes.
+  takes_input: BOOL
+    do
+      Current.runner.process.is_some
+    end
+
+  input: INPUT_LINE
+    do
+      Current.run_input
+    end
+
+  -- Whether keys go to the program's standard input: it runs, the Run tab is chosen and has
+  -- the keys, and Escape has not stopped the typing.
+  typing_now: BOOL
+    do
+      Current.typing and Current.takes_input and Current.keys_at.current = 2 and Current.low_tabs.selected = 3
     end
 
   palette: PALETTE
@@ -216,12 +310,30 @@ feature {ANY}
       end
     end
 
-  -- What the status bar shows on its right: a run going on, or the modules found.
+  -- What the status bar shows on its left: the keys that work now.
+  help: STRING
+    do
+      if Current.typing_now then " Enter sends the line  ^D ends the input  Esc stops typing  ^X stops the program"
+      else if Current.runner.running or Current.builder.running or Current.inspection.running then
+        " Tab panes  / commands  ^K check  ^B build  ^R run  ^E edit  ^X stop  q quit"
+      else " Tab panes  / commands  ^K check  ^B build  ^R run  ^E edit  q quit"
+      end end
+    end
+
+  -- What the status bar shows on its right: what runs, or the modules found and the problems.
   activity: STRING
     do
-      if Current.inspect_running then "inspecting..."
-      else GLYPHS.join(NUMBER_TEXT.nat_to_text(Current.infos.length), " modules")
-      end
+      if Current.editing then "editing..."
+      else if Current.runner.running then "running..."
+      else if Current.builder.running then "building..."
+      else if Current.inspection.running then (if Current.verifying then "checking..." else "inspecting..." end)
+      else
+        let modules = GLYPHS.join(NUMBER_TEXT.nat_to_text(Current.infos.length), " modules")
+        if Current.found.length > 0 then GLYPHS.join(GLYPHS.join(modules, ", "), DIAGNOSTICS.tally(Current.found))
+        else if Current.checked_by.equals("check") or Current.checked_by.equals("build") then GLYPHS.join(modules, ", verified")
+        else modules
+        end end
+      end end end end
     end
 
   -- Of a size `w` by `h`.
@@ -230,33 +342,69 @@ feature {ANY}
       { Current with wide = w, high = h }
     end
 
-  -- `line` added to the output, the last 500 lines kept.
+  -- `line` added to the output.
   logged(line: STRING): TABLON_STATE
     do
-      let all = Current.log.append(LIST.empty.prepend(line))
-      { Current with log = if all.length > 500 then LIST_CUT.drop(all, all.length - 500) else all end }
+      { Current with log = Current.log.with_line(line) }
     end
 
-  -- `lines` added to the output.
-  logged_all(lines: LIST[STRING]): TABLON_STATE
-    variant
-      lines.length
-    do
-      if lines.length = 0 then Current else Current.logged(lines.head).logged_all(lines.tail) end
-    end
-
-  -- A key, when the palette is closed.
+  -- A key, when the palette is closed: to the program's input while typing, and otherwise `q`
+  -- quits, `/` opens the palette, a Ctrl key runs its command, Tab moves the keys, and the rest
+  -- go to the pane that has them.
   browse(k: KEY): TUI_NEXT[TABLON_STATE]
     do
-      match k
-        case Char(c) then
-          if c = 'q' then TUI_NEXT.quit(0)
-          else if c = '/' then TUI_NEXT.next({ Current with commands = PALETTE.make(TABLON_STATE.palette_entries), commands_open = True })
-          else Current.in_pane(k)
-          end end
-        case Tab then TUI_NEXT.next({ Current with keys_at = Current.keys_at.next })
-        case KeysEnded then TUI_NEXT.quit(0)
-        case _ then Current.in_pane(k)
+      if Current.typing_now then
+        Current.in_run(k)
+      else
+        match k
+          case Char(c) then
+            if c = 'q' then TUI_NEXT.quit(0)
+            else if c = '/' then TUI_NEXT.next({ Current with commands = PALETTE.make(TABLON_STATE.palette_entries), commands_open = True })
+            else Current.in_pane(k)
+            end end
+          case Ctrl(c) then Current.on_ctrl(c)
+          case Tab then TUI_NEXT.next({ Current with keys_at = Current.keys_at.next })
+          case KeysEnded then TUI_NEXT.quit(0)
+          case _ then Current.in_pane(k)
+        end
+      end
+    end
+
+  -- The command of a Ctrl key: K check, B build, R run, E edit, X stop.
+  on_ctrl(c: CHAR): TUI_NEXT[TABLON_STATE]
+    do
+      if c = 'k' then Current.run("check", "")
+      else if c = 'b' then Current.run("build", "")
+      else if c = 'r' then Current.run("run", "")
+      else if c = 'e' then Current.run("edit", "")
+      else if c = 'x' then Current.run("stop", "")
+      else TUI_NEXT.next(Current)
+      end end end end end
+    end
+
+  -- A key while typing to the program: Enter sends the line, Ctrl-D ends the input, Escape
+  -- stops the typing, Tab moves the keys, and the rest edit the line.
+  in_run(k: KEY): TUI_NEXT[TABLON_STATE]
+    do
+      match Current.runner.process
+        case Some(p) then
+          match k
+            case Enter then
+              let line = TABLON_STATE.input_line(Current.run_input.text)
+              Next({ Current with run_input = INPUT_LINE.empty, run_log = Current.run_log.fed(line) },
+                   LIST.empty.prepend(WriteProcess(p, line)))
+            case Ctrl(c) then
+              if c = 'd' then
+                Next({ Current with typing = False, run_log = Current.run_log.with_line("(the input is ended)") },
+                     LIST.empty.prepend(CloseInput(p)))
+              else Current.on_ctrl(c)
+              end
+            case Escape then TUI_NEXT.next({ Current with typing = False })
+            case Tab then TUI_NEXT.next({ Current with keys_at = Current.keys_at.next })
+            case KeysEnded then TUI_NEXT.quit(0)
+            case _ then TUI_NEXT.next({ Current with run_input = Current.run_input.on_key(k) })
+          end
+        case None then TUI_NEXT.next({ Current with typing = False })
       end
     end
 
@@ -265,7 +413,7 @@ feature {ANY}
     do
       if Current.keys_at.current = 0 then Current.in_project(k)
       else if Current.keys_at.current = 1 then Current.in_module(k)
-      else TUI_NEXT.next(Current.in_output(k))
+      else Current.in_output(k)
       end end
     end
 
@@ -323,10 +471,26 @@ feature {ANY}
       end end end
     end
 
-  -- A key in the output's pane.
-  in_output(k: KEY): TABLON_STATE
+  -- A key in the output's pane: a tab's key; in Problems, the arrows move and Enter goes to the
+  -- line; in Run, Enter types to the program running.
+  in_output(k: KEY): TUI_NEXT[TABLON_STATE]
     do
-      if Current.low_tabs.takes(k) then { Current with low_tabs = Current.low_tabs.on_key(k) } else Current end
+      if Current.low_tabs.takes(k) then
+        TUI_NEXT.next({ Current with low_tabs = Current.low_tabs.on_key(k) })
+      else if Current.low_tabs.selected = 1 then
+        match k
+          case Enter then Current.go_to_problem(Current.found_view.selected)
+          case _ then
+            TUI_NEXT.next({ Current with found_view = Current.found_view.on_key(k, TABLON_LAYOUT.rows_in(TABLON_LAYOUT.bottom(Current.area))) })
+        end
+      else if Current.low_tabs.selected = 3 then
+        match k
+          case Enter then TUI_NEXT.next({ Current with typing = Current.takes_input })
+          case _ then TUI_NEXT.next(Current)
+        end
+      else
+        TUI_NEXT.next(Current)
+      end end end
     end
 
   -- The lines of the list view shown, for the module chosen.
@@ -361,13 +525,18 @@ feature {ANY}
       end end
     end
 
+  -- The module `m` chosen and its views made.
+  chosen_as(m: MODULE_INFO): TABLON_STATE
+    do
+      let named = { Current with chosen = m.name, short_view = TEXT_VIEW.make(m.short) }
+      named.refreshed
+    end
+
   -- The module `name` chosen, its views made, and its source shown from its header.
   choose(name: STRING): TUI_NEXT[TABLON_STATE]
     do
       match MODULE_TREE.named(Current.infos, name)
-        case Some(m) then
-          let named = { Current with chosen = name, short_view = TEXT_VIEW.make(m.short) }
-          named.refreshed.open_source(m.file, if m.line > 0 then m.line - 1 else 0 end, False)
+        case Some(m) then Current.chosen_as(m).open_source(m.file, if m.line > 0 then m.line - 1 else 0 end, False)
         case None then TUI_NEXT.next(Current.logged(GLYPHS.join("No module named ", name)))
       end
     end
@@ -384,6 +553,28 @@ feature {ANY}
       end
     end
 
+  -- Enter on problem `i`: its line shown in Text, marked, and its module chosen when it has one.
+  go_to_problem(i: NAT): TUI_NEXT[TABLON_STATE]
+    do
+      if i < Current.found.length then
+        let p = LIST_OPS.at(Current.found, i)
+        let line = if p.line > 0 then p.line - 1 else 0 end
+        let as_text = { Current with views = Current.views.choose(MODULE_VIEWS.text_view) }
+        if p.file.is_empty then
+          TUI_NEXT.next(Current.logged("That problem is placed in no file."))
+        else
+          match MODULE_TREE.of_file(Current.infos, p.file)
+            case Some(m) then as_text.chosen_as(m).open_source(m.file, line, True)
+            case None then
+              let plain = { as_text with chosen = "" }
+              plain.refreshed.open_source(p.file, line, True)
+          end
+        end
+      else
+        TUI_NEXT.next(Current)
+      end
+    end
+
   -- The source `rel` shown from line `line`, from 0, marked when `mark` is set: at once when
   -- it is the one shown, and otherwise once it is read.
   open_source(rel: STRING, line: NAT, mark: BOOL): TUI_NEXT[TABLON_STATE]
@@ -391,13 +582,19 @@ feature {ANY}
       if rel.equals(Current.source_file) and Current.reading = 0 then
         TUI_NEXT.next(Current.at_line(line, mark))
       else
-        let n = if Current.reads < 1000000 then Current.reads + 1 else 1 end
-        let tag = 1000 + n
-        Next({ Current with source_file = rel, reading = tag, reads = n, go_to = line, go_mark = mark,
-                 source = TEXT_VIEW.make(LIST.empty.prepend(GLYPHS.join("Reading ", TABLON_STATE.shown_path(rel)))),
-                 mark_line = None },
-             LIST.empty.prepend(ReadFile(tag, TABLON_STATE.under(Current.project, rel))))
+        Current.read_source(rel, line, mark)
       end
+    end
+
+  -- The source `rel` read, to be shown from line `line`, marked when `mark` is set.
+  read_source(rel: STRING, line: NAT, mark: BOOL): TUI_NEXT[TABLON_STATE]
+    do
+      let n = if Current.reads < 1000000 then Current.reads + 1 else 1 end
+      let tag = 1000 + n
+      Next({ Current with source_file = rel, reading = tag, reads = n, go_to = line, go_mark = mark,
+               source = TEXT_VIEW.make(LIST.empty.prepend(GLYPHS.join("Reading ", TABLON_STATE.shown_path(rel)))),
+               mark_line = None },
+           LIST.empty.prepend(ReadFile(tag, TABLON_STATE.under(Current.project, rel))))
     end
 
   -- The source shown from line `line`, which is marked when `mark` is set.
@@ -458,65 +655,203 @@ feature {ANY}
       end
     end
 
-  -- Whether `p` is the inspection running.
-  is_inspection(p: PROC_ID): BOOL
-    do
-      match Current.inspecting
-        case Some(q) then q.equals(p)
-        case None then False
-      end
-    end
-
-  -- A process started: the inspection, when it has tag 1.
+  -- A process started: the inspection or the check, the build, or the program run.
   started(tag: NAT, p: PROC_ID): TABLON_STATE
     do
-      if tag = 1 then { Current with inspecting = Some(p) } else Current end
+      if tag = 1 or tag = 2 then { Current with inspection = Current.inspection.started(p) }
+      else if tag = 3 then { Current with builder = Current.builder.started(p) }
+      else if tag = 4 then { Current with runner = Current.runner.started(p) }
+      else Current
+      end end end
     end
 
   -- A process that could not be started.
   start_failed(tag: NAT): TABLON_STATE
     do
-      if tag = 1 then
-        let stopped = { Current with inspect_running = False }
-        stopped.logged(GLYPHS.join(GLYPHS.join("Could not run ", Current.compiler), "; give its path as Tablon's second argument."))
+      let hint = GLYPHS.join(GLYPHS.join("Could not run ", Current.compiler), "; give its path as Tablon's second argument.")
+      if tag = 1 or tag = 2 then
+        let stopped = { Current with inspection = PROC_SLOT.idle }
+        stopped.logged(hint)
+      else if tag = 3 then
+        { Current with builder = PROC_SLOT.idle, run_next = False, build_log = Current.build_log.with_line(hint) }
+      else if tag = 4 then
+        { Current with runner = PROC_SLOT.idle, typing = False, run_log = Current.run_log.with_line("The program could not be started.") }
       else
         Current
-      end
+      end end end
     end
 
-  -- Output of a process: the inspection's is kept until it ends.
+  -- Output of a process: the inspection's and the build's kept until they end, as they are
+  -- JSON; the program's shown in Run as it comes.
   printed(p: PROC_ID, d: BYTES): TABLON_STATE
     do
-      if Current.is_inspection(p) and Current.inspect_out.length <= 18446744073709551615 - d.length then
-        { Current with inspect_out = Current.inspect_out.concat(d) }
-      else
-        Current
-      end
+      if Current.inspection.holds(p) then { Current with inspection = Current.inspection.kept(d) }
+      else if Current.builder.holds(p) then { Current with builder = Current.builder.kept(d) }
+      else if Current.runner.holds(p) then { Current with run_log = Current.run_log.fed(d) }
+      else Current
+      end end end
     end
 
-  -- Error output of a process, which `gardelc` writes its steps to: shown in Output.
+  -- Error output of a process: `gardelc` writes its steps there, shown in Output for the
+  -- inspection and the check, and in Build for the build; the program's goes to Run.
   complained(p: PROC_ID, d: BYTES): TABLON_STATE
     do
-      Current.logged_all(TABLON_STATE.text_of(d))
+      if Current.inspection.holds(p) then { Current with log = Current.log.fed(d) }
+      else if Current.builder.holds(p) then { Current with build_log = Current.build_log.fed(d) }
+      else if Current.runner.holds(p) then { Current with run_log = Current.run_log.fed(d) }
+      else Current
+      end end end
     end
 
-  -- A process ended: the inspection's output read into the modules and their tree.
-  exited(p: PROC_ID, code: I64): TABLON_STATE
+  -- A process ended.
+  exited(p: PROC_ID, code: I64): TUI_NEXT[TABLON_STATE]
     do
-      if Current.is_inspection(p) then
-        let done = { Current with inspecting = None, inspect_running = False, inspect_out = BYTES.empty }
-        match INSPECTION.modules(Current.inspect_out)
-          case Some(ms) then
-            let rows = TABLON_LAYOUT.rows_in(TABLON_LAYOUT.left(Current.area))
-            let tree = TREE_VIEW.make(MODULE_TREE.nodes(ms))
-            let read = { done with infos = ms, module_tree = tree, module_entries = MODULE_TREE.entries(ms) }
-            read.refreshed.logged(GLYPHS.join(GLYPHS.join("Inspected: ", NUMBER_TEXT.nat_to_text(ms.length)), " modules."))
-          case None then
-            done.logged(GLYPHS.join("The inspection gave no modules; gardelc ended with ", NUMBER_TEXT.i64_to_text(code)))
+      if Current.inspection.holds(p) then TUI_NEXT.next(Current.inspected(code))
+      else if Current.builder.holds(p) then Current.built(code)
+      else if Current.runner.holds(p) then
+        TUI_NEXT.next({ Current with runner = PROC_SLOT.idle, typing = False,
+          run_log = Current.run_log.with_line(GLYPHS.join("The program ended with code ", NUMBER_TEXT.i64_to_text(code))) })
+      else TUI_NEXT.next(Current)
+      end end end
+    end
+
+  -- `ps` as the problems found by `by`: the inspection, the check or the build. Problems is
+  -- chosen when there is an error.
+  with_problems(ps: LIST[PROBLEM], by: STRING): TABLON_STATE
+    do
+      let shown = DIAGNOSTICS.problems(ps)
+      let n = shown.length
+      let title = if n = 0 then "Problems" else GLYPHS.join(GLYPHS.join("Problems (", NUMBER_TEXT.nat_to_text(n)), ")") end
+      let titled = Current.low_tabs.retitled(1, title)
+      { Current with found = shown, found_view = LIST_VIEW.make(LIST_OPS.map(shown, fn(p: PROBLEM): STRING do p.summary end)),
+        checked_by = by,
+        low_tabs = if DIAGNOSTICS.errors(shown) > 0 and not Current.typing_now then titled.choose(1) else titled end }
+    end
+
+  -- The inspection or the check ended: its object read into the modules, their tree and the
+  -- problems. A tree that names the same modules is kept as it is, with its open nodes, and an
+  -- object with no modules but errors leaves the modules as they were.
+  inspected(code: I64): TABLON_STATE
+    do
+      let out = Current.inspection.output
+      let by = if Current.verifying then "check" else "inspection" end
+      let done = { Current with inspection = PROC_SLOT.idle, log = Current.log.ended }
+      let none: LIST[PROBLEM] = LIST.empty
+      let ps = match DIAGNOSTICS.of_inspection(out)
+        case Some(xs) then xs
+        case None then none
+      end
+      match INSPECTION.modules(out)
+        case Some(ms) then
+          let keep = ms.length = 0 and DIAGNOSTICS.errors(ps) > 0
+          let same = TABLON_STATE.same_modules(ms, Current.infos)
+          let read = if keep then done
+            else if same then { done with infos = ms }
+            else { done with infos = ms, module_tree = TREE_VIEW.make(MODULE_TREE.nodes(ms)), module_entries = MODULE_TREE.entries(ms) }
+            end end
+          let n = NUMBER_TEXT.nat_to_text(read.infos.length)
+          let said = if Current.verifying then
+              GLYPHS.join(GLYPHS.join(GLYPHS.join("Checked: ", n), " modules, "), DIAGNOSTICS.tally(DIAGNOSTICS.problems(ps)))
+            else GLYPHS.join(GLYPHS.join("Inspected: ", n), " modules.")
+            end
+          read.refreshed.with_problems(ps, by).logged(said)
+        case None then
+          done.logged(GLYPHS.join("The inspection gave no modules; gardelc ended with ", NUMBER_TEXT.i64_to_text(code)))
+      end
+    end
+
+  -- The build ended: its problems read, and the executable its note names run when `/run`
+  -- asked for it.
+  built(code: I64): TUI_NEXT[TABLON_STATE]
+    do
+      let none: LIST[PROBLEM] = LIST.empty
+      let ps = match DIAGNOSTICS.of_build(Current.builder.output)
+        case Some(xs) then xs
+        case None then none
+      end
+      let exe = DIAGNOSTICS.executable(ps)
+      let ended = { Current with builder = PROC_SLOT.idle, build_log = Current.build_log.ended }
+      let done = ended.with_problems(ps, "build")
+      if exe.is_empty then
+        let errors = DIAGNOSTICS.errors(DIAGNOSTICS.problems(ps))
+        let why = if errors > 0 then GLYPHS.join(GLYPHS.join("The build failed: ", DIAGNOSTICS.counted(errors, "error")), "; see Problems.")
+          else GLYPHS.join("The build failed; gardelc ended with ", NUMBER_TEXT.i64_to_text(code))
+          end
+        let failed = { done with run_next = False, build_log = done.build_log.with_line(why) }
+        TUI_NEXT.next(if Current.run_next then { failed with run_log = STREAM_LINES.empty.with_line("Not run: the build failed.") } else failed end)
+      else
+        let made = { done with build_log = done.build_log.with_line(GLYPHS.join("Built ", exe)) }
+        if Current.run_next then made.start_run(exe, DIAGNOSTICS.program(ps)) else TUI_NEXT.next(made) end
+      end
+    end
+
+  -- The executable `exe`, built from `program`, run with the words `/run` was given: attached
+  -- when it is a reactive program, which needs the terminal, and with its output read into Run
+  -- and the keys typing to it otherwise.
+  start_run(exe: STRING, program: STRING): TUI_NEXT[TABLON_STATE]
+    do
+      let path = TABLON_STATE.under(Current.project, exe)
+      let reactive = match MODULE_TREE.named(Current.infos, program)
+        case Some(m) then m.kind.equals("reactive program")
+        case None then False
+      end
+      let shown = GLYPHS.join(GLYPHS.join("$ ", exe), if Current.run_words.length = 0 then "" else GLYPHS.join(" ", WORDS.joined(Current.run_words)) end)
+      if reactive then
+        Next({ Current with runner = PROC_SLOT.asked, attached_run = True, run_next = False, typing = False,
+                 run_log = STREAM_LINES.empty.with_line(GLYPHS.join(shown, "  (attached: it has the terminal)")),
+                 low_tabs = Current.low_tabs.choose(3) },
+             LIST.empty.prepend(RunAttached(5, path, Current.run_words, Current.project)))
+      else
+        Next({ Current with runner = PROC_SLOT.asked, attached_run = False, run_next = False, typing = True,
+                 run_log = STREAM_LINES.empty.with_line(shown), run_input = INPUT_LINE.empty,
+                 keys_at = Current.keys_at.moved_to(2), low_tabs = Current.low_tabs.choose(3) },
+             LIST.empty.prepend(RunProcess(4, path, Current.run_words, Current.project)))
+      end
+    end
+
+  -- A child run attached ended: the program, or the editor, after which the file is read again
+  -- and the project checked.
+  attached_ended(tag: NAT, r: RESULT[IO_ERROR, I64]): TUI_NEXT[TABLON_STATE]
+    do
+      if tag = 5 then
+        let said = match r
+          case Ok(code) then GLYPHS.join("The program ended with code ", NUMBER_TEXT.i64_to_text(code))
+          case Error(_) then "The program could not be started."
+        end
+        TUI_NEXT.next({ Current with runner = PROC_SLOT.idle, attached_run = False, run_log = Current.run_log.with_line(said) })
+      else if tag = 6 then
+        let back = { Current with editing = False }
+        match r
+          case Ok(_) then
+            let again = if back.source_file.is_empty then TUI_NEXT.next(back)
+              else back.read_source(back.source_file, if back.source.top < 1000000 then back.source.top + 3 else 0 end, False)
+              end
+            match again
+              case Next(s, cmds) then
+                if s.inspection.running then Next(s, cmds)
+                else Next(s.checking, cmds.append(LIST.empty.prepend(s.check_command)))
+                end
+              case Quit(c, cmds) then Quit(c, cmds)
+            end
+          case Error(_) then
+            TUI_NEXT.next(back.logged(GLYPHS.join(GLYPHS.join("Could not run the editor ", WORDS.joined(Current.editor)),
+              "; give its command as Tablon's third argument, or /edit EDITOR.")))
         end
       else
-        Current
-      end
+        TUI_NEXT.next(Current)
+      end end
+    end
+
+  -- The state of a check that is asked for.
+  checking: TABLON_STATE
+    do
+      let asked = { Current with inspection = PROC_SLOT.asked, verifying = True }
+      asked.logged("Checking the project.")
+    end
+
+  check_command: COMMAND
+    do
+      RunProcess(2, Current.compiler, TABLON_STATE.check_args, Current.project)
     end
 
   -- A key, when the palette is open: Escape closes it, Enter runs the command chosen, and
@@ -547,20 +882,64 @@ feature {ANY}
         if args.is_empty then
           TUI_NEXT.next(Current.logged("/open needs a directory."))
         else
-          let fresh = TABLON_STATE.make(args, Current.compiler).sized(Current.wide, Current.high)
+          let fresh = TABLON_STATE.make(args, Current.compiler, WORDS.joined(Current.editor)).sized(Current.wide, Current.high)
           Next(fresh, fresh.starting)
         end
-      else if name.equals("inspect") then
-        if Current.inspect_running then
-          TUI_NEXT.next(Current.logged("An inspection is running already."))
+      else if name.equals("inspect") or name.equals("check") then
+        if Current.inspection.running then
+          TUI_NEXT.next(Current.logged("A check or an inspection is running already."))
+        else if name.equals("check") then
+          Next(Current.checking, LIST.empty.prepend(Current.check_command))
         else
-          let again = { Current with inspect_running = True, inspect_out = BYTES.empty }
+          let again = { Current with inspection = PROC_SLOT.asked, verifying = False }
           Next(again.logged("Inspecting again."),
                LIST.empty.prepend(RunProcess(1, Current.compiler, TABLON_STATE.inspect_args, Current.project)))
-        end
+        end end
+      else if name.equals("build") or name.equals("run") then
+        if Current.builder.running then
+          TUI_NEXT.next(Current.logged("A build is running already."))
+        else if name.equals("run") and Current.runner.running then
+          TUI_NEXT.next(Current.logged("A program is running already; ^X stops it."))
+        else
+          let words = if name.equals("run") then WORDS.of(args) else LIST.empty end
+          Next({ Current with builder = PROC_SLOT.asked, run_next = name.equals("run"), run_words = words,
+                   build_log = STREAM_LINES.empty.with_line("Building the project."), low_tabs = Current.low_tabs.choose(2) },
+               LIST.empty.prepend(RunProcess(3, Current.compiler, TABLON_STATE.build_args, Current.project)))
+        end end
+      else if name.equals("stop") then
+        Current.stopped
+      else if name.equals("edit") then
+        let editor = if args.is_empty then Current.editor else WORDS.of(args) end
+        if Current.source_file.is_empty then
+          TUI_NEXT.next(Current.logged("Open a module or a file first."))
+        else if editor.length = 0 then
+          TUI_NEXT.next(Current.logged("No editor; give its command as /edit EDITOR."))
+        else
+          Next({ Current with editor = editor, editing = True },
+               LIST.empty.prepend(RunAttached(6, editor.head, editor.tail.append(LIST.empty.prepend(Current.source_file)), Current.project)))
+        end end
       else
         TUI_NEXT.next(Current.logged(GLYPHS.join("Unknown command ", name)))
-      end end end
+      end end end end end end
+    end
+
+  -- `/stop`: the program run, or else the build, or else the check.
+  stopped: TUI_NEXT[TABLON_STATE]
+    do
+      match Current.runner.process
+        case Some(p) then Next(Current.logged("Stopping the program."), LIST.empty.prepend(StopProcess(p)))
+        case None then
+          match Current.builder.process
+            case Some(p) then
+              let no_run = { Current with run_next = False }
+              Next(no_run.logged("Stopping the build."), LIST.empty.prepend(StopProcess(p)))
+            case None then
+              match Current.inspection.process
+                case Some(p) then Next(Current.logged("Stopping the check."), LIST.empty.prepend(StopProcess(p)))
+                case None then TUI_NEXT.next(Current.logged("Nothing is running that Tablon can stop."))
+              end
+          end
+      end
     end
 
 end

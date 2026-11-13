@@ -2,19 +2,24 @@
 -- the project on the left, under the tabs Modules and Files, each a tree; the module chosen on
 -- the right, under the tabs of its views; and the output at the bottom.
 --
---   gardelc tools/tablon --strict
---   ./tools/tablon/build/tablon_bin [DIR] [GARDELC]
+--   cd tools/tablon && gardelc --project . --strict
+--   ./build/tablon_bin [DIR] [GARDELC] [EDITOR]
 --
--- DIR is the project, `.` when it is not given, and GARDELC the compiler, `gardelc` on the
--- `PATH` when it is not given. Tablon runs `gardelc --inspect --json-diagnostics --no-verify`
--- on the project and lists its `src` as it starts; neither waits, so the keys work at once.
+-- DIR is the project, `.` when it is not given; GARDELC the compiler, `gardelc` on the `PATH`
+-- when it is not given; and EDITOR the command line that edits a file, `vi` when it is not
+-- given. Tablon runs `gardelc --inspect --json-diagnostics --no-verify` on the project and
+-- lists its `src` as it starts; neither waits, so the keys work at once. `tools/tablon/README.md`
+-- tells how to use it.
 --
 -- Tab moves the keys between the panes, and the pane that has them is framed in cyan. A tab's
 -- key chooses it: `m` and `f` on the left; `t`ext, `s`hort, `f`eatures, creators (`n`),
 -- `l`aws, `i`nvariants, concepts (`a`), instances (`d`), `c`lients and s`u`ppliers on the
 -- right. In a tree, the arrows move, Right opens a node and Left closes it, and Enter opens a
 -- module or a file. In a list view, Enter goes to the line of a part in Text, or to the
--- module a line names. `/` opens the commands: `/inspect`, `/open DIR` and `/quit`. `q` quits.
+-- module a line names. In Problems, Enter goes to the line of a failure. `/` opens the commands:
+-- `/check`, `/build`, `/run [ARGS]`, `/stop`, `/edit [EDITOR]`, `/inspect`, `/open DIR` and
+-- `/quit`; Ctrl-K, B, R, E and X are the first five. `q` quits. A program run with its output
+-- read takes the keys as its input until Escape; a reactive program is run attached.
 reactive program TABLON
 
 feature {ANY}
@@ -28,7 +33,8 @@ feature {ANY}
         case ProcessFailed(tag, _) then TUI_NEXT.next(s.start_failed(tag))
         case ProcessOutput(p, d) then TUI_NEXT.next(s.printed(p, d))
         case ProcessErrorOutput(p, d) then TUI_NEXT.next(s.complained(p, d))
-        case ProcessExited(p, code) then TUI_NEXT.next(s.exited(p, code))
+        case ProcessExited(p, code) then s.exited(p, code)
+        case AttachedEnded(tag, r) then s.attached_ended(tag, r)
         case DirListed(tag, r) then s.listed(tag, r)
         case FileRead(tag, r) then TUI_NEXT.next(s.file_read(tag, r))
         case _ then TUI_NEXT.next(s)
@@ -62,17 +68,31 @@ feature {ANY}
       end end
     end
 
-  -- What the bottom pane shows under its tab.
+  -- `lines`, or `none` when there are none, drawn in `r` so that the last line shows.
+  tail_view(lines: LIST[STRING], none: STRING, scr: SCREEN, r: RECT): SCREEN
+    do
+      let out = TEXT_VIEW.make(if lines.length = 0 then LIST.empty.prepend(none) else lines end)
+      out.scrolled_to(out.last_top(r.height), r.height).draw(scr, r, STYLE.plain)
+    end
+
+  -- What the bottom pane shows under its tab: Output, Problems, Build, or Run, whose last row
+  -- is the input line while a program takes input.
   output_view(s: TABLON_STATE, scr: SCREEN, r: RECT): SCREEN
     do
       let t = s.output_tabs.selected
-      let lines = if t = 0 then s.output
-        else if t = 1 then LIST.empty.prepend("No check run yet.")
-        else if t = 2 then LIST.empty.prepend("Nothing built yet.")
-        else LIST.empty.prepend("Nothing run yet.")
-        end end end
-      let out = TEXT_VIEW.make(lines)
-      out.scrolled_to(out.last_top(r.height), r.height).draw(scr, r, STYLE.plain)
+      if t = 0 then tail_view(s.output, "", scr, r)
+      else if t = 1 then
+        if s.has_problems then s.problems.draw(scr, r, STYLE.plain, mark(s, 2))
+        else tail_view(LIST.empty, s.no_problems, scr, r)
+        end
+      else if t = 2 then tail_view(s.build_output, "Nothing built yet. ^B builds the project.", scr, r)
+      else if s.takes_input and r.height >= 2 then
+        let shown = tail_view(s.run_output, "", scr, r.drop_bottom(1))
+        let cursor = if s.typing_now then STYLE.plain.reversed else STYLE.plain end
+        s.input.draw(shown, r.take_bottom(1), "> ", STYLE.plain.fg(COLOR.cyan), cursor)
+      else
+        tail_view(s.run_output, "Nothing run yet. ^R builds and runs the project.", scr, r)
+      end end end end
     end
 
   view(s: TABLON_STATE, blank: SCREEN): SCREEN
@@ -92,8 +112,12 @@ feature {ANY}
       let g = FRAME.draw(f, bottom, "", edge(s, 2), edge(s, 2))
       let h = s.output_tabs.draw(g, FRAME.title_area(bottom), STYLE.plain, chosen)
       let i = output_view(s, h, FRAME.inner(bottom))
-      let j = STATUS_BAR.draw(i, TABLON_LAYOUT.status(area), " Tab panes  / commands  Enter open  q quit",
-        GLYPHS.join(s.activity, " "), STYLE.plain.reversed)
+      -- The help cut where the activity starts, so the two never run together.
+      let doing = GLYPHS.join(GLYPHS.join(" ", s.activity), " ")
+      let room = if area.width > doing.code_point_count then area.width - doing.code_point_count else 0 end
+      let help = s.help
+      let hint = if help.code_point_count > room then help.slice(0, room) else help end
+      let j = STATUS_BAR.draw(i, TABLON_LAYOUT.status(area), hint, doing, STYLE.plain.reversed)
       if s.palette_open then
         s.palette.draw(j, TABLON_LAYOUT.palette(area, s.palette), STYLE.plain, STYLE.plain.bg(COLOR.blue), STYLE.plain.fg(COLOR.cyan))
       else
@@ -106,7 +130,8 @@ feature {ANY}
       let xs = args.to_list
       let dir = if xs.length > 0 then xs.head else "." end
       let gardelc = if xs.length > 1 then xs.tail.head else "gardelc" end
-      let s = TABLON_STATE.make(dir, gardelc)
+      let editor = if xs.length > 2 then xs.tail.tail.head else "vi" end
+      let s = TABLON_STATE.make(dir, gardelc, editor)
       match TUI.start(s, update, view)
         case Continue(t, cmds) then Continue(t, cmds.append(s.starting))
         case Stop(code, cmds) then Stop(code, cmds)

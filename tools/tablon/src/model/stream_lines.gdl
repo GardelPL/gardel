@@ -1,0 +1,104 @@
+-- Lines that come in pieces, as a process writes them. A piece is cut at each LF, and what
+-- follows the last LF waits for the next piece, so a line written in two pieces is one line.
+-- What waits is shown as the last line, and is ended as a line of its own once it is longer
+-- than 4096 bytes, so a program that writes no LF still shows what it writes. The last 500
+-- lines are kept.
+module STREAM_LINES
+
+representation {NONE}
+  kept: LIST[STRING]
+  rest: BYTES
+
+invariant
+  at_most: kept.length <= 500
+
+create {ANY}
+
+  empty: STREAM_LINES
+    do
+      { kept = LIST.empty, rest = BYTES.empty }
+    ensure
+      none: Result.count = 0
+    end
+
+  -- The last 500 of `ls`. A recursion on `tail`: `LIST_CUT.drop(ls, ls.length - 500)` would
+  -- not do, as a list's length has no bound the verifier knows, so `ls.length - 500` is not
+  -- known to be a NAT that `drop`'s contract speaks of.
+  cut(ls: LIST[STRING]): LIST[STRING]
+    variant
+      ls.length
+    do
+      if ls.length > 500 then STREAM_LINES.cut(ls.tail) else ls end
+    ensure
+      at_most: Result.length <= 500
+    end
+
+  -- The index after the last LF of `b` at or after `from`, or `from` when there is none.
+  after_last(b: BYTES, from: NAT): NAT
+    variant
+      b.length - from
+    do
+      if from >= b.length then
+        from
+      else
+        match b.index_of_byte(10, from)
+          case Some(i) then if i >= from and i < b.length then STREAM_LINES.after_last(b, i + 1) else from end
+          case None then from
+        end
+      end
+    ensure
+      within: from <= b.length implies Result <= b.length
+      not_before: Result >= from
+    end
+
+feature {ANY}
+
+  -- The lines, the one not yet ended last.
+  lines: LIST[STRING]
+    do
+      if Current.rest.length = 0 then Current.kept
+      else Current.kept.append(LIST.empty.prepend(TEXT_LINES.line(Current.rest, 0, Current.rest.length)))
+      end
+    end
+
+  count: NAT
+    do
+      Current.kept.length + (if Current.rest.length = 0 then 0 else 1 end)
+    end
+
+  -- The line not yet ended, ended.
+  ended: STREAM_LINES
+    do
+      if Current.rest.length = 0 then Current
+      else
+        { kept = STREAM_LINES.cut(Current.kept.append(LIST.empty.prepend(TEXT_LINES.line(Current.rest, 0, Current.rest.length)))),
+          rest = BYTES.empty }
+      end
+    end
+
+  -- `line` after the others, the one not yet ended ended first.
+  with_line(line: STRING): STREAM_LINES
+    do
+      let e = Current.ended
+      { kept = STREAM_LINES.cut(e.kept.append(LIST.empty.prepend(line))), rest = BYTES.empty }
+    end
+
+  -- `lines` after the others.
+  with_lines(lines: LIST[STRING]): STREAM_LINES
+    variant
+      lines.length
+    do
+      if lines.length = 0 then Current else Current.with_line(lines.head).with_lines(lines.tail) end
+    end
+
+  -- The piece `d` after what came: its lines ended at an LF, and the rest waiting.
+  fed(d: BYTES): STREAM_LINES
+    do
+      let all = if Current.rest.length <= 18446744073709551615 - d.length then Current.rest.concat(d) else d end
+      let k = STREAM_LINES.after_last(all, 0)
+      let done = TEXT_LINES.of_bytes(all.slice(0, k))
+      let next = { kept = STREAM_LINES.cut(Current.kept.append(done)), rest = all.slice(k, all.length) }
+      if next.rest.length > 4096 then next.ended else next end
+    end
+
+end

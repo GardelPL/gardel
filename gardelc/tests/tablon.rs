@@ -2,7 +2,10 @@
 //! fixture of `tests/inspect/` lists the modules the inspection gives and the files of `src`,
 //! shows each view of a module, takes Enter from a feature to its line in the source, marked,
 //! and from a client or supplier to that module; keys work while the inspection runs and a read
-//! no longer awaited is dropped; and a replay reproduces the screen with no process run.
+//! no longer awaited is dropped; and a replay reproduces the screen with no process run. A check
+//! fills Problems, whose Enter goes to the line; a run builds first, streams the program's output
+//! and sends it the lines typed; a reactive program runs attached; an edit is read again and
+//! checked; and a failed build runs nothing.
 //!
 //! The scripts stand in for `gardelc`: the inspection's output is the fixture's expected object,
 //! and a file read is the fixture's file, so the tests need no compiler run but the build.
@@ -65,12 +68,16 @@ const H: usize = 30;
 /// The start of every session: the size, the inspection's output and its end, and the listings
 /// of `src` and of `src/sub`.
 fn start() -> String {
-    let json = fs::read(fixture().join("expected.json")).expect("the expected object");
+    start_with(&fs::read(fixture().join("expected.json")).expect("the expected object"))
+}
+
+/// The start of a session whose inspection gives `json`.
+fn start_with(json: &[u8]) -> String {
     format!(
         "Resized:{W}:{H} ProcessStarted:1:7 ProcessErrorOutput:7:{} ProcessOutput:7:{} ProcessExited:7:0 \
          DirListed:100:fuse_cell.gdl/dsub/fcell.gdl/ DirListed:101:fnote.txt/ ",
         enc(b"[1/5] Linked\n"),
-        enc(&json)
+        enc(json)
     )
 }
 
@@ -170,7 +177,12 @@ impl Terminal {
 /// The screen a session leaves, after a resize to the same size, which draws it whole: the
 /// cells the diffs left before it must be the same.
 fn screen(steps: &str) -> (Terminal, String) {
-    let script = format!("{}{steps}Resized:{W}:{H}", start());
+    screen_from(&start(), steps)
+}
+
+/// The screen a session that starts with `first` leaves, as `screen`.
+fn screen_from(first: &str, steps: &str) -> (Terminal, String) {
+    let script = format!("{first}{steps}Resized:{W}:{H}");
     let ran = run(&script, &[]);
     assert_eq!(ran.status.code(), Some(1), "the end of a script is a shutdown: {}", all(&ran));
     let term = Terminal::read(&ran.stdout);
@@ -283,4 +295,138 @@ fn a_replay_reproduces_the_screen_with_no_process_run() {
     assert_eq!(again.stdout, first.stdout, "the replay writes the same bytes");
     assert!(Terminal::read(&again.stdout).text().contains("31   measure: NAT"));
     drop(fs::remove_dir_all(&dir));
+}
+
+/// A diagnostic as `gardelc --json-diagnostics` prints it. `message` is JSON text.
+fn diag(level: &str, module: &str, tag: &str, file: &str, line: usize, message: &str) -> String {
+    format!(
+        r#"{{"level": "{level}", "rule": "Phase 3 Boogie", "module": "{module}", "routine": "{tag}", "tag": "{tag}", "contract_tag": "{tag}", "span": {{ "file": "{file}", "line": {line}, "column": 1, "end_line": {line}, "end_column": 2 }}, "path_conditions": [], "counterexample": {{}}, "relevant_lemmas": [], "message": "{message}"}}"#
+    )
+}
+
+/// The fixture's object with `diags` as its diagnostics, and `kinds` replaced in it.
+fn inspection_with(diags: &[String], kinds: &[(&str, &str)]) -> Vec<u8> {
+    let mut text = fs::read_to_string(fixture().join("expected.json")).expect("the expected object");
+    assert!(text.contains("\"diagnostics\": []"));
+    text = text.replace("\"diagnostics\": []", &format!("\"diagnostics\": [{}]", diags.join(", ")));
+    for (from, to) in kinds {
+        assert!(text.contains(from), "{from}");
+        text = text.replace(from, to);
+    }
+    text.into_bytes()
+}
+
+/// The note of a build that names the executable of `module`.
+fn executable_note(module: &str) -> String {
+    diag("note", module, "executable", "build/use_cell_bin.exe", 1, "Compiled native executable -> build/use_cell_bin.exe")
+}
+
+/// The events of a build, process 8, that prints `steps` and `json` and ends with `code`.
+fn build(steps: &[u8], json: &str, code: usize) -> String {
+    format!("ProcessStarted:3:8 ProcessErrorOutput:8:{} ProcessOutput:8:{} ProcessExited:8:{code} ", enc(steps), enc(json.as_bytes()))
+}
+
+#[test]
+fn a_check_lists_the_problems_and_enter_goes_to_the_line() {
+    let checked = inspection_with(
+        &[
+            diag("error", "CELL", "same", "./cell.gdl", 31, "Formal verification condition `same` failed in `measure`"),
+            diag("warning", "USE_CELL", "naming", "./use_cell.gdl", 1, "W0201: a warning\\nwith a second line"),
+        ],
+        &[],
+    );
+    let check = format!(
+        "Key:Ctrl:k ProcessStarted:2:8 ProcessErrorOutput:8:{} ProcessOutput:8:{} ProcessExited:8:1 ",
+        enc(b"[cache] 1 modules verified now\n"),
+        enc(&checked)
+    );
+    // While it runs: the status says so, and the keys work.
+    let (term, log) = screen(&format!("Key:Ctrl:k ProcessStarted:2:8 {}", keys("s")));
+    assert!(log.contains("proc: RunProcess 2 gardelc %2D%2Dproject %2E %2D%2Dinspect %2D%2Djson%2Ddiagnostics in "), "{log}");
+    assert!(term.text().contains("checking...") && term.text().contains("^X stop"), "{}", term.text());
+    // Its end: Problems is chosen, with both, the warning's message to its first line.
+    let (term, _) = screen(&format!("{check}Key:Tab Key:Tab Key:Down Key:Up Key:Enter FileRead:1001:{} ", file("cell.gdl")));
+    let shown = term.text();
+    assert!(shown.contains("Problems (2)"), "{shown}");
+    assert!(shown.contains("cell.gdl:31  error  Formal verification condition `same` failed in `measure`"), "{shown}");
+    assert!(shown.contains("use_cell.gdl:1  warning  W0201: a warning") && !shown.contains("second line"), "{shown}");
+    assert!(shown.contains("2 modules, 1 error, 1 warning"), "{shown}");
+    // Enter on the error chose its module and marked its line.
+    assert!(shown.contains("CELL - Text"), "{shown}");
+    let marked = term.row_of("31   measure: NAT");
+    let start = marked.iter().position(|c| c.0 == '3').expect("the line's number");
+    assert!(marked[start..].iter().take(20).all(|c| c.1.contains(&44)), "the line is not marked: {marked:?}");
+    // Output has what the check said.
+    let (term, _) = screen(&format!("{check}Key:Tab Key:Tab {}", keys("o")));
+    assert!(term.text().contains("[cache] 1 modules verified now") && term.text().contains("Checked: 2 modules, 1 error, 1 warning"), "{}", term.text());
+}
+
+#[test]
+fn a_run_builds_then_streams_the_output_and_sends_the_input() {
+    let built = build(b"[5/5] Emitted C11 runtime target\n      Compiled", &format!("[{}]", executable_note("USE_CELL")), 0);
+    let ran = format!("{}{built}ProcessStarted:4:9 ProcessOutput:9:{} ", keys("/run 3 4") + "Key:Enter ", enc(b"Name? "));
+    // While it runs, the keys type to it, `q` too; Tab leaves the input, and the other panes work.
+    let (term, log) = screen(&format!("{ran}{}Key:Tab {}Key:Tab Key:Tab ", keys("qu"), keys("f")));
+    let shown = term.text();
+    assert!(log.contains("proc: RunProcess 3 gardelc %2D%2Dproject %2E %2D%2Djson%2Ddiagnostics in "), "{log}");
+    assert!(log.lines().any(|l| l.starts_with("proc: RunProcess 4 ") && l.contains("%2Fbuild%2Fuse%5Fcell%5Fbin%2Eexe 3 4 in ")), "{log}");
+    assert!(shown.contains("> qu") && shown.contains("$ build/use_cell_bin.exe 3 4") && shown.contains("Name?"), "{shown}");
+    assert!(shown.contains("running...") && shown.contains("Enter sends the line"), "{shown}");
+    assert!(shown.contains("▾ src"), "the Files tab was chosen while it ran:\n{shown}");
+    // A line sent, output in pieces that make one line, and the end.
+    let (term, log) = screen(&format!(
+        "{ran}{}Key:Enter ProcessOutput:9:{} ProcessErrorOutput:9:{} ProcessExited:9:0 ",
+        keys("quinn"),
+        enc(b"Hel"),
+        enc(b"lo, quinn\n")
+    ));
+    let shown = term.text();
+    assert!(sent(&log, "proc: WriteProcess 9 ", "quinn%0A"), "{log}");
+    for row in ["Name? quinn", "Hello, quinn", "The program ended with code 0"] {
+        assert!(shown.contains(row), "{row:?} is not shown:\n{shown}");
+    }
+    assert!(!shown.contains("> "), "the input line outlived the program:\n{shown}");
+    // Build has the compiler's steps, the last one ended by the end of the build.
+    let (term, _) = screen(&format!("{ran}Key:Escape {}", keys("b")));
+    let shown = term.text();
+    assert!(shown.contains("[5/5] Emitted C11 runtime target") && shown.contains("      Compiled") && shown.contains("Built build/use_cell_bin.exe"), "{shown}");
+    // Ctrl-X stops it, and Ctrl-D ends its input.
+    let (_, log) = screen(&format!("{ran}Key:Ctrl:d Key:Ctrl:x "));
+    assert!(log.contains("proc: CloseInput 9") && log.contains("proc: StopProcess 9"), "{log}");
+}
+
+#[test]
+fn a_reactive_program_runs_attached_and_an_edit_is_read_again_and_checked() {
+    let reactive = inspection_with(&[], &[("\"name\": \"USE_CELL\", \"kind\": \"functions\"", "\"name\": \"USE_CELL\", \"kind\": \"reactive program\"")]);
+    let first = start_with(&reactive);
+    let built = build(b"", &format!("[{}]", executable_note("USE_CELL")), 0);
+    let (term, log) = screen_from(&first, &format!("Key:Ctrl:r {built}AttachedEnded:5:0 Resized:{W}:{H} "));
+    assert!(log.lines().any(|l| l.starts_with("proc: RunAttached 5 ") && l.contains("%2Fbuild%2Fuse%5Fcell%5Fbin%2Eexe in ")), "{log}");
+    let shown = term.text();
+    assert!(shown.contains("(attached: it has the terminal)") && shown.contains("The program ended with code 0"), "{shown}");
+    assert!(shown.contains("▾ reactive programs"), "{shown}");
+    // The editor on the file shown, then the file read again and a check.
+    let cell = choose(4, 1001, "cell.gdl");
+    let (term, log) = screen_from(&first, &format!("{cell}Key:Ctrl:e AttachedEnded:6:0 Resized:{W}:{H} FileRead:1002:{} ", file("cell.gdl")));
+    assert!(sent(&log, "proc: RunAttached 6 vi %2E%2Fcell%2Egdl in ", ""), "{log}");
+    assert!(sent(&log, "file: ReadFile 1002 ", "%2F%2E%2Fcell%2Egdl"), "{log}");
+    assert!(log.contains("proc: RunProcess 2 gardelc "), "{log}");
+    assert!(term.text().contains("checking...") && term.text().contains("CELL - Text"), "{}", term.text());
+    // An editor that does not start says how to give another.
+    let (term, _) = screen_from(&first, &format!("{cell}{}Key:Enter AttachFailed:6:2 Resized:{W}:{H} Key:Tab Key:Tab {}", keys("/edit nano -w"), keys("o")));
+    assert!(term.text().contains("Could not run the editor nano -w"), "{}", term.text());
+}
+
+#[test]
+fn a_failed_build_runs_nothing_and_its_errors_go_to_problems() {
+    let error = diag("error", "CELL", "same", "./cell.gdl", 31, "Formal verification condition `same` failed in `measure`");
+    let steps = format!("Key:Ctrl:r {}Key:Tab Key:Tab ", build(b"", &format!("[{error}]"), 1));
+    let (term, log) = screen(&steps);
+    let shown = term.text();
+    assert!(!log.contains("RunProcess 4") && !log.contains("RunAttached"), "{log}");
+    assert!(shown.contains("Problems (1)") && shown.contains("cell.gdl:31  error"), "{shown}");
+    let (term, _) = screen(&format!("{steps}{}", keys("b")));
+    assert!(term.text().contains("The build failed: 1 error; see Problems."), "{}", term.text());
+    let (term, _) = screen(&format!("{steps}{}", keys("r")));
+    assert!(term.text().contains("Not run: the build failed."), "{}", term.text());
 }

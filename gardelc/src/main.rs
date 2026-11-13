@@ -7330,6 +7330,9 @@ fn infer_gardel_type(e: &Expr, m: &ModuleDecl, ctx: &BoogiePreludeCtx) -> Option
         Expr::MethodCall(recv, r, _) if conversion_result(recv, r).is_some() => {
             conversion_result(recv, r).map(str::to_string)
         }
+        // A record is of the module's own type (F.11d): `let h = { Current with .. }` then
+        // `h.rest.length` read `rest` as a list's, and `.length` became `Seq_length`.
+        Expr::RecordLit(_) | Expr::RecordUpdate(_, _) => Some(module_self_type(m)),
         Expr::Bool(_) | Expr::UnaryNot(_) => Some("BOOL".to_string()),
         Expr::BinOp(op, l, rhs) => {
             if matches!(
