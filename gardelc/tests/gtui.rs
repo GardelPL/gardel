@@ -86,11 +86,15 @@ struct Terminal {
     /// The cells just before each clear of the screen.
     before_clear: Vec<Vec<Vec<Cell>>>,
     printed: usize,
+    /// Whether the cursor is shown, and where it was when it was last shown.
+    cursor: Option<(usize, usize)>,
+    /// What each OSC 52 sequence put on the clipboard, base64 as sent.
+    copies: Vec<String>,
 }
 
 impl Terminal {
     fn new(sizes: Vec<(usize, usize)>) -> Self {
-        Self { sizes, clears: 0, size: None, grid: Vec::new(), row: 0, col: 0, pen: Vec::new(), before_clear: Vec::new(), printed: 0 }
+        Self { sizes, clears: 0, size: None, grid: Vec::new(), row: 0, col: 0, pen: Vec::new(), before_clear: Vec::new(), printed: 0, cursor: None, copies: Vec::new() }
     }
 
     fn feed(&mut self, bytes: &[u8]) {
@@ -99,8 +103,17 @@ impl Terminal {
         let mut i = 0;
         while i < cs.len() {
             let c = cs[i];
+            if c == '\u{1b}' && cs.get(i + 1) == Some(&']') {
+                let end = cs[i..].iter().position(|c| *c == '\u{7}').expect("an OSC ends with BEL") + i;
+                let body: String = cs[i + 2..end].iter().collect();
+                let data = body.strip_prefix("52;c;").expect("only OSC 52");
+                assert!(data.chars().all(|c| c.is_ascii_alphanumeric() || "+/=".contains(c)), "base64: {data}");
+                self.copies.push(data.to_string());
+                i = end + 1;
+                continue;
+            }
             if c == '\u{1b}' {
-                assert_eq!(cs.get(i + 1), Some(&'['), "only CSI sequences, at char {i}");
+                assert_eq!(cs.get(i + 1), Some(&'['), "only CSI and OSC sequences, at char {i}");
                 let mut j = i + 2;
                 let private = cs.get(j) == Some(&'?');
                 if private {
@@ -111,8 +124,16 @@ impl Terminal {
                     j += 1;
                 }
                 let params: Vec<u32> = cs[start..j].iter().collect::<String>().split(';').map(|p| p.parse().unwrap_or(0)).collect();
+                // The cursor's shape, `CSI n SP q`.
+                if cs[j] == ' ' && cs.get(j + 1) == Some(&'q') {
+                    assert!(params == vec![6] || params == vec![0], "a bar, or the terminal's own: {params:?}");
+                    i = j + 2;
+                    continue;
+                }
                 let fin = cs[j];
                 match (private, fin) {
+                    (true, 'h') if params == vec![25] => self.cursor = Some((self.row, self.col)),
+                    (true, 'l') if params == vec![25] => self.cursor = None,
                     (true, 'h') | (true, 'l') => {}
                     (false, 'H') => {
                         let (w, h) = self.size.expect("a cursor move after a size is known");
@@ -207,7 +228,7 @@ fn a_session_draws_only_inside_the_screen() {
     assert!(shown.contains("[x] item"), "{shown}");
     assert!(shown.contains("] a very long item that does not fit é in forty column "), "{shown}");
     assert!(shown.contains("[ ] t ??"), "the tab, escape and bell are shown as a space and `?`:\n{shown}");
-    assert!(ran.stdout.ends_with(b"\x1b[0m\x1b[?25h\x1b[?1049l"), "the screen is put back");
+    assert!(ran.stdout.ends_with(b"\x1b[?2004l\x1b[0m\x1b[0 q\x1b[?25h\x1b[?1049l"), "the screen is put back");
 }
 
 #[test]
@@ -218,8 +239,8 @@ fn a_shutdown_puts_the_terminal_back_and_a_replay_repeats_the_run() {
     let script = format!("Resized:50:6 Key:97 {}Key:Enter Key:32", keys("milk"));
     let first = run(&dir.bin("todo_tui"), &script, &[("GARDEL_RECORD", &log)]);
     assert_eq!(first.status.code(), Some(1), "the end of a script is a shutdown: {}", all(&first));
-    assert!(first.stdout.starts_with(b"\x1b[?1049h"), "the alternate screen is taken");
-    assert!(first.stdout.ends_with(b"\x1b[0m\x1b[?25h\x1b[?1049l"), "and given back");
+    assert!(first.stdout.starts_with(b"\x1b[?1049h\x1b[0m\x1b[2J\x1b[?25l\x1b[6 q\x1b[?2004h"), "the alternate screen is taken, with pastes bracketed");
+    assert!(first.stdout.ends_with(b"\x1b[?2004l\x1b[0m\x1b[0 q\x1b[?25h\x1b[?1049l"), "and given back");
     let mut term = Terminal::new(sizes(&script));
     term.feed(&first.stdout);
     assert!(term.text().contains("[x] milk"), "{}", term.text());
@@ -494,7 +515,7 @@ fn an_attached_child_gets_the_terminal_and_the_tour_comes_back() {
     assert!(started.elapsed() < Duration::from_secs(20));
     assert_eq!(out.status.code(), Some(0), "{}", all(&out));
     let text = String::from_utf8(out.stdout.clone()).expect("UTF-8");
-    let leave = "\x1b[0m\x1b[?25h\x1b[?1049l";
+    let leave = "\x1b[?2004l\x1b[0m\x1b[0 q\x1b[?25h\x1b[?1049l";
     let enter = "\x1b[?1049h";
     let gone = text.find(leave).unwrap_or_else(|| panic!("the screen is put back: {text:?}"));
     let rest = gone + leave.len();
@@ -558,4 +579,72 @@ end
         assert!(!out.status.success(), "{name} must be refused: {}", all(&out));
         assert!(all(&out).contains(&format!("`{name}`")), "{name}: {}", all(&out));
     }
+}
+
+/// A client that types, takes a paste, shows the cursor after its text and copies the text:
+/// a paste is one event after which keys are read again, the frame places the cursor, a copy
+/// reaches the terminal as OSC 52, and any other `Write` of the client is dropped.
+const TYPING: &str = "reactive program TYPING
+
+feature {ANY}
+
+  update(s: STRING, e: EVENT): TUI_NEXT[STRING]
+    do
+      match e
+        case Pasted(t) then TUI_NEXT.next(GLYPHS.join(s, t))
+        case Key(k) then
+          match k
+            case Char(c) then
+              if c = 'q' then TUI_NEXT.quit(0) else TUI_NEXT.next(GLYPHS.join(s, GLYPHS.text_of(LIST.empty.prepend(c)))) end
+            case Ctrl(c) then
+              if c = 'y' then Next(s, LIST.empty.prepend(Write(\"dropped\")).prepend(TUI_COMMANDS.copy(s))) else TUI_NEXT.next(s) end
+            case Escape then TUI_NEXT.next(\"\")
+            case _ then TUI_NEXT.next(s)
+          end
+        case _ then TUI_NEXT.next(s)
+      end
+    end
+
+  view(s: STRING, blank: SCREEN): SCREEN
+    do
+      let drawn = blank.text(blank.area, 0, 0, s, STYLE.plain)
+      if s.byte_length = 0 then drawn else drawn.with_cursor(GLYPHS.of_text(s).length, 0) end
+    end
+
+  init(args: SEQ[STRING]): STEP[TUI[STRING]]
+    do
+      TUI.start(\"\", update, view)
+    end
+
+  step(t: TUI[STRING], e: EVENT): STEP[TUI[STRING]]
+    do
+      t.step(e)
+    end
+
+end
+";
+
+#[test]
+fn a_paste_is_one_event_the_cursor_follows_the_text_and_a_copy_reaches_the_clipboard() {
+    let p = Project::new("gtui_typing", TYPING);
+    let src = p.0 .0.join("p/src");
+    fs::rename(src.join("client.gdl"), src.join("typing.gdl")).expect("named after its module");
+    assert_ok(&p.check());
+    let log = p.0 .0.join("run.log");
+    let script = "Resized:20:4 Key:104 Key:105 Pasted:%20th%C3%A9re Key:Ctrl:y Key:120 Key:Ctrl:y Key:Escape Key:113";
+    let ran = run(&p.0.bin("typing"), script, &[("GARDEL_RECORD", &log)]);
+    assert_eq!(ran.status.code(), Some(0), "{}", all(&ran));
+    let mut term = Terminal::new(sizes(script));
+    term.feed(&ran.stdout);
+    // "hi thére" is eight characters: the cursor stood after them before Escape emptied it.
+    // Its nine bytes need no padding, and the ten of "hi thérex" two `=`.
+    assert_eq!(term.copies, ["aGkgdGjDqXJl", "aGkgdGjDqXJleA=="], "the copy is the text's UTF-8 in base64");
+    let out = String::from_utf8_lossy(&ran.stdout);
+    assert!(out.contains("\x1b[1;9H\x1b[?25h"), "the cursor is placed after the text and shown:\n{out:?}");
+    assert!(out.contains("\x1b[0m\x1b[?25l"), "it is hidden while a frame is drawn, and when the text is gone:\n{out:?}");
+    assert!(!out.contains("dropped"), "a Write that is not a copy is dropped");
+    let text = fs::read_to_string(&log).expect("a log");
+    let after_paste = text.split("event Pasted:%20th%C3%A9re\n").nth(1).expect("the paste is logged");
+    let before_next = after_paste.split("event ").next().expect("commands");
+    assert!(before_next.contains("command ReadKey\n"), "keys are read again after a paste:\n{before_next}");
 }

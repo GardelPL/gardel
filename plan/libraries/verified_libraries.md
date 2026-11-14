@@ -931,14 +931,41 @@ Needs F.11. Makes Tablon's Text view an editor, so a failure can be fixed where 
 
 A decision to take first: **how modifiers enter `KEY`.** A `Mod(key, shift, alt, ctrl)` constructor keeps every `match` on `KEY` working, as a client that does not list it falls to `case _`. A field on every key breaks every client. Proposed: the constructor.
 
-**F.16a: the host.**
+Taken: the constructor, `Mod(key, shift, alt, ctrl)`.
 
-- [ ] Keys: Shift with the arrows, Home and End (selection), Ctrl with the arrows (by word), Shift-Tab, Insert and F1 to F12, decoded from VT and from Windows key records alike, as F.9 did.
-- [ ] Bracketed paste: `Pasted(text)`, one event, sanitised like a cell, rather than a key per character.
-- [ ] `WriteFile(tag, path, bytes)` and `FileWritten(tag, RESULT[IO_ERROR, UNIT])`, written to a file beside it and renamed over it, so a crash leaves the old file or the new one.
-- [ ] The cursor: a frame may end by placing the terminal's cursor, shown, in a bar shape; `leave` gives the default back.
-- [ ] Copy through OSC 52 (write only). No clipboard read.
-- [ ] Logged and scripted like every command, so a replay writes no file.
+**F.16a: the host.** ✅ Completed on 2026-11-13.
+
+- [x] Keys: `Mod(key, shift, alt, ctrl)` for Shift, Alt and Ctrl with the arrows, Home, End, Page Up and Down, Insert, Delete, Tab, Enter, Backspace, Escape and the F-keys, and Alt with a character; `Insert`; `Function(n)` for F1 to F12. Decoded from xterm's sequences and from Windows key records alike.
+- [x] Bracketed paste: `Pasted(text)`, one event answering a `ReadKey`, its text cleaned so that nothing pasted reaches the terminal as a sequence.
+- [x] `WriteFile(tag, path, data)` and `FileWritten(tag, RESULT[IO_ERROR, NAT])`, written to a file beside it and renamed over it, so a crash leaves the old file or the new one.
+- [x] The cursor: `SCREEN.with_cursor(x, y)`; a frame ends by placing the terminal's cursor there, shown, in a bar shape, and `leave` gives the default back.
+- [x] Copy through OSC 52 (write only), `TUI_COMMANDS.copy`. No clipboard read.
+- [x] Logged and scripted like every command, so a replay writes no file.
+- [x] Added: Tablon's `/new NAME`, the first client of `WriteFile`.
+
+How it works:
+
+- **A key's modifiers ride beside it.** The host's event holds the key and `mods`, xterm's modifier bits less one (Shift 1, Alt 2, Ctrl 4; Meta is dropped). The loop builds the key, then wraps it in a `Mod` when `mods` is set, so every key has one place where its modifiers are added. `Mod` never wraps a `Mod`, `Ctrl`, `Other` or `KeysEnded`, and a `Char` only with Alt; the script parser refuses the rest, so a script holds only what a terminal can send.
+- **One decoder for both platforms.** The VT decoder reads the second CSI parameter as the modifier, skips a kitty sub-parameter after `:`, and knows `ESC [ Z` (Shift-Tab), `ESC O P` to `S` and `ESC [ 11 ~` to `24 ~` (the F-keys), `ESC [ 2 ~` (Insert), and Escape followed by a key (Alt). On a Windows console, raw mode now asks for VT input (`ENABLE_VIRTUAL_TERMINAL_INPUT`), and the characters of the key records go through the same decoder as bytes; a record that names its key by code (a console that refuses VT input, or winpty) is read by the code, with Shift, Alt and Ctrl from its state. AltGr, which is Ctrl and Alt, makes a character and is not taken for Alt.
+- **A paste is cut at its end marker.** After `ESC [ 200 ~` the bytes up to `ESC [ 201 ~` are one paste; an Escape inside it that does not start the marker is kept, and cleaned out after. A paste whose end never comes ends after 2 s with no byte, and 16 MiB of one are kept. The cleaning: bytes that are not UTF-8 become U+FFFD, CR LF and CR become LF, and C0 but LF and Tab, DEL and C1 are dropped.
+- **A write never leaves a part.** The helper thread writes `path.gardel-<pid>-<n>.tmp`, flushes it (`FlushFileBuffers`, `fsync`), renames it over `path` (`MoveFileExW` with `REPLACE_EXISTING` and `WRITE_THROUGH`, `rename`), and on POSIX syncs the directory; on any failure it removes the new file. On POSIX the new file takes the old one's mode.
+- **`gtui` lets one `Write` through.** `TUI_COMMANDS.own` still drops an application's `Write`, but one that `VT_TEXT.is_copy` accepts: `ESC ] 52 ; c ;`, base64 letters only, then BEL. Nothing in it can end the sequence early.
+
+Changed from the plan above:
+
+- **`FileWritten` carries the bytes written,** a `RESULT[IO_ERROR, NAT]`, as the prelude has no `UNIT`. In C a `NAT` is a `U64`, so the instance is `RESULT_IO_ERROR_U64`.
+- **Ctrl-Right is no longer `Right`.** F.9 left a modifier out, as Windows reported the key alone; now both platforms report it, so a program that wants Ctrl-Right as Right says so in a `case Mod(...)`.
+
+Found on the way:
+
+- **An inline `if` needs its `end`.** `let y = if c then a else b` without `end` is a parse error at the next `let`.
+- **A line that starts with `(` after a `let` is read as a call** of the `let`'s value: `let c = cs.head` then `(p(c) or q(c)) and r` parses as `cs.head(...)`. The parse error points at a later line. Not fixed; the code names the test instead.
+
+Tests: the F.9 tests decode every new key from bytes (modifiers, kitty's `:1`, Meta dropped, F1 to F12, Insert, Shift-Tab, Alt with a character and with Enter, an unknown `~` number) and two pastes, one holding an escape, a bad byte and a C1 control, the other an end marker cut by an Escape; from a script, each new form, and twelve malformed ones refused. `tests/files_procs.rs`: `write_file_replaces_a_file_whole_and_a_replay_writes_none`. `tests/gtui.rs`: `a_paste_is_one_event_the_cursor_follows_the_text_and_a_copy_reaches_the_clipboard`, through the VT terminal, which now reads OSC 52 and the cursor's shape and place. `tests/tablon.rs`: `new_makes_a_module_where_there_is_no_file_then_opens_it_and_inspects_again`.
+
+Live, in a real console (winpty, 100 by 24): Ctrl-Right, Shift-Tab, F5, Insert, Alt-x, Home, a character, Escape, a bracketed paste and Enter each came through as the key, or the paste, they are.
+
+Mutations, each on a private copy: twenty-four, after a baseline that passes, all red. The host's: a modifier left out, Shift-Tab not decoded, the F-keys one off, Escape and a key not taken for Alt, a paste that keeps its escapes, a paste cut at its first Escape, and a script that takes `Ctrl+Ctrl:x` or a character with Shift; the new file left after a failed write, no count of bytes written, a replay that writes the file, and a failure taken for a write. `gtui`'s: no read after a paste, a copy dropped, any `Write` let through, the cursor not hidden while drawing, the cursor never placed, a base64 letter off by one (which the verifier caught too), no `=` padding, and pastes not bracketed. Tablon's: `/new` writing over a file, the file not in lowercase, no inspection after it, and a name that starts with a digit. The padding survived the first round, as the copied text was nine bytes; the test now copies ten too. Not tested but live: a Windows console's key records with their modifiers, which winpty gives.
 
 **F.16b: `gtui` 0.3.0.**
 

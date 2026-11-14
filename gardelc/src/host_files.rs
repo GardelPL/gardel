@@ -71,6 +71,9 @@ __declspec(dllimport) int __stdcall AssignProcessToJobObject(void*, void*);
 __declspec(dllimport) int __stdcall TerminateJobObject(void*, unsigned int);
 __declspec(dllimport) unsigned long __stdcall GetEnvironmentVariableW(const wchar_t*, wchar_t*, unsigned long);
 __declspec(dllimport) unsigned long __stdcall SearchPathW(const wchar_t*, const wchar_t*, const wchar_t*, unsigned long, wchar_t*, wchar_t**);
+__declspec(dllimport) int __stdcall FlushFileBuffers(void*);
+__declspec(dllimport) int __stdcall MoveFileExW(const wchar_t*, const wchar_t*, unsigned long);
+__declspec(dllimport) int __stdcall DeleteFileW(const wchar_t*);
 #include <wchar.h>
 #define GARDEL_NO_HANDLE ((void*)(intptr_t)-1)
 static void* gardel_reader_wake = NULL; /* auto-reset: a RunAttached wants the reader parked */
@@ -116,6 +119,32 @@ static int64_t gardel_os_read(const char* path, size_t path_len, char** out, siz
     *out = buf;
     *out_len = len;
     return 0;
+}
+
+/* `data` written to `tmp`, a new file beside `path`, flushed, then renamed over `path`: a crash
+   leaves the old file or the new one, never a part. `tmp` is removed when anything fails. */
+static int64_t gardel_os_write(const char* path, size_t path_len, const char* tmp, size_t tmp_len, const char* data, size_t n) {
+    wchar_t* w = gardel_wide(path, path_len);
+    wchar_t* wt = gardel_wide(tmp, tmp_len);
+    if (!w || !wt || path_len == 0 || memchr(path, 0, path_len)) { free(w); free(wt); return GARDEL_FILE_ERR_INVALID; }
+    /* GENERIC_WRITE, no sharing, CREATE_NEW */
+    void* h = CreateFileW(wt, 0x40000000UL, 0, NULL, 1, 0x80, NULL);
+    if (h == GARDEL_NO_HANDLE) { int64_t e = (int64_t)GetLastError(); free(w); free(wt); return e; }
+    int64_t err = 0;
+    while (n > 0 && !err) {
+        unsigned long put = 0;
+        if (!WriteFile(h, data, (unsigned long)(n > 0x40000000 ? 0x40000000 : n), &put, NULL) || put == 0) err = (int64_t)GetLastError();
+        data += put;
+        n -= put;
+    }
+    if (!err && !FlushFileBuffers(h)) err = (int64_t)GetLastError();
+    CloseHandle(h);
+    /* MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH */
+    if (!err && !MoveFileExW(wt, w, 1 | 8)) err = (int64_t)GetLastError();
+    if (err) DeleteFileW(wt);
+    free(w);
+    free(wt);
+    return err;
 }
 
 /* WIN32_FIND_DATAW: FILETIME is two DWORDs, so it packs at 4. */
@@ -455,6 +484,44 @@ static int64_t gardel_os_read(const char* path, size_t path_len, char** out, siz
     return 0;
 }
 
+/* As on Windows: a new file beside `path`, with the mode of the file it replaces, written,
+   synced and renamed over it, then the directory synced, so the rename lasts. */
+static int64_t gardel_os_write(const char* path, size_t path_len, const char* tmp, size_t tmp_len, const char* data, size_t n) {
+    char* c = path_len ? gardel_c_text(path, path_len) : NULL;
+    char* t = gardel_c_text(tmp, tmp_len);
+    if (!c || !t) { free(c); free(t); return GARDEL_FILE_ERR_INVALID; }
+    int fd = open(t, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0666);
+    if (fd < 0) { int e = errno; free(c); free(t); return e; }
+    int64_t err = 0;
+    struct stat st;
+    if (stat(c, &st) == 0) {
+        if (S_ISDIR(st.st_mode)) err = EISDIR;
+        else if (fchmod(fd, st.st_mode & 07777) != 0) err = errno;
+    }
+    while (n > 0 && !err) {
+        ssize_t put = write(fd, data, n);
+        if (put < 0 && errno == EINTR) continue;
+        if (put <= 0) { err = put < 0 ? errno : EIO; break; }
+        data += put;
+        n -= (size_t)put;
+    }
+    if (!err && fsync(fd) != 0) err = errno;
+    if (close(fd) != 0 && !err) err = errno;
+    if (!err && rename(t, c) != 0) err = errno;
+    if (err) {
+        unlink(t);
+    } else {
+        char* slash = strrchr(c, '/');
+        if (slash == c) slash[1] = 0;
+        else if (slash) *slash = 0;
+        int d = open(slash ? c : ".", O_RDONLY | O_CLOEXEC);
+        if (d >= 0) { fsync(d); close(d); }
+    }
+    free(c);
+    free(t);
+    return err;
+}
+
 static void gardel_dir_add(struct gardel_dir_item** items, size_t* n, size_t* cap, const char* name, size_t len, bool is_dir);
 
 static int64_t gardel_os_list(const char* path, size_t path_len, struct gardel_dir_item** items, size_t* count) {
@@ -754,6 +821,57 @@ static void gardel_host_file(uint64_t tag, GardelString path, bool list) {
     gardel_thread_run(gardel_file_main, j);
 }
 
+/* WriteFile: on a helper thread too, with its own copy of the bytes. The new file is named
+   after the path, this process and a count, so two writes never share one. */
+struct gardel_write_job { uint64_t tag; char* path; size_t len; char* tmp; size_t tmp_len; char* data; size_t n; };
+static uint64_t gardel_writes_made = 0;
+static void gardel_write_main(void* arg) {
+    struct gardel_write_job* j = (struct gardel_write_job*)arg;
+    struct gardel_answer* a = gardel_answer_new(GARDEL_HOST_FILE_WRITTEN);
+    a->ev.tag = j->tag;
+    a->ev.err = gardel_os_write(j->path, j->len, j->tmp, j->tmp_len, j->data, j->n);
+    a->ev.ok = a->ev.err == 0;
+    a->ev.id = (uint64_t)j->n;
+    free(j->path);
+    free(j->tmp);
+    free(j->data);
+    free(j);
+    gardel_answer_post(a);
+}
+static void gardel_host_write_file(uint64_t tag, GardelString path, GardelBytes data) {
+    if (gardel_host_script) {
+        fprintf(stderr, "file: WriteFile %llu ", (unsigned long long)tag);
+        gardel_trace_text(path.data, path.len);
+        fprintf(stderr, " ");
+        gardel_trace_bytes(data);
+        fprintf(stderr, "\n");
+        return;
+    }
+    struct gardel_write_job* j = (struct gardel_write_job*)malloc(sizeof *j);
+    if (!j) abort();
+    j->tag = tag;
+    j->len = (size_t)path.len;
+    j->path = (char*)malloc(j->len + 1);
+    j->n = (size_t)data.len;
+    j->data = (char*)malloc(j->n + 1);
+    char suffix[64];
+#ifdef _WIN32
+    unsigned long pid = GetCurrentProcessId();
+#else
+    unsigned long pid = (unsigned long)getpid();
+#endif
+    int sl = snprintf(suffix, sizeof suffix, ".gardel-%lu-%llu.tmp", pid, (unsigned long long)++gardel_writes_made);
+    j->tmp_len = j->len + (size_t)sl;
+    j->tmp = (char*)malloc(j->tmp_len + 1);
+    if (!j->path || !j->data || !j->tmp) abort();
+    if (j->len) memcpy(j->path, path.data, j->len);
+    j->path[j->len] = 0;
+    if (j->n) memcpy(j->data, data.data, j->n);
+    if (j->len) memcpy(j->tmp, path.data, j->len);
+    memcpy(j->tmp + j->len, suffix, (size_t)sl + 1);
+    gardel_thread_run(gardel_write_main, j);
+}
+
 /* Processes. */
 static struct gardel_proc* gardel_proc_find(uint64_t id) {
     for (struct gardel_proc* p = gardel_procs; p; p = p->next) if (p->id == id) return p;
@@ -1050,6 +1168,7 @@ static void gardel_answer_taken(struct gardel_host_event* ev) {
     case GARDEL_HOST_FILE_READ:
     case GARDEL_HOST_PROC_OUT:
     case GARDEL_HOST_PROC_ERR:
+    case GARDEL_HOST_PASTED:
         if (ev->buf) {
             ev->data = gardel_bytes_copy(ev->buf, ev->buf_len);
             free(ev->buf);
@@ -1073,16 +1192,24 @@ static void gardel_answer_taken(struct gardel_host_event* ev) {
 /* Log lines of these events. */
 static bool gardel_log_host_event(struct gardel_host_event* ev) {
     switch (ev->kind) {
+    case GARDEL_HOST_PASTED:
+        gardel_log_word("Pasted:");
+        gardel_log_text((const char*)ev->data.data, ev->data.len);
+        return true;
     case GARDEL_HOST_FILE_READ:
     case GARDEL_HOST_DIR_LISTED:
-    case GARDEL_HOST_ATTACHED_ENDED: {
+    case GARDEL_HOST_ATTACHED_ENDED:
+    case GARDEL_HOST_FILE_WRITTEN: {
         bool file = ev->kind == GARDEL_HOST_FILE_READ, dir = ev->kind == GARDEL_HOST_DIR_LISTED;
-        if (ev->ok) gardel_log_word(file ? "FileRead:" : dir ? "DirListed:" : "AttachedEnded:");
-        else gardel_log_word(file ? "FileReadFailed:" : dir ? "DirListFailed:" : "AttachFailed:");
+        bool written = ev->kind == GARDEL_HOST_FILE_WRITTEN;
+        if (ev->ok) gardel_log_word(file ? "FileRead:" : dir ? "DirListed:" : written ? "FileWritten:" : "AttachedEnded:");
+        else gardel_log_word(file ? "FileReadFailed:" : dir ? "DirListFailed:" : written ? "WriteFailed:" : "AttachFailed:");
         gardel_log_number(ev->tag);
         gardel_log_word(":");
         if (!ev->ok) {
             gardel_log_number((uint64_t)ev->err);
+        } else if (written) {
+            gardel_log_number(ev->id);
         } else if (file) {
             gardel_log_text(ev->data.data, ev->data.len);
         } else if (dir) {
@@ -1131,7 +1258,22 @@ static bool gardel_script_host(const char* name, size_t n, struct gardel_host_ev
         {"ProcessStarted:", GARDEL_HOST_PROC_STARTED, true}, {"ProcessFailed:", GARDEL_HOST_PROC_FAILED, false},
         {"ProcessOutput:", GARDEL_HOST_PROC_OUT, true}, {"ProcessErrorOutput:", GARDEL_HOST_PROC_ERR, true},
         {"ProcessExited:", GARDEL_HOST_PROC_EXITED, true},
+        {"FileWritten:", GARDEL_HOST_FILE_WRITTEN, true}, {"WriteFailed:", GARDEL_HOST_FILE_WRITTEN, false},
     };
+    /* Pasted:<text>, cleaned as a terminal's paste is. */
+    if (n >= 7 && memcmp(name, "Pasted:", 7) == 0) {
+        size_t len;
+        char* t = gardel_script_text(name, n, 7, &len);
+        if (!t) return false;
+        size_t clean_len;
+        char* clean = gardel_paste_clean(t, len, &clean_len);
+        free(t);
+        ev->data = gardel_bytes_copy(clean, clean_len);
+        free(clean);
+        ev->kind = GARDEL_HOST_PASTED;
+        ev->ok = true;
+        return true;
+    }
     for (size_t k = 0; k < sizeof kinds / sizeof kinds[0]; k++) {
         size_t i = strlen(kinds[k].name);
         if (n <= i || memcmp(name, kinds[k].name, i) != 0) continue;
@@ -1165,7 +1307,7 @@ static bool gardel_script_host(const char* name, size_t n, struct gardel_host_ev
             free(t);
         } else {
             if (!gardel_script_number(name, n, &i, &v) || i != n) return false;
-            if (kind == GARDEL_HOST_PROC_STARTED) ev->id = v;
+            if (kind == GARDEL_HOST_PROC_STARTED || (kind == GARDEL_HOST_FILE_WRITTEN && kinds[k].ok)) ev->id = v;
             else if (!kinds[k].ok) ev->err = (int64_t)v;
             else {
                 if (v > (uint64_t)INT64_MAX) return false;
@@ -1182,13 +1324,33 @@ static bool gardel_script_host(const char* name, size_t n, struct gardel_host_ev
 }
 "#;
 
-/// The part that names instance types: the values of `FileRead`, `DirListed` and
-/// `AttachedEnded`, and the arguments of `RunProcess` and `RunAttached`. `names` gives the C
-/// names of `RESULT[IO_ERROR, BYTES]`, `RESULT[IO_ERROR, LIST[DIR_ENTRY]]`,
-/// `RESULT[IO_ERROR, I64]`, `LIST[DIR_ENTRY]` and `LIST[STRING]`.
-pub(crate) fn typed_runtime(bytes_result: &str, dir_result: &str, code_result: &str, dir_list: &str, strings: &str) -> String {
+/// The part that names instance types: the values of `FileRead`, `DirListed`,
+/// `AttachedEnded`, `FileWritten` and `Pasted`, and the arguments of `RunProcess` and
+/// `RunAttached`. `names` gives the C names of `RESULT[IO_ERROR, BYTES]`,
+/// `RESULT[IO_ERROR, LIST[DIR_ENTRY]]`, `RESULT[IO_ERROR, I64]`, `LIST[DIR_ENTRY]`,
+/// `LIST[STRING]` and `RESULT[IO_ERROR, NAT]` (whose C name is that of `U64`).
+pub(crate) fn typed_runtime(names: &[String; 6]) -> String {
+    let [bytes_result, dir_result, code_result, dir_list, strings, count_result] = names;
     format!(
         r#"/* The values of file and process events, built by the loop. */
+static struct {count_result}* gardel_written_value(struct gardel_host_event ev) {{
+    if (!ev.ok) return make_{count_result}_Error(make_IO_ERROR_OsError(ev.err));
+    return make_{count_result}_Ok(ev.id);
+}}
+/* A paste's text, which takes over the bytes: cleaned UTF-8 when it was read, so it is always
+   a STRING, and empty should it not be. */
+static GardelString gardel_paste_value(struct gardel_host_event ev) {{
+    uint64_t chars = 0;
+    uint64_t n = ev.data.len;
+    struct STRING_ERROR* bad = gardel_utf8_validate(ev.data.data, n, &chars);
+    if (bad) {{
+        drop_STRING_ERROR(bad);
+        n = 0;
+        chars = 0;
+    }}
+    GardelString s = {{ (const char*)ev.data.data, n, chars, ev.data.owner }};
+    return s;
+}}
 static struct {bytes_result}* gardel_file_value(struct gardel_host_event ev) {{
     if (!ev.ok) return make_{bytes_result}_Error(make_IO_ERROR_OsError(ev.err));
     return make_{bytes_result}_Ok(ev.data);

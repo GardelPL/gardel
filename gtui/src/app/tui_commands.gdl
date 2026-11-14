@@ -4,7 +4,8 @@ functions TUI_COMMANDS
 feature {ANY}
 
   -- `cmds` without those that write on the screen or read from the terminal: `Print`,
-  -- `Write`, `TerminalSize`, `ReadLine` and `ReadKey`. `TUI` sends those itself.
+  -- `Write`, `TerminalSize`, `ReadLine` and `ReadKey`. `TUI` sends those itself. A `Write` of
+  -- a copy to the clipboard is kept.
   own(cmds: LIST[COMMAND]): LIST[COMMAND]
     do
       LIST_OPS.filter(cmds, fn(c: COMMAND): BOOL do TUI_COMMANDS.allowed(c) end)
@@ -16,12 +17,19 @@ feature {ANY}
     do
       match c
         case Print(_) then False
-        case Write(_) then False
+        case Write(t) then VT_TEXT.is_copy(t)
         case TerminalSize then False
         case ReadLine then False
         case ReadKey then False
         case _ then True
       end
+    end
+
+  -- The command that puts `text` on the terminal's clipboard (OSC 52), which `TUI` lets
+  -- through. A terminal that does not know OSC 52 ignores it.
+  copy(text: STRING): COMMAND
+    do
+      Write(VT_TEXT.copy(text))
     end
 
   -- How many of `cmds` run a child attached.
@@ -42,7 +50,8 @@ feature {ANY}
       not_more: Result <= cmds.length
     end
 
-  -- A read of the next key after a key, until keys end; nothing after any other event.
+  -- A read of the next key after a key or a paste, which answers a read as a key does, until
+  -- keys end; nothing after any other event.
   reads_after(e: EVENT): LIST[COMMAND]
     do
       match e
@@ -51,6 +60,7 @@ feature {ANY}
             case KeysEnded then LIST.empty
             case _ then LIST.empty.prepend(ReadKey)
           end
+        case Pasted(_) then LIST.empty.prepend(ReadKey)
         case _ then LIST.empty
       end
     end

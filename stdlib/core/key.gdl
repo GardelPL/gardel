@@ -2,6 +2,11 @@
 -- by name and `match` checks it. Malformed input is `Other`, so `Char` is always a valid CHAR.
 -- `Ctrl(c)` is Ctrl with a letter, given as the lowercase letter, apart from the chords that are
 -- keys of their own: Ctrl-H is Backspace, Ctrl-I Tab, Ctrl-J and Ctrl-M Enter.
+-- `Function(n)` is F1 to F12, `n` from 1 to 12.
+-- `Mod(key, shift, alt, ctrl)` is a key pressed with Shift, Alt or Ctrl, at least one of them:
+-- Shift-Tab, Ctrl-Right, Shift-Home, Alt-x. Its key is never a `Mod`, `Ctrl`, `Other` or
+-- `KeysEnded`, and a `Char` only with Alt, as Shift is in the character already. A program
+-- that does not list `Mod` takes these keys in its `case _`.
 module KEY
 
 representation {ANY}
@@ -22,5 +27,8 @@ representation {ANY}
   | Ctrl(c: CHAR)
   | Other
   | KeysEnded
+  | Insert
+  | Function(n: NAT)
+  | Mod(key: KEY, shift: BOOL, alt: BOOL, ctrl: BOOL)
 
 end

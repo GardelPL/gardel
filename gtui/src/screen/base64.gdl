@@ -1,0 +1,69 @@
+-- Base64 (RFC 4648, with `=` padding), the text that OSC 52 carries to the clipboard.
+functions BASE64
+
+feature {ANY}
+
+  -- The letter of a 6-bit value: A to Z, a to z, 0 to 9, `+` and `/`.
+  digit(n: U64): U64
+    require
+      six_bits: n < 64
+    do
+      if n < 26 then n + 65
+      else if n < 52 then n + 71
+      else if n < 62 then n - 4
+      else if n = 62 then 43
+      else 47
+      end end end end
+    ensure
+      octet: Result < 128
+      a_letter: BASE64.is_letter(Result)
+    end
+
+  -- Whether `b` is a letter of base64 or its padding `=`.
+  is_letter(b: U64): BOOL
+    do
+      (b >= 65 and b <= 90) or (b >= 97 and b <= 122) or (b >= 48 and b <= 57) or b = 43 or b = 47 or b = 61
+    end
+
+  -- `b` in base64.
+  encode(b: BYTES): STRING
+    do
+      match STRING.from_utf8(BASE64.add(b, 0, BYTES_BUILDER.empty).to_bytes)
+        case Ok(s) then s
+        case Error(_) then ""
+      end
+    end
+
+  -- `out` with the bytes of `b` from `i` on in base64, three bytes to four letters, the last
+  -- group padded with `=`.
+  add(b: BYTES, i: NAT, out: BYTES_BUILDER): BYTES_BUILDER
+    variant
+      b.length - i
+    do
+      if i >= b.length or out.length > 1000000000000 then
+        out
+      else
+        let left = b.length - i
+        let x = b.at(i)
+        let y = if left >= 2 then b.at(i + 1) else 0 end
+        let z = if left >= 3 then b.at(i + 2) else 0 end
+        let d0 = BASE64.digit(x / 4)
+        let d1 = BASE64.digit(x % 4 * 16 + y / 16)
+        let d2 = if left >= 2 then BASE64.digit(y % 16 * 4 + z / 64) else 61 end
+        let d3 = if left >= 3 then BASE64.digit(z % 64) else 61 end
+        let next = if left >= 3 then i + 3 else b.length end
+        BASE64.add(b, next, out.add_byte(d0).add_byte(d1).add_byte(d2).add_byte(d3))
+      end
+    end
+
+  -- Whether the bytes of `b` from `i` up to `stop` are all base64 letters.
+  all_letters(b: BYTES, i: NAT, stop: NAT): BOOL
+    require
+      inside: stop <= b.length
+    variant
+      stop - i
+    do
+      if i >= stop then True else BASE64.is_letter(b.at(i)) and BASE64.all_letters(b, i + 1, stop) end
+    end
+
+end

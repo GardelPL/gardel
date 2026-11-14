@@ -56,9 +56,9 @@ start it runs `gardelc --inspect --json-diagnostics --no-verify`, which type che
 and reads its modules without proving them. While it runs, the status bar says `inspecting...`,
 and every key works. On a large project the inspection takes some seconds.
 
-To open another project while Tablon runs, use `/open DIR`. There is no command to make a new
-module yet: write its file with your editor (or `/edit` an existing one), then `/inspect` or
-`^K` reads it.
+To open another project while Tablon runs, use `/open DIR`. To start a module, use
+`/new NAME`: it writes `src/name.gdl`, a `functions` module named `NAME` with no feature yet,
+opens it, and reads the modules again. Edit it with `/edit` (Ctrl-E).
 
 ## The panes
 
@@ -127,6 +127,7 @@ Words after the command's name are its arguments, such as `/run 3 4`.
 | `/run [ARGS]` | Build, then run the program with `ARGS`, split at spaces. |
 | `/stop` | Stop the program run, or else the build, or else the check. |
 | `/edit [EDITOR]` | Open the file shown in the editor, then read it again and check the project. With `EDITOR`, that editor is used from then on. |
+| `/new NAME` | Make the module `NAME`: write `src/name.gdl`, in lowercase, unless a file is there already, then open it and read the modules again. `NAME` is a letter, then letters, digits and `_`. |
 | `/inspect` | Read the project's modules again, without proving them. |
 | `/open DIR` | Browse the project in `DIR` instead. |
 | `/quit` | Leave Tablon. |

@@ -21,6 +21,8 @@ representation {ANY}
   | ProcessErrorOutput(proc: PROC_ID, data: BYTES)
   | ProcessExited(proc: PROC_ID, code: I64)
   | AttachedEnded(tag: NAT, res: RESULT[IO_ERROR, I64])
+| FileWritten(tag: NAT, res: RESULT[IO_ERROR, NAT])
+| Pasted(text: STRING)
 
 feature {ANY}
 

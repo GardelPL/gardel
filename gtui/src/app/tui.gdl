@@ -9,9 +9,11 @@
 -- a key. Every event but `Shutdown` goes to `update`, a `Resized` included, and the screen
 -- is drawn again from `view` after it: the first frame and every resize clear the screen and
 -- draw it whole, and any other step writes only the cells that changed (`SCREEN_DIFF`), in
--- one `Write`. Each key is followed by a read of the next, until keys end. `update`'s
--- commands are sent before the frame, except those that would write on the screen or read
--- from the terminal, which are dropped (`TUI_COMMANDS.own`). `Quit`, or a `Shutdown` (with
+-- one `Write`. A view may show the cursor (`SCREEN.with_cursor`), and the frame then ends
+-- with it there. Each key, or paste, is followed by a read of the next, until keys end.
+-- `update`'s commands are sent before the frame, except those that would write on the screen
+-- or read from the terminal, which are dropped (`TUI_COMMANDS.own`), but a copy to the
+-- clipboard (`TUI_COMMANDS.copy`). `Quit`, or a `Shutdown` (with
 -- status 1), puts the terminal's screen back and stops.
 --
 -- A `RunAttached` gives the terminal to a child: the screen is put back before it, and nothing
@@ -116,17 +118,17 @@ feature {ANY}
                 case Resized(w, h) then
                   let blank = SCREEN.blank(w, h)
                   let next = SCREEN.fitted(Current.draw(s, blank), blank)
-                  let text = VT_TEXT.frame(SCREEN_DIFF.whole(next), True)
+                  let text = VT_TEXT.drawn(SCREEN_DIFF.whole(next), True, Current.shown.cursor_shown, next)
                   Continue({ Current with app = s, shown = next, sized = True }, own.append(reading.prepend(Write(text))))
                 case _ then
                   if Current.sized then
                     let blank = SCREEN.blank(Current.shown.width, Current.shown.height)
                     let next = SCREEN.fitted(Current.draw(s, blank), blank)
                     let writes = Current.frame_writes(next)
-                    if writes.length = 0 then
+                    if writes.length = 0 and Current.shown.same_cursor(next) then
                       Continue({ Current with app = s, shown = next }, own.append(reading))
                     else
-                      let text = VT_TEXT.frame(writes, False)
+                      let text = VT_TEXT.drawn(writes, False, Current.shown.cursor_shown, next)
                       Continue({ Current with app = s, shown = next }, own.append(reading.prepend(Write(text))))
                     end
                   else
