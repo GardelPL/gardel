@@ -17,16 +17,59 @@ feature {ANY}
       end
     end
 
-  -- Entering a full-screen interface: the alternate screen, cleared, with the cursor hidden.
-  enter: STRING
+  -- The text of a frame that draws `writes`, after clearing the screen when `clear` is set,
+  -- then puts the cursor where `next` has it. When the cursor was shown (`was_shown`), it is
+  -- hidden while the cells are drawn, so it is never seen moving over them.
+  drawn(writes: LIST[SCREEN_WRITE], clear: BOOL, was_shown: BOOL, next: SCREEN): STRING
     do
-      "\u{1b}[?1049h\u{1b}[0m\u{1b}[2J\u{1b}[?25l"
+      let start = GLYPHS.add_text(BYTES_BUILDER.empty, if clear then "\u{1b}[0m\u{1b}[2J" else "\u{1b}[0m" end)
+      let hidden = if was_shown then GLYPHS.add_text(start, "\u{1b}[?25l") else start end
+      let out = VT_TEXT.writes(writes, STYLE.plain, hidden)
+      let placed = if next.cursor_shown then GLYPHS.add_text(VT_TEXT.move(out, next.cursor_x, next.cursor_y), "\u{1b}[?25h") else out end
+      match STRING.from_utf8(placed.to_bytes)
+        case Ok(s) then s
+        case Error(_) then ""
+      end
     end
 
-  -- Leaving it: the pen reset, the cursor shown, and the screen that was there before.
+  -- Entering a full-screen interface: the alternate screen, cleared, with the cursor hidden
+  -- and shaped as a bar for when a view shows it, and pastes bracketed, so that the host
+  -- gives a paste as one `Pasted` event.
+  enter: STRING
+    do
+      "\u{1b}[?1049h\u{1b}[0m\u{1b}[2J\u{1b}[?25l\u{1b}[6 q\u{1b}[?2004h"
+    end
+
+  -- Leaving it: pastes as typed, the pen reset, the cursor in the terminal's own shape and
+  -- shown, and the screen that was there before.
   leave: STRING
     do
-      "\u{1b}[0m\u{1b}[?25h\u{1b}[?1049l"
+      "\u{1b}[?2004l\u{1b}[0m\u{1b}[0 q\u{1b}[?25h\u{1b}[?1049l"
+    end
+
+  -- The OSC 52 sequence that puts `text` on the terminal's clipboard. Most terminals take it;
+  -- none is asked to read the clipboard back.
+  copy(text: STRING): STRING
+    do
+      let a = GLYPHS.add_text(BYTES_BUILDER.empty, "\u{1b}]52;c;")
+      let b = GLYPHS.add_text(a, BASE64.encode(text.to_utf8))
+      match STRING.from_utf8(GLYPHS.add_text(b, "\u{7}").to_bytes)
+        case Ok(s) then s
+        case Error(_) then ""
+      end
+    end
+
+  -- Whether `t` is such a sequence: `\u{1b} ] 52 ; c ;`, base64, then \u{7}. Nothing in it can
+  -- end the sequence early or write on the screen.
+  is_copy(t: STRING): BOOL
+    do
+      let b = t.to_utf8
+      let head = "\u{1b}]52;c;".to_utf8
+      if b.length > head.length and b.starts_with(head) then
+        b.at(b.length - 1) = 7 and BASE64.all_letters(b, head.length, b.length - 1)
+      else
+        False
+      end
     end
 
   -- `out` with `ws`, drawn from the pen `pen`.

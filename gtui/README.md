@@ -32,12 +32,12 @@ end
 
 `TUI[S]` holds the application's state, its `update` and `view`, and the screen as the terminal shows it.
 
-- `TUI.start(s, update, view)` takes the alternate screen, hides the cursor, asks the terminal's size and reads a key.
+- `TUI.start(s, update, view)` takes the alternate screen, hides the cursor and shapes it as a bar for when a view shows it, turns on bracketed paste, asks the terminal's size and reads a key.
 - Every event but `Shutdown` goes to `update`, which gives `Next(state, cmds)` or `Quit(code, after)`. `TUI_NEXT.next(s)` and `quit(code)` are the short forms.
 - After each event, `view` draws the state on a blank screen of the terminal's size. The first frame and every resize clear the screen and draw it whole. Any other step writes only the cells that changed, in one `Write`.
-- A key is followed by a read of the next, until keys end.
-- `update`'s commands are sent before the frame. `Print`, `Write`, `TerminalSize`, `ReadLine` and `ReadKey` are dropped (`TUI_COMMANDS.own`), as `TUI` owns the screen and the keyboard.
-- `Quit`, and `Shutdown` with exit status 1, put the terminal's screen and cursor back and stop. The commands of `Quit` run after that, so a `Print` there is seen.
+- A key is followed by a read of the next, until keys end. So is a paste, which the host gives as one `Pasted(text)` event, its text with LF line ends and no control character but Tab.
+- `update`'s commands are sent before the frame. `Print`, `Write`, `TerminalSize`, `ReadLine` and `ReadKey` are dropped (`TUI_COMMANDS.own`), as `TUI` owns the screen and the keyboard, but for `TUI_COMMANDS.copy(text)`: a `Write` of the OSC 52 sequence that puts `text` on the terminal's clipboard, which `VT_TEXT.is_copy` recognises and nothing else passes for. No terminal is asked to read the clipboard back: most do not answer, and the paste comes from the terminal's own paste, as `Pasted`.
+- `Quit`, and `Shutdown` with exit status 1, put the terminal's screen, cursor and its shape back, turn bracketed paste off, and stop. The commands of `Quit` run after that, so a `Print` there is seen.
 - A `RunAttached` among `update`'s commands gives the terminal to a child: `TUI` puts the screen back before it, and draws nothing until every child it sent has ended (`TUI.attached` counts them). The last `AttachedEnded` takes the alternate screen again, and the `Resized` the host sends after it draws the screen whole.
 
 A view that gives back a screen of another size than the one it was given is not drawn; the blank one is (`SCREEN.fitted`). Every routine of `SCREEN` keeps the size.
@@ -51,6 +51,7 @@ A view that gives back a screen of another size than the one it was given is not
 
 - `s.text(clip, x, y, text, style)` draws text on row `y` from column `x`, and `s.fill(clip, c, style)` fills a rectangle. Both change only the cells inside both `clip` and the screen, so a widget given a rectangle cannot draw outside it.
 - A cell never holds a control character (`CELL`'s invariant): one becomes `?`, and a tab a space. So text cannot move the terminal's cursor.
+- `s.with_cursor(x, y)` shows the terminal's cursor at that cell, where typing goes; a screen from `SCREEN.blank` hides it. A frame then ends with the cursor there, and hides it while it draws when it was shown, so it is never seen moving over the cells.
 - One code point is one cell. A character a terminal shows two cells wide, or none (a combining mark), is not accounted for, and would shift the rest of its row.
 
 `SCREEN_DIFF.changes(old, new)` gives the writes that turn one screen into another of the same size: each write is a run of changed cells on one row, and runs closer than four unchanged cells are joined, since moving the cursor costs more bytes than writing a few cells again. `VT_TEXT.frame` turns writes into text: a cursor move for each, and an SGR sequence where the style changes, which resets the pen and then sets the attributes and the colours that are not the terminal's own (30 to 37 and 90 to 97 for the foreground, 40 to 47 and 100 to 107 for the background).

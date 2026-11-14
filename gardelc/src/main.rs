@@ -24943,7 +24943,28 @@ feature {ANY}
       Continue(0, LIST.empty.prepend(ReadKey).prepend(TerminalSize).prepend(Write(\"\\u{1b}[?25l\")))
     end
 
+  prefix(k: KEY): STRING
+    do
+      match k
+        case Mod(b, s, a, c) then
+          if s then
+            if a then (if c then \"shift-alt-ctrl-\" else \"shift-alt-\" end) else (if c then \"shift-ctrl-\" else \"shift-\" end) end
+          else
+            if a then (if c then \"alt-ctrl-\" else \"alt-\" end) else (if c then \"ctrl-\" else \"\" end) end
+          end
+        case _ then \"\"
+      end
+    end
+
   name(k: KEY): STRING
+    do
+      match k
+        case Mod(b, s, a, c) then plain(b)
+        case _ then plain(k)
+      end
+    end
+
+  plain(k: KEY): STRING
     do
       match k
         case Char(c) then if c = '\\u{e9}' then \"e-acute\" else \"char\" end
@@ -24958,6 +24979,9 @@ feature {ANY}
         case PageDown then \"pgdn\"
         case Delete then \"del\"
         case Ctrl(c) then if c = 'a' then \"ctrl-a\" else if c = 'z' then \"ctrl-z\" else \"ctrl\" end end
+        case Insert then \"ins\"
+        case Function(n) then if n = 1 then \"f1\" else if n = 5 then \"f5\" else if n = 12 then \"f12\" else \"f\" end end end
+        case Right then \"right\"
         case _ then \"other\"
       end
     end
@@ -24970,8 +24994,10 @@ feature {ANY}
         case Key(k) then
           match k
             case KeysEnded then Stop(0, LIST.empty.prepend(Print(\"done\")).prepend(Write(\"\\u{1b}[?25h\")))
-            case _ then Continue(s, LIST.empty.prepend(ReadKey).prepend(Write(\" \")).prepend(Write(name(k))))
+            case _ then Continue(s, LIST.empty.prepend(ReadKey).prepend(Write(\" \")).prepend(Write(name(k))).prepend(Write(prefix(k))))
           end
+        case Pasted(t) then
+          Continue(s, LIST.empty.prepend(ReadKey).prepend(Write(\" \")).prepend(Write(NUMBER_TEXT.nat_to_text(t.byte_length))).prepend(Write(\"paste\")))
         case Shutdown then Stop(1, LIST.empty.prepend(Write(\"\\u{1b}[?25h\")))
         case _ then Continue(s, LIST.empty)
       end
@@ -25005,10 +25031,10 @@ end
     fn test_f9_a_scripted_terminal_run_writes_exact_bytes() {
         let c = d4_c(&[("term_keys.gdl", F9_KEYS)]);
         let Some((dir, exe)) = c3_compile(&c, "f9keys") else { return };
-        let script = "Resized:120:40 Key:Home Key:End Key:PageUp Key:PageDown Key:Delete Key:Ctrl:a Key:Ctrl:z Key:233 Key:Up Resized:80:24 Key:KeysEnded";
+        let script = "Resized:120:40 Key:Home Key:End Key:PageUp Key:PageDown Key:Delete Key:Ctrl:a Key:Ctrl:z Key:233 Key:Up Key:Shift+Tab Key:Ctrl+Right Key:Shift+Alt+Ctrl+Home Key:F5 Key:F12 Key:Insert Key:Alt+120 Pasted:a%0Ab Resized:80:24 Key:KeysEnded";
         let run = f9_run(&exe, &[("GARDEL_EVENTS", script.as_ref())], b"");
         assert_eq!(run.0, 0, "{}", run.2);
-        let want = b"\x1b[?25l120x40 home end pgup pgdn del ctrl-a ctrl-z e-acute up 80x24 \x1b[?25hdone\n";
+        let want = b"\x1b[?25l120x40 home end pgup pgdn del ctrl-a ctrl-z e-acute up shift-tab ctrl-right shift-alt-ctrl-home f5 f12 ins alt-char paste3 80x24 \x1b[?25hdone\n";
         assert_eq!(String::from_utf8_lossy(&run.1), String::from_utf8_lossy(want));
         assert_eq!(run.1, want);
 
@@ -25016,14 +25042,14 @@ end
         let log = dir.join("run.log");
         let live = d8_run(&exe, &[("GARDEL_EVENTS", script.as_ref()), ("GARDEL_RECORD", log.as_os_str())], b"", &[]);
         let text = fs::read_to_string(&log).unwrap();
-        for line in ["command Write:%1B%5B%3F25l\n", "command TerminalSize\n", "event Resized:120:40\n", "event Key:Ctrl:a\n", "event Key:PageDown\n", "command Write:pgdn\n"] {
+        for line in ["command Write:%1B%5B%3F25l\n", "command TerminalSize\n", "event Resized:120:40\n", "event Key:Ctrl:a\n", "event Key:PageDown\n", "command Write:pgdn\n", "event Key:Shift+Tab\n", "event Key:F12\n", "event Key:Alt+120\n", "event Pasted:a%0Ab\n"] {
             assert!(text.contains(line), "{line} in\n{text}");
         }
         assert_eq!(d8_script(&text), script);
         d8_check_replay(&exe, &log, &live);
 
         // Only what a terminal can send: Ctrl-H, Ctrl-I, Ctrl-J and Ctrl-M are other keys.
-        for bad in ["Key:Ctrl:h", "Key:Ctrl:m", "Key:Ctrl:A", "Key:Ctrl:", "Key:Ctrl:ab", "Resized:1", "Resized:1:", "Resized:1:x", "Resized::2"] {
+        for bad in ["Key:Ctrl:h", "Key:Ctrl:m", "Key:Ctrl:A", "Key:Ctrl:", "Key:Ctrl:ab", "Key:Ctrl+Ctrl:a", "Key:Shift+Other", "Key:Ctrl+KeysEnded", "Key:Shift+120", "Key:Alt+Shift+Up", "Key:Shift+", "Key:F0", "Key:F13", "Key:F01", "Pasted", "Resized:1", "Resized:1:", "Resized:1:x", "Resized::2"] {
             let r = f9_run(&exe, &[("GARDEL_EVENTS", bad.as_ref())], b"");
             assert_eq!(r.0, 2, "{bad}: {}", r.2);
             assert!(r.2.contains("unknown event"), "{bad}: {}", r.2);
@@ -25038,10 +25064,10 @@ end
         let c = d4_c(&[("term_keys.gdl", F9_KEYS)]);
         let Some((dir, exe)) = c3_compile(&c, "f9bytes") else { return };
         let log = dir.join("run.log");
-        let input: &[u8] = b"\x1b[H\x1b[F\x1bOH\x1bOF\x1b[1~\x1b[4~\x1b[7~\x1b[8~\x1b[5~\x1b[6~\x1b[3~\x1b[2~\x1b[1;5A\x1b[3;2~\x01\x1a\x13\x11\x1c\x08\x7f\t\r\n\xc3\xa9";
+        let input: &[u8] = b"\x1b[H\x1b[F\x1bOH\x1bOF\x1b[1~\x1b[4~\x1b[7~\x1b[8~\x1b[5~\x1b[6~\x1b[3~\x1b[2~\x1b[1;5A\x1b[3;2~\x01\x1a\x13\x11\x1c\x08\x7f\t\r\n\xc3\xa9\x1b[Z\x1bOP\x1b[15~\x1b[24;5~\x1b[1;2C\x1b[1;5:1C\x1bx\x1b\r\x1b[1;9A\x1b[99~\x1b[200~hi\x1b[31mX\r\n\xff\xc2\x85\x1b[201~\x1b[200~\x1b[20\x1b[201~";
         let live = d8_run(&exe, &[("GARDEL_RECORD", log.as_os_str())], input, &[]);
         assert_eq!(live.0, 0, "{}", live.2);
-        let keys = "home end home end home end home end pgup pgdn del other up del ctrl-a ctrl-z ctrl ctrl other bs bs tab enter enter e-acute ";
+        let keys = "home end home end home end home end pgup pgdn del ins ctrl-up shift-del ctrl-a ctrl-z ctrl ctrl other bs bs tab enter enter e-acute shift-tab f1 f5 ctrl-f12 shift-right ctrl-right alt-char alt-enter up other paste11 paste3 ";
         assert_eq!(live.1, format!("\u{1b}[?25l80x24 {keys}\u{1b}[?25hdone\n"));
         let text = fs::read_to_string(&log).unwrap();
         assert!(text.contains("event Resized:80:24\n"), "output that is not a terminal is 80 by 24:\n{text}");

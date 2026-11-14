@@ -19,5 +19,6 @@ representation {ANY}
   | CloseInput(proc: PROC_ID)
   | StopProcess(proc: PROC_ID)
   | RunAttached(tag: NAT, program: STRING, args: LIST[STRING], dir: STRING)
+  | WriteFile(tag: NAT, path: STRING, data: BYTES)
 
 end

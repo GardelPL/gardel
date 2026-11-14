@@ -1,0 +1,82 @@
+-- A module made by `/new NAME`: its name in capitals, its file under `src` named in lowercase,
+-- as `gardelc --strict` wants it, and the text it starts with.
+functions NEW_MODULE
+
+feature {ANY}
+
+  -- Whether `cs` is a module's name: an ASCII letter, then letters, digits and `_`.
+  is_name(cs: LIST[CHAR]): BOOL
+    do
+      cs.length > 0 and cs.length <= 200 and NEW_MODULE.is_letter(cs.head) and NEW_MODULE.all_word(cs.tail)
+    end
+
+  is_letter(c: CHAR): BOOL
+    do
+      (c.code >= 65 and c.code <= 90) or (c.code >= 97 and c.code <= 122)
+    end
+
+  -- Whether every one of `cs` is a letter, a digit or `_`.
+  all_word(cs: LIST[CHAR]): BOOL
+    variant
+      cs.length
+    do
+      if cs.length = 0 then
+        True
+      else
+        NEW_MODULE.is_word(cs.head) and NEW_MODULE.all_word(cs.tail)
+      end
+    end
+
+  -- Whether `c` is a letter, a digit or `_`.
+  is_word(c: CHAR): BOOL
+    do
+      NEW_MODULE.is_letter(c) or (c.code >= 48 and c.code <= 57) or c.code = 95
+    end
+
+  -- `cs` with each lowercase ASCII letter in capitals, when `up`, or the other way.
+  cased(cs: LIST[CHAR], up: BOOL): LIST[CHAR]
+    variant
+      cs.length
+    do
+      if cs.length = 0 then
+        cs
+      else
+        NEW_MODULE.cased(cs.tail, up).prepend(NEW_MODULE.case_of(cs.head, up))
+      end
+    end
+
+  -- `c` in capitals, when `up` and it is a lowercase ASCII letter, or in lowercase, when not
+  -- `up` and it is a capital.
+  case_of(c: CHAR, up: BOOL): CHAR
+    do
+      let n = c.code
+      if up and n >= 97 and n <= 122 then
+        GLYPHS.scalar(n - 32)
+      else if not up and n >= 65 and n <= 90 then
+        GLYPHS.scalar(n + 32)
+      else
+        c
+      end end
+    end
+
+  -- The module's name.
+  name_of(cs: LIST[CHAR]): STRING
+    do
+      GLYPHS.text_of(NEW_MODULE.cased(cs, True))
+    end
+
+  -- Its file, from the project's directory.
+  file_of(cs: LIST[CHAR]): STRING
+    do
+      GLYPHS.join(GLYPHS.join("src/", GLYPHS.text_of(NEW_MODULE.cased(cs, False))), ".gdl")
+    end
+
+  -- The text it starts with: a `functions` module with no feature yet, which verifies.
+  text_of(cs: LIST[CHAR]): STRING
+    do
+      let name = NEW_MODULE.name_of(cs)
+      let head = GLYPHS.join(GLYPHS.join("-- ", name), ": what it is for.\nfunctions ")
+      GLYPHS.join(GLYPHS.join(head, name), "\n\nfeature {ANY}\n\nend\n")
+    end
+
+end

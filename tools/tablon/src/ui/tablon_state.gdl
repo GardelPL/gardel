@@ -6,8 +6,9 @@
 -- event, so the keys keep working while one runs.
 --
 -- Tags: 1 is the inspection, 2 the check, 3 the build, 4 a program run with its output read, 5
--- one run attached, 6 the editor; 100 and on the listings of directories, in the order asked;
--- and 1000 and on the reads of files, so an answer to a read no longer awaited is dropped.
+-- one run attached, 6 the editor, 7 the read that finds a new module's file is not there yet and
+-- 8 its write; 100 and on the listings of directories, in the order asked; and 1000 and on the
+-- reads of files, so an answer to a read no longer awaited is dropped.
 module TABLON_STATE
 
 representation {NONE}
@@ -53,6 +54,8 @@ representation {NONE}
   run_input: INPUT_LINE
   typing: BOOL
   editing: BOOL
+  making: STRING
+  made_text: STRING
   commands: PALETTE
   commands_open: BOOL
 
@@ -81,7 +84,7 @@ create {ANY}
         found = no_problems, found_view = LIST_VIEW.make(none), checked_by = "",
         builder = PROC_SLOT.idle, build_log = STREAM_LINES.empty, run_next = False, run_words = none,
         runner = PROC_SLOT.idle, attached_run = False, run_log = STREAM_LINES.empty, run_input = INPUT_LINE.empty,
-        typing = False, editing = False,
+        typing = False, editing = False, making = "", made_text = "",
         commands = PALETTE.make(TABLON_STATE.palette_entries), commands_open = False }
     end
 
@@ -100,6 +103,7 @@ create {ANY}
       LIST.empty
         .prepend(PALETTE_ENTRY.make("quit", "leave Tablon"))
         .prepend(PALETTE_ENTRY.make("open", "DIR  browse the project in DIR"))
+        .prepend(PALETTE_ENTRY.make("new", "NAME  make the module NAME in src, and open it"))
         .prepend(PALETTE_ENTRY.make("inspect", "read the project's modules again, unverified"))
         .prepend(PALETTE_ENTRY.make("edit", "[EDITOR]  edit the file shown, then check  ^E"))
         .prepend(PALETTE_ENTRY.make("stop", "stop the program, the build or the check  ^X"))
@@ -918,9 +922,66 @@ feature {ANY}
           Next({ Current with editor = editor, editing = True },
                LIST.empty.prepend(RunAttached(6, editor.head, editor.tail.append(LIST.empty.prepend(Current.source_file)), Current.project)))
         end end
+      else if name.equals("new") then
+        let words = WORDS.of(args)
+        let cs = if words.length = 0 then LIST.empty else GLYPHS.of_text(words.head) end
+        if not Current.making.is_empty then
+          TUI_NEXT.next(Current.logged("A module is being made already."))
+        else if not NEW_MODULE.is_name(cs) then
+          TUI_NEXT.next(Current.logged("/new needs a module's name: a letter, then letters, digits or _."))
+        else
+          let rel = NEW_MODULE.file_of(cs)
+          Next({ Current with making = rel, made_text = NEW_MODULE.text_of(cs) },
+               LIST.empty.prepend(ReadFile(7, TABLON_STATE.under(Current.project, rel))))
+        end end
       else
         TUI_NEXT.next(Current.logged(GLYPHS.join("Unknown command ", name)))
-      end end end end end end
+      end end end end end end end
+    end
+
+  -- The read of a new module's file: one that is there is kept, and one that is not is
+  -- written. A write never replaces a file.
+  new_checked(r: RESULT[IO_ERROR, BYTES]): TUI_NEXT[TABLON_STATE]
+    do
+      if Current.making.is_empty then
+        TUI_NEXT.next(Current)
+      else
+        match r
+          case Ok(_) then
+            let kept = { Current with making = "", made_text = "" }
+            TUI_NEXT.next(kept.logged(GLYPHS.join(Current.making, " is there already; /new makes no file over another.")))
+          case Error(_) then
+            Next(Current, LIST.empty.prepend(WriteFile(8, TABLON_STATE.under(Current.project, Current.making), Current.made_text.to_utf8)))
+        end
+      end
+    end
+
+  -- A new module's file written: it is opened, and the project inspected again so that the
+  -- module shows under Modules.
+  new_written(r: RESULT[IO_ERROR, NAT]): TUI_NEXT[TABLON_STATE]
+    do
+      if Current.making.is_empty then
+        TUI_NEXT.next(Current)
+      else
+        let rel = Current.making
+        let done = { Current with making = "", made_text = "" }
+        match r
+          case Ok(_) then
+            let made = done.logged(GLYPHS.join("Made ", rel))
+            let opened = made.read_source(rel, 0, False)
+            match opened
+              case Next(s, cmds) then
+                if s.inspection.running then
+                  Next(s, cmds)
+                else
+                  Next({ s with inspection = PROC_SLOT.asked, verifying = False },
+                       cmds.prepend(RunProcess(1, s.compiler, TABLON_STATE.inspect_args, s.project)))
+                end
+              case Quit(c, cmds) then Quit(c, cmds)
+            end
+          case Error(_) then TUI_NEXT.next(done.logged(GLYPHS.join("Could not write ", rel)))
+        end
+      end
     end
 
   -- `/stop`: the program run, or else the build, or else the check.

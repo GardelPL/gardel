@@ -253,3 +253,40 @@ fn a_process_ends_after_all_its_output() {
     let got: Vec<String> = lines(&out).into_iter().filter(|l| !l.is_empty()).collect();
     assert_eq!(got, ["late", "exited"], "{}", all(&out));
 }
+
+/// WriteFile (Task F.16a): a new file and a replaced one are written whole, through a file beside
+/// them that is renamed over them and leaves nothing behind; a missing directory and a path
+/// that is a directory fail; and a replay writes nothing.
+#[test]
+fn write_file_replaces_a_file_whole_and_a_replay_writes_none() {
+    let (dir, bin, _child) = build("write_file.gdl", "write");
+    let data = dir.0.join("data");
+    fs::create_dir_all(&data).expect("a directory");
+    fs::write(data.join("old.txt"), "old content that is longer").expect("a file");
+    let out = run(&bin, &[], &[("GARDEL_RECORD", "../run.log")], &data);
+    assert!(out.status.success(), "{}", all(&out));
+    let got = lines(&out);
+    for line in ["written 1 17", "written 2 8", "failed 3", "failed 4", "read first line", "second", "done"] {
+        assert!(has(&got, line), "{line} in {got:?}");
+    }
+    assert_eq!(fs::read_to_string(data.join("new.txt")).expect("written"), "first line\nsecond");
+    assert_eq!(fs::read_to_string(data.join("old.txt")).expect("replaced"), "replaced");
+    let mut names: Vec<String> = fs::read_dir(&data).expect("a listing").map(|e| e.expect("an entry").file_name().to_string_lossy().into_owned()).collect();
+    names.sort();
+    assert_eq!(names, ["new.txt", "old.txt"], "no file is left beside them");
+
+    let log = fs::read_to_string(dir.0.join("run.log")).expect("a log");
+    for line in ["command WriteFile:1:%2E%2Fnew%2Etxt:first%20line%0Asecond\n", "event FileWritten:1:17\n", "event FileWritten:2:8\n", "event WriteFailed:3:", "event WriteFailed:4:"] {
+        assert!(log.contains(line), "{line} in\n{log}");
+    }
+
+    // The replay gives the same output from the log, and touches no file.
+    fs::remove_file(data.join("new.txt")).expect("removed");
+    fs::write(data.join("old.txt"), "changed").expect("a file");
+    let again = run(&bin, &[], &[("GARDEL_REPLAY", "../run.log")], &data);
+    assert!(again.status.success(), "{}", all(&again));
+    assert_eq!(lines(&again), got, "{}", all(&again));
+    assert!(!data.join("new.txt").exists(), "a replay wrote a file");
+    assert_eq!(fs::read_to_string(data.join("old.txt")).expect("kept"), "changed");
+    assert!(String::from_utf8_lossy(&again.stderr).contains("file: WriteFile 1 %2E%2Fnew%2Etxt first%20line%0Asecond"), "{}", all(&again));
+}

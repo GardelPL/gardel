@@ -5,7 +5,8 @@
 //! no longer awaited is dropped; and a replay reproduces the screen with no process run. A check
 //! fills Problems, whose Enter goes to the line; a run builds first, streams the program's output
 //! and sends it the lines typed; a reactive program runs attached; an edit is read again and
-//! checked; and a failed build runs nothing.
+//! checked; a failed build runs nothing; and `/new` writes a module's file only where there is
+//! none, then opens it and inspects the project again.
 //!
 //! The scripts stand in for `gardelc`: the inspection's output is the fixture's expected object,
 //! and a file read is the fixture's file, so the tests need no compiler run but the build.
@@ -135,6 +136,11 @@ impl Terminal {
                     j += 1;
                 }
                 let params: Vec<u32> = cs[start..j].iter().collect::<String>().split(';').map(|p| p.parse().unwrap_or(0)).collect();
+                // The cursor's shape, `CSI n SP q`.
+                if cs[j] == ' ' && cs.get(j + 1) == Some(&'q') {
+                    i = j + 2;
+                    continue;
+                }
                 match (private, cs[j]) {
                     (true, 'h') | (true, 'l') => {}
                     (false, 'H') => {
@@ -429,4 +435,28 @@ fn a_failed_build_runs_nothing_and_its_errors_go_to_problems() {
     assert!(term.text().contains("The build failed: 1 error; see Problems."), "{}", term.text());
     let (term, _) = screen(&format!("{steps}{}", keys("r")));
     assert!(term.text().contains("Not run: the build failed."), "{}", term.text());
+}
+
+#[test]
+fn new_makes_a_module_where_there_is_no_file_then_opens_it_and_inspects_again() {
+    let text = "-- CELL_TWO: what it is for.\nfunctions CELL_TWO\n\nfeature {ANY}\n\nend\n";
+    let asked = format!("{}Key:Enter ", keys("/new cell_Two"));
+    // No file there: it is written, read and shown, and the project inspected again.
+    let steps = format!("{asked}FileReadFailed:7:2 FileWritten:8:{} FileRead:1001:{} Key:Tab Key:Tab {}", text.len(), enc(text.as_bytes()), keys("o"));
+    let (term, log) = screen(&steps);
+    assert!(sent(&log, "file: ReadFile 7 ", "%2Fsrc%2Fcell%5Ftwo%2Egdl"), "{log}");
+    let traced: String = text.bytes().map(|b| if b.is_ascii_alphanumeric() { (b as char).to_string() } else { format!("%{b:02X}") }).collect();
+    assert!(sent(&log, "file: WriteFile 8 ", &format!("%2Fsrc%2Fcell%5Ftwo%2Egdl {traced}")), "{log}");
+    assert!(sent(&log, "file: ReadFile 1001 ", "%2Fsrc%2Fcell%5Ftwo%2Egdl"), "{log}");
+    assert_eq!(log.matches("proc: RunProcess 1 ").count(), 2, "inspected at the start and again: {log}");
+    let shown = term.text();
+    assert!(shown.contains("Made src/cell_two.gdl") && shown.contains("functions CELL_TWO"), "{shown}");
+    // A file there already is kept: nothing is written.
+    let (term, log) = screen(&format!("{asked}FileRead:7:{} Key:Tab Key:Tab {}", file("cell.gdl"), keys("o")));
+    assert!(!log.contains("WriteFile"), "{log}");
+    assert!(term.text().contains("src/cell_two.gdl is there already"), "{}", term.text());
+    // A name must start with a letter.
+    let (term, log) = screen(&format!("{}Key:Enter Key:Tab Key:Tab {}", keys("/new 2cells"), keys("o")));
+    assert!(!log.contains("ReadFile 7"), "{log}");
+    assert!(term.text().contains("/new needs a module's name"), "{}", term.text());
 }

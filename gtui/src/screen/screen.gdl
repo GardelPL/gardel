@@ -1,15 +1,20 @@
 -- A grid of cells, `width` by `height`, each at most 65535, which a view draws on. Drawing
 -- is clipped: `text` and `fill` change only the cells inside both the rectangle they are
--- given and the screen, so a widget given a rectangle cannot draw outside it.
+-- given and the screen, so a widget given a rectangle cannot draw outside it. A screen may
+-- show the terminal's cursor at one of its cells (`with_cursor`), where typing goes.
 module SCREEN
 
 representation {NONE}
   wide: NAT
   high: NAT
   lines: LIST[LIST[CELL]]
+  cur_x: NAT
+  cur_y: NAT
+  cur_on: BOOL
 
 invariant
   fits: wide <= 65535 and high <= 65535
+  cursor_inside: cur_on implies cur_x < wide and cur_y < high
 
 create {ANY}
 
@@ -20,10 +25,11 @@ create {ANY}
       let ch = if h <= 65535 then h else 65535 end
       let row: LIST[CELL] = LIST_CUT.repeat(CELL.blank, cw, LIST.empty)
       let none: LIST[LIST[CELL]] = LIST.empty
-      { wide = cw, high = ch, lines = LIST_CUT.repeat(row, ch, none) }
+      { wide = cw, high = ch, lines = LIST_CUT.repeat(row, ch, none), cur_x = 0, cur_y = 0, cur_on = False }
     ensure
       width_set: w <= 65535 implies Result.width = w
       height_set: h <= 65535 implies Result.height = h
+      no_cursor: not Result.cursor_shown
     end
 
   -- Row `y` of `rows`, or no cells past the last row.
@@ -97,6 +103,52 @@ feature {ANY}
       Current.high
     ensure
       fits: Result <= 65535
+    end
+
+  -- Whether the terminal's cursor is shown, at (`cursor_x`, `cursor_y`).
+  cursor_shown: BOOL
+    do
+      Current.cur_on
+    ensure
+      inside: Result implies Current.cursor_x < Current.width and Current.cursor_y < Current.height
+    end
+
+  cursor_x: NAT
+    do
+      Current.cur_x
+    end
+
+  cursor_y: NAT
+    do
+      Current.cur_y
+    end
+
+  -- The screen with the cursor shown at column `x`, row `y`, or hidden when that is not one
+  -- of its cells.
+  with_cursor(x: NAT, y: NAT): SCREEN
+    do
+      if x < Current.wide and y < Current.high then
+        { Current with cur_x = x, cur_y = y, cur_on = True }
+      else
+        { Current with cur_on = False }
+      end
+    ensure
+      same_width: Result.width = Current.width
+      same_height: Result.height = Current.height
+      shown: Result.cursor_shown = (x < Current.width and y < Current.height)
+      at_x: Result.cursor_shown implies Result.cursor_x = x
+      at_y: Result.cursor_shown implies Result.cursor_y = y
+    end
+
+  -- Whether `other` puts the cursor where this screen does: both hide it, or both show it at
+  -- the same cell.
+  same_cursor(other: SCREEN): BOOL
+    do
+      if Current.cur_on then
+        other.cursor_shown and other.cursor_x = Current.cur_x and other.cursor_y = Current.cur_y
+      else
+        not other.cursor_shown
+      end
     end
 
   -- The whole screen as a rectangle.

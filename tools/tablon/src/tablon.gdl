@@ -17,8 +17,8 @@
 -- right. In a tree, the arrows move, Right opens a node and Left closes it, and Enter opens a
 -- module or a file. In a list view, Enter goes to the line of a part in Text, or to the
 -- module a line names. In Problems, Enter goes to the line of a failure. `/` opens the commands:
--- `/check`, `/build`, `/run [ARGS]`, `/stop`, `/edit [EDITOR]`, `/inspect`, `/open DIR` and
--- `/quit`; Ctrl-K, B, R, E and X are the first five. `q` quits. A program run with its output
+-- `/check`, `/build`, `/run [ARGS]`, `/stop`, `/edit [EDITOR]`, `/new NAME`, `/inspect`,
+-- `/open DIR` and `/quit`; Ctrl-K, B, R, E and X are the first five. `q` quits. A program run with its output
 -- read takes the keys as its input until Escape; a reactive program is run attached.
 reactive program TABLON
 
@@ -36,7 +36,8 @@ feature {ANY}
         case ProcessExited(p, code) then s.exited(p, code)
         case AttachedEnded(tag, r) then s.attached_ended(tag, r)
         case DirListed(tag, r) then s.listed(tag, r)
-        case FileRead(tag, r) then TUI_NEXT.next(s.file_read(tag, r))
+        case FileRead(tag, r) then if tag = 7 then s.new_checked(r) else TUI_NEXT.next(s.file_read(tag, r)) end
+        case FileWritten(tag, r) then if tag = 8 then s.new_written(r) else TUI_NEXT.next(s) end
         case _ then TUI_NEXT.next(s)
       end
     end
