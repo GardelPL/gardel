@@ -1,0 +1,750 @@
+-- A text being edited in a rectangle: the text and cursor of a `TEXT_ZIP`; a page scrolled
+-- both ways so that the cursor stays on it; a selection, from an anchor to the cursor; a
+-- clipboard of its own; undo and redo; going to a line; finding; and highlighting by line.
+--
+-- `on_key` takes the keys an editor does. Characters, Enter, Tab (two spaces), Backspace and
+-- Delete edit, replacing the selection when there is one. The arrows, Home, End, PageUp and
+-- PageDown move, Ctrl with Home or End to the start or end of the text, and with Shift held
+-- they select. Ctrl-A selects everything, Ctrl-C copies the selection, Ctrl-X cuts it, Ctrl-V
+-- pastes what was cut or copied, Ctrl-Z undoes and Ctrl-Y redoes. A terminal's paste is
+-- `paste`. An application sends what is copied to the terminal's clipboard when
+-- `just_copied` says so (`TUI_COMMANDS.copy`).
+--
+-- Each edit is one step to undo, and the last 200 to 400 steps are kept. A lexer
+-- (`with_lexer`) gives the state a line ends in from the one it starts in, and `draw` gives
+-- each line's spans from the state it starts in, so a string or a comment can run over lines.
+--
+-- Proven: an edit undone gives back the text and the cursor before it (`undone`); the cursor
+-- is in the text (`TEXT_ZIP`) and on the page drawn (`followed`); the selection is inside the
+-- text (`selection_*`). `of_text(t).text = t` holds for the characters
+-- (`TEXT_ZIP.of_chars`); that it holds through UTF-8 is tested.
+module TEXT_AREA
+
+representation {NONE}
+  zip: TEXT_ZIP
+  top_line: NAT
+  left_column: NAT
+  -- The column Up and Down keep to, in characters.
+  goal: NAT
+  marking: BOOL
+  anchor_line: NAT
+  anchor_column: NAT
+  undos: LIST[TEXT_ZIP]
+  undo_count: NAT
+  redos: LIST[TEXT_ZIP]
+  clip: LIST[CHAR]
+  copied: BOOL
+  edits: NAT
+  lexer: (start: NAT, line: LIST[CHAR]) -> NAT
+
+invariant
+  counted: undo_count = undos.length
+  few_undos: undo_count <= 400
+  left_fits: left_column <= 65535
+
+create {ANY}
+
+  -- `t`, the cursor at its start, with no lexer.
+  of_text(t: STRING): TEXT_AREA
+    do
+      TEXT_AREA.of_chars(GLYPHS.of_text(t))
+    end
+
+  -- The characters `cs`, the cursor at their start, with no lexer.
+  of_chars(cs: LIST[CHAR]): TEXT_AREA
+    do
+      let none: LIST[TEXT_ZIP] = LIST.empty
+      let no_chars: LIST[CHAR] = LIST.empty
+      { zip = TEXT_ZIP.of_chars(cs), top_line = 0, left_column = 0, goal = 0, marking = False,
+        anchor_line = 0, anchor_column = 0, undos = none, undo_count = 0, redos = none, clip = no_chars,
+        copied = False, edits = 0, lexer = fn(start: NAT, line: LIST[CHAR]): NAT do 0 end }
+    ensure
+      same_text: LINE_SPLIT.fits(cs) implies Result.state.chars = cs
+      at_start: Result.line_number = 0 and Result.column = 0
+    end
+
+  -- The first `n` of `xs`.
+  keep(xs: LIST[TEXT_ZIP], n: NAT): LIST[TEXT_ZIP]
+    variant
+      n
+    do
+      if n = 0 or xs.length = 0 then LIST.empty else TEXT_AREA.keep(xs.tail, n - 1).prepend(xs.head) end
+    ensure
+      length_def: Result.length = (if n <= xs.length then n else xs.length end)
+      head_kept: n > 0 and xs.length > 0 implies Result.length > 0 and Result.head = xs.head
+    end
+
+  -- The digits of `n`.
+  digits(n: NAT): NAT
+    do
+      NUMBER_TEXT.nat_to_text(n).byte_length
+    end
+
+  -- The part of `r` the text is drawn in, right of the line numbers of a text of `count`
+  -- lines.
+  text_part(r: RECT, count: NAT): RECT
+    do
+      let d = TEXT_AREA.digits(count)
+      r.drop_left(if d <= 20 then d + 1 else 21 end)
+    end
+
+  -- The characters of `cs` before column `left`, a wide character across it included.
+  hidden_count(cs: LIST[CHAR], left: NAT, used: NAT, k: NAT): NAT
+    variant
+      cs.length
+    do
+      if cs.length = 0 or used >= left or k = 18446744073709551615 or used > 65535 then
+        k
+      else
+        let w = CHAR_WIDTH.of(cs.head)
+        let step = if w = 0 then 0 else if w = 2 then 2 else 1 end end
+        TEXT_AREA.hidden_count(cs.tail, left, used + step, k + 1)
+      end
+    end
+
+  -- The first index at or after `i` where `pat` starts in `cs` (whose first character is
+  -- index `i`), or 2^64 - 1 when there is none. (A number, not an `OPTION`: one taken out of
+  -- an `OPTION` is not known to the prover to be a `NAT`.)
+  index_in(cs: LIST[CHAR], pat: LIST[CHAR], i: NAT): NAT
+    variant
+      cs.length
+    do
+      if cs.length < pat.length or i = 18446744073709551615 then 18446744073709551615
+      else if TEXT_AREA.starts(cs, pat) then i
+      else TEXT_AREA.index_in(cs.tail, pat, i + 1)
+      end end
+    end
+
+  -- Whether `cs` starts with `pat`.
+  starts(cs: LIST[CHAR], pat: LIST[CHAR]): BOOL
+    variant
+      pat.length
+    do
+      if pat.length = 0 then True
+      else if cs.length = 0 then False
+      else cs.head = pat.head and TEXT_AREA.starts(cs.tail, pat.tail)
+      end end
+    end
+
+  -- `acc` with the characters from column `c1` of line `l1` to column `c2` of line `l2` in
+  -- front of it, the last first, a line feed between lines. `ls` are the lines from line `i`.
+  between(ls: LIST[LIST[CHAR]], i: NAT, l1: NAT, c1: NAT, l2: NAT, c2: NAT, acc: LIST[CHAR]): LIST[CHAR]
+    variant
+      ls.length
+    do
+      if ls.length = 0 or i > l2 or i = 18446744073709551615 then
+        acc
+      else
+        let from = if i = l1 then c1 else 0 end
+        let rest = LIST_CUT.drop(ls.head, from)
+        let part = if i = l2 then LIST_CUT.take(rest, if c2 >= from then c2 - from else 0 end) else rest end
+        let taken = LIST_CUT.reverse(part, acc)
+        if i = l2 then taken else TEXT_AREA.between(ls.tail, i + 1, l1, c1, l2, c2, taken.prepend(LINE_SPLIT.lf)) end
+      end
+    end
+
+  -- The characters of `cs` but carriage returns.
+  without_cr(cs: LIST[CHAR], acc: LIST[CHAR]): LIST[CHAR]
+    variant
+      cs.length
+    do
+      if cs.length = 0 then LIST_CUT.reverse(acc, LIST.empty)
+      else if cs.head.code = 13 then TEXT_AREA.without_cr(cs.tail, acc)
+      else TEXT_AREA.without_cr(cs.tail, acc.prepend(cs.head))
+      end end
+    end
+
+feature {ANY}
+
+  -- The text and the cursor.
+  state: TEXT_ZIP
+    do
+      Current.zip
+    end
+
+  text: STRING
+    do
+      Current.zip.text
+    end
+
+  line_number: NAT
+    do
+      Current.zip.line_number
+    ensure
+      in_text: Result < Current.line_count
+    end
+
+  column: NAT
+    do
+      Current.zip.column
+    ensure
+      in_line: Result <= Current.length_of_line(Current.line_number)
+      short: Result <= 4294967295
+    end
+
+  -- Fewer than 2^32 (`TEXT_ZIP`).
+  line_count: NAT
+    do
+      Current.zip.line_count
+    ensure
+      some: Result > 0
+      few: Result <= 4294967295
+    end
+
+  -- The characters of line `n`, none past the last.
+  length_of_line(n: NAT): NAT
+    do
+      Current.zip.line_at(n).length
+    end
+
+  -- The first line shown, as last scrolled.
+  top: NAT
+    do
+      Current.top_line
+    end
+
+  -- The first column shown, as last scrolled.
+  left: NAT
+    do
+      Current.left_column
+    end
+
+  -- How many edits, undos and redos there have been, at most 2^64 - 1: it changes whenever
+  -- the text may have.
+  version: NAT
+    do
+      Current.edits
+    end
+
+  -- What Ctrl-C or Ctrl-X last took, or `paste` would put.
+  clipboard: STRING
+    do
+      GLYPHS.text_of(Current.clip)
+    end
+
+  -- Whether the last key copied or cut text, which an application may send to the
+  -- terminal's clipboard.
+  just_copied: BOOL
+    do
+      Current.copied
+    end
+
+  -- The column the cursor is drawn at, from the start of its line.
+  cursor_x: NAT
+    do
+      GLYPHS.width_of(Current.zip.backward)
+    ensure
+      fits: Result <= 65535
+    end
+
+  -- The anchor, as a place in the text: its line or the last, its column or the end of that
+  -- line.
+  anchor_line_at: NAT
+    do
+      let last = Current.zip.line_count - 1
+      if Current.anchor_line <= last then Current.anchor_line else last end
+    ensure
+      in_text: Result < Current.line_count
+    end
+
+  anchor_column_at: NAT
+    do
+      let n = Current.length_of_line(Current.anchor_line_at)
+      if Current.anchor_column <= n then Current.anchor_column else n end
+    ensure
+      in_line: Result <= Current.length_of_line(Current.anchor_line_at)
+    end
+
+  -- Whether the anchor comes before the cursor.
+  anchor_first: BOOL
+    do
+      Current.anchor_line_at < Current.zip.line_number or
+        (Current.anchor_line_at = Current.zip.line_number and Current.anchor_column_at < Current.zip.column)
+    end
+
+  -- Whether some text is selected.
+  has_selection: BOOL
+    do
+      Current.marking and
+        (Current.anchor_line_at != Current.zip.line_number or Current.anchor_column_at != Current.zip.column)
+    end
+
+  -- Where the selection starts and ends: the anchor and the cursor, the first first.
+  selection_start_line: NAT
+    do
+      if Current.anchor_first then Current.anchor_line_at else Current.zip.line_number end
+    ensure
+      in_text: Result < Current.line_count
+    end
+
+  selection_start_column: NAT
+    do
+      if Current.anchor_first then Current.anchor_column_at else Current.zip.column end
+    ensure
+      in_line: Result <= Current.length_of_line(Current.selection_start_line)
+    end
+
+  selection_end_line: NAT
+    do
+      if Current.anchor_first then Current.zip.line_number else Current.anchor_line_at end
+    ensure
+      in_text: Result < Current.line_count
+      ordered: Current.selection_start_line <= Result
+    end
+
+  selection_end_column: NAT
+    do
+      if Current.anchor_first then Current.zip.column else Current.anchor_column_at end
+    ensure
+      in_line: Result <= Current.length_of_line(Current.selection_end_line)
+    end
+
+  -- The selected characters, none when nothing is.
+  selected: LIST[CHAR]
+    do
+      if Current.has_selection then
+        let l1 = Current.selection_start_line
+        let none: LIST[CHAR] = LIST.empty
+        let acc = TEXT_AREA.between(LIST_CUT.drop(Current.zip.lines, l1), l1, l1, Current.selection_start_column,
+          Current.selection_end_line, Current.selection_end_column, none)
+        LIST_CUT.reverse(acc, none)
+      else
+        LIST.empty
+      end
+    end
+
+  -- The selected text.
+  selected_text: STRING
+    do
+      GLYPHS.text_of(Current.selected)
+    end
+
+  -- The same text, highlighted by `lex`: each line's state is lexed again.
+  with_lexer(lex: (start: NAT, line: LIST[CHAR]) -> NAT): TEXT_AREA
+    do
+      { Current with lexer = lex, zip = Current.zip.relexed_all(lex) }
+    end
+
+  -- The page scrolled as little as it takes to show the cursor in the text part of `r`.
+  followed(r: RECT): TEXT_AREA
+    do
+      let t = TEXT_AREA.text_part(r, Current.zip.line_count)
+      let rows = t.height
+      let cols = t.width
+      let n = Current.zip.line_number
+      let cx = Current.cursor_x
+      let tl = if n < Current.top_line then n
+        else if rows > 0 and n - Current.top_line >= rows then n - rows + 1
+        else Current.top_line
+        end end
+      let lc = if cx < Current.left_column then cx
+        else if cols > 0 and cx - Current.left_column >= cols then cx - cols + 1
+        else Current.left_column
+        end end
+      { Current with top_line = tl, left_column = lc }
+    ensure
+      on_page: TEXT_AREA.text_part(r, Current.line_count).height > 0 implies
+        Result.top <= Result.line_number and Result.line_number < Result.top + TEXT_AREA.text_part(r, Current.line_count).height
+      in_view: TEXT_AREA.text_part(r, Current.line_count).width > 0 implies
+        Result.left <= Result.cursor_x and Result.cursor_x < Result.left + TEXT_AREA.text_part(r, Current.line_count).width
+      same_state: Result.state = Current.state
+    end
+
+  -- Edited to `z`: one step to undo, the selection gone.
+  edited(z: TEXT_ZIP): TEXT_AREA
+    do
+      let lexed = if z.needs_lexing then z.relexed(Current.lexer) else z end
+      let pushed = Current.undos.prepend(Current.zip)
+      let kept = if Current.undo_count >= 400 then TEXT_AREA.keep(pushed, 200) else pushed end
+      let none: LIST[TEXT_ZIP] = LIST.empty
+      { Current with zip = lexed, undos = kept, undo_count = kept.length, redos = none, marking = False,
+        goal = lexed.column, copied = False,
+        edits = if Current.edits < 18446744073709551615 then Current.edits + 1 else Current.edits end }
+    ensure
+      undone: Result.undo.state = Current.state
+    end
+
+  -- The last edit undone, or nothing when there is none.
+  undo: TEXT_AREA
+    do
+      if Current.undos.length = 0 then
+        Current
+      else
+        { Current with zip = Current.undos.head, undos = Current.undos.tail, undo_count = Current.undo_count - 1,
+          redos = Current.redos.prepend(Current.zip), marking = False, goal = Current.undos.head.column, copied = False,
+          edits = if Current.edits < 18446744073709551615 then Current.edits + 1 else Current.edits end }
+      end
+    end
+
+  -- The last edit undone made again, or nothing when there is none.
+  redo: TEXT_AREA
+    do
+      if Current.redos.length = 0 then
+        Current
+      else
+        let pushed = Current.undos.prepend(Current.zip)
+        let kept = if Current.undo_count >= 400 then TEXT_AREA.keep(pushed, 200) else pushed end
+        { Current with zip = Current.redos.head, redos = Current.redos.tail, undos = kept, undo_count = kept.length,
+          marking = False, goal = Current.redos.head.column, copied = False,
+          edits = if Current.edits < 18446744073709551615 then Current.edits + 1 else Current.edits end }
+      end
+    end
+
+  -- The text with the selection taken out, the cursor where it started; the text itself when
+  -- nothing is selected.
+  without_selection: TEXT_ZIP
+    do
+      if Current.has_selection then
+        Current.zip.to(Current.selection_end_line, Current.selection_end_column).backspace_times(Current.selected.length)
+      else
+        Current.zip
+      end
+    end
+
+  -- `c` typed, over the selection. A control character types nothing.
+  type_char(c: CHAR): TEXT_AREA
+    do
+      if c.code < 32 or c.code = 127 then
+        Current
+      else
+        Current.edited(Current.without_selection.insert(c))
+      end
+    ensure
+      undone: c.code >= 32 and c.code != 127 implies Result.undo.state = Current.state
+    end
+
+  -- A new line at the cursor, over the selection.
+  newline: TEXT_AREA
+    do
+      Current.edited(Current.without_selection.newline)
+    ensure
+      undone: Result.undo.state = Current.state
+    end
+
+  -- The selection taken out, or the character before the cursor.
+  backspace: TEXT_AREA
+    do
+      Current.edited(if Current.has_selection then Current.without_selection else Current.zip.backspace end)
+    ensure
+      undone: Result.undo.state = Current.state
+    end
+
+  -- The selection taken out, or the character after the cursor.
+  delete: TEXT_AREA
+    do
+      Current.edited(if Current.has_selection then Current.without_selection else Current.zip.delete end)
+    ensure
+      undone: Result.undo.state = Current.state
+    end
+
+  -- `t` typed at the cursor over the selection, as one step, carriage returns left out.
+  paste(t: STRING): TEXT_AREA
+    do
+      Current.paste_chars(GLYPHS.of_text(t))
+    end
+
+  paste_chars(cs: LIST[CHAR]): TEXT_AREA
+    do
+      Current.edited(Current.without_selection.insert_all(TEXT_AREA.without_cr(cs, LIST.empty)))
+    ensure
+      undone: Result.undo.state = Current.state
+    end
+
+  -- The selection put on the clipboard.
+  copy: TEXT_AREA
+    do
+      if Current.has_selection then { Current with clip = Current.selected, copied = True } else Current end
+    end
+
+  -- The selection put on the clipboard and taken out.
+  cut: TEXT_AREA
+    do
+      if Current.has_selection then
+        let taken = Current.selected
+        let e = Current.edited(Current.without_selection)
+        { e with clip = taken, copied = True }
+      else
+        Current
+      end
+    end
+
+  -- Everything selected, the cursor at the end.
+  select_all: TEXT_AREA
+    do
+      let z = Current.zip.to(Current.zip.line_count - 1, 4294967295)
+      { Current with zip = z, marking = True, anchor_line = 0, anchor_column = 0, goal = z.column, copied = False }
+    end
+
+  -- The cursor at the start of line `n`, from 0, or of the last line.
+  go_to_line(n: NAT): TEXT_AREA
+    do
+      { Current with zip = Current.zip.to(n, 0), marking = False, goal = 0, copied = False }
+    end
+
+  -- The next place `pattern` is found after the cursor, going round to the start of the text,
+  -- selected; or the same area when it is not found. A pattern is found within a line.
+  find(pattern: STRING): TEXT_AREA
+    do
+      let pat = GLYPHS.of_text(pattern)
+      if pat.length = 0 or pat.length > 4294967295 then
+        Current
+      else
+        let ls = Current.zip.lines
+        let n = Current.zip.line_number
+        let here = Current.zip.line
+        let k = TEXT_AREA.index_in(LIST_CUT.drop(here, Current.zip.column), pat, Current.zip.column)
+        if k < 18446744073709551615 then Current.found_at(n, k, if pat.length <= 4294967295 then pat.length else 0 end)
+        else Current.find_from(LIST_CUT.drop(ls, n + 1), n + 1, pat, ls, n)
+        end
+      end
+    end
+
+  -- The search for `pat` on in the lines `ls`, the first of which is line `i`, then from the
+  -- start in `all` up to line `stop`.
+  find_from(ls: LIST[LIST[CHAR]], i: NAT, pat: LIST[CHAR], all: LIST[LIST[CHAR]], stop: NAT): TEXT_AREA
+    variant
+      ls.length
+    do
+      if ls.length = 0 or i = 18446744073709551615 then
+        Current.find_wrapped(all, 0, pat, stop)
+      else
+        let k = TEXT_AREA.index_in(ls.head, pat, 0)
+        if k < 18446744073709551615 then Current.found_at(i, k, if pat.length <= 4294967295 then pat.length else 0 end)
+        else Current.find_from(ls.tail, i + 1, pat, all, stop)
+        end
+      end
+    end
+
+  -- The search for `pat` in the lines `ls` from line `i` up to and including line `stop`.
+  find_wrapped(ls: LIST[LIST[CHAR]], i: NAT, pat: LIST[CHAR], stop: NAT): TEXT_AREA
+    variant
+      ls.length
+    do
+      if ls.length = 0 or i > stop or i = 18446744073709551615 then
+        Current
+      else
+        let k = TEXT_AREA.index_in(ls.head, pat, 0)
+        if k < 18446744073709551615 then Current.found_at(i, k, if pat.length <= 4294967295 then pat.length else 0 end)
+        else Current.find_wrapped(ls.tail, i + 1, pat, stop)
+        end
+      end
+    end
+
+  -- `n` characters from column `k` of line `i` selected, the cursor after them.
+  found_at(i: NAT, k: NAT, n: NAT): TEXT_AREA
+    do
+      let z = Current.zip.to(i, if n <= 4294967295 and k <= 4294967295 - n then k + n else 4294967295 end)
+      { Current with zip = z, marking = True, anchor_line = i, anchor_column = k, goal = z.column, copied = False }
+    end
+
+  -- Edited or moved by `k`, then scrolled to show the cursor in `r`.
+  on_key(k: KEY, r: RECT): TEXT_AREA
+    do
+      let rows = TEXT_AREA.text_part(r, Current.zip.line_count).height
+      Current.keyed(k, if rows > 1 then rows - 1 else 1 end).followed(r)
+    end
+
+  -- Edited or moved by `k`, a page being `page` lines.
+  keyed(k: KEY, page: NAT): TEXT_AREA
+    do
+      match k
+        case Char(c) then Current.type_char(c)
+        case Enter then Current.newline
+        case Tab then Current.paste_chars(LIST.empty.prepend(' ').prepend(' '))
+        case Backspace then Current.backspace
+        case Delete then Current.delete
+        case Ctrl(c) then Current.ctrl_keyed(c)
+        case Mod(m, shift, alt, ctrl) then
+          if alt then Current else Current.moved(m, page, shift, ctrl) end
+        case _ then Current.moved(k, page, False, False)
+      end
+    end
+
+  -- Changed by Ctrl and `c`: undo, redo, select all, copy, cut or paste.
+  ctrl_keyed(c: CHAR): TEXT_AREA
+    do
+      if c = 'z' then Current.undo
+      else if c = 'y' then Current.redo
+      else if c = 'a' then Current.select_all
+      else if c = 'c' then Current.copy
+      else if c = 'x' then Current.cut
+      else if c = 'v' then Current.paste_chars(Current.clip)
+      else Current
+      end end end end end end
+    end
+
+  -- Moved by the key `k`, selecting when `shift` is held. Ctrl with Home or End goes to the
+  -- start or end of the text. Keys that do not move change nothing.
+  moved(k: KEY, page: NAT, shift: BOOL, ctrl: BOOL): TEXT_AREA
+    do
+      let z = Current.zip
+      let last = z.line_count - 1
+      let n = z.line_number
+      let up_to = if n >= page then n - page else 0 end
+      let down_to = if last >= page and n <= last - page then n + page else last end
+      match k
+        case Left then Current.moved_to(z.left, shift, True)
+        case Right then Current.moved_to(z.right, shift, True)
+        case Up then Current.moved_to(z.up(Current.goal), shift, False)
+        case Down then Current.moved_to(z.down(Current.goal), shift, False)
+        case Home then Current.moved_to(if ctrl then z.to(0, 0) else z.to_column(0) end, shift, True)
+        case End then Current.moved_to(if ctrl then z.to(last, 4294967295) else z.to_column(4294967295) end, shift, True)
+        case PageUp then Current.paged(z.to(up_to, Current.goal), shift, n - up_to, False)
+        case PageDown then Current.paged(z.to(down_to, Current.goal), shift, down_to - n, True)
+        case _ then Current
+      end
+    end
+
+  -- Moved to `z`, the anchor dropped where the cursor was when a selection starts, and kept
+  -- while `shift` is held. A move along the line (`along`) sets the column Up and Down keep.
+  moved_to(z: TEXT_ZIP, shift: BOOL, along: BOOL): TEXT_AREA
+    do
+      let anchored = if shift and not Current.marking then
+          { Current with marking = True, anchor_line = Current.zip.line_number, anchor_column = Current.zip.column }
+        else
+          { Current with marking = shift and Current.marking }
+        end
+      { anchored with zip = z, goal = if along then z.column else Current.goal end, copied = False }
+    end
+
+  -- Moved a page to `z`, `d` lines, the page scrolled by as much (`down`, or up).
+  paged(z: TEXT_ZIP, shift: BOOL, d: NAT, down: BOOL): TEXT_AREA
+    do
+      let m = Current.moved_to(z, shift, False)
+      { m with top_line = if down then (if d <= 4294967295 and Current.top_line <= 4294967295 - d then Current.top_line + d else Current.top_line end)
+        else (if Current.top_line >= d then Current.top_line - d else 0 end) end }
+    end
+
+  -- The area drawn in `r` as plain text, in style `st`: see `draw_code`.
+  draw(s: SCREEN, r: RECT, st: STYLE, gutter: STYLE, chosen: STYLE): SCREEN
+    do
+      Current.draw_code(s, r, st, gutter, chosen, fn(start: NAT, line: LIST[CHAR]): LIST[SPAN] do LIST.empty end)
+    ensure
+      same_width: Result.width = s.width
+      same_height: Result.height = s.height
+    end
+
+  -- The area drawn in `r`, scrolled to show the cursor (`followed`): each line's number in
+  -- `gutter`, right-aligned in a column as wide as the last line's number and a space; its
+  -- text in `st`, with the spans `spans` gives for it, from the state it starts in, drawn over
+  -- it in their own styles; the selection in `chosen`, a line feed in it as a space; and the
+  -- terminal's cursor at the cursor.
+  draw_code(s: SCREEN, r: RECT, st: STYLE, gutter: STYLE, chosen: STYLE,
+            spans: (start: NAT, line: LIST[CHAR]) -> LIST[SPAN]): SCREEN
+    do
+      let v = Current.followed(r)
+      let z = v.zip
+      let d = TEXT_AREA.digits(z.line_count)
+      let digits = if d <= 20 then d else 20 end
+      let numbers = r.take_left(digits + 1)
+      let t = r.drop_left(digits + 1)
+      let rows = t.height
+      let starts = z.page_ends(v.top_line, rows).prepend(z.start_of(v.top_line))
+      let drawn = v.draw_rows(s, numbers, t, z.page(v.top_line, rows), starts, v.top_line, t.y, digits, st, gutter, chosen, spans)
+      let n = z.line_number
+      let cx = v.cursor_x
+      if n >= v.top_line and n - v.top_line < rows and cx >= v.left_column and cx - v.left_column < t.width then
+        drawn.with_cursor(t.x + (cx - v.left_column), t.y + (n - v.top_line))
+      else
+        drawn
+      end
+    ensure
+      same_width: Result.width = s.width
+      same_height: Result.height = s.height
+    end
+
+  -- `lines`, the first of which is line `i`, from row `y` on: each starts in the state at the
+  -- head of `starts`.
+  draw_rows(s: SCREEN, numbers: RECT, t: RECT, lines: LIST[LIST[CHAR]], starts: LIST[NAT], i: NAT, y: NAT,
+            digits: NAT, st: STYLE, gutter: STYLE, chosen: STYLE,
+            spans: (start: NAT, line: LIST[CHAR]) -> LIST[SPAN]): SCREEN
+    require
+      narrow: digits <= 20
+    variant
+      lines.length
+    do
+      if lines.length = 0 or starts.length = 0 or y >= t.bottom or i = 18446744073709551615 then
+        s
+      else
+        let label = NUMBER_TEXT.nat_to_text(i + 1)
+        let ln = label.byte_length
+        let lx = if ln <= digits then numbers.x + (digits - ln) else numbers.x end
+        let numbered = s.text(numbers, lx, y, label, gutter)
+        let drawn = Current.draw_line(numbered, t, y, lines.head, i, st, chosen, spans(starts.head, lines.head))
+        Current.draw_rows(drawn, numbers, t, lines.tail, starts.tail, i + 1, y + 1, digits, st, gutter, chosen, spans)
+      end
+    ensure
+      same_width: Result.width = s.width
+      same_height: Result.height = s.height
+    end
+
+  -- Line `i`, the characters `cs`, drawn on row `y` of `t` from the first column shown, in
+  -- `st`, with the spans `sps` over it and the selection over them.
+  draw_line(s: SCREEN, t: RECT, y: NAT, cs: LIST[CHAR], i: NAT, st: STYLE, chosen: STYLE, sps: LIST[SPAN]): SCREEN
+    do
+      let k = TEXT_AREA.hidden_count(cs, Current.left_column, 0, 0)
+      let shown_from = GLYPHS.width_of(LIST_CUT.take(cs, k))
+      let pad = if shown_from >= Current.left_column then shown_from - Current.left_column else 0 end
+      let visible = LIST_CUT.drop(cs, k)
+      let x0 = if pad <= 2 and t.x <= 65535 then t.x + pad else t.x end
+      let written = s.glyphs(t, x0, y, visible, st)
+      let styled = TEXT_AREA.draw_spans(written, t, x0, y, visible, k, sps)
+      -- A length is not known to the prover to fit a `NAT` until it is compared with one.
+      let n = if cs.length <= 4294967295 then cs.length else 4294967295 end
+      Current.draw_selection(styled, t, x0, y, visible, k, i, n, chosen)
+    ensure
+      same_width: Result.width = s.width
+      same_height: Result.height = s.height
+    end
+
+  -- The selected part of line `i`, `n` characters long, drawn in `chosen` over its characters
+  -- `visible`, which start at character `k` and are drawn from column `x0` of row `y`.
+  draw_selection(s: SCREEN, t: RECT, x0: NAT, y: NAT, visible: LIST[CHAR], k: NAT, i: NAT, n: NAT, chosen: STYLE): SCREEN
+    do
+      if Current.has_selection and i >= Current.selection_start_line and i <= Current.selection_end_line then
+        let a = if i = Current.selection_start_line then Current.selection_start_column else 0 end
+        let b = if i = Current.selection_end_line then Current.selection_end_column else n end
+        let feed = i < Current.selection_end_line
+        let part = if b > a then LIST_CUT.take(LIST_CUT.drop(visible, if a >= k then a - k else 0 end),
+            if a >= k then b - a else (if b >= k then b - k else 0 end) end) else LIST.empty end
+        let with_feed = if feed then part.append(LIST.empty.prepend(' ')) else part end
+        let from = if a >= k then a - k else 0 end
+        let x = GLYPHS.width_of(LIST_CUT.take(visible, from))
+        if (b < k and not feed) or x0 > 65535 then s else s.glyphs(t, x0 + x, y, with_feed, chosen) end
+      else
+        s
+      end
+    ensure
+      same_width: Result.width = s.width
+      same_height: Result.height = s.height
+    end
+
+create {ANY}
+
+  -- `sps` drawn over the characters `visible` of a line, which start at character `k` and are
+  -- drawn from column `x0` of row `y`; a span counts characters from the start of the line.
+  draw_spans(s: SCREEN, t: RECT, x0: NAT, y: NAT, visible: LIST[CHAR], k: NAT, sps: LIST[SPAN]): SCREEN
+    variant
+      sps.length
+    do
+      if sps.length = 0 or x0 > 65535 then
+        s
+      else
+        let sp = sps.head
+        let a = sp.start
+        let b = if a <= 18446744073709551615 - sp.length then a + sp.length else a end
+        let drawn = if b <= k then
+            s
+          else
+            let from = if a >= k then a - k else 0 end
+            let cs = LIST_CUT.take(LIST_CUT.drop(visible, from), b - k - from)
+            s.glyphs(t, x0 + GLYPHS.width_of(LIST_CUT.take(visible, from)), y, cs, sp.style)
+          end
+        TEXT_AREA.draw_spans(drawn, t, x0, y, visible, k, sps.tail)
+      end
+    ensure
+      same_width: Result.width = s.width
+      same_height: Result.height = s.height
+    end
+
+end

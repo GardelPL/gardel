@@ -115,7 +115,8 @@ feature {ANY}
       let i = output_view(s, h, FRAME.inner(bottom))
       -- The help cut where the activity starts, so the two never run together.
       let doing = GLYPHS.join(GLYPHS.join(" ", s.activity), " ")
-      let room = if area.width > doing.code_point_count then area.width - doing.code_point_count else 0 end
+      let used = GLYPHS.width(doing)
+      let room = if area.width > used then area.width - used else 0 end
       let help = s.help
       let hint = if help.code_point_count > room then help.slice(0, room) else help end
       let j = STATUS_BAR.draw(i, TABLON_LAYOUT.status(area), hint, doing, STYLE.plain.reversed)

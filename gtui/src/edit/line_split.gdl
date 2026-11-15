@@ -1,0 +1,88 @@
+-- Text as lines: `lines_of` cuts characters at each line feed, and `join` puts the lines back
+-- together with a line feed between one and the next.
+--
+-- Proven: `join(lines_of(cs)) = cs` for any characters, so cutting text into lines loses
+-- nothing. A text ending in a line feed has an empty last line, and an empty text one empty
+-- line. `lines_of` is a loop over the characters from the last, so a text of any length can be
+-- cut; `join` is what the proof states, and is not run.
+functions LINE_SPLIT
+
+feature {ANY}
+
+  -- The line feed.
+  lf: CHAR
+    do
+      '\n'
+    ensure
+      code: Result.code = 10
+    end
+
+  -- The text of `ls`: each line, with a line feed between one and the next.
+  join(ls: LIST[LIST[CHAR]]): LIST[CHAR]
+    variant
+      ls.length
+    do
+      if ls.length = 0 then LIST.empty
+      else if ls.tail.length = 0 then ls.head
+      else ls.head.append(LINE_SPLIT.join(ls.tail).prepend(LINE_SPLIT.lf))
+      end end
+    end
+
+  -- The lines of `cs`: there is always one more than there are line feeds.
+  lines_of(cs: LIST[CHAR]): LIST[LIST[CHAR]]
+    do
+      let none: LIST[CHAR] = LIST.empty
+      let no_lines: LIST[LIST[CHAR]] = LIST.empty
+      check
+        twice: LIST_FACTS.reverse_twice(cs)
+      end
+      LINE_SPLIT.split_back(LIST_CUT.reverse(cs, none), none, no_lines)
+    ensure
+      joined: LINE_SPLIT.join(Result) = cs
+      some: Result.length > 0
+    end
+
+  -- Whether every one of `ls` holds at most 2^32 - 1 characters.
+  all_short(ls: LIST[LIST[CHAR]]): BOOL
+    variant
+      ls.length
+    do
+      if ls.length = 0 then True
+      else if ls.head.length > 4294967295 then False
+      else LINE_SPLIT.all_short(ls.tail)
+      end end
+    end
+
+  -- Whether `cs` fits a `TEXT_ZIP`: fewer than 2^32 lines of at most 2^32 - 1 characters.
+  fits(cs: LIST[CHAR]): BOOL
+    do
+      let ls = LINE_SPLIT.lines_of(cs)
+      ls.length <= 4294967295 and LINE_SPLIT.all_short(ls)
+    end
+
+  -- The lines of the text `back`, given last character first, followed by `cur`, the start
+  -- of the line the rest of the text begins with, and `done`, the lines after that one.
+  split_back(back: LIST[CHAR], cur: LIST[CHAR], done: LIST[LIST[CHAR]]): LIST[LIST[CHAR]]
+    variant
+      back.length
+    do
+      if back.length = 0 then
+        done.prepend(cur)
+      else
+        let none: LIST[CHAR] = LIST.empty
+        let c = back.head
+        check
+          onto: LIST_FACTS.reverse_onto(back.tail, none.prepend(c))
+        end
+        if c.code = 10 then
+          LINE_SPLIT.split_back(back.tail, none, done.prepend(cur))
+        else
+          LINE_SPLIT.split_back(back.tail, cur.prepend(c), done)
+        end
+      end
+    ensure
+      joined: LINE_SPLIT.join(Result) = LIST_CUT.reverse(back, LIST.empty).append(LINE_SPLIT.join(done.prepend(cur)))
+      some: Result.length > 0
+    end
+
+end

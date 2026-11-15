@@ -1,0 +1,531 @@
+-- Text being edited, held as a zipper: the lines above the cursor's, the nearest first; the
+-- cursor's line, as the characters before the cursor, the nearest first, and those after it;
+-- and the lines below. A key works where the cursor is, so it costs the length of one line,
+-- not of the text. A text holds fewer than 2^32 lines of at most 2^32 - 1 characters; an edit
+-- that would pass either is not made.
+--
+-- Each line also holds the state a lexer is in at its end (`ends`), such as inside a string
+-- or a comment, so a line can be highlighted from where the line before it ends. An edit
+-- leaves the states of the lines it touched out of date until `relexed`, which lexes those
+-- lines, then the lines below them until one ends in the state it ended in before.
+--
+-- Proven: `of_chars(cs).chars = cs` for any text that fits; the cursor is in the text
+-- (`line_number < line_count`, `column <= line_length`); moving the cursor keeps the text
+-- (`lines` is the same). Two are equal when they hold the same text, cursor and states.
+module TEXT_ZIP satisfies CANONICAL_EQ
+
+representation {NONE}
+  above: LIST[LIST[CHAR]]
+  before: LIST[CHAR]
+  after: LIST[CHAR]
+  below: LIST[LIST[CHAR]]
+  above_ends: LIST[NAT]
+  here_end: NAT
+  below_ends: LIST[NAT]
+  -- How many of the lines above, from the nearest, have states out of date.
+  stale: NAT
+  -- Whether the state of the cursor's line is out of date.
+  dirty: BOOL
+
+invariant
+  ends_above: above_ends.length = above.length
+  ends_below: below_ends.length = below.length
+  few_lines: above.length + below.length < 4294967295
+  short_line: before.length + after.length <= 4294967295
+  short_above: LINE_SPLIT.all_short(above)
+  short_below: LINE_SPLIT.all_short(below)
+  stale_above: stale <= above.length
+
+create {ANY}
+
+  -- The text `cs`, the cursor at its start, every line in state 0. A text that does not fit
+  -- (`LINE_SPLIT.fits`) gives an empty one.
+  of_chars(cs: LIST[CHAR]): TEXT_ZIP
+    do
+      let ls = LINE_SPLIT.lines_of(cs)
+      let none: LIST[CHAR] = LIST.empty
+      let no_lines: LIST[LIST[CHAR]] = LIST.empty
+      let no_ends: LIST[NAT] = LIST.empty
+      if ls.length > 0 and ls.length <= 4294967295 and LINE_SPLIT.all_short(ls) then
+        let z: TEXT_ZIP = { above = no_lines, before = none, after = ls.head, below = ls.tail, above_ends = no_ends,
+          here_end = 0, below_ends = LIST_CUT.repeat(0, ls.tail.length, no_ends), stale = 0, dirty = False }
+        check
+          first: LIST_CUT.reverse(none, ls.head) = ls.head
+          line: z.line = ls.head
+          whole: ls.tail.prepend(ls.head) = ls
+          all: LIST_CUT.reverse(no_lines, ls) = ls
+          lines: z.lines = ls
+        end
+        z
+      else
+        { above = no_lines, before = none, after = none, below = no_lines, above_ends = no_ends,
+          here_end = 0, below_ends = no_ends, stale = 0, dirty = False }
+      end
+    ensure
+      same_text: LINE_SPLIT.fits(cs) implies Result.chars = cs
+      at_start: Result.line_number = 0 and Result.column = 0
+    end
+
+  -- The characters `before` (the nearest first) and those of `p` up to column `k`, the
+  -- nearest first: the start of a line cut at `k`.
+  cut_before(p: LIST[CHAR], k: NAT, acc: LIST[CHAR]): LIST[CHAR]
+    variant
+      k
+    do
+      if k = 0 or p.length = 0 then acc else TEXT_ZIP.cut_before(p.tail, k - 1, acc.prepend(p.head)) end
+    ensure
+      rejoined: LIST_CUT.reverse(Result, LIST_CUT.drop(p, k)) = LIST_CUT.reverse(acc, p)
+      length_def: Result.length + LIST_CUT.drop(p, k).length = acc.length + p.length
+    end
+
+feature {ANY}
+
+  equals(other: TEXT_ZIP): BOOL
+    do
+      Current = other
+    ensure
+      def: Result = (Current = other)
+    end
+
+  -- The lines, in order.
+  lines: LIST[LIST[CHAR]]
+    do
+      LIST_CUT.reverse(Current.above, Current.below.prepend(Current.line))
+    ensure
+      count: Result.length = Current.line_count
+    end
+
+  -- The text: the lines with a line feed between one and the next.
+  chars: LIST[CHAR]
+    do
+      LINE_SPLIT.join(Current.lines)
+    end
+
+  -- The cursor's line.
+  line: LIST[CHAR]
+    do
+      LIST_CUT.reverse(Current.before, Current.after)
+    ensure
+      length_def: Result.length = Current.line_length
+    end
+
+  -- The characters of the cursor's line before the cursor, the nearest first.
+  backward: LIST[CHAR]
+    do
+      Current.before
+    ensure
+      length_def: Result.length = Current.column
+    end
+
+  -- The characters of the cursor's line from the cursor on.
+  forward: LIST[CHAR]
+    do
+      Current.after
+    ensure
+      length_def: Result.length + Current.column = Current.line_length
+    end
+
+  -- The line the cursor is on, from 0.
+  line_number: NAT
+    do
+      Current.above.length
+    ensure
+      in_text: Result < Current.line_count
+    end
+
+  -- The cursor's column, in characters from the start of its line.
+  column: NAT
+    do
+      Current.before.length
+    ensure
+      in_line: Result <= Current.line_length
+    end
+
+  line_length: NAT
+    do
+      Current.before.length + Current.after.length
+    ensure
+      short: Result <= 4294967295
+    end
+
+  line_count: NAT
+    do
+      Current.above.length + 1 + Current.below.length
+    ensure
+      some: Result > 0
+      few: Result <= 4294967295
+    end
+
+  -- Line `n`, or none past the last. It costs the distance from the cursor's line.
+  line_at(n: NAT): LIST[CHAR]
+    do
+      let k = Current.above.length
+      if n < k then
+        LIST_OPS.at(Current.above, k - 1 - n)
+      else if n = k then
+        Current.line
+      else if n - k - 1 < Current.below.length then
+        LIST_OPS.at(Current.below, n - k - 1)
+      else
+        LIST.empty
+      end end end
+    end
+
+  -- The lines from line `top` on, at most `rows` of them, when `top` is at or above the
+  -- cursor's line. It costs `rows` lines and the distance from `top` to the cursor.
+  page(top: NAT, rows: NAT): LIST[LIST[CHAR]]
+    do
+      let k = if top <= Current.above.length then Current.above.length - top else Current.above.length end
+      let none: LIST[LIST[CHAR]] = LIST.empty
+      let ups = LIST_CUT.take_into(Current.above, k, none)
+      let downs = if rows > k + 1 then LIST_CUT.take(Current.below, rows - k - 1) else none end
+      LIST_CUT.take(ups.append(downs.prepend(Current.line)), rows)
+    end
+
+  -- The states the lines of `page(top, rows)` end in, in order.
+  page_ends(top: NAT, rows: NAT): LIST[NAT]
+    do
+      let k = if top <= Current.above.length then Current.above.length - top else Current.above.length end
+      let none: LIST[NAT] = LIST.empty
+      let ups = LIST_CUT.take_into(Current.above_ends, k, none)
+      let downs = if rows > k + 1 then LIST_CUT.take(Current.below_ends, rows - k - 1) else none end
+      LIST_CUT.take(ups.append(downs.prepend(Current.here_end)), rows)
+    end
+
+  -- The state line `top` starts in: the one the line before it ends in, or 0 for the first.
+  start_of(top: NAT): NAT
+    do
+      let k = if top <= Current.above.length then Current.above.length - top else Current.above.length end
+      if top > 0 and k < Current.above_ends.length then LIST_OPS.at(Current.above_ends, k) else 0 end
+    end
+
+  -- The state the cursor's line starts in.
+  here_start: NAT
+    do
+      if Current.above_ends.length > 0 then Current.above_ends.head else 0 end
+    end
+
+  -- Whether some line's state is out of date, so that `relexed` has work to do.
+  needs_lexing: BOOL
+    do
+      Current.dirty or Current.stale > 0
+    end
+
+  -- The text as a `STRING`, lines joined by line feeds.
+  text: STRING
+    do
+      match STRING.from_utf8(TEXT_ZIP.encode_lines(Current.lines, True, BYTES_BUILDER.empty).to_bytes)
+        case Ok(s) then s
+        case Error(_) then ""
+      end
+    end
+
+  -- One character to the left, or to the end of the line above at the start of a line.
+  left: TEXT_ZIP
+    do
+      if Current.before.length > 0 then
+        let z = { Current with before = Current.before.tail, after = Current.after.prepend(Current.before.head) }
+        check
+          step: LIST_CUT.reverse(Current.before, Current.after) =
+            LIST_CUT.reverse(Current.before.tail, Current.after.prepend(Current.before.head))
+          same: z.line = Current.line
+        end
+        z
+      else if Current.above.length > 0 then
+        Current.up(4294967295)
+      else
+        Current
+      end end
+    ensure
+      same_text: Result.lines = Current.lines
+    end
+
+  -- One character to the right, or to the start of the line below at the end of a line.
+  right: TEXT_ZIP
+    do
+      if Current.after.length > 0 then
+        let z = { Current with before = Current.before.prepend(Current.after.head), after = Current.after.tail }
+        check
+          whole: Current.after.tail.prepend(Current.after.head) = Current.after
+          step: LIST_CUT.reverse(Current.before.prepend(Current.after.head), Current.after.tail) =
+            LIST_CUT.reverse(Current.before, Current.after.tail.prepend(Current.after.head))
+          same: z.line = Current.line
+        end
+        z
+      else if Current.below.length > 0 then
+        Current.down(0)
+      else
+        Current
+      end end
+    ensure
+      same_text: Result.lines = Current.lines
+    end
+
+  -- To column `k` of the line above, or its end when it is shorter.
+  up(k: NAT): TEXT_ZIP
+    do
+      if Current.above.length = 0 then
+        Current
+      else
+        let p = Current.above.head
+        let none: LIST[CHAR] = LIST.empty
+        { above = Current.above.tail, before = TEXT_ZIP.cut_before(p, k, none), after = LIST_CUT.drop(p, k),
+          below = Current.below.prepend(Current.line), above_ends = Current.above_ends.tail,
+          here_end = Current.above_ends.head, below_ends = Current.below_ends.prepend(Current.here_end),
+          stale = if Current.stale > 0 then Current.stale - 1 else 0 end, dirty = Current.stale > 0 }
+      end
+    ensure
+      same_text: Result.lines = Current.lines
+      moved: Current.line_number > 0 implies Result.line_number + 1 = Current.line_number
+      stayed: Current.line_number = 0 implies Result.line_number = 0
+    end
+
+  -- To column `k` of the line below, or its end when it is shorter.
+  down(k: NAT): TEXT_ZIP
+    do
+      if Current.below.length = 0 then
+        Current
+      else
+        let p = Current.below.head
+        let none: LIST[CHAR] = LIST.empty
+        { above = Current.above.prepend(Current.line), before = TEXT_ZIP.cut_before(p, k, none),
+          after = LIST_CUT.drop(p, k), below = Current.below.tail,
+          above_ends = Current.above_ends.prepend(Current.here_end), here_end = Current.below_ends.head,
+          below_ends = Current.below_ends.tail,
+          stale = if Current.dirty or Current.stale > 0 then Current.stale + 1 else 0 end, dirty = False }
+      end
+    ensure
+      same_text: Result.lines = Current.lines
+      moved: Current.line_number + 1 < Current.line_count implies Result.line_number = Current.line_number + 1
+      stayed: Current.line_number + 1 = Current.line_count implies Result.line_number = Current.line_number
+    end
+
+  -- To column `k` of the cursor's line, or its end when it is shorter.
+  to_column(k: NAT): TEXT_ZIP
+    do
+      let none: LIST[CHAR] = LIST.empty
+      let l = Current.line
+      { Current with before = TEXT_ZIP.cut_before(l, k, none), after = LIST_CUT.drop(l, k) }
+    ensure
+      same_text: Result.lines = Current.lines
+    end
+
+  -- To column `k` of line `n`, or the nearest place in the text. It costs the distance in
+  -- lines and the two lines' lengths.
+  to(n: NAT, k: NAT): TEXT_ZIP
+    do
+      Current.to_column(0).to_line(n).to_column(k)
+    ensure
+      same_text: Result.lines = Current.lines
+    end
+
+  -- To the start of line `n`, or of the last line, from the start of a line.
+  to_line(n: NAT): TEXT_ZIP
+    variant
+      if n < Current.line_number then Current.line_number - n else n - Current.line_number end
+    do
+      if n < Current.line_number then
+        Current.up(0).to_line(n)
+      else if n > Current.line_number and Current.line_number + 1 < Current.line_count then
+        Current.down(0).to_line(n)
+      else
+        Current.to_column(0)
+      end end
+    ensure
+      same_text: Result.lines = Current.lines
+    end
+
+  -- `c` typed at the cursor, which moves after it, unless the line is as long as it may be.
+  -- A line feed starts a new line.
+  insert(c: CHAR): TEXT_ZIP
+    do
+      if c.code = 10 then
+        Current.newline
+      else if Current.before.length + Current.after.length < 4294967295 then
+        { Current with before = Current.before.prepend(c), dirty = True }
+      else
+        Current
+      end end
+    end
+
+  -- The cursor's line cut at the cursor, the cursor at the start of the second part.
+  newline: TEXT_ZIP
+    do
+      if Current.above.length + Current.below.length + 1 < 4294967295 then
+        let none: LIST[CHAR] = LIST.empty
+        { Current with above = Current.above.prepend(LIST_CUT.reverse(Current.before, none)), before = none,
+          above_ends = Current.above_ends.prepend(Current.here_end), stale = Current.stale + 1, dirty = True }
+      else
+        Current
+      end
+    end
+
+  -- The character before the cursor taken out, or at the start of a line, the line joined to
+  -- the one above it.
+  backspace: TEXT_ZIP
+    do
+      if Current.before.length > 0 then
+        { Current with before = Current.before.tail, dirty = True }
+      else if Current.above.length > 0 and Current.above.head.length <= 4294967295 - Current.after.length then
+        let none: LIST[CHAR] = LIST.empty
+        { Current with above = Current.above.tail, before = LIST_CUT.reverse(Current.above.head, none),
+          above_ends = Current.above_ends.tail, stale = if Current.stale > 0 then Current.stale - 1 else 0 end, dirty = True }
+      else
+        Current
+      end end
+    end
+
+  -- The character after the cursor taken out, or at the end of a line, the line below joined
+  -- to it.
+  delete: TEXT_ZIP
+    do
+      if Current.after.length > 0 then
+        { Current with after = Current.after.tail, dirty = True }
+      else if Current.below.length > 0 and Current.below.head.length <= 4294967295 - Current.before.length then
+        { Current with after = Current.below.head, below = Current.below.tail, below_ends = Current.below_ends.tail, dirty = True }
+      else
+        Current
+      end end
+    end
+
+  -- `cs` typed at the cursor, line feeds starting new lines.
+  insert_all(cs: LIST[CHAR]): TEXT_ZIP
+    variant
+      cs.length
+    do
+      -- `insert`, written out: a character taken from a list is not known to the prover to be
+      -- one, so `insert`'s contract, stated for characters, would not apply to it.
+      if cs.length = 0 then
+        Current
+      else if cs.head.code = 10 then
+        Current.newline.insert_all(cs.tail)
+      else if Current.before.length + Current.after.length < 4294967295 then
+        { Current with before = Current.before.prepend(cs.head), dirty = True }.insert_all(cs.tail)
+      else
+        Current.insert_all(cs.tail)
+      end end end
+    end
+
+  -- `n` characters before the cursor taken out, a line feed counting as one.
+  backspace_times(n: NAT): TEXT_ZIP
+    variant
+      n
+    do
+      if n = 0 then Current else Current.backspace.backspace_times(n - 1) end
+    end
+
+  -- The states brought up to date with `lex`, which gives the state a line ends in from the
+  -- one it starts in. The lines whose states are out of date are lexed, and the cursor's
+  -- line, then the lines below it until one ends as it did before.
+  relexed(lex: (start: NAT, line: LIST[CHAR]) -> NAT): TEXT_ZIP
+    do
+      let n = if Current.stale <= Current.above.length then Current.stale else Current.above.length end
+      let none: LIST[LIST[CHAR]] = LIST.empty
+      let deep_first = LIST_CUT.take_into(Current.above, n, none)
+      let ups = TEXT_ZIP.ends_onto(deep_first, lex, LIST_CUT.drop(Current.above_ends, n))
+      let here = TEXT_ZIP.ends_onto(LIST.empty.prepend(Current.line), lex, ups)
+      let downs = TEXT_ZIP.relex_below(Current.below, Current.below_ends, lex, LIST.empty.prepend(here.head))
+      { Current with above_ends = ups, here_end = here.head, below_ends = downs.tail, stale = 0, dirty = False }
+    end
+
+  -- Every line lexed again with `lex`: for a new lexer.
+  relexed_all(lex: (start: NAT, line: LIST[CHAR]) -> NAT): TEXT_ZIP
+    do
+      let none: LIST[LIST[CHAR]] = LIST.empty
+      let no_ends: LIST[NAT] = LIST.empty
+      let ups = TEXT_ZIP.ends_onto(LIST_CUT.take_into(Current.above, Current.above.length, none), lex, no_ends)
+      let here = TEXT_ZIP.ends_onto(LIST.empty.prepend(Current.line), lex, ups)
+      let downs = TEXT_ZIP.ends_onto(Current.below, lex, LIST.empty.prepend(here.head))
+      { Current with above_ends = ups, here_end = here.head, below_ends = LIST_CUT.reverse(downs, no_ends).tail,
+        stale = 0, dirty = False }
+    end
+
+create {ANY}
+
+  -- `acc` with the states `ls` end in in front of it, the last line's first. Each line is
+  -- lexed from the state the one before it ends in: the head of `acc`, or 0 when it is empty.
+  -- (A state is passed in a list: a number a function gives back is not known to the prover
+  -- to be a `NAT`, so it could not be one of its arguments.)
+  ends_onto(ls: LIST[LIST[CHAR]], lex: (start: NAT, line: LIST[CHAR]) -> NAT, acc: LIST[NAT]): LIST[NAT]
+    variant
+      ls.length
+    do
+      if ls.length = 0 then
+        acc
+      else
+        let s = if acc.length > 0 then acc.head else 0 end
+        TEXT_ZIP.ends_onto(ls.tail, lex, acc.prepend(lex(s, ls.head)))
+      end
+    ensure
+      length_def: Result.length = acc.length + ls.length
+      some: acc.length > 0 or ls.length > 0 implies Result.length > 0
+    end
+
+  -- The states of `ls`, whose states were `ends`, each lexed from the head of `acc`, until one
+  -- ends as it did: `acc` in order, those lexed in order, then the rest of `ends`. `acc` holds
+  -- the state the first line starts in, then those lexed, the last first.
+  relex_below(ls: LIST[LIST[CHAR]], ends: LIST[NAT], lex: (start: NAT, line: LIST[CHAR]) -> NAT,
+              acc: LIST[NAT]): LIST[NAT]
+    require
+      paired: ends.length = ls.length
+      started: acc.length > 0
+    variant
+      ls.length
+    do
+      if ls.length = 0 then
+        LIST_CUT.reverse(acc, ends)
+      else
+        let e = lex(acc.head, ls.head)
+        if e = ends.head then
+          LIST_CUT.reverse(acc, ends)
+        else
+          TEXT_ZIP.relex_below(ls.tail, ends.tail, lex, acc.prepend(e))
+        end
+      end
+    ensure
+      length_def: Result.length = acc.length + ls.length
+    end
+
+  -- `out` with the UTF-8 bytes of `ls`, a line feed before each but the first (`first`).
+  encode_lines(ls: LIST[LIST[CHAR]], first: BOOL, out: BYTES_BUILDER): BYTES_BUILDER
+    variant
+      ls.length
+    do
+      if ls.length = 0 then
+        out
+      else
+        let fed = if first then out else GLYPHS.add_char(out, LINE_SPLIT.lf) end
+        TEXT_ZIP.encode_lines(ls.tail, False, GLYPHS.encode(ls.head, fed))
+      end
+    end
+
+specify {CANONICAL_EQ}
+
+  law agrees_with_structural(a: TEXT_ZIP, b: TEXT_ZIP)
+    ensure
+      sound: a.equals(b) = (a = b)
+    end
+
+specify {EQ}
+
+  law reflexive(a: TEXT_ZIP)
+    ensure
+      refl: a.equals(a)
+    end
+
+  law symmetric(a: TEXT_ZIP, b: TEXT_ZIP)
+    require
+      ab: a.equals(b)
+    ensure
+      ba: b.equals(a)
+    end
+
+  law transitive(a: TEXT_ZIP, b: TEXT_ZIP, c: TEXT_ZIP)
+    require
+      ab: a.equals(b)
+      bc: b.equals(c)
+    ensure
+      ac: a.equals(c)
+    end
+
+end

@@ -99,8 +99,16 @@ feature {ANY}
       GLYPHS.add_text(d, "H")
     end
 
-  -- `out` with `cs`, each preceded by its style when it differs from the one before.
+  -- `out` with `cs`, each preceded by its style when it differs from the one before. A right
+  -- half after its left half sends nothing, as the terminal has filled it already; one after
+  -- anything else, which a screen never holds, sends a space. A cell's marks follow it.
   cells(cs: LIST[CELL], pen: STYLE, out: BYTES_BUILDER): BYTES_BUILDER
+    do
+      VT_TEXT.cells_after(cs, pen, False, out)
+    end
+
+  -- `cells`, after a left half when `half` is set.
+  cells_after(cs: LIST[CELL], pen: STYLE, half: BOOL, out: BYTES_BUILDER): BYTES_BUILDER
     variant
       cs.length
     do
@@ -108,9 +116,22 @@ feature {ANY}
         out
       else
         let c = cs.head
-        let styled = if c.style.same(pen) then out else VT_TEXT.add_sgr(out, c.style) end
-        VT_TEXT.cells(cs.tail, c.style, GLYPHS.add_char(styled, c.char))
+        if c.is_right_half and half then
+          VT_TEXT.cells_after(cs.tail, pen, False, out)
+        else
+          let styled = if c.style.same(pen) then out else VT_TEXT.add_sgr(out, c.style) end
+          let drawn = VT_TEXT.marks(LIST_CUT.reverse(c.marks_backwards, LIST.empty), GLYPHS.add_char(styled, c.char))
+          VT_TEXT.cells_after(cs.tail, c.style, c.is_left_half, drawn)
+        end
       end
+    end
+
+  -- `out` with the marks `ms`.
+  marks(ms: LIST[CHAR], out: BYTES_BUILDER): BYTES_BUILDER
+    variant
+      ms.length
+    do
+      if ms.length = 0 then out else VT_TEXT.marks(ms.tail, GLYPHS.add_char(out, ms.head)) end
     end
 
   -- The style of the last of `cs`, or `pen` when there is none.
