@@ -1,9 +1,9 @@
 # Tablon
 
 Tablon is a workbench for a Gardel project, written in Gardel on `gtui` and `gjson`. It browses
-a project's modules and files, shows each module's short form and parts, checks the project and
-takes you from a failure to its line, builds it, runs it, and opens a file in your editor. It
-runs in a terminal.
+a project's modules and files, shows each module's short form and parts, edits the source,
+checks the project and takes you from a failure to its line, builds it, and runs it. It runs in
+a terminal.
 
 ```
 ┌ Modules(m) │ Files(f) ─┐┌ CELL - Text ──────────────────────────────────────────┐
@@ -72,7 +72,7 @@ opens it, and reads the modules again. Edit it with `/edit` (Ctrl-E).
 
   | Key | View | What it shows |
   |-----|------|---------------|
-  | `t` | Text | The source, with line numbers and Gardel's syntax coloured. |
+  | `t` | Text | The source, with line numbers and Gardel's syntax coloured. Enter edits it (see [Editing](#editing)). |
   | `s` | Short | The short form: the module's contracts without their bodies. |
   | `f` | Features | Its features, one a line. Enter shows the feature's line in Text. |
   | `n` | Creators | Its creators. Enter shows the line. |
@@ -101,7 +101,8 @@ The pane that has the keys is framed in cyan. Tab moves the keys to the next pan
 | Key | Where | What it does |
 |-----|-------|--------------|
 | Tab | anywhere | The keys to the next pane. |
-| Up, Down, PageUp, PageDown, Home, End | a tree, a list or a text | Move or scroll. |
+| Up, Down, PageUp, PageDown, Home, End | a tree, a list or a text | Move or scroll; in Text, the cursor. |
+| Enter | Text | Edit the file shown, until Escape. |
 | Right, Left | a tree | Open or close a node. |
 | Enter | a tree, a list, Problems | Open what is chosen, or go to its line. |
 | a tab's key | its pane | Choose that tab, such as `s` for Short on the right. |
@@ -109,9 +110,10 @@ The pane that has the keys is framed in cyan. Tab moves the keys to the next pan
 | Ctrl-K | anywhere | Check (`/check`). |
 | Ctrl-B | anywhere | Build (`/build`). |
 | Ctrl-R | anywhere | Build and run (`/run`). |
-| Ctrl-E | anywhere | Edit the file shown (`/edit`). |
+| Ctrl-S | anywhere | Save the file shown, then check (`/save`). |
+| Ctrl-E | anywhere | Edit the file shown in your editor (`/edit`). |
 | Ctrl-X | anywhere | Stop what runs (`/stop`). |
-| `q` | anywhere but the input line | Quit. |
+| `q` | anywhere but the input line and the text being edited | Quit, after asking when files are unsaved. |
 
 Ctrl-C is not one of them: as in any terminal program, it ends Tablon.
 
@@ -126,11 +128,12 @@ Words after the command's name are its arguments, such as `/run 3 4`.
 | `/build` | Verify and compile the project with `gardelc --json-diagnostics`. Its steps go to Build, its errors to Problems. |
 | `/run [ARGS]` | Build, then run the program with `ARGS`, split at spaces. |
 | `/stop` | Stop the program run, or else the build, or else the check. |
-| `/edit [EDITOR]` | Open the file shown in the editor, then read it again and check the project. With `EDITOR`, that editor is used from then on. |
+| `/save` | Write the file shown, then check the project. |
+| `/edit [EDITOR]` | Open the file shown in your editor, then read it again and check the project. With `EDITOR`, that editor is used from then on. A file with unsaved edits must be saved first. |
 | `/new NAME` | Make the module `NAME`: write `src/name.gdl`, in lowercase, unless a file is there already, then open it and read the modules again. `NAME` is a letter, then letters, digits and `_`. |
 | `/inspect` | Read the project's modules again, without proving them. |
-| `/open DIR` | Browse the project in `DIR` instead. |
-| `/quit` | Leave Tablon. |
+| `/open DIR` | Browse the project in `DIR` instead, after asking when files are unsaved. |
+| `/quit` | Leave Tablon, after asking when files are unsaved. |
 
 None of them waits: each runs `gardelc` or the program as a process, the status bar says what
 runs (`checking...`, `building...`, `running...`), and the keys keep working. Only one check,
@@ -153,9 +156,39 @@ now, and runs it only when the build makes an executable. Tablon then runs it on
 
 ## Editing
 
-Tablon shows source but does not edit it yet (that is Task F.16). `/edit` (or Ctrl-E) runs your
-editor on the file shown, attached to the terminal. When the editor ends, Tablon reads the file
-again and checks the project, so Problems shows what the edit fixed or broke.
+Text edits the file shown. With the keys in Text, Enter starts editing, and the keys type until
+Escape, `q` and `/` too; Tab still moves to the next pane. While editing:
+
+| Key | What it does |
+|-----|--------------|
+| a character, Enter, Backspace, Delete | Type, start a line, delete. They replace the selection when there is one. |
+| arrows, Home, End, PageUp, PageDown | Move. Ctrl-Home and Ctrl-End go to the start and the end of the file. |
+| Shift with a move | Select. |
+| Ctrl-A | Select everything. |
+| Ctrl-X, Shift-Delete | Cut the selection. |
+| Ctrl-Insert | Copy the selection. (Ctrl-C ends Tablon, as in any terminal program.) |
+| Ctrl-V, Shift-Insert | Paste what was cut or copied. A paste from the terminal is pasted too, as one edit. |
+| Ctrl-Z, Ctrl-Y | Undo and redo, one edit at a time. |
+| Ctrl-S | Save, then check the project. |
+| Ctrl-K, Ctrl-B, Ctrl-R, Ctrl-E | Check, build, run, edit in your editor, as anywhere. |
+
+What is cut or copied also goes to the terminal's clipboard, where the terminal knows OSC 52.
+
+- **Unsaved files.** The frame's title says `(unsaved)` once the file shown is edited. Another
+  file can be shown in the meantime: an edited file stays edited, and showing it again gives its
+  text back without reading it. Quitting, or `/open`, asks first while files are unsaved: `y`
+  goes on, and any other key goes back.
+- **Saving.** Ctrl-S writes the file, with the line ends it had (CR LF stays CR LF), and then
+  checks the project, so Problems shows what the edit fixed or broke. A save while a check runs
+  checks again once that check ends.
+- **Problems move with the lines.** An edit that adds or takes out lines moves the marked line
+  and the problems placed below it in that file, so Enter on a problem still goes to its line
+  before the next check.
+- **Your own editor.** `/edit` (or Ctrl-E) runs your editor on the file shown, attached to the
+  terminal. When the editor ends, Tablon reads the file again and checks the project. A file with
+  unsaved edits must be saved first, as the editor reads it from the disk.
+- **What is shown.** A file that is not UTF-8, or that has 2^32 lines or more, is not shown, and
+  a line is edited as code points, each taking the columns a terminal gives it.
 
 ## How it is made
 

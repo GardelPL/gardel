@@ -6,8 +6,9 @@
 -- Delete edit, replacing the selection when there is one. The arrows, Home, End, PageUp and
 -- PageDown move, Ctrl with Home or End to the start or end of the text, and with Shift held
 -- they select. Ctrl-A selects everything, Ctrl-C copies the selection, Ctrl-X cuts it, Ctrl-V
--- pastes what was cut or copied, Ctrl-Z undoes and Ctrl-Y redoes. A terminal's paste is
--- `paste`. An application sends what is copied to the terminal's clipboard when
+-- pastes what was cut or copied, Ctrl-Z undoes and Ctrl-Y redoes. Ctrl-Insert copies,
+-- Shift-Insert pastes and Shift-Delete cuts too, for a terminal whose Ctrl-C is a signal (as
+-- in the Gardel runtime). A terminal's paste is `paste`. An application sends what is copied to the terminal's clipboard when
 -- `just_copied` says so (`TUI_COMMANDS.copy`).
 --
 -- Each edit is one step to undo, and the last 200 to 400 steps are kept. A lexer
@@ -325,6 +326,16 @@ feature {ANY}
       { Current with lexer = lex, zip = Current.zip.relexed_all(lex) }
     end
 
+  -- The page scrolled to show line `n` first, or the last line when there are fewer; drawing
+  -- scrolls it again as little as it takes to show the cursor (`followed`).
+  with_top(n: NAT): TEXT_AREA
+    do
+      let last = Current.zip.line_count - 1
+      { Current with top_line = if n <= last then n else last end }
+    ensure
+      same_state: Result.state = Current.state
+    end
+
   -- The page scrolled as little as it takes to show the cursor in the text part of `r`.
   followed(r: RECT): TEXT_AREA
     do
@@ -555,8 +566,30 @@ feature {ANY}
         case Delete then Current.delete
         case Ctrl(c) then Current.ctrl_keyed(c)
         case Mod(m, shift, alt, ctrl) then
-          if alt then Current else Current.moved(m, page, shift, ctrl) end
+          if alt then Current
+          else if Current.is_insert(m) and ctrl and not shift then Current.copy
+          else if Current.is_insert(m) and shift and not ctrl then Current.paste_chars(Current.clip)
+          else if Current.is_delete(m) and shift and not ctrl then Current.cut
+          else Current.moved(m, page, shift, ctrl)
+          end end end end
         case _ then Current.moved(k, page, False, False)
+      end
+    end
+
+  -- Whether `k` is Insert, or Delete.
+  is_insert(k: KEY): BOOL
+    do
+      match k
+        case Insert then True
+        case _ then False
+      end
+    end
+
+  is_delete(k: KEY): BOOL
+    do
+      match k
+        case Delete then True
+        case _ then False
       end
     end
 
@@ -632,6 +665,18 @@ feature {ANY}
   draw_code(s: SCREEN, r: RECT, st: STYLE, gutter: STYLE, chosen: STYLE,
             spans: (start: NAT, line: LIST[CHAR]) -> LIST[SPAN]): SCREEN
     do
+      Current.draw_marked(s, r, st, gutter, chosen, spans, None, st, True)
+    ensure
+      same_width: Result.width = s.width
+      same_height: Result.height = s.height
+    end
+
+  -- As `draw_code`, with line `marked`, when there is one, drawn across on the background of
+  -- `mark`, its number and its spans too; and the terminal's cursor shown only when `cursor`
+  -- is set, as when the area has the keys.
+  draw_marked(s: SCREEN, r: RECT, st: STYLE, gutter: STYLE, chosen: STYLE,
+              spans: (start: NAT, line: LIST[CHAR]) -> LIST[SPAN], marked: OPTION[NAT], mark: STYLE, cursor: BOOL): SCREEN
+    do
       let v = Current.followed(r)
       let z = v.zip
       let d = TEXT_AREA.digits(z.line_count)
@@ -640,10 +685,11 @@ feature {ANY}
       let t = r.drop_left(digits + 1)
       let rows = t.height
       let starts = z.page_ends(v.top_line, rows).prepend(z.start_of(v.top_line))
-      let drawn = v.draw_rows(s, numbers, t, z.page(v.top_line, rows), starts, v.top_line, t.y, digits, st, gutter, chosen, spans)
+      let drawn = v.draw_rows(s, numbers, t, z.page(v.top_line, rows), starts, v.top_line, t.y, digits, st, gutter, chosen, spans,
+        marked, mark)
       let n = z.line_number
       let cx = v.cursor_x
-      if n >= v.top_line and n - v.top_line < rows and cx >= v.left_column and cx - v.left_column < t.width then
+      if cursor and n >= v.top_line and n - v.top_line < rows and cx >= v.left_column and cx - v.left_column < t.width then
         drawn.with_cursor(t.x + (cx - v.left_column), t.y + (n - v.top_line))
       else
         drawn
@@ -657,7 +703,7 @@ feature {ANY}
   -- head of `starts`.
   draw_rows(s: SCREEN, numbers: RECT, t: RECT, lines: LIST[LIST[CHAR]], starts: LIST[NAT], i: NAT, y: NAT,
             digits: NAT, st: STYLE, gutter: STYLE, chosen: STYLE,
-            spans: (start: NAT, line: LIST[CHAR]) -> LIST[SPAN]): SCREEN
+            spans: (start: NAT, line: LIST[CHAR]) -> LIST[SPAN], marked: OPTION[NAT], mark: STYLE): SCREEN
     require
       narrow: digits <= 20
     variant
@@ -669,9 +715,17 @@ feature {ANY}
         let label = NUMBER_TEXT.nat_to_text(i + 1)
         let ln = label.byte_length
         let lx = if ln <= digits then numbers.x + (digits - ln) else numbers.x end
-        let numbered = s.text(numbers, lx, y, label, gutter)
-        let drawn = Current.draw_line(numbered, t, y, lines.head, i, st, chosen, spans(starts.head, lines.head))
-        Current.draw_rows(drawn, numbers, t, lines.tail, starts.tail, i + 1, y + 1, digits, st, gutter, chosen, spans)
+        let hit = match marked case Some(m) then m = i case None then False end
+        let filled = if hit then
+            s.fill(RECT.make(numbers.x, y, numbers.width, 1), ' ', mark).fill(RECT.make(t.x, y, t.width, 1), ' ', mark)
+          else
+            s
+          end
+        let numbered = filled.text(numbers, lx, y, label, if hit then mark else gutter end)
+        let sps = spans(starts.head, lines.head)
+        let drawn = Current.draw_line(numbered, t, y, lines.head, i, if hit then mark else st end, chosen,
+          if hit then TEXT_AREA.on_mark(sps, mark, LIST.empty) else sps end)
+        Current.draw_rows(drawn, numbers, t, lines.tail, starts.tail, i + 1, y + 1, digits, st, gutter, chosen, spans, marked, mark)
       end
     ensure
       same_width: Result.width = s.width
@@ -720,6 +774,19 @@ feature {ANY}
     end
 
 create {ANY}
+
+  -- `sps` on the background of `mark` (`TEXT_VIEW.on_mark`), in the same order.
+  on_mark(sps: LIST[SPAN], mark: STYLE, acc: LIST[SPAN]): LIST[SPAN]
+    variant
+      sps.length
+    do
+      if sps.length = 0 then
+        LIST_CUT.reverse(acc, LIST.empty)
+      else
+        let sp = sps.head
+        TEXT_AREA.on_mark(sps.tail, mark, acc.prepend(SPAN.make(sp.start, sp.length, TEXT_VIEW.on_mark(sp.style, mark))))
+      end
+    end
 
   -- `sps` drawn over the characters `visible` of a line, which start at character `k` and are
   -- drawn from column `x0` of row `y`; a span counts characters from the start of the line.

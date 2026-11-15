@@ -20,6 +20,11 @@
 -- `/check`, `/build`, `/run [ARGS]`, `/stop`, `/edit [EDITOR]`, `/new NAME`, `/inspect`,
 -- `/open DIR` and `/quit`; Ctrl-K, B, R, E and X are the first five. `q` quits. A program run with its output
 -- read takes the keys as its input until Escape; a reactive program is run attached.
+--
+-- In Text, Enter edits the file shown, and Escape stops: keys type, select, cut (Ctrl-X),
+-- copy (Ctrl-Insert), paste (Ctrl-V), undo (Ctrl-Z) and redo (Ctrl-Y). Ctrl-S saves the file
+-- and checks the project again. The frame's title says when the file is unsaved, an edited
+-- file stays edited while another is shown, and quitting with unsaved files asks first.
 reactive program TABLON
 
 feature {ANY}
@@ -37,7 +42,8 @@ feature {ANY}
         case AttachedEnded(tag, r) then s.attached_ended(tag, r)
         case DirListed(tag, r) then s.listed(tag, r)
         case FileRead(tag, r) then if tag = 7 then s.new_checked(r) else TUI_NEXT.next(s.file_read(tag, r)) end
-        case FileWritten(tag, r) then if tag = 8 then s.new_written(r) else TUI_NEXT.next(s) end
+        case FileWritten(tag, r) then if tag = 8 then s.new_written(r) else if tag = 9 then s.written(r) else TUI_NEXT.next(s) end end
+        case Pasted(t) then s.pasted(t)
         case _ then TUI_NEXT.next(s)
       end
     end
@@ -58,8 +64,9 @@ feature {ANY}
   module_view(s: TABLON_STATE, scr: SCREEN, r: RECT): SCREEN
     do
       if s.view = MODULE_VIEWS.text_view then
-        s.text.draw_code(scr, r, STYLE.plain, STYLE.plain.fg(COLOR.gray), s.marked,
-          STYLE.plain.bg(COLOR.blue), fn(i: NAT, line: STRING): LIST[SPAN] do GARDEL_LEXER.spans(i, line) end)
+        s.shown_file.area.draw_marked(scr, r, STYLE.plain, STYLE.plain.fg(COLOR.gray), STYLE.plain.reversed,
+          fn(start: NAT, line: LIST[CHAR]): LIST[SPAN] do GARDEL_LEXER.scan(line, 0, LIST.empty) end,
+          s.marked, STYLE.plain.bg(COLOR.blue), s.cursor_shown)
       else if s.view = MODULE_VIEWS.short_view then
         if s.has_module then s.short.draw(scr, r, STYLE.plain)
         else TEXT_VIEW.make(LIST.empty.prepend("Choose a module on the left.")).draw(scr, r, STYLE.plain)

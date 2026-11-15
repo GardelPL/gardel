@@ -8,6 +8,13 @@
 //! checked; a failed build runs nothing; and `/new` writes a module's file only where there is
 //! none, then opens it and inspects the project again.
 //!
+//! F.16c: Text edits the file shown. A save writes the text with the file's own line ends and
+//! checks again; an edit moves the marked line and the problems below it; an edited file stays
+//! edited while another is shown; quitting with unsaved files asks first; a copy reaches the
+//! terminal's clipboard; a session that edits and saves replays to the same screen and the same
+//! bytes with no file written; a key on a file of 5000 lines takes less than a 16 ms frame; and a
+//! real check's failure, fixed in Tablon and saved, gives a clean check.
+//!
 //! The scripts stand in for `gardelc`: the inspection's output is the fixture's expected object,
 //! and a file read is the fixture's file, so the tests need no compiler run but the build.
 
@@ -114,18 +121,30 @@ struct Terminal {
     col: usize,
     pen: Vec<u32>,
     before_clear: Vec<Vec<Vec<Cell>>>,
+    /// The operating system commands written, such as a copy (`52;c;...`).
+    osc: Vec<String>,
 }
 
 impl Terminal {
     fn read(bytes: &[u8]) -> Self {
-        let mut t = Terminal { grid: Vec::new(), row: 0, col: 0, pen: Vec::new(), before_clear: Vec::new() };
+        let mut t = Terminal { grid: Vec::new(), row: 0, col: 0, pen: Vec::new(), before_clear: Vec::new(), osc: Vec::new() };
         let text = std::str::from_utf8(bytes).expect("the output is UTF-8");
         let cs: Vec<char> = text.chars().collect();
         let mut i = 0;
         while i < cs.len() {
             let c = cs[i];
+            if c == '\u{1b}' && cs.get(i + 1) == Some(&']') {
+                // An OSC sequence, ended by BEL or by ESC \.
+                let mut j = i + 2;
+                while j < cs.len() && cs[j] != '\u{7}' && !(cs[j] == '\u{1b}' && cs.get(j + 1) == Some(&'\\')) {
+                    j += 1;
+                }
+                t.osc.push(cs[i + 2..j.min(cs.len())].iter().collect());
+                i = if cs.get(j) == Some(&'\u{7}') { j + 1 } else { j + 2 };
+                continue;
+            }
             if c == '\u{1b}' {
-                assert_eq!(cs.get(i + 1), Some(&'['), "only CSI sequences, at char {i}");
+                assert_eq!(cs.get(i + 1), Some(&'['), "only CSI and OSC sequences, at char {i}");
                 let mut j = i + 2;
                 let private = cs.get(j) == Some(&'?');
                 if private {
@@ -459,4 +478,288 @@ fn new_makes_a_module_where_there_is_no_file_then_opens_it_and_inspects_again() 
     let (term, log) = screen(&format!("{}Key:Enter Key:Tab Key:Tab {}", keys("/new 2cells"), keys("o")));
     assert!(!log.contains("ReadFile 7"), "{log}");
     assert!(term.text().contains("/new needs a module's name"), "{}", term.text());
+}
+
+// F.16c: editing in Text.
+
+/// The bytes a scripted run's log says were written by the command `WriteFile tag`, decoded
+/// from the `%XX` the log writes for anything but a letter or a digit.
+fn written(log: &str, tag: usize) -> Option<Vec<u8>> {
+    let line = log.lines().find(|l| l.starts_with(&format!("file: WriteFile {tag} ")))?;
+    let text = line.split(' ').nth(4).unwrap_or("");
+    let b = text.as_bytes();
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'%' && i + 2 < b.len() {
+            out.push(u8::from_str_radix(std::str::from_utf8(&b[i + 1..i + 3]).expect("hex"), 16).expect("hex"));
+            i += 3;
+        } else {
+            out.push(b[i]);
+            i += 1;
+        }
+    }
+    Some(out)
+}
+
+/// CELL chosen, the keys moved to Text, and Enter pressed to edit it: the cursor is at the
+/// start of its header, line 2.
+fn edit_cell() -> String {
+    format!("{}Key:Tab Key:Enter ", choose(2, 1001, "cell.gdl"))
+}
+
+/// The fixture's `cell.gdl` with `text` put at the start of its second line.
+fn cell_with(text: &str) -> Vec<u8> {
+    let cell = fs::read_to_string(fixture().join("cell.gdl")).expect("cell.gdl");
+    assert!(cell.contains("\r\nmodule CELL"), "the fixture ends its lines with CR LF");
+    cell.replacen("\r\nmodule CELL", &format!("\r\n{text}module CELL"), 1).into_bytes()
+}
+
+#[test]
+fn text_is_edited_and_saved_with_its_own_line_ends_then_checked_again() {
+    // Typed: the title says unsaved; saved: the text written with its CR LF kept, and a check.
+    let steps = format!("{}{}Key:Ctrl:s ", edit_cell(), keys("x"));
+    let (term, log) = screen(&steps);
+    let shown = term.text();
+    assert!(shown.contains("CELL - Text (unsaved)") && shown.contains(" 2 xmodule CELL"), "{shown}");
+    assert!(shown.contains("Esc stops editing") && shown.contains("saving..."), "{shown}");
+    assert!(sent(&log, "file: WriteFile 9 ", ""), "{log}");
+    assert!(log.contains("%2F%2E%2Fcell%2Egdl "), "{log}");
+    assert_eq!(written(&log, 9).expect("a save"), cell_with("x"));
+    assert!(!log.contains("RunProcess 2"), "checked before the file was written: {log}");
+    // Written: the title no longer says so, the project is checked, and Output says it.
+    let (term, log) = screen(&format!("{steps}FileWritten:9:900 Key:Tab {}", keys("o")));
+    let shown = term.text();
+    assert!(log.contains("proc: RunProcess 2 gardelc "), "{log}");
+    assert!(shown.contains("CELL - Text") && !shown.contains("(unsaved)") && shown.contains("checking..."), "{shown}");
+    assert!(shown.contains("Saved cell.gdl") && shown.contains("Checking the project."), "{shown}");
+    // A file whose lines end with LF alone is written so.
+    let lf = format!(
+        "{}Key:Down Key:Right Key:Down Key:Down Key:Enter FileRead:1001:{} Key:Tab Key:Enter {}Key:Ctrl:s ",
+        keys("f"),
+        enc(b"some notes\nline two\n"),
+        keys("y")
+    );
+    let (term, log) = screen(&lf);
+    assert!(term.text().contains("src/cell.gdl (unsaved)"), "{}", term.text());
+    assert_eq!(written(&log, 9).expect("a save"), b"ysome notes\nline two\n");
+    // Before Enter, letters choose views and move nothing; after Escape, too.
+    let (term, log) = screen(&format!("{}Key:Tab {}Key:Down {}", choose(2, 1001, "cell.gdl"), keys("x"), keys("s")));
+    assert!(term.text().contains("CELL - Short") && !term.text().contains("(unsaved)") && !log.contains("WriteFile"), "{}", term.text());
+    let (term, _) = screen(&format!("{}{}Key:Escape {}", edit_cell(), keys("x"), keys("s")));
+    assert!(term.text().contains("CELL - Short (unsaved)"), "{}", term.text());
+}
+
+#[test]
+fn an_edit_moves_the_marked_line_and_the_problems_and_a_save_checks_again() {
+    let error = diag("error", "CELL", "same", "./cell.gdl", 31, "Formal verification condition `same` failed in `measure`");
+    let checked = inspection_with(&[error], &[]);
+    let check = format!("Key:Ctrl:k ProcessStarted:2:8 ProcessOutput:8:{} ProcessExited:8:1 ", enc(&checked));
+    // To the failure, then a line added above it: the failure and the mark move down a line.
+    let at = format!("{check}Key:Tab Key:Tab Key:Enter FileRead:1001:{} Key:Tab Key:Tab Key:Enter ", file("cell.gdl"));
+    let (term, _) = screen(&format!("{at}Key:Enter "));
+    let shown = term.text();
+    assert!(shown.contains("cell.gdl:32  error  Formal verification condition"), "{shown}");
+    let marked = term.row_of("32   measure: NAT");
+    let start = marked.iter().position(|c| c.0 == '3').expect("the line's number");
+    assert!(marked[start..].iter().take(20).all(|c| c.1.contains(&44)), "the line is not marked: {marked:?}");
+    // Taken out again, they move back; an edit that adds no line moves nothing.
+    let (term, _) = screen(&format!("{at}Key:Enter Key:Backspace {}", keys("ab")));
+    let shown = term.text();
+    assert!(shown.contains("cell.gdl:31  error") && shown.contains("31 ab  measure: NAT"), "{shown}");
+    // Saved: checked again, and a clean check leaves no problem.
+    let clean = inspection_with(&[], &[]);
+    let (term, log) = screen(&format!(
+        "{at}Key:Enter Key:Ctrl:s FileWritten:9:900 ProcessStarted:2:10 ProcessOutput:10:{} ProcessExited:10:0 Key:Tab {}",
+        enc(&clean),
+        keys("p")
+    ));
+    assert_eq!(log.matches("proc: RunProcess 2 ").count(), 2, "{log}");
+    assert!(term.text().contains("No problems: the project verifies."), "{}", term.text());
+    // A save while a check runs: the check that follows waits for it to end.
+    let (_, log) = screen(&format!("{}{}Key:Ctrl:k ProcessStarted:2:8 Key:Ctrl:s FileWritten:9:900 ", edit_cell(), keys("x")));
+    assert_eq!(log.matches("proc: RunProcess 2 ").count(), 1, "{log}");
+    let (_, log) = screen(&format!(
+        "{}{}Key:Ctrl:k ProcessStarted:2:8 Key:Ctrl:s FileWritten:9:900 ProcessOutput:8:{} ProcessExited:8:0 ",
+        edit_cell(),
+        keys("x"),
+        enc(&clean)
+    ));
+    assert_eq!(log.matches("proc: RunProcess 2 ").count(), 2, "{log}");
+}
+
+#[test]
+fn an_edited_file_stays_edited_while_another_is_shown_and_quitting_asks_first() {
+    // Edited, then USE_CELL shown, then CELL again: it is not read again, and is still edited.
+    let away = format!(
+        "{}{}Key:Escape Key:Tab Key:Tab Key:Down Key:Down Key:Enter FileRead:1002:{} Key:Up Key:Up Key:Enter ",
+        edit_cell(),
+        keys("x"),
+        file("use_cell.gdl")
+    );
+    let (term, log) = screen(&away);
+    assert!(!log.contains("ReadFile 1003"), "{log}");
+    assert!(term.text().contains("CELL - Text (unsaved)") && term.text().contains(" 2 xmodule CELL"), "{}", term.text());
+    // `q` asks; another key goes back, and `y` quits.
+    let (term, _) = screen(&format!("{away}{}", keys("q")));
+    assert!(term.text().contains("Unsaved: cell.gdl. Quit without saving them?"), "{}", term.text());
+    let (term, _) = screen(&format!("{away}{}", keys("qn")));
+    assert!(!term.text().contains("Quit without saving"), "{}", term.text());
+    let quit = run(&format!("{}{away}{}", start(), keys("qy")), &[]);
+    assert_eq!(quit.status.code(), Some(0), "{}", all(&quit));
+    let asked = run(&format!("{}{away}{}", start(), keys("q")), &[]);
+    assert_eq!(asked.status.code(), Some(1), "quit without asking: {}", all(&asked));
+    // So does `/open`; and `/edit` waits for a save, as the editor reads the disk.
+    let (term, log) = screen(&format!("{away}{}Key:Enter ", keys("/open elsewhere")));
+    assert!(term.text().contains("Open another project without saving them?"), "{}", term.text());
+    assert_eq!(log.matches("proc: RunProcess 1 ").count(), 1, "{log}");
+    let (term, log) = screen(&format!("{away}Key:Ctrl:e Key:Tab Key:Tab {}", keys("o")));
+    assert!(!log.contains("RunAttached 6") && term.text().contains("Save the file first (^S)"), "{log}");
+    // Nothing unsaved: `q` quits at once.
+    let clean = run(&format!("{}{}Key:Escape {}", start(), edit_cell(), keys("q")), &[]);
+    assert_eq!(clean.status.code(), Some(0), "{}", all(&clean));
+}
+
+/// `text` in base 64, as OSC 52 carries it.
+fn base64(text: &[u8]) -> String {
+    const A: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::new();
+    for c in text.chunks(3) {
+        let n = (u32::from(c[0]) << 16) | (u32::from(*c.get(1).unwrap_or(&0)) << 8) | u32::from(*c.get(2).unwrap_or(&0));
+        for k in 0..4 {
+            out.push(if k <= c.len() { A[((n >> (18 - 6 * k)) & 63) as usize] as char } else { '=' });
+        }
+    }
+    out
+}
+
+#[test]
+fn a_selection_is_cut_copied_and_pasted_and_a_copy_reaches_the_terminal() {
+    // Shift-End selects the header, Ctrl-Insert copies it to the terminal's clipboard.
+    let (term, _) = screen(&format!("{}Key:Shift+End Key:Ctrl+Insert ", edit_cell()));
+    assert!(term.osc.iter().any(|o| o == &format!("52;c;{}", base64(b"module CELL satisfies MEASURED"))), "{:?}", term.osc);
+    // Ctrl-X cuts it, which leaves Tablon's Ctrl-X alone, and Ctrl-V puts it back twice.
+    let (term, log) = screen(&format!("{}Key:Shift+End Key:Ctrl:x Key:Ctrl:v Key:Ctrl:v ", edit_cell()));
+    assert!(!log.contains("StopProcess"), "{log}");
+    assert!(term.text().contains(" 2 module CELL satisfies MEASUREDmodule CELL satisfies MEASURED"), "{}", term.text());
+    // A terminal's paste goes in as one edit; Ctrl-Z takes it out.
+    let (term, _) = screen(&format!("{}Pasted:{} ", edit_cell(), enc(b"one\r\ntwo ")));
+    assert!(term.text().contains(" 2 one") && term.text().contains(" 3 two module CELL"), "{}", term.text());
+    let (term, _) = screen(&format!("{}Pasted:{} Key:Ctrl:z ", edit_cell(), enc(b"one\r\ntwo ")));
+    assert!(term.text().contains(" 2 module CELL") && !term.text().contains(" 3 two"), "{}", term.text());
+}
+
+#[test]
+fn a_session_that_edits_and_saves_replays_to_the_same_screen_and_bytes_with_no_file_written() {
+    let dir = std::env::temp_dir().join(format!("gardelc_tablon_edit_replay_{}", std::process::id()));
+    drop(fs::remove_dir_all(&dir));
+    fs::create_dir_all(&dir).expect("temporary directory");
+    let log = dir.join("run.log");
+    let before = fs::read(fixture().join("cell.gdl")).expect("cell.gdl");
+    // Types, selects what it typed, pastes over it, undoes the paste, types again and saves.
+    let script = format!(
+        "{}{}{}Key:Shift+Left Key:Shift+Left Pasted:{} Key:Ctrl:z Key:End {}Key:Ctrl:s FileWritten:9:900",
+        start(),
+        edit_cell(),
+        keys("ab"),
+        enc(b"cd"),
+        keys("!")
+    );
+    let first = run(&script, &[("GARDEL_RECORD", &log)]);
+    assert_eq!(first.status.code(), Some(1), "{}", all(&first));
+    let first_log = String::from_utf8_lossy(&first.stderr).to_string();
+    let saved = written(&first_log, 9).expect("a save");
+    let cell = String::from_utf8(before.clone()).expect("UTF-8");
+    assert_eq!(saved, cell.replacen("module CELL satisfies MEASURED", "abmodule CELL satisfies MEASURED!", 1).into_bytes());
+    let again = Command::new(tablon()).env("GARDEL_REPLAY", &log).output().expect("the replay runs");
+    assert_eq!(again.status.code(), Some(1), "{}", all(&again));
+    assert_eq!(again.stdout, first.stdout, "the replay writes the same bytes to the terminal");
+    let recorded = fs::read_to_string(&log).expect("the recording");
+    assert!(recorded.contains("command WriteFile:9:"), "the save is in the recording:\n{recorded}");
+    assert_eq!(fs::read(fixture().join("cell.gdl")).expect("cell.gdl"), before, "a file was written");
+    drop(fs::remove_dir_all(&dir));
+}
+
+#[test]
+fn a_key_on_a_file_of_5000_lines_draws_within_a_frame() {
+    let mut text = String::new();
+    for i in 0..5000 {
+        text += &format!("  line {i}: NAT\n");
+    }
+    let open = format!(
+        "{}{}Key:Down Key:Right Key:Down Key:Down Key:Enter FileRead:1001:{} Key:Tab Key:Enter Key:Ctrl+End ",
+        start(),
+        keys("f"),
+        enc(text.as_bytes())
+    );
+    let typed: String = (0..200).map(|i| if i % 20 == 19 { "Key:Enter ".to_string() } else { "Key:97 ".to_string() }).collect::<String>()
+        + &"Key:Up ".repeat(100);
+    let time = |script: &str| {
+        // The best of five, as other tests may run at the same time.
+        (0..5)
+            .map(|_| {
+                let t = std::time::Instant::now();
+                let out = run(script, &[]);
+                assert_eq!(out.status.code(), Some(1), "{}", all(&out));
+                t.elapsed()
+            })
+            .min()
+            .expect("five runs")
+    };
+    let base = time(&open);
+    let keyed = time(&format!("{open}{typed}"));
+    let per_key = keyed.saturating_sub(base) / 300;
+    eprintln!("a key on 5000 lines, with its frame: {per_key:?}");
+    assert!(per_key < std::time::Duration::from_millis(16), "{per_key:?} a key");
+}
+
+#[test]
+fn a_real_failure_is_fixed_and_saved_in_tablon_and_the_check_after_it_is_clean() {
+    let dir = std::env::temp_dir().join(format!("gardelc_tablon_fix_{}", std::process::id()));
+    drop(fs::remove_dir_all(&dir));
+    fs::create_dir_all(dir.join("src")).expect("temporary directory");
+    fs::write(dir.join("Gardel.toml"), "[project]\nname = \"broken\"\nversion = \"0.1.0\"\n").expect("the manifest");
+    let broken = "-- Doubling, with a contract that is wrong.\nfunctions TWICE\n\nfeature {ANY}\n\n  twice(n: NAT): NAT\n    require\n      small: n <= 1000\n    do\n      n + n\n    ensure\n      doubled: Result = n + n + 1\n    end\n\nend\n";
+    fs::write(dir.join("src/twice.gdl"), broken).expect("the module");
+    // The check Tablon asks for, run for real.
+    let check = || {
+        let out = Command::new(env!("CARGO_BIN_EXE_gardelc"))
+            .current_dir(&dir)
+            .env("GARDEL_CACHE_DIR", dir.join("cache"))
+            .args(["--project", ".", "--inspect", "--json-diagnostics"])
+            .output()
+            .expect("gardelc runs");
+        (out.stdout, out.status.code().unwrap_or(-1))
+    };
+    let (failed, code) = check();
+    assert_ne!(code, 0);
+    assert!(String::from_utf8_lossy(&failed).contains("`doubled` failed"), "{}", String::from_utf8_lossy(&failed));
+    // Tablon on the project: the check, Enter on its failure, the line fixed and saved.
+    let session = |tail: &str| {
+        let script = format!(
+            "Resized:{W}:{H} ProcessStarted:1:7 ProcessOutput:7:{} ProcessExited:7:1 DirListed:100:ftwice.gdl/ \
+             Key:Ctrl:k ProcessStarted:2:8 ProcessOutput:8:{} ProcessExited:8:1 \
+             Key:Tab Key:Tab Key:Enter FileRead:1001:{} Key:Tab Key:Tab Key:Enter Key:End \
+             Key:Backspace Key:Backspace Key:Backspace Key:Backspace Key:Ctrl:s FileWritten:9:100 {tail}Resized:{W}:{H}",
+            enc(&failed),
+            enc(&failed),
+            enc(broken.as_bytes())
+        );
+        let mut cmd = Command::new(tablon());
+        cmd.env("GARDEL_EVENTS", script).args([&dir.to_string_lossy().to_string(), "gardelc"]);
+        cmd.output().expect("Tablon runs")
+    };
+    let ran = session("");
+    let log = String::from_utf8_lossy(&ran.stderr).to_string();
+    assert!(Terminal::read(&ran.stdout).text().contains("src/twice.gdl:12  error"), "{}", Terminal::read(&ran.stdout).text());
+    let fixed = written(&log, 9).expect("a save");
+    assert_eq!(String::from_utf8_lossy(&fixed), broken.replace("n + n + 1", "n + n"));
+    // What Tablon wrote, checked for real, verifies; and Tablon shows it clean.
+    fs::write(dir.join("src/twice.gdl"), &fixed).expect("the fixed module");
+    let (clean, code) = check();
+    assert_eq!(code, 0, "{}", String::from_utf8_lossy(&clean));
+    let ran = session(&format!("ProcessStarted:2:9 ProcessOutput:9:{} ProcessExited:9:0 Key:Tab {}", enc(&clean), keys("p")));
+    let shown = Terminal::read(&ran.stdout).text();
+    assert!(shown.contains("No problems: the project verifies.") && shown.contains("verified"), "{shown}");
+    drop(fs::remove_dir_all(&dir));
 }

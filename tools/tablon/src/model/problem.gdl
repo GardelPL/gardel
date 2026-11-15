@@ -87,6 +87,14 @@ feature {ANY}
       Current.grade.equals("note") and Current.label.equals("executable")
     end
 
+  -- Placed at line `n` instead, from 1, as after an edit added or took out lines above it.
+  at_line(n: NAT): PROBLEM
+    do
+      { Current with spot = n }
+    ensure
+      moved: Result.line = n
+    end
+
   -- Its line in Problems: where, the level, and the first line of the message.
   summary: STRING
     do
