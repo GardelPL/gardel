@@ -8,6 +8,11 @@
 //! widget, in colour, inside the screen; a child run attached gets the terminal, with nothing
 //! drawn while it runs, and the tour takes the screen back after it; and a client proves the
 //! widgets' facts through their contracts.
+//!
+//! `gtui` 0.3.0 (Task F.16b): wide characters take two cells and marks none, through a
+//! terminal that draws them as terminals do; an editor on `TEXT_AREA` types, highlights a
+//! string over lines, cuts, pastes, undoes, finds and scrolls both ways, and a key on 5000
+//! lines fits in a frame; and a client proves the editing facts through the contracts.
 
 use std::fs;
 use std::io::Write;
@@ -69,8 +74,19 @@ fn run(bin: &Path, script: &str, env: &[(&str, &Path)]) -> Output {
     cmd.output().expect("the program runs")
 }
 
-/// A cell as a terminal shows it: a character and the SGR parameters in force.
-type Cell = (char, Vec<u32>);
+/// A cell as a terminal shows it: its character (`'\0'` for the right half of a wide one), its pen, and the
+/// zero-width characters drawn on it.
+type Cell = (char, Vec<u32>, String);
+
+/// The columns a terminal gives `c`, for the characters these tests draw: CJK and Hangul
+/// two, combining accents and the zero-width joiner none.
+fn columns(c: char) -> usize {
+    match c as u32 {
+        0x300..=0x36F | 0x200B..=0x200D => 0,
+        0x1100..=0x115F | 0x2E80..=0xA4CF | 0xAC00..=0xD7A3 | 0xF900..=0xFAFF | 0xFF00..=0xFF60 | 0x1F300..=0x1F64F => 2,
+        _ => 1,
+    }
+}
 
 /// A VT terminal, enough of one to read a frame: cursor moves, SGR, clearing the screen, and
 /// the private modes, which it ignores. Every character must land on the screen of the size
@@ -150,7 +166,7 @@ impl Terminal {
                         self.size = if self.clears == 0 { None } else { Some(self.sizes[self.clears - 1]) };
                         self.clears += 1;
                         if let Some((w, h)) = self.size {
-                            self.grid = vec![vec![(' ', Vec::new()); w]; h];
+                            self.grid = vec![vec![(' ', Vec::new(), String::new()); w]; h];
                         }
                     }
                     other => panic!("unexpected sequence {other:?}"),
@@ -159,9 +175,32 @@ impl Terminal {
             } else {
                 assert!(!c.is_control(), "a control character {:?} was written", c);
                 let (w, h) = self.size.expect("text after a size is known");
-                assert!(self.row < h && self.col < w, "{c:?} written at row {}, column {}, outside {w} by {h}", self.row, self.col);
-                self.grid[self.row][self.col] = (c, self.pen.clone());
-                self.col += 1;
+                let n = columns(c);
+                if n == 0 {
+                    // A mark goes on the character before it, as a terminal draws it.
+                    assert!(self.col > 0, "a mark {c:?} with nothing before it");
+                    let mut x = self.col - 1;
+                    if self.grid[self.row][x].0 == '\0' {
+                        x -= 1;
+                    }
+                    self.grid[self.row][x].2.push(c);
+                    i += 1;
+                    continue;
+                }
+                assert!(self.row < h && self.col + n <= w, "{c:?} written at row {}, column {}, outside {w} by {h}", self.row, self.col);
+                let row = &mut self.grid[self.row];
+                // Writing over half a wide character blanks its other half, as terminals do.
+                if row[self.col].0 == '\0' {
+                    row[self.col - 1] = (' ', row[self.col - 1].1.clone(), String::new());
+                }
+                if self.col + n < w && row[self.col + n].0 == '\0' {
+                    row[self.col + n] = (' ', row[self.col + n].1.clone(), String::new());
+                }
+                row[self.col] = (c, self.pen.clone(), String::new());
+                if n == 2 {
+                    row[self.col + 1] = ('\0', self.pen.clone(), String::new());
+                }
+                self.col += n;
                 self.printed += 1;
                 i += 1;
             }
@@ -169,7 +208,8 @@ impl Terminal {
     }
 
     fn text(&self) -> String {
-        self.grid.iter().map(|r| r.iter().map(|c| c.0).collect::<String>()).collect::<Vec<_>>().join("\n")
+        let shown = |c: &Cell| if c.0 == '\0' { c.2.clone() } else { format!("{}{}", c.0, c.2) };
+        self.grid.iter().map(|r| r.iter().map(shown).collect::<String>()).collect::<Vec<_>>().join("\n")
     }
 }
 
@@ -573,6 +613,344 @@ end
     for (name, claim) in [
         ("past", "      past: t.choose(n).selected = n"),
         ("no_rows", "      no_rows: n < tv.line_count implies n < tv.showing(n, rows).top + rows"),
+    ] {
+        let p = Project::new(&format!("gtui_{name}"), &source(claim));
+        let out = p.check();
+        assert!(!out.status.success(), "{name} must be refused: {}", all(&out));
+        assert!(all(&out).contains(&format!("`{name}`")), "{name}: {}", all(&out));
+    }
+}
+
+/// A client that draws by display width (F.16b): wide characters, a combining accent, wide
+/// characters cut by the clip on the right and on the left, one whose half is written over,
+/// and an input line too long for its bar. Each key changes the middle of the first row
+/// between `本` and `xy` and back, so the diffs write half a wide character's columns.
+const WIDE: &str = "reactive program WIDE
+
+feature {ANY}
+
+  update(n: NAT, e: EVENT): TUI_NEXT[NAT]
+    do
+      match e
+        case Key(k) then
+          match k
+            case Char(c) then if c = 'q' then TUI_NEXT.quit(0) else TUI_NEXT.next(if n < 100 then n + 1 else n end) end
+            case _ then TUI_NEXT.next(n)
+          end
+        case _ then TUI_NEXT.next(n)
+      end
+    end
+
+  view(n: NAT, blank: SCREEN): SCREEN
+    do
+      let p = STYLE.plain
+      let a = blank.text(blank.area, 0, 0, \"日本語abc\", p)
+      let a2 = if n % 2 = 1 then a.text(blank.area, 2, 0, \"xy\", p) else a end
+      let b = a2.text(blank.area, 0, 1, \"e\\u{301}x\", p)
+      let c = b.text(RECT.make(0, 2, 5, 1), 0, 2, \"ab日本\", p)
+      let d0 = c.text(RECT.make(1, 3, 9, 1), 0, 3, \"日本\", p)
+      -- A right half left alone where the clip cut its left half sends a space too, so the
+      -- screen itself is looked at: `!` at the end of the row if its second cell is one.
+      let row = d0.row(3)
+      let orphan = row.length > 1 and LIST_OPS.at(row, 1).is_right_half
+      let d = if orphan then d0.text(blank.area, 9, 3, \"!\", p) else d0 end
+      let e = d.text(blank.area, 0, 4, \"日本語\", p).text(blank.area, 1, 4, \"x\", p)
+      INPUT_LINE.of_text(\"日本語テキスト\").draw(e, RECT.make(0, 5, 10, 1), \"> \", p, p.reversed)
+    end
+
+  init(args: SEQ[STRING]): STEP[TUI[NAT]]
+    do
+      TUI.start(0, update, view)
+    end
+
+  step(t: TUI[NAT], e: EVENT): STEP[TUI[NAT]]
+    do
+      t.step(e)
+    end
+
+end
+";
+
+#[test]
+fn wide_characters_take_two_cells_marks_none_and_a_cut_one_leaves_a_space() {
+    let p = Project::new("gtui_wide", WIDE);
+    let src = p.0 .0.join("p/src");
+    fs::rename(src.join("client.gdl"), src.join("wide.gdl")).expect("named after its module");
+    assert_ok(&p.check());
+    let script = "Resized:10:6 Key:120 Resized:10:6 Key:120 Resized:10:6 Key:113";
+    let ran = run(&p.0.bin("wide"), script, &[]);
+    assert_eq!(ran.status.code(), Some(0), "{}", all(&ran));
+    let mut term = Terminal::new(sizes(script));
+    term.feed(&ran.stdout);
+    let rest = "\ne\u{301}x        \nab日      \n  本      \n x本語    \n> キスト  ";
+    let even = format!("日本語abc {rest}");
+    let odd = format!("日xy語abc {rest}");
+    // `before_clear[k + 1]` is the screen just before resize `k`: there the diffs drew it.
+    assert_eq!(screen_text(&term.before_clear[2]), odd, "the diff from 本 to xy");
+    assert_eq!(screen_text(&term.before_clear[3]), even, "the diff from xy back to 本");
+    assert_eq!(term.text(), even, "drawn whole");
+    let out = String::from_utf8_lossy(&ran.stdout);
+    assert!(out.contains("\x1b[1;3Hxy"), "the diff writes the two columns 本 took:\n{out:?}");
+    assert!(out.contains("\x1b[1;3H本\x1b"), "and 本 alone, never its right half:\n{out:?}");
+    assert!(out.contains("e\u{301}x"), "the accent follows its letter:\n{out:?}");
+    // The cursor's cell is reversed, after the end of the text.
+    assert_eq!(term.grid[5][8].1, vec![7], "the cursor at column 8");
+}
+
+/// An editor (F.16b): a `TEXT_AREA` 30 by 5 with a status row below it, highlighting strings
+/// in green, which may run over lines. F2 finds `a`, a paste is pasted, a cut or copy goes to
+/// the terminal's clipboard, and Escape quits.
+const EDITOR: &str = "reactive program EDITOR
+
+feature {ANY}
+
+  update(a: TEXT_AREA, e: EVENT): TUI_NEXT[TEXT_AREA]
+    do
+      match e
+        case Pasted(t) then TUI_NEXT.next(a.paste(t))
+        case Key(k) then
+          match k
+            case Escape then TUI_NEXT.quit(0)
+            case Function(n) then
+              if n = 2 then TUI_NEXT.next(a.find(\"a\"))
+              else if n = 3 then TUI_NEXT.next(a.paste_chars(LIST.empty.prepend('2').prepend(CHAR.from_scalar(10)).prepend(CHAR.from_scalar(13)).prepend('1')))
+              else TUI_NEXT.next(a)
+              end end
+            case _ then
+              let b = a.on_key(k, RECT.make(0, 0, 30, 5))
+              if b.just_copied then Next(b, LIST.empty.prepend(TUI_COMMANDS.copy(b.clipboard))) else TUI_NEXT.next(b) end
+          end
+        case _ then TUI_NEXT.next(a)
+      end
+    end
+
+  view(a: TEXT_AREA, blank: SCREEN): SCREEN
+    do
+      let drawn = a.draw_code(blank, RECT.make(0, 0, 30, 5), STYLE.plain, STYLE.plain.fg(COLOR.gray), STYLE.plain.reversed,
+        fn(start: NAT, line: LIST[CHAR]): LIST[SPAN] do spans(start, line, 0, 0, LIST.empty) end)
+      let place = GLYPHS.join(GLYPHS.join(\"L\", NUMBER_TEXT.nat_to_text(a.line_number + 1)),
+        GLYPHS.join(\" C\", NUMBER_TEXT.nat_to_text(a.column + 1)))
+      drawn.text(blank.area, 0, 5, place, STYLE.plain)
+    end
+
+  -- The state after `cs` from `s`: 1 inside a string, 0 outside.
+  ends(s: NAT, cs: LIST[CHAR]): NAT
+    variant
+      cs.length
+    do
+      if cs.length = 0 then s
+      else ends(if cs.head = '\"' then (if s = 0 then 1 else 0 end) else s end, cs.tail)
+      end
+    end
+
+  -- `acc` with the strings of `cs` as green spans, from state `s`, `cs` starting at character
+  -- `i`, the open string at `from`.
+  spans(s: NAT, cs: LIST[CHAR], i: NAT, from: NAT, acc: LIST[SPAN]): LIST[SPAN]
+    require
+      started: from <= i
+    variant
+      cs.length
+    do
+      if cs.length = 0 or i = 18446744073709551615 then
+        if s != 0 and i > from then acc.prepend(SPAN.make(from, i - from, STYLE.plain.fg(COLOR.green))) else acc end
+      else if cs.head = '\"' then
+        if s != 0 then spans(0, cs.tail, i + 1, i + 1, acc.prepend(SPAN.make(from, i + 1 - from, STYLE.plain.fg(COLOR.green))))
+        else spans(1, cs.tail, i + 1, i, acc)
+        end
+      else
+        spans(s, cs.tail, i + 1, from, acc)
+      end end
+    end
+
+  init(args: SEQ[STRING]): STEP[TUI[TEXT_AREA]]
+    do
+      TUI.start(TEXT_AREA.of_text(\"\").with_lexer(fn(start: NAT, line: LIST[CHAR]): NAT do ends(start, line) end), update, view)
+    end
+
+  step(t: TUI[TEXT_AREA], e: EVENT): STEP[TUI[TEXT_AREA]]
+    do
+      t.step(e)
+    end
+
+end
+";
+
+/// The editor, built in a directory of its own (`name`): tests run at once.
+fn editor(name: &str) -> Project {
+    let p = Project::new(name, EDITOR);
+    let src = p.0 .0.join("p/src");
+    fs::rename(src.join("client.gdl"), src.join("editor.gdl")).expect("named after its module");
+    assert_ok(&p.check());
+    p
+}
+
+#[test]
+fn an_editor_types_highlights_over_lines_cuts_pastes_undoes_and_finds() {
+    let p = editor("gtui_editor");
+    let shot = "Resized:30:6 ";
+    let mut script = String::from(shot);
+    script += &keys("let a = 1");
+    script += "Key:Enter ";
+    script += &keys("say \"hi");
+    script += "Key:Enter ";
+    script += &keys("there\" ok");
+    // 1: three lines, the string from line 2 into line 3.
+    script += shot;
+    script += "Key:Shift+Home Key:Ctrl:x ";
+    // 2: the third line cut, and on the clipboard.
+    script += shot;
+    script += "Key:Up Key:Ctrl:v ";
+    // 3: pasted at the start of line 2, which now closes its own strings.
+    script += shot;
+    script += "Key:Ctrl:z Key:Ctrl:z ";
+    // 4: both undone: the text of 1, the cursor where the cut was made.
+    script += shot;
+    script += "Key:F2 ";
+    // 5: `a` found on line 1, past the end of the text: selected.
+    script += shot;
+    script += "Key:98 Key:Down Key:Ctrl+Home Key:End Key:34 Key:Left Key:Enter ";
+    // 6: `b` typed over it; then, from line 2, a quote at the end of line 1, moved to a line
+    // of its own, opens a string the lines below are lexed again for.
+    script += shot;
+    script += "Key:F3 ";
+    // 7: a text with a carriage return pasted (F3): it is left out.
+    script += shot;
+    script += "Key:Escape";
+    let ran = run(&p.0.bin("editor"), &script, &[]);
+    assert_eq!(ran.status.code(), Some(0), "{}", all(&ran));
+    let mut term = Terminal::new(sizes(&script));
+    term.feed(&ran.stdout);
+    let shot = |k: usize| term.before_clear[k + 1].clone();
+    let rows = |k: usize| screen_text(&shot(k)).lines().map(|l| l.trim_end().to_string()).collect::<Vec<_>>();
+    let first = rows(1);
+    assert_eq!(first[..3], ["1 let a = 1", "2 say \"hi", "3 there\" ok"], "{first:?}");
+    assert_eq!(first[5], "L3 C10");
+    // The string runs from line 2 into line 3, and stops at its quote.
+    assert_eq!(pen_at(&shot(1), "\"hi"), vec![32], "the string on line 2 is green");
+    assert_eq!(pen_at(&shot(1), "there\""), vec![32], "and goes on into line 3");
+    assert_eq!(pen_at(&shot(1), " ok"), Vec::<u32>::new(), "until its quote");
+    assert_eq!(pen_at(&shot(1), "let"), Vec::<u32>::new(), "line 1 is plain");
+    assert_eq!(pen_at(&shot(1), "1 let"), vec![90], "the numbers are gray");
+    let cut = rows(2);
+    assert_eq!(cut[..3], ["1 let a = 1", "2 say \"hi", "3"], "{cut:?}");
+    assert_eq!(term.copies, ["dGhlcmUiIG9r"], "the cut text went to the clipboard");
+    let pasted = rows(3);
+    assert_eq!(pasted[..3], ["1 let a = 1", "2 there\" oksay \"hi", "3"], "{pasted:?}");
+    assert_eq!(pen_at(&shot(3), "\" oksay \""), vec![32], "the string now opens after `there`");
+    assert_eq!(pen_at(&shot(3), "hi"), Vec::<u32>::new(), "and `hi` is outside it");
+    let undone = rows(4);
+    assert_eq!(undone[..3], first[..3], "two undos give back the text");
+    assert_eq!(undone[5], "L3 C1", "and the cursor where the cut was made");
+    let found = rows(5);
+    assert_eq!(found[5], "L1 C6", "the cursor after the `a` found");
+    assert_eq!(pen_at(&shot(5), "a ="), vec![7], "which is selected");
+    assert_eq!(pen_at(&shot(5), " = 1"), Vec::<u32>::new(), "and nothing after it");
+    let quoted = rows(6);
+    assert_eq!(quoted[..4], ["1 let b = 1", "2 \"", "3 say \"hi", "4 there\" ok"], "{quoted:?}");
+    assert_eq!(pen_at(&shot(6), "let"), Vec::<u32>::new(), "line 1 ends outside a string");
+    assert_eq!(pen_at(&shot(6), "say \""), vec![32], "line 2 opens one that line 3 closes");
+    assert_eq!(pen_at(&shot(6), "hi"), Vec::<u32>::new(), "so `hi` is outside it");
+    assert_eq!(pen_at(&shot(6), "there"), Vec::<u32>::new(), "and so is `there`");
+    assert_eq!(pen_at(&shot(6), "\" ok"), vec![32], "whose quote opens one");
+    let crlf = rows(7);
+    assert_eq!(crlf[..4], ["1 let b = 1", "2 1", "3 2\"", "4 say \"hi"], "{crlf:?}");
+}
+
+#[test]
+fn an_editor_scrolls_both_ways_to_keep_the_cursor_and_a_key_on_5000_lines_is_quick() {
+    let p = editor("gtui_editor_long");
+    // A line too long for the area, then 5000 numbered lines, ended as on Windows: the
+    // carriage returns are left out.
+    let mut text = String::from("0123456789abcdefghijklmnopqrstuvwxyz\r\n");
+    for i in 0..5000 {
+        text += &format!("line {i}\r\n");
+    }
+    let pasted = format!("Pasted:{} ", text.bytes().map(|b| format!("%{b:02X}")).collect::<String>());
+    let script = format!("Resized:30:6 {pasted}Key:Ctrl+Home Key:End Resized:30:6 Key:Down Key:End Resized:30:6 Key:Home Resized:30:6 Key:Escape");
+    let ran = run(&p.0.bin("editor"), &script, &[]);
+    assert_eq!(ran.status.code(), Some(0), "{}", all(&ran));
+    let mut term = Terminal::new(sizes(&script));
+    term.feed(&ran.stdout);
+    let rows = |k: usize| screen_text(&term.before_clear[k + 1]).lines().map(|l| l.trim_end().to_string()).collect::<Vec<_>>();
+    // At the end of the long line the page is scrolled right: the cursor's cell is the last.
+    let right = rows(1);
+    // The numbers take five columns, so the text 25: 36 characters and the cursor's cell.
+    assert_eq!(right[0], "   1 cdefghijklmnopqrstuvwxyz", "{right:?}");
+    assert_eq!(right[5], "L1 C37");
+    // One line down, at the end of a short line, it is scrolled back as far as the cursor.
+    let back = rows(2);
+    assert_eq!(back[..2], ["   1 6789abcdefghijklmnopqrstu", "   2"], "{back:?}");
+    assert_eq!(back[5], "L2 C7");
+    assert_eq!(term.before_clear[3][1][5].1, Vec::<u32>::new(), "the cursor's cell, past the end of `line 0`");
+    // Home scrolls it to the first column.
+    let home = rows(3);
+    assert_eq!(home[..2], ["   1 0123456789abcdefghijklmno", "   2 line 0"], "{home:?}");
+
+    // A key costs a line, not the text: the frames of 200 keys on a text of 5000 lines.
+    let time = |n: usize| {
+        (0..3)
+            .map(|_| {
+                let mut s = format!("Resized:30:6 {pasted}");
+                for i in 0..n {
+                    s += if i % 2 == 0 { "Key:Up Key:120 " } else { "Key:Backspace " };
+                }
+                s += "Key:Escape";
+                let t = std::time::Instant::now();
+                let out = run(&p.0.bin("editor"), &s, &[]);
+                assert_eq!(out.status.code(), Some(0), "{}", all(&out));
+                t.elapsed()
+            })
+            .min()
+            .expect("three runs")
+    };
+    let base = time(0);
+    let keyed = time(200);
+    let per_key = keyed.saturating_sub(base) / 300;
+    eprintln!("a key on 5000 lines: {per_key:?} ({keyed:?} for 300 keys, {base:?} for none)");
+    assert!(per_key.as_millis() < 16, "{per_key:?} per key");
+}
+
+#[test]
+fn a_client_proves_the_editing_facts_through_the_contracts() {
+    let source = |claims: &str| {
+        format!(
+            "functions CLIENT
+
+feature {{ANY}}
+
+  f(a: TEXT_AREA, cs: LIST[CHAR], c: CHAR, r: RECT): BOOL
+    do
+      True
+    ensure
+{claims}
+    end
+
+end
+"
+        )
+    };
+    let facts = source(
+        "      round: LINE_SPLIT.fits(cs) implies TEXT_AREA.of_chars(cs).state.chars = cs
+      lines: LINE_SPLIT.join(LINE_SPLIT.lines_of(cs)) = cs
+      typed: (c.code >= 32 and c.code != 127) implies a.type_char(c).undo.state = a.state
+      fed: a.newline.undo.state = a.state
+      erased: a.backspace.undo.state = a.state and a.delete.undo.state = a.state
+      pasted: a.paste_chars(cs).undo.state = a.state
+      cursor: a.line_number < a.line_count and a.column <= a.length_of_line(a.line_number)
+      page: TEXT_AREA.text_part(r, a.line_count).height > 0 implies
+        a.followed(r).top <= a.followed(r).line_number and
+        a.followed(r).line_number < a.followed(r).top + TEXT_AREA.text_part(r, a.line_count).height
+      start: a.selection_start_line < a.line_count and a.selection_start_column <= a.length_of_line(a.selection_start_line)
+      end_: a.selection_end_line < a.line_count and a.selection_end_column <= a.length_of_line(a.selection_end_line)
+      moves: a.state.left.lines = a.state.lines and a.state.down(3).lines = a.state.lines",
+    );
+    let p = Project::new("gtui_editing", &facts);
+    assert_ok(&p.check());
+    // Past the contracts: a typed character changes the text, and a text that does not fit
+    // is not kept.
+    for (name, claim) in [
+        ("unchanged", "      unchanged: a.type_char(c).state = a.state"),
+        ("any_text", "      any_text: TEXT_AREA.of_chars(cs).state.chars = cs"),
     ] {
         let p = Project::new(&format!("gtui_{name}"), &source(claim));
         let out = p.check();

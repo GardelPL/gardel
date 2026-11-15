@@ -36,7 +36,7 @@ create {ANY}
       if es.length = 0 then
         w
       else
-        let n = es.head.name.code_point_count
+        let n = GLYPHS.width(es.head.name)
         PALETTE.widest(es.tail, if n > w and n <= 40 then n else if n > 40 then 40 else w end end)
       end
     end
@@ -54,7 +54,7 @@ create {ANY}
   -- `/`, the name, and what it does after the name's column, `w` wide, and two spaces.
   line(e: PALETTE_ENTRY, w: NAT): STRING
     do
-      let n = e.name.code_point_count
+      let n = GLYPHS.width(e.name)
       let pad = if n < w and w <= 65535 then w - n + 2 else 2 end
       GLYPHS.join(GLYPHS.join(GLYPHS.join("/", e.name), GLYPHS.spaces(pad)), e.help)
     end

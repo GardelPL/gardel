@@ -1,28 +1,70 @@
 -- One cell of a screen: a character and its style. A cell never holds a control character
 -- (`printable`), so text drawn on a screen cannot move the terminal's cursor: a control
--- character becomes `?`, and a tab a space. One code point is one cell; characters that a
--- terminal shows two cells wide, or none, are not accounted for.
+-- character becomes `?`, and a tab a space.
+--
+-- A character two columns wide (`CHAR_WIDTH`) takes two cells: its left half holds it, and
+-- its right half holds nothing and is never sent, as the terminal fills it when it draws the
+-- left one. Zero-width characters, such as combining accents, are marks on the cell they
+-- follow, at most eight of them.
 module CELL
 
 representation {NONE}
   glyph: CHAR
   look: STYLE
+  -- The marks drawn on the glyph, the last first.
+  extra: LIST[CHAR]
+  -- 0: a cell of its own; 1: the left half of a wide glyph; 2: its right half.
+  part: NAT
 
 invariant
   printable: glyph.code >= 32 and (glyph.code < 127 or glyph.code >= 160)
+  marks_printable: CELL.all_printable(extra)
+  few_marks: extra.length <= 8
+  a_part: part <= 2
+  right_half_empty: part = 2 implies glyph = ' ' and extra.length = 0
 
 create {ANY}
 
+  -- `c` in one cell, or `?` when it is not one column wide.
   make(c: CHAR, s: STYLE): CELL
     do
-      { glyph = CELL.shown(c), look = s }
+      let none: LIST[CHAR] = LIST.empty
+      { glyph = CELL.narrow(c), look = s, extra = none, part = 0 }
     ensure
       style_set: Result.style.same(s)
+      own: Result.is_own
     end
 
   blank: CELL
     do
-      { glyph = ' ', look = STYLE.plain }
+      let none: LIST[CHAR] = LIST.empty
+      { glyph = ' ', look = STYLE.plain, extra = none, part = 0 }
+    ensure
+      own: Result.is_own
+    end
+
+  -- The left half of the wide character `c`, or `c` in one cell (`make`) when it is not
+  -- two columns wide.
+  wide(c: CHAR, s: STYLE): CELL
+    do
+      if CHAR_WIDTH.of(c) = 2 and CELL.is_printable(c) then
+        let none: LIST[CHAR] = LIST.empty
+        { glyph = c, look = s, extra = none, part = 1 }
+      else
+        CELL.make(c, s)
+      end
+    ensure
+      style_set: Result.style.same(s)
+    end
+
+  -- The right half of a wide character in style `s`.
+  right_half(s: STYLE): CELL
+    do
+      let none: LIST[CHAR] = LIST.empty
+      { glyph = ' ', look = s, extra = none, part = 2 }
+    ensure
+      right: Result.is_right_half
+      style_set: Result.style.same(s)
     end
 
 create {ANY}
@@ -41,6 +83,34 @@ create {ANY}
       printable: CELL.is_printable(Result)
     end
 
+  -- `c` as it is shown in one cell: itself when it is one column wide, and `?` otherwise.
+  narrow(c: CHAR): CHAR
+    do
+      let s = CELL.shown(c)
+      if CHAR_WIDTH.of(s) = 1 then s else '?' end
+    ensure
+      printable: CELL.is_printable(Result)
+    end
+
+  -- Whether every one of `cs` is printable.
+  all_printable(cs: LIST[CHAR]): BOOL
+    variant
+      cs.length
+    do
+      if cs.length = 0 then True else CELL.is_printable(cs.head) and CELL.all_printable(cs.tail) end
+    end
+
+  -- Whether `a` and `b` hold the same characters.
+  same_chars(a: LIST[CHAR], b: LIST[CHAR]): BOOL
+    variant
+      a.length
+    do
+      if a.length = 0 then b.length = 0
+      else if b.length = 0 then False
+      else a.head = b.head and CELL.same_chars(a.tail, b.tail)
+      end end
+    end
+
 feature {ANY}
 
   char: CHAR
@@ -55,10 +125,65 @@ feature {ANY}
       Current.look
     end
 
-  same(other: CELL): BOOL
+  -- The zero-width characters drawn on the glyph, in order.
+  marks: LIST[CHAR]
     do
-      Current.glyph = other.glyph and Current.look.same(other.look)
+      LIST_CUT.reverse(Current.extra, LIST.empty)
     end
 
+  -- The marks, the last first.
+  marks_backwards: LIST[CHAR]
+    do
+      Current.extra
+    ensure
+      printable: CELL.all_printable(Result)
+    end
+
+  -- A cell of its own, one column wide.
+  is_own: BOOL
+    do
+      Current.part = 0
+    end
+
+  -- The left half of a wide character, which holds it.
+  is_left_half: BOOL
+    do
+      Current.part = 1
+    end
+
+  -- The right half of a wide character, which holds nothing.
+  is_right_half: BOOL
+    do
+      Current.part = 2
+    end
+
+  -- The cell with `m` drawn on it as well, when it is printable, there is room for it, and
+  -- the cell is not a right half.
+  with_mark(m: CHAR): CELL
+    do
+      if Current.part < 2 and Current.extra.length < 8 and CELL.is_printable(m) then
+        { Current with extra = Current.extra.prepend(m) }
+      else
+        Current
+      end
+    ensure
+      style_same: Result.style.same(Current.style)
+      part_same: Result.is_own = Current.is_own and Result.is_left_half = Current.is_left_half and
+        Result.is_right_half = Current.is_right_half
+    end
+
+  -- A space in this cell's style, in a cell of its own: what is left of half a wide character.
+  cleared: CELL
+    do
+      CELL.make(' ', Current.look)
+    ensure
+      own: Result.is_own
+    end
+
+  same(other: CELL): BOOL
+    do
+      Current.glyph = other.glyph and Current.look.same(other.look) and Current.part = other.part and
+        CELL.same_chars(Current.extra, other.extra)
+    end
 
 end

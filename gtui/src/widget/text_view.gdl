@@ -170,7 +170,8 @@ create {ANY}
       same_height: Result.height = s.height
     end
 
-  -- `sps` drawn over the characters `chars` of the line on row `y` of `area`.
+  -- `sps` drawn over the characters `chars` of the line on row `y` of `area`. A span counts
+  -- characters, and starts at the column the characters before it end at.
   draw_spans(s: SCREEN, area: RECT, y: NAT, chars: LIST[CHAR], sps: LIST[SPAN], marked: BOOL, mark: STYLE): SCREEN
     variant
       sps.length
@@ -180,8 +181,9 @@ create {ANY}
       else
         let sp = sps.head
         let look = if marked then TEXT_VIEW.on_mark(sp.style, mark) else sp.style end
+        let col = GLYPHS.width_of(LIST_CUT.take(chars, sp.start))
         let drawn = if sp.start <= 65535 then
-            s.glyphs(area, area.x + sp.start, y, LIST_CUT.take(LIST_CUT.drop(chars, sp.start), sp.length), look)
+            s.glyphs(area, area.x + col, y, LIST_CUT.take(LIST_CUT.drop(chars, sp.start), sp.length), look)
           else
             s
           end

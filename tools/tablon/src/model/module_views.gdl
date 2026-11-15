@@ -41,7 +41,7 @@ feature {ANY}
       if ts.length = 0 then
         0
       else
-        let n = ts.head.code_point_count
+        let n = GLYPHS.width(ts.head)
         let rest = MODULE_VIEWS.width_of(ts.tail)
         if n <= 1000 and rest <= 64000 then n + 6 + rest else 65535 end
       end

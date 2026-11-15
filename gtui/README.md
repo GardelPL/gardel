@@ -26,7 +26,7 @@ feature {ANY}
 end
 ```
 
-`examples/todo_tui` is a complete program, and `examples/gtui_tour` uses every widget: three framed panes, tabs, trees, a source with line numbers and coloured keywords, problems that mark a line, and a command palette.
+`examples/todo_tui` is a complete program, and `examples/gtui_tour` uses every widget: three framed panes, tabs, trees, a source with line numbers and coloured keywords, problems that mark a line, and a command palette. `TEXT_AREA` is a text editor in a rectangle (see [Editing](#editing)).
 
 ## The loop
 
@@ -52,9 +52,10 @@ A view that gives back a screen of another size than the one it was given is not
 - `s.text(clip, x, y, text, style)` draws text on row `y` from column `x`, and `s.fill(clip, c, style)` fills a rectangle. Both change only the cells inside both `clip` and the screen, so a widget given a rectangle cannot draw outside it.
 - A cell never holds a control character (`CELL`'s invariant): one becomes `?`, and a tab a space. So text cannot move the terminal's cursor.
 - `s.with_cursor(x, y)` shows the terminal's cursor at that cell, where typing goes; a screen from `SCREEN.blank` hides it. A frame then ends with the cursor there, and hides it while it draws when it was shown, so it is never seen moving over the cells.
-- One code point is one cell. A character a terminal shows two cells wide, or none (a combining mark), is not accounted for, and would shift the rest of its row.
+- Text takes the columns a terminal gives it (`CHAR_WIDTH`): a CJK character or most emoji two cells, its left half holding it and its right half nothing, and a combining mark or a zero-width character none, as a mark on the cell before it (at most eight to a cell). A wide character that a clip, the screen's edge or another write would cut in half leaves a space in its style instead, so every left half is followed by its right half. `GLYPHS.width(s)` gives the columns of a text, and every widget measures with it.
+- `CHAR_WIDTH` is generated from the Unicode data by `scripts/gen_char_width.py` (Unicode 15.0 today), with the rules terminals use for `wcwidth`: marks and format characters 0, East Asian Wide and Fullwidth 2, the rest 1. The module reads as a table: for each block of 4096 code points, its runs one per line, with their code points in hex. A character below U+0300 is one column at the first comparison.
 
-`SCREEN_DIFF.changes(old, new)` gives the writes that turn one screen into another of the same size: each write is a run of changed cells on one row, and runs closer than four unchanged cells are joined, since moving the cursor costs more bytes than writing a few cells again. `VT_TEXT.frame` turns writes into text: a cursor move for each, and an SGR sequence where the style changes, which resets the pen and then sets the attributes and the colours that are not the terminal's own (30 to 37 and 90 to 97 for the foreground, 40 to 47 and 100 to 107 for the background).
+`SCREEN_DIFF.changes(old, new)` gives the writes that turn one screen into another of the same size: each write is a run of changed cells on one row, and runs closer than four unchanged cells are joined, since moving the cursor costs more bytes than writing a few cells again. `VT_TEXT.frame` turns writes into text: a cursor move for each, each cell's character and marks (a right half after its left half sends nothing, as the terminal has drawn it), and an SGR sequence where the style changes, which resets the pen and then sets the attributes and the colours that are not the terminal's own (30 to 37 and 90 to 97 for the foreground, 40 to 47 and 100 to 107 for the background).
 
 ## Layout
 
@@ -77,6 +78,7 @@ Each widget is a value with a `draw(screen, rect, ...)` that gives a new screen,
 | `TABS` | A row of titles such as `Text(t) \| Short(s)`, one chosen, by its key or by Tab |
 | `TREE_VIEW` | Nodes at depths, opened and closed with `▾` and `▸`, on a `LIST_VIEW`'s selection and paging |
 | `PALETTE` | Commands drawn over the screen, narrowed by what is typed after `/`, each with what it does |
+| `TEXT_AREA` | A text being edited, with line numbers, a selection, undo, finding and highlighting (see [Editing](#editing)) |
 
 `TEXT_VIEW`, `LIST_VIEW`, `TREE_VIEW` and `PALETTE` take `rows`, the height they are drawn in, which pages them. `update` does not know the layout, so an application keeps the size it gets from `Resized` and finds the height from the same layout `view` uses, as `todo_tui` and `gtui_tour` do.
 
@@ -88,15 +90,35 @@ Each widget is a value with a `draw(screen, rect, ...)` that gives a new screen,
 
 **Commands.** `PALETTE.make(entries)` with `PALETTE_ENTRY.make("run", "[ARGS] run the program")`. What is typed after `/` narrows the list to the commands whose name starts with its first word, and the rest is `arguments`. The arrows and the page keys move in the list and other keys edit the line; Enter and Escape are the application's, which reads `chosen` and `arguments`. `place(area, width, height)` gives where to draw it, at the bottom of `area`.
 
+## Editing
+
+`TEXT_AREA.of_text(t)` is a text to edit. `a.on_key(k, r)` edits or moves by a key and scrolls the page to keep the cursor in `r`, and `a.draw(s, r, st, gutter, chosen)` draws it there with line numbers in `gutter`, the selection in `chosen`, and the terminal's cursor at the cursor. `a.text` gives the text back, its lines joined by LF.
+
+- **Keys.** Characters, Enter, Tab (two spaces), Backspace and Delete edit, replacing the selection when there is one. The arrows, Home, End, PageUp and PageDown move; Up and Down keep to the column the cursor was last moved to along a line; Ctrl with Home or End goes to the start or the end of the text; Shift with any of them selects. Ctrl-A selects everything, Ctrl-C copies the selection, Ctrl-X cuts it, Ctrl-V pastes what was cut or copied, Ctrl-Z undoes and Ctrl-Y redoes. Ctrl-Insert copies, Shift-Insert pastes and Shift-Delete cuts too: the Gardel runtime keeps Ctrl-C as the signal that stops a program, so it never arrives as a key.
+- **The clipboard.** The area keeps its own. When `a.just_copied`, send `TUI_COMMANDS.copy(a.clipboard)` so the terminal's clipboard has it too. A terminal's paste arrives as `Pasted(t)`: give it to `a.paste(t)`, which leaves carriage returns out and is one step to undo.
+- **Undo.** Each edit is one step, and the last 200 to 400 are kept: past 400, the oldest 200 are dropped. `a.version` changes whenever the text may have, so an application can tell a text from the one it saved.
+- **Going to a line, finding.** `a.go_to_line(n)` puts the cursor at the start of line `n`, from 0. `a.find(pattern)` selects the next place `pattern` is found after the cursor, within a line, going round to the start; nothing changes when it is not there.
+- **Scrolling and a marked line.** `a.with_top(n)` scrolls the page to start at line `n`, as after a jump, and drawing then scrolls as little as shows the cursor. `a.draw_marked(s, r, st, gutter, chosen, spans, marked, mark, cursor)` draws as `draw_code` does, with line `marked` across on `mark`'s background, its number and its spans too, and the terminal's cursor only when `cursor` is set.
+- **Highlighting.** `a.with_lexer(lex)` gives the area a function from the state a line starts in, and its characters, to the state it ends in, such as inside a string or a comment. `a.draw_code(s, r, st, gutter, chosen, spans)` draws each line's `SPAN`s from the state it starts in, so a string can run over lines. Each line keeps the state it ends in: an edit lexes the lines it touched, then the lines below until one ends as it did before, so a key costs one line or two, not the text.
+- **The text.** `TEXT_ZIP` holds it as a zipper: the lines above the cursor's, the cursor's line cut at the cursor, and the lines below. A key works where the cursor is and costs the length of one line, and drawing costs the lines on the page. A text has fewer than 2^32 lines of fewer than 2^32 characters; an edit past either is not made, and a text from `of_text` that is larger is empty.
+
+`tests/gtui.rs` has an editor of 20 lines: a `TEXT_AREA` with a lexer of strings.
+
 ## What is proven
 
 - **Every write stays inside the screen.** `SCREEN_DIFF.changes` and `whole` ensure `SCREEN_WRITE.all_within(Result, width, height)`: each write is on a row of the screen and ends at or before its right edge. `TUI.frame_writes` gives it for every frame, against the terminal's last reported size.
 - **Children stay inside their parent and do not overlap.** `RECT.cut_top`, `cut_bottom`, `cut_left` and `cut_right`: both pieces are inside, they are disjoint, and they hold all the rows or columns. `LAYOUT.columns` and `rows` give one child per size, laid along the axis in order (`LAYOUT.across` and `down`); `LAYOUT.across_inside` and `down_inside` put each child inside the parent, and `LAYOUT_APART.columns_apart` and `rows_apart` make any two disjoint. `RECT.inside_trans` and `disjoint_inside` carry this through nested layouts.
 - **The widgets' invariants.** A list's selection is an item, or 0 when it is empty, and on the page shown. A text view's first line is one of its lines. An input line has at most 4096 characters. A tree shows one list row per row it holds, and a palette one per command it shows. A tab bar has one key per title and its choice is a tab; a focus is on a pane.
 - **Where things go.** `FRAME.inner(r)` and `title_area(r)` lie inside `r`, and `PALETTE.place(area, w, h)` inside `area`. `TEXT_VIEW.showing(n, rows)` shows line `n` when there is one and `rows` is not 0.
+- **Text cut into lines comes back whole.** `LINE_SPLIT.join(LINE_SPLIT.lines_of(cs)) = cs` for any characters, by induction (`LIST_FACTS` proves the facts about reversing a list it needs), and so `TEXT_AREA.of_chars(cs).state.chars = cs` for any text that fits (`LINE_SPLIT.fits`).
+- **An edit undone gives the text and the cursor back.** For a character typed, a new line, Backspace, Delete and a paste, `a.edit.undo.state = a.state`.
+- **The cursor is in the text and on the page.** Its line is one of the text's and its column is in that line. `followed(r)` scrolls the page so the cursor's line and column are inside the part of `r` the text is drawn in, and moving the cursor keeps the text (`TEXT_ZIP`'s `same_text`).
+- **The selection is inside the text.** Its start and end are each on a line of the text and in that line, the start first.
 
-Not proven: that the writes of a diff turn the old screen into the new one, and that the bytes `VT_TEXT` writes put each cell where its write says. `tests/gtui.rs` checks both by running sessions of `todo_tui` and `gtui_tour` through a small VT terminal: every character lands inside the screen, and after the session the cells are the same, styles and colours included, as a full redraw gives. That a tree hides what is inside a closed node, that a palette narrows, and that nothing is drawn while a child has the terminal are tested too.
+Not proven: that the writes of a diff turn the old screen into the new one, and that the bytes `VT_TEXT` writes put each cell where its write says; that `TEXT_AREA.of_text(t).text = t` through UTF-8, rather than for its characters; that the width table is the Unicode data; and that an edit does what its key says. `tests/gtui.rs` checks both by running sessions of `todo_tui` and `gtui_tour` through a small VT terminal: every character lands inside the screen, and after the session the cells are the same, styles and colours included, as a full redraw gives. That a tree hides what is inside a closed node, that a palette narrows, and that nothing is drawn while a child has the terminal are tested too. So are wide characters, marks and wide characters cut in half, through a terminal that draws them as terminals do, and an editor that types, highlights a string over lines, cuts, pastes, undoes, finds, and scrolls both ways.
 
 ## Cost
 
 A full redraw of a 200 by 60 screen, where every cell changes, takes about 7 ms, measured by `tests/gtui.rs` with `gtui/tests`'s bench, against a frame of 16 ms. Each frame builds its screen from lists of cells, compares each row once, and writes the changed cells through `BYTES_BUILDER`.
+
+A key in a `TEXT_AREA` of 5000 lines, with its frame, takes about 0.2 ms, measured by `tests/gtui.rs`.

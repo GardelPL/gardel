@@ -1,0 +1,171 @@
+-- A file shown in Text: its path from the project, its text in a `TEXT_AREA`, the version of
+-- the text the file on disk has, and whether its lines end with CR LF, which a save keeps. A
+-- note, such as a file being read, one that could not be read, or Tablon's welcome, is shown
+-- the same way, but cannot be edited or saved.
+module OPEN_FILE
+
+representation {NONE}
+  where: STRING
+  body: TEXT_AREA
+  saved_at: NAT
+  crlf: BOOL
+  real: BOOL
+
+create {ANY}
+
+  -- `lines` about the file `rel`, which cannot be edited.
+  note(rel: STRING, lines: LIST[STRING]): OPEN_FILE
+    do
+      { where = rel, body = TEXT_AREA.of_text(OPEN_FILE.joined(lines)), saved_at = 0, crlf = False, real = False }
+    ensure
+      kept: not Result.editable
+    end
+
+  -- The file `rel`, read as `b`: editable when it is UTF-8 and fits a `TEXT_AREA`, its carriage
+  -- returns left out; and a note that says why not otherwise.
+  of_bytes(rel: STRING, b: BYTES): OPEN_FILE
+    do
+      match STRING.from_utf8(b)
+        case Ok(t) then
+          let cs = TEXT_AREA.without_cr(GLYPHS.of_text(t), LIST.empty)
+          if LINE_SPLIT.fits(cs) then
+            let a = TEXT_AREA.of_chars(cs)
+            { where = rel, body = a, saved_at = a.version, crlf = OPEN_FILE.has_crlf(b), real = True }
+          else
+            OPEN_FILE.note(rel, LIST.empty.prepend("The file has too many lines, or a line too long, to be shown."))
+          end
+        case Error(_) then OPEN_FILE.note(rel, LIST.empty.prepend("The file is not UTF-8 text, so it is not shown."))
+      end
+    end
+
+  -- `lines` joined by line feeds.
+  joined(lines: LIST[STRING]): STRING
+    variant
+      lines.length
+    do
+      if lines.length = 0 then ""
+      else if lines.length = 1 then lines.head
+      else GLYPHS.join(GLYPHS.join(lines.head, "\n"), OPEN_FILE.joined(lines.tail))
+      end end
+    end
+
+  -- Whether the first carriage return of `b` is followed by a line feed.
+  has_crlf(b: BYTES): BOOL
+    do
+      match b.index_of_byte(13, 0)
+        case Some(i) then i < b.length and i + 1 < b.length and b.at(i + 1) = 10
+        case None then False
+      end
+    end
+
+  cr: CHAR
+    do
+      '\r'
+    ensure
+      code: Result.code = 13
+    end
+
+  -- `cs` with a carriage return before each line feed, after the reverse of `acc`.
+  with_cr(cs: LIST[CHAR], acc: LIST[CHAR]): LIST[CHAR]
+    variant
+      cs.length
+    do
+      if cs.length = 0 then LIST_CUT.reverse(acc, LIST.empty)
+      else if cs.head = LINE_SPLIT.lf then OPEN_FILE.with_cr(cs.tail, acc.prepend(OPEN_FILE.cr).prepend(cs.head))
+      else OPEN_FILE.with_cr(cs.tail, acc.prepend(cs.head))
+      end end
+    end
+
+  -- The file of `fs` at `rel`, if there is one.
+  find(fs: LIST[OPEN_FILE], rel: STRING): OPTION[OPEN_FILE]
+    variant
+      fs.length
+    do
+      if fs.length = 0 then None
+      else if fs.head.path.equals(rel) then Some(fs.head)
+      else OPEN_FILE.find(fs.tail, rel)
+      end end
+    end
+
+  -- `fs` but the file at `rel`.
+  without(fs: LIST[OPEN_FILE], rel: STRING): LIST[OPEN_FILE]
+    do
+      LIST_OPS.filter(fs, fn(f: OPEN_FILE): BOOL do not f.path.equals(rel) end)
+    end
+
+  -- `fs`, the file at `rel` marked saved at version `v`, and those no longer unsaved left out.
+  saved_in(fs: LIST[OPEN_FILE], rel: STRING, v: NAT): LIST[OPEN_FILE]
+    do
+      let marked = LIST_OPS.map(fs, fn(f: OPEN_FILE): OPEN_FILE do if f.path.equals(rel) then f.saved_as(v) else f end end)
+      LIST_OPS.filter(marked, fn(f: OPEN_FILE): BOOL do f.unsaved end)
+    end
+
+  -- The paths of `fs`, without a leading `./`, joined by commas.
+  names(fs: LIST[OPEN_FILE]): STRING
+    variant
+      fs.length
+    do
+      if fs.length = 0 then ""
+      else if fs.length = 1 then fs.head.shown_path
+      else GLYPHS.join(GLYPHS.join(fs.head.shown_path, ", "), OPEN_FILE.names(fs.tail))
+      end end
+    end
+
+feature {ANY}
+
+  path: STRING
+    do
+      Current.where
+    end
+
+  -- The path without a leading `./`.
+  shown_path: STRING
+    do
+      if Current.where.starts_with("./") and Current.where.code_point_count >= 2 then
+        Current.where.slice(2, Current.where.code_point_count)
+      else
+        Current.where
+      end
+    end
+
+  area: TEXT_AREA
+    do
+      Current.body
+    end
+
+  -- Whether it is a file's text, which can be edited and saved.
+  editable: BOOL
+    do
+      Current.real
+    end
+
+  -- Whether it has been edited since it was read or last saved. An edit undone still counts.
+  unsaved: BOOL
+    do
+      Current.real and Current.body.version != Current.saved_at
+    end
+
+  with_area(a: TEXT_AREA): OPEN_FILE
+    do
+      { Current with body = a }
+    ensure
+      same_kind: Result.editable = Current.editable
+    end
+
+  -- Saved when its text was at version `v`.
+  saved_as(v: NAT): OPEN_FILE
+    do
+      { Current with saved_at = v }
+    end
+
+  -- What a save writes: the text as UTF-8, its line ends CR LF when the file's were.
+  bytes: BYTES
+    do
+      if Current.crlf then
+        GLYPHS.text_of(OPEN_FILE.with_cr(Current.body.state.chars, LIST.empty)).to_utf8
+      else
+        Current.body.text.to_utf8
+      end
+    end
+
+end

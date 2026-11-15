@@ -1,14 +1,15 @@
 -- Tablon's state: the project, the compiler that inspects, checks and builds it, and the editor
 -- that edits it; which pane has the keys; the Modules and Files trees with what each node stands
--- for; the modules the inspection gave; the module chosen and its views; the source shown with
--- its marked line; the bottom pane's Output, Problems, Build and Run; the palette; and the
--- processes and reads awaited. Every process and every read is a command, and its answer an
--- event, so the keys keep working while one runs.
+-- for; the modules the inspection gave; the module chosen and its views; the file shown, which
+-- Text edits, with its marked line, and the other files edited and not saved; the bottom pane's
+-- Output, Problems, Build and Run; the palette; a question asked before unsaved files are left;
+-- and the processes, reads and writes awaited. Every process, read and write is a command, and
+-- its answer an event, so the keys keep working while one runs.
 --
 -- Tags: 1 is the inspection, 2 the check, 3 the build, 4 a program run with its output read, 5
 -- one run attached, 6 the editor, 7 the read that finds a new module's file is not there yet and
--- 8 its write; 100 and on the listings of directories, in the order asked; and 1000 and on the
--- reads of files, so an answer to a read no longer awaited is dropped.
+-- 8 its write, 9 the save of a file; 100 and on the listings of directories, in the order asked;
+-- and 1000 and on the reads of files, so an answer to a read no longer awaited is dropped.
 module TABLON_STATE
 
 representation {NONE}
@@ -28,7 +29,9 @@ representation {NONE}
   chosen: STRING
   views: TABS
   source_file: STRING
-  source: TEXT_VIEW
+  source: OPEN_FILE
+  others: LIST[OPEN_FILE]
+  writing: BOOL
   mark_line: OPTION[NAT]
   reading: NAT
   reads: NAT
@@ -58,6 +61,11 @@ representation {NONE}
   made_text: STRING
   commands: PALETTE
   commands_open: BOOL
+  asking: STRING
+  asked_args: STRING
+  saving: STRING
+  saving_at: NAT
+  recheck: BOOL
 
 create {ANY}
 
@@ -75,7 +83,8 @@ create {ANY}
         file_entries = LIST.empty.prepend(TREE_ENTRY.make("./src", True)),
         dirs_asked = none.prepend("./src"),
         infos = LIST.empty, chosen = "", views = MODULE_VIEWS.tabs,
-        source_file = "", source = TEXT_VIEW.make(TABLON_STATE.welcome), mark_line = None,
+        source_file = "", source = OPEN_FILE.note("", TABLON_STATE.welcome), others = LIST.empty, writing = False,
+        mark_line = None,
         reading = 0, reads = 0, go_to = 0, go_mark = False,
         short_view = TEXT_VIEW.make(none), part_lines = VIEW_LINES.empty, parts_view = LIST_VIEW.make(none),
         low_tabs = TABS.empty.with("Output", 'o').with("Problems", 'p').with("Build", 'b').with("Run", 'r'),
@@ -85,14 +94,16 @@ create {ANY}
         builder = PROC_SLOT.idle, build_log = STREAM_LINES.empty, run_next = False, run_words = none,
         runner = PROC_SLOT.idle, attached_run = False, run_log = STREAM_LINES.empty, run_input = INPUT_LINE.empty,
         typing = False, editing = False, making = "", made_text = "",
-        commands = PALETTE.make(TABLON_STATE.palette_entries), commands_open = False }
+        commands = PALETTE.make(TABLON_STATE.palette_entries), commands_open = False,
+        asking = "", asked_args = "", saving = "", saving_at = 0, recheck = False }
     end
 
   welcome: LIST[STRING]
     do
       LIST.empty
         .prepend("Tab moves between the panes; / opens the commands; q quits.")
-        .prepend("^K checks the project, ^B builds it, ^R runs it, ^E edits the file shown.")
+        .prepend("In Text, Enter edits the file shown and Escape stops; ^S saves it and checks again.")
+        .prepend("^K checks the project, ^B builds it, ^R runs it, ^E edits the file shown in your editor.")
         .prepend("")
         .prepend("Choose a module on the left, under Modules, or a file under Files, and press Enter.")
         .prepend("Tablon: a workbench for a Gardel project.")
@@ -106,6 +117,7 @@ create {ANY}
         .prepend(PALETTE_ENTRY.make("new", "NAME  make the module NAME in src, and open it"))
         .prepend(PALETTE_ENTRY.make("inspect", "read the project's modules again, unverified"))
         .prepend(PALETTE_ENTRY.make("edit", "[EDITOR]  edit the file shown, then check  ^E"))
+        .prepend(PALETTE_ENTRY.make("save", "write the file shown, then check  ^S"))
         .prepend(PALETTE_ENTRY.make("stop", "stop the program, the build or the check  ^X"))
         .prepend(PALETTE_ENTRY.make("run", "[ARGS]  build, then run the program  ^R"))
         .prepend(PALETTE_ENTRY.make("build", "verify and compile the project  ^B"))
@@ -170,6 +182,64 @@ create {ANY}
       end
     end
 
+  -- Line `line`, from 0, after an edit that started at line `e` turned `n0` lines into `n1`:
+  -- moved by as many lines as were added or taken out, and to `e` when it was taken out. Line
+  -- `e` itself moves with lines added when the edit started at its first column (`whole`).
+  shifted(line: NAT, e: NAT, whole: BOOL, n0: NAT, n1: NAT): NAT
+    do
+      if line < e or (line = e and not (whole and n1 > n0)) then line
+      else if n1 >= n0 then (if line <= 18446744073709551615 - (n1 - n0) then line + (n1 - n0) else line end)
+      else if n0 - n1 <= line and line - (n0 - n1) >= e then line - (n0 - n1)
+      else e
+      end end end
+    end
+
+  -- `ps`, those placed in the file `file` at a line moved as `shifted` says, after the
+  -- reverse of `acc`.
+  problems_moved(ps: LIST[PROBLEM], file: STRING, e: NAT, whole: BOOL, n0: NAT, n1: NAT, acc: LIST[PROBLEM]): LIST[PROBLEM]
+    variant
+      ps.length
+    do
+      if ps.length = 0 then
+        LIST_CUT.reverse(acc, LIST.empty)
+      else
+        let p = ps.head
+        let here = p.line > 0 and TABLON_STATE.shown_path(p.file).equals(file)
+        let l = if here then TABLON_STATE.shifted(p.line - 1, e, whole, n0, n1) else 0 end
+        let q = if here and l < 18446744073709551615 then p.at_line(l + 1) else p end
+        TABLON_STATE.problems_moved(ps.tail, file, e, whole, n0, n1, acc.prepend(q))
+      end
+    end
+
+  summaries(ps: LIST[PROBLEM]): LIST[STRING]
+    do
+      LIST_OPS.map(ps, fn(p: PROBLEM): STRING do p.summary end)
+    end
+
+  -- Whether `k` only moves the cursor: an arrow, Home, End or a page key, with Shift or Ctrl.
+  moves(k: KEY): BOOL
+    do
+      match k
+        case Mod(m, _, alt, _) then not alt and TABLON_STATE.plain_move(m)
+        case _ then TABLON_STATE.plain_move(k)
+      end
+    end
+
+  plain_move(k: KEY): BOOL
+    do
+      match k
+        case Up then True
+        case Down then True
+        case Left then True
+        case Right then True
+        case Home then True
+        case End then True
+        case PageUp then True
+        case PageDown then True
+        case _ then False
+      end
+    end
+
   -- `text` and a line end, as bytes, for a program's standard input.
   input_line(text: STRING): BYTES
     do
@@ -207,9 +277,36 @@ feature {ANY}
       Current.views.selected
     end
 
-  text: TEXT_VIEW
+  -- The file shown in Text, or a note.
+  shown_file: OPEN_FILE
     do
       Current.source
+    end
+
+  -- Where Text is drawn.
+  text_area: RECT
+    do
+      TABLON_LAYOUT.view_body(TABLON_LAYOUT.right(Current.area))
+    end
+
+  -- Whether keys edit the file shown: Enter started editing it, Escape has not stopped it, and
+  -- Text is shown and has the keys.
+  writing_now: BOOL
+    do
+      Current.writing and Current.keys_at.current = 1 and Current.views.selected = MODULE_VIEWS.text_view and
+        Current.source.editable and Current.reading = 0
+    end
+
+  -- Whether the terminal's cursor shows where typing goes in Text.
+  cursor_shown: BOOL
+    do
+      Current.writing_now and not Current.commands_open and Current.asking.is_empty
+    end
+
+  -- The files edited and not saved: the one shown, then the others.
+  unsaved_files: LIST[OPEN_FILE]
+    do
+      if Current.source.unsaved then Current.others.prepend(Current.source) else Current.others end
     end
 
   marked: OPTION[NAT]
@@ -308,26 +405,37 @@ feature {ANY}
   title: STRING
     do
       if Current.chosen.is_empty then
-        if Current.source_file.is_empty then "Tablon" else TABLON_STATE.shown_path(Current.source_file) end
+        if Current.source_file.is_empty then "Tablon"
+        else GLYPHS.join(TABLON_STATE.shown_path(Current.source_file), if Current.source.unsaved then " (unsaved)" else "" end)
+        end
       else
-        GLYPHS.join(GLYPHS.join(Current.chosen, " - "), Current.views.selected_title)
+        GLYPHS.join(GLYPHS.join(GLYPHS.join(Current.chosen, " - "), Current.views.selected_title),
+          if Current.source.unsaved then " (unsaved)" else "" end)
       end
     end
 
   -- What the status bar shows on its left: the keys that work now.
   help: STRING
     do
-      if Current.typing_now then " Enter sends the line  ^D ends the input  Esc stops typing  ^X stops the program"
+      if not Current.asking.is_empty then
+        GLYPHS.join(GLYPHS.join(" Unsaved: ", OPEN_FILE.names(Current.unsaved_files)),
+          if Current.asking.equals("quit") then ". Quit without saving them? y quits, another key goes back"
+          else ". Open another project without saving them? y opens it, another key goes back" end)
+      else if Current.typing_now then " Enter sends the line  ^D ends the input  Esc stops typing  ^X stops the program"
+      else if Current.writing_now then " Esc stops editing  ^S save  ^Z undo  ^Y redo  ^X cut  ^Ins copy  ^V paste  Tab panes"
+      else if Current.keys_at.current = 1 and Current.views.selected = MODULE_VIEWS.text_view and Current.source.editable then
+        " Enter edits  ^S save  Tab panes  / commands  ^K check  ^B build  ^R run  ^E edit  q quit"
       else if Current.runner.running or Current.builder.running or Current.inspection.running then
         " Tab panes  / commands  ^K check  ^B build  ^R run  ^E edit  ^X stop  q quit"
       else " Tab panes  / commands  ^K check  ^B build  ^R run  ^E edit  q quit"
-      end end
+      end end end end end
     end
 
   -- What the status bar shows on its right: what runs, or the modules found and the problems.
   activity: STRING
     do
-      if Current.editing then "editing..."
+      if not Current.saving.is_empty then "saving..."
+      else if Current.editing then "editing..."
       else if Current.runner.running then "running..."
       else if Current.builder.running then "building..."
       else if Current.inspection.running then (if Current.verifying then "checking..." else "inspecting..." end)
@@ -337,7 +445,7 @@ feature {ANY}
         else if Current.checked_by.equals("check") or Current.checked_by.equals("build") then GLYPHS.join(modules, ", verified")
         else modules
         end end
-      end end end end
+      end end end end end
     end
 
   -- Of a size `w` by `h`.
@@ -357,12 +465,16 @@ feature {ANY}
   -- go to the pane that has them.
   browse(k: KEY): TUI_NEXT[TABLON_STATE]
     do
-      if Current.typing_now then
+      if not Current.asking.is_empty then
+        Current.answered(k)
+      else if Current.typing_now then
         Current.in_run(k)
+      else if Current.writing_now then
+        Current.in_text(k)
       else
         match k
           case Char(c) then
-            if c = 'q' then TUI_NEXT.quit(0)
+            if c = 'q' then Current.run("quit", "")
             else if c = '/' then TUI_NEXT.next({ Current with commands = PALETTE.make(TABLON_STATE.palette_entries), commands_open = True })
             else Current.in_pane(k)
             end end
@@ -371,19 +483,119 @@ feature {ANY}
           case KeysEnded then TUI_NEXT.quit(0)
           case _ then Current.in_pane(k)
         end
+      end end end
+    end
+
+  -- A key that answers whether to leave unsaved files: `y` does what was asked, and another
+  -- key goes back.
+  answered(k: KEY): TUI_NEXT[TABLON_STATE]
+    do
+      let back = { Current with asking = "", asked_args = "" }
+      match k
+        case Char(c) then
+          if c = 'y' then back.forced(Current.asking, Current.asked_args)
+          else TUI_NEXT.next(back.logged("Nothing done: the files are still unsaved."))
+          end
+        case KeysEnded then TUI_NEXT.quit(0)
+        case _ then TUI_NEXT.next(back.logged("Nothing done: the files are still unsaved."))
       end
+    end
+
+  -- `/quit` or `/open args`, whatever is unsaved.
+  forced(name: STRING, args: STRING): TUI_NEXT[TABLON_STATE]
+    do
+      if name.equals("open") then
+        let fresh = TABLON_STATE.make(args, Current.compiler, WORDS.joined(Current.editor)).sized(Current.wide, Current.high)
+        Next(fresh, fresh.starting)
+      else
+        TUI_NEXT.quit(0)
+      end
+    end
+
+  -- A key while editing the file shown: Escape stops, Tab moves the keys, Ctrl-S saves, Ctrl-K,
+  -- B, R and E run their commands, and the rest go to the text.
+  in_text(k: KEY): TUI_NEXT[TABLON_STATE]
+    do
+      match k
+        case Escape then TUI_NEXT.next({ Current with writing = False })
+        case Tab then TUI_NEXT.next({ Current with keys_at = Current.keys_at.next })
+        case KeysEnded then TUI_NEXT.quit(0)
+        case Ctrl(c) then
+          if c = 's' or c = 'k' or c = 'b' or c = 'r' or c = 'e' then Current.on_ctrl(c)
+          else Current.with_text(Current.source.area.on_key(k, Current.text_area))
+          end
+        case _ then Current.with_text(Current.source.area.on_key(k, Current.text_area))
+      end
+    end
+
+  -- A terminal's paste: into the text while editing it.
+  pasted(t: STRING): TUI_NEXT[TABLON_STATE]
+    do
+      if Current.writing_now then Current.with_text(Current.source.area.paste(t).followed(Current.text_area))
+      else TUI_NEXT.next(Current)
+      end
+    end
+
+  -- The file shown with the text `a`: the marked line and the problems placed in it moved with
+  -- the lines an edit added or took out, and what was copied sent to the terminal's clipboard.
+  --
+  -- Each step is a feature of its own: a record built from a `let` that holds another record
+  -- grows the prover's definition of a feature by as many copies as the state has fields.
+  with_text(a: TEXT_AREA): TUI_NEXT[TABLON_STATE]
+    do
+      Current.moved_for(a).showing(a).copied_out(a)
+    end
+
+  -- The marked line and the problems moved for the edit that gives `a`.
+  moved_for(a: TEXT_AREA): TABLON_STATE
+    do
+      let before = Current.source.area
+      let n0 = before.line_count
+      let n1 = a.line_count
+      let from = if before.has_selection then before.selection_start_line else before.line_number end
+      let col = if before.has_selection then before.selection_start_column else before.column end
+      let e = if a.line_number < from then a.line_number else from end
+      if n0 = n1 then Current else Current.lines_moved(e, e = from and col = 0, n0, n1) end
+    end
+
+  -- The file shown with the text `a`.
+  showing(a: TEXT_AREA): TABLON_STATE
+    do
+      { Current with source = Current.source.with_area(a) }
+    end
+
+  -- What `a` copied, sent to the terminal's clipboard.
+  copied_out(a: TEXT_AREA): TUI_NEXT[TABLON_STATE]
+    do
+      if a.just_copied then Next(Current, LIST.empty.prepend(TUI_COMMANDS.copy(a.clipboard)))
+      else TUI_NEXT.next(Current)
+      end
+    end
+
+  -- The marked line and the problems in the file shown moved after an edit from line `e` that
+  -- turned `n0` lines into `n1`.
+  lines_moved(e: NAT, whole: BOOL, n0: NAT, n1: NAT): TABLON_STATE
+    do
+      let ml = match Current.mark_line
+        case Some(m) then Some(TABLON_STATE.shifted(m, e, whole, n0, n1))
+        case None then None
+      end
+      let ps = TABLON_STATE.problems_moved(Current.found, TABLON_STATE.shown_path(Current.source_file), e, whole, n0, n1, LIST.empty)
+      let rows = TABLON_LAYOUT.rows_in(TABLON_LAYOUT.bottom(Current.area))
+      { Current with mark_line = ml, found = ps, found_view = Current.found_view.with_items(TABLON_STATE.summaries(ps), rows) }
     end
 
   -- The command of a Ctrl key: K check, B build, R run, E edit, X stop.
   on_ctrl(c: CHAR): TUI_NEXT[TABLON_STATE]
     do
-      if c = 'k' then Current.run("check", "")
+      if c = 's' then Current.run("save", "")
+      else if c = 'k' then Current.run("check", "")
       else if c = 'b' then Current.run("build", "")
       else if c = 'r' then Current.run("run", "")
       else if c = 'e' then Current.run("edit", "")
       else if c = 'x' then Current.run("stop", "")
       else TUI_NEXT.next(Current)
-      end end end end end
+      end end end end end end
     end
 
   -- A key while typing to the program: Enter sends the line, Ctrl-D ends the input, Escape
@@ -464,7 +676,16 @@ feature {ANY}
         let switched = { Current with views = Current.views.on_key(k) }
         TUI_NEXT.next(switched.refreshed)
       else if Current.views.selected = MODULE_VIEWS.text_view then
-        TUI_NEXT.next({ Current with source = Current.source.on_key(k, rows) })
+        match k
+          case Enter then
+            TUI_NEXT.next(if Current.source.editable and Current.reading = 0 then { Current with writing = True } else Current end)
+          case _ then
+            if TABLON_STATE.moves(k) then
+              TUI_NEXT.next({ Current with source = Current.source.with_area(Current.source.area.on_key(k, Current.text_area)) })
+            else
+              TUI_NEXT.next(Current)
+            end
+        end
       else if Current.views.selected = MODULE_VIEWS.short_view then
         TUI_NEXT.next({ Current with short_view = Current.short_view.on_key(k, rows) })
       else
@@ -586,7 +807,28 @@ feature {ANY}
       if rel.equals(Current.source_file) and Current.reading = 0 then
         TUI_NEXT.next(Current.at_line(line, mark))
       else
-        Current.read_source(rel, line, mark)
+        let kept = Current.stashed
+        match OPEN_FILE.find(kept.others, rel)
+          case Some(f) then TUI_NEXT.next(kept.shown_again(f).at_line(line, mark))
+          case None then kept.read_source(rel, line, mark)
+        end
+      end
+    end
+
+  -- `f`, an edited file kept with the others, shown again.
+  shown_again(f: OPEN_FILE): TABLON_STATE
+    do
+      { Current with source_file = f.path, source = f, others = OPEN_FILE.without(Current.others, f.path), reading = 0,
+        writing = False, mark_line = None }
+    end
+
+  -- The file shown kept with the others when it is unsaved, as another is shown in its place.
+  stashed: TABLON_STATE
+    do
+      if Current.source.unsaved then
+        { Current with others = OPEN_FILE.without(Current.others, Current.source.path).prepend(Current.source) }
+      else
+        Current
       end
     end
 
@@ -596,20 +838,20 @@ feature {ANY}
       let n = if Current.reads < 1000000 then Current.reads + 1 else 1 end
       let tag = 1000 + n
       Next({ Current with source_file = rel, reading = tag, reads = n, go_to = line, go_mark = mark,
-               source = TEXT_VIEW.make(LIST.empty.prepend(GLYPHS.join("Reading ", TABLON_STATE.shown_path(rel)))),
-               mark_line = None },
+               source = OPEN_FILE.note(rel, LIST.empty.prepend(GLYPHS.join("Reading ", TABLON_STATE.shown_path(rel)))),
+               writing = False, mark_line = None },
            LIST.empty.prepend(ReadFile(tag, TABLON_STATE.under(Current.project, rel))))
     end
 
   -- The source shown from line `line`, which is marked when `mark` is set.
   at_line(line: NAT, mark: BOOL): TABLON_STATE
     do
-      let rows = TABLON_LAYOUT.view_rows(Current.area)
-      let n = Current.source.line_count
-      let l = if line < n then line else (if n > 0 then n - 1 else 0 end) end
+      let a = Current.source.area
+      let n = a.line_count
+      let l = if line < n then line else n - 1 end
       -- A few lines of what comes before, as a jump lands on a declaration or a clause.
-      let top = Current.source.scrolled_to(if l >= 3 then l - 3 else 0 end, rows)
-      { Current with source = top, mark_line = if mark then Some(l) else None end }
+      let moved = a.go_to_line(l).with_top(if l >= 3 then l - 3 else 0 end)
+      { Current with source = Current.source.with_area(moved), mark_line = if mark then Some(l) else None end }
     end
 
   -- A file read: the source awaited, or one no longer awaited, which is dropped.
@@ -618,10 +860,11 @@ feature {ANY}
       if tag = Current.reading and tag > 0 then
         match r
           case Ok(b) then
-            let got = { Current with source = TEXT_VIEW.make(TEXT_LINES.of_bytes(b)), reading = 0 }
+            let got = { Current with source = OPEN_FILE.of_bytes(Current.source_file, b), reading = 0 }
             got.at_line(Current.go_to, Current.go_mark)
           case Error(_) then
-            let failed = { Current with source = TEXT_VIEW.make(LIST.empty.prepend("The file could not be read.")), reading = 0 }
+            let failed = { Current with source = OPEN_FILE.note(Current.source_file, LIST.empty.prepend("The file could not be read.")),
+                             reading = 0 }
             failed.logged(GLYPHS.join("Could not read ", Current.source_file))
         end
       else
@@ -710,7 +953,9 @@ feature {ANY}
   -- A process ended.
   exited(p: PROC_ID, code: I64): TUI_NEXT[TABLON_STATE]
     do
-      if Current.inspection.holds(p) then TUI_NEXT.next(Current.inspected(code))
+      if Current.inspection.holds(p) then
+        let s = Current.inspected(code)
+        if Current.recheck and s.saving.is_empty then s.checked_again else TUI_NEXT.next(s) end
       else if Current.builder.holds(p) then Current.built(code)
       else if Current.runner.holds(p) then
         TUI_NEXT.next({ Current with runner = PROC_SLOT.idle, typing = False,
@@ -768,25 +1013,48 @@ feature {ANY}
   -- asked for it.
   built(code: I64): TUI_NEXT[TABLON_STATE]
     do
+      let ps = Current.build_problems
+      let exe = DIAGNOSTICS.executable(ps)
+      let done = Current.build_ended.with_problems(ps, "build")
+      if exe.is_empty then
+        TUI_NEXT.next(done.build_failed(DIAGNOSTICS.errors(DIAGNOSTICS.problems(ps)), code, Current.run_next))
+      else if Current.run_next then
+        done.build_made(exe).start_run(exe, DIAGNOSTICS.program(ps))
+      else
+        TUI_NEXT.next(done.build_made(exe))
+      end end
+    end
+
+  -- The problems of the build that ended. Steps of `built` are features of their own, as with
+  -- `with_text`.
+  build_problems: LIST[PROBLEM]
+    do
       let none: LIST[PROBLEM] = LIST.empty
-      let ps = match DIAGNOSTICS.of_build(Current.builder.output)
+      match DIAGNOSTICS.of_build(Current.builder.output)
         case Some(xs) then xs
         case None then none
       end
-      let exe = DIAGNOSTICS.executable(ps)
-      let ended = { Current with builder = PROC_SLOT.idle, build_log = Current.build_log.ended }
-      let done = ended.with_problems(ps, "build")
-      if exe.is_empty then
-        let errors = DIAGNOSTICS.errors(DIAGNOSTICS.problems(ps))
-        let why = if errors > 0 then GLYPHS.join(GLYPHS.join("The build failed: ", DIAGNOSTICS.counted(errors, "error")), "; see Problems.")
-          else GLYPHS.join("The build failed; gardelc ended with ", NUMBER_TEXT.i64_to_text(code))
-          end
-        let failed = { done with run_next = False, build_log = done.build_log.with_line(why) }
-        TUI_NEXT.next(if Current.run_next then { failed with run_log = STREAM_LINES.empty.with_line("Not run: the build failed.") } else failed end)
-      else
-        let made = { done with build_log = done.build_log.with_line(GLYPHS.join("Built ", exe)) }
-        if Current.run_next then made.start_run(exe, DIAGNOSTICS.program(ps)) else TUI_NEXT.next(made) end
-      end
+    end
+
+  build_ended: TABLON_STATE
+    do
+      { Current with builder = PROC_SLOT.idle, build_log = Current.build_log.ended }
+    end
+
+  -- A build that made no executable, with `errors` errors, `gardelc` ending with `code`; Run
+  -- says so when the build was to run it (`to_run`).
+  build_failed(errors: NAT, code: I64, to_run: BOOL): TABLON_STATE
+    do
+      let why = if errors > 0 then GLYPHS.join(GLYPHS.join("The build failed: ", DIAGNOSTICS.counted(errors, "error")), "; see Problems.")
+        else GLYPHS.join("The build failed; gardelc ended with ", NUMBER_TEXT.i64_to_text(code))
+        end
+      { Current with run_next = False, build_log = Current.build_log.with_line(why),
+        run_log = if to_run then STREAM_LINES.empty.with_line("Not run: the build failed.") else Current.run_log end }
+    end
+
+  build_made(exe: STRING): TABLON_STATE
+    do
+      { Current with build_log = Current.build_log.with_line(GLYPHS.join("Built ", exe)) }
     end
 
   -- The executable `exe`, built from `program`, run with the words `/run` was given: attached
@@ -828,7 +1096,7 @@ feature {ANY}
         match r
           case Ok(_) then
             let again = if back.source_file.is_empty then TUI_NEXT.next(back)
-              else back.read_source(back.source_file, if back.source.top < 1000000 then back.source.top + 3 else 0 end, False)
+              else back.read_source(back.source_file, if back.source.area.top < 1000000 then back.source.area.top + 3 else 0 end, False)
               end
             match again
               case Next(s, cmds) then
@@ -881,14 +1149,19 @@ feature {ANY}
   run(name: STRING, args: STRING): TUI_NEXT[TABLON_STATE]
     do
       if name.equals("quit") then
-        TUI_NEXT.quit(0)
+        if Current.unsaved_files.length > 0 then TUI_NEXT.next({ Current with asking = "quit", asked_args = "", writing = False })
+        else TUI_NEXT.quit(0)
+        end
       else if name.equals("open") then
         if args.is_empty then
           TUI_NEXT.next(Current.logged("/open needs a directory."))
+        else if Current.unsaved_files.length > 0 then
+          TUI_NEXT.next({ Current with asking = "open", asked_args = args, writing = False })
         else
-          let fresh = TABLON_STATE.make(args, Current.compiler, WORDS.joined(Current.editor)).sized(Current.wide, Current.high)
-          Next(fresh, fresh.starting)
-        end
+          Current.forced("open", args)
+        end end
+      else if name.equals("save") then
+        Current.save
       else if name.equals("inspect") or name.equals("check") then
         if Current.inspection.running then
           TUI_NEXT.next(Current.logged("A check or an inspection is running already."))
@@ -916,12 +1189,14 @@ feature {ANY}
         let editor = if args.is_empty then Current.editor else WORDS.of(args) end
         if Current.source_file.is_empty then
           TUI_NEXT.next(Current.logged("Open a module or a file first."))
+        else if Current.source.unsaved then
+          TUI_NEXT.next(Current.logged("Save the file first (^S): the editor reads it from the disk."))
         else if editor.length = 0 then
           TUI_NEXT.next(Current.logged("No editor; give its command as /edit EDITOR."))
         else
           Next({ Current with editor = editor, editing = True },
                LIST.empty.prepend(RunAttached(6, editor.head, editor.tail.append(LIST.empty.prepend(Current.source_file)), Current.project)))
-        end end
+        end end end
       else if name.equals("new") then
         let words = WORDS.of(args)
         let cs = if words.length = 0 then LIST.empty else GLYPHS.of_text(words.head) end
@@ -936,7 +1211,77 @@ feature {ANY}
         end end
       else
         TUI_NEXT.next(Current.logged(GLYPHS.join("Unknown command ", name)))
-      end end end end end end end
+      end end end end end end end end
+    end
+
+  -- `/save`: the file shown written, then the project checked again.
+  save: TUI_NEXT[TABLON_STATE]
+    do
+      if not Current.source.editable or Current.reading > 0 then
+        TUI_NEXT.next(Current.logged("Nothing to save: open a module or a file first."))
+      else if not Current.saving.is_empty then
+        TUI_NEXT.next(Current.logged("A save is being written already."))
+      else
+        Next({ Current with saving = Current.source.path, saving_at = Current.source.area.version },
+             LIST.empty.prepend(WriteFile(9, TABLON_STATE.under(Current.project, Current.source.path), Current.source.bytes)))
+      end end
+    end
+
+  -- A save written: the file marked saved at the version written, and the project checked, or
+  -- checked again once the check running ends.
+  written(r: RESULT[IO_ERROR, NAT]): TUI_NEXT[TABLON_STATE]
+    do
+      if Current.saving.is_empty then
+        TUI_NEXT.next(Current)
+      else
+        match r
+          case Ok(_) then Current.saved_now.check_after_save
+          case Error(_) then TUI_NEXT.next(Current.save_failed)
+        end
+      end
+    end
+
+  -- The file being saved marked saved, at the version written, and Output told.
+  saved_now: TABLON_STATE
+    do
+      let rel = Current.saving
+      let v = Current.saving_at
+      let said = Current.log.with_line(GLYPHS.join("Saved ", TABLON_STATE.shown_path(rel)))
+      if Current.source.path.equals(rel) then
+        { Current with saving = "", source = Current.source.saved_as(v), log = said }
+      else
+        { Current with saving = "", others = OPEN_FILE.saved_in(Current.others, rel, v), log = said }
+      end
+    end
+
+  save_failed: TABLON_STATE
+    do
+      { Current with saving = "", log = Current.log.with_line(GLYPHS.join("Could not save ", TABLON_STATE.shown_path(Current.saving))) }
+    end
+
+  -- The check after a save: now, or once the check running ends.
+  check_after_save: TUI_NEXT[TABLON_STATE]
+    do
+      if Current.inspection.running then TUI_NEXT.next(Current.rechecking)
+      else Next(Current.checking, LIST.empty.prepend(Current.check_command))
+      end
+    end
+
+  rechecking: TABLON_STATE
+    do
+      { Current with recheck = True }
+    end
+
+  -- A check after one that ran while a save was written.
+  checked_again: TUI_NEXT[TABLON_STATE]
+    do
+      let again = Current.not_rechecking
+      Next(again.checking, LIST.empty.prepend(again.check_command))
+    end
+
+  not_rechecking: TABLON_STATE
+    do
+      { Current with recheck = False }
     end
 
   -- The read of a new module's file: one that is there is kept, and one that is not is

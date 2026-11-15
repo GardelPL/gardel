@@ -130,26 +130,27 @@ feature {ANY}
     end
 
   -- The line drawn on the first row of `r` after `prompt`, in style `st`, the cursor's cell
-  -- in `cursor_style`. When it is too long, the part around the cursor is shown.
+  -- in `cursor_style`. When it is too long, the part around the cursor is shown. Widths are
+  -- those the terminal gives (`CHAR_WIDTH`).
   draw(s: SCREEN, r: RECT, prompt: STRING, st: STYLE, cursor_style: STYLE): SCREEN
     do
       let bar = r.take_top(1)
       let shown = s.fill(bar, ' ', st).text(bar, bar.x, bar.y, prompt, st)
-      let p = prompt.code_point_count
+      let p = GLYPHS.width(prompt)
       if p >= bar.width then
         shown
       else
         let cx = bar.x + p
         let room = bar.right - cx
-        let pos = Current.before.length
-        let skip = if pos >= room then pos - room + 1 else 0 end
-        let all = LIST_CUT.drop(Current.chars, skip)
-        let typed = shown.glyphs(bar, cx, bar.y, all, st)
-        let under = LIST_CUT.drop(Current.after, 0)
-        let mark = if under.length > 0 then under.head else ' ' end
-        let at = pos - skip
+        let under = INPUT_LINE.cluster(Current.after)
+        let cw = GLYPHS.width_of(under)
+        let budget = if room > cw then room - cw else 0 end
+        let k = INPUT_LINE.fitting(Current.before, budget, 0, 0)
+        let skip = if k <= Current.before.length then Current.before.length - k else 0 end
+        let typed = shown.glyphs(bar, cx, bar.y, LIST_CUT.drop(Current.chars, skip), st)
+        let at = GLYPHS.width_of(LIST_CUT.take(Current.before, k))
         if at < room then
-          typed.glyphs(bar, cx + at, bar.y, LIST.empty.prepend(mark), cursor_style)
+          typed.glyphs(bar, cx + at, bar.y, under, cursor_style)
         else
           typed
         end
@@ -157,6 +158,43 @@ feature {ANY}
     ensure
       same_width: Result.width = s.width
       same_height: Result.height = s.height
+    end
+
+create {ANY}
+
+  -- The character at the front of `after` with the zero-width ones that follow it, or a
+  -- space when there is none: what the cursor's cell shows.
+  cluster(after: LIST[CHAR]): LIST[CHAR]
+    do
+      if after.length = 0 then LIST.empty.prepend(' ')
+      else LIST_CUT.reverse(INPUT_LINE.marks_into(after.tail, LIST.empty), LIST.empty).prepend(after.head)
+      end
+    end
+
+  -- `acc` with the zero-width characters at the front of `cs` in front of it, the last first.
+  marks_into(cs: LIST[CHAR], acc: LIST[CHAR]): LIST[CHAR]
+    variant
+      cs.length
+    do
+      if cs.length > 0 and CHAR_WIDTH.of(cs.head) = 0 then INPUT_LINE.marks_into(cs.tail, acc.prepend(cs.head)) else acc end
+    end
+
+  -- `k` and how many more of `back`, the characters before the cursor nearest first, fit in
+  -- `budget` columns with the `used` the first `k` take.
+  fitting(back: LIST[CHAR], budget: NAT, k: NAT, used: NAT): NAT
+    variant
+      back.length
+    do
+      if back.length = 0 or k = 18446744073709551615 then
+        k
+      else
+        let w = CHAR_WIDTH.of(back.head)
+        let step = if w = 0 then 0 else if w = 2 then 2 else 1 end end
+        if used > 65535 then k
+        else if used + step > budget then k
+        else INPUT_LINE.fitting(back.tail, budget, k + 1, used + step)
+        end end
+      end
     end
 
 create {ANY}

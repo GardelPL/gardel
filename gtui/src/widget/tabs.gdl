@@ -51,7 +51,7 @@ create {ANY}
       else
         let title = names.head
         let k = keys.head
-        let n = title.code_point_count
+        let n = GLYPHS.width(title)
         let titled = s.text(row, x, row.y, title, if i = picked then chosen else st end)
         if n > 65535 then
           titled

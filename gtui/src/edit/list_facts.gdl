@@ -1,0 +1,64 @@
+-- Facts about reversing a list, each proven by induction: a call states its fact for the lists
+-- it is given, and holds (`Result`), so a proof can call it where it needs the fact.
+functions LIST_FACTS
+
+feature {ANY}
+
+  -- Reversing onto `acc` is reversing, then appending `acc`.
+  reverse_onto[A](xs: LIST[A], acc: LIST[A]): BOOL
+    variant
+      xs.length
+    do
+      if xs.length = 0 then
+        True
+      else
+        let none: LIST[A] = LIST.empty
+        LIST_FACTS.reverse_onto(xs.tail, acc.prepend(xs.head)) and LIST_FACTS.reverse_onto(xs.tail, none.prepend(xs.head))
+      end
+    ensure
+      holds: Result
+      onto: LIST_CUT.reverse(xs, acc) = LIST_CUT.reverse(xs, LIST.empty).append(acc)
+    end
+
+  -- The reverse of `xs` with `x` after it is `x` in front of the reverse of `xs`.
+  reverse_snoc[A](xs: LIST[A], x: A): BOOL
+    variant
+      xs.length
+    do
+      let none: LIST[A] = LIST.empty
+      let one = none.prepend(x)
+      if xs.length = 0 then
+        check
+          whole: xs.append(one) = one
+        end
+        True
+      else
+        check
+          split: xs.append(one) = xs.tail.append(one).prepend(xs.head)
+        end
+        LIST_FACTS.reverse_onto(xs.tail.append(one), none.prepend(xs.head)) and
+          LIST_FACTS.reverse_snoc(xs.tail, x) and LIST_FACTS.reverse_onto(xs.tail, none.prepend(xs.head))
+      end
+    ensure
+      holds: Result
+      snoc: LIST_CUT.reverse(xs.append(LIST.empty.prepend(x)), LIST.empty) = LIST_CUT.reverse(xs, LIST.empty).prepend(x)
+    end
+
+  -- Reversing twice gives the list back.
+  reverse_twice[A](xs: LIST[A]): BOOL
+    variant
+      xs.length
+    do
+      if xs.length = 0 then
+        True
+      else
+        let none: LIST[A] = LIST.empty
+        LIST_FACTS.reverse_onto(xs.tail, none.prepend(xs.head)) and
+          LIST_FACTS.reverse_snoc(LIST_CUT.reverse(xs.tail, none), xs.head) and LIST_FACTS.reverse_twice(xs.tail)
+      end
+    ensure
+      holds: Result
+      twice: LIST_CUT.reverse(LIST_CUT.reverse(xs, LIST.empty), LIST.empty) = xs
+    end
+
+end

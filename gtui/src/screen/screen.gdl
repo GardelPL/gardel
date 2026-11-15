@@ -1,6 +1,8 @@
 -- A grid of cells, `width` by `height`, each at most 65535, which a view draws on. Drawing
 -- is clipped: `text` and `fill` change only the cells inside both the rectangle they are
--- given and the screen, so a widget given a rectangle cannot draw outside it. A screen may
+-- given and the screen, so a widget given a rectangle cannot draw outside it. Text takes
+-- the columns a terminal gives it (`CHAR_WIDTH`), and a wide character that would be cut by
+-- the edge is not drawn: a space in its style is. A screen may
 -- show the terminal's cursor at one of its cells (`with_cursor`), where typing goes.
 module SCREEN
 
@@ -57,27 +59,81 @@ create {ANY}
       end end
     end
 
-  -- `row` with `cells` from column `x`, padded with blanks when it is shorter than `x`.
+  -- `row` with `cells` from column `x`, padded with blanks when it is shorter than `x`. A wide
+  -- character cut in half, on either side of `cells` or at either end of them, leaves a space
+  -- in its style where its other half was, so every left half is followed by its right half
+  -- and every right half follows its left one.
   splice(row: LIST[CELL], x: NAT, cells: LIST[CELL]): LIST[CELL]
     require
       left: x <= 65535
       short: cells.length <= 65535
     do
-      let before = LIST_CUT.take(row, x)
+      if cells.length = 0 then
+        row
+      else
+      let before = SCREEN.mend_last(LIST_CUT.take(row, x))
       let pad = if row.length < x then LIST_CUT.repeat(CELL.blank, x - row.length, LIST.empty) else LIST.empty end
-      before.append(pad).append(cells).append(LIST_CUT.drop(row, x + cells.length))
+      let after = SCREEN.mend_first(LIST_CUT.drop(row, x + cells.length))
+      before.append(pad).append(SCREEN.mend_last(SCREEN.mend_first(cells))).append(after)
+      end
     end
 
-  -- `acc` with a cell of style `st` for each of `chars` in front of it, the last first.
-  styled_into(chars: LIST[CHAR], st: STYLE, acc: LIST[CELL]): LIST[CELL]
+  -- `cells`, with a space for the first when it is a right half.
+  mend_first(cells: LIST[CELL]): LIST[CELL]
+    do
+      if cells.length > 0 and cells.head.is_right_half then cells.tail.prepend(cells.head.cleared) else cells end
+    ensure
+      length_same: Result.length = cells.length
+    end
+
+  -- `cells`, with a space for the last when it is a left half.
+  mend_last(cells: LIST[CELL]): LIST[CELL]
+    do
+      let none: LIST[CELL] = LIST.empty
+      let back = LIST_CUT.reverse(cells, none)
+      if back.length > 0 and back.head.is_left_half then
+        LIST_CUT.reverse(back.tail.prepend(back.head.cleared), none)
+      else
+        cells
+      end
+    ensure
+      length_same: Result.length = cells.length
+    end
+
+  -- `acc` with the cells of `chars` in style `st` in front of it, the last first, until it
+  -- holds more than `room` cells. A wide character takes two cells, and a zero-width one is
+  -- a mark on the cell before it, or is left out when there is none.
+  styled_into(chars: LIST[CHAR], st: STYLE, room: NAT, acc: LIST[CELL]): LIST[CELL]
     variant
       chars.length
     do
-      if chars.length = 0 then acc
-      else SCREEN.styled_into(chars.tail, st, acc.prepend(CELL.make(chars.head, st)))
+      if chars.length = 0 or acc.length > room then
+        acc
+      else
+        let c = chars.head
+        let w = CHAR_WIDTH.of(c)
+        if w = 0 then
+          SCREEN.styled_into(chars.tail, st, room, SCREEN.marked(acc, c))
+        else if w = 2 and CELL.is_printable(c) then
+          SCREEN.styled_into(chars.tail, st, room, acc.prepend(CELL.wide(c, st)).prepend(CELL.right_half(st)))
+        else
+          SCREEN.styled_into(chars.tail, st, room, acc.prepend(CELL.make(c, st)))
+        end end
       end
+    end
+
+  -- `acc`, the last first, with the mark `m` on its last character.
+  marked(acc: LIST[CELL], m: CHAR): LIST[CELL]
+    do
+      if acc.length = 0 then
+        acc
+      else if acc.head.is_right_half then
+        if acc.tail.length = 0 then acc else acc.tail.tail.prepend(acc.tail.head.with_mark(m)).prepend(acc.head) end
+      else
+        acc.tail.prepend(acc.head.with_mark(m))
+      end end
     ensure
-      length_def: Result.length = chars.length + acc.length
+      length_same: Result.length = acc.length
     end
 
   -- `drawn`, when it is the size of `blank`, and `blank` otherwise.
@@ -197,9 +253,10 @@ feature {ANY}
       if y < clip.y or y >= clip.bottom or start >= edge then
         Current
       else
-        let chars = LIST_CUT.drop(cs, start - x)
-        let shown = LIST_CUT.take_into(chars, edge - start, LIST.empty)
-        Current.put(start, y, SCREEN.styled_into(shown, st, LIST.empty))
+        let none: LIST[CELL] = LIST.empty
+        let cells = LIST_CUT.reverse(SCREEN.styled_into(cs, st, edge - x, none), none)
+        let shown = LIST_CUT.take(LIST_CUT.drop(cells, start - x), edge - start)
+        Current.put(start, y, shown)
       end
     ensure
       same_width: Result.width = Current.width

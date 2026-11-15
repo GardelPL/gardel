@@ -11,6 +11,42 @@ feature {ANY}
       LIST_CUT.reverse(GLYPHS.decode(s.to_utf8.to_list, LIST.empty), LIST.empty)
     end
 
+  -- The columns `s` takes on a screen (`CHAR_WIDTH`), or 65535 when it takes more.
+  width(s: STRING): NAT
+    do
+      GLYPHS.width_of(GLYPHS.of_text(s))
+    ensure
+      fits: Result <= 65535
+    end
+
+  -- The columns `cs` take on a screen, or 65535 when they take more.
+  width_of(cs: LIST[CHAR]): NAT
+    do
+      GLYPHS.width_into(cs, 0)
+    ensure
+      fits: Result <= 65535
+    end
+
+  -- `acc` and the columns `cs` take, or 65535 when that is more.
+  width_into(cs: LIST[CHAR], acc: NAT): NAT
+    require
+      fits: acc <= 65535
+    variant
+      cs.length
+    do
+      if cs.length = 0 then
+        acc
+      else
+        -- A character taken from a list is not known to the prover to be one, so the bound
+        -- that `CHAR_WIDTH.of` states for characters is applied here as well.
+        let w = CHAR_WIDTH.of(cs.head)
+        let next = acc + (if w = 0 then 0 else if w = 2 then 2 else 1 end end)
+        if next >= 65535 then 65535 else GLYPHS.width_into(cs.tail, next) end
+      end
+    ensure
+      fits: Result <= 65535
+    end
+
   -- `n` as a character when it is a Unicode scalar value, and `?` otherwise.
   scalar(n: NAT): CHAR
     do
