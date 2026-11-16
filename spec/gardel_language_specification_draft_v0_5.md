@@ -317,7 +317,7 @@ The Standard Prelude provides an irreducible core of verified concepts, algebrai
 - **Mathematical Ghost Types & Specification Modules (§2, §6, §8):**
   - `LIST[A]`: The canonical inductive sequence ADT (`Nil | Cons(head: A, tail: LIST[A])`). `LIST` has **dual status**: it is the canonical ghost model of Dual-Layer Model Refinement (§2) *and* an ordinary sequential runtime structure that may appear in `representation` sections (e.g., `BOUNDED_STACK.items`, `BIGNAT.limbs`, `STRING.bytes`) and in runtime `do` bodies. Only its use as a model (inside `specify` queries and contracts) is erased.
   - `MATH_INT`: The built-in unbounded mathematical integer sort ($\mathbb{Z}$) mapping directly to native SMT linear integer arithmetic (`Int`). Unlike `LIST`, `MATH_INT` is **strictly ghost-only** (§3).
-  - `functions LIST_OPS`: Inductive list operations over `LIST[A]` (`append`, `length`, `at`, `map`, `filter`, `fold_left`, `fold_right`, `reverse`) serving as reference targets for Dual-Layer Model Refinement (§2). Its `feature {ANY}` routines are executable (sequential, $O(n)$); its `specify` laws are erased.
+  - `functions LIST_OPS`: Inductive list operations over `LIST[A]` (`at`, `map`, `filter`, `fold_left`, `fold_right`; `append`, `length`, `head`, `tail`, `prepend` and `has` are `LIST` built-ins, and `reverse` with the rest of the list operations is planned in Phase H, task H.21) serving as reference targets for Dual-Layer Model Refinement (§2). Its `feature {ANY}` routines are executable (sequential, $O(n)$); its `specify` laws are erased.
   - `functions FUNCTION_OPS`: Pointwise combinators (`id_fn`, `compose`) with verified category-theoretic identity and associativity laws.
 
 #### 3. Namespace Collision, Shadowing & Bootstrap Rules

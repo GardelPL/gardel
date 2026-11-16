@@ -1,7 +1,7 @@
 # Phase F: Verified Libraries and Applications
 
 **Date:** November 6, 2026
-**Status:** In progress. Tasks F.0 to F.14 are completed (F.7 on Windows only), and the decisions below are taken.
+**Status:** Completed (2026-11-16). Tasks F.0 to F.16 are completed, F.7 on Windows and on Linux, and the decisions below are taken. One question stays open, with no task: explicit parallelism (F.14).
 **Roadmap entry:** [Phase F in Roadmap.md](../Roadmap.md#phase-f-verified-libraries-and-applications)
 **Probed at:** commit `1349cb6`
 
@@ -577,7 +577,7 @@ Step 4, handlers with state (decided 2026-11-10: a handler takes the service's s
 
 Needs decision 9.
 
-**Status:** Done on Windows (2026-11-10). The POSIX side is written beside the Windows one, but no Linux or macOS machine has run it yet.
+**Status:** ✅ Completed. Done on Windows on 2026-11-10, and run on Linux on 2026-11-16 (the last item below). No macOS machine has run it.
 
 - [x] `Connect(tag: NAT, host: STRING, port: NAT)`, with `Connected(tag, conn)` and `ConnectFailed(tag, err)`.
 - [x] Non-blocking connect on the shared `poll` / `WSAPoll` loop, behind the event source interface.
@@ -595,6 +595,7 @@ What was done:
 - **Script and log.** Events `Connected:<tag>:<id>` and `ConnectFailed:<tag>:<code>`. Commands `Connect:<tag>:<host>:<port>` and `CancelTimer:<id>` in the log, and `net: Connect <tag> <host> <port>` on standard error in a script.
 - **Tests.** `tests/connect.rs` runs `tests/reactive/net_client.gdl`, verified under `--strict`: a connect to a server on `127.0.0.1` and on `localhost` sends `ping`, gets `pong`, is recorded and replays with the same output; a refused port fails (about 2 s on Windows, which retries the SYN); `10.255.255.1` with a 300 ms limit times out (`ConnectFailed:5:10060` on this machine); five hosts or ports that are not valid fail; and a script gives both events, with four malformed tokens refused. The timer set and cancelled in `init` never ticks.
 - Known limits: no name lookup; IPv4 only; the timeout is one for the whole program, not one per `Connect`.
+- **On Linux (2026-11-16).** The C that `gardelc` emits for `net_client.gdl` was built with `gcc -O3 -fopenmp` on Debian bookworm (gcc 12.2, in Docker, `rust:1-bookworm`) and run through every check of `tests/connect.rs`, ported to a Python script, since the Rust tests would need `gardelc`, Boogie and Z3 in the container. All 42 checks pass. A connect to `127.0.0.1` and to `localhost` sends `ping` and gets `pong`; its log has every command and event the test asks for; the cancelled timer never ticks; and the replay gives the same output. A refused port fails in about 80 ms, as Linux does not retry the SYN as Windows does. `10.255.255.1` with a 300 ms limit gives `ConnectFailed:5:110` (`ETIMEDOUT`) after 0.38 s. The five invalid hosts and ports fail, and a script gives both events and refuses the four malformed tokens. It is the first run of the POSIX connect path.
 
 #### Task F.8: HTTP Client and Async Handlers
 
