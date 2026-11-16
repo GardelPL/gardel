@@ -13550,6 +13550,84 @@ fn is_bytes_expr(recv: &Expr, m: &ModuleDecl, implicit_fields: &HashSet<String>)
     false
 }
 
+thread_local! {
+    /// How many record updates the one being emitted is inside, so the variable each one binds
+    /// for its base (`emit_shared_record_update`) is named apart from those it encloses.
+    static RECORD_SHARE_DEPTH: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// `{ base with f = v, ... }` with its base bound once, as `(var _shareN := base; T_Ctor(...))`,
+/// when the base is not a variable and the constructor would otherwise copy it more than once:
+/// once for each field kept, and once for each time an update's value reads it. A `let` is
+/// substituted before emission, so without the binding a chain of `let`s each updating the last
+/// multiplies the base by the number of fields at every step. `None` when there is nothing to
+/// share; `emit` emits an expression in the caller's context.
+fn emit_shared_record_update(
+    base: &Expr,
+    updates: &[(String, Expr)],
+    m: &ModuleDecl,
+    emit: &mut dyn FnMut(&Expr) -> String,
+) -> Option<String> {
+    let ReprKind::Product(fields) = &m.repr else {
+        return None;
+    };
+    if matches!(base, Expr::Var(_)) {
+        return None;
+    }
+    let depth = RECORD_SHARE_DEPTH.with(std::cell::Cell::get);
+    let name = format!("_share{depth}");
+    let kept = fields.iter().filter(|(f, _)| !updates.iter().any(|(u, _)| u == f)).count();
+    let mut reads = 0;
+    let shared_updates: Vec<(String, Expr)> = updates
+        .iter()
+        .map(|(f, v)| (f.clone(), share_subexpr(v, base, &name, &mut reads)))
+        .collect();
+    if kept + reads < 2 {
+        return None;
+    }
+    let b_str = emit(base);
+    RECORD_SHARE_DEPTH.with(|d| d.set(depth + 1));
+    let body = with_scoped_var_types(&[(name.clone(), module_self_type(m))], || {
+        emit(&Expr::RecordUpdate(Box::new(Expr::Var(name.clone())), shared_updates))
+    });
+    RECORD_SHARE_DEPTH.with(|d| d.set(depth));
+    Some(format!("(var {name} := {b_str}; {body})"))
+}
+
+/// `e` with each occurrence of `target` replaced by the variable `name`, counted in `found`.
+/// Only nodes that bind nothing are entered, so no binder can capture a variable of `target`;
+/// an occurrence under a binder (a quantifier, a lambda, a `match` arm or a branch with `let`s)
+/// stays as it is, which is equal and only larger.
+fn share_subexpr(e: &Expr, target: &Expr, name: &str, found: &mut usize) -> Expr {
+    if e == target {
+        *found += 1;
+        return Expr::Var(name.to_string());
+    }
+    let mut go = |x: &Expr| share_subexpr(x, target, name, found);
+    match e {
+        Expr::UnaryNot(x) => Expr::UnaryNot(Box::new(go(x))),
+        Expr::UnaryNeg(x) => Expr::UnaryNeg(Box::new(go(x))),
+        Expr::BinOp(op, l, r) => Expr::BinOp(op.clone(), Box::new(go(l)), Box::new(go(r))),
+        Expr::Call(f, args) => Expr::Call(f.clone(), args.iter().map(go).collect()),
+        Expr::MethodCall(recv, f, args) => {
+            let recv = go(recv);
+            Expr::MethodCall(Box::new(recv), f.clone(), args.iter().map(go).collect())
+        }
+        Expr::If(c, ts, t, es, el) if ts.is_empty() && es.is_empty() => {
+            let c = go(c);
+            let t = go(t);
+            Expr::If(Box::new(c), Vec::new(), Box::new(t), Vec::new(), Box::new(go(el)))
+        }
+        Expr::RecordLit(fs) => Expr::RecordLit(fs.iter().map(|(f, v)| (f.clone(), go(v))).collect()),
+        Expr::RecordUpdate(b, fs) => {
+            let b = go(b);
+            Expr::RecordUpdate(Box::new(b), fs.iter().map(|(f, v)| (f.clone(), go(v))).collect())
+        }
+        Expr::TupleLit(xs) => Expr::TupleLit(xs.iter().map(go).collect()),
+        _ => e.clone(),
+    }
+}
+
 fn emit_boogie_expr_with_strings(
     e: &Expr,
     m: &ModuleDecl,
@@ -14194,6 +14272,11 @@ fn emit_boogie_expr_with_strings(
             }
         }
         Expr::RecordUpdate(base, updates) => {
+            if let Some(shared) = emit_shared_record_update(base, updates, m, &mut |e| {
+                emit_boogie_expr_with_strings(e, m, implicit_fields, revealed, fuel_var, strings)
+            }) {
+                return shared;
+            }
             let b_str = emit_boogie_expr_with_strings(
                 base,
                 m,
