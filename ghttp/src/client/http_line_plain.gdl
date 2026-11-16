@@ -1,0 +1,38 @@
+-- Stage D of the round trip: the field read from a field line the writer writes frames
+-- nothing. Apart from `HTTP_READ_LINE`, whose laws it uses.
+functions HTTP_LINE_PLAIN
+
+specify {ANY}
+
+  -- The field read from a field line of `h` that ends at `e` is `h`'s, and frames nothing.
+  law line_plain(buf: BYTES, pos: NAT, e: NAT, h: HTTP_HEADER)
+    require
+      ok: HTTP_REQUEST_WRITER.field_ok(h)
+      holds: forall k: NAT. (pos <= k and k < pos + h.serialize_line.byte_model.length) implies
+        LIST_OPS.at(buf.model, k) = LIST_OPS.at(h.serialize_line.byte_model, k - pos)
+      ends: e + 2 = pos + h.serialize_line.byte_model.length
+      in_buf: e + 2 <= buf.length
+    do
+      HTTP_WRITER_LINES.field_line(h) and
+      e = pos + h.serialize_line.byte_model.length - 2 and
+      HTTP_READ_LINE.line_field(buf, pos, h) and
+      h.name.to_utf8.model = h.name.byte_model and
+      not HTTP_HEAD_PARSER.ascii_equal_ci(h.name.to_utf8, HTTP_HEAD_PARSER.content_length_name, 0) and
+      not HTTP_HEAD_PARSER.ascii_equal_ci(h.name.to_utf8, HTTP_HEAD_PARSER.transfer_encoding_name, 0) and
+      HTTP_HEAD_PARSER.field_at(buf, pos, e).get.name.to_utf8.model = HTTP_HEAD_PARSER.field_at(buf, pos, e).get.name.byte_model and
+      HTTP_HEAD_PARSER.field_at(buf, pos, e).get.name.to_utf8.model = h.name.to_utf8.model and
+      HTTP_LINE_FACTS.ci_same(HTTP_HEAD_PARSER.field_at(buf, pos, e).get.name.to_utf8,
+        h.name.to_utf8, HTTP_HEAD_PARSER.content_length_name, 0) and
+      HTTP_LINE_FACTS.ci_same(HTTP_HEAD_PARSER.field_at(buf, pos, e).get.name.to_utf8,
+        h.name.to_utf8, HTTP_HEAD_PARSER.transfer_encoding_name, 0)
+    ensure
+      read: HTTP_HEAD_PARSER.field_at(buf, pos, e).is_ok
+      name: HTTP_HEAD_PARSER.field_at(buf, pos, e).get.name.byte_model = h.name.byte_model
+      value: HTTP_HEAD_PARSER.field_at(buf, pos, e).get.value.byte_model = h.value.byte_model
+      not_length: not HTTP_HEAD_PARSER.ascii_equal_ci(HTTP_HEAD_PARSER.field_at(buf, pos, e).get.name.to_utf8,
+        HTTP_HEAD_PARSER.content_length_name, 0)
+      not_coding: not HTTP_HEAD_PARSER.ascii_equal_ci(HTTP_HEAD_PARSER.field_at(buf, pos, e).get.name.to_utf8,
+        HTTP_HEAD_PARSER.transfer_encoding_name, 0)
+    end
+
+end

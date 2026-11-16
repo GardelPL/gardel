@@ -1,0 +1,48 @@
+-- Stage D of the round trip: the step of `HTTP_READ_STEPS.fields_steps`, over the start
+-- `p` and the line break `e` of the line of `hs.head`, from what it says of the tail and
+-- `HTTP_LINE_STEP.line_step`, the step itself.
+functions HTTP_STEPS_STEP
+
+specify {ANY}
+
+  -- The step of `fields_steps`, from what it says of the tail.
+  law steps_step(buf: BYTES, pos: NAT, he: NAT, hs: LIST[HTTP_HEADER], acc: HTTP_HEADERS,
+                 cl: OPTION[NAT], te: BOOL, p: NAT, e: NAT)
+    require
+      ok: HTTP_REQUEST_WRITER.fields_ok(hs)
+      some: hs.length > 0
+      few: hs.length <= 64
+      holds: forall k: NAT. (pos <= k and k < pos + HTTP_REQUEST_WRITER.fields_text(hs).byte_model.length) implies
+        LIST_OPS.at(buf.model, k) = LIST_OPS.at(HTTP_REQUEST_WRITER.fields_text(hs).byte_model, k - pos)
+      fits: pos + HTTP_REQUEST_WRITER.fields_text(hs).byte_model.length <= he + 2
+      in_buf: he + 4 <= buf.length
+      room: acc.num_headers + hs.length <= acc.max_headers
+      small: pos <= 1000000000
+      at: p = pos + HTTP_REQUEST_WRITER.fields_text(hs.tail).byte_model.length
+      ends: e + 2 = p + hs.head.serialize_line.byte_model.length
+      tail_ok: HTTP_READ_FIELD.outcome_ok(HTTP_HEAD_PARSER.fields(buf, pos, he, acc, cl, te)) =
+        HTTP_READ_FIELD.outcome_ok(HTTP_HEAD_PARSER.fields(buf, p, he, HTTP_READ_FIELDS.reads(buf, pos, hs.tail, acc), cl, te))
+      tail_names: HTTP_READ_FIELD.outcome_names(HTTP_HEAD_PARSER.fields(buf, pos, he, acc, cl, te)) =
+        HTTP_READ_FIELD.outcome_names(HTTP_HEAD_PARSER.fields(buf, p, he, HTTP_READ_FIELDS.reads(buf, pos, hs.tail, acc), cl, te))
+      tail_values: HTTP_READ_FIELD.outcome_values(HTTP_HEAD_PARSER.fields(buf, pos, he, acc, cl, te)) =
+        HTTP_READ_FIELD.outcome_values(HTTP_HEAD_PARSER.fields(buf, p, he, HTTP_READ_FIELDS.reads(buf, pos, hs.tail, acc), cl, te))
+      tail_length: HTTP_READ_FIELD.outcome_length(HTTP_HEAD_PARSER.fields(buf, pos, he, acc, cl, te)) =
+        HTTP_READ_FIELD.outcome_length(HTTP_HEAD_PARSER.fields(buf, p, he, HTTP_READ_FIELDS.reads(buf, pos, hs.tail, acc), cl, te))
+      tail_chunked: HTTP_READ_FIELD.outcome_chunked(HTTP_HEAD_PARSER.fields(buf, pos, he, acc, cl, te)) =
+        HTTP_READ_FIELD.outcome_chunked(HTTP_HEAD_PARSER.fields(buf, p, he, HTTP_READ_FIELDS.reads(buf, pos, hs.tail, acc), cl, te))
+    do
+      HTTP_LINE_STEP.line_step(buf, pos, he, hs, acc, cl, te, p, e)
+    ensure
+      step_ok: HTTP_READ_FIELD.outcome_ok(HTTP_HEAD_PARSER.fields(buf, pos, he, acc, cl, te)) =
+        HTTP_READ_FIELD.outcome_ok(HTTP_HEAD_PARSER.fields(buf, pos + HTTP_REQUEST_WRITER.fields_text(hs).byte_model.length, he, HTTP_READ_FIELDS.reads(buf, pos, hs, acc), cl, te))
+      step_names: HTTP_READ_FIELD.outcome_names(HTTP_HEAD_PARSER.fields(buf, pos, he, acc, cl, te)) =
+        HTTP_READ_FIELD.outcome_names(HTTP_HEAD_PARSER.fields(buf, pos + HTTP_REQUEST_WRITER.fields_text(hs).byte_model.length, he, HTTP_READ_FIELDS.reads(buf, pos, hs, acc), cl, te))
+      step_values: HTTP_READ_FIELD.outcome_values(HTTP_HEAD_PARSER.fields(buf, pos, he, acc, cl, te)) =
+        HTTP_READ_FIELD.outcome_values(HTTP_HEAD_PARSER.fields(buf, pos + HTTP_REQUEST_WRITER.fields_text(hs).byte_model.length, he, HTTP_READ_FIELDS.reads(buf, pos, hs, acc), cl, te))
+      step_length: HTTP_READ_FIELD.outcome_length(HTTP_HEAD_PARSER.fields(buf, pos, he, acc, cl, te)) =
+        HTTP_READ_FIELD.outcome_length(HTTP_HEAD_PARSER.fields(buf, pos + HTTP_REQUEST_WRITER.fields_text(hs).byte_model.length, he, HTTP_READ_FIELDS.reads(buf, pos, hs, acc), cl, te))
+      step_chunked: HTTP_READ_FIELD.outcome_chunked(HTTP_HEAD_PARSER.fields(buf, pos, he, acc, cl, te)) =
+        HTTP_READ_FIELD.outcome_chunked(HTTP_HEAD_PARSER.fields(buf, pos + HTTP_REQUEST_WRITER.fields_text(hs).byte_model.length, he, HTTP_READ_FIELDS.reads(buf, pos, hs, acc), cl, te))
+    end
+
+end

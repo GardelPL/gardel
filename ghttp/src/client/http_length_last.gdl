@@ -1,0 +1,50 @@
+-- Stage D of the round trip, the end of the field lines: from the writer's `Content-Length`
+-- line, the last before the blank line, or from the blank line when there is none,
+-- `HTTP_HEAD_PARSER.fields` ends with that field added and the length it declares.
+functions HTTP_LENGTH_LAST
+
+specify {ANY}
+
+  -- The `Content-Length` line of `req` at `p`, its break at `he`: `fields` adds it and stops.
+  law with_length(buf: BYTES, p: NAT, he: NAT, req: HTTP_REQUEST, r: HTTP_HEADERS)
+    require
+      sent: HTTP_REQUEST_WRITER.needs_length(req)
+      holds: forall k: NAT. (p <= k and k < p + HTTP_REQUEST_WRITER.length_line(req).byte_model.length) implies
+        LIST_OPS.at(buf.model, k) = LIST_OPS.at(HTTP_REQUEST_WRITER.length_line(req).byte_model, k - p)
+      fits: p + HTTP_REQUEST_WRITER.length_line(req).byte_model.length = he + 2
+      in_buf: he + 4 <= buf.length
+      room: r.has_header_room
+    do
+      HTTP_READ_LINE.length_line_ends(buf, p, he, req) and
+      HTTP_READ_LINE.length_line_field(buf, p, he, req) and
+      HTTP_FIELD_STEP.length_step(buf, p, he, he, r, req.request_body_length, False) and
+      HTTP_READ_FIELD.add_counts(r, HTTP_HEAD_PARSER.field_at(buf, p, he).get) and
+      HTTP_READ_FIELD.names_of(r.fields.prepend(HTTP_HEAD_PARSER.field_at(buf, p, he).get)) =
+        HTTP_READ_FIELD.names_of(r.fields).prepend(HTTP_REQUEST_WRITER.content_length_field.byte_model) and
+      HTTP_READ_FIELD.values_of(r.fields.prepend(HTTP_HEAD_PARSER.field_at(buf, p, he).get)) =
+        HTTP_READ_FIELD.values_of(r.fields).prepend(NUMBER_TEXT.nat_to_text(req.request_body_length).byte_model)
+    ensure
+      ok: HTTP_READ_FIELD.outcome_ok(HTTP_HEAD_PARSER.fields(buf, p, he, r, None, False))
+      names: HTTP_READ_FIELD.outcome_names(HTTP_HEAD_PARSER.fields(buf, p, he, r, None, False)) =
+        HTTP_READ_FIELD.names_of(r.fields).prepend(HTTP_REQUEST_WRITER.content_length_field.byte_model)
+      values: HTTP_READ_FIELD.outcome_values(HTTP_HEAD_PARSER.fields(buf, p, he, r, None, False)) =
+        HTTP_READ_FIELD.values_of(r.fields).prepend(NUMBER_TEXT.nat_to_text(req.request_body_length).byte_model)
+      length: HTTP_READ_FIELD.outcome_length(HTTP_HEAD_PARSER.fields(buf, p, he, r, None, False)) = Some(req.request_body_length)
+      chunked: not HTTP_READ_FIELD.outcome_chunked(HTTP_HEAD_PARSER.fields(buf, p, he, r, None, False))
+    end
+
+  -- At the blank line, `fields` stops with what it has read.
+  law at_blank(buf: BYTES, he: NAT, r: HTTP_HEADERS)
+    require
+      in_buf: he + 4 <= buf.length
+    ensure
+      ok: HTTP_READ_FIELD.outcome_ok(HTTP_HEAD_PARSER.fields(buf, he + 2, he, r, None, False))
+      names: HTTP_READ_FIELD.outcome_names(HTTP_HEAD_PARSER.fields(buf, he + 2, he, r, None, False)) =
+        HTTP_READ_FIELD.names_of(r.fields)
+      values: HTTP_READ_FIELD.outcome_values(HTTP_HEAD_PARSER.fields(buf, he + 2, he, r, None, False)) =
+        HTTP_READ_FIELD.values_of(r.fields)
+      length: HTTP_READ_FIELD.outcome_length(HTTP_HEAD_PARSER.fields(buf, he + 2, he, r, None, False)) = None
+      chunked: not HTTP_READ_FIELD.outcome_chunked(HTTP_HEAD_PARSER.fields(buf, he + 2, he, r, None, False))
+    end
+
+end

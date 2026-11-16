@@ -36,9 +36,9 @@ feature {ANY}
       let v = h.value.to_utf8
       if not HTTP_HEAD_PARSER.is_token(n, 0) then
         False
-      else if HTTP_HEAD_PARSER.ascii_equal_ci(n, "content-length".to_utf8, 0) then
+      else if HTTP_HEAD_PARSER.ascii_equal_ci(n, HTTP_HEAD_PARSER.content_length_name, 0) then
         False
-      else if HTTP_HEAD_PARSER.ascii_equal_ci(n, "transfer-encoding".to_utf8, 0) then
+      else if HTTP_HEAD_PARSER.ascii_equal_ci(n, HTTP_HEAD_PARSER.transfer_encoding_name, 0) then
         False
       else if not HTTP_HEAD_PARSER.all_field_bytes(v, 0, v.length) then
         False
@@ -121,6 +121,15 @@ feature {ANY}
       no_cr: forall k: NAT. k + 2 < Result.byte_model.length implies LIST_OPS.at(Result.byte_model, k) != 13
     end
 
+  -- The name of the field that frames a body by its length, as the writer spells it.
+  content_length_field: STRING
+    do
+      "Content-Length"
+    ensure
+      bytes: Result.byte_model = LIST.empty.prepend(104).prepend(116).prepend(103).prepend(110).prepend(101).prepend(76).prepend(45).prepend(116).prepend(110).prepend(101).prepend(116).prepend(110).prepend(111).prepend(67)
+      size: Result.byte_length = 14
+    end
+
   -- The digits of `req`'s body length, as `length_line` writes them: `0` for a length of
   -- more than 10 digits, which no body has.
   length_digits(req: HTTP_REQUEST): STRING
@@ -170,6 +179,31 @@ feature {ANY}
     ensure
       exact: Result.length = HTTP_REQUEST_WRITER.head_text(req).byte_length + req.request_body_length
       bounded: Result.length <= 74545 + 65536
+    end
+
+specify {ANY}
+
+  -- The bytes of the `Content-Length` line, for stage D of the round trip: the field's name,
+  -- a colon and a space, the digits of the body's length, and the line break. A body has at
+  -- most 65536 bytes, so its length has at most 5 digits. A law rather than ensures, so that
+  -- only a proof that needs these bytes has them.
+  law length_line_bytes(req: HTTP_REQUEST)
+    require
+      sent: HTTP_REQUEST_WRITER.needs_length(req)
+    do
+      req.request_body_length <= 65536 and
+      NUMBER_TEXT.nat_to_text(req.request_body_length).byte_model =
+        NUMBER_TEXT.digits(req.request_body_length, LIST.empty) and
+      NUMBER_TEXT.nat_to_text(req.request_body_length).byte_length <= 5 and
+      HTTP_REQUEST_WRITER.length_digits(req).byte_model = NUMBER_TEXT.nat_to_text(req.request_body_length).byte_model and
+      "Content-Length: ".byte_model = HTTP_REQUEST_WRITER.content_length_field.byte_model.append(LIST.empty.prepend(32).prepend(58)) and
+      "\r\n".byte_model = LIST.empty.prepend(10).prepend(13)
+    ensure
+      name: HTTP_REQUEST_WRITER.content_length_field.byte_model = LIST.empty.prepend(104).prepend(116).prepend(103).prepend(110).prepend(101).prepend(76).prepend(45).prepend(116).prepend(110).prepend(101).prepend(116).prepend(110).prepend(111).prepend(67)
+      digits: HTTP_REQUEST_WRITER.length_digits(req).byte_model = NUMBER_TEXT.nat_to_text(req.request_body_length).byte_model
+      bytes: HTTP_REQUEST_WRITER.length_line(req).byte_model =
+        HTTP_REQUEST_WRITER.content_length_field.byte_model.append(LIST.empty.prepend(32).prepend(58))
+          .append(HTTP_REQUEST_WRITER.length_digits(req).byte_model).append(LIST.empty.prepend(10).prepend(13))
     end
 
 end

@@ -59,6 +59,19 @@ feature {ANY}
       bytes: Result.model = LIST.empty.prepend(10).prepend(13).prepend(10).prepend(13)
     end
 
+  -- The name of the field that frames a body by its length, in lower case, as `fields`
+  -- compares a field's name with it. A writer that leaves the field to the framing uses it too.
+  content_length_name: BYTES
+    do
+      "content-length".to_utf8
+    end
+
+  -- The name of the field that frames a body by a coding, in lower case.
+  transfer_encoding_name: BYTES
+    do
+      "transfer-encoding".to_utf8
+    end
+
   -- The bytes of `m`, as a request line spells it.
   spelling(m: HTTP_METHOD): BYTES
     do
@@ -181,7 +194,7 @@ feature {ANY}
                   Error(err)
                 case Ok(h) then
                   let next_hs = hs.add(h)
-                  if ascii_equal_ci(h.name.to_utf8, "content-length".to_utf8, 0) then
+                  if ascii_equal_ci(h.name.to_utf8, HTTP_HEAD_PARSER.content_length_name, 0) then
                     match NUMBER_TEXT.parse_nat(h.value)
                       case Error(_) then
                         Error(ContentLengthInvalid)
@@ -193,7 +206,7 @@ feature {ANY}
                           fields(buf, e + 2, he, next_hs, Some(n), te)
                         end
                     end
-                  else if ascii_equal_ci(h.name.to_utf8, "transfer-encoding".to_utf8, 0) then
+                  else if ascii_equal_ci(h.name.to_utf8, HTTP_HEAD_PARSER.transfer_encoding_name, 0) then
                     fields(buf, e + 2, he, next_hs, cl, True)
                   else
                     fields(buf, e + 2, he, next_hs, cl, te)
@@ -425,6 +438,34 @@ specify {ANY}
       if lo = hi then True else visible_from(b, lo + 1, hi) end
     ensure
       visible: HTTP_HEAD_PARSER.all_visible(b, lo, hi)
+    end
+
+  -- `Content-Length`, as a writer spells it, names the field that frames a body by its
+  -- length. A law rather than an ensure of `content_length_name`, so that only a proof that
+  -- needs the name's bytes has them.
+  law content_length_named(b: BYTES)
+    require
+      spelled: b.model = LIST.empty.prepend(104).prepend(116).prepend(103).prepend(110).prepend(101).prepend(76).prepend(45).prepend(116).prepend(110).prepend(101).prepend(116).prepend(110).prepend(111).prepend(67)
+    do
+      HTTP_HEAD_PARSER.content_length_name.model = LIST.empty.prepend(104).prepend(116).prepend(103).prepend(110).prepend(101).prepend(108).prepend(45).prepend(116).prepend(110).prepend(101).prepend(116).prepend(110).prepend(111).prepend(99) and
+      b.length = 14 and HTTP_HEAD_PARSER.content_length_name.length = 14 and
+      HTTP_HEAD_PARSER.ascii_equal_ci(b, HTTP_HEAD_PARSER.content_length_name, 14) and
+      HTTP_HEAD_PARSER.ascii_equal_ci(b, HTTP_HEAD_PARSER.content_length_name, 13) and
+      HTTP_HEAD_PARSER.ascii_equal_ci(b, HTTP_HEAD_PARSER.content_length_name, 12) and
+      HTTP_HEAD_PARSER.ascii_equal_ci(b, HTTP_HEAD_PARSER.content_length_name, 11) and
+      HTTP_HEAD_PARSER.ascii_equal_ci(b, HTTP_HEAD_PARSER.content_length_name, 10) and
+      HTTP_HEAD_PARSER.ascii_equal_ci(b, HTTP_HEAD_PARSER.content_length_name, 9) and
+      HTTP_HEAD_PARSER.ascii_equal_ci(b, HTTP_HEAD_PARSER.content_length_name, 8) and
+      HTTP_HEAD_PARSER.ascii_equal_ci(b, HTTP_HEAD_PARSER.content_length_name, 7) and
+      HTTP_HEAD_PARSER.ascii_equal_ci(b, HTTP_HEAD_PARSER.content_length_name, 6) and
+      HTTP_HEAD_PARSER.ascii_equal_ci(b, HTTP_HEAD_PARSER.content_length_name, 5) and
+      HTTP_HEAD_PARSER.ascii_equal_ci(b, HTTP_HEAD_PARSER.content_length_name, 4) and
+      HTTP_HEAD_PARSER.ascii_equal_ci(b, HTTP_HEAD_PARSER.content_length_name, 3) and
+      HTTP_HEAD_PARSER.ascii_equal_ci(b, HTTP_HEAD_PARSER.content_length_name, 2) and
+      HTTP_HEAD_PARSER.ascii_equal_ci(b, HTTP_HEAD_PARSER.content_length_name, 1) and
+      HTTP_HEAD_PARSER.ascii_equal_ci(b, HTTP_HEAD_PARSER.content_length_name, 0)
+    ensure
+      named: HTTP_HEAD_PARSER.ascii_equal_ci(b, HTTP_HEAD_PARSER.content_length_name, 0)
     end
 
 end
