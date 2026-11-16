@@ -290,7 +290,8 @@ fn a_shutdown_puts_the_terminal_back_and_a_replay_repeats_the_run() {
 }
 
 /// The bench redraws every cell on every key. A frame's cost is the time of a run with keys
-/// less that of one with none, over the keys; the best of three runs is taken.
+/// less that of one with none, over the keys; the best of five runs is taken, as other tests may
+/// run at the same time.
 #[test]
 fn a_full_redraw_of_200_by_60_fits_a_frame() {
     let dir = Dir::new("bench");
@@ -299,7 +300,7 @@ fn a_full_redraw_of_200_by_60_fits_a_frame() {
     let frames = 200;
     let time = |n: usize| {
         let script = format!("Resized:200:60 {}", "Key:Down ".repeat(n));
-        (0..3)
+        (0..5)
             .map(|_| {
                 let t = Instant::now();
                 let out = run(&bin, &script, &[]);
@@ -312,7 +313,7 @@ fn a_full_redraw_of_200_by_60_fits_a_frame() {
                 took
             })
             .min()
-            .expect("three runs")
+            .expect("five runs")
     };
     let base = time(0);
     let full = time(frames);
@@ -886,9 +887,10 @@ fn an_editor_scrolls_both_ways_to_keep_the_cursor_and_a_key_on_5000_lines_is_qui
     let home = rows(3);
     assert_eq!(home[..2], ["   1 0123456789abcdefghijklmno", "   2 line 0"], "{home:?}");
 
-    // A key costs a line, not the text: the frames of 200 keys on a text of 5000 lines.
+    // A key costs a line, not the text: the frames of 200 keys on a text of 5000 lines,
+    // the best of five runs, as other tests may run at the same time.
     let time = |n: usize| {
-        (0..3)
+        (0..5)
             .map(|_| {
                 let mut s = format!("Resized:30:6 {pasted}");
                 for i in 0..n {
@@ -901,7 +903,7 @@ fn an_editor_scrolls_both_ways_to_keep_the_cursor_and_a_key_on_5000_lines_is_qui
                 t.elapsed()
             })
             .min()
-            .expect("three runs")
+            .expect("five runs")
     };
     let base = time(0);
     let keyed = time(200);
