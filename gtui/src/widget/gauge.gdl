@@ -1,0 +1,136 @@
+-- Progress gauge rendered with 1/8th horizontal block glyphs (`▏▎▍▌▋▊▉█`) and a
+-- centered label whose colors invert across the filled/unfilled boundary.
+module GAUGE
+
+representation {NONE}
+  num_val: NAT
+  den_val: NAT
+  custom_label: STRING
+
+invariant
+  valid_ratio: den_val > 0 and num_val <= den_val and den_val <= 65535
+
+create {ANY}
+
+  -- Gauge from percentage `p` (clamped to `0..100`).
+  percent(p: NAT): GAUGE
+    do
+      let cp = if p <= 100 then p else 100 end
+      { num_val = cp, den_val = 100, custom_label = "" }
+    ensure
+      pct_set: p <= 100 implies Result.percentage = p
+      pct_clamped: p > 100 implies Result.percentage = 100
+      pct_bounded: Result.percentage <= 100
+    end
+
+  -- Gauge from ratio `num / den` (`den` clamped to `1..65535`, `num` clamped to `0..den`).
+  ratio(num: NAT, den: NAT): GAUGE
+    do
+      let cd = if den = 0 then 1 else if den <= 65535 then den else 65535 end end
+      let cn = if num <= cd then num else cd end
+      { num_val = cn, den_val = cd, custom_label = "" }
+    ensure
+      pct_bounded: Result.percentage <= 100
+    end
+
+  -- Fractional 1/8th-cell left-filled block glyph for remainder `1..7`.
+  eighth_char(rem: NAT): CHAR
+    do
+      if rem = 1 then '▏'
+      else if rem = 2 then '▎'
+      else if rem = 3 then '▍'
+      else if rem = 4 then '▌'
+      else if rem = 5 then '▋'
+      else if rem = 6 then '▊'
+      else if rem = 7 then '▉'
+      else '█'
+      end end end end end end end
+    end
+
+feature {ANY}
+
+  numerator: NAT
+    do
+      Current.num_val
+    end
+
+  denominator: NAT
+    do
+      Current.den_val
+    ensure
+      positive: Result > 0
+    end
+
+  percentage: NAT
+    do
+      if Current.den_val = 100 then
+        Current.num_val
+      else
+        let raw = Current.num_val * 100 / Current.den_val
+        if raw <= 100 then raw else 100 end
+      end
+    ensure
+      bounded: Result <= 100
+    end
+
+  label: STRING
+    do
+      if Current.custom_label.is_empty then
+        GLYPHS.join(NUMBER_TEXT.nat_to_text(Current.percentage), "%")
+      else
+        Current.custom_label
+      end
+    end
+
+  with_label(text: STRING): GAUGE
+    do
+      { Current with custom_label = text }
+    end
+
+  -- Filled width in 1/8th-column increments for a gauge of `width` cells.
+  eighths(width: NAT): NAT
+    do
+      let cw = if width <= 65535 then width else 65535 end
+      let tot = cw * 8
+      let raw = Current.num_val * tot / Current.den_val
+      if raw <= tot then raw else tot end
+    ensure
+      bounded: width <= 65535 implies Result <= width * 8
+    end
+
+  -- Render the gauge inside `r` with `unfilled_style` and `filled_style`.
+  -- TODO(proof-GT.7): prove GAUGE.draw modifies only cells inside r and filled cell count matches ratio
+  draw(s: SCREEN, r: RECT, unfilled_style: STYLE, filled_style: STYLE): SCREEN
+    do
+      if r.is_empty then
+        s
+      else
+        let e = Current.eighths(r.width)
+        let full_raw = e / 8
+        let full_cols = if full_raw <= r.width then full_raw else r.width end
+        let rem = e % 8
+        let s0 = s.fill(r, ' ', unfilled_style)
+        let filled_rect = r.take_left(full_cols)
+        let unfilled_rect = r.drop_left(full_cols)
+        let s1 = s0.fill(filled_rect, '█', filled_style)
+        let s2 =
+          if rem > 0 and full_cols < r.width then
+            s1.fill(unfilled_rect.take_left(1), GAUGE.eighth_char(rem), filled_style)
+          else
+            s1
+          end
+        let lbl = Current.label
+        let lw = GLYPHS.width(lbl)
+        let lx = r.x + ALIGN.center.offset(lw, r.width)
+        let dy_raw = (r.height - 1) / 2
+        let dy = if dy_raw <= r.height - 1 then dy_raw else r.height - 1 end
+        let mid_y = r.y + dy
+        let lbl_filled = s2.text(filled_rect, lx, mid_y, lbl, filled_style.reversed)
+        lbl_filled.text(unfilled_rect, lx, mid_y, lbl, unfilled_style)
+      end
+    ensure
+      same_width: Result.width = s.width
+      same_height: Result.height = s.height
+    end
+
+end

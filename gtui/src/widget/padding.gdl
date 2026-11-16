@@ -1,0 +1,86 @@
+-- Inner spacing on the four sides of a rectangle: top, right, bottom, left.
+module PADDING
+
+representation {NONE}
+  pad_top: NAT
+  pad_right: NAT
+  pad_bottom: NAT
+  pad_left: NAT
+
+create {ANY}
+
+  -- Zero padding on every side.
+  none: PADDING
+    do
+      { pad_top = 0, pad_right = 0, pad_bottom = 0, pad_left = 0 }
+    ensure
+      zero: Result.top = 0 and Result.right = 0 and Result.bottom = 0 and Result.left = 0
+    end
+
+  -- Padding with explicit top, right, bottom, and left insets.
+  make(t: NAT, r: NAT, b: NAT, l: NAT): PADDING
+    do
+      { pad_top = t, pad_right = r, pad_bottom = b, pad_left = l }
+    ensure
+      top_set: Result.top = t
+      right_set: Result.right = r
+      bottom_set: Result.bottom = b
+      left_set: Result.left = l
+    end
+
+  -- Equal padding `n` on all four sides.
+  uniform(n: NAT): PADDING
+    do
+      { pad_top = n, pad_right = n, pad_bottom = n, pad_left = n }
+    ensure
+      all_set: Result.top = n and Result.right = n and Result.bottom = n and Result.left = n
+    end
+
+  -- Padding `v` on top and bottom, `h` on left and right.
+  symmetric(v: NAT, h: NAT): PADDING
+    do
+      { pad_top = v, pad_right = h, pad_bottom = v, pad_left = h }
+    ensure
+      v_set: Result.top = v and Result.bottom = v
+      h_set: Result.right = h and Result.left = h
+    end
+
+  -- Left and right padding `n`, with zero vertical padding.
+  horizontal(n: NAT): PADDING
+    do
+      { pad_top = 0, pad_right = n, pad_bottom = 0, pad_left = n }
+    ensure
+      h_set: Result.top = 0 and Result.bottom = 0 and Result.right = n and Result.left = n
+    end
+
+  -- Top and bottom padding `n`, with zero horizontal padding.
+  vertical(n: NAT): PADDING
+    do
+      { pad_top = n, pad_right = 0, pad_bottom = n, pad_left = 0 }
+    ensure
+      v_set: Result.top = n and Result.bottom = n and Result.right = 0 and Result.left = 0
+    end
+
+feature {ANY}
+
+  top: NAT
+    do
+      Current.pad_top
+    end
+
+  right: NAT
+    do
+      Current.pad_right
+    end
+
+  bottom: NAT
+    do
+      Current.pad_bottom
+    end
+
+  left: NAT
+    do
+      Current.pad_left
+    end
+
+end

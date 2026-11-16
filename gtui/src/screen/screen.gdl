@@ -101,24 +101,49 @@ create {ANY}
     end
 
   -- `acc` with the cells of `chars` in style `st` in front of it, the last first, until it
-  -- holds more than `room` cells. A wide character takes two cells, and a zero-width one is
-  -- a mark on the cell before it, or is left out when there is none.
+  -- holds more than `room` cells. A wide character or wide grapheme cluster takes two cells,
+  -- and zero-width characters, ZWJ sequences, emoji modifiers, regional-indicator flag pairs,
+  -- and variation selectors are grouped as marks on their base cell.
+  -- TODO(proof-GT.8): prove wide-character invariant (every left half is followed by its right half) and termination variant
   styled_into(chars: LIST[CHAR], st: STYLE, room: NAT, acc: LIST[CELL]): LIST[CELL]
+    do
+      SCREEN.styled_clusters_into(chars, st, room, acc, False, False)
+    end
+
+  -- Segment `chars` into cells under UAX #29 rules (`after_zwj` after U+200D, `ri_open` after
+  -- an unpaired Regional Indicator).
+  -- TODO(proof-GT.8): prove wide-character pairing invariant across marked_wide promotion in styled_clusters_into
+  styled_clusters_into(chars: LIST[CHAR], st: STYLE, room: NAT, acc: LIST[CELL], after_zwj: BOOL, ri_open: BOOL): LIST[CELL]
     variant
       chars.length
     do
-      if chars.length = 0 or acc.length > room then
+      if chars.length = 0 then
         acc
       else
         let c = chars.head
         let w = CHAR_WIDTH.of(c)
-        if w = 0 then
-          SCREEN.styled_into(chars.tail, st, room, SCREEN.marked(acc, c))
+        let has_cluster = acc.length > 0
+        if after_zwj and has_cluster then
+          let promote = w = 2 or CHAR_WIDTH.is_skin_tone(c) or CHAR_WIDTH.is_vs16(c)
+          let next_acc = if promote then SCREEN.marked_wide(acc, c) else SCREEN.marked(acc, c) end
+          SCREEN.styled_clusters_into(chars.tail, st, room, next_acc, CHAR_WIDTH.is_zwj(c), False)
+        else if CHAR_WIDTH.is_zwj(c) then
+          SCREEN.styled_clusters_into(chars.tail, st, room, SCREEN.marked(acc, c), has_cluster, False)
+        else if (CHAR_WIDTH.is_vs16(c) or CHAR_WIDTH.is_skin_tone(c)) and has_cluster then
+          SCREEN.styled_clusters_into(chars.tail, st, room, SCREEN.marked_wide(acc, c), False, False)
+        else if w = 0 then
+          SCREEN.styled_clusters_into(chars.tail, st, room, SCREEN.marked(acc, c), False, False)
+        else if CHAR_WIDTH.is_regional_indicator(c) and ri_open and has_cluster then
+          SCREEN.styled_clusters_into(chars.tail, st, room, SCREEN.marked_wide(acc, c), False, False)
+        else if acc.length > room then
+          acc
+        else if CHAR_WIDTH.is_regional_indicator(c) then
+          SCREEN.styled_clusters_into(chars.tail, st, room, acc.prepend(CELL.make(c, st)), False, True)
         else if w = 2 and CELL.is_printable(c) then
-          SCREEN.styled_into(chars.tail, st, room, acc.prepend(CELL.wide(c, st)).prepend(CELL.right_half(st)))
+          SCREEN.styled_clusters_into(chars.tail, st, room, acc.prepend(CELL.wide(c, st)).prepend(CELL.right_half(st)), False, False)
         else
-          SCREEN.styled_into(chars.tail, st, room, acc.prepend(CELL.make(c, st)))
-        end end
+          SCREEN.styled_clusters_into(chars.tail, st, room, acc.prepend(CELL.make(c, st)), False, False)
+        end end end end end end end end
       end
     end
 
@@ -134,6 +159,20 @@ create {ANY}
       end end
     ensure
       length_same: Result.length = acc.length
+    end
+
+  -- `acc`, the last first, with `m` attached to its last cluster and that cluster promoted to
+  -- two cells wide if it was one cell wide.
+  marked_wide(acc: LIST[CELL], m: CHAR): LIST[CELL]
+    do
+      if acc.length = 0 then
+        acc
+      else if acc.head.is_right_half then
+        SCREEN.marked(acc, m)
+      else
+        let left_cell = acc.head.as_wide.with_mark(m)
+        acc.tail.prepend(left_cell).prepend(CELL.right_half(left_cell.style))
+      end end
     end
 
   -- `drawn`, when it is the size of `blank`, and `blank` otherwise.

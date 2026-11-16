@@ -1,0 +1,138 @@
+-- Border glyph sets for `FRAME`: rounded, plain, double, or thick box-drawing lines.
+module BORDER_KIND
+
+representation {NONE}
+  | BorderRounded
+  | BorderPlain
+  | BorderDouble
+  | BorderThick
+
+create {ANY}
+
+  -- Single-line border with rounded corners (`╭─╮`).
+  rounded: BORDER_KIND
+    do
+      BorderRounded
+    ensure
+      is_rounded: Result.is_rounded
+    end
+
+  -- Single-line border with square corners (`┌─┐`).
+  plain: BORDER_KIND
+    do
+      BorderPlain
+    ensure
+      is_plain: Result.is_plain
+    end
+
+  -- Double-line border (`╔═╗`).
+  double: BORDER_KIND
+    do
+      BorderDouble
+    ensure
+      is_double: Result.is_double
+    end
+
+  -- Heavy single-line border (`┏━┓`).
+  thick: BORDER_KIND
+    do
+      BorderThick
+    ensure
+      is_thick: Result.is_thick
+    end
+
+feature {ANY}
+
+  is_rounded: BOOL
+    do
+      match Current
+        case BorderRounded then True
+        case _ then False
+      end
+    end
+
+  is_plain: BOOL
+    do
+      match Current
+        case BorderPlain then True
+        case _ then False
+      end
+    end
+
+  is_double: BOOL
+    do
+      match Current
+        case BorderDouble then True
+        case _ then False
+      end
+    end
+
+  is_thick: BOOL
+    do
+      match Current
+        case BorderThick then True
+        case _ then False
+      end
+    end
+
+  horizontal: CHAR
+    do
+      match Current
+        case BorderRounded then '─'
+        case BorderPlain then '─'
+        case BorderDouble then '═'
+        case BorderThick then '━'
+      end
+    end
+
+  vertical: CHAR
+    do
+      match Current
+        case BorderRounded then '│'
+        case BorderPlain then '│'
+        case BorderDouble then '║'
+        case BorderThick then '┃'
+      end
+    end
+
+  top_left: STRING
+    do
+      match Current
+        case BorderRounded then "╭"
+        case BorderPlain then "┌"
+        case BorderDouble then "╔"
+        case BorderThick then "┏"
+      end
+    end
+
+  top_right: STRING
+    do
+      match Current
+        case BorderRounded then "╮"
+        case BorderPlain then "┐"
+        case BorderDouble then "╗"
+        case BorderThick then "┓"
+      end
+    end
+
+  bottom_left: STRING
+    do
+      match Current
+        case BorderRounded then "╰"
+        case BorderPlain then "└"
+        case BorderDouble then "╚"
+        case BorderThick then "┗"
+      end
+    end
+
+  bottom_right: STRING
+    do
+      match Current
+        case BorderRounded then "╯"
+        case BorderPlain then "┘"
+        case BorderDouble then "╝"
+        case BorderThick then "┛"
+      end
+    end
+
+end

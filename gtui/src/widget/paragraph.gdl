@@ -1,0 +1,384 @@
+-- Multi-line text widget with word/character wrapping, horizontal alignment, and vertical
+-- and horizontal scrolling. Width measurements use terminal cell widths (`GLYPHS.width` /
+-- `CHAR_WIDTH.of`) rather than codepoint counts.
+module PARAGRAPH
+
+representation {NONE}
+  raw_lines: LIST[STRING]
+  wrap_kind: WRAP_MODE
+  alignment: ALIGN
+  scroll_y: NAT
+  scroll_x: NAT
+
+create {ANY}
+
+  -- A paragraph of `lines`, defaulting to word wrap, left alignment, and top-left scroll.
+  make(lines: LIST[STRING]): PARAGRAPH
+    do
+      { raw_lines = lines, wrap_kind = WRAP_MODE.word, alignment = ALIGN.left, scroll_y = 0, scroll_x = 0 }
+    ensure
+      at_origin: Result.top = 0 and Result.left_col = 0
+    end
+
+  -- A paragraph split from `text` on line feeds, defaulting to word wrap and left alignment.
+  of_text(text: STRING): PARAGRAPH
+    do
+      let split = LIST_OPS.map(LINE_SPLIT.lines_of(GLYPHS.of_text(text)), fn(cs: LIST[CHAR]): STRING do GLYPHS.text_of(cs) end)
+      PARAGRAPH.make(split)
+    ensure
+      at_origin: Result.top = 0 and Result.left_col = 0
+    end
+
+feature {ANY}
+
+  lines: LIST[STRING]
+    do
+      Current.raw_lines
+    end
+
+  wrap_mode: WRAP_MODE
+    do
+      Current.wrap_kind
+    end
+
+  align: ALIGN
+    do
+      Current.alignment
+    end
+
+  top: NAT
+    do
+      Current.scroll_y
+    end
+
+  left_col: NAT
+    do
+      Current.scroll_x
+    end
+
+  with_wrap(w: WRAP_MODE): PARAGRAPH
+    do
+      { Current with wrap_kind = w }
+    end
+
+  wrap_word: PARAGRAPH
+    do
+      Current.with_wrap(WRAP_MODE.word)
+    end
+
+  wrap_char: PARAGRAPH
+    do
+      Current.with_wrap(WRAP_MODE.char_wrap)
+    end
+
+  no_wrap: PARAGRAPH
+    do
+      Current.with_wrap(WRAP_MODE.none)
+    end
+
+  with_align(a: ALIGN): PARAGRAPH
+    do
+      { Current with alignment = a }
+    end
+
+  align_left: PARAGRAPH
+    do
+      Current.with_align(ALIGN.left)
+    end
+
+  align_center: PARAGRAPH
+    do
+      Current.with_align(ALIGN.center)
+    end
+
+  align_right: PARAGRAPH
+    do
+      Current.with_align(ALIGN.right)
+    end
+
+  with_lines(lines: LIST[STRING]): PARAGRAPH
+    do
+      { Current with raw_lines = lines, scroll_y = 0, scroll_x = 0 }
+    end
+
+  with_text(text: STRING): PARAGRAPH
+    do
+      let split = LIST_OPS.map(LINE_SPLIT.lines_of(GLYPHS.of_text(text)), fn(cs: LIST[CHAR]): STRING do GLYPHS.text_of(cs) end)
+      Current.with_lines(split)
+    end
+
+  -- Display lines when rendered in `width` columns.
+  -- TODO(proof-GT.5): prove every line in wrapped_lines(width) has GLYPHS.width <= width when width >= 2 and wrap_mode is not NoWrap
+  wrapped_lines(width: NAT): LIST[STRING]
+    do
+      if width = 0 or Current.wrap_kind.is_none then
+        Current.raw_lines
+      else
+        PARAGRAPH.wrap_all_lines(Current.raw_lines, width, Current.wrap_kind.is_char)
+      end
+    end
+
+  -- Number of wrapped display lines at `width` columns.
+  line_count(width: NAT): NAT
+    do
+      Current.wrapped_lines(width).length
+    end
+
+  -- Highest vertical scroll offset when showing `rows` lines at `width` columns.
+  last_top(width: NAT, rows: NAT): NAT
+    do
+      let n = Current.line_count(width)
+      if n > rows then n - rows else 0 end
+    ensure
+      bounded: Result <= Current.line_count(width)
+    end
+
+  -- Vertically scrolled to `t`, clamped to the last page for `width` by `rows`.
+  -- TODO(proof-GT.5): prove scroll offset invariant across width/row resizes
+  scrolled_to(t: NAT, width: NAT, rows: NAT): PARAGRAPH
+    do
+      let last = Current.last_top(width, rows)
+      { Current with scroll_y = if t <= last then t else last end }
+    ensure
+      top_bounded: Result.top <= Current.last_top(width, rows)
+    end
+
+  scroll_down(n: NAT, width: NAT, rows: NAT): PARAGRAPH
+    do
+      let next = if Current.scroll_y <= 18446744073709551615 - n then Current.scroll_y + n else 18446744073709551615 end
+      Current.scrolled_to(next, width, rows)
+    end
+
+  scroll_up(n: NAT, width: NAT, rows: NAT): PARAGRAPH
+    do
+      let next = if Current.scroll_y >= n then Current.scroll_y - n else 0 end
+      Current.scrolled_to(next, width, rows)
+    end
+
+  with_scroll_x(col: NAT): PARAGRAPH
+    do
+      { Current with scroll_x = col }
+    end
+
+  scroll_right(n: NAT): PARAGRAPH
+    do
+      let next = if Current.scroll_x <= 18446744073709551615 - n then Current.scroll_x + n else Current.scroll_x end
+      { Current with scroll_x = next }
+    end
+
+  scroll_left(n: NAT): PARAGRAPH
+    do
+      let next = if Current.scroll_x >= n then Current.scroll_x - n else 0 end
+      { Current with scroll_x = next }
+    end
+
+  -- Scrolled by navigation keys relative to bounds `r`.
+  on_key(k: KEY, r: RECT): PARAGRAPH
+    do
+      let page = if r.height > 1 then r.height - 1 else 1 end
+      match k
+        case Down then Current.scroll_down(1, r.width, r.height)
+        case Up then Current.scroll_up(1, r.width, r.height)
+        case PageDown then Current.scroll_down(page, r.width, r.height)
+        case PageUp then Current.scroll_up(page, r.width, r.height)
+        case Home then Current.scrolled_to(0, r.width, r.height)
+        case End then Current.scrolled_to(Current.last_top(r.width, r.height), r.width, r.height)
+        case Right then Current.scroll_right(1)
+        case Left then Current.scroll_left(1)
+        case _ then Current
+      end
+    end
+
+  -- Draw visible wrapped and aligned lines inside `r` in style `st`.
+  -- TODO(proof-GT.5): prove PARAGRAPH.draw modifies only cells inside r
+  draw(s: SCREEN, r: RECT, st: STYLE): SCREEN
+    do
+      if r.is_empty then
+        s
+      else
+        let display = Current.wrapped_lines(r.width)
+        let visible = LIST_CUT.drop(display, Current.scroll_y)
+        let horz_off = if Current.wrap_kind.is_none then Current.scroll_x else 0 end
+        PARAGRAPH.draw_lines(s, r, visible, r.y, Current.alignment, horz_off, st)
+      end
+    ensure
+      same_width: Result.width = s.width
+      same_height: Result.height = s.height
+    end
+
+create {ANY}
+
+  wrap_all_lines(raw: LIST[STRING], width: NAT, by_char: BOOL): LIST[STRING]
+    require
+      pos: width > 0
+    variant
+      raw.length
+    do
+      if raw.length = 0 then
+        LIST.empty
+      else
+        let head_lines =
+          if by_char then
+            PARAGRAPH.wrap_char_line(raw.head, width)
+          else
+            PARAGRAPH.wrap_word_line(raw.head, width)
+          end
+        head_lines.append(PARAGRAPH.wrap_all_lines(raw.tail, width, by_char))
+      end
+    end
+
+  wrap_char_line(line: STRING, max_w: NAT): LIST[STRING]
+    require
+      pos: max_w > 0
+    do
+      let empty_chars: LIST[CHAR] = LIST.empty
+      let empty_lines: LIST[STRING] = LIST.empty
+      PARAGRAPH.wrap_chars_into(GLYPHS.of_text(line), max_w, empty_chars, 0, empty_lines)
+    end
+
+  wrap_chars_into(cs: LIST[CHAR], max_w: NAT, cur_rev: LIST[CHAR], cur_w: NAT, done_rev: LIST[STRING]): LIST[STRING]
+    require
+      pos: max_w > 0
+      bounded: cur_w <= 65535
+    variant
+      cs.length
+    do
+      if cs.length = 0 then
+        let none: LIST[CHAR] = LIST.empty
+        let last = GLYPHS.text_of(LIST_CUT.reverse(cur_rev, none))
+        LIST_CUT.reverse(done_rev.prepend(last), LIST.empty)
+      else
+        let c = cs.head
+        let w = CHAR_WIDTH.of(c)
+        let cw = if w = 0 then 0 else if w = 2 then 2 else 1 end end
+        if cw = 0 or cur_rev.length = 0 or cur_w + cw <= max_w then
+          let raw_next = cur_w + cw
+          let next_w = if raw_next <= 65535 then raw_next else 65535 end
+          PARAGRAPH.wrap_chars_into(cs.tail, max_w, cur_rev.prepend(c), next_w, done_rev)
+        else
+          let none: LIST[CHAR] = LIST.empty
+          let flushed = GLYPHS.text_of(LIST_CUT.reverse(cur_rev, none))
+          PARAGRAPH.wrap_chars_into(cs.tail, max_w, none.prepend(c), cw, done_rev.prepend(flushed))
+        end
+      end
+    end
+
+  wrap_word_line(line: STRING, max_w: NAT): LIST[STRING]
+    require
+      pos: max_w > 0
+    do
+      let empty_chars: LIST[CHAR] = LIST.empty
+      let empty_lines: LIST[STRING] = LIST.empty
+      let words = PARAGRAPH.words_of(GLYPHS.of_text(line), empty_chars, empty_lines)
+      if words.length = 0 then
+        empty_lines.prepend("")
+      else
+        PARAGRAPH.pack_words(words, max_w, "", 0, empty_lines)
+      end
+    end
+
+  words_of(cs: LIST[CHAR], cur_rev: LIST[CHAR], acc_rev: LIST[STRING]): LIST[STRING]
+    variant
+      cs.length
+    do
+      if cs.length = 0 then
+        let none: LIST[CHAR] = LIST.empty
+        let done =
+          if cur_rev.length > 0 then
+            acc_rev.prepend(GLYPHS.text_of(LIST_CUT.reverse(cur_rev, none)))
+          else
+            acc_rev
+          end
+        LIST_CUT.reverse(done, LIST.empty)
+      else if cs.head = ' ' then
+        let none: LIST[CHAR] = LIST.empty
+        let next_acc =
+          if cur_rev.length > 0 then
+            acc_rev.prepend(GLYPHS.text_of(LIST_CUT.reverse(cur_rev, none)))
+          else
+            acc_rev
+          end
+        PARAGRAPH.words_of(cs.tail, none, next_acc)
+      else
+        PARAGRAPH.words_of(cs.tail, cur_rev.prepend(cs.head), acc_rev)
+      end end
+    end
+
+  pack_words(words: LIST[STRING], max_w: NAT, cur_line: STRING, cur_w: NAT, done_rev: LIST[STRING]): LIST[STRING]
+    require
+      pos: max_w > 0
+      bounded: cur_w <= 65535
+    variant
+      words.length
+    do
+      if words.length = 0 then
+        let final_rev = if cur_line.is_empty then done_rev else done_rev.prepend(cur_line) end
+        if final_rev.length = 0 then
+          let empty_lines: LIST[STRING] = LIST.empty
+          empty_lines.prepend("")
+        else
+          LIST_CUT.reverse(final_rev, LIST.empty)
+        end
+      else
+        let w = words.head
+        let ww = GLYPHS.width(w)
+        if not cur_line.is_empty and cur_w + 1 + ww <= max_w then
+          let raw_w = cur_w + 1 + ww
+          let nw = if raw_w <= 65535 then raw_w else 65535 end
+          let joined = GLYPHS.join(GLYPHS.join(cur_line, " "), w)
+          PARAGRAPH.pack_words(words.tail, max_w, joined, nw, done_rev)
+        else
+          let flushed = if cur_line.is_empty then done_rev else done_rev.prepend(cur_line) end
+          if ww <= max_w then
+            PARAGRAPH.pack_words(words.tail, max_w, w, ww, flushed)
+          else
+            let rev = LIST_CUT.reverse(PARAGRAPH.wrap_char_line(w, max_w), LIST.empty)
+            if rev.length = 0 then
+              PARAGRAPH.pack_words(words.tail, max_w, "", 0, flushed)
+            else
+              PARAGRAPH.pack_words(words.tail, max_w, rev.head, GLYPHS.width(rev.head), rev.tail.append(flushed))
+            end
+          end
+        end
+      end
+    end
+
+  -- `cs` with the first `cols` terminal columns removed.
+  drop_columns(cs: LIST[CHAR], cols: NAT): STRING
+    variant
+      cs.length
+    do
+      if cs.length = 0 then
+        ""
+      else if cols = 0 then
+        GLYPHS.text_of(cs)
+      else
+        let w = CHAR_WIDTH.of(cs.head)
+        let cw = if w = 0 then 0 else if w = 2 then 2 else 1 end end
+        if cw > cols then
+          GLYPHS.join(" ", PARAGRAPH.drop_columns(cs.tail, 0))
+        else
+          PARAGRAPH.drop_columns(cs.tail, cols - cw)
+        end
+      end end
+    end
+
+  draw_lines(s: SCREEN, r: RECT, lines: LIST[STRING], y: NAT, align: ALIGN, scroll_x: NAT, st: STYLE): SCREEN
+    variant
+      lines.length
+    do
+      if lines.length = 0 or y >= r.bottom then
+        s
+      else
+        let text = if scroll_x = 0 then lines.head else PARAGRAPH.drop_columns(GLYPHS.of_text(lines.head), scroll_x) end
+        let w = GLYPHS.width(text)
+        let x = r.x + align.offset(w, r.width)
+        let next = s.text(r, x, y, text, st)
+        PARAGRAPH.draw_lines(next, r, lines.tail, y + 1, align, scroll_x, st)
+      end
+    ensure
+      same_width: Result.width = s.width
+      same_height: Result.height = s.height
+    end
+
+end

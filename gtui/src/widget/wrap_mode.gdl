@@ -1,0 +1,85 @@
+-- How `PARAGRAPH` wraps lines that exceed its rectangle width.
+module WRAP_MODE
+
+representation {NONE}
+  | WrapWord
+  | WrapChar
+  | NoWrap
+
+create {ANY}
+
+  -- Break lines at word boundaries, falling back to character splits for oversized words.
+  word: WRAP_MODE
+    do
+      WrapWord
+    ensure
+      is_word: Result.is_word
+    end
+
+  -- Alias for `word`.
+  wrap_word: WRAP_MODE
+    do
+      WrapWord
+    ensure
+      is_word: Result.is_word
+    end
+
+  -- Break lines at the cell boundary regardless of spaces.
+  char_wrap: WRAP_MODE
+    do
+      WrapChar
+    ensure
+      is_char: Result.is_char
+    end
+
+  -- Alias for `char_wrap`.
+  wrap_char: WRAP_MODE
+    do
+      WrapChar
+    ensure
+      is_char: Result.is_char
+    end
+
+  -- Keep lines unwrapped and clip/scroll horizontally.
+  none: WRAP_MODE
+    do
+      NoWrap
+    ensure
+      is_none: Result.is_none
+    end
+
+  -- Alias for `none`.
+  no_wrap: WRAP_MODE
+    do
+      NoWrap
+    ensure
+      is_none: Result.is_none
+    end
+
+feature {ANY}
+
+  is_word: BOOL
+    do
+      match Current
+        case WrapWord then True
+        case _ then False
+      end
+    end
+
+  is_char: BOOL
+    do
+      match Current
+        case WrapChar then True
+        case _ then False
+      end
+    end
+
+  is_none: BOOL
+    do
+      match Current
+        case NoWrap then True
+        case _ then False
+      end
+    end
+
+end

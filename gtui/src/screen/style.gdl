@@ -1,13 +1,15 @@
--- How a cell is drawn: any of bold, dim, underlined and reversed, and a foreground and a
--- background `COLOR`. `plain` has none of them and the terminal's own colours; each of the
--- others changes one.
+-- How a cell is drawn: any of bold, dim, italic, underlined, reversed and strikethrough, and
+-- a foreground and a background `COLOR`. `plain` has none of them and the terminal's own
+-- colours; each of the others changes one.
 module STYLE
 
 representation {NONE}
   strong: BOOL
   faint: BOOL
+  slanted: BOOL
   under: BOOL
   inverse: BOOL
+  crossed: BOOL
   ink: COLOR
   paper: COLOR
 
@@ -15,9 +17,11 @@ create {ANY}
 
   plain: STYLE
     do
-      { strong = False, faint = False, under = False, inverse = False, ink = COLOR.default, paper = COLOR.default }
+      { strong = False, faint = False, slanted = False, under = False, inverse = False, crossed = False,
+        ink = COLOR.default, paper = COLOR.default }
     ensure
-      nothing: not Result.is_bold and not Result.is_dim and not Result.is_underlined and not Result.is_reversed
+      nothing: not Result.is_bold and not Result.is_dim and not Result.is_italic and
+        not Result.is_underlined and not Result.is_reversed and not Result.is_strikethrough
       own_colours: Result.foreground.is_default and Result.background.is_default
     end
 
@@ -33,6 +37,11 @@ feature {ANY}
       Current.faint
     end
 
+  is_italic: BOOL
+    do
+      Current.slanted
+    end
+
   is_underlined: BOOL
     do
       Current.under
@@ -41,6 +50,11 @@ feature {ANY}
   is_reversed: BOOL
     do
       Current.inverse
+    end
+
+  is_strikethrough: BOOL
+    do
+      Current.crossed
     end
 
   foreground: COLOR
@@ -67,6 +81,13 @@ feature {ANY}
       set: Result.is_dim
     end
 
+  italic: STYLE
+    do
+      { Current with slanted = True }
+    ensure
+      set: Result.is_italic
+    end
+
   underlined: STYLE
     do
       { Current with under = True }
@@ -79,6 +100,13 @@ feature {ANY}
       { Current with inverse = True }
     ensure
       set: Result.is_reversed
+    end
+
+  strikethrough: STYLE
+    do
+      { Current with crossed = True }
+    ensure
+      set: Result.is_strikethrough
     end
 
   -- The same, in the foreground colour `c`.
@@ -99,10 +127,34 @@ feature {ANY}
       bold_same: Result.is_bold = Current.is_bold
     end
 
+  -- This style with `other` applied over it: enabled attributes are unioned, and a non-default
+  -- colour in `other` (including `COLOR.reset`) overrides this style's colour.
+  -- TODO(proof-GT.2): algebraic properties of patch (plain.patch(s).same(s), s.patch(plain).same(s), associativity)
+  patch(other: STYLE): STYLE
+    do
+      { strong = Current.strong or other.is_bold,
+        faint = Current.faint or other.is_dim,
+        slanted = Current.slanted or other.is_italic,
+        under = Current.under or other.is_underlined,
+        inverse = Current.inverse or other.is_reversed,
+        crossed = Current.crossed or other.is_strikethrough,
+        ink = if other.foreground.is_default then Current.ink else other.foreground end,
+        paper = if other.background.is_default then Current.paper else other.background end }
+    ensure
+      bold_set: Result.is_bold = (Current.is_bold or other.is_bold)
+      dim_set: Result.is_dim = (Current.is_dim or other.is_dim)
+      italic_set: Result.is_italic = (Current.is_italic or other.is_italic)
+      underlined_set: Result.is_underlined = (Current.is_underlined or other.is_underlined)
+      reversed_set: Result.is_reversed = (Current.is_reversed or other.is_reversed)
+      strikethrough_set: Result.is_strikethrough = (Current.is_strikethrough or other.is_strikethrough)
+    end
+
+  -- TODO(proof-GT.2): reflexivity and symmetry of STYLE.same
   same(other: STYLE): BOOL
     do
       Current.strong = other.strong and Current.faint = other.faint and
-        Current.under = other.under and Current.inverse = other.inverse and
+        Current.slanted = other.slanted and Current.under = other.under and
+        Current.inverse = other.inverse and Current.crossed = other.crossed and
         Current.ink.same(other.ink) and Current.paper.same(other.paper)
     end
 

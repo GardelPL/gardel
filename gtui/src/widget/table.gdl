@@ -1,0 +1,263 @@
+-- Multi-column selectable table widget with optional header row, column `SIZE` constraints
+-- (`LAYOUT.columns_with_gap`), and row scrolling/selection navigation.
+module TABLE
+
+representation {NONE}
+  col_sizes: LIST[SIZE]
+  headers: LIST[STRING]
+  rows_data: LIST[LIST[STRING]]
+  chosen: NAT
+  topmost: NAT
+  col_gap: NAT
+
+invariant
+  chosen_row: chosen < rows_data.length or (rows_data.length = 0 and chosen = 0)
+  chosen_shown: topmost <= chosen
+
+create {ANY}
+
+  -- A table with column constraints `widths` and data `rows`, without a header row.
+  make(widths: LIST[SIZE], rows: LIST[LIST[STRING]]): TABLE
+    do
+      { col_sizes = widths, headers = LIST.empty, rows_data = rows,
+        chosen = 0, topmost = 0, col_gap = 1 }
+    ensure
+      first_chosen: Result.selected = 0
+      count_set: Result.row_count = rows.length
+    end
+
+  -- A table with `header_cells` and data `rows`.
+  with_headers(widths: LIST[SIZE], header_cells: LIST[STRING], rows: LIST[LIST[STRING]]): TABLE
+    do
+      { col_sizes = widths, headers = header_cells, rows_data = rows,
+        chosen = 0, topmost = 0, col_gap = 1 }
+    ensure
+      first_chosen: Result.selected = 0
+      count_set: Result.row_count = rows.length
+      has_header: Result.has_header = (header_cells.length > 0)
+    end
+
+  -- Draw `cells` into corresponding column rectangles `cols` on row `y`.
+  draw_row_cells(s: SCREEN, cols: LIST[RECT], cells: LIST[STRING], y: NAT, st: STYLE): SCREEN
+    variant
+      cols.length
+    do
+      if cols.length = 0 or cells.length = 0 then
+        s
+      else
+        let c_rect = cols.head
+        let next = s.text(c_rect, c_rect.x, y, cells.head, st)
+        TABLE.draw_row_cells(next, cols.tail, cells.tail, y, st)
+      end
+    ensure
+      same_width: Result.width = s.width
+      same_height: Result.height = s.height
+    end
+
+  -- Draw data `rows` starting at row index `i` from `y` downwards inside `r`.
+  draw_data_rows(s: SCREEN, r: RECT, col_sizes: LIST[SIZE], gap: NAT, rows: LIST[LIST[STRING]], i: NAT, chosen: NAT, y: NAT, base_style: STYLE, selected_style: STYLE): SCREEN
+    variant
+      rows.length
+    do
+      if rows.length = 0 or y >= r.bottom or i = 18446744073709551615 then
+        s
+      else
+        let row_rect = RECT.make(r.x, y, r.width, 1)
+        let cols = LAYOUT.columns_with_gap(row_rect, col_sizes, gap)
+        let hit = i = chosen
+        let look = if hit then base_style.patch(selected_style) else base_style end
+        let row_bg = if hit then s.fill(row_rect, ' ', look) else s end
+        let row_drawn = TABLE.draw_row_cells(row_bg, cols, rows.head, y, look)
+        TABLE.draw_data_rows(row_drawn, r, col_sizes, gap, rows.tail, i + 1, chosen, y + 1, base_style, selected_style)
+      end
+    ensure
+      same_width: Result.width = s.width
+      same_height: Result.height = s.height
+    end
+
+feature {ANY}
+
+  widths: LIST[SIZE]
+    do
+      Current.col_sizes
+    end
+
+  header: LIST[STRING]
+    do
+      Current.headers
+    end
+
+  has_header: BOOL
+    do
+      Current.headers.length > 0
+    end
+
+  rows: LIST[LIST[STRING]]
+    do
+      Current.rows_data
+    end
+
+  row_count: NAT
+    do
+      Current.rows_data.length
+    end
+
+  column_count: NAT
+    do
+      Current.col_sizes.length
+    end
+
+  is_empty: BOOL
+    do
+      Current.rows_data.length = 0
+    end
+
+  gap: NAT
+    do
+      Current.col_gap
+    end
+
+  -- Index of the selected data row, or 0 when the table is empty.
+  selected: NAT
+    do
+      Current.chosen
+    ensure
+      a_row: Result < Current.row_count or (Current.row_count = 0 and Result = 0)
+    end
+
+  -- Selected row's cells, or `None` when empty.
+  selected_row: OPTION[LIST[STRING]]
+    do
+      if Current.chosen < Current.rows_data.length then
+        Some(LIST_OPS.at(Current.rows_data, Current.chosen))
+      else
+        None
+      end
+    ensure
+      some_unless_empty: Result.is_some = (Current.row_count > 0)
+    end
+
+  -- Index of the first visible data row.
+  top: NAT
+    do
+      Current.topmost
+    ensure
+      before_selected: Result <= Current.selected
+    end
+
+  with_gap(g: NAT): TABLE
+    do
+      { Current with col_gap = g }
+    ensure
+      same_count: Result.row_count = Current.row_count
+    end
+
+  with_header(h: LIST[STRING]): TABLE
+    do
+      { Current with headers = h }
+    ensure
+      same_count: Result.row_count = Current.row_count
+    end
+
+  -- Select row `i` (clamped to the last row) and scroll the viewport of `visible_rows` rows to keep it visible.
+  -- TODO(proof-GT.7): prove TABLE.select maintains page visibility when header row reduces body height
+  select(i: NAT, visible_rows: NAT): TABLE
+    do
+      let n = Current.rows_data.length
+      let c = if n = 0 then 0 else if i < n then i else n - 1 end end
+      let t =
+        if c < Current.topmost then c
+        else if visible_rows = 0 then c
+        else if c - Current.topmost >= visible_rows then c - visible_rows + 1
+        else Current.topmost
+        end end end
+      { Current with chosen = c, topmost = t }
+    ensure
+      same_count: Result.row_count = Current.row_count
+      chosen_set: Current.row_count > 0 implies Result.selected = (if i < Current.row_count then i else Current.row_count - 1 end)
+      shown: visible_rows > 0 implies Result.selected < Result.top + visible_rows
+    end
+
+  with_rows(rows: LIST[LIST[STRING]], visible_rows: NAT): TABLE
+    do
+      let fresh: TABLE = { Current with rows_data = rows, chosen = 0, topmost = 0 }
+      fresh.select(Current.chosen, visible_rows)
+    ensure
+      count_set: Result.row_count = rows.length
+    end
+
+  down(n: NAT, visible_rows: NAT): TABLE
+    do
+      Current.select(if Current.chosen <= 18446744073709551615 - n then Current.chosen + n else Current.chosen end, visible_rows)
+    ensure
+      same_count: Result.row_count = Current.row_count
+    end
+
+  up(n: NAT, visible_rows: NAT): TABLE
+    do
+      Current.select(if Current.chosen >= n then Current.chosen - n else 0 end, visible_rows)
+    ensure
+      same_count: Result.row_count = Current.row_count
+    end
+
+  target(k: KEY, visible_rows: NAT): NAT
+    do
+      let page = if visible_rows > 1 then visible_rows - 1 else 1 end
+      let c = Current.chosen
+      match k
+        case Down then if c < 18446744073709551615 then c + 1 else c end
+        case Up then if c >= 1 then c - 1 else 0 end
+        case PageDown then if c <= 18446744073709551615 - page then c + page else c end
+        case PageUp then if c >= page then c - page else 0 end
+        case Home then 0
+        case End then if Current.rows_data.length > 0 then Current.rows_data.length - 1 else 0 end
+        case _ then c
+      end
+    end
+
+  on_key(k: KEY, visible_rows: NAT): TABLE
+    do
+      if LIST_VIEW.moves(k) then
+        Current.select(Current.target(k, visible_rows), visible_rows)
+      else
+        Current
+      end
+    ensure
+      same_count: Result.row_count = Current.row_count
+    end
+
+  -- Render optional header row and visible data rows inside `r`.
+  -- TODO(proof-GT.7): prove TABLE.draw clips all cells inside r and columns do not overlap
+  draw(s: SCREEN, r: RECT, base_style: STYLE, header_style: STYLE, selected_style: STYLE): SCREEN
+    do
+      if r.is_empty then
+        s
+      else
+        let body_rect = if Current.has_header then r.drop_top(1) else r end
+        let after_header =
+          if Current.has_header then
+            let hdr_rect = r.take_top(1)
+            let hdr_cols = LAYOUT.columns_with_gap(hdr_rect, Current.col_sizes, Current.col_gap)
+            TABLE.draw_row_cells(s, hdr_cols, Current.headers, r.y, base_style.patch(header_style))
+          else
+            s
+          end
+        TABLE.draw_data_rows(
+          after_header,
+          body_rect,
+          Current.col_sizes,
+          Current.col_gap,
+          LIST_CUT.drop(Current.rows_data, Current.topmost),
+          Current.topmost,
+          Current.chosen,
+          body_rect.y,
+          base_style,
+          selected_style
+        )
+      end
+    ensure
+      same_width: Result.width = s.width
+      same_height: Result.height = s.height
+    end
+
+end

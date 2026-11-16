@@ -27,21 +27,79 @@ feature {ANY}
       fits: Result <= 65535
     end
 
-  -- `acc` and the columns `cs` take, or 65535 when that is more.
+  -- `acc` and the columns `cs` take under UAX #29 grapheme-cluster segmentation, or 65535 when that is more.
+  -- TODO(proof-GT.8): prove GLYPHS.width_into equals the number of cells produced by SCREEN.styled_into
   width_into(cs: LIST[CHAR], acc: NAT): NAT
     require
       fits: acc <= 65535
+    do
+      GLYPHS.width_clusters_into(cs, acc, 0, False, False)
+    ensure
+      fits: Result <= 65535
+    end
+
+  -- Accumulate cluster widths across `cs` with active cluster width `cur_w` (`0..2`),
+  -- `after_zwj` when the previous character was U+200D, and `ri_open` when the current cluster
+  -- is an unpaired Regional Indicator.
+  -- TODO(proof-GT.8): prove termination variant and width bounds across compound ZWJ/modifier/flag clusters
+  width_clusters_into(cs: LIST[CHAR], acc: NAT, cur_w: NAT, after_zwj: BOOL, ri_open: BOOL): NAT
+    require
+      fits: acc <= 65535
+      valid_cur: cur_w <= 2
     variant
       cs.length
     do
       if cs.length = 0 then
         acc
       else
-        -- A character taken from a list is not known to the prover to be one, so the bound
-        -- that `CHAR_WIDTH.of` states for characters is applied here as well.
-        let w = CHAR_WIDTH.of(cs.head)
-        let next = acc + (if w = 0 then 0 else if w = 2 then 2 else 1 end end)
-        if next >= 65535 then 65535 else GLYPHS.width_into(cs.tail, next) end
+        let c = cs.head
+        let w = CHAR_WIDTH.of(c)
+        if after_zwj and cur_w > 0 then
+          let promote = cur_w = 1 and (w = 2 or CHAR_WIDTH.is_skin_tone(c) or CHAR_WIDTH.is_vs16(c))
+          let next_acc = acc + (if promote then 1 else 0 end)
+          let next_w = if promote then 2 else cur_w end
+          if next_acc >= 65535 then
+            65535
+          else
+            GLYPHS.width_clusters_into(cs.tail, next_acc, next_w, CHAR_WIDTH.is_zwj(c), False)
+          end
+        else if CHAR_WIDTH.is_zwj(c) then
+          GLYPHS.width_clusters_into(cs.tail, acc, cur_w, cur_w > 0, False)
+        else if (CHAR_WIDTH.is_vs16(c) or CHAR_WIDTH.is_skin_tone(c)) and cur_w > 0 then
+          let delta = if cur_w = 1 then 1 else 0 end
+          let next_acc = acc + delta
+          if next_acc >= 65535 then
+            65535
+          else
+            GLYPHS.width_clusters_into(cs.tail, next_acc, 2, False, False)
+          end
+        else if w = 0 then
+          GLYPHS.width_clusters_into(cs.tail, acc, cur_w, False, False)
+        else if CHAR_WIDTH.is_regional_indicator(c) then
+          if ri_open and cur_w = 1 then
+            let next_acc = acc + 1
+            if next_acc >= 65535 then
+              65535
+            else
+              GLYPHS.width_clusters_into(cs.tail, next_acc, 2, False, False)
+            end
+          else
+            let next_acc = acc + 1
+            if next_acc >= 65535 then
+              65535
+            else
+              GLYPHS.width_clusters_into(cs.tail, next_acc, 1, False, True)
+            end
+          end
+        else
+          let step = if w = 2 then 2 else 1 end
+          let next_acc = acc + step
+          if next_acc >= 65535 then
+            65535
+          else
+            GLYPHS.width_clusters_into(cs.tail, next_acc, step, False, False)
+          end
+        end end end end end
       end
     ensure
       fits: Result <= 65535

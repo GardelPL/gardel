@@ -1,7 +1,8 @@
--- A box drawn on the edge of a rectangle, with rounded corners and a title in its top edge.
+-- A box drawn on the edge of a rectangle, with configurable border style, optional
+-- padding, top/bottom/multi titles, and pure border-junction merging (`merge_borders`).
 -- Its style is how a pane shows that it has the keys: an application draws the frame of the
--- pane that `FOCUS` names in a style of its own. What the pane holds is drawn in `inner`, and
--- what goes in the top edge besides a title, such as a row of `TABS`, in `title_area`.
+-- pane that `FOCUS` names in a style of its own. What the pane holds is drawn in `inner` or
+-- `inner_padded`, and what goes in the top edge besides a title, such as `TABS`, in `title_area`.
 functions FRAME
 
 feature {ANY}
@@ -10,6 +11,23 @@ feature {ANY}
   inner(r: RECT): RECT
     do
       r.inset(1)
+    ensure
+      within: Result.inside(r)
+    end
+
+  -- `r` inset by `pad` on each side, clamped to empty if `r` is too small.
+  pad_rect(r: RECT, pad: PADDING): RECT
+    do
+      r.drop_top(pad.top).drop_right(pad.right).drop_bottom(pad.bottom).drop_left(pad.left)
+    ensure
+      within: Result.inside(r)
+    end
+
+  -- The rectangle inside the edge after applying `pad`.
+  -- TODO(proof-GT.4): prove inner_padded(r, pad).inside(r) and inner_padded(r, pad).inside(FRAME.inner(r))
+  inner_padded(r: RECT, pad: PADDING): RECT
+    do
+      FRAME.pad_rect(r.inset(1), pad)
     ensure
       within: Result.inside(r)
     end
@@ -24,29 +42,298 @@ feature {ANY}
       one_row: Result.height <= 1
     end
 
-  -- The edge of `r` in style `edge`, and `title`, when it is not empty, in its top edge in
-  -- `title_style`, cut at the corner. A rectangle less than two cells wide or high is left as
-  -- it is.
+  -- The bottom edge less two cells at each end, where a bottom title goes.
+  bottom_title_area(r: RECT): RECT
+    do
+      r.take_bottom(1).drop_left(2).drop_right(2)
+    ensure
+      within: Result.inside(r)
+      one_row: Result.height <= 1
+    end
+
+  -- The edge of `r` in rounded style and `edge`, with `title` in its top edge in `title_style`.
   draw(s: SCREEN, r: RECT, title: STRING, edge: STYLE, title_style: STYLE): SCREEN
+    do
+      FRAME.draw_styled(s, r, BORDER_KIND.rounded, title, edge, title_style)
+    ensure
+      same_width: Result.width = s.width
+      same_height: Result.height = s.height
+    end
+
+  -- The edge of `r` in border `kind` and style `edge`, with `title` in its top edge in `title_style`.
+  draw_styled(s: SCREEN, r: RECT, kind: BORDER_KIND, title: STRING, edge: STYLE, title_style: STYLE): SCREEN
     do
       if r.width < 2 or r.height < 2 then
         s
       else
-        let sides = r.drop_top(1).drop_bottom(1)
-        let a = s.fill(r.take_top(1), '─', edge).fill(r.take_bottom(1), '─', edge)
-        let b = a.fill(sides.take_left(1), '│', edge).fill(sides.take_right(1), '│', edge)
-        let c = b.text(r, r.x, r.y, "╭", edge).text(r, r.right - 1, r.y, "╮", edge)
-        let d = c.text(r, r.x, r.bottom - 1, "╰", edge).text(r, r.right - 1, r.bottom - 1, "╯", edge)
-        if title.is_empty then
-          d
+        let boxed = FRAME.draw_border(s, r, kind, edge)
+        FRAME.draw_left_title(boxed, FRAME.title_area(r), title, title_style)
+      end
+    ensure
+      same_width: Result.width = s.width
+      same_height: Result.height = s.height
+    end
+
+  -- The edge of `r` in `kind` and `edge`, with top-left, top-right, and bottom titles.
+  draw_titled(s: SCREEN, r: RECT, kind: BORDER_KIND, top_left_title: STRING, top_right_title: STRING, bottom_title: STRING, edge: STYLE, title_style: STYLE): SCREEN
+    do
+      if r.width < 2 or r.height < 2 then
+        s
+      else
+        let boxed = FRAME.draw_border(s, r, kind, edge)
+        let top_area = FRAME.title_area(r)
+        let with_tl = FRAME.draw_left_title(boxed, top_area, top_left_title, title_style)
+        let with_tr =
+          if top_right_title.is_empty then
+            with_tl
+          else
+            let badge = GLYPHS.join(GLYPHS.join(" ", top_right_title), " ")
+            let w = GLYPHS.width(badge)
+            let rx = if w < top_area.width then top_area.x + (top_area.width - w) else top_area.x end
+            with_tl.text(top_area, rx, top_area.y, badge, title_style)
+          end
+        FRAME.draw_left_title(with_tr, FRAME.bottom_title_area(r), bottom_title, title_style)
+      end
+    ensure
+      same_width: Result.width = s.width
+      same_height: Result.height = s.height
+    end
+
+  -- The edge of `r` in `kind` and `edge`, with `titles` laid sequentially along its top edge.
+  draw_titles(s: SCREEN, r: RECT, kind: BORDER_KIND, titles: LIST[STRING], edge: STYLE, title_style: STYLE): SCREEN
+    do
+      if r.width < 2 or r.height < 2 then
+        s
+      else
+        let boxed = FRAME.draw_border(s, r, kind, edge)
+        let area = FRAME.title_area(r)
+        FRAME.draw_title_list(boxed, area, area.x, titles, title_style)
+      end
+    ensure
+      same_width: Result.width = s.width
+      same_height: Result.height = s.height
+    end
+
+  -- Pure border-junction solver over `r`: turns touching box-drawing segments and overlapping
+  -- corners in `s` into T-junctions and crosses (`┬`, `┴`, `├`, `┤`, `┼`, plus double/thick).
+  -- TODO(proof-GT.4): prove merge_borders modifies only box-drawing cells inside r
+  merge_borders(s: SCREEN, r: RECT): SCREEN
+    do
+      let last_x = if r.right < s.width then r.right else s.width end
+      let last_y = if r.bottom < s.height then r.bottom else s.height end
+      if r.x >= last_x or r.y >= last_y then
+        s
+      else
+        FRAME.merge_rows(s, s, r.x, last_x, r.y, last_y)
+      end
+    ensure
+      same_width: Result.width = s.width
+      same_height: Result.height = s.height
+    end
+
+  -- The box edges and four corners of `r` drawn in `kind` and `edge`.
+  draw_border(s: SCREEN, r: RECT, kind: BORDER_KIND, edge: STYLE): SCREEN
+    require
+      big_enough: r.width >= 2 and r.height >= 2
+    do
+      let sides = r.drop_top(1).drop_bottom(1)
+      let a = s.fill(r.take_top(1), kind.horizontal, edge).fill(r.take_bottom(1), kind.horizontal, edge)
+      let b = a.fill(sides.take_left(1), kind.vertical, edge).fill(sides.take_right(1), kind.vertical, edge)
+      let c = b.text(r, r.x, r.y, kind.top_left, edge).text(r, r.right - 1, r.y, kind.top_right, edge)
+      c.text(r, r.x, r.bottom - 1, kind.bottom_left, edge).text(r, r.right - 1, r.bottom - 1, kind.bottom_right, edge)
+    ensure
+      same_width: Result.width = s.width
+      same_height: Result.height = s.height
+    end
+
+  -- Draw padded `title` at the left of `area` when non-empty.
+  draw_left_title(s: SCREEN, area: RECT, title: STRING, title_style: STYLE): SCREEN
+    do
+      if title.is_empty then
+        s
+      else
+        s.text(area, area.x, area.y, GLYPHS.join(GLYPHS.join(" ", title), " "), title_style)
+      end
+    ensure
+      same_width: Result.width = s.width
+      same_height: Result.height = s.height
+    end
+
+  -- Draw `titles` in order starting at column `col` along `area`, separated by 1 border cell.
+  draw_title_list(s: SCREEN, area: RECT, col: NAT, titles: LIST[STRING], title_style: STYLE): SCREEN
+    variant
+      titles.length
+    do
+      if titles.length = 0 or col >= area.right then
+        s
+      else
+        let t = titles.head
+        if t.is_empty then
+          FRAME.draw_title_list(s, area, col, titles.tail, title_style)
         else
-          let t = FRAME.title_area(r)
-          d.text(t, t.x, t.y, GLYPHS.join(GLYPHS.join(" ", title), " "), title_style)
+          let badge = GLYPHS.join(GLYPHS.join(" ", t), " ")
+          let w = GLYPHS.width(badge)
+          let next = s.text(area, col, area.y, badge, title_style)
+          let next_col = if w <= 65534 - col then col + w + 1 else area.right end
+          FRAME.draw_title_list(next, area, next_col, titles.tail, title_style)
         end
       end
     ensure
       same_width: Result.width = s.width
       same_height: Result.height = s.height
+    end
+
+  merge_rows(orig: SCREEN, acc: SCREEN, start_x: NAT, last_x: NAT, y: NAT, last_y: NAT): SCREEN
+    require
+      same_w: acc.width = orig.width
+      same_h: acc.height = orig.height
+      bx: start_x <= last_x and last_x <= orig.width
+      by: y <= last_y and last_y <= orig.height
+    variant
+      last_y - y
+    do
+      if y >= last_y then
+        acc
+      else
+        let row_done = FRAME.merge_cols(orig, acc, start_x, last_x, y)
+        FRAME.merge_rows(orig, row_done, start_x, last_x, y + 1, last_y)
+      end
+    ensure
+      same_width: Result.width = orig.width
+      same_height: Result.height = orig.height
+    end
+
+  merge_cols(orig: SCREEN, acc: SCREEN, x: NAT, last_x: NAT, y: NAT): SCREEN
+    require
+      same_w: acc.width = orig.width
+      same_h: acc.height = orig.height
+      bx: x <= last_x and last_x <= orig.width
+      by: y < orig.height
+    variant
+      last_x - x
+    do
+      if x >= last_x then
+        acc
+      else
+        let c = FRAME.char_at(orig, x, y)
+        let next_acc =
+          if not FRAME.is_box_char(c) then
+            acc
+          else
+            let nb_n = if y > 0 then FRAME.has_south(FRAME.char_at(orig, x, y - 1)) else False end
+            let nb_s = if y + 1 < orig.height then FRAME.has_north(FRAME.char_at(orig, x, y + 1)) else False end
+            let nb_w = if x > 0 then FRAME.has_east(FRAME.char_at(orig, x - 1, y)) else False end
+            let nb_e = if x + 1 < orig.width then FRAME.has_west(FRAME.char_at(orig, x + 1, y)) else False end
+            let jc = FRAME.junction_char(c, nb_n, nb_s, nb_w, nb_e)
+            if jc = c then
+              acc
+            else
+              let st = FRAME.style_at(orig, x, y)
+              let none: LIST[CELL] = LIST.empty
+              acc.put(x, y, none.prepend(CELL.make(jc, st)))
+            end
+          end
+        FRAME.merge_cols(orig, next_acc, x + 1, last_x, y)
+      end
+    ensure
+      same_width: Result.width = orig.width
+      same_height: Result.height = orig.height
+    end
+
+  char_at(s: SCREEN, x: NAT, y: NAT): CHAR
+    do
+      let row = s.row(y)
+      if x < row.length then LIST_OPS.at(row, x).char else ' ' end
+    end
+
+  style_at(s: SCREEN, x: NAT, y: NAT): STYLE
+    do
+      let row = s.row(y)
+      if x < row.length then LIST_OPS.at(row, x).style else STYLE.plain end
+    end
+
+  has_north(c: CHAR): BOOL
+    do
+      c = '│' or c = '╰' or c = '╯' or c = '└' or c = '┘' or c = '├' or c = '┤' or c = '┴' or c = '┼'
+        or c = '║' or c = '╚' or c = '╝' or c = '╠' or c = '╣' or c = '╩' or c = '╬'
+        or c = '┃' or c = '┗' or c = '┛' or c = '┣' or c = '┫' or c = '┻' or c = '╋'
+    end
+
+  has_south(c: CHAR): BOOL
+    do
+      c = '│' or c = '╭' or c = '╮' or c = '┌' or c = '┐' or c = '├' or c = '┤' or c = '┬' or c = '┼'
+        or c = '║' or c = '╔' or c = '╗' or c = '╠' or c = '╣' or c = '╦' or c = '╬'
+        or c = '┃' or c = '┏' or c = '┓' or c = '┣' or c = '┫' or c = '┳' or c = '╋'
+    end
+
+  has_west(c: CHAR): BOOL
+    do
+      c = '─' or c = '╮' or c = '╯' or c = '┐' or c = '┘' or c = '┤' or c = '┬' or c = '┴' or c = '┼'
+        or c = '═' or c = '╗' or c = '╝' or c = '╣' or c = '╦' or c = '╩' or c = '╬'
+        or c = '━' or c = '┓' or c = '┛' or c = '┫' or c = '┳' or c = '┻' or c = '╋'
+    end
+
+  has_east(c: CHAR): BOOL
+    do
+      c = '─' or c = '╭' or c = '╰' or c = '┌' or c = '└' or c = '├' or c = '┬' or c = '┴' or c = '┼'
+        or c = '═' or c = '╔' or c = '╚' or c = '╠' or c = '╦' or c = '╩' or c = '╬'
+        or c = '━' or c = '┏' or c = '┗' or c = '┣' or c = '┳' or c = '┻' or c = '╋'
+    end
+
+  is_box_char(c: CHAR): BOOL
+    do
+      FRAME.has_north(c) or FRAME.has_south(c) or FRAME.has_west(c) or FRAME.has_east(c)
+    end
+
+  is_double_box(c: CHAR): BOOL
+    do
+      c = '═' or c = '║' or c = '╔' or c = '╗' or c = '╚' or c = '╝'
+        or c = '╠' or c = '╣' or c = '╦' or c = '╩' or c = '╬'
+    end
+
+  is_thick_box(c: CHAR): BOOL
+    do
+      c = '━' or c = '┃' or c = '┏' or c = '┓' or c = '┗' or c = '┛'
+        or c = '┣' or c = '┫' or c = '┳' or c = '┻' or c = '╋'
+    end
+
+  -- Synthesize a junction from `orig` and its neighbor connections `(n, so, w, e)`.
+  -- Leaves `orig` unchanged if neighbors add no new cardinal connection.
+  junction_char(orig: CHAR, n: BOOL, so: BOOL, w: BOOL, e: BOOL): CHAR
+    do
+      let orig_n = FRAME.has_north(orig)
+      let orig_s = FRAME.has_south(orig)
+      let orig_w = FRAME.has_west(orig)
+      let orig_e = FRAME.has_east(orig)
+      let cn = orig_n or n
+      let cs = orig_s or so
+      let cw = orig_w or w
+      let ce = orig_e or e
+      if cn = orig_n and cs = orig_s and cw = orig_w and ce = orig_e then
+        orig
+      else if FRAME.is_double_box(orig) then
+        FRAME.select_junction(cn, cs, cw, ce, '╬', '╦', '╩', '╠', '╣', '╔', '╗', '╚', '╝', '║', '═')
+      else if FRAME.is_thick_box(orig) then
+        FRAME.select_junction(cn, cs, cw, ce, '╋', '┳', '┻', '┣', '┫', '┏', '┓', '┗', '┛', '┃', '━')
+      else
+        FRAME.select_junction(cn, cs, cw, ce, '┼', '┬', '┴', '├', '┤', '┌', '┐', '└', '┘', '│', '─')
+      end end end
+    end
+
+  select_junction(n: BOOL, so: BOOL, w: BOOL, e: BOOL, cross: CHAR, tee_s: CHAR, tee_n: CHAR, tee_e: CHAR, tee_w: CHAR, tl: CHAR, tr: CHAR, bl: CHAR, br: CHAR, vert: CHAR, horiz: CHAR): CHAR
+    do
+      if n and so and w and e then cross
+      else if not n and so and w and e then tee_s
+      else if n and not so and w and e then tee_n
+      else if n and so and not w and e then tee_e
+      else if n and so and w and not e then tee_w
+      else if not n and so and not w and e then tl
+      else if not n and so and w and not e then tr
+      else if n and not so and not w and e then bl
+      else if n and not so and w and not e then br
+      else if n or so then vert
+      else horiz
+      end end end end end end end end end end
     end
 
 end

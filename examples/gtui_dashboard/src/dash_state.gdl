@@ -1,0 +1,262 @@
+-- State of `gtui_dashboard`: selectable verification module table, live gauges and sparkline,
+-- paragraph inspector with wrap/alignment controls, border-style & theme cycling, and help popup.
+module DASH_STATE
+
+representation {NONE}
+  wide: NAT
+  high: NAT
+  keys_at: FOCUS
+  mod_table: TABLE
+  history: LIST[NAT]
+  tick_count: NAT
+  theme_idx: NAT
+  border_idx: NAT
+  wrap_idx: NAT
+  align_idx: NAT
+  help_shown: BOOL
+
+create {ANY}
+
+  make: DASH_STATE
+    do
+      let widths: LIST[SIZE] = LIST.empty
+        .prepend(SIZE.fixed(6))
+        .prepend(SIZE.fixed(6))
+        .prepend(SIZE.fixed(5))
+        .prepend(SIZE.flex(1))
+      let hdr = DASH_STATE.row4("Module", "VCs", "Time", "State")
+      let rows: LIST[LIST[STRING]] = LIST.empty
+        .prepend(DASH_STATE.row4("CHAR_WIDTH", "12", "18ms", "👩‍💻16"))
+        .prepend(DASH_STATE.row4("SPARKLINE", "14", "24ms", "🏳️‍🌈OK"))
+        .prepend(DASH_STATE.row4("SCROLLBAR", "16", "21ms", "🇺🇸OK"))
+        .prepend(DASH_STATE.row4("TABLE", "22", "35ms", "🪉OK"))
+        .prepend(DASH_STATE.row4("POPUP", "15", "19ms", "✓OK"))
+        .prepend(DASH_STATE.row4("PARAGRAPH", "28", "42ms", "✓OK"))
+        .prepend(DASH_STATE.row4("FRAME", "31", "38ms", "✓OK"))
+        .prepend(DASH_STATE.row4("LAYOUT", "44", "51ms", "✓OK"))
+      let hist: LIST[NAT] = LIST.empty
+        .prepend(7).prepend(5).prepend(8).prepend(6)
+        .prepend(4).prepend(7).prepend(3).prepend(6)
+        .prepend(5).prepend(2).prepend(4).prepend(1)
+      { wide = 80, high = 24, keys_at = FOCUS.make(2),
+        mod_table = TABLE.with_headers(widths, hdr, rows),
+        history = hist, tick_count = 0,
+        theme_idx = 0, border_idx = 0, wrap_idx = 0, align_idx = 0,
+        help_shown = False }
+    end
+
+  row4(a: STRING, b: STRING, c: STRING, d: STRING): LIST[STRING]
+    do
+      let none: LIST[STRING] = LIST.empty
+      none.prepend(d).prepend(c).prepend(b).prepend(a)
+    end
+
+  detail_for(sel: NAT): STRING
+    do
+      if sel = 0 then
+        GLYPHS.join("LAYOUT (GT.3): SIZE.min, SIZE.max, SIZE.percent, ", "columns_with_gap, rows_with_gap, and JUSTIFY.")
+      else if sel = 1 then
+        GLYPHS.join("FRAME (GT.4): Rounded, Plain, Double, and Thick ", "BORDER_KIND, PADDING, multi-titles, and merge_borders.")
+      else if sel = 2 then
+        GLYPHS.join("PARAGRAPH (GT.5): Word/char wrap and Left/Center/", "Right ALIGN measured by terminal display width.")
+      else if sel = 3 then
+        GLYPHS.join("POPUP & CLEAR (GT.6): Centered modal overlays via ", "RECT.centered, CLEAR blanking, and framed body.")
+      else if sel = 4 then
+        GLYPHS.join("TABLE (GT.7): Multi-column grid using LAYOUT ", "constraints, optional header row, and scrolling.")
+      else if sel = 5 then
+        GLYPHS.join("SCROLLBAR (GT.7): Vertical and horizontal track ", "and proportional thumb indicators.")
+      else if sel = 6 then
+        GLYPHS.join("SPARKLINE (GT.7): 8-level vertical block trend ", "chart with automatic or explicit ceiling.")
+      else
+        let p1 = GLYPHS.join("CHAR_WIDTH (GT.8): Unicode 16.0 ", "\u{1FA89}\u{1FAC6}\u{1FAE9}")
+        let p2 = GLYPHS.join(" + UAX #29 ZWJ ", "\u{1F469}\u{200D}\u{1F4BB}\u{1F3F3}\u{FE0F}\u{200D}\u{1F308}")
+        let p3 = GLYPHS.join(", tone \u{1F44D}\u{1F3FD}", ", flag \u{1F1FA}\u{1F1F8}.")
+        GLYPHS.join(GLYPHS.join(p1, p2), p3)
+      end end end end end end end
+    end
+
+feature {ANY}
+
+  area: RECT
+    do
+      RECT.sized(Current.wide, Current.high)
+    end
+
+  focus: FOCUS
+    do
+      Current.keys_at
+    end
+
+  table: TABLE
+    do
+      Current.mod_table
+    end
+
+  samples: LIST[NAT]
+    do
+      Current.history
+    end
+
+  ticks: NAT
+    do
+      Current.tick_count
+    end
+
+  help_open: BOOL
+    do
+      Current.help_shown
+    end
+
+  theme: THEME
+    do
+      if Current.theme_idx = 0 then THEME.dark
+      else if Current.theme_idx = 1 then THEME.nord
+      else if Current.theme_idx = 2 then THEME.dracula
+      else THEME.light
+      end end end
+    end
+
+  border_kind: BORDER_KIND
+    do
+      if Current.border_idx = 0 then BORDER_KIND.rounded
+      else if Current.border_idx = 1 then BORDER_KIND.plain
+      else if Current.border_idx = 2 then BORDER_KIND.double
+      else BORDER_KIND.thick
+      end end end
+    end
+
+  border_name: STRING
+    do
+      if Current.border_idx = 0 then "rounded"
+      else if Current.border_idx = 1 then "plain"
+      else if Current.border_idx = 2 then "double"
+      else "thick"
+      end end end
+    end
+
+  wrap_mode: WRAP_MODE
+    do
+      if Current.wrap_idx = 0 then WRAP_MODE.wrap_word
+      else if Current.wrap_idx = 1 then WRAP_MODE.wrap_char
+      else WRAP_MODE.no_wrap
+      end end
+    end
+
+  wrap_name: STRING
+    do
+      if Current.wrap_idx = 0 then "word"
+      else if Current.wrap_idx = 1 then "char"
+      else "none"
+      end end
+    end
+
+  align_mode: ALIGN
+    do
+      if Current.align_idx = 0 then ALIGN.left
+      else if Current.align_idx = 1 then ALIGN.center
+      else ALIGN.right
+      end end
+    end
+
+  align_name: STRING
+    do
+      if Current.align_idx = 0 then "left"
+      else if Current.align_idx = 1 then "center"
+      else "right"
+      end end
+    end
+
+  -- Coverage gauge derived from the currently selected row (`1..8` out of `8`).
+  coverage_gauge: GAUGE
+    do
+      let done = if Current.mod_table.selected < 8 then Current.mod_table.selected + 1 else 8 end
+      GAUGE.ratio(done, 8).with_label(GLYPHS.join(NUMBER_TEXT.nat_to_text(done), "/8 modules"))
+    end
+
+  -- Verification cache hit rate gauge (`0..100%`).
+  cache_gauge: GAUGE
+    do
+      let pct = 75 + (Current.tick_count % 25)
+      GAUGE.percent(pct)
+    end
+
+  sparkline: SPARKLINE
+    do
+      SPARKLINE.make(Current.history).with_max(8)
+    end
+
+  scrollbar: SCROLLBAR
+    do
+      let vis = DASH_LAYOUT.table_rows(Current.area)
+      SCROLLBAR.vertical(Current.mod_table.row_count, vis, Current.mod_table.top)
+    end
+
+  inspector: PARAGRAPH
+    do
+      let text = DASH_STATE.detail_for(Current.mod_table.selected)
+      PARAGRAPH.of_text(text).with_wrap(Current.wrap_mode).with_align(Current.align_mode)
+    end
+
+  help_popup: POPUP
+    do
+      let l1 = "Up/Down/PgUp/PgDn/Home/End: select module\n"
+      let l2 = "Space: record solver sample | Tab: focus\n"
+      let l3 = "t: theme | b: border | w: wrap | a: align\n"
+      let l4 = "?: toggle help | q: quit"
+      let help_text = GLYPHS.join(GLYPHS.join(l1, l2), GLYPHS.join(l3, l4))
+      POPUP.of_text("Dashboard Controls", help_text, 54, 8)
+        .with_border(Current.border_kind)
+        .with_padding(PADDING.symmetric(0, 1))
+        .with_footer("Esc/? to close")
+    end
+
+  sized(w: NAT, h: NAT): DASH_STATE
+    do
+      { Current with wide = w, high = h }
+    end
+
+  stepped_sample: DASH_STATE
+    do
+      let next_tick = if Current.tick_count < 1000000 then Current.tick_count + 1 else 0 end
+      let sample = 1 + (next_tick * 3 + (Current.mod_table.selected % 8)) % 8
+      let base_hist = if Current.history.length > 0 then Current.history.tail else Current.history end
+      let next_hist = LIST_CUT.take(base_hist.append(LIST.empty.prepend(sample)), 16)
+      { Current with history = next_hist, tick_count = next_tick }
+    end
+
+  on_key(k: KEY): TUI_NEXT[DASH_STATE]
+    do
+      if Current.help_shown then
+        match k
+          case Escape then TUI_NEXT.next({ Current with help_shown = False })
+          case Enter then TUI_NEXT.next({ Current with help_shown = False })
+          case KeysEnded then TUI_NEXT.quit(0)
+          case Char(c) then
+            if c = 'q' then TUI_NEXT.quit(0)
+            else if c = '?' then TUI_NEXT.next({ Current with help_shown = False })
+            else TUI_NEXT.next(Current)
+            end end
+          case _ then TUI_NEXT.next(Current)
+        end
+      else
+        match k
+          case KeysEnded then TUI_NEXT.quit(0)
+          case Tab then TUI_NEXT.next({ Current with keys_at = Current.keys_at.next })
+          case Char(c) then
+            if c = 'q' then TUI_NEXT.quit(0)
+            else if c = '?' then TUI_NEXT.next({ Current with help_shown = True })
+            else if c = 't' then TUI_NEXT.next({ Current with theme_idx = if Current.theme_idx < 3 then Current.theme_idx + 1 else 0 end })
+            else if c = 'b' then TUI_NEXT.next({ Current with border_idx = if Current.border_idx < 3 then Current.border_idx + 1 else 0 end })
+            else if c = 'w' then TUI_NEXT.next({ Current with wrap_idx = if Current.wrap_idx < 2 then Current.wrap_idx + 1 else 0 end })
+            else if c = 'a' then TUI_NEXT.next({ Current with align_idx = if Current.align_idx < 2 then Current.align_idx + 1 else 0 end })
+            else if c = ' ' then TUI_NEXT.next(Current.stepped_sample)
+            else TUI_NEXT.next(Current)
+            end end end end end end end
+          case _ then
+            let vis = DASH_LAYOUT.table_rows(Current.area)
+            TUI_NEXT.next({ Current with mod_table = Current.mod_table.on_key(k, vis) })
+        end
+      end
+    end
+
+end

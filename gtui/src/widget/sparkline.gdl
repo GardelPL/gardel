@@ -1,0 +1,136 @@
+-- Compact 1-row or multi-row trend chart using 8-level vertical block glyphs (`▁▂▃▄▅▆▇█`).
+module SPARKLINE
+
+representation {NONE}
+  samples: LIST[NAT]
+  ceil_override: OPTION[NAT]
+
+create {ANY}
+
+  -- A sparkline of sample values `data` auto-scaled to its maximum sample.
+  make(data: LIST[NAT]): SPARKLINE
+    do
+      { samples = data, ceil_override = None }
+    ensure
+      count_set: Result.count = data.length
+    end
+
+  -- 1/8th-height vertical bar glyph for level `1..8` (and space for `0`).
+  bar_char(level: NAT): CHAR
+    do
+      if level = 0 then ' '
+      else if level = 1 then '▁'
+      else if level = 2 then '▂'
+      else if level = 3 then '▃'
+      else if level = 4 then '▄'
+      else if level = 5 then '▅'
+      else if level = 6 then '▆'
+      else if level = 7 then '▇'
+      else '█'
+      end end end end end end end end
+    end
+
+  -- Maximum value in `xs` or `acc`, whichever is greater.
+  max_in(xs: LIST[NAT], acc: NAT): NAT
+    variant
+      xs.length
+    do
+      if xs.length = 0 then
+        acc
+      else
+        let next = if xs.head > acc then xs.head else acc end
+        SPARKLINE.max_in(xs.tail, next)
+      end
+    end
+
+  draw_columns(s: SCREEN, r: RECT, xs: LIST[NAT], x: NAT, cap: NAT, st: STYLE): SCREEN
+    variant
+      xs.length
+    do
+      if xs.length = 0 or x < r.x or x >= r.right or r.height = 0 or cap = 0 then
+        s
+      else
+        let c = if cap <= 65535 then cap else 65535 end
+        let h = xs.head
+        let vc = if h <= 0 then 0 else if h <= c then h else c end end
+        let total_levels = r.height * 8
+        let raw_e = vc * total_levels / c
+        let e = if raw_e <= 0 then 0 else if raw_e <= total_levels then raw_e else total_levels end end
+        let col_done = SPARKLINE.draw_col_rows(s, r, x, 0, e, st)
+        SPARKLINE.draw_columns(col_done, r, xs.tail, x + 1, c, st)
+      end
+    ensure
+      same_width: Result.width = s.width
+      same_height: Result.height = s.height
+    end
+
+  draw_col_rows(s: SCREEN, r: RECT, x: NAT, row_idx: NAT, e: NAT, st: STYLE): SCREEN
+    variant
+      r.height - row_idx
+    do
+      if row_idx >= r.height or r.height = 0 or x < r.x or x >= r.right then
+        s
+      else
+        let below = r.height - 1 - row_idx
+        let base_eighths = below * 8
+        let ch =
+          if e <= base_eighths then
+            ' '
+          else
+            let diff = e - base_eighths
+            if diff >= 8 then '█' else SPARKLINE.bar_char(diff) end
+          end
+        let next = s.fill(RECT.make(x, r.y + row_idx, 1, 1), ch, st)
+        SPARKLINE.draw_col_rows(next, r, x, row_idx + 1, e, st)
+      end
+    ensure
+      same_width: Result.width = s.width
+      same_height: Result.height = s.height
+    end
+
+feature {ANY}
+
+  data: LIST[NAT]
+    do
+      Current.samples
+    end
+
+  count: NAT
+    do
+      Current.samples.length
+    end
+
+  with_max(m: NAT): SPARKLINE
+    do
+      { Current with ceil_override = Some(m) }
+    end
+
+  max_value: NAT
+    do
+      match Current.ceil_override
+        case Some(m) then m
+        case None then SPARKLINE.max_in(Current.samples, 0)
+      end
+    end
+
+  -- Draw the sparkline columns left-to-right across `r` in style `st`.
+  -- TODO(proof-GT.7): prove SPARKLINE.draw modifies only cells inside r
+  draw(s: SCREEN, r: RECT, st: STYLE): SCREEN
+    do
+      if r.is_empty then
+        s
+      else
+        let raw_cap = Current.max_value
+        if raw_cap <= 0 then
+          s.fill(r, ' ', st)
+        else
+          let cap = if raw_cap <= 65535 then raw_cap else 65535 end
+          SPARKLINE.draw_columns(s, r, Current.samples, r.x, cap, st)
+        end
+      end
+    ensure
+      same_width: Result.width = s.width
+      same_height: Result.height = s.height
+    end
+
+end

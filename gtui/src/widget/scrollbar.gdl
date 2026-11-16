@@ -1,0 +1,134 @@
+-- 1-column vertical or 1-row horizontal scrollbar with proportional track and thumb.
+module SCROLLBAR
+
+representation {NONE}
+  total_items: NAT
+  viewport_items: NAT
+  position: NAT
+  vert_flag: BOOL
+  track_glyph: CHAR
+  thumb_glyph: CHAR
+
+create {ANY}
+
+  -- Vertical scrollbar drawn along the right column of a bounding rectangle.
+  vertical(total: NAT, viewport: NAT, pos: NAT): SCROLLBAR
+    do
+      { total_items = total, viewport_items = viewport, position = pos,
+        vert_flag = True, track_glyph = '│', thumb_glyph = '█' }
+    ensure
+      is_vert: Result.is_vertical
+    end
+
+  -- Horizontal scrollbar drawn along the bottom row of a bounding rectangle.
+  horizontal(total: NAT, viewport: NAT, pos: NAT): SCROLLBAR
+    do
+      { total_items = total, viewport_items = viewport, position = pos,
+        vert_flag = False, track_glyph = '─', thumb_glyph = '█' }
+    ensure
+      is_horz: not Result.is_vertical
+    end
+
+feature {ANY}
+
+  is_vertical: BOOL
+    do
+      Current.vert_flag
+    end
+
+  total: NAT
+    do
+      Current.total_items
+    end
+
+  viewport: NAT
+    do
+      Current.viewport_items
+    end
+
+  offset: NAT
+    do
+      Current.position
+    end
+
+  with_symbols(track: CHAR, thumb: CHAR): SCROLLBAR
+    do
+      { Current with track_glyph = track, thumb_glyph = thumb }
+    end
+
+  -- Proportional thumb length along a track of `track_len` cells, at least 1 when non-empty.
+  thumb_size(track_len: NAT): NAT
+    do
+      if track_len = 0 then
+        0
+      else if Current.total_items = 0 or Current.viewport_items >= Current.total_items then
+        track_len
+      else
+        let tot = Current.total_items
+        let vp = Current.viewport_items
+        let scale = if tot > 65535 then tot / 65535 + 1 else 1 end
+        let svp_raw = vp / scale
+        let stot_raw = tot / scale
+        let svp = if svp_raw <= 65535 then svp_raw else 65535 end
+        let stot = if stot_raw = 0 then 1 else if stot_raw <= 65535 then stot_raw else 65535 end end
+        let tlen = if track_len <= 65535 then track_len else 65535 end
+        let raw = svp * tlen / stot
+        let clamped = if raw <= tlen then raw else tlen end
+        if clamped < 1 then 1 else clamped end
+      end end
+    ensure
+      bounded: Result <= track_len
+      at_least_one: track_len > 0 implies Result >= 1
+    end
+
+  -- Starting cell offset of the thumb along a track of `track_len` cells.
+  -- TODO(proof-GT.7): prove thumb_start monotonicity with respect to scroll offset
+  thumb_start(track_len: NAT): NAT
+    do
+      let ts = Current.thumb_size(track_len)
+      let slack = track_len - ts
+      if slack = 0 or Current.total_items <= Current.viewport_items or Current.position = 0 then
+        0
+      else
+        let max_pos = Current.total_items - Current.viewport_items
+        let pos = if Current.position <= max_pos then Current.position else max_pos end
+        let scale = if max_pos > 65535 then max_pos / 65535 + 1 else 1 end
+        let spos_raw = pos / scale
+        let smax_raw = max_pos / scale
+        let spos = if spos_raw <= 65535 then spos_raw else 65535 end
+        let smax = if smax_raw = 0 then 1 else if smax_raw <= 65535 then smax_raw else 65535 end end
+        let sl = if slack <= 65535 then slack else 65535 end
+        let raw = spos * sl / smax
+        if raw <= slack then raw else slack end
+      end
+    ensure
+      bounded: Result + Current.thumb_size(track_len) <= track_len
+    end
+
+  -- Draw the scrollbar along the right (vertical) or bottom (horizontal) edge of `r`.
+  -- TODO(proof-GT.7): prove SCROLLBAR.draw modifies only the 1-cell edge of r
+  draw(s: SCREEN, r: RECT, track_style: STYLE, thumb_style: STYLE): SCREEN
+    do
+      if r.is_empty then
+        s
+      else if Current.vert_flag then
+        let bar = r.take_right(1)
+        let len = bar.height
+        let ts = Current.thumb_size(len)
+        let start = Current.thumb_start(len)
+        let with_track = s.fill(bar, Current.track_glyph, track_style)
+        with_track.fill(bar.drop_top(start).take_top(ts), Current.thumb_glyph, thumb_style)
+      else
+        let bar = r.take_bottom(1)
+        let len = bar.width
+        let ts = Current.thumb_size(len)
+        let start = Current.thumb_start(len)
+        let with_track = s.fill(bar, Current.track_glyph, track_style)
+        with_track.fill(bar.drop_left(start).take_left(ts), Current.thumb_glyph, thumb_style)
+      end end
+    ensure
+      same_width: Result.width = s.width
+      same_height: Result.height = s.height
+    end
+
+end

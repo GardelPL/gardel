@@ -1,0 +1,80 @@
+-- Horizontal text alignment within a bounding rectangle: left, centered, or right.
+module ALIGN
+
+representation {NONE}
+  | AlignLeft
+  | AlignCenter
+  | AlignRight
+
+create {ANY}
+
+  -- Align text to the left edge.
+  left: ALIGN
+    do
+      AlignLeft
+    ensure
+      is_left: Result.is_left
+    end
+
+  -- Center text horizontally within the available width.
+  center: ALIGN
+    do
+      AlignCenter
+    ensure
+      is_center: Result.is_center
+    end
+
+  -- Align text to the right edge.
+  right: ALIGN
+    do
+      AlignRight
+    ensure
+      is_right: Result.is_right
+    end
+
+feature {ANY}
+
+  is_left: BOOL
+    do
+      match Current
+        case AlignLeft then True
+        case _ then False
+      end
+    end
+
+  is_center: BOOL
+    do
+      match Current
+        case AlignCenter then True
+        case _ then False
+      end
+    end
+
+  is_right: BOOL
+    do
+      match Current
+        case AlignRight then True
+        case _ then False
+      end
+    end
+
+  -- Starting column offset for text of display width `text_width` inside `area_width` columns.
+  offset(text_width: NAT, area_width: NAT): NAT
+    do
+      if text_width >= area_width then
+        0
+      else
+        let spare = area_width - text_width
+        match Current
+          case AlignLeft then 0
+          case AlignCenter then
+            let half = spare / 2
+            if half <= spare then half else spare end
+          case AlignRight then spare
+        end
+      end
+    ensure
+      bounded: Result <= area_width
+    end
+
+end

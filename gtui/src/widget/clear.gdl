@@ -1,0 +1,33 @@
+-- Clear a rectangle of cells on a `SCREEN` by filling it with blanks (in plain or a given style).
+functions CLEAR
+
+feature {ANY}
+
+  -- Reset every cell inside `r` to a plain blank space.
+  area(s: SCREEN, r: RECT): SCREEN
+    do
+      CLEAR.styled(s, r, STYLE.plain)
+    ensure
+      same_width: Result.width = s.width
+      same_height: Result.height = s.height
+    end
+
+  -- Fill every cell inside `r` with blank spaces in style `st`.
+  styled(s: SCREEN, r: RECT, st: STYLE): SCREEN
+    do
+      s.fill(r, ' ', st)
+    ensure
+      same_width: Result.width = s.width
+      same_height: Result.height = s.height
+    end
+
+  -- Alias for `styled`.
+  draw(s: SCREEN, r: RECT, st: STYLE): SCREEN
+    do
+      CLEAR.styled(s, r, st)
+    ensure
+      same_width: Result.width = s.width
+      same_height: Result.height = s.height
+    end
+
+end

@@ -1,0 +1,72 @@
+-- Layout geometry for `gtui_dashboard`:
+-- - Top main area split into two touching columns (`left` table pane and `right` metrics/sparkline pane,
+--   sharing a 1-column vertical border so `FRAME.merge_borders` joins their corners into `┬` and `┴`).
+-- - Bottom inspector pane (`bottom`) for `PARAGRAPH` details.
+-- - 1-row `status` bar at the bottom of the screen.
+functions DASH_LAYOUT
+
+feature {ANY}
+
+  -- Vertical split of `area`: main upper area, 6-row inspector pane, and 1-row status bar.
+  vertical_parts(area: RECT): LIST[RECT]
+    do
+      let sizes: LIST[SIZE] = LIST.empty
+        .prepend(SIZE.fixed(1))
+        .prepend(SIZE.fixed(6))
+        .prepend(SIZE.min(8))
+      LAYOUT.rows(area, sizes)
+    ensure
+      three: Result.length = 3
+    end
+
+  upper(area: RECT): RECT
+    do
+      LIST_OPS.at(DASH_LAYOUT.vertical_parts(area), 0)
+    end
+
+  bottom(area: RECT): RECT
+    do
+      LIST_OPS.at(DASH_LAYOUT.vertical_parts(area), 1)
+    end
+
+  status(area: RECT): RECT
+    do
+      LIST_OPS.at(DASH_LAYOUT.vertical_parts(area), 2)
+    end
+
+  -- Left (`TABLE` + `SCROLLBAR`) and right (`GAUGE` + `SPARKLINE`) panes inside `upper(area)`,
+  -- overlapping by 1 column at the shared vertical border so `FRAME.merge_borders` merges `┬` and `┴`.
+  left(area: RECT): RECT
+    do
+      let u = DASH_LAYOUT.upper(area)
+      let lw = u.width * 55 / 100
+      u.take_left(lw)
+    end
+
+  right(area: RECT): RECT
+    do
+      let u = DASH_LAYOUT.upper(area)
+      let lw = u.width * 55 / 100
+      u.drop_left(if lw > 0 then lw - 1 else 0 end)
+    end
+
+  -- Visible data rows inside the left `TABLE` pane (excluding border and 1-row table header).
+  table_rows(area: RECT): NAT
+    do
+      let inner = FRAME.inner(DASH_LAYOUT.left(area))
+      if inner.height > 1 then inner.height - 1 else 1 end
+    end
+
+  -- Sub-rows inside the right metrics pane: two 1-row gauges and a min-1-row sparkline area, with 1-row gap.
+  metrics_rows(right_inner: RECT): LIST[RECT]
+    do
+      let sizes: LIST[SIZE] = LIST.empty
+        .prepend(SIZE.min(1))
+        .prepend(SIZE.fixed(1))
+        .prepend(SIZE.fixed(1))
+      LAYOUT.rows_with_gap(right_inner, sizes, 1)
+    ensure
+      three: Result.length = 3
+    end
+
+end

@@ -20,14 +20,20 @@ feature {ANY}
       STYLE.plain.fg(COLOR.green)
     end
 
-  -- The spans of line `i`, whose text is `line`.
+  -- The spans of line `i`, whose text is `line`, using the default dark theme.
   spans(i: NAT, line: STRING): LIST[SPAN]
     do
-      TOUR_LEXER.scan(GLYPHS.of_text(line), 0, LIST.empty)
+      TOUR_LEXER.spans_with(THEME.dark, i, line)
+    end
+
+  -- The spans of line `i`, whose text is `line`, coloured from `t`.
+  spans_with(t: THEME, i: NAT, line: STRING): LIST[SPAN]
+    do
+      TOUR_LEXER.scan(t, GLYPHS.of_text(line), 0, LIST.empty)
     end
 
   -- `acc` with the spans of `cs`, the first of which is character `at` of its line.
-  scan(cs: LIST[CHAR], at: NAT, acc: LIST[SPAN]): LIST[SPAN]
+  scan(t: THEME, cs: LIST[CHAR], at: NAT, acc: LIST[SPAN]): LIST[SPAN]
     variant
       cs.length
     do
@@ -36,18 +42,18 @@ feature {ANY}
       else
         let c = cs.head
         if c = '-' and cs.tail.length > 0 and cs.tail.head = '-' then
-          acc.prepend(SPAN.make(at, cs.length, TOUR_LEXER.comment_style))
+          acc.prepend(SPAN.make(at, cs.length, t.comment))
         else if c = '"' then
           let n = TOUR_LEXER.quoted(cs.tail)
           let k = if n < cs.tail.length then n + 2 else cs.length end
-          TOUR_LEXER.scan(LIST_CUT.drop(cs, k), at + k, acc.prepend(SPAN.make(at, k, TOUR_LEXER.string_style)))
+          TOUR_LEXER.scan(t, LIST_CUT.drop(cs, k), at + k, acc.prepend(SPAN.make(at, k, t.string)))
         else if TOUR_LEXER.is_letter(c) then
           let n = TOUR_LEXER.word_length(cs)
           let w = GLYPHS.text_of(LIST_CUT.take(cs, n))
-          let more = if TOUR_LEXER.is_keyword(w) then acc.prepend(SPAN.make(at, n, TOUR_LEXER.keyword_style)) else acc end
-          TOUR_LEXER.scan(LIST_CUT.drop(cs, n), at + n, more)
+          let more = if TOUR_LEXER.is_keyword(w) then acc.prepend(SPAN.make(at, n, t.keyword)) else acc end
+          TOUR_LEXER.scan(t, LIST_CUT.drop(cs, n), at + n, more)
         else
-          TOUR_LEXER.scan(cs.tail, at + 1, acc)
+          TOUR_LEXER.scan(t, cs.tail, at + 1, acc)
         end end end
       end
     end

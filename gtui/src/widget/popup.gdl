@@ -1,0 +1,157 @@
+-- Centered modal overlay: clears underlying screen cells (`CLEAR`), draws a framed box
+-- (`FRAME`), and renders an inner `PARAGRAPH` inside the padded inner area.
+module POPUP
+
+representation {NONE}
+  heading: STRING
+  footer: STRING
+  content: PARAGRAPH
+  pref_width: NAT
+  pref_height: NAT
+  border: BORDER_KIND
+  pad: PADDING
+
+create {ANY}
+
+  -- A popup of preferred size `width` by `height`, defaulting to a rounded border and no padding.
+  make(title: STRING, body: PARAGRAPH, width: NAT, height: NAT): POPUP
+    do
+      { heading = title, footer = "", content = body,
+        pref_width = width, pref_height = height,
+        border = BORDER_KIND.rounded, pad = PADDING.none }
+    ensure
+      width_set: Result.width = width
+      height_set: Result.height = height
+    end
+
+  -- A popup wrapping `text` inside a `PARAGRAPH`.
+  of_text(title: STRING, text: STRING, width: NAT, height: NAT): POPUP
+    do
+      POPUP.make(title, PARAGRAPH.of_text(text), width, height)
+    ensure
+      width_set: Result.width = width
+      height_set: Result.height = height
+    end
+
+  -- Centered bounding rectangle of size `width` by `height` clamped inside `area`.
+  place(area: RECT, width: NAT, height: NAT): RECT
+    do
+      area.centered(width, height)
+    ensure
+      within: Result.inside(area)
+    end
+
+  -- Clear `r` in style `bg` and draw a border of `kind` with `title`.
+  draw_box(s: SCREEN, r: RECT, title: STRING, kind: BORDER_KIND, bg: STYLE, edge: STYLE, title_style: STYLE): SCREEN
+    do
+      FRAME.draw_styled(CLEAR.styled(s, r, bg), r, kind, title, edge, title_style)
+    ensure
+      same_width: Result.width = s.width
+      same_height: Result.height = s.height
+    end
+
+  -- Convenience function to draw a one-shot modal overlay centered inside `area`.
+  draw_modal(s: SCREEN, area: RECT, width: NAT, height: NAT, title: STRING, body: PARAGRAPH, bg: STYLE, edge: STYLE, title_style: STYLE): SCREEN
+    do
+      POPUP.make(title, body, width, height).draw(s, area, bg, edge, title_style)
+    ensure
+      same_width: Result.width = s.width
+      same_height: Result.height = s.height
+    end
+
+feature {ANY}
+
+  title: STRING
+    do
+      Current.heading
+    end
+
+  bottom_title: STRING
+    do
+      Current.footer
+    end
+
+  body: PARAGRAPH
+    do
+      Current.content
+    end
+
+  width: NAT
+    do
+      Current.pref_width
+    end
+
+  height: NAT
+    do
+      Current.pref_height
+    end
+
+  border_kind: BORDER_KIND
+    do
+      Current.border
+    end
+
+  padding: PADDING
+    do
+      Current.pad
+    end
+
+  with_border(k: BORDER_KIND): POPUP
+    do
+      { Current with border = k }
+    end
+
+  with_padding(p: PADDING): POPUP
+    do
+      { Current with pad = p }
+    end
+
+  with_footer(f: STRING): POPUP
+    do
+      { Current with footer = f }
+    end
+
+  with_body(b: PARAGRAPH): POPUP
+    do
+      { Current with content = b }
+    end
+
+  -- Bounding rectangle of `Current` centered inside `area`.
+  bounds(area: RECT): RECT
+    do
+      area.centered(Current.pref_width, Current.pref_height)
+    ensure
+      within: Result.inside(area)
+    end
+
+  -- Inner padded rectangle inside `Current.bounds(area)`.
+  -- TODO(proof-GT.6): prove content_area(area).inside(Current.bounds(area)) and content_area(area).inside(area)
+  content_area(area: RECT): RECT
+    do
+      let b = Current.bounds(area)
+      let inner = FRAME.inner_padded(b, Current.pad)
+      check tr: RECT.inside_trans(inner, b, area) end
+      inner
+    ensure
+      within: Result.inside(area)
+    end
+
+  on_key(k: KEY, area: RECT): POPUP
+    do
+      { Current with content = Current.content.on_key(k, Current.content_area(area)) }
+    end
+
+  -- Clear `Current.bounds(area)` in style `bg`, draw the frame, and render `Current.body`.
+  -- TODO(proof-GT.6): prove POPUP.draw modifies only cells inside Current.bounds(area)
+  draw(s: SCREEN, area: RECT, bg: STYLE, edge: STYLE, title_style: STYLE): SCREEN
+    do
+      let r = Current.bounds(area)
+      let cleared = CLEAR.styled(s, r, bg)
+      let framed = FRAME.draw_titled(cleared, r, Current.border, Current.heading, "", Current.footer, edge, title_style)
+      Current.content.draw(framed, FRAME.inner_padded(r, Current.pad), bg)
+    ensure
+      same_width: Result.width = s.width
+      same_height: Result.height = s.height
+    end
+
+end

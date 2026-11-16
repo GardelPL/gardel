@@ -1,0 +1,86 @@
+-- How surplus space along a layout axis is distributed relative to the children.
+module JUSTIFY
+
+representation {NONE}
+  | JustifyStart
+  | JustifyCenter
+  | JustifyEnd
+  | JustifySpaceBetween
+
+create {ANY}
+
+  -- Pack children at the start of the axis (default).
+  start: JUSTIFY
+    do
+      JustifyStart
+    ensure
+      is_start: Result.is_start
+    end
+
+  -- Center children within the container when surplus space remains.
+  center: JUSTIFY
+    do
+      JustifyCenter
+    ensure
+      is_center: Result.is_center
+    end
+
+  -- Pack children at the end of the axis when surplus space remains.
+  finish: JUSTIFY
+    do
+      JustifyEnd
+    ensure
+      is_end: Result.is_end
+    end
+
+  -- Alias for `finish`.
+  end_align: JUSTIFY
+    do
+      JustifyEnd
+    ensure
+      is_end: Result.is_end
+    end
+
+  -- Distribute surplus space evenly between adjacent children.
+  space_between: JUSTIFY
+    do
+      JustifySpaceBetween
+    ensure
+      is_space_between: Result.is_space_between
+    end
+
+feature {ANY}
+
+  is_start: BOOL
+    do
+      match Current
+        case JustifyStart then True
+        case _ then False
+      end
+    end
+
+  is_center: BOOL
+    do
+      match Current
+        case JustifyCenter then True
+        case _ then False
+      end
+    end
+
+  is_end: BOOL
+    do
+      match Current
+        case JustifyEnd then True
+        case _ then False
+      end
+    end
+
+  is_space_between: BOOL
+    do
+      match Current
+        case JustifySpaceBetween then True
+        case _ then False
+      end
+    end
+
+end

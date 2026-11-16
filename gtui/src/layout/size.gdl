@@ -1,15 +1,22 @@
--- The size a layout gives one child along its axis: a fixed number of cells, or a share of
--- what the fixed children leave, in proportion to a weight from 1 to 1000.
+-- The size a layout gives one child along its axis: a fixed number of cells, a share of
+-- spare space by weight (1 to 1000), a minimum floor that also grows, a maximum ceiling, or
+-- a percentage (0 to 100) of the container's axis span.
 module SIZE
 
 representation {NONE}
   | Fixed(cells: NAT)
   | Flex(weight: NAT)
+  | Min(floor: NAT)
+  | Max(ceiling: NAT)
+  | Percent(pct: NAT)
 
 invariant
   weighed: match Current
     case Fixed(_) then True
     case Flex(w) then w >= 1 and w <= 1000
+    case Min(_) then True
+    case Max(_) then True
+    case Percent(p) then p <= 100
   end
 
 create {ANY}
@@ -30,38 +37,177 @@ create {ANY}
       flexible: Result.is_flex
     end
 
+  -- At least `n` cells, sharing spare space with flexible children if any remains.
+  min(n: NAT): SIZE
+    do
+      Min(n)
+    ensure
+      is_min: Result.is_min
+      not_flexible: not Result.is_flex
+      min_set: Result.min_cells = n
+    end
+
+  -- Up to `n` cells when sharing spare space.
+  max(n: NAT): SIZE
+    do
+      Max(n)
+    ensure
+      is_max: Result.is_max
+      not_flexible: not Result.is_flex
+      max_set: Result.max_cells = n
+    end
+
+  -- `p` percent of the container's axis span, clamped to 100 above 100.
+  percent(p: NAT): SIZE
+    do
+      Percent(if p <= 100 then p else 100 end)
+    ensure
+      is_percent: Result.is_percent
+      not_flexible: not Result.is_flex
+      pct_set: p <= 100 implies Result.percentage = p
+      pct_clamped: p > 100 implies Result.percentage = 100
+      pct_bounded: Result.percentage <= 100
+    end
+
 feature {ANY}
+
+  is_fixed: BOOL
+    do
+      match Current
+        case Fixed(_) then True
+        case _ then False
+      end
+    end
 
   is_flex: BOOL
     do
       match Current
         case Fixed(_) then False
         case Flex(_) then True
+        case Min(_) then False
+        case Max(_) then False
+        case Percent(_) then False
       end
     end
 
-  -- The cells of a fixed size, and 0 for a flexible one.
+  is_min: BOOL
+    do
+      match Current
+        case Min(_) then True
+        case _ then False
+      end
+    end
+
+  is_max: BOOL
+    do
+      match Current
+        case Max(_) then True
+        case _ then False
+      end
+    end
+
+  is_percent: BOOL
+    do
+      match Current
+        case Percent(_) then True
+        case _ then False
+      end
+    end
+
+  -- The cells of a fixed size, and 0 for any other kind.
   fixed_cells: NAT
     do
       match Current
         case Fixed(n) then n
-        case Flex(_) then 0
+        case _ then 0
       end
     ensure
       flex_none: Current.is_flex implies Result = 0
     end
 
-  -- The weight of a flexible size, and 0 for a fixed one.
+  -- The minimum cell count of a `min` size, and 0 otherwise.
+  min_cells: NAT
+    do
+      match Current
+        case Min(n) then n
+        case _ then 0
+      end
+    end
+
+  -- The maximum cell count of a `max` size, and 0 otherwise.
+  max_cells: NAT
+    do
+      match Current
+        case Max(n) then n
+        case _ then 0
+      end
+    end
+
+  -- The percentage of a `percent` size (0..100), and 0 otherwise.
+  percentage: NAT
+    do
+      match Current
+        case Percent(p) then p
+        case _ then 0
+      end
+    ensure
+      bounded: Result <= 100
+    end
+
+  -- The weight of a flexible size, and 0 for any other kind.
   weight: NAT
     do
       match Current
-        case Fixed(_) then 0
         case Flex(w) then w
+        case _ then 0
       end
     ensure
       bounded: Result <= 1000
       fixed_none: not Current.is_flex implies Result = 0
       flex_some: Current.is_flex implies Result >= 1
+    end
+
+  -- The cells guaranteed to `Current` before spare space is distributed for axis length `span`.
+  base_cells(span: NAT): NAT
+    do
+      match Current
+        case Fixed(n) then if n <= 65535 then n else 65535 end
+        case Min(n) then if n <= 65535 then n else 65535 end
+        case Percent(p) then
+          let s = if span <= 65535 then span else 65535 end
+          let share = s * p / 100
+          if share <= 65535 then share else 65535 end
+        case Max(_) then 0
+        case Flex(_) then 0
+      end
+    ensure
+      bounded: Result <= 65535
+    end
+
+  -- The weight `Current` carries when sharing spare space (`Flex` weight, 1 for `Min`/`Max`,
+  -- 0 for `Fixed`/`Percent`).
+  grow_weight: NAT
+    do
+      match Current
+        case Flex(w) then w
+        case Min(_) then 1
+        case Max(_) then 1
+        case Fixed(_) then 0
+        case Percent(_) then 0
+      end
+    ensure
+      bounded: Result <= 1000
+    end
+
+  -- Cap `extra` spare cells at `Max`'s ceiling, leaving other sizes uncapped.
+  cap_extra(extra: NAT): NAT
+    do
+      match Current
+        case Max(c) then if extra <= c then extra else c end
+        case _ then extra
+      end
+    ensure
+      bounded: Result <= extra
     end
 
 end

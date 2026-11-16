@@ -1,0 +1,121 @@
+-- Semantic style presets (`dark`, `light`, `nord`, `dracula`) for framing panes,
+-- tabs, selections, highlighted lines, and syntax tokens.
+module THEME
+
+representation {NONE}
+  label: STRING
+  plain_style: STYLE
+  edge_style: STYLE
+  focused_edge_style: STYLE
+  tab_style: STYLE
+  chosen_style: STYLE
+  mark_style: STYLE
+  line_num_style: STYLE
+  kw_style: STYLE
+  str_style: STYLE
+  cmt_style: STYLE
+
+create {ANY}
+
+  make(name: STRING, base: STYLE, border: STYLE, focused_border: STYLE, active_tab: STYLE,
+       selection: STYLE, marked: STYLE, gutter: STYLE, keyword: STYLE, string: STYLE, comment: STYLE): THEME
+    do
+      { label = name, plain_style = base, edge_style = border, focused_edge_style = focused_border,
+        tab_style = active_tab, chosen_style = selection, mark_style = marked, line_num_style = gutter,
+        kw_style = keyword, str_style = string, cmt_style = comment }
+    end
+
+  -- The default 16-colour dark terminal theme.
+  dark: THEME
+    do
+      THEME.make(
+        "dark",
+        STYLE.plain,
+        STYLE.plain.fg(COLOR.gray),
+        STYLE.plain.fg(COLOR.cyan).bold,
+        STYLE.plain.fg(COLOR.bright_yellow).bold.underlined,
+        STYLE.plain.reversed,
+        STYLE.plain.bg(COLOR.blue),
+        STYLE.plain.fg(COLOR.gray),
+        STYLE.plain.fg(COLOR.bright_blue).bold,
+        STYLE.plain.fg(COLOR.yellow),
+        STYLE.plain.fg(COLOR.green))
+    end
+
+  -- A 256-colour light-background theme.
+  light: THEME
+    do
+      THEME.make(
+        "light",
+        STYLE.plain,
+        STYLE.plain.fg(COLOR.indexed(244)),
+        STYLE.plain.fg(COLOR.indexed(27)).bold,
+        STYLE.plain.fg(COLOR.indexed(130)).bold.underlined,
+        STYLE.plain.reversed,
+        STYLE.plain.bg(COLOR.indexed(153)),
+        STYLE.plain.fg(COLOR.indexed(244)),
+        STYLE.plain.fg(COLOR.indexed(25)).bold,
+        STYLE.plain.fg(COLOR.indexed(136)),
+        STYLE.plain.fg(COLOR.indexed(28)).italic)
+    end
+
+  -- A 24-bit TrueColor Nord palette theme.
+  nord: THEME
+    do
+      THEME.make(
+        "nord",
+        STYLE.plain,
+        STYLE.plain.fg(COLOR.rgb(76, 86, 106)),
+        STYLE.plain.fg(COLOR.rgb(136, 192, 208)).bold,
+        STYLE.plain.fg(COLOR.rgb(235, 203, 139)).bold.underlined,
+        STYLE.plain.reversed,
+        STYLE.plain.bg(COLOR.rgb(67, 76, 94)),
+        STYLE.plain.fg(COLOR.rgb(97, 110, 136)),
+        STYLE.plain.fg(COLOR.rgb(129, 161, 193)).bold,
+        STYLE.plain.fg(COLOR.rgb(235, 203, 139)),
+        STYLE.plain.fg(COLOR.rgb(163, 190, 140)).italic)
+    end
+
+  -- A 24-bit TrueColor Dracula palette theme.
+  dracula: THEME
+    do
+      THEME.make(
+        "dracula",
+        STYLE.plain,
+        STYLE.plain.fg(COLOR.rgb(98, 114, 164)),
+        STYLE.plain.fg(COLOR.rgb(139, 233, 253)).bold,
+        STYLE.plain.fg(COLOR.rgb(241, 250, 140)).bold.underlined,
+        STYLE.plain.reversed,
+        STYLE.plain.bg(COLOR.rgb(68, 71, 90)),
+        STYLE.plain.fg(COLOR.rgb(98, 114, 164)),
+        STYLE.plain.fg(COLOR.rgb(255, 121, 198)).bold,
+        STYLE.plain.fg(COLOR.rgb(241, 250, 140)),
+        STYLE.plain.fg(COLOR.rgb(80, 250, 123)).italic)
+    end
+
+  -- The preset matching `n`, or `dark` when unknown.
+  named(n: STRING): THEME
+    do
+      let k = n.trim
+      if k.equals("light") then THEME.light
+      else if k.equals("nord") then THEME.nord
+      else if k.equals("dracula") then THEME.dracula
+      else THEME.dark
+      end end end
+    end
+
+feature {ANY}
+
+  name: STRING do Current.label end
+  base: STYLE do Current.plain_style end
+  border: STYLE do Current.edge_style end
+  focused_border: STYLE do Current.focused_edge_style end
+  active_tab: STYLE do Current.tab_style end
+  selection: STYLE do Current.chosen_style end
+  marked: STYLE do Current.mark_style end
+  gutter: STYLE do Current.line_num_style end
+  keyword: STYLE do Current.kw_style end
+  string: STYLE do Current.str_style end
+  comment: STYLE do Current.cmt_style end
+
+end

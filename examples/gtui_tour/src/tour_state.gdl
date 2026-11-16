@@ -18,7 +18,9 @@ representation {NONE}
   log: LIST[STRING]
   commands: PALETTE
   commands_open: BOOL
+  help_shown: BOOL
   child: STRING
+  look: THEME
 
 create {ANY}
 
@@ -40,12 +42,16 @@ create {ANY}
         log = LIST.empty.prepend("Tab moves between panes; / opens the commands; q quits."),
         commands = PALETTE.make(TOUR_STATE.palette_entries),
         commands_open = False,
-        child = program }
+        help_shown = False,
+        child = program,
+        look = THEME.dark }
     end
 
   palette_entries: LIST[PALETTE_ENTRY]
     do
       LIST.empty
+        .prepend(PALETTE_ENTRY.make("help", "show keyboard shortcuts"))
+        .prepend(PALETTE_ENTRY.make("theme", "[NAME] dark, light, nord or dracula"))
         .prepend(PALETTE_ENTRY.make("top", "the source from its first line"))
         .prepend(PALETTE_ENTRY.make("shell", "[ARGS] run the program given to the tour, attached"))
         .prepend(PALETTE_ENTRY.make("quit", "leave the tour"))
@@ -180,6 +186,22 @@ feature {ANY}
       Current.commands_open
     end
 
+  help_open: BOOL
+    do
+      Current.help_shown
+    end
+
+  help_popup: POPUP
+    do
+      let text = "Tab: move between panes | m/f/o/p: switch tabs\nArrows/Enter: browse tree & mark problem line\n/: command palette | ?: toggle help | q: quit"
+      POPUP.of_text("Help", text, 50, 7).with_footer("Esc/? to close").with_padding(PADDING.symmetric(0, 1))
+    end
+
+  theme: THEME
+    do
+      Current.look
+    end
+
   area: RECT
     do
       RECT.sized(Current.wide, Current.high)
@@ -209,15 +231,30 @@ feature {ANY}
   -- A key, when the palette is closed.
   browse(k: KEY): TUI_NEXT[TOUR_STATE]
     do
-      match k
-        case Char(c) then
-          if c = 'q' then TUI_NEXT.quit(0)
-          else if c = '/' then TUI_NEXT.next({ Current with commands = PALETTE.make(TOUR_STATE.palette_entries), commands_open = True })
-          else TUI_NEXT.next(Current.in_pane(k))
-          end end
-        case Tab then TUI_NEXT.next({ Current with keys_at = Current.keys_at.next })
-        case KeysEnded then TUI_NEXT.quit(0)
-        case _ then TUI_NEXT.next(Current.in_pane(k))
+      if Current.help_shown then
+        match k
+          case Escape then TUI_NEXT.next({ Current with help_shown = False })
+          case Enter then TUI_NEXT.next({ Current with help_shown = False })
+          case KeysEnded then TUI_NEXT.quit(0)
+          case Char(c) then
+            if c = 'q' then TUI_NEXT.quit(0)
+            else if c = '?' then TUI_NEXT.next({ Current with help_shown = False })
+            else TUI_NEXT.next(Current)
+            end end
+          case _ then TUI_NEXT.next(Current)
+        end
+      else
+        match k
+          case Char(c) then
+            if c = 'q' then TUI_NEXT.quit(0)
+            else if c = '/' then TUI_NEXT.next({ Current with commands = PALETTE.make(TOUR_STATE.palette_entries), commands_open = True })
+            else if c = '?' then TUI_NEXT.next({ Current with help_shown = True })
+            else TUI_NEXT.next(Current.in_pane(k))
+            end end end
+          case Tab then TUI_NEXT.next({ Current with keys_at = Current.keys_at.next })
+          case KeysEnded then TUI_NEXT.quit(0)
+          case _ then TUI_NEXT.next(Current.in_pane(k))
+        end
       end
     end
 
@@ -289,6 +326,11 @@ feature {ANY}
         TUI_NEXT.next({ Current with log = LIST.empty })
       else if name.equals("top") then
         TUI_NEXT.next({ Current with source = Current.source.scrolled_to(0, 1) })
+      else if name.equals("theme") then
+        let t = THEME.named(args)
+        TUI_NEXT.next({ Current with look = t }.logged(GLYPHS.join("Theme ", t.name)))
+      else if name.equals("help") then
+        TUI_NEXT.next({ Current with help_shown = True })
       else if name.equals("shell") then
         if Current.child.is_empty then
           TUI_NEXT.next(Current.logged("No program was given to the tour to run."))
@@ -298,7 +340,7 @@ feature {ANY}
         end
       else
         TUI_NEXT.next(Current.logged(GLYPHS.join("Unknown command ", name)))
-      end end end end
+      end end end end end end
     end
 
 create {ANY}

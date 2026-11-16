@@ -33,6 +33,19 @@ fn assert_ok(out: &Output) {
     assert!(all(out).contains("0 errors, 0 warnings"), "{}", all(out));
 }
 
+fn cache_dir() -> &'static Path {
+    static CACHE: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+    CACHE.get_or_init(|| {
+        let dir = std::env::temp_dir().join("gardelc_gtui_shared_cache");
+        let _ = fs::create_dir_all(&dir);
+        let secret = dir.join("machine.secret");
+        if !secret.exists() {
+            let _ = fs::write(&secret, [0x42_u8; 32]);
+        }
+        dir
+    })
+}
+
 /// A directory of its own, where `gardelc` writes its build and cache.
 struct Dir(PathBuf);
 
@@ -47,7 +60,7 @@ impl Dir {
     fn check(&self, project: &Path) -> Output {
         Command::new(env!("CARGO_BIN_EXE_gardelc"))
             .current_dir(&self.0)
-            .env("GARDEL_CACHE_DIR", self.0.join("cache"))
+            .env("GARDEL_CACHE_DIR", cache_dir())
             .args(["--project", &project.to_string_lossy(), "--strict"])
             .output()
             .expect("gardelc runs")
@@ -78,19 +91,156 @@ fn run(bin: &Path, script: &str, env: &[(&str, &Path)]) -> Output {
 /// zero-width characters drawn on it.
 type Cell = (char, Vec<u32>, String);
 
-/// The columns a terminal gives `c`, for the characters these tests draw: CJK and Hangul
-/// two, combining accents and the zero-width joiner none.
+/// The columns a terminal gives `c`, including Unicode 16.0 wide characters/emoji and
+/// zero-width combining marks, variation selectors, and joiners.
 fn columns(c: char) -> usize {
     match c as u32 {
-        0x300..=0x36F | 0x200B..=0x200D => 0,
-        0x1100..=0x115F | 0x2E80..=0xA4CF | 0xAC00..=0xD7A3 | 0xF900..=0xFAFF | 0xFF00..=0xFF60 | 0x1F300..=0x1F64F => 2,
+        0x0300..=0x036F | 0x0897 | 0x200B..=0x200D | 0xFE00..=0xFE0F | 0xE0020..=0xE007F => 0,
+        0x1100..=0x115F
+        | 0x231A..=0x231B
+        | 0x2614..=0x2615
+        | 0x2705
+        | 0x270A..=0x270B
+        | 0x2728
+        | 0x274C
+        | 0x2E80..=0xA4CF
+        | 0xAC00..=0xD7A3
+        | 0xF900..=0xFAFF
+        | 0xFF00..=0xFF60
+        | 0x1F18E
+        | 0x1F191..=0x1F19A
+        | 0x1F200..=0x1F265
+        | 0x1F300..=0x1F64F
+        | 0x1F680..=0x1F6FF
+        | 0x1F7E0..=0x1F7F0
+        | 0x1F90C..=0x1F9FF
+        | 0x1FA70..=0x1FAFF
+        | 0x20000..=0x3FFFD => 2,
         _ => 1,
     }
+}
+
+fn is_zwj(c: char) -> bool {
+    c == '\u{200D}'
+}
+
+fn is_vs16(c: char) -> bool {
+    c == '\u{FE0F}'
+}
+
+fn is_skin_tone(c: char) -> bool {
+    matches!(c as u32, 0x1F3FB..=0x1F3FF)
+}
+
+fn is_regional_indicator(c: char) -> bool {
+    matches!(c as u32, 0x1F1E6..=0x1F1FF)
 }
 
 /// A VT terminal, enough of one to read a frame: cursor moves, SGR, clearing the screen, and
 /// the private modes, which it ignores. Every character must land on the screen of the size
 /// the script last gave, and no other control byte may appear.
+#[derive(Default)]
+struct SgrPen {
+    flags: [bool; 6],
+    fg: Vec<u32>,
+    bg: Vec<u32>,
+}
+
+fn parse_ext_sgr_color(params: &[u32], start_idx: usize, prefix: u32) -> (Vec<u32>, usize) {
+    match params.get(start_idx + 1) {
+        Some(&5) => {
+            let palette_index = *params.get(start_idx + 2).expect("extended indexed SGR");
+            (vec![prefix, 5, palette_index], 3)
+        }
+        Some(&2) => {
+            let red = *params.get(start_idx + 2).expect("extended rgb r");
+            let green = *params.get(start_idx + 3).expect("extended rgb g");
+            let blue = *params.get(start_idx + 4).expect("extended rgb b");
+            (vec![prefix, 2, red, green, blue], 5)
+        }
+        other => panic!("unexpected extended SGR {prefix} parameter {other:?} in {params:?}"),
+    }
+}
+
+impl SgrPen {
+    fn apply(&mut self, params: &[u32]) {
+        if params.is_empty() {
+            *self = Self::default();
+            return;
+        }
+        let mut idx = 0;
+        while idx < params.len() {
+            match params[idx] {
+                0 => {
+                    *self = Self::default();
+                    idx += 1;
+                }
+                1 => { self.flags[0] = true; idx += 1; }
+                2 => { self.flags[1] = true; idx += 1; }
+                3 => { self.flags[2] = true; idx += 1; }
+                4 => { self.flags[3] = true; idx += 1; }
+                7 => { self.flags[4] = true; idx += 1; }
+                9 => { self.flags[5] = true; idx += 1; }
+                22 => { self.flags[0] = false; self.flags[1] = false; idx += 1; }
+                23 => { self.flags[2] = false; idx += 1; }
+                24 => { self.flags[3] = false; idx += 1; }
+                27 => { self.flags[4] = false; idx += 1; }
+                29 => { self.flags[5] = false; idx += 1; }
+                code @ (30..=37 | 90..=97) => {
+                    self.fg = vec![code];
+                    idx += 1;
+                }
+                39 => {
+                    self.fg.clear();
+                    idx += 1;
+                }
+                38 => {
+                    let (color, used) = parse_ext_sgr_color(params, idx, 38);
+                    self.fg = color;
+                    idx += used;
+                }
+                code @ (40..=47 | 100..=107) => {
+                    self.bg = vec![code];
+                    idx += 1;
+                }
+                49 => {
+                    self.bg.clear();
+                    idx += 1;
+                }
+                48 => {
+                    let (color, used) = parse_ext_sgr_color(params, idx, 48);
+                    self.bg = color;
+                    idx += used;
+                }
+                other => panic!("unexpected SGR parameter {other} in {params:?}"),
+            }
+        }
+    }
+
+    fn canonical(&self) -> Vec<u32> {
+        const FLAG_CODES: [u32; 6] = [1, 2, 3, 4, 7, 9];
+        let mut out = Vec::new();
+        for (active, flag_code) in self.flags.iter().zip(FLAG_CODES) {
+            if *active {
+                out.push(flag_code);
+            }
+        }
+        out.extend_from_slice(&self.fg);
+        out.extend_from_slice(&self.bg);
+        out
+    }
+
+    fn full_reset_len(&self) -> usize {
+        let codes = self.canonical();
+        let param_bytes: usize = codes
+            .iter()
+            .map(|code| 1 + code.to_string().len())
+            .sum();
+        // `\x1b[0` + `;...` + `m`
+        4 + param_bytes
+    }
+}
+
 struct Terminal {
     sizes: Vec<(usize, usize)>,
     clears: usize,
@@ -99,6 +249,7 @@ struct Terminal {
     row: usize,
     col: usize,
     pen: Vec<u32>,
+    pen_state: SgrPen,
     /// The cells just before each clear of the screen.
     before_clear: Vec<Vec<Vec<Cell>>>,
     printed: usize,
@@ -106,11 +257,32 @@ struct Terminal {
     cursor: Option<(usize, usize)>,
     /// What each OSC 52 sequence put on the clipboard, base64 as sent.
     copies: Vec<String>,
+    sync_depth: usize,
+    sync_frames: usize,
+    after_zwj: bool,
+    ri_open: bool,
 }
 
 impl Terminal {
     fn new(sizes: Vec<(usize, usize)>) -> Self {
-        Self { sizes, clears: 0, size: None, grid: Vec::new(), row: 0, col: 0, pen: Vec::new(), before_clear: Vec::new(), printed: 0, cursor: None, copies: Vec::new() }
+        Self {
+            sizes,
+            clears: 0,
+            size: None,
+            grid: Vec::new(),
+            row: 0,
+            col: 0,
+            pen: Vec::new(),
+            pen_state: SgrPen::default(),
+            before_clear: Vec::new(),
+            printed: 0,
+            cursor: None,
+            copies: Vec::new(),
+            sync_depth: 0,
+            sync_frames: 0,
+            after_zwj: false,
+            ri_open: false,
+        }
     }
 
     fn feed(&mut self, bytes: &[u8]) {
@@ -150,6 +322,12 @@ impl Terminal {
                 match (private, fin) {
                     (true, 'h') if params == vec![25] => self.cursor = Some((self.row, self.col)),
                     (true, 'l') if params == vec![25] => self.cursor = None,
+                    (true, 'h') if params == vec![2026] => self.sync_depth += 1,
+                    (true, 'l') if params == vec![2026] => {
+                        assert!(self.sync_depth > 0, "unmatched ?2026l");
+                        self.sync_depth -= 1;
+                        self.sync_frames += 1;
+                    }
                     (true, 'h') | (true, 'l') => {}
                     (false, 'H') => {
                         let (w, h) = self.size.expect("a cursor move after a size is known");
@@ -158,8 +336,13 @@ impl Terminal {
                         assert!(params[1] >= 1 && params[1] as usize <= w, "column {} outside {w} columns", params[1]);
                         self.row = params[0] as usize - 1;
                         self.col = params[1] as usize - 1;
+                        self.after_zwj = false;
+                        self.ri_open = false;
                     }
-                    (false, 'm') => self.pen = params.into_iter().filter(|p| *p != 0).collect(),
+                    (false, 'm') => {
+                        self.pen_state.apply(&params);
+                        self.pen = self.pen_state.canonical();
+                    }
                     (false, 'J') => {
                         assert_eq!(params, vec![2], "only a whole clear");
                         self.before_clear.push(self.grid.clone());
@@ -168,6 +351,8 @@ impl Terminal {
                         if let Some((w, h)) = self.size {
                             self.grid = vec![vec![(' ', Vec::new(), String::new()); w]; h];
                         }
+                        self.after_zwj = false;
+                        self.ri_open = false;
                     }
                     other => panic!("unexpected sequence {other:?}"),
                 }
@@ -176,14 +361,37 @@ impl Terminal {
                 assert!(!c.is_control(), "a control character {:?} was written", c);
                 let (w, h) = self.size.expect("text after a size is known");
                 let n = columns(c);
-                if n == 0 {
-                    // A mark goes on the character before it, as a terminal draws it.
-                    assert!(self.col > 0, "a mark {c:?} with nothing before it");
+                let continues_cluster = self.col > 0
+                    && (self.after_zwj
+                        || is_zwj(c)
+                        || is_vs16(c)
+                        || is_skin_tone(c)
+                        || n == 0
+                        || (is_regional_indicator(c) && self.ri_open));
+                if continues_cluster {
                     let mut x = self.col - 1;
-                    if self.grid[self.row][x].0 == '\0' {
+                    let was_wide = self.grid[self.row][x].0 == '\0';
+                    if was_wide {
                         x -= 1;
                     }
                     self.grid[self.row][x].2.push(c);
+                    let promote = !was_wide
+                        && (is_vs16(c)
+                            || is_skin_tone(c)
+                            || (is_regional_indicator(c) && self.ri_open)
+                            || (self.after_zwj && n == 2));
+                    if promote {
+                        assert!(self.col < w, "promoted wide cluster at column {} outside {w}", self.col);
+                        let pen = self.grid[self.row][x].1.clone();
+                        if self.col + 1 < w && self.grid[self.row][self.col + 1].0 == '\0' {
+                            let right_pen = self.grid[self.row][self.col + 1].1.clone();
+                            self.grid[self.row][self.col + 1] = (' ', right_pen, String::new());
+                        }
+                        self.grid[self.row][self.col] = ('\0', pen, String::new());
+                        self.col += 1;
+                    }
+                    self.after_zwj = is_zwj(c);
+                    self.ri_open = false;
                     i += 1;
                     continue;
                 }
@@ -202,6 +410,8 @@ impl Terminal {
                 }
                 self.col += n;
                 self.printed += 1;
+                self.after_zwj = false;
+                self.ri_open = is_regional_indicator(c);
                 i += 1;
             }
         }
@@ -1025,4 +1235,1166 @@ fn a_paste_is_one_event_the_cursor_follows_the_text_and_a_copy_reaches_the_clipb
     let after_paste = text.split("event Pasted:%20th%C3%A9re\n").nth(1).expect("the paste is logged");
     let before_next = after_paste.split("event ").next().expect("commands");
     assert!(before_next.contains("command ReadKey\n"), "keys are read again after a paste:\n{before_next}");
+}
+
+#[test]
+fn gt2_extended_colors_styles_patch_and_themes_work() {
+    // 1. Contract checks for COLOR (standard, indexed, rgb, reset) and STYLE (italic, strikethrough, patch).
+    let source = "functions CLIENT
+
+feature {ANY}
+
+  f(n: NAT, r: NAT, g: NAT, b: NAT, s1: STYLE, s2: STYLE): BOOL
+    do
+      True
+    ensure
+      std_num: n < 16 implies (COLOR.standard(n).is_standard and COLOR.standard(n).number = n)
+      std_def: n >= 16 implies COLOR.standard(n).is_default
+      idx_set: n <= 255 implies (COLOR.indexed(n).is_indexed and COLOR.indexed(n).index = n)
+      idx_bound: COLOR.indexed(n).index <= 255
+      rgb_set: (r <= 255 and g <= 255 and b <= 255) implies
+        (COLOR.rgb(r, g, b).is_rgb and COLOR.rgb(r, g, b).r = r and COLOR.rgb(r, g, b).g = g and COLOR.rgb(r, g, b).b = b)
+      rgb_bound: COLOR.rgb(r, g, b).r <= 255 and COLOR.rgb(r, g, b).g <= 255 and COLOR.rgb(r, g, b).b <= 255
+      reset_kind: COLOR.reset.is_reset and not COLOR.reset.is_default
+      flags: STYLE.plain.italic.is_italic and STYLE.plain.strikethrough.is_strikethrough
+      patch_bold: s1.patch(s2).is_bold = (s1.is_bold or s2.is_bold)
+      patch_italic: s1.patch(s2).is_italic = (s1.is_italic or s2.is_italic)
+      patch_strike: s1.patch(s2).is_strikethrough = (s1.is_strikethrough or s2.is_strikethrough)
+    end
+
+end
+";
+    let p = Project::new("gtui_gt2_contracts", source);
+    assert_ok(&p.check());
+
+    // 2. Runtime rendering of indexed, rgb, italic, strikethrough, and patch(reset).
+    let prog = "reactive program GT2_RENDER
+
+feature {ANY}
+
+  update(n: NAT, e: EVENT): TUI_NEXT[NAT]
+    do
+      match e
+        case Key(k) then
+          match k
+            case Char(c) then if c = 'q' then TUI_NEXT.quit(0) else TUI_NEXT.next(n) end
+            case _ then TUI_NEXT.next(n)
+          end
+        case _ then TUI_NEXT.next(n)
+      end
+    end
+
+  view(n: NAT, blank: SCREEN): SCREEN
+    do
+      let base = STYLE.plain.fg(COLOR.rgb(0, 128, 255)).bg(COLOR.indexed(236)).bold
+      let patched = base.patch(STYLE.plain.fg(COLOR.reset).italic.strikethrough)
+      let a = blank.text(blank.area, 0, 0, \"rgb\", base)
+      a.text(blank.area, 0, 1, \"patched\", patched)
+    end
+
+  init(args: SEQ[STRING]): STEP[TUI[NAT]]
+    do
+      TUI.start(0, update, view)
+    end
+
+  step(t: TUI[NAT], e: EVENT): STEP[TUI[NAT]]
+    do
+      t.step(e)
+    end
+
+end
+";
+    let rp = Project::new("gtui_gt2_render", prog);
+    let src = rp.0 .0.join("p/src");
+    fs::rename(src.join("client.gdl"), src.join("gt2_render.gdl")).expect("named after its module");
+    assert_ok(&rp.check());
+    let script = "Resized:20:4 Key:113";
+    let ran = run(&rp.0.bin("gt2_render"), script, &[]);
+    assert_eq!(ran.status.code(), Some(0), "{}", all(&ran));
+    let mut term = Terminal::new(sizes(script));
+    term.feed(&ran.stdout);
+    assert_eq!(pen_at(&term.grid, "rgb"), vec![1, 38, 2, 0, 128, 255, 48, 5, 236]);
+    assert_eq!(pen_at(&term.grid, "patched"), vec![1, 3, 9, 48, 5, 236]);
+
+    // 3. Switching themes in gtui_tour: /theme nord (24-bit RGB + italic comments) and /theme light (256-color).
+    let dir = Dir::new("tour_themes");
+    assert_ok(&dir.check(&root().join("examples/gtui_tour")));
+    let tour_script = format!(
+        "Resized:90:24 Key:47 {}Key:Enter Resized:90:24 Key:47 {}Key:Enter Resized:90:24 Key:113",
+        keys("theme nord"),
+        keys("theme light")
+    );
+    let ran_tour = run(&dir.bin("gtui_tour"), &tour_script, &[]);
+    assert_eq!(ran_tour.status.code(), Some(0), "{}", all(&ran_tour));
+    let mut tour_term = Terminal::new(sizes(&tour_script));
+    tour_term.feed(&ran_tour.stdout);
+    let nord_shot = &tour_term.before_clear[2];
+    let light_shot = &tour_term.before_clear[3];
+    assert_eq!(pen_at(nord_shot, "╭─Modules"), vec![1, 38, 2, 136, 192, 208]);
+    assert_eq!(pen_at(nord_shot, "-- A row"), vec![3, 38, 2, 163, 190, 140]);
+    assert_eq!(pen_at(light_shot, "╭─Modules"), vec![1, 38, 5, 27]);
+    assert_eq!(pen_at(light_shot, "-- A row"), vec![3, 38, 5, 28]);
+}
+
+fn sgr_delta_stats(vt: &str) -> (usize, usize, usize) {
+    let bytes = vt.as_bytes();
+    let mut idx = 0;
+    let mut pen = SgrPen::default();
+    let mut delta_count = 0;
+    let mut actual_bytes = 0;
+    let mut full_reset_bytes = 0;
+    while idx < bytes.len() {
+        if bytes[idx] == 0x1b && bytes.get(idx + 1) == Some(&b'[') {
+            let mut end = idx + 2;
+            while end < bytes.len() && (bytes[end].is_ascii_digit() || bytes[end] == b';' || bytes[end] == b'?') {
+                end += 1;
+            }
+            if end < bytes.len() && bytes[end] == b'm' && bytes.get(idx + 2) != Some(&b'?') {
+                let raw = std::str::from_utf8(&bytes[idx + 2..end]).unwrap_or("");
+                let params: Vec<u32> = raw.split(';').map(|part| part.parse().unwrap_or(0)).collect();
+                pen.apply(&params);
+                if params.first() != Some(&0) {
+                    delta_count += 1;
+                }
+                actual_bytes += (end + 1) - idx;
+                full_reset_bytes += pen.full_reset_len();
+            }
+            idx = end + 1;
+        } else {
+            idx += 1;
+        }
+    }
+    (delta_count, actual_bytes, full_reset_bytes)
+}
+
+#[test]
+fn gt1_synchronized_output_and_sgr_deltas_work() {
+    // 1. Real session (gtui_tour): balanced ?2026h/?2026l, delta SGR savings, and VT equivalence.
+    let dir = Dir::new("gt1_tour");
+    assert_ok(&dir.check(&root().join("examples/gtui_tour")));
+    let tour_script = tour_session();
+    let ran_tour = run(&dir.bin("gtui_tour"), &tour_script, &[]);
+    assert_eq!(ran_tour.status.code(), Some(0), "{}", all(&ran_tour));
+    let mut tour_term = Terminal::new(sizes(&tour_script));
+    tour_term.feed(&ran_tour.stdout);
+    assert_eq!(tour_term.sync_depth, 0, "all ?2026h/?2026l pairs must close cleanly");
+    assert!(tour_term.sync_frames > 0, "gtui_tour must emit synchronized frames");
+    let tour_before = tour_term.before_clear.last().expect("final resize clear in tour_session");
+    assert_eq!(tour_before, &tour_term.grid, "tour incremental diff screen must equal full redraw");
+    let tour_vt = String::from_utf8(ran_tour.stdout.clone()).expect("valid utf-8 VT output");
+    let (tour_deltas, tour_sgr_bytes, tour_full_bytes) = sgr_delta_stats(&tour_vt);
+    assert!(tour_deltas > 0, "gtui_tour must emit delta SGR sequences without leading 0;");
+    assert!(
+        tour_sgr_bytes < tour_full_bytes,
+        "gtui_tour SGR bytes ({tour_sgr_bytes}) must be smaller than full-reset SGR bytes ({tour_full_bytes})"
+    );
+
+    // 2. Targeted SGR delta transitions, empty/idle frame suppression, and VT canonical equivalence.
+    let prog = "reactive program GT1_DELTAS
+
+feature {ANY}
+
+  update(step: NAT, e: EVENT): TUI_NEXT[NAT]
+    do
+      match e
+        case Key(k) then
+          match k
+            case Char(c) then
+              if c = 'q' then
+                TUI_NEXT.quit(0)
+              else if c = 'n' then
+                TUI_NEXT.next(1)
+              else
+                TUI_NEXT.next(step)
+              end end
+            case _ then TUI_NEXT.next(step)
+          end
+        case _ then TUI_NEXT.next(step)
+      end
+    end
+
+  view(step: NAT, blank: SCREEN): SCREEN
+    do
+      let s0 = STYLE.plain.bold.fg(COLOR.cyan)
+      let s1 = s0.dim.fg(COLOR.red)
+      let s2 = s1.bg(COLOR.rgb(10, 20, 30))
+      let s3 = s2.italic
+      let s4 = STYLE.plain.fg(COLOR.indexed(200))
+      let s5 = s4.bg(COLOR.indexed(236)).underlined.reversed.strikethrough
+      let a = blank.text(blank.area, 0, 0, \"AA\", s0)
+      let b = a.text(blank.area, 2, 0, \"BB\", s1)
+      let c = b.text(blank.area, 4, 0, \"CC\", s2)
+      let d = c.text(blank.area, 6, 0, \"DD\", s3)
+      let e = d.text(blank.area, 8, 0, \"EE\", s4)
+      let f = e.text(blank.area, 10, 0, \"FF\", s5)
+      let g = f.text(blank.area, 12, 0, \"GG\", STYLE.plain)
+      let empty_check = if VT_TEXT.frame(LIST.empty, False).byte_length = 0 then \"EMPTY_OK\" else \"EMPTY_FAIL\" end
+      let h = g.text(blank.area, 0, 2, empty_check, STYLE.plain)
+      if step > 0 then
+        h.text(blank.area, 0, 1, \"UPDATED\", s0)
+      else
+        h
+      end
+    end
+
+  init(args: SEQ[STRING]): STEP[TUI[NAT]]
+    do
+      TUI.start(0, update, view)
+    end
+
+  step(t: TUI[NAT], e: EVENT): STEP[TUI[NAT]]
+    do
+      t.step(e)
+    end
+
+end
+";
+    let rp = Project::new("gtui_gt1_deltas", prog);
+    let src = rp.0 .0.join("p/src");
+    fs::rename(src.join("client.gdl"), src.join("gt1_deltas.gdl")).expect("named after its module");
+    assert_ok(&rp.check());
+    let script = "Resized:40:6 Key:105 Key:110 Resized:40:6 Key:113";
+    let ran = run(&rp.0.bin("gt1_deltas"), script, &[]);
+    assert_eq!(ran.status.code(), Some(0), "{}", all(&ran));
+    let mut term = Terminal::new(sizes(script));
+    term.feed(&ran.stdout);
+    assert_eq!(term.sync_depth, 0);
+    // Initial draw + Key:110 diff + final Resized full redraw; Key:105 idle emits no frame.
+    assert_eq!(term.sync_frames, 3, "idle update must not emit a frame");
+    let before = term.before_clear.last().expect("final resize clear");
+    assert_eq!(before, &term.grid, "incremental frame matches full redraw");
+
+    let vt = String::from_utf8(ran.stdout.clone()).expect("valid utf-8 VT output");
+    for expected in [
+        "\x1b[?2026h",
+        "\x1b[?2026l",
+        "\x1b[1;36m",
+        "\x1b[2;31m",
+        "\x1b[48;2;10;20;30m",
+        "\x1b[3m",
+        "\x1b[0;38;5;200m",
+        "\x1b[4;7;9;48;5;236m",
+    ] {
+        assert!(vt.contains(expected), "missing expected sequence {expected:?} in:\n{vt:?}");
+    }
+    assert!(term.text().contains("EMPTY_OK"), "empty frame without clear must be 0 bytes");
+    assert!(term.text().contains("UPDATED"), "incremental update must draw UPDATED");
+    assert_eq!(pen_at(&term.grid, "AA"), vec![1, 36]);
+    assert_eq!(pen_at(&term.grid, "BB"), vec![1, 2, 31]);
+    assert_eq!(pen_at(&term.grid, "CC"), vec![1, 2, 31, 48, 2, 10, 20, 30]);
+    assert_eq!(pen_at(&term.grid, "DD"), vec![1, 2, 3, 31, 48, 2, 10, 20, 30]);
+    assert_eq!(pen_at(&term.grid, "EE"), vec![38, 5, 200]);
+    assert_eq!(pen_at(&term.grid, "FF"), vec![4, 7, 9, 38, 5, 200, 48, 5, 236]);
+    assert_eq!(pen_at(&term.grid, "GG"), Vec::<u32>::new());
+
+    let (deltas, actual_bytes, full_bytes) = sgr_delta_stats(&vt);
+    assert!(deltas >= 5);
+    assert!(actual_bytes < full_bytes, "expected {actual_bytes} < {full_bytes}");
+}
+
+#[test]
+fn gt3_layout_constraints_gaps_and_justify_work() {
+    // 1. Contract checks: SIZE constructors, JUSTIFY constructors, gap & justify LAYOUT guarantees.
+    let contracts = "functions CLIENT
+
+feature {ANY}
+
+  check_size_justify(n: NAT, p: NAT): BOOL
+    do
+      True
+    ensure
+      min_kind: SIZE.min(n).is_min and not SIZE.min(n).is_flex and SIZE.min(n).min_cells = n
+      max_kind: SIZE.max(n).is_max and not SIZE.max(n).is_flex and SIZE.max(n).max_cells = n
+      pct_ok: p <= 100 implies (SIZE.percent(p).is_percent and SIZE.percent(p).percentage = p)
+      pct_cap: p > 100 implies (SIZE.percent(p).is_percent and SIZE.percent(p).percentage = 100)
+      j_kinds: JUSTIFY.start.is_start and JUSTIFY.center.is_center and JUSTIFY.finish.is_end and
+        JUSTIFY.end_align.is_end and JUSTIFY.space_between.is_space_between
+    end
+
+  check_layout(r: RECT, sizes: LIST[SIZE], gap: NAT, justify: JUSTIFY, i: NAT, j: NAT): BOOL
+    do
+      let cg = LAYOUT.columns_with_gap(r, sizes, gap)
+      let rg = LAYOUT.rows_with_gap(r, sizes, gap)
+      let cj = LAYOUT.columns_justified(r, sizes, gap, justify)
+      let rj = LAYOUT.rows_justified(r, sizes, gap, justify)
+      if i < j and j < sizes.length then
+        check
+          c_in: LAYOUT.across_inside(cg, r.x, r, i)
+          r_in: LAYOUT.down_inside(rg, r.y, r, i)
+          cj_in: LAYOUT.across_inside(cj, r.x, r, i)
+          rj_in: LAYOUT.down_inside(rj, r.y, r, i)
+          c_ap: LAYOUT_APART.columns_apart(cg, r.x, r, i, j)
+          r_ap: LAYOUT_APART.rows_apart(rg, r.y, r, i, j)
+          cj_ap: LAYOUT_APART.columns_apart(cj, r.x, r, i, j)
+          rj_ap: LAYOUT_APART.rows_apart(rj, r.y, r, i, j)
+        end
+        True
+      else if i < sizes.length then
+        check
+          c_in: LAYOUT.across_inside(cg, r.x, r, i)
+          r_in: LAYOUT.down_inside(rg, r.y, r, i)
+          cj_in: LAYOUT.across_inside(cj, r.x, r, i)
+          rj_in: LAYOUT.down_inside(rj, r.y, r, i)
+        end
+        True
+      else
+        True
+      end end
+    ensure
+      same_len:
+        LAYOUT.columns_with_gap(r, sizes, gap).length = sizes.length and
+        LAYOUT.rows_with_gap(r, sizes, gap).length = sizes.length and
+        LAYOUT.columns_justified(r, sizes, gap, justify).length = sizes.length and
+        LAYOUT.rows_justified(r, sizes, gap, justify).length = sizes.length
+      cg_in: i < sizes.length implies LIST_OPS.at(LAYOUT.columns_with_gap(r, sizes, gap), i).inside(r)
+      rg_in: i < sizes.length implies LIST_OPS.at(LAYOUT.rows_with_gap(r, sizes, gap), i).inside(r)
+      cj_in: i < sizes.length implies LIST_OPS.at(LAYOUT.columns_justified(r, sizes, gap, justify), i).inside(r)
+      rj_in: i < sizes.length implies LIST_OPS.at(LAYOUT.rows_justified(r, sizes, gap, justify), i).inside(r)
+      cg_apart: (i < j and j < sizes.length) implies
+        LIST_OPS.at(LAYOUT.columns_with_gap(r, sizes, gap), i).disjoint(LIST_OPS.at(LAYOUT.columns_with_gap(r, sizes, gap), j))
+      rg_apart: (i < j and j < sizes.length) implies
+        LIST_OPS.at(LAYOUT.rows_with_gap(r, sizes, gap), i).disjoint(LIST_OPS.at(LAYOUT.rows_with_gap(r, sizes, gap), j))
+      cj_apart: (i < j and j < sizes.length) implies
+        LIST_OPS.at(LAYOUT.columns_justified(r, sizes, gap, justify), i).disjoint(LIST_OPS.at(LAYOUT.columns_justified(r, sizes, gap, justify), j))
+      rj_apart: (i < j and j < sizes.length) implies
+        LIST_OPS.at(LAYOUT.rows_justified(r, sizes, gap, justify), i).disjoint(LIST_OPS.at(LAYOUT.rows_justified(r, sizes, gap, justify), j))
+    end
+
+end
+";
+    let contract_proj = Project::new("gtui_gt3_contracts", contracts);
+    assert_ok(&contract_proj.check());
+
+    // 2. Runtime constraint, gap, overflow, and justification edge cases.
+    let prog = "reactive program GT3_LAYOUT
+
+feature {ANY}
+
+  update(n: NAT, e: EVENT): TUI_NEXT[NAT]
+    do
+      match e
+        case Key(k) then
+          match k
+            case Char(c) then if c = 'q' then TUI_NEXT.quit(0) else TUI_NEXT.next(n) end
+            case _ then TUI_NEXT.next(n)
+          end
+        case _ then TUI_NEXT.next(n)
+      end
+    end
+
+  fmt_spans(rs: LIST[RECT], horiz: BOOL): STRING
+    variant
+      rs.length
+    do
+      if rs.length = 0 then
+        \"\"
+      else
+        let pos = if horiz then rs.head.x else rs.head.y end
+        let len = if horiz then rs.head.width else rs.head.height end
+        let item = GLYPHS.join(GLYPHS.join(NUMBER_TEXT.nat_to_text(pos), \"-\"), NUMBER_TEXT.nat_to_text(len))
+        if rs.tail.length = 0 then item else GLYPHS.join(GLYPHS.join(item, \";\"), fmt_spans(rs.tail, horiz)) end
+      end
+    end
+
+  view(n: NAT, blank: SCREEN): SCREEN
+    do
+      let none: LIST[SIZE] = LIST.empty
+      let pct_s = none.prepend(SIZE.percent(25)).prepend(SIZE.percent(50)).prepend(SIZE.percent(25))
+      let mix_s = none.prepend(SIZE.min(20)).prepend(SIZE.flex(1)).prepend(SIZE.max(15))
+      let ovr_s = none.prepend(SIZE.min(30)).prepend(SIZE.min(30))
+      let cgap_s = none.prepend(SIZE.flex(1)).prepend(SIZE.flex(1))
+      let rgap_s = none.prepend(SIZE.flex(1)).prepend(SIZE.fixed(3))
+      let two_f = none.prepend(SIZE.fixed(10)).prepend(SIZE.fixed(10))
+      let three_f = two_f.prepend(SIZE.fixed(10))
+
+      let r0 = GLYPHS.join(\"PCT:\", fmt_spans(LAYOUT.columns(RECT.sized(80, 5), pct_s), True))
+      let r1 = GLYPHS.join(\"MIX:\", fmt_spans(LAYOUT.columns(RECT.sized(100, 5), mix_s), True))
+      let r2 = GLYPHS.join(\"OVR:\", fmt_spans(LAYOUT.columns(RECT.sized(40, 5), ovr_s), True))
+      let r3 = GLYPHS.join(\"CGAP:\", fmt_spans(LAYOUT.columns_with_gap(RECT.sized(100, 5), cgap_s, 10), True))
+      let r4 = GLYPHS.join(\"RGAP:\", fmt_spans(LAYOUT.rows_with_gap(RECT.sized(20, 10), rgap_s, 2), False))
+      let r5 = GLYPHS.join(\"HUGE:\", fmt_spans(LAYOUT.columns_with_gap(RECT.sized(15, 5), two_f, 20), True))
+      let r6 = GLYPHS.join(\"JS:\", fmt_spans(LAYOUT.columns_justified(RECT.sized(50, 5), two_f, 0, JUSTIFY.start), True))
+      let r7 = GLYPHS.join(\"JC:\", fmt_spans(LAYOUT.columns_justified(RECT.sized(50, 5), two_f, 0, JUSTIFY.center), True))
+      let r8 = GLYPHS.join(\"JE:\", fmt_spans(LAYOUT.columns_justified(RECT.sized(50, 5), two_f, 0, JUSTIFY.finish), True))
+      let r9 = GLYPHS.join(\"JB2:\", fmt_spans(LAYOUT.columns_justified(RECT.sized(50, 5), two_f, 0, JUSTIFY.space_between), True))
+      let r10 = GLYPHS.join(\"JB3:\", fmt_spans(LAYOUT.columns_justified(RECT.sized(50, 5), three_f, 0, JUSTIFY.space_between), True))
+      let r11 = GLYPHS.join(\"JRC:\", fmt_spans(LAYOUT.rows_justified(RECT.sized(10, 50), two_f, 0, JUSTIFY.center), False))
+
+      let a = blank.text(blank.area, 0, 0, r0, STYLE.plain)
+      let b = a.text(blank.area, 0, 1, r1, STYLE.plain)
+      let c = b.text(blank.area, 0, 2, r2, STYLE.plain)
+      let d = c.text(blank.area, 0, 3, r3, STYLE.plain)
+      let e = d.text(blank.area, 0, 4, r4, STYLE.plain)
+      let f = e.text(blank.area, 0, 5, r5, STYLE.plain)
+      let g = f.text(blank.area, 0, 6, r6, STYLE.plain)
+      let h = g.text(blank.area, 0, 7, r7, STYLE.plain)
+      let i = h.text(blank.area, 0, 8, r8, STYLE.plain)
+      let j = i.text(blank.area, 0, 9, r9, STYLE.plain)
+      let k = j.text(blank.area, 0, 10, r10, STYLE.plain)
+      k.text(blank.area, 0, 11, r11, STYLE.plain)
+    end
+
+  init(args: SEQ[STRING]): STEP[TUI[NAT]]
+    do
+      TUI.start(0, update, view)
+    end
+
+  step(t: TUI[NAT], e: EVENT): STEP[TUI[NAT]]
+    do
+      t.step(e)
+    end
+
+end
+";
+    let runtime_proj = Project::new("gtui_gt3_runtime", prog);
+    let src = runtime_proj.0 .0.join("p/src");
+    fs::rename(src.join("client.gdl"), src.join("gt3_layout.gdl")).expect("named after its module");
+    assert_ok(&runtime_proj.check());
+    let script = "Resized:80:14 Key:113";
+    let ran = run(&runtime_proj.0.bin("gt3_layout"), script, &[]);
+    assert_eq!(ran.status.code(), Some(0), "{}", all(&ran));
+    let mut term = Terminal::new(sizes(script));
+    term.feed(&ran.stdout);
+    let shown = term.text();
+    for expected in [
+        "PCT:0-20;20-40;60-20",
+        "MIX:0-15;15-32;47-53",
+        "OVR:0-30;30-10",
+        "CGAP:0-45;55-45",
+        "RGAP:0-3;5-5",
+        "HUGE:0-10;15-0",
+        "JS:0-10;10-10",
+        "JC:15-10;25-10",
+        "JE:30-10;40-10",
+        "JB2:0-10;40-10",
+        "JB3:0-10;20-10;40-10",
+        "JRC:15-10;25-10",
+    ] {
+        assert!(shown.contains(expected), "missing {expected:?} in:\n{shown}");
+    }
+}
+
+#[test]
+fn gt4_frame_borders_padding_titles_and_junction_merge_work() {
+    // 1. Formal contract checks for BORDER_KIND, PADDING, inner_padded, bottom_title_area, multi-title, and merge_borders.
+    let contracts = "functions CLIENT
+
+feature {ANY}
+
+  check_frame_ext(s: SCREEN, r: RECT, pad: PADDING, st: STYLE, title: STRING, titles: LIST[STRING], n: NAT): BOOL
+    do
+      True
+    ensure
+      kinds: BORDER_KIND.rounded.is_rounded and BORDER_KIND.plain.is_plain and
+        BORDER_KIND.double.is_double and BORDER_KIND.thick.is_thick
+      pad_none: PADDING.none.top = 0 and PADDING.none.right = 0 and PADDING.none.bottom = 0 and PADDING.none.left = 0
+      pad_uniform: PADDING.uniform(n).top = n and PADDING.uniform(n).left = n
+      pad_sym: PADDING.symmetric(n, n).top = n and PADDING.symmetric(n, n).right = n
+      pad_hv: PADDING.horizontal(n).left = n and PADDING.vertical(n).bottom = n
+      pad_in: FRAME.pad_rect(r, pad).inside(r)
+      inner_pad_in: FRAME.inner_padded(r, pad).inside(r)
+      bot_title_in: FRAME.bottom_title_area(r).inside(r) and FRAME.bottom_title_area(r).height <= 1
+      styled_dim: FRAME.draw_styled(s, r, BORDER_KIND.double, title, st, st).width = s.width and
+        FRAME.draw_styled(s, r, BORDER_KIND.double, title, st, st).height = s.height
+      titled_dim: FRAME.draw_titled(s, r, BORDER_KIND.thick, title, title, title, st, st).width = s.width and
+        FRAME.draw_titled(s, r, BORDER_KIND.thick, title, title, title, st, st).height = s.height
+      multi_dim: FRAME.draw_titles(s, r, BORDER_KIND.plain, titles, st, st).width = s.width and
+        FRAME.draw_titles(s, r, BORDER_KIND.plain, titles, st, st).height = s.height
+      merge_dim: FRAME.merge_borders(s, r).width = s.width and FRAME.merge_borders(s, r).height = s.height
+    end
+
+end
+";
+    let contract_proj = Project::new("gtui_gt4_contracts", contracts);
+    assert_ok(&contract_proj.check());
+
+    // 2. Runtime border kinds, padding, multi-title, and junction merging (┬, ┴, ├, ┤, ┼, ┳, ┻).
+    let prog = "reactive program GT4_FRAME
+
+feature {ANY}
+
+  update(n: NAT, e: EVENT): TUI_NEXT[NAT]
+    do
+      match e
+        case Key(k) then
+          match k
+            case Char(c) then if c = 'q' then TUI_NEXT.quit(0) else TUI_NEXT.next(n) end
+            case _ then TUI_NEXT.next(n)
+          end
+        case _ then TUI_NEXT.next(n)
+      end
+    end
+
+  view(n: NAT, blank: SCREEN): SCREEN
+    do
+      let st = STYLE.plain
+      let s0 = FRAME.draw_styled(blank, RECT.make(0, 0, 10, 4), BORDER_KIND.rounded, \"R\", st, st)
+      let s1 = FRAME.draw_styled(s0, RECT.make(11, 0, 10, 4), BORDER_KIND.plain, \"P\", st, st)
+      let s2 = FRAME.draw_styled(s1, RECT.make(22, 0, 10, 4), BORDER_KIND.double, \"D\", st, st)
+      let s3 = FRAME.draw_styled(s2, RECT.make(33, 0, 10, 4), BORDER_KIND.thick, \"T\", st, st)
+
+      let tr = RECT.make(0, 5, 24, 5)
+      let s4 = FRAME.draw_titled(s3, tr, BORDER_KIND.plain, \"Left\", \"Right\", \"Foot\", st, st)
+      let ip = FRAME.inner_padded(tr, PADDING.make(1, 2, 1, 3))
+      let s5 = s4.text(ip, ip.x, ip.y, \"PAD\", st)
+
+      let none: LIST[STRING] = LIST.empty
+      let multi = none.prepend(\"C\").prepend(\"B\").prepend(\"A\")
+      let s6 = FRAME.draw_titles(s5, RECT.make(25, 5, 25, 5), BORDER_KIND.double, multi, st, st)
+
+      let g0 = FRAME.draw(s6, RECT.make(0, 11, 11, 5), \"\", st, st)
+      let g1 = FRAME.draw(g0, RECT.make(10, 11, 11, 5), \"\", st, st)
+      let g2 = FRAME.draw(g1, RECT.make(0, 15, 11, 5), \"\", st, st)
+      let g3 = FRAME.draw(g2, RECT.make(10, 15, 11, 5), \"\", st, st)
+      let g4 = FRAME.merge_borders(g3, RECT.make(0, 11, 21, 9))
+
+      let h0 = FRAME.draw_styled(g4, RECT.make(25, 11, 11, 5), BORDER_KIND.thick, \"\", st, st)
+      let h1 = FRAME.draw_styled(h0, RECT.make(35, 11, 11, 5), BORDER_KIND.thick, \"\", st, st)
+      FRAME.merge_borders(h1, RECT.make(25, 11, 21, 5))
+    end
+
+  init(args: SEQ[STRING]): STEP[TUI[NAT]]
+    do
+      TUI.start(0, update, view)
+    end
+
+  step(t: TUI[NAT], e: EVENT): STEP[TUI[NAT]]
+    do
+      t.step(e)
+    end
+
+end
+";
+    let runtime_proj = Project::new("gtui_gt4_runtime", prog);
+    let src = runtime_proj.0 .0.join("p/src");
+    fs::rename(src.join("client.gdl"), src.join("gt4_frame.gdl")).expect("named after its module");
+    assert_ok(&runtime_proj.check());
+    let script = "Resized:50:22 Key:113";
+    let ran = run(&runtime_proj.0.bin("gt4_frame"), script, &[]);
+    assert_eq!(ran.status.code(), Some(0), "{}", all(&ran));
+    let mut term = Terminal::new(sizes(script));
+    term.feed(&ran.stdout);
+    let shown = term.text();
+
+    // All 4 border styles
+    assert_eq!((term.grid[0][0].0, term.grid[0][9].0, term.grid[3][0].0, term.grid[3][9].0), ('╭', '╮', '╰', '╯'));
+    assert_eq!((term.grid[0][11].0, term.grid[0][20].0, term.grid[3][11].0, term.grid[3][20].0), ('┌', '┐', '└', '┘'));
+    assert_eq!((term.grid[0][22].0, term.grid[0][31].0, term.grid[3][22].0, term.grid[3][31].0), ('╔', '╗', '╚', '╝'));
+    assert_eq!((term.grid[0][33].0, term.grid[0][42].0, term.grid[3][33].0, term.grid[3][42].0), ('┏', '┓', '┗', '┛'));
+
+    // Titled + inner_padded + multi-title
+    assert!(shown.contains("┌─ Left ─────── Right ─┐"), "top left+right title:\n{shown}");
+    assert!(shown.contains("└─ Foot ─"), "bottom title:\n{shown}");
+    assert_eq!((term.grid[7][4].0, term.grid[7][5].0, term.grid[7][6].0), ('P', 'A', 'D'));
+    assert!(shown.contains("╔═ A ═ B ═ C "), "multi-title:\n{shown}");
+
+    // 2x2 rounded border merge junctions and preserved outer corners
+    assert_eq!(term.grid[11][10].0, '┬', "top shared junction:\n{shown}");
+    assert_eq!(term.grid[19][10].0, '┴', "bottom shared junction:\n{shown}");
+    assert_eq!(term.grid[15][0].0, '├', "left shared junction:\n{shown}");
+    assert_eq!(term.grid[15][20].0, '┤', "right shared junction:\n{shown}");
+    assert_eq!(term.grid[15][10].0, '┼', "center 4-way junction:\n{shown}");
+    assert_eq!((term.grid[11][0].0, term.grid[11][20].0, term.grid[19][0].0, term.grid[19][20].0), ('╭', '╮', '╰', '╯'));
+
+    // Thick border merge junctions
+    assert_eq!(term.grid[11][35].0, '┳', "thick top junction:\n{shown}");
+    assert_eq!(term.grid[15][35].0, '┻', "thick bottom junction:\n{shown}");
+    assert_eq!((term.grid[11][25].0, term.grid[11][45].0, term.grid[15][25].0, term.grid[15][45].0), ('┏', '┓', '┗', '┛'));
+}
+
+#[test]
+fn gt5_paragraph_wrapping_alignment_and_scroll_work() {
+    // 1. Formal contract checks for ALIGN, WRAP_MODE, and PARAGRAPH.
+    let contracts = "functions CLIENT
+
+feature {ANY}
+
+  check_paragraph(s: SCREEN, r: RECT, p: PARAGRAPH, st: STYLE, w: NAT, rows: NAT, t: NAT, text: STRING): BOOL
+    do
+      True
+    ensure
+      align_kinds: ALIGN.left.is_left and ALIGN.center.is_center and ALIGN.right.is_right
+      align_bounds: ALIGN.left.offset(w, rows) <= rows and ALIGN.center.offset(w, rows) <= rows and ALIGN.right.offset(w, rows) <= rows
+      wrap_kinds: WRAP_MODE.word.is_word and WRAP_MODE.wrap_word.is_word and
+        WRAP_MODE.char_wrap.is_char and WRAP_MODE.wrap_char.is_char and
+        WRAP_MODE.none.is_none and WRAP_MODE.no_wrap.is_none
+      of_text_zero: PARAGRAPH.of_text(text).top = 0 and PARAGRAPH.of_text(text).left_col = 0
+      last_bound: p.last_top(w, rows) <= p.line_count(w)
+      scroll_bound: p.scrolled_to(t, w, rows).top <= p.last_top(w, rows)
+      draw_dim: p.draw(s, r, st).width = s.width and p.draw(s, r, st).height = s.height
+    end
+
+end
+";
+    let contract_proj = Project::new("gtui_gt5_contracts", contracts);
+    assert_ok(&contract_proj.check());
+
+    // 2. Runtime WrapWord, WrapChar (ASCII + wide chars), NoWrap + horizontal scroll, ALIGN, and scrolling.
+    let prog = "reactive program GT5_PARAGRAPH
+
+feature {ANY}
+
+  update(p: PARAGRAPH, e: EVENT): TUI_NEXT[PARAGRAPH]
+    do
+      match e
+        case Key(k) then
+          match k
+            case Char(c) then if c = 'q' then TUI_NEXT.quit(0) else TUI_NEXT.next(p) end
+            case _ then TUI_NEXT.next(p.on_key(k, RECT.make(0, 12, 12, 3)))
+          end
+        case _ then TUI_NEXT.next(p)
+      end
+    end
+
+  view(p: PARAGRAPH, blank: SCREEN): SCREEN
+    do
+      let st = STYLE.plain
+      let s0 = PARAGRAPH.of_text(\"alpha beta gamma delta\").draw(blank, RECT.make(0, 0, 11, 4), st)
+      let s1 = PARAGRAPH.of_text(\"supercalifragilistic\").draw(s0, RECT.make(14, 0, 10, 4), st)
+      let s2 = PARAGRAPH.of_text(\"abcdefghij\").wrap_char.draw(s1, RECT.make(28, 0, 4, 4), st)
+      let s3 = PARAGRAPH.of_text(\"0123456789\").no_wrap.with_scroll_x(3).draw(s2, RECT.make(0, 5, 5, 1), st)
+      let s4 = s3.text(blank.area, 5, 5, \"|\", st)
+      let s5 = PARAGRAPH.of_text(\"hi\").align_left.draw(s4, RECT.make(0, 7, 10, 1), st)
+      let s6 = PARAGRAPH.of_text(\"hi\").align_center.draw(s5, RECT.make(0, 8, 10, 1), st)
+      let s7 = PARAGRAPH.of_text(\"hi\").align_right.draw(s6, RECT.make(0, 9, 10, 1), st)
+      let s8 = PARAGRAPH.of_text(\"日本語a\").wrap_char.draw(s7, RECT.make(28, 5, 3, 3), st)
+      let s9 = p.draw(s8, RECT.make(0, 12, 12, 3), st)
+      let clamped = p.scroll_down(99, 12, 3)
+      let info = GLYPHS.join(NUMBER_TEXT.nat_to_text(clamped.top), \"/\")
+      let full_info = GLYPHS.join(info, NUMBER_TEXT.nat_to_text(p.last_top(12, 3)))
+      s9.text(blank.area, 20, 12, full_info, st)
+    end
+
+  init(args: SEQ[STRING]): STEP[TUI[PARAGRAPH]]
+    do
+      let sample = PARAGRAPH.of_text(\"row0 one two\\nrow1 three four\\nrow2 five\")
+      TUI.start(sample, update, view)
+    end
+
+  step(t: TUI[PARAGRAPH], e: EVENT): STEP[TUI[PARAGRAPH]]
+    do
+      t.step(e)
+    end
+
+end
+";
+    let runtime_proj = Project::new("gtui_gt5_runtime", prog);
+    let src = runtime_proj.0 .0.join("p/src");
+    fs::rename(src.join("client.gdl"), src.join("gt5_paragraph.gdl")).expect("named after its module");
+    assert_ok(&runtime_proj.check());
+    let script = "Resized:40:18 Resized:40:18 Key:Down Resized:40:18 Key:PageDown Key:End Resized:40:18 Key:113";
+    let ran = run(&runtime_proj.0.bin("gt5_paragraph"), script, &[]);
+    assert_eq!(ran.status.code(), Some(0), "{}", all(&ran));
+    let mut term = Terminal::new(sizes(script));
+    term.feed(&ran.stdout);
+
+    let slice = |grid: &[Vec<Cell>], row: usize, x0: usize, x1: usize| -> String {
+        grid[row][x0..x1].iter().map(|cell| cell.0).filter(|ch| *ch != '\0').collect()
+    };
+
+    let init_shot = &term.before_clear[2];
+    // WrapWord
+    assert_eq!(slice(init_shot, 0, 0, 11), "alpha beta ");
+    assert_eq!(slice(init_shot, 1, 0, 11), "gamma delta");
+    assert_eq!(slice(init_shot, 0, 14, 24), "supercalif");
+    assert_eq!(slice(init_shot, 1, 14, 24), "ragilistic");
+
+    // WrapChar (ASCII and wide Japanese characters in width 3)
+    assert_eq!(slice(init_shot, 0, 28, 32), "abcd");
+    assert_eq!(slice(init_shot, 1, 28, 32), "efgh");
+    assert_eq!(slice(init_shot, 2, 28, 32), "ij  ");
+    assert_eq!(slice(init_shot, 5, 28, 31), "日 ");
+    assert_eq!(slice(init_shot, 6, 28, 31), "本 ");
+    assert_eq!(slice(init_shot, 7, 28, 31), "語a");
+
+    // NoWrap + horizontal scroll clipped to 5 columns
+    assert_eq!(slice(init_shot, 5, 0, 6), "34567|");
+
+    // Alignment (left @ 0, center @ 4, right @ 8)
+    assert_eq!(slice(init_shot, 7, 0, 10), "hi        ");
+    assert_eq!(slice(init_shot, 8, 0, 10), "    hi    ");
+    assert_eq!(slice(init_shot, 9, 0, 10), "        hi");
+
+    // Initial scrolled lines (`row0 one two`, `row1 three four` wrapped to width 12 -> `row0 one two`, `row1 three`, `four`, `row2 five` => 4 lines, last_top(12, 3) = 1)
+    assert_eq!(slice(init_shot, 12, 0, 12), "row0 one two");
+    assert_eq!(slice(init_shot, 13, 0, 12), "row1 three  ");
+    assert_eq!(slice(init_shot, 14, 0, 12), "four        ");
+    assert!(slice(init_shot, 12, 20, 26).starts_with("1/1"));
+
+    // After Key:Down -> top becomes 1
+    let down_shot = &term.before_clear[3];
+    assert_eq!(slice(down_shot, 12, 0, 12), "row1 three  ");
+    assert_eq!(slice(down_shot, 13, 0, 12), "four        ");
+    assert_eq!(slice(down_shot, 14, 0, 12), "row2 five   ");
+
+    // After PageDown + End -> stays clamped at last_top = 1
+    assert_eq!(slice(&term.grid, 12, 0, 12), "row1 three  ");
+    assert_eq!(slice(&term.grid, 14, 0, 12), "row2 five   ");
+}
+
+#[test]
+fn gt6_popup_clear_and_centered_rect_work() {
+    // 1. Formal contract checks for RECT.centered / centered_percent, CLEAR, and POPUP.
+    let contracts = "functions CLIENT
+
+feature {ANY}
+
+  check_popup(s: SCREEN, r: RECT, p: POPUP, w: NAT, h: NAT, pw: NAT, ph: NAT, st: STYLE): BOOL
+    do
+      True
+    ensure
+      centered_in: r.centered(w, h).inside(r)
+      centered_pct_in: r.centered_percent(pw, ph).inside(r)
+      clear_area_dim: CLEAR.area(s, r).width = s.width and CLEAR.area(s, r).height = s.height
+      clear_styled_dim: CLEAR.styled(s, r, st).width = s.width and CLEAR.styled(s, r, st).height = s.height
+      place_in: POPUP.place(r, w, h).inside(r)
+      bounds_in: p.bounds(r).inside(r)
+      content_in: p.content_area(r).inside(r)
+      draw_dim: p.draw(s, r, st, st, st).width = s.width and p.draw(s, r, st, st, st).height = s.height
+    end
+
+end
+";
+    let contract_proj = Project::new("gtui_gt6_contracts", contracts);
+    assert_ok(&contract_proj.check());
+
+    // 2. Runtime RECT.centered, CLEAR (including over wide characters), and POPUP overlay.
+    let prog = "reactive program GT6_POPUP
+
+feature {ANY}
+
+  update(n: NAT, e: EVENT): TUI_NEXT[NAT]
+    do
+      match e
+        case Key(k) then
+          match k
+            case Char(c) then if c = 'q' then TUI_NEXT.quit(0) else TUI_NEXT.next(n) end
+            case _ then TUI_NEXT.next(n)
+          end
+        case _ then TUI_NEXT.next(n)
+      end
+    end
+
+  fmt_rect(r: RECT): STRING
+    do
+      let a = GLYPHS.join(NUMBER_TEXT.nat_to_text(r.x), \",\")
+      let b = GLYPHS.join(a, NUMBER_TEXT.nat_to_text(r.y))
+      let c = GLYPHS.join(b, \",\")
+      let d = GLYPHS.join(c, NUMBER_TEXT.nat_to_text(r.width))
+      let e = GLYPHS.join(d, \",\")
+      GLYPHS.join(e, NUMBER_TEXT.nat_to_text(r.height))
+    end
+
+  view(n: NAT, blank: SCREEN): SCREEN
+    do
+      let st = STYLE.plain
+      let bg = blank.fill(blank.area, 'X', st)
+      let wide_bg = bg.text(blank.area, 19, 9, \"本本\", st)
+      let c1 = RECT.make(10, 4, 40, 20).centered(20, 8)
+      let c2 = RECT.make(5, 2, 10, 6).centered(30, 20)
+      let c3 = RECT.make(0, 0, 80, 20).centered_percent(50, 50)
+      let modal = POPUP.of_text(\"Modal\", \"Hello overlay!\", 20, 6)
+        .with_footer(\"OK\")
+        .with_padding(PADDING.symmetric(0, 1))
+      let s0 = modal.draw(wide_bg, RECT.make(10, 4, 40, 14), st, st.bold.fg(COLOR.cyan), st.bold)
+      let coords = GLYPHS.join(fmt_rect(c1), GLYPHS.join(\"|\", GLYPHS.join(fmt_rect(c2), GLYPHS.join(\"|\", fmt_rect(c3)))))
+      s0.text(blank.area, 0, 0, coords, st)
+    end
+
+  init(args: SEQ[STRING]): STEP[TUI[NAT]]
+    do
+      TUI.start(0, update, view)
+    end
+
+  step(t: TUI[NAT], e: EVENT): STEP[TUI[NAT]]
+    do
+      t.step(e)
+    end
+
+end
+";
+    let runtime_proj = Project::new("gtui_gt6_runtime", prog);
+    let src = runtime_proj.0 .0.join("p/src");
+    fs::rename(src.join("client.gdl"), src.join("gt6_popup.gdl")).expect("named after its module");
+    assert_ok(&runtime_proj.check());
+    let script = "Resized:60:20 Key:113";
+    let ran = run(&runtime_proj.0.bin("gt6_popup"), script, &[]);
+    assert_eq!(ran.status.code(), Some(0), "{}", all(&ran));
+    let mut term = Terminal::new(sizes(script));
+    term.feed(&ran.stdout);
+    let shown = term.text();
+
+    assert!(shown.contains("20,10,20,8|5,2,10,6|20,5,40,10"), "centered coordinates:\n{shown}");
+    // Popup bounds for centered(20, 6) inside (10, 4, 40, 14) -> x = 20..40, y = 8..14.
+    assert!(shown.contains("╭─ Modal ─"), "modal title:\n{shown}");
+    assert!(shown.contains("│ Hello overlay!   │"), "cleared & padded modal body:\n{shown}");
+    assert!(shown.contains("╰─ OK ─"), "modal footer:\n{shown}");
+    // Surrounding background cells remain untouched `'X'`.
+    assert_eq!(term.grid[9][17].0, 'X', "outside popup on left remains 'X':\n{shown}");
+    assert_eq!(term.grid[9][19].0, ' ', "cut wide char half mended to space:\n{shown}");
+    assert_eq!(term.grid[9][40].0, 'X', "outside popup on right remains 'X':\n{shown}");
+    assert_eq!(term.grid[9][20].0, '│', "popup left border:\n{shown}");
+    assert_eq!(term.grid[9][21].0, ' ', "popup cleared interior:\n{shown}");
+
+    // 3. Help popup overlay in gtui_tour (`?` opens, `Escape` dismisses).
+    let dir = Dir::new("tour_help_popup");
+    assert_ok(&dir.check(&root().join("examples/gtui_tour")));
+    let tour_script = "Resized:90:24 Key:63 Resized:90:24 Key:Escape Resized:90:24 Key:113";
+    let ran_tour = run(&dir.bin("gtui_tour"), tour_script, &[]);
+    assert_eq!(ran_tour.status.code(), Some(0), "{}", all(&ran_tour));
+    let mut tour_term = Terminal::new(sizes(tour_script));
+    tour_term.feed(&ran_tour.stdout);
+    let help_shot = screen_text(&tour_term.before_clear[2]);
+    let restored_shot = screen_text(&tour_term.before_clear[3]);
+    assert!(help_shot.contains("╭─ Help ─"), "tour help popup header:\n{help_shot}");
+    assert!(help_shot.contains("Tab: move between panes"), "tour help popup body:\n{help_shot}");
+    assert!(help_shot.contains("╰─ Esc/? to close ─"), "tour help popup footer:\n{help_shot}");
+    assert!(!restored_shot.contains("Esc/? to close"), "Escape dismisses help overlay:\n{restored_shot}");
+    assert!(restored_shot.contains("module TABS"), "underlying source view restored:\n{restored_shot}");
+}
+
+#[test]
+fn gt7_table_gauge_sparkline_and_scrollbar_work() {
+    // 1. Formal contract checks for TABLE, GAUGE, SPARKLINE, and SCROLLBAR.
+    let contracts = "functions CLIENT
+
+feature {ANY}
+
+  check_gt7(s: SCREEN, r: RECT, tbl: TABLE, g: GAUGE, sp: SPARKLINE, sb: SCROLLBAR,
+            i: NAT, rows: NAT, n: NAT, track_len: NAT, k: KEY, st: STYLE): BOOL
+    do
+      True
+    ensure
+      tbl_sel: tbl.selected < tbl.row_count or (tbl.row_count = 0 and tbl.selected = 0)
+      tbl_top: tbl.top <= tbl.selected
+      tbl_some: tbl.selected_row.is_some = (tbl.row_count > 0)
+      tbl_set: tbl.row_count > 0 implies tbl.select(i, rows).selected = (if i < tbl.row_count then i else tbl.row_count - 1 end)
+      tbl_key: tbl.on_key(k, rows).row_count = tbl.row_count
+      tbl_draw: tbl.draw(s, r, st, st, st).width = s.width and tbl.draw(s, r, st, st, st).height = s.height
+      gauge_pct: g.percentage <= 100 and GAUGE.percent(n).percentage <= 100 and GAUGE.ratio(i, n).denominator > 0
+      gauge_draw: g.draw(s, r, st, st).width = s.width and g.draw(s, r, st, st).height = s.height
+      spark_draw: sp.draw(s, r, st).width = s.width and sp.draw(s, r, st).height = s.height
+      sb_thumb: sb.thumb_size(track_len) <= track_len and (track_len > 0 implies sb.thumb_size(track_len) >= 1)
+      sb_start: sb.thumb_start(track_len) + sb.thumb_size(track_len) <= track_len
+      sb_draw: sb.draw(s, r, st, st).width = s.width and sb.draw(s, r, st, st).height = s.height
+    end
+
+end
+";
+    let contract_proj = Project::new("gtui_gt7_contracts", contracts);
+    assert_ok(&contract_proj.check());
+
+    // 2. Runtime & VT snapshot checks for TABLE, GAUGE, SPARKLINE, and SCROLLBAR.
+    let prog = "reactive program GT7_WIDGETS
+
+feature {ANY}
+
+  update(tbl: TABLE, e: EVENT): TUI_NEXT[TABLE]
+    do
+      match e
+        case Key(k) then
+          match k
+            case Char(c) then if c = 'q' then TUI_NEXT.quit(0) else TUI_NEXT.next(tbl) end
+            case _ then TUI_NEXT.next(tbl.on_key(k, 2))
+          end
+        case _ then TUI_NEXT.next(tbl)
+      end
+    end
+
+  make_row(id: STRING, name: STRING, load: STRING): LIST[STRING]
+    do
+      let none: LIST[STRING] = LIST.empty
+      none.prepend(load).prepend(name).prepend(id)
+    end
+
+  view(tbl: TABLE, blank: SCREEN): SCREEN
+    do
+      let base = STYLE.plain
+      let hdr_st = STYLE.plain.bold.fg(COLOR.cyan)
+      let sel_st = STYLE.plain.reversed
+      let s0 = tbl.draw(blank, RECT.make(0, 0, 24, 3), base, hdr_st, sel_st)
+
+      let unfilled_st = STYLE.plain.fg(COLOR.gray)
+      let filled_st = STYLE.plain.fg(COLOR.green)
+      let s1 = GAUGE.percent(50).draw(s0, RECT.make(0, 4, 16, 1), unfilled_st, filled_st)
+      let s2 = GAUGE.ratio(5, 8).with_label(\"5/8\").draw(s1, RECT.make(0, 6, 10, 1), unfilled_st, filled_st)
+
+      let none_n: LIST[NAT] = LIST.empty
+      let samples = none_n.prepend(8).prepend(7).prepend(6).prepend(5).prepend(4).prepend(3).prepend(2).prepend(1).prepend(0)
+      let s3 = SPARKLINE.make(samples).draw(s2, RECT.make(0, 8, 9, 1), STYLE.plain.fg(COLOR.yellow))
+
+      let s4 = SCROLLBAR.vertical(10, 5, 0).draw(s3, RECT.make(20, 4, 1, 6), base, base)
+      let s5 = SCROLLBAR.vertical(10, 5, 5).draw(s4, RECT.make(22, 4, 1, 6), base, base)
+      SCROLLBAR.horizontal(10, 5, 5).draw(s5, RECT.make(0, 10, 8, 1), base, base)
+    end
+
+  init(args: SEQ[STRING]): STEP[TUI[TABLE]]
+    do
+      let none_s: LIST[SIZE] = LIST.empty
+      let widths = none_s.prepend(SIZE.fixed(4)).prepend(SIZE.flex(1)).prepend(SIZE.fixed(4))
+      let hdr = make_row(\"ID\", \"Name\", \"Load\")
+      let none_rows: LIST[LIST[STRING]] = LIST.empty
+      let rows = none_rows
+        .prepend(make_row(\"r3\", \"delta\", \"40%\"))
+        .prepend(make_row(\"r2\", \"gamma\", \"30%\"))
+        .prepend(make_row(\"r1\", \"beta\", \"20%\"))
+        .prepend(make_row(\"r0\", \"alpha\", \"10%\"))
+      TUI.start(TABLE.with_headers(widths, hdr, rows), update, view)
+    end
+
+  step(t: TUI[TABLE], e: EVENT): STEP[TUI[TABLE]]
+    do
+      t.step(e)
+    end
+
+end
+";
+    let runtime_proj = Project::new("gtui_gt7_runtime", prog);
+    let src = runtime_proj.0 .0.join("p/src");
+    fs::rename(src.join("client.gdl"), src.join("gt7_widgets.gdl")).expect("named after its module");
+    assert_ok(&runtime_proj.check());
+    let script = "Resized:30:12 Resized:30:12 Key:Down Resized:30:12 Key:End Resized:30:12 Key:113";
+    let ran = run(&runtime_proj.0.bin("gt7_widgets"), script, &[]);
+    assert_eq!(ran.status.code(), Some(0), "{}", all(&ran));
+    let mut term = Terminal::new(sizes(script));
+    term.feed(&ran.stdout);
+
+    let slice = |grid: &[Vec<Cell>], row: usize, x0: usize, x1: usize| -> String {
+        grid[row][x0..x1].iter().map(|cell| cell.0).filter(|ch| *ch != '\0').collect()
+    };
+
+    // Initial snapshot: header in cyan+bold, r0 selected (reversed), r1 plain.
+    let shot0 = &term.before_clear[2];
+    assert_eq!(slice(shot0, 0, 0, 24), "ID   Name           Load");
+    assert_eq!(slice(shot0, 1, 0, 24), "r0   alpha          10% ");
+    assert_eq!(slice(shot0, 2, 0, 24), "r1   beta           20% ");
+    assert_eq!(pen_at(shot0, "ID"), vec![1, 36]);
+    assert_eq!(pen_at(shot0, "r0   alpha"), vec![7]);
+    assert_eq!(pen_at(shot0, "beta"), Vec::<u32>::new());
+
+    // After Key:Down -> r1 selected
+    let shot1 = &term.before_clear[3];
+    assert_eq!(pen_at(shot1, "r0   alpha"), Vec::<u32>::new());
+    assert_eq!(pen_at(shot1, "r1   beta"), vec![7]);
+
+    // After Key:End -> scrolled to show r2, r3 with r3 selected
+    assert_eq!(slice(&term.grid, 1, 0, 24), "r2   gamma          30% ");
+    assert_eq!(slice(&term.grid, 2, 0, 24), "r3   delta          40% ");
+    assert_eq!(pen_at(&term.grid, "r3   delta"), vec![7]);
+
+    // GAUGE 50%: centered "50%" with inverted pen on filled half ('5','0') and unfilled pen on '%'
+    assert_eq!(slice(&term.grid, 4, 0, 16), "██████50%       ");
+    assert_eq!(term.grid[4][0].1, vec![32], "filled bar cell is green");
+    assert_eq!(term.grid[4][6].1, vec![7, 32], "label over filled side has reversed green");
+    assert_eq!(term.grid[4][8].1, vec![90], "label over unfilled side is gray");
+
+    // GAUGE ratio(5, 8) -> 6 full cells + 2/8th block '▎' with centered "5/8"
+    assert_eq!(slice(&term.grid, 6, 0, 10), "███5/8▎   ");
+
+    // SPARKLINE [0..8] -> " ▁▂▃▄▅▆▇█"
+    assert_eq!(slice(&term.grid, 8, 0, 9), " ▁▂▃▄▅▆▇█");
+
+    // SCROLLBAR vertical (top & bottom) and horizontal
+    let vert_top: String = (4..10).map(|y| term.grid[y][20].0).collect();
+    let vert_bot: String = (4..10).map(|y| term.grid[y][22].0).collect();
+    assert_eq!(vert_top, "███│││");
+    assert_eq!(vert_bot, "│││███");
+    assert_eq!(slice(&term.grid, 10, 0, 8), "────████");
+}
+
+#[test]
+fn gt8_unicode16_and_grapheme_clusters_work() {
+    // 1. Formal contract checks for CHAR_WIDTH, CELL.as_wide, GLYPHS.width, and SCREEN.text.
+    let contracts = "functions CLIENT
+
+feature {ANY}
+
+  check_gt8(s: SCREEN, r: RECT, c: CHAR, cell: CELL, st: STYLE, str_val: STRING, n: NAT): BOOL
+    do
+      True
+    ensure
+      cw_bound: CHAR_WIDTH.of(c) <= 2 and CHAR_WIDTH.of_code(n) <= 2
+      width_bound: GLYPHS.width(str_val) <= 65535
+      wide_cell: cell.as_wide.is_right_half = cell.is_right_half
+      drawn_dim: s.text(r, 0, 0, str_val, st).width = s.width and s.text(r, 0, 0, str_val, st).height = s.height
+    end
+
+end
+";
+    let contract_proj = Project::new("gtui_gt8_contracts", contracts);
+    assert_ok(&contract_proj.check());
+
+    // 2. Runtime & VT snapshot checks for Unicode 16.0 widths and UAX #29 grapheme clusters.
+    let prog = "reactive program GT8_UNICODE
+
+feature {ANY}
+
+  update(n: NAT, e: EVENT): TUI_NEXT[NAT]
+    do
+      match e
+        case Key(k) then
+          match k
+            case Char(c) then if c = 'q' then TUI_NEXT.quit(0) else TUI_NEXT.next(if n < 100 then n + 1 else n end) end
+            case _ then TUI_NEXT.next(n)
+          end
+        case _ then TUI_NEXT.next(n)
+      end
+    end
+
+  view(n: NAT, blank: SCREEN): SCREEN
+    do
+      let p = STYLE.plain
+      let zwj_dev = \"\\u{1F469}\\u{200D}\\u{1F4BB}\"
+      let zwj_family = \"\\u{1F468}\\u{200D}\\u{1F469}\\u{200D}\\u{1F467}\\u{200D}\\u{1F466}\"
+      let toned_sci = \"\\u{1F468}\\u{1F3FD}\\u{200D}\\u{1F52C}\"
+      let thumbs_tone = \"\\u{1F44D}\\u{1F3FD}\"
+      let us_flag = \"\\u{1F1FA}\\u{1F1F8}\"
+      let two_flags = \"\\u{1F1FA}\\u{1F1F8}\\u{1F1EF}\\u{1F1F5}\"
+      let heart_emoji = \"\\u{2764}\\u{FE0F}\"
+      let heart_text = \"\\u{2764}\\u{FE0E}\"
+      let rainbow_flag = \"\\u{1F3F3}\\u{FE0F}\\u{200D}\\u{1F308}\"
+      let u16 = \"\\u{1FA89}\\u{1FAC6}\\u{1FAE9}\"
+
+      let widths_ok =
+        CHAR_WIDTH.of_code(129673) = 2
+          and CHAR_WIDTH.of_code(129734) = 2
+          and CHAR_WIDTH.of_code(129769) = 2
+          and CHAR_WIDTH.of_code(2199) = 0
+          and GLYPHS.width(zwj_dev) = 2
+          and GLYPHS.width(zwj_family) = 2
+          and GLYPHS.width(toned_sci) = 2
+          and GLYPHS.width(thumbs_tone) = 2
+          and GLYPHS.width(us_flag) = 2
+          and GLYPHS.width(two_flags) = 4
+          and GLYPHS.width(heart_emoji) = 2
+          and GLYPHS.width(heart_text) = 1
+          and GLYPHS.width(rainbow_flag) = 2
+          and GLYPHS.width(u16) = 6
+      let s0 = blank.text(blank.area, 0, 0, if widths_ok then \"OK\" else \"BAD\" end, p)
+
+      -- Row 1: compound clusters toggled by key press for diff equivalence testing.
+      let row1 = if n % 2 = 1 then \"xy\" else zwj_dev end
+      let s1 = s0.text(blank.area, 0, 1, GLYPHS.join(row1, toned_sci), p)
+
+      -- Row 2: flags + VS16/VS15 hearts + skin-tone thumb + Rainbow flag.
+      let row2_prefix = GLYPHS.join(GLYPHS.join(us_flag, heart_emoji), heart_text)
+      let s2 = s1.text(blank.area, 0, 2, GLYPHS.join(GLYPHS.join(row2_prefix, thumbs_tone), rainbow_flag), p)
+
+      -- Row 3: Unicode 16.0 new emoji (Harp, Fingerprint, Bags-Under-Eyes) + family ZWJ.
+      let s3 = s2.text(blank.area, 0, 3, GLYPHS.join(u16, zwj_family), p)
+
+      -- Row 4: clip a 2-col cluster to 1 col -> becomes space; overwrite right half of 🇺🇸 -> clears whole flag.
+      let s4 = s3.text(RECT.make(0, 4, 1, 1), 0, 4, heart_emoji, p)
+      s4.text(blank.area, 2, 4, us_flag, p).text(blank.area, 3, 4, \"Z\", p)
+    end
+
+  init(args: SEQ[STRING]): STEP[TUI[NAT]]
+    do
+      TUI.start(0, update, view)
+    end
+
+  step(t: TUI[NAT], e: EVENT): STEP[TUI[NAT]]
+    do
+      t.step(e)
+    end
+
+end
+";
+    let runtime_proj = Project::new("gtui_gt8_runtime", prog);
+    let src = runtime_proj.0 .0.join("p/src");
+    fs::rename(src.join("client.gdl"), src.join("gt8_unicode.gdl")).expect("named after its module");
+    assert_ok(&runtime_proj.check());
+
+    let script = "Resized:16:6 Key:120 Resized:16:6 Key:120 Resized:16:6 Key:113";
+    let ran = run(&runtime_proj.0.bin("gt8_unicode"), script, &[]);
+    assert_eq!(ran.status.code(), Some(0), "{}", all(&ran));
+
+    let mut term = Terminal::new(sizes(script));
+    term.feed(&ran.stdout);
+
+    // Row 0: all GLYPHS.width checks matched.
+    assert_eq!(
+        screen_text(&term.grid).lines().next().unwrap().trim_end(),
+        "OK",
+        "{}",
+        screen_text(&term.grid)
+    );
+
+    // Diffed frame (n = 1 -> "xy👨🏽‍🔬") matches exact expected cells on row 1.
+    let shot1_row1: String = term.before_clear[2][1]
+        .iter()
+        .map(|c| if c.0 == '\0' { String::new() } else { format!("{}{}", c.0, c.2) })
+        .collect();
+    assert_eq!(shot1_row1.trim_end(), "xy\u{1F468}\u{1F3FD}\u{200D}\u{1F52C}");
+
+    // Diff back (n = 2 -> "👩‍💻👨🏽‍🔬") matches final full redraw.
+    assert_eq!(
+        screen_text(&term.before_clear[3]),
+        screen_text(&term.grid),
+        "diff back matches full redraw"
+    );
+
+    // Full screen text assertions across rows 1..4.
+    let rows: Vec<String> = screen_text(&term.grid).lines().map(|l| l.trim_end().to_string()).collect();
+    assert_eq!(rows[1], "\u{1F469}\u{200D}\u{1F4BB}\u{1F468}\u{1F3FD}\u{200D}\u{1F52C}");
+    assert_eq!(
+        rows[2],
+        "\u{1F1FA}\u{1F1F8}\u{2764}\u{FE0F}\u{2764}\u{FE0E}\u{1F44D}\u{1F3FD}\u{1F3F3}\u{FE0F}\u{200D}\u{1F308}"
+    );
+    assert_eq!(
+        rows[3],
+        "\u{1FA89}\u{1FAC6}\u{1FAE9}\u{1F468}\u{200D}\u{1F469}\u{200D}\u{1F467}\u{200D}\u{1F466}"
+    );
+    assert_eq!(rows[4], "   Z");
+
+    // Verify column widths directly on the terminal grid cells:
+    // Row 2: flag (cols 0..2), red heart emoji (cols 2..4), text heart (col 4), thumbs up (cols 5..7), rainbow flag (cols 7..9)
+    assert_eq!(term.grid[2][0].0, '\u{1F1FA}');
+    assert_eq!(term.grid[2][1].0, '\0');
+    assert_eq!(term.grid[2][2].0, '\u{2764}');
+    assert_eq!(term.grid[2][3].0, '\0');
+    assert_eq!(term.grid[2][4].0, '\u{2764}');
+    assert_eq!(term.grid[2][5].0, '\u{1F44D}');
+    assert_eq!(term.grid[2][6].0, '\0');
+    assert_eq!(term.grid[2][7].0, '\u{1F3F3}');
+    assert_eq!(term.grid[2][8].0, '\0');
+}
+
+#[test]
+fn gtui_dashboard_example_verifies_and_renders_all_widgets() {
+    let dir = Dir::new("dashboard_example");
+    assert_ok(&dir.check(&root().join("examples/gtui_dashboard")));
+    let script = "Resized:80:24 Resized:80:24 Key:Down Key:32 Key:116 Key:98 Key:119 Key:97 Resized:80:24 Key:63 Resized:80:24 Key:Escape Resized:80:24 Key:113";
+    let ran = run(&dir.bin("gtui_dashboard"), script, &[]);
+    assert_eq!(ran.status.code(), Some(0), "{}", all(&ran));
+
+    let mut term = Terminal::new(sizes(script));
+    term.feed(&ran.stdout);
+    assert!(term.sync_frames > 0, "dashboard emits synchronized frames");
+
+    // 1. Initial snapshot (dark theme, rounded borders with merged junction `┬` and `┴`, row 0 "LAYOUT" selected).
+    let initial = screen_text(&term.before_clear[2]);
+    assert!(initial.contains("Modules"), "{initial}");
+    assert!(initial.contains("Telemetry"), "{initial}");
+    assert!(initial.contains("Inspector"), "{initial}");
+    assert!(initial.contains("1/8 modules"), "{initial}");
+    assert!(initial.contains("Theme: dark"), "{initial}");
+    assert!(initial.contains("┬") && initial.contains("┴"), "shared vertical border is merged:\n{initial}");
+
+    // 2. After Down, Space, 't' (nord), 'b' (plain), 'w' (char), 'a' (center):
+    let updated = screen_text(&term.before_clear[3]);
+    assert!(updated.contains("2/8 modules"), "{updated}");
+    assert!(updated.contains("Theme: nord"), "{updated}");
+    assert!(updated.contains("wrap:char align:center"), "{updated}");
+    assert!(updated.contains("FRAME (GT.4)"), "{updated}");
+
+    // 3. After '?' (help popup open):
+    let help_shown = screen_text(&term.before_clear[4]);
+    assert!(help_shown.contains("Dashboard Controls"), "{help_shown}");
+    assert!(help_shown.contains("Esc/? to close"), "{help_shown}");
+
+    // 4. After Escape (help popup dismissed, underlying dashboard restored):
+    let final_screen = term.text();
+    assert!(!final_screen.contains("Dashboard Controls"), "{final_screen}");
+    assert!(final_screen.contains("2/8 modules"), "{final_screen}");
 }

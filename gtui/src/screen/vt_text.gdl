@@ -1,32 +1,54 @@
 -- The bytes a VT terminal is sent for a list of writes: for each write, a cursor move
 -- (`ESC [ row ; col H`, from 1) and its cells, with an SGR sequence wherever the style
--- changes. The pen is reset first, so a frame does not depend on what came before it. These
--- are the only control sequences a frame holds, as a cell holds no control character.
+-- changes. Non-empty frames are bracketed in synchronized output (`ESC [ ? 2026 h` /
+-- `ESC [ ? 2026 l`), and the pen is reset at the start so a frame does not depend on what
+-- came before it. These are the only control sequences a frame holds, as a cell holds no
+-- control character.
 functions VT_TEXT
 
 feature {ANY}
 
-  -- The text of a frame: `writes`, after clearing the screen when `clear` is set.
+  -- The text of a frame: `writes`, after clearing the screen when `clear` is set, wrapped in
+  -- synchronized output; empty when `writes` is empty and `clear` is false.
+  -- TODO(proof-GT.1): prove VT_TEXT.frame introduces no control characters outside CSI SGR, cursor, and mode-2026 sequences
   frame(writes: LIST[SCREEN_WRITE], clear: BOOL): STRING
     do
-      let start = GLYPHS.add_text(BYTES_BUILDER.empty, if clear then "\u{1b}[0m\u{1b}[2J" else "\u{1b}[0m" end)
-      let out = VT_TEXT.writes(writes, STYLE.plain, start)
-      match STRING.from_utf8(out.to_bytes)
-        case Ok(s) then s
-        case Error(_) then ""
+      if writes.length = 0 and not clear then
+        ""
+      else
+        let out = VT_TEXT.writes(writes, STYLE.plain, VT_TEXT.begin_frame(clear))
+        VT_TEXT.finish_frame(out)
       end
     end
 
   -- The text of a frame that draws `writes`, after clearing the screen when `clear` is set,
   -- then puts the cursor where `next` has it. When the cursor was shown (`was_shown`), it is
   -- hidden while the cells are drawn, so it is never seen moving over them.
+  -- TODO(proof-GT.1): prove VT_TEXT.drawn introduces no control characters outside CSI SGR, cursor, and mode-2026 sequences
   drawn(writes: LIST[SCREEN_WRITE], clear: BOOL, was_shown: BOOL, next: SCREEN): STRING
     do
-      let start = GLYPHS.add_text(BYTES_BUILDER.empty, if clear then "\u{1b}[0m\u{1b}[2J" else "\u{1b}[0m" end)
-      let hidden = if was_shown then GLYPHS.add_text(start, "\u{1b}[?25l") else start end
-      let out = VT_TEXT.writes(writes, STYLE.plain, hidden)
-      let placed = if next.cursor_shown then GLYPHS.add_text(VT_TEXT.move(out, next.cursor_x, next.cursor_y), "\u{1b}[?25h") else out end
-      match STRING.from_utf8(placed.to_bytes)
+      if writes.length = 0 and not clear and not was_shown and not next.cursor_shown then
+        ""
+      else
+        let start = VT_TEXT.begin_frame(clear)
+        let hidden = if was_shown then GLYPHS.add_text(start, "\u{1b}[?25l") else start end
+        let out = VT_TEXT.writes(writes, STYLE.plain, hidden)
+        let placed = if next.cursor_shown then GLYPHS.add_text(VT_TEXT.move(out, next.cursor_x, next.cursor_y), "\u{1b}[?25h") else out end
+        VT_TEXT.finish_frame(placed)
+      end
+    end
+
+  -- Synchronized-output and pen-reset prefix of a non-empty frame, clearing the screen when `clear` is set.
+  begin_frame(clear: BOOL): BYTES_BUILDER
+    do
+      let prefix = if clear then "\u{1b}[?2026h\u{1b}[0m\u{1b}[2J" else "\u{1b}[?2026h\u{1b}[0m" end
+      GLYPHS.add_text(BYTES_BUILDER.empty, prefix)
+    end
+
+  -- End synchronized output on `out` and decode the frame bytes as UTF-8.
+  finish_frame(out: BYTES_BUILDER): STRING
+    do
+      match STRING.from_utf8(GLYPHS.add_text(out, "\u{1b}[?2026l").to_bytes)
         case Ok(s) then s
         case Error(_) then ""
       end
@@ -119,7 +141,7 @@ feature {ANY}
         if c.is_right_half and half then
           VT_TEXT.cells_after(cs.tail, pen, False, out)
         else
-          let styled = if c.style.same(pen) then out else VT_TEXT.add_sgr(out, c.style) end
+          let styled = if c.style.same(pen) then out else VT_TEXT.add_sgr_delta(out, pen, c.style) end
           let drawn = VT_TEXT.marks(LIST_CUT.reverse(c.marks_backwards, LIST.empty), GLYPHS.add_char(styled, c.char))
           VT_TEXT.cells_after(cs.tail, c.style, c.is_left_half, drawn)
         end
@@ -142,24 +164,90 @@ feature {ANY}
       if cs.length = 0 then pen else VT_TEXT.last_style(cs.tail, cs.head.style) end
     end
 
+  -- `out` with the SGR sequence that transitions from `pen` to `s`. Emits only added
+  -- attributes and changed colours when nothing is cleared; falls back to `add_sgr` when any
+  -- attribute is turned off or a colour returns to default.
+  add_sgr_delta(out: BYTES_BUILDER, pen: STYLE, s: STYLE): BYTES_BUILDER
+    do
+      if VT_TEXT.clears_any(pen, s) then
+        VT_TEXT.add_sgr(out, s)
+      else
+        let base = out.length
+        let diff = VT_TEXT.add_sgr_diff(out, base, pen, s)
+        if diff.length = base then out else GLYPHS.add_text(diff, "m") end
+      end
+    end
+
+  -- Whether changing from `pen` to `s` turns off an attribute or restores a default colour.
+  clears_any(pen: STYLE, s: STYLE): BOOL
+    do
+      let flags_cleared =
+        (pen.is_bold and not s.is_bold)
+          or (pen.is_dim and not s.is_dim)
+          or (pen.is_italic and not s.is_italic)
+          or (pen.is_underlined and not s.is_underlined)
+          or (pen.is_reversed and not s.is_reversed)
+          or (pen.is_strikethrough and not s.is_strikethrough)
+      let fg_cleared = not (pen.foreground.is_default or pen.foreground.is_reset) and (s.foreground.is_default or s.foreground.is_reset)
+      let bg_cleared = not (pen.background.is_default or pen.background.is_reset) and (s.background.is_default or s.background.is_reset)
+      flags_cleared or fg_cleared or bg_cleared
+    end
+
   -- `out` with the SGR sequence that sets `s` from any pen: a reset, then each attribute,
   -- then the colours that are not the terminal's own.
   add_sgr(out: BYTES_BUILDER, s: STYLE): BYTES_BUILDER
     do
-      let a = GLYPHS.add_text(out, "\u{1b}[0")
-      let b = if s.is_bold then GLYPHS.add_text(a, ";1") else a end
-      let c = if s.is_dim then GLYPHS.add_text(b, ";2") else b end
-      let d = if s.is_underlined then GLYPHS.add_text(c, ";4") else c end
-      let e = if s.is_reversed then GLYPHS.add_text(d, ";7") else d end
-      let f = if s.foreground.is_default then e else VT_TEXT.add_param(e, s.foreground.foreground_code) end
-      let g = if s.background.is_default then f else VT_TEXT.add_param(f, s.background.background_code) end
-      GLYPHS.add_text(g, "m")
+      let base = out.length
+      let reset = VT_TEXT.add_sgr_param(out, base, 0)
+      let attrs = VT_TEXT.add_sgr_diff(reset, base, STYLE.plain, s)
+      GLYPHS.add_text(attrs, "m")
     end
 
-  -- `out` with `;` and the number `n`.
-  add_param(out: BYTES_BUILDER, n: NAT): BYTES_BUILDER
+  -- `cur` with SGR parameters for attributes and colours added or changed between `from` and `to`,
+  -- starting from CSI buffer offset `base`.
+  add_sgr_diff(cur: BYTES_BUILDER, base: NAT, from: STYLE, to: STYLE): BYTES_BUILDER
     do
-      GLYPHS.add_text(GLYPHS.add_text(out, ";"), NUMBER_TEXT.nat_to_text(n))
+      let b = if to.is_bold and not from.is_bold then VT_TEXT.add_sgr_param(cur, base, 1) else cur end
+      let d = if to.is_dim and not from.is_dim then VT_TEXT.add_sgr_param(b, base, 2) else b end
+      let it = if to.is_italic and not from.is_italic then VT_TEXT.add_sgr_param(d, base, 3) else d end
+      let u = if to.is_underlined and not from.is_underlined then VT_TEXT.add_sgr_param(it, base, 4) else it end
+      let r = if to.is_reversed and not from.is_reversed then VT_TEXT.add_sgr_param(u, base, 7) else u end
+      let st = if to.is_strikethrough and not from.is_strikethrough then VT_TEXT.add_sgr_param(r, base, 9) else r end
+      let f = if to.foreground.same(from.foreground) then st else VT_TEXT.add_color_at(st, base, True, to.foreground) end
+      if to.background.same(from.background) then f else VT_TEXT.add_color_at(f, base, False, to.background) end
+    end
+
+  -- `out` with foreground (`is_fg`) or background (`not is_fg`) SGR parameters for `c`, if set,
+  -- starting a CSI sequence when `out.length = base`.
+  add_color_at(out: BYTES_BUILDER, base: NAT, is_fg: BOOL, c: COLOR): BYTES_BUILDER
+    do
+      if c.is_default or c.is_reset then
+        out
+      else if c.is_standard then
+        VT_TEXT.add_sgr_param(out, base, if is_fg then c.foreground_code else c.background_code end)
+      else
+        let ext = if is_fg then 38 else 48 end
+        if c.is_indexed then
+          let a = VT_TEXT.add_sgr_param(out, base, ext)
+          let b = VT_TEXT.add_sgr_param(a, base, 5)
+          VT_TEXT.add_sgr_param(b, base, c.index)
+        else if c.is_rgb then
+          let a = VT_TEXT.add_sgr_param(out, base, ext)
+          let b = VT_TEXT.add_sgr_param(a, base, 2)
+          let r = VT_TEXT.add_sgr_param(b, base, c.r)
+          let g = VT_TEXT.add_sgr_param(r, base, c.g)
+          VT_TEXT.add_sgr_param(g, base, c.b)
+        else
+          out
+        end end
+      end end
+    end
+
+  -- `out` with `ESC [` (when `out.length = base`) or `;`, followed by `n`.
+  add_sgr_param(out: BYTES_BUILDER, base: NAT, n: NAT): BYTES_BUILDER
+    do
+      let sep = if out.length = base then "\u{1b}[" else ";" end
+      GLYPHS.add_text(GLYPHS.add_text(out, sep), NUMBER_TEXT.nat_to_text(n))
     end
 
 end

@@ -1,0 +1,79 @@
+-- A verification & metrics dashboard showcasing `gtui` widgets (`TABLE`, `GAUGE`, `SPARKLINE`,
+-- `SCROLLBAR`, `PARAGRAPH`, `POPUP`, `BORDER_KIND`, `PADDING`, `FRAME.merge_borders`, `THEME`,
+-- and Unicode 16.0 / UAX #29 grapheme clusters).
+--
+--   gardelc --project examples/gtui_dashboard --strict
+--   ./build/gtui_dashboard_bin
+reactive program GTUI_DASHBOARD
+
+feature {ANY}
+
+  update(s: DASH_STATE, e: EVENT): TUI_NEXT[DASH_STATE]
+    do
+      match e
+        case Resized(w, h) then TUI_NEXT.next(s.sized(w, h))
+        case Key(k) then s.on_key(k)
+        case _ then TUI_NEXT.next(s)
+      end
+    end
+
+  edge(s: DASH_STATE, pane: NAT): STYLE
+    do
+      if s.focus.has(pane) then s.theme.focused_border else s.theme.border end
+    end
+
+  view(s: DASH_STATE, blank: SCREEN): SCREEN
+    do
+      let t = s.theme
+      let area = blank.area
+      let left = DASH_LAYOUT.left(area)
+      let right = DASH_LAYOUT.right(area)
+      let bottom = DASH_LAYOUT.bottom(area)
+      let status_rect = DASH_LAYOUT.status(area)
+      let kind = s.border_kind
+
+      -- 1. Left pane: Framed TABLE + right-edge vertical SCROLLBAR.
+      let s0 = FRAME.draw_titled(blank, left, kind, "Modules", "GT.7", "", edge(s, 0), t.active_tab)
+      let left_inner = FRAME.inner(left)
+      let tbl_area = left_inner.drop_right(1)
+      let s1 = s.table.draw(s0, tbl_area, t.base, t.keyword.bold, t.selection)
+      let s2 = s.scrollbar.draw(s1, left_inner, t.gutter, t.focused_border)
+
+      -- 2. Right pane: Framed GAUGEs + SPARKLINE, with shared vertical border merged via FRAME.merge_borders.
+      let s3 = FRAME.draw_titled(s2, right, kind, "Telemetry", s.border_name, "Space: sample", edge(s, 1), t.active_tab)
+      let s4 = FRAME.merge_borders(s3, DASH_LAYOUT.upper(area))
+      let m_rows = DASH_LAYOUT.metrics_rows(FRAME.inner_padded(right, PADDING.symmetric(0, 1)))
+      let g1_rect = LIST_OPS.at(m_rows, 0)
+      let g2_rect = LIST_OPS.at(m_rows, 1)
+      let sp_rect = LIST_OPS.at(m_rows, 2)
+      let s5 = s.coverage_gauge.draw(s4, g1_rect, t.gutter, t.string)
+      let s6 = s.cache_gauge.draw(s5, g2_rect, t.gutter, t.keyword)
+      let s7 = s.sparkline.draw(s6, sp_rect, t.comment.patch(STYLE.plain.fg(COLOR.yellow)))
+
+      -- 3. Bottom pane: Framed PARAGRAPH inspector with live wrap & alignment modes.
+      let meta = GLYPHS.join(GLYPHS.join("wrap:", s.wrap_name), GLYPHS.join(" align:", s.align_name))
+      let s8 = FRAME.draw_titled(s7, bottom, kind, "Inspector", meta, "", t.border, t.active_tab)
+      let s9 = s.inspector.draw(s8, FRAME.inner_padded(bottom, PADDING.symmetric(0, 1)), t.base)
+
+      -- 4. Status bar + optional Help POPUP overlay.
+      let left_status = GLYPHS.join("Theme: ", t.name)
+      let right_status = "t:theme b:border w:wrap a:align Space:tick ?:help q:quit"
+      let s10 = STATUS_BAR.draw(s9, status_rect, left_status, right_status, t.selection)
+      if s.help_open then
+        s.help_popup.draw(s10, area, t.base, t.focused_border, t.active_tab)
+      else
+        s10
+      end
+    end
+
+  init(args: SEQ[STRING]): STEP[TUI[DASH_STATE]]
+    do
+      TUI.start(DASH_STATE.make, update, view)
+    end
+
+  step(t: TUI[DASH_STATE], e: EVENT): STEP[TUI[DASH_STATE]]
+    do
+      t.step(e)
+    end
+
+end

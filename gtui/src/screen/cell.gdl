@@ -4,8 +4,9 @@
 --
 -- A character two columns wide (`CHAR_WIDTH`) takes two cells: its left half holds it, and
 -- its right half holds nothing and is never sent, as the terminal fills it when it draws the
--- left one. Zero-width characters, such as combining accents, are marks on the cell they
--- follow, at most eight of them.
+-- left one. Zero-width characters and grapheme-cluster continuations (ZWJ sequences, skin-tone
+-- modifiers, regional indicators, variation selectors) are marks on the cell they follow, at
+-- most sixteen of them.
 module CELL
 
 representation {NONE}
@@ -19,7 +20,7 @@ representation {NONE}
 invariant
   printable: glyph.code >= 32 and (glyph.code < 127 or glyph.code >= 160)
   marks_printable: CELL.all_printable(extra)
-  few_marks: extra.length <= 8
+  few_marks: extra.length <= 16
   a_part: part <= 2
   right_half_empty: part = 2 implies glyph = ' ' and extra.length = 0
 
@@ -161,7 +162,7 @@ feature {ANY}
   -- the cell is not a right half.
   with_mark(m: CHAR): CELL
     do
-      if Current.part < 2 and Current.extra.length < 8 and CELL.is_printable(m) then
+      if Current.part < 2 and Current.extra.length < 16 and CELL.is_printable(m) then
         { Current with extra = Current.extra.prepend(m) }
       else
         Current
@@ -170,6 +171,19 @@ feature {ANY}
       style_same: Result.style.same(Current.style)
       part_same: Result.is_own = Current.is_own and Result.is_left_half = Current.is_left_half and
         Result.is_right_half = Current.is_right_half
+    end
+
+  -- This cell promoted to the left half of a 2-column grapheme cluster when it is a 1-column cell.
+  as_wide: CELL
+    do
+      if Current.part = 0 then
+        { Current with part = 1 }
+      else
+        Current
+      end
+    ensure
+      style_same: Result.style.same(Current.style)
+      not_right: Result.is_right_half = Current.is_right_half
     end
 
   -- A space in this cell's style, in a cell of its own: what is left of half a wide character.

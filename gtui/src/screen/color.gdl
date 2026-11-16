@@ -1,78 +1,202 @@
--- A colour of a cell: the terminal's own (`default`), or one of the 16 standard colours that
--- every VT terminal has, the 8 normal ones and their bright forms. What each looks like is
--- the terminal's choice, so a program that uses them follows the user's theme.
+-- A colour of a cell: the terminal's own (`default`), an explicit reset (`reset`), one of the
+-- 16 standard ANSI colours (`standard`), one of the 256 palette colours (`indexed`), or a
+-- 24-bit TrueColor (`rgb`).
 module COLOR
 
 representation {NONE}
-  tone: NAT
+  | DefaultColor
+  | ResetColor
+  | Standard(code: NAT)
+  | Indexed(idx: NAT)
+  | Rgb(red_ch: NAT, green_ch: NAT, blue_ch: NAT)
 
 invariant
-  standard: tone <= 16
+  valid_ranges: match Current
+    case DefaultColor then True
+    case ResetColor then True
+    case Standard(n) then n <= 15
+    case Indexed(n) then n <= 255
+    case Rgb(rv, gv, bv) then rv <= 255 and gv <= 255 and bv <= 255
+  end
 
 create {ANY}
 
   -- The terminal's own colour.
   default: COLOR
     do
-      { tone = 0 }
+      DefaultColor
     ensure
       is_default: Result.is_default
+    end
+
+  -- An explicit colour reset (SGR 39 / 49), distinct from `default` in `STYLE.patch`.
+  reset: COLOR
+    do
+      ResetColor
+    ensure
+      is_reset: Result.is_reset
+      not_default: not Result.is_default
     end
 
   -- Standard colour `n`, from 0 to 15: black, red, green, yellow, blue, magenta, cyan and
   -- white, then the same bright. Past 15, the terminal's own.
   standard(n: NAT): COLOR
     do
-      { tone = if n < 16 then n + 1 else 0 end }
+      if n < 16 then Standard(n) else DefaultColor end
     ensure
-      numbered: n < 16 implies Result.number = n
+      numbered: n < 16 implies (Result.is_standard and Result.number = n)
       or_default: n >= 16 implies Result.is_default
     end
 
-  black: COLOR do { tone = 1 } end
-  red: COLOR do { tone = 2 } end
-  green: COLOR do { tone = 3 } end
-  yellow: COLOR do { tone = 4 } end
-  blue: COLOR do { tone = 5 } end
-  magenta: COLOR do { tone = 6 } end
-  cyan: COLOR do { tone = 7 } end
-  white: COLOR do { tone = 8 } end
-  gray: COLOR do { tone = 9 } end
-  bright_red: COLOR do { tone = 10 } end
-  bright_green: COLOR do { tone = 11 } end
-  bright_yellow: COLOR do { tone = 12 } end
-  bright_blue: COLOR do { tone = 13 } end
-  bright_magenta: COLOR do { tone = 14 } end
-  bright_cyan: COLOR do { tone = 15 } end
-  bright_white: COLOR do { tone = 16 } end
+  -- A 256-palette colour `n` (0 to 255), clamped to 255.
+  indexed(n: NAT): COLOR
+    do
+      Indexed(if n <= 255 then n else 255 end)
+    ensure
+      is_indexed: Result.is_indexed
+      index_set: n <= 255 implies Result.index = n
+    end
+
+  -- A 24-bit TrueColor (`rv`, `gv`, `bv`), each channel clamped to 255.
+  rgb(rv: NAT, gv: NAT, bv: NAT): COLOR
+    do
+      let cr = if rv <= 255 then rv else 255 end
+      let cg = if gv <= 255 then gv else 255 end
+      let cb = if bv <= 255 then bv else 255 end
+      Rgb(cr, cg, cb)
+    ensure
+      is_rgb: Result.is_rgb
+      channels_set: (rv <= 255 and gv <= 255 and bv <= 255) implies
+        (Result.r = rv and Result.g = gv and Result.b = bv)
+    end
+
+  black: COLOR do Standard(0) end
+  red: COLOR do Standard(1) end
+  green: COLOR do Standard(2) end
+  yellow: COLOR do Standard(3) end
+  blue: COLOR do Standard(4) end
+  magenta: COLOR do Standard(5) end
+  cyan: COLOR do Standard(6) end
+  white: COLOR do Standard(7) end
+  gray: COLOR do Standard(8) end
+  bright_red: COLOR do Standard(9) end
+  bright_green: COLOR do Standard(10) end
+  bright_yellow: COLOR do Standard(11) end
+  bright_blue: COLOR do Standard(12) end
+  bright_magenta: COLOR do Standard(13) end
+  bright_cyan: COLOR do Standard(14) end
+  bright_white: COLOR do Standard(15) end
 
 feature {ANY}
 
   is_default: BOOL
     do
-      Current.tone = 0
+      match Current
+        case DefaultColor then True
+        case _ then False
+      end
     end
 
-  -- The colour's number from 0 to 15, or 16 for the terminal's own.
+  is_reset: BOOL
+    do
+      match Current
+        case ResetColor then True
+        case _ then False
+      end
+    end
+
+  is_standard: BOOL
+    do
+      match Current
+        case Standard(_) then True
+        case _ then False
+      end
+    end
+
+  is_indexed: BOOL
+    do
+      match Current
+        case Indexed(_) then True
+        case _ then False
+      end
+    end
+
+  is_rgb: BOOL
+    do
+      match Current
+        case Rgb(_, _, _) then True
+        case _ then False
+      end
+    end
+
+  -- The standard colour's number from 0 to 15, or 16 for any other colour.
   number: NAT
     do
-      if Current.tone = 0 then 16 else Current.tone - 1 end
+      match Current
+        case Standard(n) then n
+        case _ then 16
+      end
     ensure
       bounded: Result <= 16
     end
 
-  -- The SGR parameter that sets it as the foreground: 39, 30 to 37, or 90 to 97.
+  -- The palette index from 0 to 255 for `indexed` or `standard`, or 0 otherwise.
+  index: NAT
+    do
+      match Current
+        case Indexed(n) then n
+        case Standard(n) then n
+        case _ then 0
+      end
+    ensure
+      bounded: Result <= 255
+    end
+
+  -- The red channel (0 to 255) for `rgb`, or 0 otherwise.
+  r: NAT
+    do
+      match Current
+        case Rgb(rv, _, _) then rv
+        case _ then 0
+      end
+    ensure
+      bounded: Result <= 255
+    end
+
+  -- The green channel (0 to 255) for `rgb`, or 0 otherwise.
+  g: NAT
+    do
+      match Current
+        case Rgb(_, gv, _) then gv
+        case _ then 0
+      end
+    ensure
+      bounded: Result <= 255
+    end
+
+  -- The blue channel (0 to 255) for `rgb`, or 0 otherwise.
+  b: NAT
+    do
+      match Current
+        case Rgb(_, _, bv) then bv
+        case _ then 0
+      end
+    ensure
+      bounded: Result <= 255
+    end
+
+  -- The SGR parameter that sets a standard colour as the foreground: 39, 30 to 37, or 90 to 97.
   foreground_code: NAT
     do
-      if Current.tone = 0 then 39
-      else if Current.tone <= 8 then 29 + Current.tone
-      else 81 + Current.tone
-      end end
+      match Current
+        case Standard(n) then if n < 8 then 30 + n else 82 + n end
+        case _ then 39
+      end
     ensure
       named: Result = 39 or (30 <= Result and Result <= 37) or (90 <= Result and Result <= 97)
     end
 
-  -- The SGR parameter that sets it as the background: 49, 40 to 47, or 100 to 107.
+  -- The SGR parameter that sets a standard colour as the background: 49, 40 to 47, or 100 to 107.
   background_code: NAT
     do
       Current.foreground_code + 10
@@ -82,9 +206,20 @@ feature {ANY}
 
   same(other: COLOR): BOOL
     do
-      Current.tone = other.tone
+      match Current
+        case DefaultColor then other.is_default
+        case ResetColor then other.is_reset
+        case Standard(n) then other.is_standard and n = other.number
+        case Indexed(n) then other.is_indexed and n = other.index
+        case Rgb(rv, gv, bv) then other.is_rgb and rv = other.r and gv = other.g and bv = other.b
+      end
     ensure
-      def: Result = (Current.number = other.number)
+      def: Result = (
+        (Current.is_default and other.is_default) or
+        (Current.is_reset and other.is_reset) or
+        (Current.is_standard and other.is_standard and Current.number = other.number) or
+        (Current.is_indexed and other.is_indexed and Current.index = other.index) or
+        (Current.is_rgb and other.is_rgb and Current.r = other.r and Current.g = other.g and Current.b = other.b))
     end
 
 end

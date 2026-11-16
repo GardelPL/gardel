@@ -1,5 +1,6 @@
 -- No two children of a layout overlap. Its own module, as a law builds only on the laws of
 -- other modules, here `LAYOUT.across_after` and `down_after`.
+-- TODO(proof-GT.3): prove stronger gap-separation laws (right + gap <= next.x and bottom + gap <= next.y for unclipped children)
 functions LAYOUT_APART
 
 specify {ANY}

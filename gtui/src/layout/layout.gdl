@@ -15,9 +15,7 @@ feature {ANY}
   -- The children of `r` side by side, left to right.
   columns(r: RECT, sizes: LIST[SIZE]): LIST[RECT]
     do
-      let fixed = LAYOUT.fixed_total(sizes)
-      let spare = if fixed < r.width then r.width - fixed else 0 end
-      LAYOUT.lay_across(sizes, r.x, spare, r)
+      LAYOUT.columns_with_gap(r, sizes, 0)
     ensure
       one_each: Result.length = sizes.length
       placed: LAYOUT.across(Result, r.x, r)
@@ -26,9 +24,61 @@ feature {ANY}
   -- The children of `r` one below another, top to bottom.
   rows(r: RECT, sizes: LIST[SIZE]): LIST[RECT]
     do
-      let fixed = LAYOUT.fixed_total(sizes)
-      let spare = if fixed < r.height then r.height - fixed else 0 end
-      LAYOUT.lay_down(sizes, r.y, spare, r)
+      LAYOUT.rows_with_gap(r, sizes, 0)
+    ensure
+      one_each: Result.length = sizes.length
+      placed: LAYOUT.down(Result, r.y, r)
+    end
+
+  -- The children of `r` side by side, separated by `gap` cells between consecutive children.
+  -- TODO(proof-GT.3): prove adjacent unclipped children are separated by at least gap
+  columns_with_gap(r: RECT, sizes: LIST[SIZE], gap: NAT): LIST[RECT]
+    do
+      LAYOUT.columns_justified(r, sizes, gap, JUSTIFY.start)
+    ensure
+      one_each: Result.length = sizes.length
+      placed: LAYOUT.across(Result, r.x, r)
+    end
+
+  -- The children of `r` one below another, separated by `gap` rows between consecutive children.
+  -- TODO(proof-GT.3): prove adjacent unclipped children are separated by at least gap
+  rows_with_gap(r: RECT, sizes: LIST[SIZE], gap: NAT): LIST[RECT]
+    do
+      LAYOUT.rows_justified(r, sizes, gap, JUSTIFY.start)
+    ensure
+      one_each: Result.length = sizes.length
+      placed: LAYOUT.down(Result, r.y, r)
+    end
+
+  -- The children of `r` side by side with `gap` spacing and `justify` surplus placement.
+  -- TODO(proof-GT.3): prove justified start offset and inter-child gap bounds
+  columns_justified(r: RECT, sizes: LIST[SIZE], gap: NAT, justify: JUSTIFY): LIST[RECT]
+    do
+      let spare = LAYOUT.spare_for(sizes, r.width, gap)
+      let left = LAYOUT.leftover_for(sizes, r.width, spare, gap)
+      let offset = LAYOUT.justified_offset(r.width, left, justify)
+      let between = LAYOUT.justified_between(sizes, left, gap, justify)
+      let start = r.x + offset
+      let res = LAYOUT.lay_across_with(sizes, start, spare, gap, between, r)
+      check step: LAYOUT.across_from(res, r.x, start, r) end
+      res
+    ensure
+      one_each: Result.length = sizes.length
+      placed: LAYOUT.across(Result, r.x, r)
+    end
+
+  -- The children of `r` top to bottom with `gap` spacing and `justify` surplus placement.
+  -- TODO(proof-GT.3): prove justified start offset and inter-child gap bounds
+  rows_justified(r: RECT, sizes: LIST[SIZE], gap: NAT, justify: JUSTIFY): LIST[RECT]
+    do
+      let spare = LAYOUT.spare_for(sizes, r.height, gap)
+      let left = LAYOUT.leftover_for(sizes, r.height, spare, gap)
+      let offset = LAYOUT.justified_offset(r.height, left, justify)
+      let between = LAYOUT.justified_between(sizes, left, gap, justify)
+      let start = r.y + offset
+      let res = LAYOUT.lay_down_with(sizes, start, spare, gap, between, r)
+      check step: LAYOUT.down_from(res, r.y, start, r) end
+      res
     ensure
       one_each: Result.length = sizes.length
       placed: LAYOUT.down(Result, r.y, r)
@@ -77,6 +127,37 @@ feature {ANY}
       bounded: Result <= 65535
     end
 
+  -- The cells guaranteed by `Fixed`, `Min`, and `Percent` sizes for axis length `span`, at most 65535.
+  base_total(sizes: LIST[SIZE], span: NAT): NAT
+    variant
+      sizes.length
+    do
+      if sizes.length = 0 then
+        0
+      else
+        let rest = LAYOUT.base_total(sizes.tail, span)
+        let c = sizes.head.base_cells(span)
+        if c >= 65535 - rest then 65535 else rest + c end
+      end
+    ensure
+      bounded: Result <= 65535
+    end
+
+  -- Total cells reserved by `gap` between consecutive children of `sizes`, at most 65535.
+  gap_total(sizes: LIST[SIZE], gap: NAT): NAT
+    do
+      if sizes.length <= 1 or gap = 0 then
+        0
+      else if sizes.length - 1 >= 65535 or gap >= 65535 then
+        65535
+      else
+        let prod = (sizes.length - 1) * gap
+        if prod <= 65535 then prod else 65535 end
+      end end
+    ensure
+      bounded: Result <= 65535
+    end
+
   -- The weights of the flexible sizes, at most a billion.
   weight_total(sizes: LIST[SIZE]): NAT
     variant
@@ -91,6 +172,137 @@ feature {ANY}
       end
     ensure
       bounded: Result <= 1000000000
+    end
+
+  -- The total growth weight of `Flex`, `Min`, and `Max` children in `sizes`, at most a billion.
+  grow_total(sizes: LIST[SIZE]): NAT
+    variant
+      sizes.length
+    do
+      if sizes.length = 0 then
+        0
+      else
+        let rest = LAYOUT.grow_total(sizes.tail)
+        let w = sizes.head.grow_weight
+        if rest >= 1000000000 - w then 1000000000 else rest + w end
+      end
+    ensure
+      bounded: Result <= 1000000000
+    end
+
+  -- Spare space remaining in `span` after reserving `base_total` and `gap_total`.
+  spare_for(sizes: LIST[SIZE], span: NAT, gap: NAT): NAT
+    require
+      small: span <= 65535
+    do
+      let base = LAYOUT.base_total(sizes, span)
+      let gaps = LAYOUT.gap_total(sizes, gap)
+      let reserved = if base >= 65535 - gaps then 65535 else base + gaps end
+      if reserved < span then span - reserved else 0 end
+    ensure
+      bounded: Result <= span and Result <= 65535
+    end
+
+  -- Extra spare cells given to `sizes.head` out of `spare`.
+  extra_wanted(sizes: LIST[SIZE], spare: NAT): NAT
+    require
+      some: sizes.length > 0
+      small: spare <= 65535
+    do
+      let w = sizes.head.grow_weight
+      if w = 0 then
+        0
+      else
+        let total = LAYOUT.grow_total(sizes)
+        let raw =
+          if total <= w then
+            spare
+          else
+            let share = spare * w / total
+            if share <= spare then share else spare end
+          end
+        sizes.head.cap_extra(raw)
+      end
+    ensure
+      within: Result <= spare
+    end
+
+  -- Total cells requested by `sizes.head` for axis span `span` when `spare` cells remain.
+  wanted_for(sizes: LIST[SIZE], span: NAT, spare: NAT): NAT
+    require
+      some: sizes.length > 0
+      small: spare <= 65535
+    do
+      sizes.head.base_cells(span) + LAYOUT.extra_wanted(sizes, spare)
+    ensure
+      bounded: Result <= 131070
+    end
+
+  -- Total cells requested across all children in `sizes` for `span` and `spare`, at most 65535.
+  children_total(sizes: LIST[SIZE], span: NAT, spare: NAT): NAT
+    require
+      small: spare <= 65535
+    variant
+      sizes.length
+    do
+      if sizes.length = 0 then
+        0
+      else
+        let extra = LAYOUT.extra_wanted(sizes, spare)
+        let w = sizes.head.base_cells(span) + extra
+        let rest = LAYOUT.children_total(sizes.tail, span, spare - extra)
+        if w >= 65535 - rest then 65535 else rest + w end
+      end
+    ensure
+      bounded: Result <= 65535
+    end
+
+  -- Unallocated surplus left in `span` after child sizes and minimum gaps.
+  leftover_for(sizes: LIST[SIZE], span: NAT, spare: NAT, gap: NAT): NAT
+    require
+      small_span: span <= 65535
+      small_spare: spare <= 65535
+    do
+      let gaps = LAYOUT.gap_total(sizes, gap)
+      let children = LAYOUT.children_total(sizes, span, spare)
+      let used = if children >= 65535 - gaps then 65535 else children + gaps end
+      if used < span then span - used else 0 end
+    ensure
+      bounded: Result <= span and Result <= 65535
+    end
+
+  -- Initial axis offset for `justify` given `leftover` surplus within `span`.
+  justified_offset(span: NAT, leftover: NAT, justify: JUSTIFY): NAT
+    require
+      small_span: span <= 65535
+      within: leftover <= span
+    do
+      if justify.is_center then
+        let half = leftover / 2
+        if half <= leftover then half else leftover end
+      else if justify.is_end then
+        leftover
+      else
+        0
+      end end
+    ensure
+      bounded: Result <= span
+    end
+
+  -- Inter-child gap for `justify` given `leftover` surplus and minimum `gap`, at most 65535.
+  justified_between(sizes: LIST[SIZE], leftover: NAT, gap: NAT, justify: JUSTIFY): NAT
+    require
+      small_leftover: leftover <= 65535
+    do
+      if justify.is_space_between and sizes.length > 1 then
+        let raw_extra = leftover / (sizes.length - 1)
+        let extra_gap = if raw_extra <= leftover then raw_extra else leftover end
+        if gap <= 65535 - extra_gap then gap + extra_gap else 65535 end
+      else
+        if gap <= 65535 then gap else 65535 end
+      end
+    ensure
+      bounded: Result <= 65535
     end
 
   -- The cells a size takes when `spare` cells are left for the flexible sizes from it on.
@@ -160,7 +372,87 @@ feature {ANY}
       placed: LAYOUT.down(Result, pos, r)
     end
 
+  lay_across_with(sizes: LIST[SIZE], pos: NAT, spare: NAT, gap: NAT, between: NAT, r: RECT): LIST[RECT]
+    require
+      started: r.x <= pos
+      within: pos <= r.right
+      small: spare <= 65535
+      small_between: between <= 65535
+    variant
+      sizes.length
+    do
+      if sizes.length = 0 then
+        LIST.empty
+      else
+        let extra = LAYOUT.extra_wanted(sizes, spare)
+        let want = sizes.head.base_cells(r.width) + extra
+        let room = r.right - pos
+        let take = if want <= room then want else room end
+        let child = RECT.make(pos, r.y, take, r.height)
+        let child_end = pos + take
+        let step_gap = if between >= gap then between else gap end
+        let next_pos = if r.right - child_end >= step_gap then child_end + step_gap else r.right end
+        let tail = LAYOUT.lay_across_with(sizes.tail, next_pos, spare - extra, gap, between, r)
+        check step: LAYOUT.across_from(tail, child.right, next_pos, r) end
+        tail.prepend(child)
+      end
+    ensure
+      one_each: Result.length = sizes.length
+      placed: LAYOUT.across(Result, pos, r)
+    end
+
+  lay_down_with(sizes: LIST[SIZE], pos: NAT, spare: NAT, gap: NAT, between: NAT, r: RECT): LIST[RECT]
+    require
+      started: r.y <= pos
+      within: pos <= r.bottom
+      small: spare <= 65535
+      small_between: between <= 65535
+    variant
+      sizes.length
+    do
+      if sizes.length = 0 then
+        LIST.empty
+      else
+        let extra = LAYOUT.extra_wanted(sizes, spare)
+        let want = sizes.head.base_cells(r.height) + extra
+        let room = r.bottom - pos
+        let take = if want <= room then want else room end
+        let child = RECT.make(r.x, pos, r.width, take)
+        let child_end = pos + take
+        let step_gap = if between >= gap then between else gap end
+        let next_pos = if r.bottom - child_end >= step_gap then child_end + step_gap else r.bottom end
+        let tail = LAYOUT.lay_down_with(sizes.tail, next_pos, spare - extra, gap, between, r)
+        check step: LAYOUT.down_from(tail, child.bottom, next_pos, r) end
+        tail.prepend(child)
+      end
+    ensure
+      one_each: Result.length = sizes.length
+      placed: LAYOUT.down(Result, pos, r)
+    end
+
 specify {ANY}
+
+  -- Monotonicity of `across` starting column: valid from `b` implies valid from any `a <= b`.
+  law across_from(rs: LIST[RECT], a: NAT, b: NAT, r: RECT)
+    require
+      laid: LAYOUT.across(rs, b, r)
+      before: a <= b
+    do
+      True
+    ensure
+      from_a: LAYOUT.across(rs, a, r)
+    end
+
+  -- Monotonicity of `down` starting row: valid from `b` implies valid from any `a <= b`.
+  law down_from(rs: LIST[RECT], a: NAT, b: NAT, r: RECT)
+    require
+      laid: LAYOUT.down(rs, b, r)
+      before: a <= b
+    do
+      True
+    ensure
+      from_a: LAYOUT.down(rs, a, r)
+    end
 
   -- Every child laid from `from` starts at or after it.
   law across_after(rs: LIST[RECT], from: NAT, r: RECT, j: NAT)

@@ -28,39 +28,46 @@ feature {ANY}
       end
     end
 
-  -- The edge of pane `i`: cyan when it has the keys, and gray otherwise.
+  -- The edge of pane `i`: `focused_border` when it has the keys, and `border` otherwise.
   edge(s: TOUR_STATE, i: NAT): STYLE
     do
-      if s.focus.has(i) then STYLE.plain.fg(COLOR.cyan).bold else STYLE.plain.fg(COLOR.gray) end
+      if s.focus.has(i) then s.theme.focused_border else s.theme.border end
     end
 
   view(s: TOUR_STATE, blank: SCREEN): SCREEN
     do
+      let t = s.theme
       let area = blank.area
       let left = TOUR_LAYOUT.left(area)
       let right = TOUR_LAYOUT.right(area)
       let bottom = TOUR_LAYOUT.bottom(area)
-      let chosen = STYLE.plain.fg(COLOR.bright_yellow).bold.underlined
-      let mark = STYLE.plain.reversed
+      let chosen = t.active_tab
+      let mark = t.selection
       let a = FRAME.draw(blank, left, "", edge(s, 0), edge(s, 0))
-      let b = s.project_tabs.draw(a, FRAME.title_area(left), STYLE.plain, chosen)
-      let c = s.tree.draw(b, FRAME.inner(left), STYLE.plain, mark)
-      let d = FRAME.draw(c, right, s.title, edge(s, 1), edge(s, 1).reversed)
-      let e = s.text.draw_code(d, FRAME.inner(right), STYLE.plain, STYLE.plain.fg(COLOR.gray), s.marked,
-        STYLE.plain.bg(COLOR.blue), fn(i: NAT, line: STRING): LIST[SPAN] do TOUR_LEXER.spans(i, line) end)
+      let b = s.project_tabs.draw(a, FRAME.title_area(left), t.base, chosen)
+      let c = s.tree.draw(b, FRAME.inner(left), t.base, mark)
+      let d = FRAME.draw(c, right, s.title, edge(s, 1), edge(s, 1).patch(STYLE.plain.reversed))
+      let e = s.text.draw_code(d, FRAME.inner(right), t.base, t.gutter, s.marked,
+        t.marked, fn(i: NAT, line: STRING): LIST[SPAN] do TOUR_LEXER.spans_with(t, i, line) end)
       let f = FRAME.draw(e, bottom, "", edge(s, 2), edge(s, 2))
-      let g = s.output_tabs.draw(f, FRAME.title_area(bottom), STYLE.plain, chosen)
+      let g = s.output_tabs.draw(f, FRAME.title_area(bottom), t.base, chosen)
       let inner = FRAME.inner(bottom)
       let h = if s.output_tabs.selected = 0 then
           let out = TEXT_VIEW.make(s.output)
-          out.scrolled_to(out.last_top(inner.height), inner.height).draw(g, inner, STYLE.plain)
+          out.scrolled_to(out.last_top(inner.height), inner.height).draw(g, inner, t.base)
         else
-          s.problems.draw(g, inner, STYLE.plain, mark)
+          s.problems.draw(g, inner, t.base, mark)
         end
-      if s.palette_open then
-        s.palette.draw(h, TOUR_LAYOUT.palette(area, s.palette), STYLE.plain, STYLE.plain.bg(COLOR.blue), STYLE.plain.fg(COLOR.cyan))
+      let with_palette =
+        if s.palette_open then
+          s.palette.draw(h, TOUR_LAYOUT.palette(area, s.palette), t.base, t.marked, t.focused_border)
+        else
+          h
+        end
+      if s.help_open then
+        s.help_popup.draw(with_palette, area, t.base, t.focused_border, t.active_tab)
       else
-        h
+        with_palette
       end
     end
 

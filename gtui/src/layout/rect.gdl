@@ -228,6 +228,35 @@ feature {ANY}
       within: Result.inside(Current)
     end
 
+  -- A rectangle of size `w` by `h` (clamped to `Current`) centered inside `Current`.
+  -- TODO(proof-GT.6): prove centered(w, h).inside(Current) and exact centering margin symmetry
+  centered(w: NAT, h: NAT): RECT
+    do
+      let cw = if w <= Current.wide then w else Current.wide end
+      let ch = if h <= Current.high then h else Current.high end
+      let dx_raw = (Current.wide - cw) / 2
+      let dy_raw = (Current.high - ch) / 2
+      let dx = if dx_raw <= Current.wide - cw then dx_raw else Current.wide - cw end
+      let dy = if dy_raw <= Current.high - ch then dy_raw else Current.high - ch end
+      { left = Current.left + dx, top = Current.top + dy, wide = cw, high = ch }
+    ensure
+      within: Result.inside(Current)
+      width_def: Result.width = (if w <= Current.width then w else Current.width end)
+      height_def: Result.height = (if h <= Current.height then h else Current.height end)
+    end
+
+  -- A rectangle of `pw`% width by `ph`% height (clamped to 100%) centered inside `Current`.
+  centered_percent(pw: NAT, ph: NAT): RECT
+    do
+      let cpw = if pw <= 100 then pw else 100 end
+      let cph = if ph <= 100 then ph else 100 end
+      let w = Current.wide * cpw / 100
+      let h = Current.high * cph / 100
+      Current.centered(w, h)
+    ensure
+      within: Result.inside(Current)
+    end
+
 specify {ANY}
 
   -- A cut across the rows gives two pieces inside the rectangle that do not overlap, with
