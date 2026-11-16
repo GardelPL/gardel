@@ -1,0 +1,105 @@
+-- One mouse event, answering `ReadKey` when SGR 1006 mouse reporting is enabled.
+-- Coordinates `(x, y)` are 0-based cell indices (`0` is the leftmost column / top row).
+-- `button` is `0` for left, `1` for middle, `2` for right.
+-- `MouseMod(mouse, shift, alt, ctrl)` wraps a mouse event with Shift, Alt or Ctrl.
+module MOUSE
+
+representation {ANY}
+  | MouseDown(button: NAT, x: NAT, y: NAT)
+  | MouseUp(button: NAT, x: NAT, y: NAT)
+  | MouseDrag(button: NAT, x: NAT, y: NAT)
+  | WheelUp(x: NAT, y: NAT)
+  | WheelDown(x: NAT, y: NAT)
+  | MouseMod(mouse: MOUSE, shift: BOOL, alt: BOOL, ctrl: BOOL)
+
+feature {ANY}
+
+  -- The underlying mouse event when wrapped in `MouseMod`, or `Current` itself.
+  plain: MOUSE
+    do
+      match Current
+        case MouseMod(inner, _, _, _) then inner
+        case _ then Current
+      end
+    ensure
+      def: Result = (match Current case MouseMod(inner, _, _, _) then inner case _ then Current end)
+    end
+
+  -- 0-based cell column of the event.
+  x: NAT
+    do
+      match Current.plain
+        case MouseDown(_, cx, _) then cx
+        case MouseUp(_, cx, _) then cx
+        case MouseDrag(_, cx, _) then cx
+        case WheelUp(cx, _) then cx
+        case WheelDown(cx, _) then cx
+        case MouseMod(_, _, _, _) then 0
+      end
+    ensure
+      def: Result = (match Current.plain
+        case MouseDown(_, cx, _) then cx
+        case MouseUp(_, cx, _) then cx
+        case MouseDrag(_, cx, _) then cx
+        case WheelUp(cx, _) then cx
+        case WheelDown(cx, _) then cx
+        case MouseMod(_, _, _, _) then 0
+      end)
+    end
+
+  -- 0-based cell row of the event.
+  y: NAT
+    do
+      match Current.plain
+        case MouseDown(_, _, cy) then cy
+        case MouseUp(_, _, cy) then cy
+        case MouseDrag(_, _, cy) then cy
+        case WheelUp(_, cy) then cy
+        case WheelDown(_, cy) then cy
+        case MouseMod(_, _, _, _) then 0
+      end
+    ensure
+      def: Result = (match Current.plain
+        case MouseDown(_, _, cy) then cy
+        case MouseUp(_, _, cy) then cy
+        case MouseDrag(_, _, cy) then cy
+        case WheelUp(_, cy) then cy
+        case WheelDown(_, cy) then cy
+        case MouseMod(_, _, _, _) then 0
+      end)
+    end
+
+  -- True when `Current` (or its inner event under `MouseMod`) is a left-button press (`MouseDown(0, _, _)`).
+  is_left_down: BOOL
+    do
+      match Current.plain
+        case MouseDown(b, _, _) then b = 0
+        case _ then False
+      end
+    ensure
+      def: Result = (match Current.plain case MouseDown(b, _, _) then b = 0 case _ then False end)
+    end
+
+  -- True when `Current` (or its inner event under `MouseMod`) is `WheelUp`.
+  is_wheel_up: BOOL
+    do
+      match Current.plain
+        case WheelUp(_, _) then True
+        case _ then False
+      end
+    ensure
+      def: Result = (match Current.plain case WheelUp(_, _) then True case _ then False end)
+    end
+
+  -- True when `Current` (or its inner event under `MouseMod`) is `WheelDown`.
+  is_wheel_down: BOOL
+    do
+      match Current.plain
+        case WheelDown(_, _) then True
+        case _ then False
+      end
+    ensure
+      def: Result = (match Current.plain case WheelDown(_, _) then True case _ then False end)
+    end
+
+end

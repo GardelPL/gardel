@@ -18,7 +18,7 @@
 5. **Modern Unicode Grapheme Clusters (`GT.8`):** Unicode 16.0.0 character widths and UAX #29 cell segmentation (ZWJ emoji sequences, skin-tone modifiers, regional-indicator flags, `VS15`/`VS16`).
 
 **Out of scope:**
-* Inline or fixed viewports, terminal mouse capture, or Kitty keyboard protocol (these require host-level changes in `gardelc` and `stdlib` beyond `gtui` itself).
+* Inline or fixed viewports, terminal mouse capture (planned separately in [gtui_mouse_support.md](gtui_mouse_support.md)), or Kitty keyboard protocol (these require host-level changes in `gardelc` and `stdlib` beyond `gtui` itself).
 * Braille/HalfBlock vector canvas and chart widgets (deferred until an application requires vector plotting).
 * Mutable screen buffers or thread-local layout caches.
 

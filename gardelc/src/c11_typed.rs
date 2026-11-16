@@ -2862,6 +2862,7 @@ static struct SEQ_STRING* gardel_main_args(int argc, char** argv) {
         self.needs_validator = true;
         self.ctype(READ_LINE_RESULT_TYPE)?;
         let keyt = self.ctype("KEY")?;
+        let mouset = self.ctype("MOUSE")?;
         let evt = self.ctype("EVENT")?;
         let cmd = self.ctype("COMMAND")?;
         let cmds = self.ctype("LIST[COMMAND]")?;
@@ -2894,6 +2895,11 @@ static struct SEQ_STRING* gardel_main_args(int argc, char** argv) {
             let case = host_key_code(&v).ok_or_else(|| format!("`KEY.{v}` has no host implementation"))?;
             make_key.push_str(&format!("        {case}\n"));
         }
+        let mut make_mouse = String::new();
+        for v in self.variants_of("MOUSE")? {
+            let case = host_mouse_code(&v).ok_or_else(|| format!("`MOUSE.{v}` has no host implementation"))?;
+            make_mouse.push_str(&format!("        {case}\n"));
+        }
         let inst = c_instance_name(&ret);
         let keep = self.own(borrowed("r->Continue.next".to_string(), state.clone()))?;
         let drop_step = self.drop_stmt(&ret, "r")?;
@@ -2907,6 +2913,9 @@ static struct SEQ_STRING* gardel_main_args(int argc, char** argv) {
                  static {keyt} gardel_key_plain(struct gardel_host_event ev) {{\n    switch (ev.key) {{\n{make_key}        default: abort();\n    }}\n}}\n\n\
                  /* A key with Shift, Alt or Ctrl is that key in a `Mod`. */\n\
                  static {keyt} gardel_key_value(struct gardel_host_event ev) {{\n    {keyt} k = gardel_key_plain(ev);\n    if (!ev.mods) return k;\n    return make_KEY_Mod(k, (ev.mods & GARDEL_MOD_SHIFT) != 0, (ev.mods & GARDEL_MOD_ALT) != 0, (ev.mods & GARDEL_MOD_CTRL) != 0);\n}}\n\n\
+                 static {mouset} gardel_mouse_plain(struct gardel_host_event ev) {{\n    switch (ev.mouse) {{\n{make_mouse}        default: abort();\n    }}\n}}\n\n\
+                 /* A mouse event with Shift, Alt or Ctrl is that event in a `MouseMod`. */\n\
+                 static {mouset} gardel_mouse_value(struct gardel_host_event ev) {{\n    {mouset} m = gardel_mouse_plain(ev);\n    if (!ev.mods) return m;\n    return make_MOUSE_MouseMod(m, (ev.mods & GARDEL_MOD_SHIFT) != 0, (ev.mods & GARDEL_MOD_ALT) != 0, (ev.mods & GARDEL_MOD_CTRL) != 0);\n}}\n\n\
                  static {evt} gardel_event_value(struct gardel_host_event ev) {{\n    switch (ev.kind) {{\n{make}        default: abort();\n    }}\n}}\n\n\
                  int gardel_reactive_main(int argc, char** argv) {{\n\
                  \x20   gardel_host_install();\n\
@@ -3040,7 +3049,7 @@ enum gardel_host_kind {
     GARDEL_HOST_CONNECTED, GARDEL_HOST_CONNECT_FAILED, GARDEL_HOST_RESIZED, GARDEL_HOST_FILE_READ,
     GARDEL_HOST_DIR_LISTED, GARDEL_HOST_PROC_STARTED, GARDEL_HOST_PROC_FAILED, GARDEL_HOST_PROC_OUT,
     GARDEL_HOST_PROC_ERR, GARDEL_HOST_PROC_EXITED, GARDEL_HOST_ATTACHED_ENDED, GARDEL_HOST_FILE_WRITTEN,
-    GARDEL_HOST_PASTED
+    GARDEL_HOST_PASTED, GARDEL_HOST_MOUSE
 };
 enum gardel_host_key {
     GARDEL_KEY_CHAR, GARDEL_KEY_UP, GARDEL_KEY_DOWN, GARDEL_KEY_LEFT, GARDEL_KEY_RIGHT,
@@ -3048,6 +3057,9 @@ enum gardel_host_key {
     GARDEL_KEY_OTHER, GARDEL_KEY_END_OF_INPUT, GARDEL_KEY_HOME, GARDEL_KEY_END,
     GARDEL_KEY_PAGE_UP, GARDEL_KEY_PAGE_DOWN, GARDEL_KEY_DELETE, GARDEL_KEY_CTRL,
     GARDEL_KEY_INSERT, GARDEL_KEY_FUNCTION
+};
+enum gardel_host_mouse {
+    GARDEL_MOUSE_DOWN, GARDEL_MOUSE_UP, GARDEL_MOUSE_DRAG, GARDEL_MOUSE_WHEEL_UP, GARDEL_MOUSE_WHEEL_DOWN
 };
 /* A key's modifiers, as `mods` holds them: the bits of xterm's modifier parameter less one. */
 #define GARDEL_MOD_SHIFT 1u
@@ -3075,7 +3087,9 @@ struct gardel_host_event {
     size_t buf_len;
     struct gardel_dir_item* items; /* DirListed: malloc'd, sorted by name */
     size_t item_count;
-    unsigned mods;              /* Key: GARDEL_MOD_* bits, 0 for none */
+    unsigned mods;              /* Key, Mouse: GARDEL_MOD_* bits, 0 for none */
+    enum gardel_host_mouse mouse;         /* Mouse */
+    uint64_t mouse_btn, mouse_x, mouse_y; /* Mouse: button 0..2, 0-based cell coords */
 };
 struct gardel_dir_item { char* name; size_t len; bool is_dir; };
 
@@ -3308,27 +3322,42 @@ static void gardel_term_open(void) {
     gardel_term_is_console = GetConsoleMode(gardel_term_in, &gardel_term_saved) != 0;
 }
 /* Raw mode also asks for VT input (ENABLE_VIRTUAL_TERMINAL_INPUT), so that the console sends what
-   a POSIX terminal sends: Ctrl and Shift with the arrows, F-keys, and a bracketed paste. A console
-   that refuses it gives key records, read by their key codes. */
+   a POSIX terminal sends: Ctrl and Shift with the arrows, F-keys, SGR mouse events, and a bracketed
+   paste. Quick Edit is cleared so mouse clicks reach the program; a console that refuses VT input
+   falls back to key and mouse input records. */
 static bool gardel_term_vt_in = false;
+static unsigned long gardel_con_buttons = 0;
 static void gardel_term_set_raw(bool raw) {
     if (!gardel_term_is_console || raw == gardel_term_is_raw) return;
     if (raw) {
-        unsigned long mode = gardel_term_saved & ~6UL;
-        gardel_term_vt_in = SetConsoleMode(gardel_term_in, mode | 0x200UL) != 0;
+        /* Clear line/echo input (6) and Quick Edit (0x40); enable mouse input (0x10) and extended flags (0x80). */
+        unsigned long mode = (gardel_term_saved & ~(6UL | 0x0040UL)) | 0x0010UL | 0x0080UL;
+        gardel_term_vt_in = SetConsoleMode(gardel_term_in, mode | 0x0200UL) != 0;
         if (!gardel_term_vt_in) SetConsoleMode(gardel_term_in, mode);
+        gardel_con_buttons = 0;
     } else {
-        SetConsoleMode(gardel_term_in, gardel_term_saved);
+        if (!SetConsoleMode(gardel_term_in, gardel_term_saved | 0x0080UL)) {
+            SetConsoleMode(gardel_term_in, gardel_term_saved);
+        }
         gardel_term_vt_in = false;
+        gardel_con_buttons = 0;
     }
     gardel_term_is_raw = raw;
 }
 struct gardel_console_key {
     unsigned short type, pad;
-    int down;
-    unsigned short repeat, vk, scan;
-    wchar_t ch;
-    unsigned long state;
+    union {
+        struct {
+            int down;
+            unsigned short repeat, vk, scan;
+            wchar_t ch;
+            unsigned long state;
+        };
+        struct {
+            short mouse_x, mouse_y;
+            unsigned long mouse_buttons, mouse_state, mouse_flags;
+        };
+    };
 };
 static void gardel_decode_control(uint32_t c, struct gardel_host_event* ev);
 /* Bytes of characters taken from console records, UTF-8, not yet decoded. */
@@ -3343,10 +3372,70 @@ static void gardel_con_put(uint32_t c) {
     else if (c < 0x10000) { o[0] = (unsigned char)(0xE0 | (c >> 12)); o[1] = (unsigned char)(0x80 | ((c >> 6) & 0x3F)); o[2] = (unsigned char)(0x80 | (c & 0x3F)); gardel_con_len += 3; }
     else { o[0] = (unsigned char)(0xF0 | (c >> 18)); o[1] = (unsigned char)(0x80 | ((c >> 12) & 0x3F)); o[2] = (unsigned char)(0x80 | ((c >> 6) & 0x3F)); o[3] = (unsigned char)(0x80 | (c & 0x3F)); gardel_con_len += 4; }
 }
-/* One console record: 0 when it is no key, 1 when `ev` holds its key, 2 when its character's
-   bytes wait in gardel_con_bytes. A key named by its key code comes with its modifiers; with VT
-   input every character goes to the bytes, where escape sequences are decoded as on POSIX. */
+static int gardel_con_mouse_take(const struct gardel_console_key* k, struct gardel_host_event* ev) {
+    if (k->mouse_x < 0 || k->mouse_y < 0) return 0;
+    uint64_t x = (uint64_t)k->mouse_x;
+    uint64_t y = (uint64_t)k->mouse_y;
+    if (x > 65534 || y > 65534) return 0;
+    unsigned mods = ((k->mouse_state & 0x10) ? GARDEL_MOD_SHIFT : 0)
+                  | ((k->mouse_state & 0x3) ? GARDEL_MOD_ALT : 0)
+                  | ((k->mouse_state & 0xC) ? GARDEL_MOD_CTRL : 0);
+    if (k->mouse_flags & 0x0008UL) return 0; /* horizontal wheel out of scope */
+    if (k->mouse_flags & 0x0004UL) {
+        int16_t delta = (int16_t)(uint16_t)(k->mouse_buttons >> 16);
+        if (delta == 0) return 0;
+        ev->kind = GARDEL_HOST_MOUSE;
+        ev->mouse = delta > 0 ? GARDEL_MOUSE_WHEEL_UP : GARDEL_MOUSE_WHEEL_DOWN;
+        ev->mouse_btn = 0;
+        ev->mouse_x = x;
+        ev->mouse_y = y;
+        ev->mods = mods;
+        return 1;
+    }
+    unsigned long cur = k->mouse_buttons & 0x7UL;
+    if (k->mouse_flags & 0x0001UL) {
+        gardel_con_buttons = cur;
+        if (!cur) return 0; /* hover without button out of scope */
+        ev->kind = GARDEL_HOST_MOUSE;
+        ev->mouse = GARDEL_MOUSE_DRAG;
+        ev->mouse_btn = (cur & 0x1UL) ? 0 : (cur & 0x4UL) ? 1 : 2;
+        ev->mouse_x = x;
+        ev->mouse_y = y;
+        ev->mods = mods;
+        return 1;
+    }
+    unsigned long changed = cur ^ gardel_con_buttons;
+    static const struct { unsigned long mask; uint64_t btn; } map[3] = {
+        { 0x1UL, 0 }, { 0x4UL, 1 }, { 0x2UL, 2 },
+    };
+    for (size_t i = 0; i < 3; i++) {
+        if (changed & map[i].mask) {
+            gardel_con_buttons ^= map[i].mask;
+            ev->kind = GARDEL_HOST_MOUSE;
+            ev->mouse = (cur & map[i].mask) ? GARDEL_MOUSE_DOWN : GARDEL_MOUSE_UP;
+            ev->mouse_btn = map[i].btn;
+            ev->mouse_x = x;
+            ev->mouse_y = y;
+            ev->mods = mods;
+            return 1;
+        }
+    }
+    if ((k->mouse_flags & 0x0002UL) && cur != 0) {
+        ev->kind = GARDEL_HOST_MOUSE;
+        ev->mouse = GARDEL_MOUSE_DOWN;
+        ev->mouse_btn = (cur & 0x1UL) ? 0 : (cur & 0x4UL) ? 1 : 2;
+        ev->mouse_x = x;
+        ev->mouse_y = y;
+        ev->mods = mods;
+        return 1;
+    }
+    return 0;
+}
+/* One console record: 0 when ignored, 1 when `ev` holds its key or mouse event, 2 when its
+   character's bytes wait in gardel_con_bytes. With VT input every character goes to the bytes,
+   where escape sequences are decoded as on POSIX. */
 static int gardel_con_take(const struct gardel_console_key* k, struct gardel_host_event* ev) {
+    if (k->type == 2 && !gardel_term_vt_in) return gardel_con_mouse_take(k, ev);
     if (k->type != 1 || !k->down) return 0;
     unsigned mods = ((k->state & 0x10) ? GARDEL_MOD_SHIFT : 0) | ((k->state & 0x3) ? GARDEL_MOD_ALT : 0)
                   | ((k->state & 0xC) ? GARDEL_MOD_CTRL : 0);
@@ -4080,14 +4169,70 @@ static uint32_t gardel_function_of(uint64_t n) {
     return 0;
 }
 
+/* SGR 1006 mouse event after ESC [ <: Cb ; Cx ; Cy M or m. Coordinates on the wire are
+   1-based (1..65535) and become 0-based (0..65534). Malformed or unsupported sequences
+   leave ev as GARDEL_HOST_KEY / GARDEL_KEY_OTHER. */
+static void gardel_decode_sgr_mouse(struct gardel_host_event* ev) {
+    uint64_t p[3] = { 0, 0, 0 };
+    bool has[3] = { false, false, false };
+    bool ok = true;
+    size_t at = 0, len = 0;
+    ev->key = GARDEL_KEY_OTHER;
+    ev->mods = 0;
+    int c = gardel_read_byte();
+    while (c >= 0 && ((c >= '0' && c <= '9') || c == ';') && len < 40) {
+        len++;
+        if (c == ';') {
+            if (at < 2) at++;
+            else ok = false;
+        } else {
+            has[at] = true;
+            if (p[at] < 100000) p[at] = p[at] * 10 + (uint64_t)(c - '0');
+        }
+        c = gardel_read_byte();
+    }
+    if (!ok || (c != 'M' && c != 'm') || at != 2 || !has[0] || !has[1] || !has[2]) return;
+    if (p[1] < 1 || p[1] > 65535 || p[2] < 1 || p[2] > 65535) return;
+    uint64_t cb = p[0];
+    if ((cb & ~(uint64_t)(3u | 4u | 8u | 16u | 32u | 64u)) != 0) return;
+    unsigned mods = ((cb & 4u) ? GARDEL_MOD_SHIFT : 0)
+                  | ((cb & 8u) ? GARDEL_MOD_ALT : 0)
+                  | ((cb & 16u) ? GARDEL_MOD_CTRL : 0);
+    uint64_t btn = cb & 3u;
+    if (cb & 64u) {
+        if (c != 'M' || (cb & 32u) != 0 || btn > 1) return;
+        ev->mouse = btn == 0 ? GARDEL_MOUSE_WHEEL_UP : GARDEL_MOUSE_WHEEL_DOWN;
+        ev->mouse_btn = 0;
+    } else {
+        if (btn > 2) return;
+        if (c == 'm') {
+            if ((cb & 32u) != 0) return;
+            ev->mouse = GARDEL_MOUSE_UP;
+        } else if (cb & 32u) {
+            ev->mouse = GARDEL_MOUSE_DRAG;
+        } else {
+            ev->mouse = GARDEL_MOUSE_DOWN;
+        }
+        ev->mouse_btn = btn;
+    }
+    ev->kind = GARDEL_HOST_MOUSE;
+    ev->mouse_x = p[1] - 1;
+    ev->mouse_y = p[2] - 1;
+    ev->mods = mods;
+}
+
 /* What follows ESC [ or ESC O: parameters, then a final byte. The second parameter, as in
    ESC [ 1 ; 5 C for Ctrl-Right, is xterm's modifier: one more than the GARDEL_MOD_* bits, of
    which Meta is not kept. A sub-parameter after `:`, such as kitty's event type, is skipped. */
-static void gardel_decode_sequence(struct gardel_host_event* ev) {
+static void gardel_decode_sequence(int prefix, struct gardel_host_event* ev) {
+    int c = gardel_read_byte();
+    if (prefix == '[' && c == '<') {
+        gardel_decode_sgr_mouse(ev);
+        return;
+    }
     uint64_t p[2] = { 0, 0 };
     size_t at = 0;
     bool sub = false;
-    int c = gardel_read_byte();
     while (c >= '0' && c <= ';') {
         if (c == ';') { at++; sub = false; }
         else if (c == ':') sub = true;
@@ -4140,7 +4285,7 @@ static void gardel_decode_key_byte(int b, struct gardel_host_event* ev) {
         int c = gardel_read_byte();
         ev->key = GARDEL_KEY_OTHER;
         if ((c == '[' || c == 'O') && gardel_byte_soon()) {
-            gardel_decode_sequence(ev);
+            gardel_decode_sequence(c, ev);
             return;
         }
         /* ESC and a key is Alt with it, as a terminal sends Alt-x. */
@@ -5093,6 +5238,24 @@ static void gardel_log_event(struct gardel_host_event* ev) {
             gardel_log_word(":");
             gardel_log_number(ev->height);
             break;
+        case GARDEL_HOST_MOUSE:
+            gardel_log_word("Mouse:");
+            if (ev->mods & GARDEL_MOD_SHIFT) gardel_log_word("Shift+");
+            if (ev->mods & GARDEL_MOD_ALT) gardel_log_word("Alt+");
+            if (ev->mods & GARDEL_MOD_CTRL) gardel_log_word("Ctrl+");
+            switch (ev->mouse) {
+                case GARDEL_MOUSE_DOWN: gardel_log_word("Down:"); gardel_log_number(ev->mouse_btn); break;
+                case GARDEL_MOUSE_UP: gardel_log_word("Up:"); gardel_log_number(ev->mouse_btn); break;
+                case GARDEL_MOUSE_DRAG: gardel_log_word("Drag:"); gardel_log_number(ev->mouse_btn); break;
+                case GARDEL_MOUSE_WHEEL_UP: gardel_log_word("WheelUp"); break;
+                case GARDEL_MOUSE_WHEEL_DOWN: gardel_log_word("WheelDown"); break;
+                default: abort();
+            }
+            gardel_log_word(":");
+            gardel_log_number(ev->mouse_x);
+            gardel_log_word(":");
+            gardel_log_number(ev->mouse_y);
+            break;
         default:
             if (!gardel_log_host_event(ev)) abort();
         }
@@ -5281,6 +5444,62 @@ static struct gardel_host_event gardel_next_scripted_event(void) {
         }
         if (found) return ev;
     }
+    /* Mouse:[Shift+][Alt+][Ctrl+](Down:<btn>|Up:<btn>|Drag:<btn>|WheelUp|WheelDown):<x>:<y>,
+       with button in 0..2 and coordinates in 0..65534. */
+    if (n > 6 && memcmp(name, "Mouse:", 6) == 0) {
+        size_t at = 6;
+        unsigned mods = 0;
+        static const struct { const char* word; unsigned bit; } mod_words[] = {
+            {"Shift+", GARDEL_MOD_SHIFT}, {"Alt+", GARDEL_MOD_ALT}, {"Ctrl+", GARDEL_MOD_CTRL},
+        };
+        for (size_t m = 0; m < 3; m++) {
+            size_t w = strlen(mod_words[m].word);
+            if (n - at > w && memcmp(name + at, mod_words[m].word, w) == 0) {
+                mods |= mod_words[m].bit;
+                at += w;
+            }
+        }
+        static const struct { const char* name; enum gardel_host_mouse kind; bool has_btn; } kinds[] = {
+            {"Down:", GARDEL_MOUSE_DOWN, true},
+            {"Up:", GARDEL_MOUSE_UP, true},
+            {"Drag:", GARDEL_MOUSE_DRAG, true},
+            {"WheelUp:", GARDEL_MOUSE_WHEEL_UP, false},
+            {"WheelDown:", GARDEL_MOUSE_WHEEL_DOWN, false},
+        };
+        bool ok = false;
+        enum gardel_host_mouse mouse = GARDEL_MOUSE_DOWN;
+        uint64_t btn = 0, x = 0, y = 0;
+        for (size_t k = 0; k < sizeof kinds / sizeof kinds[0]; k++) {
+            size_t w = strlen(kinds[k].name);
+            if (n - at <= w || memcmp(name + at, kinds[k].name, w) != 0) continue;
+            at += w;
+            mouse = kinds[k].kind;
+            if (kinds[k].has_btn) {
+                size_t bs = at;
+                if (!gardel_script_number(name, n, &at, &btn) || (at - bs > 1 && name[bs] == '0') || btn > 2 || at >= n || name[at] != ':') break;
+                at++;
+            }
+            size_t xs = at;
+            if (gardel_script_number(name, n, &at, &x) && !(at - xs > 1 && name[xs] == '0') && x <= 65534
+                && at < n && name[at] == ':') {
+                at++;
+                size_t ys = at;
+                if (gardel_script_number(name, n, &at, &y) && !(at - ys > 1 && name[ys] == '0') && y <= 65534 && at == n) {
+                    ok = true;
+                }
+            }
+            break;
+        }
+        if (ok) {
+            ev.kind = GARDEL_HOST_MOUSE;
+            ev.mouse = mouse;
+            ev.mouse_btn = btn;
+            ev.mouse_x = x;
+            ev.mouse_y = y;
+            ev.mods = mods;
+            return ev;
+        }
+    }
     fprintf(stderr, "error: %s: unknown event `%.*s`\n", gardel_event_source, (int)n, name);
     exit(2);
 }
@@ -5402,6 +5621,7 @@ pub(crate) fn host_event_code(variant: &str) -> Option<&'static str> {
         "AttachedEnded" => Some("case GARDEL_HOST_ATTACHED_ENDED: return make_EVENT_AttachedEnded(ev.tag, gardel_attached_value(ev));"),
         "FileWritten" => Some("case GARDEL_HOST_FILE_WRITTEN: return make_EVENT_FileWritten(ev.tag, gardel_written_value(ev));"),
         "Pasted" => Some("case GARDEL_HOST_PASTED: return make_EVENT_Pasted(gardel_paste_value(ev));"),
+        "Mouse" => Some("case GARDEL_HOST_MOUSE: return make_EVENT_Mouse(gardel_mouse_value(ev));"),
         _ => None,
     }
 }
@@ -5429,6 +5649,19 @@ pub(crate) fn host_key_code(variant: &str) -> Option<&'static str> {
         "Insert" => Some("case GARDEL_KEY_INSERT: return make_KEY_Insert();"),
         "Function" => Some("case GARDEL_KEY_FUNCTION: return make_KEY_Function(ev.ch);"),
         "Mod" => Some("/* Mod: around another key, by gardel_key_value */"),
+        _ => None,
+    }
+}
+
+/// The `switch` case that builds a `MOUSE` variant from the host's `ev`.
+pub(crate) fn host_mouse_code(variant: &str) -> Option<&'static str> {
+    match variant {
+        "MouseDown" => Some("case GARDEL_MOUSE_DOWN: return make_MOUSE_MouseDown(ev.mouse_btn, ev.mouse_x, ev.mouse_y);"),
+        "MouseUp" => Some("case GARDEL_MOUSE_UP: return make_MOUSE_MouseUp(ev.mouse_btn, ev.mouse_x, ev.mouse_y);"),
+        "MouseDrag" => Some("case GARDEL_MOUSE_DRAG: return make_MOUSE_MouseDrag(ev.mouse_btn, ev.mouse_x, ev.mouse_y);"),
+        "WheelUp" => Some("case GARDEL_MOUSE_WHEEL_UP: return make_MOUSE_WheelUp(ev.mouse_x, ev.mouse_y);"),
+        "WheelDown" => Some("case GARDEL_MOUSE_WHEEL_DOWN: return make_MOUSE_WheelDown(ev.mouse_x, ev.mouse_y);"),
+        "MouseMod" => Some("/* MouseMod: around another mouse event, by gardel_mouse_value */"),
         _ => None,
     }
 }

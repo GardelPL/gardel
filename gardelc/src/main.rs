@@ -4031,6 +4031,10 @@ pub const STDLIB_SOURCES: &[(&str, &str)] = &[
         include_str!("../../stdlib/core/key.gdl"),
     ),
     (
+        "stdlib/core/mouse.gdl",
+        include_str!("../../stdlib/core/mouse.gdl"),
+    ),
+    (
         "stdlib/core/event.gdl",
         include_str!("../../stdlib/core/event.gdl"),
     ),
@@ -4088,6 +4092,8 @@ pub fn phase4_stdlib_source() -> &'static str {
         include_str!("../../stdlib/core/command.gdl"),
         "\n",
         include_str!("../../stdlib/core/key.gdl"),
+        "\n",
+        include_str!("../../stdlib/core/mouse.gdl"),
         "\n",
         include_str!("../../stdlib/core/event.gdl"),
         "\n",
@@ -5220,7 +5226,7 @@ pub const GCC_NET_LIBS: &[&str] = if cfg!(windows) { &["-lws2_32"] } else { &[] 
 /// `STRING` is injected for modules that mention it, contain string literals or use `IO`
 /// (Task B.3: literals denote prelude `STRING` values); `LIST_OPS` / `FUNCTION_OPS` are realized by the built-in
 /// `Seq_*` / `Fn1_*` preamble theories already present in every Boogie file.
-const BOOGIE_INJECTED_PRELUDE: [&str; 20] = [
+const BOOGIE_INJECTED_PRELUDE: [&str; 21] = [
     "OPTION",
     "RESULT",
     "SEQ",
@@ -5237,6 +5243,7 @@ const BOOGIE_INJECTED_PRELUDE: [&str; 20] = [
     "DIR_ENTRY",
     "COMMAND",
     "KEY",
+    "MOUSE",
     "EVENT",
     "STEP",
     "KEY_ORDER",
@@ -24041,7 +24048,11 @@ int main(void) {
         for v in variants("KEY") {
             assert!(c11_typed::host_key_code(&v).is_some(), "KEY.{v}");
         }
+        for v in variants("MOUSE") {
+            assert!(c11_typed::host_mouse_code(&v).is_some(), "MOUSE.{v}");
+        }
         assert!(c11_typed::host_key_code("Nonsense").is_none());
+        assert!(c11_typed::host_mouse_code("Nonsense").is_none());
         assert!(c11_typed::host_command_code("Nonsense").is_none());
         assert!(c11_typed::host_event_code("Nonsense").is_none());
         let c = d4_c(&[("reactive_hello.gdl", D4_HELLO)]);
@@ -25072,6 +25083,162 @@ end
         let text = fs::read_to_string(&log).unwrap();
         assert!(text.contains("event Resized:80:24\n"), "output that is not a terminal is 80 by 24:\n{text}");
         assert!(text.contains("event Key:Ctrl:s\n") && text.contains("event Key:Ctrl:q\n"), "{text}");
+        d8_check_replay(&exe, &log, &live);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// F.9 + GM.2: reactive program formatting `EVENT.Mouse(m)` and exercising `MOUSE` helpers.
+    const F9_MOUSE: &str = "reactive program TERM_MOUSE
+
+feature {ANY}
+
+  init(args: SEQ[STRING]): STEP[NAT]
+    do
+      Continue(0, LIST.empty.prepend(ReadKey))
+    end
+
+  mod_prefix(m: MOUSE): STRING
+    do
+      match m
+        case MouseMod(_, s, a, c) then
+          if s then
+            if a then (if c then \"shift-alt-ctrl-\" else \"shift-alt-\" end) else (if c then \"shift-ctrl-\" else \"shift-\" end) end
+          else
+            if a then (if c then \"alt-ctrl-\" else \"alt-\" end) else (if c then \"ctrl-\" else \"\" end) end
+          end
+        case _ then \"\"
+      end
+    end
+
+  mouse_kind(m: MOUSE): STRING
+    do
+      match m.plain
+        case MouseDown(_, _, _) then \"down\"
+        case MouseUp(_, _, _) then \"up\"
+        case MouseDrag(_, _, _) then \"drag\"
+        case WheelUp(_, _) then \"wheelup\"
+        case WheelDown(_, _) then \"wheeldown\"
+        case MouseMod(_, _, _, _) then \"mod\"
+      end
+    end
+
+  mouse_btn(m: MOUSE): STRING
+    do
+      match m.plain
+        case MouseDown(b, _, _) then NUMBER_TEXT.nat_to_text(b)
+        case MouseUp(b, _, _) then NUMBER_TEXT.nat_to_text(b)
+        case MouseDrag(b, _, _) then NUMBER_TEXT.nat_to_text(b)
+        case _ then \"\"
+      end
+    end
+
+  flags(m: MOUSE): STRING
+    do
+      if m.is_left_down then \"L\"
+      else if m.is_wheel_up then \"U\"
+      else if m.is_wheel_down then \"D\"
+      else \"\"
+      end end end
+    end
+
+  step(s: NAT, e: EVENT): STEP[NAT]
+    do
+      match e
+        case Key(k) then
+          match k
+            case KeysEnded then Stop(0, LIST.empty.prepend(Print(\"done\")))
+            case Other then Continue(s, LIST.empty.prepend(ReadKey).prepend(Write(\" \")).prepend(Write(\"other\")))
+            case _ then Continue(s, LIST.empty.prepend(ReadKey).prepend(Write(\" \")).prepend(Write(\"key\")))
+          end
+        case Mouse(m) then
+          Continue(s, LIST.empty
+            .prepend(ReadKey)
+            .prepend(Write(\" \"))
+            .prepend(Write(flags(m)))
+            .prepend(Write(NUMBER_TEXT.nat_to_text(m.y)))
+            .prepend(Write(\",\"))
+            .prepend(Write(NUMBER_TEXT.nat_to_text(m.x)))
+            .prepend(Write(\"@\"))
+            .prepend(Write(mouse_btn(m)))
+            .prepend(Write(mouse_kind(m)))
+            .prepend(Write(mod_prefix(m))))
+        case Shutdown then Stop(1, LIST.empty)
+        case _ then Continue(s, LIST.empty)
+      end
+    end
+
+end
+";
+
+    #[test]
+    fn test_f9_mouse_sgr_script_log_and_replay() {
+        let c = d4_c(&[("term_mouse.gdl", F9_MOUSE)]);
+        let Some((dir, exe)) = c3_compile(&c, "f9mousescript") else { return };
+        let script = "Mouse:Down:0:12:3 Mouse:Shift+Drag:0:15:4 Mouse:Ctrl+Up:2:15:4 Mouse:Alt+WheelUp:8:2 Mouse:WheelDown:8:2 Key:KeysEnded";
+        let run = f9_run(&exe, &[("GARDEL_EVENTS", script.as_ref())], b"");
+        assert_eq!(run.0, 0, "{}", run.2);
+        let want = b"down0@12,3L shift-drag0@15,4 ctrl-up2@15,4 alt-wheelup@8,2U wheeldown@8,2D done\n";
+        assert_eq!(String::from_utf8_lossy(&run.1), String::from_utf8_lossy(want));
+        assert_eq!(run.1, want);
+
+        let log = dir.join("run.log");
+        let live = d8_run(&exe, &[("GARDEL_EVENTS", script.as_ref()), ("GARDEL_RECORD", log.as_os_str())], b"", &[]);
+        let text = fs::read_to_string(&log).unwrap();
+        for line in [
+            "event Mouse:Down:0:12:3\n",
+            "event Mouse:Shift+Drag:0:15:4\n",
+            "event Mouse:Ctrl+Up:2:15:4\n",
+            "event Mouse:Alt+WheelUp:8:2\n",
+            "event Mouse:WheelDown:8:2\n",
+        ] {
+            assert!(text.contains(line), "{line} in\n{text}");
+        }
+        assert_eq!(d8_script(&text), script);
+        d8_check_replay(&exe, &log, &live);
+
+        for bad in [
+            "Mouse:Down:3:0:0",
+            "Mouse:Down:0:65535:0",
+            "Mouse:WheelUp:1:2:3",
+            "Mouse:Ctrl+Alt+Down:0:1:1",
+            "Mouse:Bogus",
+            "Mouse:Down:00:0:0",
+            "Mouse:Down:0:0:01",
+            "Mouse:Shift+Down:0:0:0:1",
+            "Mouse:",
+        ] {
+            let r = f9_run(&exe, &[("GARDEL_EVENTS", bad.as_ref())], b"");
+            assert_eq!(r.0, 2, "{bad}: {}", r.2);
+            assert!(r.2.contains("unknown event"), "{bad}: {}", r.2);
+        }
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_f9_mouse_sgr_bytes_decoded() {
+        let c = d4_c(&[("term_mouse.gdl", F9_MOUSE)]);
+        let Some((dir, exe)) = c3_compile(&c, "f9mousebytes") else { return };
+        let log = dir.join("run.log");
+        let input: &[u8] = b"\x1b[<0;13;4M\x1b[<36;16;5M\x1b[<2;16;5m\x1b[<18;16;5m\x1b[<64;9;3M\x1b[<72;9;3M\x1b[<65;9;3M\x1b[<999;1;1M\x1b[<0;0;1M\x1b[<64;1;1m\x1b[<3;1;1M\x1b[<66;1;1M";
+        let live = d8_run(&exe, &[("GARDEL_RECORD", log.as_os_str())], input, &[]);
+        assert_eq!(live.0, 0, "{}", live.2);
+        assert_eq!(
+            live.1,
+            "down0@12,3L shift-drag0@15,4 up2@15,4 ctrl-up2@15,4 wheelup@8,2U alt-wheelup@8,2U wheeldown@8,2D other other other other other done\n"
+        );
+        let text = fs::read_to_string(&log).unwrap();
+        for line in [
+            "event Mouse:Down:0:12:3\n",
+            "event Mouse:Shift+Drag:0:15:4\n",
+            "event Mouse:Up:2:15:4\n",
+            "event Mouse:Ctrl+Up:2:15:4\n",
+            "event Mouse:WheelUp:8:2\n",
+            "event Mouse:Alt+WheelUp:8:2\n",
+            "event Mouse:WheelDown:8:2\n",
+            "event Key:Other\n",
+        ] {
+            assert!(text.contains(line), "{line} in\n{text}");
+        }
         d8_check_replay(&exe, &log, &live);
         let _ = fs::remove_dir_all(&dir);
     }
