@@ -1,0 +1,36 @@
+-- Stage D of the round trip, the writer's field lines of `req` at `p0`, up to `pf`:
+-- `HTTP_HEAD_PARSER.fields` reads them, from no fields, with the same outcome as from `pf`
+-- with them read (`HTTP_READ_FIELDS.reads`; what those hold is `HTTP_FIELDS_READ`'s). The
+-- first part of `HTTP_FIELDS_CHAIN.chain`.
+functions HTTP_FIELDS_PART
+
+specify {ANY}
+
+  law fields_part(req: HTTP_REQUEST, buf: BYTES, p0: NAT, pf: NAT, he: NAT)
+    require
+      sendable: HTTP_REQUEST_WRITER.sendable(req)
+      few: req.headers.fields.length <= 31
+      small: p0 <= 1000000000
+      fields_hold: forall k: NAT. (p0 <= k and k < p0 + HTTP_REQUEST_WRITER.fields_text(req.headers.fields).byte_model.length) implies
+        LIST_OPS.at(buf.model, k) = LIST_OPS.at(HTTP_REQUEST_WRITER.fields_text(req.headers.fields).byte_model, k - p0)
+      at: pf = p0 + HTTP_REQUEST_WRITER.fields_text(req.headers.fields).byte_model.length
+      fits: pf <= he + 2
+      in_buf: he + 4 <= buf.length
+    do
+      HTTP_REQUEST_WRITER.fields_ok(req.headers.fields) and
+      HTTP_HEADERS.default_empty.num_headers = 0 and HTTP_HEADERS.default_empty.max_headers = 32 and
+      HTTP_READ_STEPS.fields_steps(buf, p0, he, req.headers.fields, HTTP_HEADERS.default_empty, None, False)
+    ensure
+      step_ok: HTTP_READ_FIELD.outcome_ok(HTTP_HEAD_PARSER.fields(buf, p0, he, HTTP_HEADERS.default_empty, None, False)) =
+        HTTP_READ_FIELD.outcome_ok(HTTP_HEAD_PARSER.fields(buf, pf, he, HTTP_READ_FIELDS.reads(buf, p0, req.headers.fields, HTTP_HEADERS.default_empty), None, False))
+      step_names: HTTP_READ_FIELD.outcome_names(HTTP_HEAD_PARSER.fields(buf, p0, he, HTTP_HEADERS.default_empty, None, False)) =
+        HTTP_READ_FIELD.outcome_names(HTTP_HEAD_PARSER.fields(buf, pf, he, HTTP_READ_FIELDS.reads(buf, p0, req.headers.fields, HTTP_HEADERS.default_empty), None, False))
+      step_values: HTTP_READ_FIELD.outcome_values(HTTP_HEAD_PARSER.fields(buf, p0, he, HTTP_HEADERS.default_empty, None, False)) =
+        HTTP_READ_FIELD.outcome_values(HTTP_HEAD_PARSER.fields(buf, pf, he, HTTP_READ_FIELDS.reads(buf, p0, req.headers.fields, HTTP_HEADERS.default_empty), None, False))
+      step_length: HTTP_READ_FIELD.outcome_length(HTTP_HEAD_PARSER.fields(buf, p0, he, HTTP_HEADERS.default_empty, None, False)) =
+        HTTP_READ_FIELD.outcome_length(HTTP_HEAD_PARSER.fields(buf, pf, he, HTTP_READ_FIELDS.reads(buf, p0, req.headers.fields, HTTP_HEADERS.default_empty), None, False))
+      step_chunked: HTTP_READ_FIELD.outcome_chunked(HTTP_HEAD_PARSER.fields(buf, p0, he, HTTP_HEADERS.default_empty, None, False)) =
+        HTTP_READ_FIELD.outcome_chunked(HTTP_HEAD_PARSER.fields(buf, pf, he, HTTP_READ_FIELDS.reads(buf, p0, req.headers.fields, HTTP_HEADERS.default_empty), None, False))
+    end
+
+end

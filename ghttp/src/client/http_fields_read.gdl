@@ -1,0 +1,37 @@
+-- Stage D of the round trip, the writer's field lines of `req` at `p0`: the fields
+-- `HTTP_HEAD_PARSER.fields` reads from them, from no fields (`HTTP_READ_FIELDS.reads`), hold
+-- the writer's names and values in order and leave room for one field more.
+functions HTTP_FIELDS_READ
+
+specify {ANY}
+
+  law fields_read(req: HTTP_REQUEST, buf: BYTES, p0: NAT, pf: NAT, he: NAT)
+    require
+      sendable: HTTP_REQUEST_WRITER.sendable(req)
+      few: req.headers.fields.length <= 31
+      small: p0 <= 1000000000
+      fields_hold: forall k: NAT. (p0 <= k and k < p0 + HTTP_REQUEST_WRITER.fields_text(req.headers.fields).byte_model.length) implies
+        LIST_OPS.at(buf.model, k) = LIST_OPS.at(HTTP_REQUEST_WRITER.fields_text(req.headers.fields).byte_model, k - p0)
+      at: pf = p0 + HTTP_REQUEST_WRITER.fields_text(req.headers.fields).byte_model.length
+      fits: pf <= he + 2
+      in_buf: he + 4 <= buf.length
+    do
+      HTTP_REQUEST_WRITER.fields_ok(req.headers.fields) and
+      HTTP_HEADERS.default_empty.num_headers = 0 and HTTP_HEADERS.default_empty.max_headers = 32 and
+      HTTP_HEADERS.default_empty.fields.length = 0 and
+      HTTP_READ_FIELD.names_of(HTTP_HEADERS.default_empty.fields) = LIST.empty and
+      HTTP_READ_FIELD.values_of(HTTP_HEADERS.default_empty.fields) = LIST.empty and
+      HTTP_READ_FIELD.names_of(req.headers.fields).append(LIST.empty) = HTTP_READ_FIELD.names_of(req.headers.fields) and
+      HTTP_READ_FIELD.values_of(req.headers.fields).append(LIST.empty) = HTTP_READ_FIELD.values_of(req.headers.fields) and
+      HTTP_READ_BACK.reads_back(buf, p0, he, req.headers.fields, HTTP_HEADERS.default_empty) and
+      HTTP_READ_FIELD.room_after(HTTP_READ_FIELDS.reads(buf, p0, req.headers.fields, HTTP_HEADERS.default_empty),
+        HTTP_HEADERS.default_empty, req.headers.fields.length)
+    ensure
+      room: HTTP_READ_FIELDS.reads(buf, p0, req.headers.fields, HTTP_HEADERS.default_empty).has_header_room
+      names: HTTP_READ_FIELD.names_of(HTTP_READ_FIELDS.reads(buf, p0, req.headers.fields, HTTP_HEADERS.default_empty).fields) =
+        HTTP_READ_FIELD.names_of(req.headers.fields)
+      values: HTTP_READ_FIELD.values_of(HTTP_READ_FIELDS.reads(buf, p0, req.headers.fields, HTTP_HEADERS.default_empty).fields) =
+        HTTP_READ_FIELD.values_of(req.headers.fields)
+    end
+
+end

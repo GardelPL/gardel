@@ -1,0 +1,39 @@
+-- Stage D of the round trip: a field line the writer writes is one step of
+-- `HTTP_HEAD_PARSER.fields`. Apart from the laws it uses.
+functions HTTP_LINE_READS
+
+specify {ANY}
+
+  -- A field line of `h` at `pos`, whose line break is at `e`: one step of `fields`, which
+  -- adds `h`'s field and goes on after the line, the framing so far unchanged.
+  law line_reads(buf: BYTES, pos: NAT, e: NAT, he: NAT, h: HTTP_HEADER, acc: HTTP_HEADERS, cl: OPTION[NAT], te: BOOL)
+    require
+      ok: HTTP_REQUEST_WRITER.field_ok(h)
+      holds: forall k: NAT. (pos <= k and k < pos + h.serialize_line.byte_model.length) implies
+        LIST_OPS.at(buf.model, k) = LIST_OPS.at(h.serialize_line.byte_model, k - pos)
+      ends: e + 2 = pos + h.serialize_line.byte_model.length
+      fits: e <= he
+      in_buf: he + 4 <= buf.length
+      room: acc.has_header_room
+    do
+      HTTP_WRITER_LINES.field_line(h) and
+      HTTP_READ_LINE.line_found(buf, pos, e, h) and
+      HTTP_LINE_PLAIN.line_plain(buf, pos, e, h) and
+      HTTP_FIELD_STEP.plain_step(buf, pos, e, he, acc, cl, te)
+    ensure
+      read: HTTP_HEAD_PARSER.field_at(buf, pos, e).is_ok and
+        HTTP_HEAD_PARSER.field_at(buf, pos, e).get.name.byte_model = h.name.byte_model and
+        HTTP_HEAD_PARSER.field_at(buf, pos, e).get.value.byte_model = h.value.byte_model
+      step_ok: HTTP_READ_FIELD.outcome_ok(HTTP_HEAD_PARSER.fields(buf, pos, he, acc, cl, te)) =
+        HTTP_READ_FIELD.outcome_ok(HTTP_HEAD_PARSER.fields(buf, e + 2, he, acc.add(HTTP_HEAD_PARSER.field_at(buf, pos, e).get), cl, te))
+      step_names: HTTP_READ_FIELD.outcome_names(HTTP_HEAD_PARSER.fields(buf, pos, he, acc, cl, te)) =
+        HTTP_READ_FIELD.outcome_names(HTTP_HEAD_PARSER.fields(buf, e + 2, he, acc.add(HTTP_HEAD_PARSER.field_at(buf, pos, e).get), cl, te))
+      step_values: HTTP_READ_FIELD.outcome_values(HTTP_HEAD_PARSER.fields(buf, pos, he, acc, cl, te)) =
+        HTTP_READ_FIELD.outcome_values(HTTP_HEAD_PARSER.fields(buf, e + 2, he, acc.add(HTTP_HEAD_PARSER.field_at(buf, pos, e).get), cl, te))
+      step_length: HTTP_READ_FIELD.outcome_length(HTTP_HEAD_PARSER.fields(buf, pos, he, acc, cl, te)) =
+        HTTP_READ_FIELD.outcome_length(HTTP_HEAD_PARSER.fields(buf, e + 2, he, acc.add(HTTP_HEAD_PARSER.field_at(buf, pos, e).get), cl, te))
+      step_chunked: HTTP_READ_FIELD.outcome_chunked(HTTP_HEAD_PARSER.fields(buf, pos, he, acc, cl, te)) =
+        HTTP_READ_FIELD.outcome_chunked(HTTP_HEAD_PARSER.fields(buf, e + 2, he, acc.add(HTTP_HEAD_PARSER.field_at(buf, pos, e).get), cl, te))
+    end
+
+end
