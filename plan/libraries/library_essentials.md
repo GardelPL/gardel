@@ -1,7 +1,7 @@
 # Phase H: Library Essentials
 
 **Date:** November 12, 2026
-**Status:** In progress. H.0a is done (2026-11-16). No decision below is taken.
+**Status:** In progress. H.0a is done (2026-11-16), and H.0b (2026-11-17). Decision 4 is taken; no other decision below is.
 **Follows:** [Phase F](verified_libraries.md) (verified libraries) and [Phase G](../ffi/ffi_plan.md) (foreign interfaces).
 
 ---
@@ -200,11 +200,30 @@ Client: `HASH` (H.4, H.12) and `SHOW` (H.6). Closes F.1's first known limit.
 
 Client: every parser. Needs decision 4. Closes F.2's first known limit.
 
-- [ ] An element of a `LIST` or `SEQ` of a machine type is in the type's range: at `head`, `LIST_OPS.at`, a `match` binder and a `fold` argument.
-- [ ] `BYTES.model` elements are below 256 wherever a client reads one, from `BYTES`' invariant, without a call to `at`.
-- [ ] Remove the per-byte range checks from `gjson`'s reader, and measure.
-- [ ] Soundness test: a list built from a value out of range must be refused where it is built.
+**Status:** ✅ Completed (2026-11-17). Decision 4 taken as proposed: element ranges.
+
+- [x] An element of a `LIST` or `SEQ` of a machine type is in the type's range: at `head`, `LIST_OPS.at`, a `match` binder and a `fold` argument.
+- [x] `BYTES.model` elements are below 256 wherever a client reads one, from `BYTES`' invariant, without a call to `at`.
+- [x] Remove the per-byte range checks from `gjson`'s reader, and measure.
+- [x] Soundness test: a list built from a value out of range must be refused where it is built.
 - Acceptance: a client proves `bs.model.head < 256` for a non-empty `BYTES` with no check in its body. `gjson` is 0/0 with the checks removed.
+- **Fix: the range of a list.** A list of a machine type carries a predicate, `Seq_in_u64`, `Seq_in_i64` or `Seq_in_char`, over its Boogie `Seq int`. It is assumed of every parameter, field and result whose type is such a list, and checked where one is built: at a call argument, a field of a record, and a routine's result (`range::<name>_elements`). Axioms take it through `empty`, `prepend`, `singleton`, `append`, `head`, `tail`, `at`, `has` and `filter`, and through the prelude's generic routines (`map`, `reverse`, `take`, ...) at each machine type they are used with. A lambda with a machine result keeps its range, so `LIST_OPS.map(xs, fn ...)` does too. A `match` binder and a `fold` accumulator take the range of their type.
+- **Fix: nested lists and function values.** `LIST[LIST[U64]]` carries `Seq2_in_u64`, whose items are each `Seq_in_u64`, so a character of a line of a `LIST[LIST[CHAR]]` text is in range (gtui). A function value of type `(a: T1, b: T2) -> R`, of up to three arguments, carries `forall a, b in range :: f(a, b) in range`. It is checked where the function is passed, which refuses `(x: NAT) -> MATH_INT` for `(x: NAT) -> NAT`. That check starts a verification condition of its own (`{:split_here}`). In one condition with a false `require` after it, Z3 ran out of resources on `tests/refined.rs`, after 171 s and 264 s. Split, each takes about 1 s.
+- **Fix: Boolean routines.** A `BOOL` routine with no `require` and only number guards besides its lists' ranges is defined as false of a list out of range, and its truth gives its lists' ranges back. So `valid_utf8(bs)` gives `Seq_in_u64(bs)`. Without that axiom, ghttp's test client made about 50 times as many decisions (794k against 15k) and ran out of resources.
+- **Fix: `BYTES`.** Four laws in `stdlib/text/bytes.gdl` carry the invariant into the model: `model_octets`, then `octets_head`, `octets_tail` and `octets_at`. A client reads `b.model.head < 256` and `LIST_OPS.at(b.model, i) < 256` with no check. The `>= 0` half needs nothing, since it is `U64`'s range.
+- **Measurement.** `gjson` drops the six `>= 0` checks from `json_bytes.gdl` and `json_writer.gdl`, and stays 0/0. The `< 256` checks stay, since a `LIST[U64]` reaches them and not a `BYTES`. Its 70 cases run in 1.16 s both before and after. The generated C differs only where the checks were removed. A `>= 0` test of an unsigned number costs nothing.
+- **Result.** `cargo test --release` 499/499 (233 unit tests, 34 suites). `tests/gtui.rs`' frame timing test took 16.99 ms per frame while every suite ran in parallel, and 9.5 ms when run alone, against a limit of 16 ms. The new `tests/elements.rs` has three tests:
+  - **Reads.** An element read from a list is in range: at `head`, `at`, a `fold`, an `OPTION` binder, a `SEQ`, a record field, a nested list, `BYTES.model`, a function parameter's result, and a list mapped by a wrapping lambda.
+  - **Lies.** A range that does not hold is not proven: `< 256` of a `LIST[U64]`, `< 128` of a byte, `>= 0` of a `LIST[MATH_INT]`, `> -2^63` of a `LIST[I64]`, and `>= 0` of a function into `MATH_INT`.
+  - **Built.** A list built out of range is refused where it is built: at a result, through `map`, at an argument, at a field (also of a sum's variant), in a nested list, and a function passed with a `MATH_INT` result.
+
+  `--stdlib --strict`, `gjson`, `ghttp/tests` and `gtui/tests` are 0/0, in 48 s, 40 s, 237 s and 156 s. 15 of 15 mutations of the new code turn a test red. Each removes one of: an axiom, a check at a call, field or result, the nested level, function facts or their guard, the parametric axioms, a lambda's range, a binder's or `SEQ`'s range, the Boolean rule (red in `ghttp`), or the split (red in `tests/refined.rs`).
+- **Known limits.**
+  - A law's axiom does not state its parameters' ranges and invariants, while its proof assumes them. This predates H.0b, which follows the same convention for lists. A law over `LIST[U64]` is thus stated of every `Seq int`.
+  - A routine's own contract is an axiom in its own proof. A false `ensure` on a recursive routine can prove itself through the recursive call. The `tree.gdl` mutant in the unit tests passes, but because Z3 happens to find the failure, not because the rule forbids it.
+  - A `U64` literal result is not checked: `big: U64 do 18446744073709551616 end` verifies. Nor is a `MATH_INT` passed to a `U64` parameter. Both predate H.0b. A list built from such a value is refused, since its range is checked.
+  - A function of more than three arguments, a `LIST[SEQ[...]]`, and lists nested three deep get no range facts. Nothing needs them yet.
+  - The comment in `gtui`'s `text_zip.gdl` that says a state is passed in a list to keep its range is now out of date.
 
 #### Task H.0c: Derived Instances for Enumerations
 

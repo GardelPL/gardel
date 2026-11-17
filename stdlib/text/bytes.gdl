@@ -344,6 +344,49 @@ specify {ANY}
       Current.items
     end
 
+  -- Every byte of a `model` is below 256, from the invariant, so a client reads one with no
+  -- check (Task H.0b). The three laws below take it to `head`, `tail` and `at`.
+  law model_octets(b: BYTES)
+    trigger
+      b.model
+    ensure
+      octets: all_octets(b.model)
+    end
+
+  law octets_head(xs: LIST[U64])
+    require
+      octets: all_octets(xs)
+      nonempty: xs.length > 0
+    trigger
+      all_octets(xs), xs.head
+    ensure
+      below: xs.head < 256
+    end
+
+  law octets_tail(xs: LIST[U64])
+    require
+      octets: all_octets(xs)
+      nonempty: xs.length > 0
+    trigger
+      all_octets(xs), xs.tail
+    ensure
+      tail_octets: all_octets(xs.tail)
+    end
+
+  law octets_at(xs: LIST[U64], i: NAT)
+    require
+      octets: all_octets(xs)
+      in_bounds: i < xs.length
+    trigger
+      all_octets(xs), LIST_OPS.at(xs, i)
+    variant
+      i
+    do
+      if i = 0 then True else octets_at(xs.tail, i - 1) end
+    ensure
+      below: LIST_OPS.at(xs, i) < 256
+    end
+
   -- Every well-formed UTF-8 sequence consists of octets. The proof steps walk back from
   -- the induction hypothesis one byte at a time (each step is a single unfolding).
   law utf8_octets(xs: LIST[U64])

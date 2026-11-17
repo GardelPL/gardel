@@ -544,7 +544,13 @@ feature {ANY}
 end
 ```
 
-A field of a number type keeps the range of its type. In `| Box(n: NAT, i: I64)`, the `n` that `case Box(n, i)` binds is known to be in $[0, 2^{64} - 1]$ and `i` in $[-2^{63}, 2^{63} - 1]$, so a contract that needs that range applies to them. The same holds for a record's fields, and for `U64` and `CHAR`. An element of a `LIST[U64]` does not yet carry its range: check it, as `if b <= 255 then`, before relying on it.
+A field of a number type keeps the range of its type. In `| Box(n: NAT, i: I64)`, the `n` that `case Box(n, i)` binds is known to be in $[0, 2^{64} - 1]$ and `i` in $[-2^{63}, 2^{63} - 1]$, so a contract that needs that range applies to them. The same holds for a record's fields, and for `U64` and `CHAR`.
+
+An element of a `LIST` or `SEQ` of a number type keeps its range too. `xs.head`, `xs.tail.head`, `LIST_OPS.at(xs, i)`, an `x` with `xs.has(x)`, a fold's argument and the result of a generic routine such as `BYTES.list_drop(xs, n)` are all known to be in range. So is a character of a line of a text, a `LIST[LIST[CHAR]]`. A byte read from `b.model` of a `BYTES` is also below 256, from the laws `model_octets`, `octets_head`, `octets_tail` and `octets_at`. A plain `LIST[U64]` is only in the range of `U64`, so to know that its elements are bytes, check them, as `if b < 256 then`.
+
+The range is checked where a list is built. A routine that returns a `LIST[U64]`, an argument passed as one, and a field of that type must each have their elements in range, so `LIST.singleton(n)` with `n: MATH_INT` is refused there, as a `Range Violation`. A lambda keeps its result type's range, so `s.map(fn(x: U64): U64 do x *% 2 end)` is still a list of `U64`s.
+
+A function value keeps its result type's range too. Given `lex: (start: NAT, line: LIST[CHAR]) -> NAT`, `lex(s, line)` is a `NAT` when `s` and `line` are in range, so it can be the next state passed to `lex`. A function is checked where it is passed: a `(x: NAT) -> MATH_INT` given where a `(x: NAT) -> NAT` is expected is refused, as a `Range Violation`.
 
 Two arms of one `match` may not bind the same name at different types, as `case JInt(v)` with `v: I64` beside `case JString(v)` with `v: LIST[U64]`. The verifier cannot translate it and reports `E0199`. Give each its own name.
 

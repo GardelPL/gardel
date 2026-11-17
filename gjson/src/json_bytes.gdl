@@ -12,9 +12,9 @@ create {ANY}
     variant
       xs.length
     do
-      if xs = LIST.empty then True else xs.head >= 0 and xs.head < 256 and JSON_BYTES.octets(xs.tail) end
+      if xs = LIST.empty then True else xs.head < 256 and JSON_BYTES.octets(xs.tail) end
     ensure
-      step: xs.length > 0 implies Result = (xs.head >= 0 and xs.head < 256 and JSON_BYTES.octets(xs.tail))
+      step: xs.length > 0 implies Result = (xs.head < 256 and JSON_BYTES.octets(xs.tail))
       empty: xs.length = 0 implies Result
     end
 
@@ -23,14 +23,14 @@ create {ANY}
     do
       if bs = LIST.empty then
         256
-      else if bs.head >= 0 and bs.head < 256 then
+      else if bs.head < 256 then
         bs.head
       else
         256
       end end
     ensure
       bounded: Result <= 256
-      byte: (bs.length > 0 and bs.head >= 0 and bs.head < 256) implies Result = bs.head
+      byte: (bs.length > 0 and bs.head < 256) implies Result = bs.head
       octet: Result < 256 implies (bs.length > 0 and Result = bs.head)
     end
 
@@ -59,7 +59,7 @@ create {ANY}
     do
       if xs = LIST.empty then
         b
-      else if xs.head >= 0 and xs.head < 256 and b.length < 18446744073709551615 then
+      else if xs.head < 256 and b.length < 18446744073709551615 then
         let next = b.add_byte(xs.head)
         check
           one: LIST.singleton(xs.head).append(xs.tail) = xs
