@@ -1,4 +1,4 @@
-//! Concept bounds through the command line (Task F.1): a method from a bound means the instance
+//! Concept bounds through the command line (Tasks F.1 and H.0a): a method from a bound means the instance
 //! chosen at each use, a bound is checked at each use, and no false contract gets through one.
 
 use std::fs;
@@ -741,4 +741,340 @@ fn a_record_holding_a_function_has_no_equality() {
     );
     let p = Project::new("fn_list_eq", &[("route.gdl", ROUTE), ("client.gdl", &list)]);
     assert_refused(&p.check(), "E0311: non_canonical_equality");
+}
+
+// --- Task H.0a: a user's own concept as a bound ---
+
+const HASH: &str = "concept HASH refines EQ
+
+  hash: U64
+
+  law consistent(a: Current, b: Current)
+    require
+      ab: a.equals(b)
+    ensure
+      same: a.hash = b.hash
+    end
+
+end
+";
+
+/// A hash that is not the identity, so a proof or a run that used the id by mistake is caught.
+const TOKEN: &str = "module TOKEN satisfies HASH
+
+representation {ANY}
+  id: NAT
+
+create {ANY}
+
+  of(n: NAT): TOKEN
+    do
+      { id = n }
+    end
+
+feature {ANY}
+
+  equals(other: TOKEN): BOOL
+    do
+      Current.id = other.id
+    end
+
+  hash: U64
+    do
+      Current.id % 1000 + 5
+    end
+
+specify {EQ}
+
+  law reflexive(a: TOKEN)
+    ensure
+      refl: a.equals(a)
+    end
+
+  law symmetric(a: TOKEN, b: TOKEN)
+    require
+      ab: a.equals(b)
+    ensure
+      ba: b.equals(a)
+    end
+
+  law transitive(a: TOKEN, b: TOKEN, c: TOKEN)
+    require
+      ab: a.equals(b)
+      bc: b.equals(c)
+    ensure
+      ac: a.equals(c)
+    end
+
+specify {HASH}
+
+  law consistent(a: TOKEN, b: TOKEN)
+    require
+      ab: a.equals(b)
+    ensure
+      same: a.hash = b.hash
+    end
+
+end
+";
+
+const BAG: &str = "module BAG[K: HASH]
+
+representation {ANY}
+  item: K
+
+create {ANY}
+
+  make(k: K): BAG[K]
+    do
+      { item = k }
+    end
+
+  bucket(k: K, n: NAT): NAT
+    require
+      pos: n > 0
+    do
+      k.hash % n
+    ensure
+      below: Result < n
+    end
+
+  same_bucket(a: K, b: K, n: NAT): BOOL
+    require
+      pos: n > 0
+      eq: a.equals(b)
+    do
+      True
+    ensure
+      claim: BAG.bucket(a, n) = BAG.bucket(b, n)
+    end
+
+end
+";
+
+/// A generic that hands its own bounded parameter on to `BAG`.
+const RELAY: &str = "module RELAY[T: HASH]
+
+representation {ANY}
+  item: T
+
+create {ANY}
+
+  pass(t: T): NAT
+    do
+      BAG.bucket(t, 7)
+    ensure
+      below: Result < 7
+    end
+
+end
+";
+
+#[test]
+fn a_user_concept_is_a_bound() {
+    let main = "program MAIN
+
+feature {ANY}
+
+  main(args: SEQ[STRING]): IO[EXIT_CODE]
+    do
+      let b = BAG.bucket(TOKEN.of(1013), 10)
+      let r = RELAY.pass(TOKEN.of(2))
+      with IO
+        IO.exit(b * 10 +% r)
+      end
+    end
+
+end
+";
+    let use_it = client(
+        "  agree(a: TOKEN, b: TOKEN, n: NAT): NAT
+    require
+      pos: n > 0
+      eq: a.equals(b)
+    do
+      BAG.bucket(a, n)
+    ensure
+      same: Result = BAG.bucket(b, n)
+      below: Result < n
+    end
+
+  hashed(a: TOKEN): NAT
+    do
+      BAG.bucket(a, 1000)
+    ensure
+      by_the_instance: Result = (a.id % 1000 + 5) % 1000
+    end
+",
+    );
+    let p = Project::new(
+        "user_bound",
+        &[
+            ("hash.gdl", HASH),
+            ("token.gdl", TOKEN),
+            ("bag.gdl", BAG),
+            ("relay.gdl", RELAY),
+            ("client.gdl", &use_it),
+            ("main.gdl", main),
+        ],
+    );
+    assert_ok(&p.check());
+    let bag = p.generated("bag.bpl");
+    assert!(bag.contains("function K_m_hash<K>(x: K) returns (int);"), "{bag}");
+    assert!(bag.contains("in_u64(K_m_hash(x))"), "the result is in range");
+    assert!(bag.contains("(K_eq(a, b))) ==> (((K_m_hash(a) == K_m_hash(b))"), "the law is an axiom");
+    let client = p.generated("client.bpl");
+    assert!(client.contains("BAG__K_m_hash(_bx) == TOKEN__fn_hash(DefaultFuel, _bx)"), "{client}");
+    // (1013 % 1000 + 5) % 10 = 8, and (2 + 5) % 7 = 0.
+    assert_eq!(p.run_binary(), 80);
+}
+
+#[test]
+fn a_lie_through_a_user_bound_does_not_verify() {
+    let lies = [
+        ("no_premise", "f(a: K, b: K): BOOL\n    do\n      True\n    ensure\n      claim: a.hash = b.hash\n    end\n"),
+        ("converse", "f(a: K, b: K): BOOL\n    require\n      h: a.hash = b.hash\n    do\n      True\n    ensure\n      claim: a.equals(b)\n    end\n"),
+        ("small", "f(a: K): BOOL\n    do\n      True\n    ensure\n      claim: a.hash < 1000\n    end\n"),
+    ];
+    for (name, routine) in lies {
+        let text = generic("LIE[K: HASH]", &format!("  {routine}"));
+        let p = Project::new(&format!("user_lie_{name}"), &[("hash.gdl", HASH), ("lie.gdl", &text)]);
+        assert_refused(&p.check(), "claim");
+    }
+
+    let client_lie = client(
+        "  f(a: TOKEN): NAT\n    do\n      BAG.bucket(a, 1000)\n    ensure\n      claim: Result = a.id % 1000\n    end\n",
+    );
+    let p = Project::new(
+        "user_lie_client",
+        &[("hash.gdl", HASH), ("token.gdl", TOKEN), ("bag.gdl", BAG), ("client.gdl", &client_lie)],
+    );
+    assert_refused(&p.check(), "claim");
+}
+
+/// The false-law test: every token is equal to every other, but each hashes apart. `consistent`
+/// is false, and must stay unproven even when the type uses itself through `BAG`, whose theory
+/// assumes the law for `K`.
+#[test]
+fn a_false_law_does_not_verify_through_a_user_bound() {
+    let broken = TOKEN
+        .replace("TOKEN", "BROKEN")
+        .replace("Current.id = other.id", "True")
+        .replace("Current.id % 1000 + 5", "Current.id")
+        .replace(
+            "specify {EQ}",
+            "  slot(other: BROKEN): NAT\n    do\n      BAG.bucket(Current, 10) +% BAG.bucket(other, 10)\n    end\n\nspecify {EQ}",
+        );
+    let p = Project::new("user_false_law", &[("hash.gdl", HASH), ("bag.gdl", BAG), ("broken.gdl", &broken)]);
+    let out = p.check();
+    assert_refused(&out, "same");
+    assert!(!all(&out).contains("E0199"), "{}", all(&out));
+}
+
+#[test]
+fn a_user_bound_is_checked_at_each_use() {
+    let text = client("  f(n: NAT): NAT\n    do\n      BAG.bucket(n, 10)\n    end\n");
+    let p = Project::new("user_unsatisfied", &[("hash.gdl", HASH), ("bag.gdl", BAG), ("client.gdl", &text)]);
+    assert_refused(&p.check(), "E0317: unsatisfied_bound");
+}
+
+#[test]
+fn a_user_concept_without_a_theory_is_refused() {
+    let with_body = "concept SIZED
+
+  size: NAT
+
+  doubled: NAT
+    do
+      Current.size * 2
+    end
+
+end
+";
+    let text = generic("BOX[K: SIZED]", "  f(a: K): K\n    do\n      a\n    end\n");
+    let p = Project::new("user_body", &[("sized.gdl", with_body), ("box.gdl", &text)]);
+    assert_refused(&p.check(), "E0320: unsupported_bound");
+
+    let only = generic("ONLY[K: HASH]", "  f(a: K): NAT\n    do\n      a.size\n    end\n");
+    let p = Project::new("user_no_method", &[("hash.gdl", HASH), ("only.gdl", &only)]);
+    assert_refused(&p.check(), "E0318: method_not_in_bound");
+}
+
+/// `[K: ORD]` with `where K satisfies HASH`: the order stays in the proof and at every use, and
+/// the `where` concept's laws are there to prove the conditional conformance.
+#[test]
+fn a_bound_and_a_where_constraint_are_both_kept() {
+    let keyed = "module KEYED[K: ORD] satisfies HASH where K satisfies HASH
+
+representation {ANY}
+  item: K
+
+create {ANY}
+
+  make(k: K): KEYED[K]
+    do
+      { item = k }
+    end
+
+  smaller(a: K, b: K): K
+    do
+      if a.less_than(b) then a else b end
+    ensure
+      least: not b.less_than(Result) and not a.less_than(Result)
+    end
+
+feature {ANY}
+
+  equals(other: KEYED[K]): BOOL
+    do
+      Current.item.equals(other.item)
+    end
+
+  hash: U64
+    do
+      Current.item.hash
+    end
+
+specify {EQ}
+
+  law reflexive(a: KEYED[K])
+    ensure
+      refl: a.equals(a)
+    end
+
+  law symmetric(a: KEYED[K], b: KEYED[K])
+    require
+      ab: a.equals(b)
+    ensure
+      ba: b.equals(a)
+    end
+
+  law transitive(a: KEYED[K], b: KEYED[K], c: KEYED[K])
+    require
+      ab: a.equals(b)
+      bc: b.equals(c)
+    ensure
+      ac: a.equals(c)
+    end
+
+specify {HASH}
+
+  law consistent(a: KEYED[K], b: KEYED[K])
+    require
+      ab: a.equals(b)
+    ensure
+      same: a.hash = b.hash
+    end
+
+end
+";
+    let p = Project::new("where_both", &[("hash.gdl", HASH), ("keyed.gdl", keyed)]);
+    assert_ok(&p.check());
+
+    let use_token = client("  f(a: TOKEN): KEYED[TOKEN]\n    do\n      KEYED.make(a)\n    end\n");
+    let p = Project::new(
+        "where_both_use",
+        &[("hash.gdl", HASH), ("token.gdl", TOKEN), ("keyed.gdl", keyed), ("client.gdl", &use_token)],
+    );
+    assert_refused(&p.check(), "E0317: unsatisfied_bound");
 }

@@ -409,6 +409,9 @@ pub struct ModuleDecl {
     pub name: String,
     pub type_params: Vec<String>,
     pub type_bounds: HashMap<String, String>, // e.g., [A: ORD] -> "A" -> "ORD"
+    /// The bounds written as `[A: C]`, which every use must satisfy. `type_bounds` also holds
+    /// the concept of a `where` constraint on a parameter with no written bound.
+    pub declared_bounds: HashMap<String, String>,
     pub satisfies: Option<SatisfiesClause>,
     pub repr_vis: Visibility,
     pub repr: ReprKind,
@@ -1787,6 +1790,7 @@ impl Parser {
             kind,
             name,
             type_params,
+            declared_bounds: type_bounds.clone(),
             type_bounds,
             satisfies,
             repr_vis,
@@ -2753,7 +2757,8 @@ pub fn check_and_expand_concepts(
                 cname.clone(),
                 format!("Where constraint specifies unknown concept `{cname}`"),
             ));
-        } else {
+        } else if !m.declared_bounds.contains_key(tp) {
+            // A written bound stays: `bound_concepts` adds the `where` concept to its theory.
             m.type_bounds.insert(tp.clone(), cname.clone());
         }
     }
@@ -4128,6 +4133,7 @@ pub fn monomorphize_module(m: &ModuleDecl, concrete_args: &[String]) -> ModuleDe
     spec.name = format!("{}_{}", m.name, concrete_args.join("_"));
     spec.type_params.clear();
     spec.type_bounds.clear();
+    spec.declared_bounds.clear();
 
     let sub_ty = |t: &str| -> String {
         if let Some(rep) = subst.get(t) {
@@ -4662,10 +4668,15 @@ fn conditional_canonical_tps(m: &ModuleDecl) -> Vec<String> {
         .map(|s| {
             s.where_constraints
                 .iter()
-                // Only parameters whose bound was resolved (so `<tp>_eq` is declared).
+                // Only parameters whose bound was resolved (so `<tp>_eq` is declared), and
+                // not one whose written bound already makes it canonical everywhere.
                 .filter(|(tp, c)| {
                     c == "CANONICAL_EQ"
-                        && m.type_bounds.get(tp).is_some_and(|b| b == "CANONICAL_EQ")
+                        && m.type_bounds.contains_key(tp)
+                        && bound_concepts(m, tp).iter().any(|x| x == "EQ")
+                        && !m.declared_bounds.get(tp).is_some_and(|b| {
+                            concept_closure(b).iter().any(|x| x == "CANONICAL_EQ")
+                        })
                 })
                 .map(|(tp, _)| tp.clone())
                 .collect()
@@ -4781,8 +4792,8 @@ fn elem_receiver_type(e: &Expr, m: &ModuleDecl) -> Option<String> {
 /// to structural `==` (§5, §9).
 fn elem_equals_fn(recv: &Expr, m: &ModuleDecl) -> Option<String> {
     let ty = elem_receiver_type(recv, m)?;
-    let bound = m.type_bounds.get(&ty)?;
-    if m.type_params.contains(&ty) && matches!(bound.as_str(), "EQ" | "ORD" | "CANONICAL_EQ") {
+    m.type_bounds.get(&ty)?;
+    if m.type_params.contains(&ty) && bound_concepts(m, &ty).iter().any(|c| c == "EQ") {
         Some(format!("{ty}_eq"))
     } else {
         None
@@ -4812,17 +4823,13 @@ fn function_field_call(recv: &Expr, f: &str, args: &[Expr], m: &ModuleDecl) -> O
 
 /// The theory function of concept method `mname` on type parameter `tp` with bound `bound`:
 /// what `emit_boogie_parts_with_options` declares for an `EQ`-family or `ORD` bound.
-fn bound_method_relation(tp: &str, bound: &str, mname: &str) -> Option<String> {
-    if !BOUND_THEORY_CONCEPTS.contains(&bound) {
-        return None;
-    }
-    let closure = concept_closure(bound);
-    let has = |c: &str| closure.iter().any(|x| x == c);
+fn bound_method_relation(tp: &str, concepts: &[String], mname: &str) -> Option<String> {
+    let has = |c: &str| concepts.iter().any(|x| x == c);
     match mname {
         "equals" if has("EQ") => Some(format!("{tp}_eq")),
         "less_than" if has("ORD") => Some(format!("{tp}_less")),
         "less_or_equal" if has("ORD") => Some(format!("{tp}_less_eq")),
-        _ => None,
+        _ => user_bound_method(concepts, mname).map(|_| user_method_relation(tp, mname)),
     }
 }
 
@@ -4842,7 +4849,8 @@ fn bound_method_fn(recv: &Expr, mname: &str, m: &ModuleDecl) -> Option<String> {
     if !m.type_params.contains(&ty) {
         return None;
     }
-    bound_method_relation(&ty, m.type_bounds.get(&ty)?, mname)
+    m.type_bounds.get(&ty)?;
+    bound_method_relation(&ty, &bound_concepts(m, &ty), mname)
 }
 
 /// The range predicate of a machine number type. `MATH_INT` has none.
@@ -6212,13 +6220,103 @@ fn with_scoped_var_types<T>(vars: &[(String, String)], f: impl FnOnce() -> T) ->
 /// The concepts whose laws a type parameter's bound can carry into Boogie.
 const BOUND_THEORY_CONCEPTS: [&str; 3] = ["EQ", "CANONICAL_EQ", "ORD"];
 
+thread_local! {
+    /// The concepts a user declared in the current run (Task H.0a). The prelude's are in
+    /// `standard_prelude`.
+    static USER_CONCEPTS: std::cell::RefCell<Rc<Vec<ConceptDecl>>> =
+        std::cell::RefCell::new(Rc::new(Vec::new()));
+}
+
+/// Installs the user concepts of the current run, for bounds and their theories.
+pub fn set_user_concepts(concepts: Vec<ConceptDecl>) {
+    USER_CONCEPTS.with(|c| *c.borrow_mut() = Rc::new(concepts));
+}
+
+/// The declaration of concept `name`, from the prelude or the user's run.
+fn find_concept(name: &str) -> Option<ConceptDecl> {
+    if let Some(c) = standard_prelude().concept(name) {
+        return Some(c.clone());
+    }
+    USER_CONCEPTS.with(|c| c.borrow().iter().find(|x| x.name == name).cloned())
+}
+
+/// Every concept whose laws reach the theory of type parameter `tp` of `m`: its bound (written,
+/// or from a `where` when none is written) and every `where` concept on it, each with what it
+/// refines. Prelude concepts come first, in the order of `BOUND_THEORY_CONCEPTS`, then a user's.
+fn bound_concepts(m: &ModuleDecl, tp: &str) -> Vec<String> {
+    let mut all: Vec<String> = Vec::new();
+    let mut add = |c: &str| {
+        for x in concept_closure(c) {
+            if !all.contains(&x) {
+                all.push(x);
+            }
+        }
+    };
+    if let Some(b) = m.type_bounds.get(tp) {
+        add(b);
+    }
+    if let Some(sat) = &m.satisfies {
+        for (t, c) in &sat.where_constraints {
+            if t == tp {
+                add(c);
+            }
+        }
+    }
+    let mut out: Vec<String> = BOUND_THEORY_CONCEPTS
+        .iter()
+        .filter(|c| all.iter().any(|x| x == *c))
+        .map(ToString::to_string)
+        .collect();
+    out.extend(all.into_iter().filter(|c| !BOUND_THEORY_CONCEPTS.contains(&c.as_str())));
+    out
+}
+
+/// The methods a user concept gives a type parameter, from it and not from what it refines.
+fn user_concept_methods(c: &str) -> Vec<SignatureDecl> {
+    if BOUND_THEORY_CONCEPTS.contains(&c) {
+        return Vec::new();
+    }
+    find_concept(c).map(|cd| cd.signatures).unwrap_or_default()
+}
+
+/// A method of a user concept on type parameter `tp`, with its signature.
+fn user_bound_method(concepts: &[String], mname: &str) -> Option<SignatureDecl> {
+    concepts.iter().flat_map(|c| user_concept_methods(c)).find(|s| s.name == mname)
+}
+
+/// The theory function of a user concept's method `mname` on type parameter `tp`.
+fn user_method_relation(tp: &str, mname: &str) -> String {
+    format!("{tp}_m_{mname}")
+}
+
+/// Why concept `c` cannot be a bound, or `None` when it can: the prelude's three, and a user
+/// concept with no type parameters, whose methods all have a receiver, and whose refined
+/// concepts can be bounds too.
+fn bound_unsupported_reason(c: &str) -> Option<String> {
+    if BOUND_THEORY_CONCEPTS.contains(&c) {
+        return None;
+    }
+    let Some(cd) = find_concept(c) else {
+        return Some(format!("there is no concept `{c}`"));
+    };
+    if !cd.type_params.is_empty() {
+        return Some(format!("`{c}` has type parameters, and a bound's theory has none"));
+    }
+    if let Some(r) = cd.default_routines.first() {
+        return Some(format!(
+            "`{c}.{}` has a body, and a bound gives only methods without one",
+            r.name
+        ));
+    }
+    cd.refines.iter().find_map(|r| bound_unsupported_reason(r))
+}
+
 /// Concept `c` together with every concept it (transitively) refines.
 fn concept_closure(c: &str) -> Vec<String> {
-    let prelude = standard_prelude();
     let mut out = vec![c.to_string()];
     let mut i = 0;
     while i < out.len() {
-        if let Some(cd) = prelude.concepts.iter().find(|x| x.name == out[i]) {
+        if let Some(cd) = find_concept(&out[i]) {
             for r in &cd.refines {
                 if !out.contains(r) {
                     out.push(r.clone());
@@ -6236,6 +6334,10 @@ fn concept_closure(c: &str) -> Vec<String> {
 /// constraints hold for the type arguments.
 fn type_satisfies(ty: &str, concept: &str, m: &ModuleDecl, ctx: &BoogiePreludeCtx) -> bool {
     let module = |head: &str| if head == m.name { Some(m) } else { ctx.module(head) };
+    // Inside `m`, a parameter has its written bound and its `where` concepts.
+    if m.type_params.iter().any(|p| p == ty.trim()) && m.type_bounds.contains_key(ty.trim()) {
+        return bound_concepts(m, ty.trim()).iter().any(|c| c == concept);
+    }
     let param_bound = |tp: &str| {
         m.type_params.iter().any(|p| p == tp).then(|| m.type_bounds.get(tp).cloned())
     };
@@ -6370,17 +6472,10 @@ struct BoundUse {
 }
 
 /// The bound written as `[tp: C]`. A `where` constraint is conditional: it limits what the
-/// module's conformance claims, not which types the module can be used at.
+/// module's conformance claims, not which types the module can be used at. A parameter can
+/// have both, and then every use is checked against the written bound.
 fn declared_bound<'a>(owner: &'a ModuleDecl, tp: &str) -> Option<&'a String> {
-    let conditional = owner
-        .satisfies
-        .as_ref()
-        .is_some_and(|s| s.where_constraints.iter().any(|(t, _)| t == tp));
-    if conditional {
-        None
-    } else {
-        owner.type_bounds.get(tp)
-    }
+    owner.declared_bounds.get(tp)
 }
 
 /// Every application `H[a, b]` in a written type, nested ones included.
@@ -6528,11 +6623,8 @@ impl<'a> ConceptWalk<'a> {
             return;
         };
         if m.type_params.contains(&t) || self.routine_tps.contains(&t) {
-            let known = m
-                .type_bounds
-                .get(&t)
-                .and_then(|b| bound_method_relation(&t, b, rname))
-                .is_some();
+            let known = m.type_bounds.contains_key(&t)
+                && bound_method_relation(&t, &bound_concepts(m, &t), rname).is_some();
             if !known {
                 let bound = m.type_bounds.get(&t).map_or("no bound".to_string(), |b| format!("bound {b}"));
                 self.report(
@@ -6553,12 +6645,8 @@ impl<'a> ConceptWalk<'a> {
             return;
         };
         // The concept (listed directly) that declares this routine.
-        let prelude = standard_prelude();
         let declaring = sat.concepts.iter().find(|c| {
-            prelude
-                .concepts
-                .iter()
-                .any(|cd| &cd.name == *c && cd.signatures.iter().any(|s| s.name == rname))
+            find_concept(c).is_some_and(|cd| cd.signatures.iter().any(|s| s.name == rname))
         });
         if declaring.is_none() {
             return;
@@ -6787,6 +6875,99 @@ impl<'a> ConceptWalk<'a> {
     }
 }
 
+/// `ty` with `Current` read as `tp`.
+fn current_as(ty: &str, tp: &str) -> String {
+    if ty.trim() == "Current" {
+        tp.to_string()
+    } else {
+        subst_type_idents(ty, &HashMap::from([("Current".to_string(), tp.to_string())]))
+    }
+}
+
+/// The theory that a user concept gives type parameter `tp` of `m` (Task H.0a), as `EQ` and
+/// `ORD` give theirs: one function per method, with the range of a machine number result, and
+/// each law as an axiom. `q` quantifies a module's own type parameter.
+fn emit_user_bound_theory(m: &ModuleDecl, tp: &str, q: &str, concepts: &[String]) -> String {
+    let mut out = String::new();
+    let user: Vec<ConceptDecl> = concepts
+        .iter()
+        .filter(|c| !BOUND_THEORY_CONCEPTS.contains(&c.as_str()))
+        .filter_map(|c| find_concept(c))
+        .collect();
+    if user.is_empty() {
+        return out;
+    }
+    for cd in &user {
+        for sig in &cd.signatures {
+            let f = user_method_relation(tp, &sig.name);
+            let mut formals = vec![format!("x: {tp}")];
+            let mut vars = vec!["x".to_string()];
+            for (i, (_, pt)) in sig.params.iter().enumerate() {
+                formals.push(format!("p{i}: {}", map_boogie_type(&current_as(pt, tp), m)));
+                vars.push(format!("p{i}"));
+            }
+            let ret = current_as(&sig.ret_type, tp);
+            out.push_str(&format!(
+                "function {f}{q}({}) returns ({});\n",
+                formals.join(", "),
+                map_boogie_type(&ret, m)
+            ));
+            if let Some(range) = machine_range(&ret) {
+                let app = format!("{f}({})", vars.join(", "));
+                out.push_str(&format!(
+                    "axiom (forall{q} {} :: {{ {app} }} {range}({app}));\n",
+                    formals.join(", ")
+                ));
+            }
+        }
+    }
+    let (no_fields, no_revealed) = (HashSet::new(), HashSet::new());
+    for cd in &user {
+        for law in &cd.laws {
+            let params: Vec<(String, String)> =
+                law.params.iter().map(|(n, t)| (n.clone(), current_as(t, tp))).collect();
+            if params.is_empty() || law.ensures.is_empty() {
+                continue;
+            }
+            set_boogie_type_env(m, &params, None);
+            let emit = |e: &Expr| {
+                with_scoped_var_types(&params, || {
+                    emit_boogie_expr_with_strings(e, m, &no_fields, &no_revealed, "DefaultFuel", &[])
+                })
+            };
+            let mut reqs: Vec<String> = params
+                .iter()
+                .filter_map(|(n, t)| machine_range(t).map(|r| format!("{r}({n})")))
+                .collect();
+            reqs.extend(law.requires.iter().map(|(_, e)| format!("({})", emit(e))));
+            let ens: Vec<String> = law.ensures.iter().map(|(_, e)| format!("({})", emit(e))).collect();
+            let triggers: Vec<String> = law.triggers.iter().map(&emit).collect();
+            clear_boogie_type_env();
+            let trig = if triggers.is_empty() {
+                String::new()
+            } else {
+                format!("{{ {} }} ", triggers.join(", "))
+            };
+            let body = if reqs.is_empty() {
+                ens.join(" && ")
+            } else {
+                format!("({}) ==> ({})", reqs.join(" && "), ens.join(" && "))
+            };
+            let formals: Vec<String> = params
+                .iter()
+                .map(|(n, t)| format!("{n}: {}", map_boogie_type(t, m)))
+                .collect();
+            out.push_str(&format!(
+                "// {}.{} on {tp}\naxiom (forall{q} {} :: {trig}{body});\n",
+                cd.name,
+                law.name,
+                formals.join(", ")
+            ));
+        }
+    }
+    out
+}
+
 /// Whether the proofs behind `arg` can depend on `m`: it names `m`, or a module that needs `m`.
 /// `m` must then not assume that `arg` keeps its concept's laws. Those laws are what `m` may be
 /// proving, or what a module that `m` is under depends on.
@@ -6826,9 +7007,10 @@ fn emit_bound_instance_links(m: &ModuleDecl, ctx: &BoogiePreludeCtx) -> String {
             })
             .collect();
         let quant = if tps.is_empty() { String::new() } else { format!("<{}>", tps.join(", ")) };
+        let concepts = concept_closure(&u.bound);
         // `less_or_equal` follows from these two, on both sides.
         for mname in ["equals", "less_than"] {
-            let Some(rel) = bound_method_relation(&u.tp, &u.bound, mname) else {
+            let Some(rel) = bound_method_relation(&u.tp, &concepts, mname) else {
                 continue;
             };
             let (x, y) = ("_bx".to_string(), "_by".to_string());
@@ -6852,6 +7034,39 @@ fn emit_bound_instance_links(m: &ModuleDecl, ctx: &BoogiePreludeCtx) -> String {
                 "axiom (forall{quant} {x}: {bty}, {y}: {bty} :: {triggers} {rel_app} <==> {inst});\n"
             ));
         }
+        // A user concept's methods: the receiver is `_bx`, and the arguments `_b0`, `_b1`, ...
+        for sig in concepts.iter().flat_map(|c| user_concept_methods(c)) {
+            let rel = user_method_relation(&u.tp, &sig.name);
+            let mut vars = vec![("_bx".to_string(), u.arg.clone())];
+            for (i, (_, pt)) in sig.params.iter().enumerate() {
+                vars.push((format!("_b{i}"), current_as(pt, &u.arg)));
+            }
+            let args: Vec<Expr> = vars[1..].iter().map(|(v, _)| Expr::Var(v.clone())).collect();
+            let call = Expr::MethodCall(Box::new(Expr::Var("_bx".to_string())), sig.name.clone(), args);
+            let (inst, formals) = with_scoped_var_types(&vars, || {
+                let inst = emit_boogie_expr_with_strings(&call, m, &empty, &empty, "DefaultFuel", &[]);
+                let formals: Vec<String> =
+                    vars.iter().map(|(v, t)| format!("{v}: {}", map_boogie_type(t, m))).collect();
+                (inst, formals)
+            });
+            let names: Vec<&str> = vars.iter().map(|(v, _)| v.as_str()).collect();
+            let rel_app = format!("{}__{rel}({})", u.owner, names.join(", "));
+            let ret = current_as(&sig.ret_type, &u.arg);
+            let eq = if map_boogie_type(&ret, m) == "bool" { "<==>" } else { "==" };
+            // Only an application can be a trigger.
+            let is_app = inst.split_once('(').is_some_and(|(h, _)| {
+                !h.is_empty() && h.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+            });
+            let triggers = if is_app {
+                format!("{{ {rel_app} }} {{ {inst} }}")
+            } else {
+                format!("{{ {rel_app} }}")
+            };
+            out.push_str(&format!(
+                "axiom (forall{quant} {} :: {triggers} {rel_app} {eq} {inst});\n",
+                formals.join(", ")
+            ));
+        }
     }
     clear_boogie_type_env();
     out
@@ -6867,12 +7082,12 @@ pub fn check_where_constraints(m: &ModuleDecl, src: &str, input_path: &str) -> V
     BOOGIE_PRELUDE_CTX.with(|c| *c.borrow_mut() = prev);
     for tp in &m.type_params {
         if let Some(bound) = declared_bound(m, tp) {
-            if !BOUND_THEORY_CONCEPTS.contains(&bound.as_str()) {
+            if let Some(why) = bound_unsupported_reason(bound) {
                 found.push((
                     m.name.clone(),
                     "E0320: unsupported_bound",
                     format!(
-                        "E0320: unsupported_bound: `[{tp}: {bound}]`: a bound must be EQ, CANONICAL_EQ or ORD, the concepts with a theory for a type parameter (§9)"
+                        "E0320: unsupported_bound: `[{tp}: {bound}]`: {why}. A bound is a concept with no type parameters whose methods have no body (§9)"
                     ),
                 ));
             }
@@ -7429,6 +7644,12 @@ fn infer_gardel_type(e: &Expr, m: &ModuleDecl, ctx: &BoogiePreludeCtx) -> Option
             };
             if r == "apply" && split_top_level_arrow(&rt).is_some() {
                 return c11_typed::fn_parts(&c11_typed::norm_type(&rt)).map(|(_, ret)| ret);
+            }
+            // A method that a user concept gives a bounded type parameter (Task H.0a).
+            if m.type_params.contains(&rt) && m.type_bounds.contains_key(&rt) {
+                if let Some(sig) = user_bound_method(&bound_concepts(m, &rt), r) {
+                    return Some(current_as(&sig.ret_type, &rt));
+                }
             }
             let head = type_head(&rt).to_string();
             if head == "LIST" || (head == "SEQ" && ctx.module("SEQ").is_none()) {
@@ -8257,68 +8478,43 @@ fn emit_boogie_parts_with_options(
         // Module type parameters are the holes of `type M A ...;` and are quantified (`<A>`) in every
         // module function, so they must not also be declared as global types.
         let is_adt_tp = m.type_params.contains(tp);
+        let q = if is_adt_tp { format!("<{tp}>") } else { String::new() };
         if !is_adt_tp {
             out.push_str(&format!("type {tp};\n"));
-            if bound == "EQ" || bound == "ORD" || bound == "CANONICAL_EQ" {
-                out.push_str(&format!(
-                    "function {tp}_eq(x: {tp}, y: {tp}) returns (bool);\n"
-                ));
-                out.push_str(&format!(
-                    "axiom (forall x: {tp} :: {{ {tp}_eq(x, x) }} {tp}_eq(x, x));\n"
-                ));
-                out.push_str(&format!("axiom (forall x: {tp}, y: {tp} :: {{ {tp}_eq(x, y) }} {tp}_eq(x, y) ==> {tp}_eq(y, x));\n"));
-                out.push_str(&format!("axiom (forall x: {tp}, y: {tp}, z: {tp} :: {{ {tp}_eq(x, y), {tp}_eq(y, z) }} {tp}_eq(x, y) && {tp}_eq(y, z) ==> {tp}_eq(x, z));\n"));
-            }
-            if bound == "CANONICAL_EQ" && !conditional_tps.contains(tp) {
-                out.push_str(&format!(
-                    "axiom (forall x: {tp}, y: {tp} :: {{ {tp}_eq(x, y) }} {tp}_eq(x, y) <==> (x == y));\n"
-                ));
-            }
-            if bound == "ORD" {
-                out.push_str(&format!(
-                    "function {tp}_less(x: {tp}, y: {tp}) returns (bool);\n"
-                ));
-                out.push_str(&format!(
-                    "function {tp}_less_eq(x: {tp}, y: {tp}) returns (bool);\n"
-                ));
-                out.push_str(&format!(
-                    "axiom (forall x: {tp} :: {{ {tp}_less(x, x) }} !{tp}_less(x, x));\n"
-                ));
-                out.push_str(&format!("axiom (forall x: {tp}, y: {tp}, z: {tp} :: {{ {tp}_less(x, y), {tp}_less(y, z) }} {tp}_less(x, y) && {tp}_less(y, z) ==> {tp}_less(x, z));\n"));
-                out.push_str(&format!("axiom (forall x: {tp}, y: {tp} :: {{ {tp}_less_eq(x, y) }} {tp}_less_eq(x, y) <==> ({tp}_less(x, y) || {tp}_eq(x, y)));\n"));
-                out.push_str(&format!("axiom (forall x: {tp}, y: {tp} :: {{ {tp}_less(x, y), {tp}_less(y, x) }} {tp}_less(x, y) || {tp}_eq(x, y) || {tp}_less(y, x));\n"));
-            }
-        } else {
-            if bound == "EQ" || bound == "ORD" || bound == "CANONICAL_EQ" {
-                out.push_str(&format!(
-                    "function {tp}_eq<{tp}>(x: {tp}, y: {tp}) returns (bool);\n"
-                ));
-                out.push_str(&format!(
-                    "axiom (forall<{tp}> x: {tp} :: {{ {tp}_eq(x, x) }} {tp}_eq(x, x));\n"
-                ));
-                out.push_str(&format!("axiom (forall<{tp}> x: {tp}, y: {tp} :: {{ {tp}_eq(x, y) }} {tp}_eq(x, y) ==> {tp}_eq(y, x));\n"));
-                out.push_str(&format!("axiom (forall<{tp}> x: {tp}, y: {tp}, z: {tp} :: {{ {tp}_eq(x, y), {tp}_eq(y, z) }} {tp}_eq(x, y) && {tp}_eq(y, z) ==> {tp}_eq(x, z));\n"));
-            }
-            if bound == "CANONICAL_EQ" && !conditional_tps.contains(tp) {
-                out.push_str(&format!(
-                    "axiom (forall<{tp}> x: {tp}, y: {tp} :: {{ {tp}_eq(x, y) }} {tp}_eq(x, y) <==> (x == y));\n"
-                ));
-            }
-            if bound == "ORD" {
-                out.push_str(&format!(
-                    "function {tp}_less<{tp}>(x: {tp}, y: {tp}) returns (bool);\n"
-                ));
-                out.push_str(&format!(
-                    "function {tp}_less_eq<{tp}>(x: {tp}, y: {tp}) returns (bool);\n"
-                ));
-                out.push_str(&format!(
-                    "axiom (forall<{tp}> x: {tp} :: {{ {tp}_less(x, x) }} !{tp}_less(x, x));\n"
-                ));
-                out.push_str(&format!("axiom (forall<{tp}> x: {tp}, y: {tp}, z: {tp} :: {{ {tp}_less(x, y), {tp}_less(y, z) }} {tp}_less(x, y) && {tp}_less(y, z) ==> {tp}_less(x, z));\n"));
-                out.push_str(&format!("axiom (forall<{tp}> x: {tp}, y: {tp} :: {{ {tp}_less_eq(x, y) }} {tp}_less_eq(x, y) <==> ({tp}_less(x, y) || {tp}_eq(x, y)));\n"));
-                out.push_str(&format!("axiom (forall<{tp}> x: {tp}, y: {tp} :: {{ {tp}_less(x, y), {tp}_less(y, x) }} {tp}_less(x, y) || {tp}_eq(x, y) || {tp}_less(y, x));\n"));
-            }
         }
+        let concepts = bound_concepts(m, tp);
+        let has = |c: &str| concepts.iter().any(|x| x == c);
+        if has("EQ") {
+            out.push_str(&format!(
+                "function {tp}_eq{q}(x: {tp}, y: {tp}) returns (bool);\n"
+            ));
+            out.push_str(&format!(
+                "axiom (forall{q} x: {tp} :: {{ {tp}_eq(x, x) }} {tp}_eq(x, x));\n"
+            ));
+            out.push_str(&format!("axiom (forall{q} x: {tp}, y: {tp} :: {{ {tp}_eq(x, y) }} {tp}_eq(x, y) ==> {tp}_eq(y, x));\n"));
+            out.push_str(&format!("axiom (forall{q} x: {tp}, y: {tp}, z: {tp} :: {{ {tp}_eq(x, y), {tp}_eq(y, z) }} {tp}_eq(x, y) && {tp}_eq(y, z) ==> {tp}_eq(x, z));\n"));
+        }
+        let canonical = concept_closure(bound).iter().any(|c| c == "CANONICAL_EQ");
+        if canonical && !conditional_tps.contains(tp) {
+            out.push_str(&format!(
+                "axiom (forall{q} x: {tp}, y: {tp} :: {{ {tp}_eq(x, y) }} {tp}_eq(x, y) <==> (x == y));\n"
+            ));
+        }
+        if has("ORD") {
+            out.push_str(&format!(
+                "function {tp}_less{q}(x: {tp}, y: {tp}) returns (bool);\n"
+            ));
+            out.push_str(&format!(
+                "function {tp}_less_eq{q}(x: {tp}, y: {tp}) returns (bool);\n"
+            ));
+            out.push_str(&format!(
+                "axiom (forall{q} x: {tp} :: {{ {tp}_less(x, x) }} !{tp}_less(x, x));\n"
+            ));
+            out.push_str(&format!("axiom (forall{q} x: {tp}, y: {tp}, z: {tp} :: {{ {tp}_less(x, y), {tp}_less(y, z) }} {tp}_less(x, y) && {tp}_less(y, z) ==> {tp}_less(x, z));\n"));
+            out.push_str(&format!("axiom (forall{q} x: {tp}, y: {tp} :: {{ {tp}_less_eq(x, y) }} {tp}_less_eq(x, y) <==> ({tp}_less(x, y) || {tp}_eq(x, y)));\n"));
+            out.push_str(&format!("axiom (forall{q} x: {tp}, y: {tp} :: {{ {tp}_less(x, y), {tp}_less(y, x) }} {tp}_less(x, y) || {tp}_eq(x, y) || {tp}_less(y, x));\n"));
+        }
+        out.push_str(&emit_user_bound_theory(m, tp, &q, &concepts));
         out.push('\n');
     }
     // Representation fields typed by another prelude module: declare that sort opaquely
@@ -13628,6 +13824,31 @@ fn share_subexpr(e: &Expr, target: &Expr, name: &str, found: &mut usize) -> Expr
     }
 }
 
+/// `recv.mname(args)` with other than one argument, as a method of a user concept's bound
+/// (Task H.0a). Apart from `emit_boogie_expr_with_strings`, whose frame every nested
+/// expression pays for.
+#[inline(never)]
+fn emit_user_bound_call(
+    recv: &Expr,
+    mname: &str,
+    args: &[Expr],
+    r_str: &str,
+    m: &ModuleDecl,
+    (implicit_fields, revealed, fuel_var, strings): (
+        &HashSet<String>,
+        &HashSet<String>,
+        &str,
+        &[String],
+    ),
+) -> Option<String> {
+    let f = bound_method_fn(recv, mname, m)?;
+    let mut parts = vec![r_str.to_string()];
+    parts.extend(args.iter().map(|a| {
+        emit_boogie_expr_with_strings(a, m, implicit_fields, revealed, fuel_var, strings)
+    }));
+    Some(format!("{f}({})", parts.join(", ")))
+}
+
 fn emit_boogie_expr_with_strings(
     e: &Expr,
     m: &ModuleDecl,
@@ -14132,6 +14353,19 @@ fn emit_boogie_expr_with_strings(
                                 strings,
                             );
                             return format!("{eq_fn}({r_str}, {rhs})");
+                        }
+                    }
+                    // A method of a user concept's bound, of any arity (Task H.0a).
+                    if args.len() != 1 {
+                        if let Some(app) = emit_user_bound_call(
+                            recv,
+                            mname,
+                            args,
+                            &r_str,
+                            m,
+                            (implicit_fields, revealed, fuel_var, strings),
+                        ) {
+                            return app;
                         }
                     }
                     // A method of a concept bound, or one on a scalar, has no routine: it
@@ -18902,6 +19136,7 @@ pub fn contract_only_module(m: &ModuleDecl) -> ModuleDecl {
         name: m.name.clone(),
         type_params: m.type_params.clone(),
         type_bounds: m.type_bounds.clone(),
+        declared_bounds: m.declared_bounds.clone(),
         satisfies: m.satisfies.clone(),
         repr_vis: m.repr_vis.clone(),
         repr: m.repr.clone(),
@@ -19904,6 +20139,7 @@ pub fn check_and_verify_project(units: &mut [SourceUnit], opts: VerifyOptions) -
             concept_map.insert(c.name.clone(), c.clone());
         }
     }
+    set_user_concepts(units.iter().flat_map(|u| u.ast.concepts.iter().cloned()).collect());
 
     // Concept expansion and static checks of every module (before linking, so linked
     // modules carry their expanded routines).
@@ -20999,6 +21235,7 @@ fn main() {
                 name: format!("{}_closures", m.name),
                 type_params: Vec::new(),
                 type_bounds: HashMap::new(),
+                declared_bounds: HashMap::new(),
                 satisfies: None,
                 repr_vis: Visibility::Any,
                 repr: ReprKind::Product(Vec::new()),

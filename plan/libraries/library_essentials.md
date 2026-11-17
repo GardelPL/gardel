@@ -1,7 +1,7 @@
 # Phase H: Library Essentials
 
 **Date:** November 12, 2026
-**Status:** Proposal. Nothing here is started, and no decision below is taken.
+**Status:** In progress. H.0a is done (2026-11-16). No decision below is taken.
 **Follows:** [Phase F](verified_libraries.md) (verified libraries) and [Phase G](../ffi/ffi_plan.md) (foreign interfaces).
 
 ---
@@ -177,12 +177,24 @@ Every task follows the rules of Phases E and F:
 
 Client: `HASH` (H.4, H.12) and `SHOW` (H.6). Closes F.1's first known limit.
 
-- [ ] A `concept` declared by a user gets a theory in a generic module that names it as a bound: one relation or function per method, and its laws as axioms, as `EQ` and `ORD` have today.
-- [ ] Methods that are not relations: `hash: U64`, `show: STRING`. Today's theory covers only `equals`, `less_than` and `less_or_equal`.
-- [ ] Instance links (F.1) for a user concept, with the same rule: no link inside a module that the instance's own proofs could rest on.
-- [ ] `[A: ORD]` together with `where A satisfies C` checks both (F.1's fourth limit).
-- [ ] A false-law test, as F.1 had: a type whose `hash` breaks `equals implies same hash` must not verify through a bound.
+**Status:** ✅ Completed (2026-11-16).
+
+- [x] A `concept` declared by a user gets a theory in a generic module that names it as a bound: one relation or function per method, and its laws as axioms, as `EQ` and `ORD` have today.
+- [x] Methods that are not relations: `hash: U64`, `show: STRING`. Today's theory covers only `equals`, `less_than` and `less_or_equal`.
+- [x] Instance links (F.1) for a user concept, with the same rule: no link inside a module that the instance's own proofs could rest on.
+- [x] `[A: ORD]` together with `where A satisfies C` checks both (F.1's fourth limit).
+- [x] A false-law test, as F.1 had: a type whose `hash` breaks `equals implies same hash` must not verify through a bound.
 - Acceptance: `module BAG[K: HASH]` verifies, uses `k.hash`, and runs in C. `E0320` is gone for user concepts. All existing `.bpl` output is byte-identical, as no existing code has such a bound.
+- **Fix: the theory.** The hand-written block that gave a parameter `K_eq`, `K_less` and their laws is now one piece per concept in the parameter's closure, in the order `EQ`, `CANONICAL_EQ`, `ORD`, then a user's. A user concept's piece (`emit_user_bound_theory`) declares `K_m_<method>(x: K, args...)` per method, with `Current` read as `K`; states the range of a machine number result (`in_u64(K_m_hash(x))`); and translates each law, with `Current` as `K`, through the ordinary expression emitter, so `a.hash` and `a.equals(b)` reach the relations. `HASH refines EQ` brings `EQ`'s piece. A user concept's laws carry the triggers they declare, or none, and the solver picks. The concepts a run declares are kept beside the prelude's (`find_concept`), so refinement, `E0317` and the C backend's own check see them.
+- **Fix: links.** At each use, every method of the bound is linked, not only `equals` and `less_than`: `BAG__K_m_hash(_bx) == TOKEN__fn_hash(DefaultFuel, _bx)`, with `<==>` for a `BOOL` result and the arguments as `_b0`, `_b1`. `type_rests_on` is unchanged, so the rule of F.1 applies as it is.
+- **Fix: a bound with a `where`.** `check_and_expand_concepts` wrote a `where` concept over the bound, and `declared_bound` then called the bound conditional, so `[A: ORD]` with `where A satisfies HASH` lost the order and was used unchecked. `ModuleDecl.declared_bounds` now keeps what `[A: C]` wrote: every use is checked against it, and inside the module the parameter has the methods and laws of both (`bound_concepts`). A `where CANONICAL_EQ` stays conditional unless the written bound is canonical already.
+- **What `E0320` means now.** A bound is refused when the concept has type parameters, or a method with a body (as `ORD.less_or_equal` has), since the proof would need that body for every instance. A method a user concept does not give is still `E0318`.
+- **Result.** `cargo test --release` 496/496 (233 unit tests, 33 suites). A debug build overflows its stack in `tests/gtui.rs`, as it already did before H.0a. `tests/bounds.rs` gains six tests: `BAG` over `TOKEN` and through a generic `RELAY[T: HASH]`, with the theory and the link checked in the `.bpl` and the C program run; three lies in a generic and one in a client refused; the false-law test, where `BROKEN`'s `consistent` stays unproven while `BROKEN` itself uses `BAG`; `E0317` at `BAG.bucket(n, 10)` on a `NAT`; `E0320` for a concept with a body, and `E0318` for a method `HASH` does not give; and `KEYED[K: ORD] satisfies HASH where K satisfies HASH` verifying, with `KEYED[TOKEN]` refused. `SHOWN[T: SHOW]` with `show: STRING` verifies and runs too. `--stdlib --strict`, the 8 example files, the 8 example projects, `ghttp`, `gjson`, `grest` and `gtui` stay 0/0, and all 1,216 `.bpl` and `.c` files they generate are byte-identical to those of the previous commit. 11 of 11 mutations of the new code, each on a private copy, turn a test red.
+- **Known limits.**
+  - A concept method with a body cannot be given to a bound. The plan's `HASH` and `SHOW` need none.
+  - An instance whose `hash` uses `*%` does not prove `consistent` within the default resources: the solver stalls on `bv2int(bvmul(int2bv(x), ...))` even when `x` is equal on both sides. With `%` it proves at once. This is H.12's risk, met early, and it needs a fix before H.12's hashes, which all wrap.
+  - A link does not tell a client what a string literal of another module holds, so `SHOWN.twice(LABEL.of(1))` needs `LABEL.show` to state its `byte_length` in an `ensure`. This is how a client learns any routine's result, and not new.
+  - A law of a user concept with no `trigger` reaches the solver with the triggers it picks. None of the tests needed one.
 
 #### Task H.0b: Bytes That Carry Their Range
 

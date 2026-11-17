@@ -892,7 +892,7 @@ impl<'a> Resolver<'a> {
         m.name = self.own.top(&m.name);
         let params = m.type_params.clone();
         self.with_type_params(&params, |this| {
-            for bound in m.type_bounds.values_mut() {
+            for bound in m.type_bounds.values_mut().chain(m.declared_bounds.values_mut()) {
                 this.ty(bound);
             }
             if let Some(sat) = &mut m.satisfies {

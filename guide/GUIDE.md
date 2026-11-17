@@ -1204,7 +1204,54 @@ create {ANY}
 end
 ```
 
-`K` is `EQ`, `CANONICAL_EQ` or `ORD`. Only those have a theory, so another concept is `E0320`. `a = b` on a `K` needs `CANONICAL_EQ`, because `equals` is not the identity under `EQ` or `ORD`.
+`K` is `EQ`, `CANONICAL_EQ`, `ORD` or a concept of your own. `a = b` on a `K` needs `CANONICAL_EQ`, because `equals` is not the identity under `EQ` or `ORD`.
+
+Your own concept works the same way. Its methods become the parameter's, and its laws are what the proof knows of them:
+
+```gardel
+concept HASH refines EQ
+
+  hash: U64
+
+  law consistent(a: Current, b: Current)
+    require
+      ab: a.equals(b)
+    ensure
+      same: a.hash = b.hash
+    end
+
+end
+
+module BAG[K: HASH]
+
+representation {ANY}
+  item: K
+
+create {ANY}
+
+  bucket(k: K, n: NAT): NAT
+    require
+      pos: n > 0
+    do
+      k.hash % n          -- `k.hash` is a U64, so it is below 2^64
+    ensure
+      below: Result < n
+    end
+
+  same_bucket(a: K, b: K, n: NAT): BOOL
+    require
+      pos: n > 0
+      eq: a.equals(b)
+    do
+      True
+    ensure
+      claim: BAG.bucket(a, n) = BAG.bucket(b, n)   -- from `consistent`
+    end
+
+end
+```
+
+A concept with type parameters, or with a method that has a body, cannot be a bound (`E0320`): the proof would need that body for every instance.
 
 The type is checked at every use, written or inferred. `SORTED.smaller(s, s)` on a `STRING` is `E0317`, because `STRING` is `EQ` and not `ORD`. So is `SORTED[F64]`. A method the bound does not give is `E0318`.
 
@@ -1234,6 +1281,8 @@ module RESULT[E, A] satisfies CANONICAL_EQ where E satisfies CANONICAL_EQ, A sat
 ```
 
 The constraint is enforced where the concept's routines are used. `SEQ.equals` compares elements structurally, which is behavioral equality only for canonical elements, so `SEQ[U64].equals` is accepted while `SEQ[STRING].equals` and `SEQ[SEQ[U64]].equals` are rejected with `E0314: unsatisfied_where_constraint`. Primitives satisfy `CANONICAL_EQ` and `ORD`, a type parameter satisfies its declared bound (`[A: CANONICAL_EQ]`), and a module type satisfies the concepts it lists when its own `where` constraints hold.
+
+A parameter can have both. In `module KEYED[K: ORD] satisfies HASH where K satisfies HASH`, every use of `KEYED` needs an `ORD` type, and inside `KEYED`, `K` has `less_than` and `hash` with the laws of both.
 
 ---
 
@@ -1532,7 +1581,7 @@ When repairing failing Gardel code:
 | `E0317: unsatisfied_bound` | `SORTED[STRING]` with `K: ORD`, written or inferred | Use a type that satisfies the bound, or weaken the bound |
 | `E0318: method_not_in_bound` | `a.less_than(b)` on `K: EQ`, or `a.equals(b)` on a bare `K` | Add or strengthen the bound |
 | `E0319: variant_no_measure` | `variant xs` on a `LIST` or a `STRING` | Use a number (`xs.length`), or a parameter of a sum type |
-| `E0320: unsupported_bound` | `[K: MY_CONCEPT]` | Bound by `EQ`, `CANONICAL_EQ` or `ORD` |
+| `E0320: unsupported_bound` | `[K: C]` where `C` has type parameters or a method with a body | Move the body to each instance, or bound by a concept without one |
 | `E0321: refined_function_type_position` | `let g: ((x: NAT) -> NAT ensure ...) = ...`, `LIST[(x: NAT) -> NAT ensure ...]`, a `require` on a field | Put the clauses on a parameter, a field or a result; a `require` on a parameter only |
 | `E0322: refined_function_escapes` | `let g = f` or returning `f`, where `f`'s type has a `require` | Apply `f`, or pass it to a parameter whose `require` implies `f`'s |
 
