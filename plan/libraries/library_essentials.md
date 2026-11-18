@@ -1,7 +1,7 @@
 # Phase H: Library Essentials
 
 **Date:** November 12, 2026
-**Status:** In progress. H.0a is done (2026-11-16), and H.0b (2026-11-17). Decision 4 is taken; no other decision below is.
+**Status:** In progress. H.0a is done (2026-11-16), and H.0b and H.0c (2026-11-17). Decisions 4 and 13 are taken; no other decision below is.
 **Follows:** [Phase F](verified_libraries.md) (verified libraries) and [Phase G](../ffi/ffi_plan.md) (foreign interfaces).
 
 ---
@@ -229,13 +229,30 @@ Client: every parser. Needs decision 4. Closes F.2's first known limit.
 
 Client: `LOG_LEVEL` in H.2 (`GARDEL_LOG_LEVEL` sets the lowest level written, so levels need an order), months and weekdays in H.11, the breaker states in H.16. Today `HTTP_METHOD` and every other enumeration write `equals` by hand. Needs decision 13. Adds what B&W §8.1 gives an enumerated type.
 
-- [ ] On a sum whose variants all have no fields, `satisfies CANONICAL_EQ` or `satisfies ORD` with no bodies gets `equals` and `less_than` from the compiler. The order is the order of declaration.
-- [ ] `ordinal: NAT`, `from_ordinal(n): OPTION[T]` and `all: LIST[T]`, with laws: `from_ordinal(t.ordinal) = Some(t)`, `a.less_than(b) = (a.ordinal < b.ordinal)`, `all.length` is the number of variants, and every value is in `all`.
-- [ ] The concept's laws are proven for the generated bodies, as for written ones, so no derived instance is trusted.
-- [ ] A body written by hand still wins, and a sum with a field asks for one (a new error code).
-- [ ] Move `HTTP_METHOD` and `HTTP_VERSION` onto it, and record the lines removed.
-- [ ] With H.0a: `HASH` and `SHOW` derived the same way.
+**Status:** ✅ Completed (2026-11-17), except `HASH` and `SHOW`, which move to H.12 and H.6. Decision 13 taken as proposed.
+
+- [x] On a sum whose variants all have no fields, `satisfies CANONICAL_EQ` or `satisfies ORD` with no bodies gets `equals` and `less_than` from the compiler. The order is the order of declaration.
+- [x] `ordinal: NAT`, `from_ordinal(n): OPTION[T]` and `all: LIST[T]`, with laws: `from_ordinal(t.ordinal) = Some(t)`, `a.less_than(b) = (a.ordinal < b.ordinal)`, `all.length` is the number of variants, and every value is in `all`.
+- [x] The concept's laws are proven for the generated bodies, as for written ones, so no derived instance is trusted.
+- [x] A body written by hand still wins, and a sum with a field asks for one (a new error code).
+- [x] Move `HTTP_METHOD` and `HTTP_VERSION` onto it, and record the lines removed.
+- [ ] With H.0a: `HASH` and `SHOW` derived the same way. Moved to H.12 and H.6: neither concept is in the prelude yet, and the compiler cannot tell what a user's `hash` or `show` should mean from its name.
 - Acceptance: `module LOG_LEVEL satisfies ORD` with four variants and no feature verifies, and a client proves `Debug.less_than(Error)`. All existing `.bpl` output is byte-identical.
+- **Fix: the derivation.** `check_and_expand_concepts` calls `derive_enumeration_instance` before it checks a module's methods. For an enumeration (a sum with no type parameters whose variants have no fields) that leaves out `equals` (for `EQ`) or `less_than` (for `ORD`), the compiler writes the module's instance as Gardel source (`enumeration_source`), parses it, and adds each routine and law the module does not write: `equals` as `Current = other`, `less_than` as `Current.ordinal < other.ordinal`, each with `ensure def`; `ordinal` by a `match`; `from_ordinal` by nested `if`s; `all` by `prepend`s, with `count` and `has_each`; the laws `ordinal_back`, `all_listed` (by cases) and `all_at_ordinal`; and every law of the concepts that the module does not state, under its concept's `specify`. A derived `equals` is structural, so the module also satisfies `CANONICAL_EQ` (otherwise `E0311` refuses its own `=`). A client calls the laws as any other: `LOG_LEVEL.all_listed(t)`.
+- **Fix: `E0323: underivable_instance`.** A type that is not an enumeration and leaves out `equals` or `less_than` is refused with a message that says only an enumeration gets them. Other missing methods keep `Missing Concept Operation`.
+- **Fix: a bare variant as a receiver.** `Info.less_than(Warn)` in a `program` was translated as `fn_less_than`, with no module, and refused as `E0199`, whether the instance was derived or written. `infer_gardel_type` now gives a variant with no fields the type of the module that declares it.
+- **Fix: a proof the solver gives up on is tried under other seeds.** With `HTTP_METHOD` derived, `HTTP_ROUND_TRIP.fields_read_back` ran out of time under Z3's default seed (300 s, then the 600 s backstop) and took 1.3 to 1.9 s under seeds 1 to 3. Deleting `ordinal`'s two definition axioms, which no term of the proof triggers, brought it back to 1.5 s under the default seed; a dummy function of the same shape in their place took 2.2 s. Split into one law per conclusion, ghttp passed, and then `fields_read_values` did the same in `ghttp/tests`' package form. Proofs this close to the edge break with any change to their context, so `gardelc` now retries the whole module under seeds 1, 2 and 3 when the solver gives up (a resource limit, a timeout or the backstop) and no seed was chosen, and keeps the first run in which it does not. The first try stops a procedure after 120 s when retries follow, as this proof never reached its resource budget: ghttp took 769 s with the 600 s first try and 321 s with 120 s. The split was undone; `fields_read_back` is as it was.
+- **Lines removed.** `HTTP_METHOD` 138 → 102 and `HTTP_VERSION` 92 → 56: each drops `equals` and its `CANONICAL_EQ` and `EQ` laws, 36 lines. Each gains `ordinal`, `from_ordinal` and `all`.
+- **Result.** `cargo test --release` 505/505 (234 unit tests, 35 suites). The new `tests/derived.rs` has four tests:
+  - **Instance.** `LOG_LEVEL satisfies ORD` with four variants and nothing else verifies. A client proves `Info.less_than(Warn)`, the ordinals, `all_listed`, `all_at_ordinal` and equality, and keys a `MAP` by it. A program using it runs to the expected exit code. The `.bpl` holds a proof for each derived law and for each `CANONICAL_EQ`, `EQ` and `ORD` law.
+  - **Lies.** Four false claims about the derived instance are refused.
+  - **Not trusted.** A hand-written `ordinal` of 0 leaves `ORD_total`, `ordinal_back` and `all_at_ordinal` unproven. A hand-written `equals` that is always true leaves `CANONICAL_EQ_agrees_with_structural` unproven.
+  - **E0323.** A sum with a field and no `equals`, and a record with no `less_than`, are refused.
+
+  `tests/seed_retry.rs` starves a module with `--z3-rlimit 1` and checks that it is retried under seeds 1 to 3 and still reported as unproven. It checks that `--z3-seed` is not varied, and that a module proven at once is not retried. The stdlib, the 8 examples, the 6 example projects, `ghttp`, `gjson`, `grest` and `gtui` generate byte-identical `.bpl` and `.c` files, before `HTTP_METHOD` and `HTTP_VERSION` moved. After the move, `ghttp` (321 s, one retry, of `HTTP_ROUND_TRIP`), `ghttp/tests` and `grest` are 0/0. 14 of 14 mutations of the new code turn a test red.
+- **Known limits.**
+  - A retry costs up to three more runs of the module: a module that is truly unprovable now takes about four times as long to be reported.
+  - A sum with type parameters, such as `OPTION[T]`, gets nothing derived, even when no variant has a field.
 
 ### Step 1: Host essentials
 

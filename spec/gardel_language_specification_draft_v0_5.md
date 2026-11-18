@@ -1557,7 +1557,7 @@ When Boogie/Z3 returns `unknown` or fails to prove an obligation:
    - Adjust function unfolding with `reveal f` or increase routine `fuel`.
    - Formulate ghost lemmas in `specify` blocks proving inductive sub-goals.
    - In rare exploratory phases, mark an unproven assumption with `assume tag: predicate end`. `gardelc --audit` lists all ambient assumptions, and production compilation (`--strict`) strictly rejects any remaining `assume` blocks.
-4. **Solver Limit.** Each Boogie procedure has a budget of Z3 resources (`--z3-rlimit <N>` overrides the default). The budget counts solver work, not time, so a verdict does not depend on machine load. An obligation that exhausts it is *unproven*, not refuted: it is reported as `Phase 3 Boogie (Verification Resource Limit)`, without a counterexample. Prefer a lemma to a higher limit. A matching loop can outrun the solver's own checks of this budget, so `gardelc` also stops a Boogie run after 600 seconds (`GARDEL_SOLVER_BACKSTOP` overrides it, in seconds). That is a hang, not a verdict, and the module is reported as unproven. `--z3-seed <N>` (or `GARDEL_Z3_SEED`) fixes Z3's random seed for proof stability checks; an invalid value in either option is an error.
+4. **Solver Limit.** Each Boogie procedure has a budget of Z3 resources (`--z3-rlimit <N>` overrides the default). The budget counts solver work, not time, so a verdict does not depend on machine load. An obligation that exhausts it is *unproven*, not refuted: it is reported as `Phase 3 Boogie (Verification Resource Limit)`, without a counterexample. Prefer a lemma to a higher limit. A matching loop can outrun the solver's own checks of this budget, so `gardelc` also stops a Boogie run after 600 seconds (`GARDEL_SOLVER_BACKSTOP` overrides it, in seconds). That is a hang, not a verdict, and the module is reported as unproven. Whether the solver finds a proof within its budget can turn on its random seed. So when it gives up on a module under its default seed (a resource limit, a timeout or the backstop), `gardelc` verifies the module again under seeds 1, 2 and 3, and the first run in which it does not give up stands; a proof under any seed is a proof. As a stuck proof may never exhaust its budget, the first try then stops each procedure after 120 seconds, and the retries allow the full 600. `--z3-seed <N>` (or `GARDEL_Z3_SEED`) fixes Z3's random seed for proof stability checks, and is not varied; an invalid value in either option is an error.
 5. **Local Cache.** A proof may be reused only on the machine that made it, and only for the same verification condition, `gardelc`, Boogie and Z3 versions, limits and seed. A cached proof is a saved solver run, not evidence: a result from elsewhere is never accepted, and `--verify-deps` runs the solver on every module and proves the prelude this `gardelc` carries. `--bounded-check` proves nothing, so it is never cached. `--strict` and `--audit` cover every `assume` in the run, wherever it is written, and a dependency's `assume`s are always reported to its client.
 
 ---
@@ -1893,6 +1893,30 @@ end
 ```
 
 Because `less_or_equal` is defined as `Current.less_than(other) or Current.equals(other)`, antisymmetry (`a.less_or_equal(b) and b.less_or_equal(a) implies a.equals(b)`) follows automatically as a derived consequence of `irreflexive`, `transitive`, and `EQ.symmetric`.
+
+##### Derived Instances for Enumerations
+An enumeration is a sum type with no type parameters whose variants have no fields. When an enumeration declares `satisfies EQ`, `CANONICAL_EQ` or `ORD` and leaves out `equals` or `less_than`, the compiler writes what is left out (B&W §8.1):
+
+```eiffel
+module LOG_LEVEL satisfies ORD
+
+representation {ANY}
+  | Debug
+  | Info
+  | Warn
+  | Error
+
+end
+```
+
+- `equals(other)` is `Current = other`, with `ensure def: Result = (Current = other)`. As it is structural, the enumeration also satisfies `CANONICAL_EQ`, so `=` is allowed on it.
+- `less_than(other)` is `Current.ordinal < other.ordinal`, with the same `ensure def`: the order is the order of declaration.
+- `ordinal: NAT` gives the place of a variant, from 0, with `ensure bound: Result < n` for `n` variants.
+- `LOG_LEVEL.from_ordinal(k): OPTION[LOG_LEVEL]` is `Some` of the variant at `k`, and `None` for `k >= n` (`ensure in_range: Result.is_some = (k < n)`).
+- `LOG_LEVEL.all: LIST[LOG_LEVEL]` lists every variant in order (`ensure count: Result.length = n`).
+- The laws `ordinal_back` (`from_ordinal(t.ordinal) = Some(t)`), `all_listed` (`all.has(t)`) and `all_at_ordinal` (`LIST_OPS.at(all, t.ordinal) = t`), and every law of the concepts satisfied that the module does not state.
+
+Nothing derived is trusted: each routine and law is verified as if written by hand. A routine or law the module writes itself is kept in place of the derived one, and the laws are proven for it, so a hand-written `ordinal` that breaks the order is refused. A type that is not an enumeration and leaves out `equals` or `less_than` is `E0323: underivable_instance`.
 
 #### 3. Ghost Model Equality (`a.model = b.model`)
 Ghost model equality is the verification mechanism of Dual-Layer Model Refinement (§2 Principle 9). Non-canonical runtime data structures project their state into canonical inductive mathematical models in `specify`:
@@ -2442,7 +2466,7 @@ Both `create` and `feature` routines returning an instance of `Current` (or any 
 | `check` | each `check` block | the predicate holds, then joins the active proof context |
 | `assume` | each `assume` block | none; joins the proof context and is listed by `gardelc --audit` |
 
-Static rules introduced in v0.5: `E0104: entry_point_reference` (§4), `E0316: unreachable_match_arm` (§5.1), `E0317: unsatisfied_bound`, `E0318: method_not_in_bound` and `E0320: unsupported_bound` (§9), `E0319: variant_no_measure` (§7), `E0321: refined_function_type_position` and `E0322: refined_function_escapes` (§8), and the family `"Phase 4 (Reactive Violation)"` with the tags `missing_init`, `missing_step`, `main_in_reactive`, `bad_init_signature`, `bad_step_signature`, `state_type_mismatch`, `entry_point_require`, `io_in_reactive` and `shutdown_must_stop` (§11.6).
+Static rules introduced in v0.5: `E0104: entry_point_reference` (§4), `E0316: unreachable_match_arm` (§5.1), `E0317: unsatisfied_bound`, `E0318: method_not_in_bound`, `E0320: unsupported_bound` and `E0323: underivable_instance` (§9), `E0319: variant_no_measure` (§7), `E0321: refined_function_type_position` and `E0322: refined_function_escapes` (§8), and the family `"Phase 4 (Reactive Violation)"` with the tags `missing_init`, `missing_step`, `main_in_reactive`, `bad_init_signature`, `bad_step_signature`, `state_type_mismatch`, `entry_point_require`, `io_in_reactive` and `shutdown_must_stop` (§11.6).
 
 A solver result that is neither proof nor refutation is an error with its own rule, and its message says that the obligation is unproven: `"Phase 3 Boogie (Verification Resource Limit)"` for an obligation that exhausted the solver limit (§7.3), `"Phase 3 Boogie (Verification Timeout)"` for a procedure that did not finish, and `"Phase 3 Boogie (Verification Incomplete)"` when Boogie gives no clean result. A refutation always carries a counterexample.
 

@@ -1188,6 +1188,32 @@ This is the prelude's own `stdlib/concepts/ord.gdl`; `EQ`, `CANONICAL_EQ` and `O
 
 Generic modules like `SORTED_LIST[A: ORD]` can safely assume these laws as axioms during sorting and lookup proofs.
 
+### Enumerations Get Their Instance
+
+A sum whose variants have no fields needs no `equals` or `less_than` of its own:
+
+```gardel
+module LOG_LEVEL satisfies ORD
+
+representation {ANY}
+  | Debug
+  | Info
+  | Warn
+  | Error
+
+end
+```
+
+The compiler writes `equals` as `Current = other`, which also makes `LOG_LEVEL` `CANONICAL_EQ`, and `less_than` by the order the variants are written in. It adds:
+
+- `t.ordinal`: 0 for `Debug`, up to 3 for `Error`.
+- `LOG_LEVEL.from_ordinal(k)`: `Some(Warn)` for 2, `None` from 4 on.
+- `LOG_LEVEL.all`: the four variants in order.
+- The laws `ordinal_back`, `all_listed` and `all_at_ordinal`, which a client calls like any law: `LOG_LEVEL.all_listed(t)` gives `LOG_LEVEL.all.has(t)`.
+- Every law of `EQ`, `CANONICAL_EQ` and `ORD` not written in the module.
+
+All of it is verified, as if you had written it. A routine you write yourself is kept instead, and the laws are proven for yours. A sum with a field, or a record, must write `equals` and `less_than` (`E0323`).
+
 ### Bounds on Type Parameters
 
 A bound gives a type parameter the methods of its concept, and the proof their laws:
@@ -1590,6 +1616,7 @@ When repairing failing Gardel code:
 | `E0320: unsupported_bound` | `[K: C]` where `C` has type parameters or a method with a body | Move the body to each instance, or bound by a concept without one |
 | `E0321: refined_function_type_position` | `let g: ((x: NAT) -> NAT ensure ...) = ...`, `LIST[(x: NAT) -> NAT ensure ...]`, a `require` on a field | Put the clauses on a parameter, a field or a result; a `require` on a parameter only |
 | `E0322: refined_function_escapes` | `let g = f` or returning `f`, where `f`'s type has a `require` | Apply `f`, or pass it to a parameter whose `require` implies `f`'s |
+| `E0323: underivable_instance` | `module CELL satisfies CANONICAL_EQ` with a variant `Full(n: NAT)` and no `equals` | Write `equals` (and `less_than` for `ORD`); only an enumeration gets them from the compiler |
 
 ---
 
@@ -2165,7 +2192,8 @@ gardelc --stdlib --strict
 # built as without the flag: a C compiler that fails is `E0401`, and a `note` names the executable
 gardelc <file.gdl> --json-diagnostics
 
-# Fix the solver seed, to check that a proof is stable, or its work limit per procedure
+# Fix the solver seed, to check that a proof is stable, or its work limit per procedure.
+# Without a seed, a module on which the solver gives up is verified again under seeds 1 to 3
 gardelc <file.gdl> --z3-seed <N>
 gardelc <file.gdl> --z3-rlimit <N>
 

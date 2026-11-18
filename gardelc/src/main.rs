@@ -2786,6 +2786,9 @@ pub fn check_and_expand_concepts(
         }
     }
 
+    derive_enumeration_instance(m, &mut required_concepts, concepts);
+    let enumeration = enumeration_variants(m).is_some();
+
     let existing_features: HashSet<String> = m
         .feature_routines
         .iter()
@@ -2801,7 +2804,18 @@ pub fn check_and_expand_concepts(
 
         // 1. Check required signatures
         for sig in &cdecl.signatures {
-            if !existing_features.contains(&sig.name) {
+            if !existing_features.contains(&sig.name) && !enumeration && DERIVABLE.contains(&(cname.as_str(), sig.name.as_str())) {
+                diags.push(Diagnostic::basic(
+                    "error",
+                    "E0323: underivable_instance",
+                    sig.name.clone(),
+                    "underivable_instance".to_string(),
+                    format!(
+                        "E0323: underivable_instance: `{}` satisfies `{cname}` but writes no `{}`. The compiler gives one only to an enumeration, a sum whose variants have no fields and that has no type parameters; write it (§9)",
+                        m.name, sig.name
+                    ),
+                ));
+            } else if !existing_features.contains(&sig.name) {
                 diags.push(Diagnostic::basic(
                     "error",
                     "Phase 2 (Missing Concept Operation)",
@@ -2863,6 +2877,174 @@ pub fn check_and_expand_concepts(
 
     m.feature_routines.extend(default_routines_to_inject);
     diags
+}
+
+/// The methods the compiler writes for an enumeration (H.0c), by the concept that asks for them.
+const DERIVABLE: [(&str, &str); 2] = [("EQ", "equals"), ("ORD", "less_than")];
+
+/// The variants of an enumeration: a sum with no type parameters whose variants have no fields.
+fn enumeration_variants(m: &ModuleDecl) -> Option<Vec<String>> {
+    match &m.repr {
+        ReprKind::Sum(vs) if m.type_params.is_empty() && !vs.is_empty() && vs.iter().all(|v| v.fields.is_empty()) => {
+            Some(vs.iter().map(|v| v.name.clone()).collect())
+        }
+        _ => None,
+    }
+}
+
+/// What the compiler writes for an enumeration `name` (B&W §8.1): `equals` as structural
+/// equality, `less_than` by the order of declaration, `ordinal`, `from_ordinal` and `all`, and
+/// laws that tie them together. All of it is verified as if written by hand.
+fn enumeration_source(name: &str, variants: &[String]) -> String {
+    let n = variants.len();
+    let cases = |f: &dyn Fn(usize, &str) -> String| {
+        variants.iter().enumerate().map(|(i, v)| format!("        case {v} then {}\n", f(i, v))).collect::<String>()
+    };
+    let from_ordinal = variants.iter().enumerate().map(|(i, v)| format!("if n = {i} then Some({v}) else ")).collect::<String>();
+    let ends = " end".repeat(n);
+    let all = variants.iter().rev().map(|v| format!(".prepend({v})")).collect::<String>();
+    let has_each = variants.iter().map(|v| format!("Result.has({v})")).collect::<Vec<_>>().join(" and ");
+    let repr = variants.iter().map(|v| format!("  | {v}\n")).collect::<String>();
+    let ordinal_cases = cases(&|i, _| i.to_string());
+    let true_cases = cases(&|_, _| "True".to_string());
+    format!(
+        "module {name}
+
+representation {{ANY}}
+{repr}
+create {{ANY}}
+
+  from_ordinal(n: NAT): OPTION[{name}]
+    do
+      {from_ordinal}None{ends}
+    ensure
+      in_range: Result.is_some = (n < {n})
+    end
+
+  all: LIST[{name}]
+    do
+      LIST.empty{all}
+    ensure
+      count: Result.length = {n}
+      has_each: {has_each}
+    end
+
+feature {{ANY}}
+
+  equals(other: {name}): BOOL
+    do
+      Current = other
+    ensure
+      def: Result = (Current = other)
+    end
+
+  less_than(other: {name}): BOOL
+    do
+      Current.ordinal < other.ordinal
+    ensure
+      def: Result = (Current.ordinal < other.ordinal)
+    end
+
+  ordinal: NAT
+    do
+      match Current
+{ordinal_cases}      end
+    ensure
+      bound: Result < {n}
+    end
+
+specify {{ANY}}
+
+  law ordinal_back(t: {name})
+    ensure
+      back: {name}.from_ordinal(t.ordinal) = Some(t)
+    end
+
+  law all_listed(t: {name})
+    do
+      match t
+{true_cases}      end
+    ensure
+      listed: {name}.all.has(t)
+    end
+
+  law all_at_ordinal(t: {name})
+    ensure
+      placed: LIST_OPS.at({name}.all, t.ordinal) = t
+    end
+
+end
+"
+    )
+}
+
+/// Supplies an enumeration's instance (H.0c): when `m` is an enumeration and leaves out a
+/// method in `DERIVABLE` that a concept of `required` asks for, the compiler writes it, with
+/// `ordinal`, `from_ordinal`, `all`, their laws and every law of `required` that `m` does not
+/// state. A routine or law written by hand keeps its place. Nothing is trusted: each is
+/// verified like the module's own. A derived `equals` is structural, so it also makes `m`
+/// satisfy `CANONICAL_EQ`, whose law is then proven too.
+fn derive_enumeration_instance(m: &mut ModuleDecl, required: &mut Vec<String>, concepts: &HashMap<String, ConceptDecl>) {
+    let Some(variants) = enumeration_variants(m) else {
+        return;
+    };
+    let written = |m: &ModuleDecl, n: &str| m.feature_routines.iter().chain(&m.create_routines).any(|(_, r)| r.name == n);
+    let missing: Vec<&str> = DERIVABLE
+        .iter()
+        .filter(|(c, meth)| required.iter().any(|r| r == c) && !written(m, meth))
+        .map(|(_, meth)| *meth)
+        .collect();
+    if missing.is_empty() {
+        return;
+    }
+    if missing.contains(&"equals") && concepts.contains_key("CANONICAL_EQ") && !required.iter().any(|c| c == "CANONICAL_EQ") {
+        required.push("CANONICAL_EQ".to_string());
+        if let Some(sat) = &mut m.satisfies {
+            sat.concepts.push("CANONICAL_EQ".to_string());
+        }
+    }
+    let parsed = tokenize(&enumeration_source(&m.name, &variants))
+        .map_err(|e| e.to_string())
+        .and_then(|t| Parser::new(t).parse_file().map_err(|e| e.to_string()));
+    let Some(derived) = parsed.ok().and_then(|f| f.modules.into_iter().next()) else {
+        return; // Variant names are identifiers, so the source always parses.
+    };
+    for (vis, r) in derived.create_routines.into_iter().chain(derived.feature_routines) {
+        let asked = !DERIVABLE.iter().any(|(_, meth)| *meth == r.name) || missing.contains(&r.name.as_str());
+        if asked && !written(m, &r.name) {
+            let list = if r.name == "from_ordinal" || r.name == "all" { &mut m.create_routines } else { &mut m.feature_routines };
+            list.push((vis, r));
+        }
+    }
+    let stated = |m: &ModuleDecl, n: &str, concept: Option<&str>| {
+        m.specify_laws.iter().any(|(vis, l)| {
+            l.name == n
+                && match vis {
+                    Visibility::Any => true,
+                    Visibility::Modules(ms) => concept.is_some_and(|c| ms.iter().any(|x| x == c)),
+                    Visibility::None => false,
+                }
+        })
+    };
+    for (vis, l) in derived.specify_laws {
+        if !stated(m, &l.name, None) {
+            m.specify_laws.push((vis, l));
+        }
+    }
+    for cname in required {
+        let Some(c) = concepts.get(cname) else { continue };
+        for law in &c.laws {
+            if !stated(m, &law.name, Some(cname)) {
+                let mut l = law.clone();
+                for (_, t) in &mut l.params {
+                    if t == "Current" {
+                        *t = m.name.clone();
+                    }
+                }
+                m.specify_laws.push((Visibility::Modules(vec![cname.clone()]), l));
+            }
+        }
+    }
 }
 
 const REACTIVE_VIOLATION: &str = "Phase 4 (Reactive Violation)";
@@ -7879,7 +8061,12 @@ fn infer_gardel_type(e: &Expr, m: &ModuleDecl, ctx: &BoogiePreludeCtx) -> Option
                     return Some(fty.clone());
                 }
             }
-            None
+            if module_has_variant(m, v) {
+                return Some(module_self_type(m));
+            }
+            // A variant with no fields of another module, such as `Info` in `Info.less_than(Warn)`.
+            let owner = ctx.module(ctx.ctor_owner.get(v)?)?;
+            owner.type_params.is_empty().then(|| owner.name.clone())
         }
         Expr::Call(f, args) => {
             let arg_tys: Vec<Option<String>> =
@@ -15609,8 +15796,7 @@ fn run_boogie_verification(
     let mut untrusted: HashSet<String> = HashSet::new();
     loop {
         let prev = UNTRUSTED_CONTRACTS.with(|u| u.replace(untrusted.clone()));
-        let pass =
-            run_boogie_verification_once(m, fuel_limit, boogie_path, z3_path, src, input_path);
+        let pass = run_boogie_with_retries(m, fuel_limit, boogie_path, z3_path, src, input_path);
         UNTRUSTED_CONTRACTS.with(|u| *u.borrow_mut() = prev);
         let pass = pass?;
         // A failed postcondition clause withdraws that clause only; any other failure of a
@@ -15641,6 +15827,58 @@ fn run_boogie_verification(
         untrusted.extend(newly_failed);
     }
     Ok(all)
+}
+
+/// The Z3 seeds tried, in order, when a proof runs out of resources under the default one.
+const RETRY_SEEDS: [u32; 3] = [1, 2, 3];
+
+/// Seconds per procedure for the first try under the default seed, when other seeds follow.
+const FIRST_TRY_SECS: u32 = 120;
+
+/// The solver gave up: it ran out of time or of its resource budget, or `gardelc` stopped
+/// it. This says
+/// nothing about the program, unlike a failed obligation.
+fn solver_gave_up(d: &Diagnostic) -> bool {
+    d.rule == "Phase 3 Boogie (Verification Timeout)"
+        || d.rule == "Phase 3 Boogie (Verification Resource Limit)"
+        || (d.rule == "Phase 3 Boogie (Verification Incomplete)" && d.message.contains("the solver was stopped after"))
+}
+
+/// One verification pass. Whether Z3 finds a proof within its resources can turn on its
+/// random seed: a proof that takes 2 s under one seed can run out under another, after a
+/// change that adds only declarations the proof never uses (H.0c). So when the solver gives
+/// up under the default seed, the pass runs again under each of `RETRY_SEEDS`, and the first
+/// result in which it does not give up stands. A proof under any seed is a proof, so this is
+/// sound; it costs time only where a proof did not complete. A seed the user chose
+/// (`--z3-seed`, `GARDEL_Z3_SEED`) is kept, so that run can be reproduced.
+fn run_boogie_with_retries(
+    m: &ModuleDecl,
+    fuel_limit: usize,
+    boogie_path: &str,
+    z3_path: &str,
+    src: &str,
+    input_path: &str,
+) -> Result<Vec<Diagnostic>, String> {
+    let retrying = current_z3_seed().is_none();
+    // A stuck proof may never reach its resource budget, so the first try has a shorter time
+    // limit per procedure when other seeds will follow: a proof that needs longer gets the
+    // full limit under them.
+    let first_limit = if retrying { FIRST_TRY_SECS.min(solver_backstop_secs()) } else { solver_backstop_secs() };
+    let first = run_boogie_verification_once(m, fuel_limit, boogie_path, z3_path, src, input_path, first_limit)?;
+    if !retrying || !first.iter().any(solver_gave_up) {
+        return Ok(first);
+    }
+    for seed in RETRY_SEEDS {
+        let again = with_z3_seed(Some(seed), || {
+            run_boogie_verification_once(m, fuel_limit, boogie_path, z3_path, src, input_path, solver_backstop_secs())
+        })?;
+        if !again.iter().any(solver_gave_up) {
+            eprintln!("      [seed] `{}` ran out of resources under Z3's default seed, and completed under seed {seed}", m.name);
+            return Ok(again);
+        }
+    }
+    eprintln!("      [seed] `{}`: the solver gave up under Z3's default seed and under seeds 1, 2 and 3", m.name);
+    Ok(first)
 }
 
 thread_local! {
@@ -15782,6 +16020,7 @@ fn run_boogie_verification_once(
     z3_path: &str,
     src: &str,
     input_path: &str,
+    proc_limit: u32,
 ) -> Result<Vec<Diagnostic>, String> {
     let bpl_code = emit_boogie(m, fuel_limit);
     // Unique per call: concurrent verifications of the same module (e.g. parallel tests)
@@ -15806,7 +16045,7 @@ fn run_boogie_verification_once(
     cmd.arg(BOOGIE_TYPE_ENCODING);
     cmd.arg(format!("/rlimit:{}", current_z3_rlimit()));
     let backstop = solver_backstop_secs();
-    cmd.arg(format!("/timeLimit:{backstop}"));
+    cmd.arg(format!("/timeLimit:{proc_limit}"));
     cmd.arg("/mv:-");
     cmd.arg("/errorTrace:0");
     if TYPES_ONLY.with(|t| t.get()) {
@@ -21824,6 +22063,22 @@ mod tests {
         let mut m = ast.modules.pop().expect("expected one module");
         let _ = check_and_expand_concepts(&mut m, &cmap);
         m
+    }
+
+    /// A run is retried under other seeds only where the solver gave up: a timeout, or a run
+    /// `gardelc` stopped. A failed obligation, or a Boogie run that ended without a clean
+    /// summary for another reason, is the answer, and is not retried.
+    #[test]
+    fn only_a_solver_that_gave_up_is_retried() {
+        let d = |rule: &'static str, msg: &str| Diagnostic::basic("error", rule, "r".into(), "t".into(), msg.into());
+        assert!(solver_gave_up(&d("Phase 3 Boogie (Verification Timeout)", "did not complete")));
+        assert!(solver_gave_up(&d("Phase 3 Boogie (Verification Resource Limit)", "out of resource")));
+        assert!(solver_gave_up(&d(
+            "Phase 3 Boogie (Verification Incomplete)",
+            "Fatal Error: the solver was stopped after 600 s, likely in a matching loop"
+        )));
+        assert!(!solver_gave_up(&d("Phase 3 Boogie (Verification Incomplete)", "Boogie did not report a clean result: parse error")));
+        assert!(!solver_gave_up(&d("Phase 3 Boogie (Postcondition Violation)", "failed")));
     }
 
     #[test]
