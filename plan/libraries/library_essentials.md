@@ -1,7 +1,7 @@
 # Phase H: Library Essentials
 
 **Date:** November 12, 2026
-**Status:** In progress. H.0a is done (2026-11-16), and H.0b and H.0c (2026-11-17). Decisions 4 and 13 are taken; no other decision below is.
+**Status:** In progress. H.0a is done (2026-11-16), H.0b and H.0c (2026-11-17), and H.0d (2026-11-18). Decisions 4 and 13 are taken; no other decision below is.
 **Follows:** [Phase F](verified_libraries.md) (verified libraries) and [Phase G](../ffi/ffi_plan.md) (foreign interfaces).
 
 ---
@@ -221,9 +221,9 @@ Client: every parser. Needs decision 4. Closes F.2's first known limit.
 - **Known limits.**
   - A law's axiom does not state its parameters' ranges and invariants, while its proof assumes them. This predates H.0b, which follows the same convention for lists. A law over `LIST[U64]` is thus stated of every `Seq int`.
   - A routine's own contract is an axiom in its own proof. A false `ensure` on a recursive routine can prove itself through the recursive call. The `tree.gdl` mutant in the unit tests passes, but because Z3 happens to find the failure, not because the rule forbids it.
-  - A `U64` literal result is not checked: `big: U64 do 18446744073709551616 end` verifies. Nor is a `MATH_INT` passed to a `U64` parameter. Both predate H.0b. A list built from such a value is refused, since its range is checked.
+  - ~~A `U64` literal result is not checked: `big: U64 do 18446744073709551616 end` verifies. Nor is a `MATH_INT` passed to a `U64` parameter.~~ Fixed in H.0d.
   - A function of more than three arguments, a `LIST[SEQ[...]]`, and lists nested three deep get no range facts. Nothing needs them yet.
-  - The comment in `gtui`'s `text_zip.gdl` that says a state is passed in a list to keep its range is now out of date.
+  - ~~The comment in `gtui`'s `text_zip.gdl` that says a state is passed in a list to keep its range is now out of date.~~ Removed in H.0d.
 
 #### Task H.0c: Derived Instances for Enumerations
 
@@ -253,6 +253,46 @@ Client: `LOG_LEVEL` in H.2 (`GARDEL_LOG_LEVEL` sets the lowest level written, so
 - **Known limits.**
   - A retry costs up to three more runs of the module: a module that is truly unprovable now takes about four times as long to be reported.
   - A sum with type parameters, such as `OPTION[T]`, gets nothing derived, even when no variant has a field.
+
+#### Task H.0d: Numbers Checked Where They Are Made
+
+A soundness fix found in H.0b (its known limits). `big: U64 do 18446744073709551616 end` verified. Its frame axiom `in_u64(fn_big)` contradicted its definition `fn_big == 18446744073709551616`, so a caller of `big` could prove `False`. A `MATH_INT` passed to a `U64` parameter, or given to a `U64` field, was not checked either.
+
+**Status:** ✅ Completed (2026-11-18).
+
+- [x] A routine's result of a machine number type is in its range (`<routine>::range::result`).
+- [x] An argument passed to a parameter of a machine number type is in its range (`range::<param>_range`), and so is a value given to a field of one (`range::<field>`).
+- [x] Every library, example and package stays 0/0, with each proof that breaks fixed by a true range fact, not by weakening the check.
+- [x] Remove the outdated comment in `gtui`'s `text_zip.gdl`.
+- Acceptance: `big` above, `take(m)` with `m: MATH_INT`, and `{ value = m }` are refused as `Range Violation`. The same with a `require` that bounds `m` verify.
+- **Fix: the checks.** H.0b's checks of a list's elements at a result, an argument and a field now also cover `NAT`, `U64`, `I64`, `INT`, `CHAR` and `EXIT_CODE` (`machine_range_obligation`). An argument is not checked again when its own type has the same range: a parameter, a field, or a call of a routine that declares that range, since every such result is checked in the callee (`known_in_range`, `callee_declares`). A built-in, as a fold, and a routine whose result is a type parameter are checked: before, `take(s.fold_left(f, 18446744073709551616))` passed unchecked. A literal, an arithmetic result, a branch and a `let` local are checked. A local's type is inferred, so `let x = 18446744073709551616` is a `NAT` to the inference.
+- **Fix: folds.** `s.fold_left(fn(acc: U64, x: U64): U64 do acc *% 10 +% x end, 0)` had no range, and three routines of `examples/seq_ops.gdl` failed. Axioms now state, by induction on the list, that a fold with an accumulator of a machine type is in its range when its start is and each step keeps it there. A step may assume its element's range when the list's elements have one (`emit_fold_range_theory`).
+- **Fix: a list's length is trusted (decision taken 2026-11-18).** `xs.length` has no upper bound in the proofs, so `MAP.size`, 7 routines of `gtui` (and 4 obligations of two `on_key`s that rest on them) and 4 of `tablon` failed. Before H.0d, each routine's result axiom asserted the bound unchecked. An axiom that every list's length fits a `U64` would contradict `prepend`. The length of a `LIST` that a program reads is now assumed to be in `U64`'s range where it is read (`emit_list_length_trust`), since no list in memory holds 2^64 elements. The assumption is of the length term itself, as of `LIST_OPS.filter(ps, keep).length`.
+- **Fix: a number read out of a generic container is trusted (decision taken 2026-11-18).** The full test run then failed 5 compiler unit tests. Their fixtures read a number out of a generic container: `o.unwrap_or(d)` of an `OPTION[NAT]`, `p.first` of a `TUPLE[U64, BOOL]`, a binder of a `RESULT[U64, ...]`, and `b.twin.twin.get` of a `BOX[I64]`. A container's contents have no range in the proof. Before H.0d each such routine's result axiom asserted the range unchecked. Two reads are now assumed in range: the result of a routine whose declared result is a type parameter of its module, together with a tuple's `first` and `second` (`emit_generic_read_trust`), and a match binder of such a field. A routine's own type parameter, as `B` of `fold[B]`, is made from its arguments, not read out of the container, and is not trusted: trusting it accepted `s.fold_left(f, 18446744073709551616)`. The body's proof assumes a binder in range already, so an arm with no obligation of its own needs nothing more. A routine that declares a machine result is not trusted, since its body is checked. The full fix, range predicates for every generic type at a machine type argument as H.0b gave `LIST`, is H.0e.
+- **Fix: a lambda keeps its name.** Each translation of a lambda gave it a new name, `lam_WORK_2` in the obligations and `lam_WORK_3` in the body, so an assumption whose term held a lambda never met the body's term, and the trusts above had to skip such terms. A lifted lambda now reuses the name of an identical one already lifted in the module (`BOOGIE_LAMBDA_NAMES`), and each is declared once.
+- **Fix: a fold of a `MAP`.** `m.fold(0, fn(acc: NAT, k: STRING, v: NAT): NAT do ... acc + v ... end)` of `tests/map.rs` had no range. Where such a fold is called, its result is assumed in range when its start is and each step keeps it there, for a value in its type's range: the trust of a read out of a container, stated at the call since a `MAP[K, MATH_INT]` holds ints too (`emit_map_fold_range`).
+- **Fix: a wrap is not checked.** A result made by `+%`, `-%` or `*%` at its own type's range, or by a bitwise operator at `U64`'s, is in range by construction, and its check is skipped. Proving `in_u64` of `bv2int(bvadd(int2bv(..)))` made Z3 bit-blast: the compiler's unit test of every expression position went from 2 s to over 15 minutes. It now takes 9 s.
+- **Result.** All 507 tests pass: the 234 compiler unit tests and the 36 integration suites. Under load, two tests miss their timing (`gtui`'s 200 by 60 frame, and `files_procs`'s keys for an attached child), and both pass alone. The stdlib is 0/0 in 47 s, `gjson` in 36 s, `gtui/tests` in 158 s, `ghttp/tests` in 163 s and `tablon` in 394 s, 4 projects at a time.
+  - **Lies.** `tests/machine_range.rs` gives eleven values out of range, each refused at its place: a literal result too large, `-1` as a `U64`, a `MATH_INT` result, argument, constructor field and record field, a literal through a `let` local, a fold of `MATH_INT` steps, and a fold of a `SEQ` and of a `MAP` whose start is out of range, and such a fold passed as a `U64` argument. A call whose precondition fails is refused for that, and its result is not refused again.
+  - **Truths.** The same values bounded by a `require` verify. So do a parameter passed on, a `NAT` passed as a `U64`, a list's length, the length of a `filter` and a `map`, folds at `U64` over `U64` and `BOOL` elements, a `MAP` fold, and reads of an `OPTION[NAT]`, a `TUPLE[U64, BOOL]` and a `Some(x)` binder. The `.bpl` has no trust of a routine that declares a `U64` result, and no check of an argument that is a parameter or a call result of the same range, and one declaration for each lambda.
+
+  The stdlib (`--stdlib --strict`), the 8 single-file examples, and every project are 0/0 with no source change: `api_gateway`, `echo_server`, `gtui_tour`, `hello_api`, `todo_api`, `todo_tui`, `gjson`, `gjson/tests`, `gtui`, `gtui/tests`, `ghttp`, `ghttp/tests`, `grest`, `grest/tests` and `tablon`. 21 of 21 mutations of the new code turn a test red. The last of them, a built-in call taken as in range, survived until the fold passed as an argument joined the lies.
+- **Known limits.**
+  - A list's length is trusted, not proven. A law or `ensure` that reads the length of a list no program could hold is proven only for lists that fit.
+  - A `SEQ`'s or a module's own `length` is a routine, checked in its body, and gets no trust: a `length` defined as the length of an unbounded list must bound it.
+  - A fold's range axioms cover an accumulator of a number type, not a list of numbers or a record. A fold of a user generic container has none.
+  - **A container built from a number out of range is accepted.** `Some(m)` with `m: MATH_INT`, used as an `OPTION[U64]`, is not refused, while a read of it is trusted to be in range. So a caller can still prove `False` this way. This is H.0e.
+
+#### Task H.0e: Containers That Carry Their Range
+
+Found in H.0d (its known limits). A number read out of a generic container is trusted to be in its type's range, and the container is not checked where it is built.
+
+**Status:** Not started.
+
+- [ ] A range predicate for `OPTION[T]`, `RESULT[T, E]`, `TUPLE[...]`, `MAP[K, V]` and a user generic at a machine type argument, as H.0b's `Seq_in_u64` for `LIST`. It is assumed of every parameter, field, binder and result of the type, and checked where one is built.
+- [ ] Remove H.0d's trust of generic reads (`emit_generic_read_trust`, the binder's range assumption, and the value assumption of `emit_map_fold_range`), and record what that costs.
+- [ ] Every library, example and package stays 0/0.
+- Acceptance: `Some(m)` with `m: MATH_INT` returned as an `OPTION[U64]` is refused as a `Range Violation`. `o.get` of an `OPTION[NAT]` parameter is a `NAT` without trust.
 
 ### Step 1: Host essentials
 

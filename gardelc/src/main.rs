@@ -5272,7 +5272,35 @@ fn emit_elements_range_theory() -> String {
         out.push_str(&format!("axiom (forall xs: {s}, x: {t} :: {{ {p}(xs), Seq_has(xs, x) }} {p}(xs) && Seq_has(xs, x) ==> {r}(x));\n"));
         out.push_str(&format!("axiom (forall xs: {s}, keep: Fn1 {tw} bool :: {{ {p}(Seq_filter(xs, keep)) }} {p}(xs) ==> {p}(Seq_filter(xs, keep)));\n"));
     }
+    out.push_str(&emit_fold_range_theory());
     out.push('\n');
+    out
+}
+
+/// Task H.0d: a fold whose accumulator is a machine number is in that number's range when its
+/// start is and every step keeps it there, by induction on the list. A step may assume the
+/// range of the element it takes when the list's elements have one.
+fn emit_fold_range_theory() -> String {
+    let ranges = ["in_u64", "in_i64", "in_char"];
+    let mut out = String::new();
+    for r in ranges {
+        // Each fold, with its step applied as `Fn2_app(f, <acc>, <elem>)` or the other way.
+        for (fold, fty, app) in [
+            ("Seq_fold_left", "Fn2 int {A} int", "Fn2_app(f, b, a)"),
+            ("Seq_fold_right", "Fn2 {A} int int", "Fn2_app(f, a, b)"),
+        ] {
+            let any = fty.replace("{A}", "A");
+            out.push_str(&format!(
+                "axiom (forall<A> xs: Seq A, f: {any}, init: int :: {{ {fold}(xs, f, init) }} {r}(init) && (forall b: int, a: A :: {{ {app} }} {r}(b) ==> {r}({app})) ==> {r}({fold}(xs, f, init)));\n"
+            ));
+            let ints = fty.replace("{A}", "int");
+            for ra in ranges {
+                out.push_str(&format!(
+                    "axiom (forall xs: Seq int, f: {ints}, init: int :: {{ {fold}(xs, f, init) }} {r}(init) && Seq_{ra}(xs) && (forall b: int, a: int :: {{ {app} }} {r}(b) && {ra}(a) ==> {r}({app})) ==> {r}({fold}(xs, f, init)));\n"
+                ));
+            }
+        }
+    }
     out
 }
 
@@ -6154,9 +6182,11 @@ fn linked_user_modules_for(m: &ModuleDecl) -> Vec<ModuleDecl> {
 /// shared by every client.
 fn with_fresh_boogie_numbering<T>(f: impl FnOnce() -> T) -> T {
     let saved_lambda = BOOGIE_LAMBDA_COUNTER.with(|c| c.replace(0));
+    let saved_names = BOOGIE_LAMBDA_NAMES.with(|n| std::mem::take(&mut *n.borrow_mut()));
     let saved_obligation = BOOGIE_OBLIGATION_COUNTER.with(|c| c.replace(0));
     let out = f();
     BOOGIE_LAMBDA_COUNTER.with(|c| c.set(saved_lambda));
+    BOOGIE_LAMBDA_NAMES.with(|n| *n.borrow_mut() = saved_names);
     BOOGIE_OBLIGATION_COUNTER.with(|c| c.set(saved_obligation));
     out
 }
@@ -6253,6 +6283,11 @@ thread_local! {
     static BOOGIE_LIFTED_LAMBDAS: std::cell::RefCell<String> =
         const { std::cell::RefCell::new(String::new()) };
     static BOOGIE_LAMBDA_COUNTER: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// The name each lifted lambda got, by its definition: a lambda translated again, as the
+    /// obligation walker and the body both do, keeps its name, so a term holding it is the
+    /// same in both (Task H.0d).
+    static BOOGIE_LAMBDA_NAMES: std::cell::RefCell<HashMap<String, String>> =
+        std::cell::RefCell::new(HashMap::new());
     /// Procedure locals for the binders and lambda parameters of nested expressions (see
     /// `emit_boogie_expr_obligations`), drained by `emit_boogie_verify_routine`.
     static BOOGIE_OBLIGATION_LOCALS: std::cell::RefCell<Vec<(String, String)>> =
@@ -6431,12 +6466,22 @@ fn lift_boogie_lambda(
             }
         }
     });
-    let k = BOOGIE_LAMBDA_COUNTER.with(|c| {
-        let v = c.get();
-        c.set(v + 1);
-        v
+    let key = format!(
+        "{}|{:?}|{:?}|{ret_ty}|{generic}|{:?}|{body_bpl}",
+        m.name, params, captures, lam_tps
+    );
+    let known = BOOGIE_LAMBDA_NAMES.with(|n| n.borrow().get(&key).cloned());
+    let fresh = known.is_none();
+    let name = known.unwrap_or_else(|| {
+        let k = BOOGIE_LAMBDA_COUNTER.with(|c| {
+            let v = c.get();
+            c.set(v + 1);
+            v
+        });
+        let name = format!("lam_{}_{k}", m.name);
+        BOOGIE_LAMBDA_NAMES.with(|n| n.borrow_mut().insert(key, name.clone()));
+        name
     });
-    let name = format!("lam_{}_{k}", m.name);
     let cap_decls: Vec<String> = captures
         .iter()
         .map(|(v, t)| format!("{v}: {}", map_boogie_type(t, m)))
@@ -6459,6 +6504,9 @@ fn lift_boogie_lambda(
     } else {
         format!("{name}({})", cap_names.join(", "))
     };
+    if !fresh {
+        return Some(call);
+    }
     let mut quant: Vec<String> = cap_decls.clone();
     quant.extend(params.iter().map(|(p, t)| format!("{p}: {}", map_boogie_type(t, m))));
     let applied = format!("{app}({call}, {})", param_names.join(", "));
@@ -7869,6 +7917,219 @@ fn emit_field_elements_obligation(
     let v = emit_boogie_expr_with_strings(value, m, &HashSet::new(), revealed, "DefaultFuel", strings);
     let fact = elements_fact(ty, &v).expect("a range, as checked above");
     elements_obligation(pad, &format!("{routine}::range::{field}_elements"), &fact)
+}
+
+/// Task H.0d: a value given to a parameter or field `name` of a machine number type `ty` is in
+/// that type's range, which the callee or every reader of the field assumes. A value whose own
+/// type has the range already is not checked again.
+#[allow(clippy::too_many_arguments)]
+fn machine_range_obligation(
+    name: &str,
+    ty: &str,
+    value: &Expr,
+    r: &RoutineDecl,
+    m: &ModuleDecl,
+    revealed: &HashSet<String>,
+    pad: &str,
+    strings: &[String],
+) -> String {
+    let Some(range) = machine_range(ty) else {
+        return String::new();
+    };
+    if known_in_range(value, range, r, m) {
+        return String::new();
+    }
+    let v = emit_boogie_expr_with_strings(value, m, &HashSet::new(), revealed, "DefaultFuel", strings);
+    elements_obligation(pad, &format!("{}::range::{name}", r.name), &format!("{range}({v})"))
+}
+
+/// Task H.0d: the length of a `LIST` that a program reads is a `NAT`, a trusted fact: no list
+/// that exists in memory holds 2^64 elements. It is assumed where the length is read, not as
+/// an axiom over every list, which `prepend` would contradict.
+#[allow(clippy::too_many_arguments)]
+fn emit_list_length_trust(
+    e: &Expr,
+    mname: &str,
+    args: &[Expr],
+    m: &ModuleDecl,
+    revealed: &HashSet<String>,
+    pad: &str,
+    strings: &[String],
+) -> String {
+    if mname != "length" || !args.is_empty() {
+        return String::new();
+    }
+    // Keyed on the translation, the built-in `Seq_length`: the receiver's Gardel type is not
+    // always known, as of `LIST_OPS.filter(ps, keep)`. A `SEQ` or a module's own `length` is
+    // a routine with a result checked in its body, and is not trusted.
+    let v = emit_boogie_expr_with_strings(e, m, &HashSet::new(), revealed, "DefaultFuel", strings);
+    if !v.starts_with("Seq_length(") {
+        return String::new();
+    }
+    // A lambda in the term keeps its name in the body (`BOOGIE_LAMBDA_NAMES`), so the
+    // length of `LIST_OPS.filter(ps, keep)` here is the body's.
+    format!("{pad}assume in_u64({v});\n")
+}
+
+/// Task H.0d: a machine number read out of a generic container, as `o.get` of an
+/// `OPTION[NAT]` or `p.first` of a `TUPLE[U64, BOOL]`, is in its type's range, a trusted fact
+/// (decision taken 2026-11-18). The container's contents have no range in the proof; a
+/// container built from a value out of range is not refused yet (H.0e).
+fn emit_generic_read_trust(
+    e: &Expr,
+    m: &ModuleDecl,
+    revealed: &HashSet<String>,
+    pad: &str,
+    strings: &[String],
+) -> String {
+    let Some(ctx) = boogie_prelude_ctx() else {
+        return String::new();
+    };
+    let Some(range) = infer_gardel_type(e, m, &ctx).and_then(|t| machine_range(&t)) else {
+        return String::new();
+    };
+    if !reads_type_parameter(e, m, &ctx) {
+        return String::new();
+    }
+    let v = emit_boogie_expr_with_strings(e, m, &HashSet::new(), revealed, "DefaultFuel", strings);
+    format!("{pad}assume {range}({v});\n")
+}
+
+/// Whether the call `e` gives back a value of a type parameter of its routine or module:
+/// `get` of an `OPTION[T]`, or `first` and `second` of a tuple. A routine that declares a
+/// machine result is checked in its body, and is not trusted.
+fn reads_type_parameter(e: &Expr, m: &ModuleDecl, ctx: &BoogiePreludeCtx) -> bool {
+    if let Expr::MethodCall(recv, name, _) = e {
+        if infer_gardel_type(recv, m, ctx).is_some_and(|rt| type_head(&rt) == "TUPLE") {
+            return matches!(name.as_str(), "first" | "second");
+        }
+    }
+    // The container's own parameter, as `T` of `OPTION[T]`. A routine's own, as `B` of
+    // `fold[B]`, is made from its arguments, not read out of the container.
+    callee_declares(e, m, ctx, |owner, rd| {
+        let ret = rd.ret_type.trim();
+        owner.type_params.iter().any(|tp| tp == ret) && !rd.type_params.iter().any(|tp| tp == ret)
+    })
+}
+
+/// Task H.0d: `m.fold(init, f)` of a `MAP[K, V]` is in a machine range when `init` is and each
+/// step keeps it there, as `emit_fold_range_theory` states of a list. A value of a machine `V`
+/// is assumed in its range, the trust of a read out of a generic container; the axiom is
+/// stated here, where `V` is known, since a `MAP[K, MATH_INT]` holds ints too.
+#[allow(clippy::too_many_arguments)]
+fn emit_map_fold_range(
+    e: &Expr,
+    recv: &Expr,
+    mname: &str,
+    args: &[Expr],
+    m: &ModuleDecl,
+    revealed: &HashSet<String>,
+    pad: &str,
+    strings: &[String],
+) -> String {
+    let [init, f] = args else {
+        return String::new();
+    };
+    let Some(ctx) = boogie_prelude_ctx() else {
+        return String::new();
+    };
+    if mname != "fold" {
+        return String::new();
+    }
+    let Some(rt) = infer_gardel_type(recv, m, &ctx) else {
+        return String::new();
+    };
+    let Some(inner) = rt.trim().strip_prefix("MAP[").and_then(|x| x.strip_suffix(']')) else {
+        return String::new();
+    };
+    let parts = split_top_level_commas(inner);
+    let [k_ty, v_ty] = parts.as_slice() else {
+        return String::new();
+    };
+    let (k_ty, v_ty) = (k_ty.trim(), v_ty.trim());
+    let Some(range) = infer_gardel_type(e, m, &ctx).and_then(|t| machine_range(&t)) else {
+        return String::new();
+    };
+    let tr = |x: &Expr| emit_boogie_expr_with_strings(x, m, &HashSet::new(), revealed, "DefaultFuel", strings);
+    let (term, init_v, f_v) = (tr(e), tr(init), tr(f));
+    let app = format!("Fn3_app({f_v}, b, k, v)");
+    let v_guard = machine_range(v_ty).map(|rv| format!(" && {rv}(v)")).unwrap_or_default();
+    format!(
+        "{pad}assume {range}({init_v}) && (forall b: int, k: {}, v: {} :: {{ {app} }} {range}(b){v_guard} ==> {range}({app})) ==> {range}({term});\n",
+        map_boogie_type(k_ty, m),
+        map_boogie_type(v_ty, m),
+    )
+}
+
+/// Whether the call `e` is of a routine, of `m` or of a module in `ctx`, for which `test`
+/// holds. A built-in, as `fold_left` of a `SEQ`, is no such routine.
+fn callee_declares(
+    e: &Expr,
+    m: &ModuleDecl,
+    ctx: &BoogiePreludeCtx,
+    test: impl Fn(&ModuleDecl, &RoutineDecl) -> bool,
+) -> bool {
+    let holds = |owner: &ModuleDecl, name: &str| find_module_routine(owner, name).is_some_and(|(rd, _)| test(owner, rd));
+    match e {
+        Expr::Call(f, _) => holds(m, f),
+        Expr::MethodCall(recv, name, _) => {
+            if let Expr::Var(v) = &**recv {
+                if v != "Current" && boogie_env_type(v).is_none() {
+                    if v == &m.name {
+                        return holds(m, name);
+                    }
+                    if let Some(owner) = ctx.module(v) {
+                        return holds(owner, name);
+                    }
+                }
+            }
+            let Some(rt) = infer_gardel_type(recv, m, ctx) else {
+                return false;
+            };
+            match type_head(&rt) {
+                head if head == m.name => holds(m, name),
+                head => ctx.module(head).is_some_and(|owner| holds(owner, name)),
+            }
+        }
+        _ => false,
+    }
+}
+
+/// Whether `e` is in the range `range` by its type alone: a parameter or field of a type with
+/// that range, or a call whose result has it, since every result is checked (Task H.0d). A
+/// local is not, as its type can be inferred from a literal out of range, nor is a literal.
+fn known_in_range(e: &Expr, range: &str, r: &RoutineDecl, m: &ModuleDecl) -> bool {
+    let declared = match e {
+        Expr::Var(v) => r
+            .params
+            .iter()
+            .find(|(p, _)| p == v)
+            .map(|(_, t)| t.clone())
+            .or_else(|| match &m.repr {
+                ReprKind::Product(fs) => fs.iter().find(|(f, _)| f == v).map(|(_, t)| t.clone()),
+                _ => None,
+            }),
+        // A wrapping or bit operation is in range by construction: proving it of the
+        // bit-vector term, as `in_u64(u64_wrap_add(1, x * 10))`, took Z3 minutes.
+        Expr::BinOp(op, a, b) if matches!(op.as_str(), "+%" | "-%" | "*%" | "&" | "|" | "^" | "<<" | ">>") => {
+            let wraps = matches!(op.as_str(), "+%" | "-%" | "*%");
+            return if operands_kind(a, b, m) == NumKind::Signed {
+                wraps && range == "in_i64"
+            } else {
+                range == "in_u64"
+            };
+        }
+        // Only a routine that declares the range checks its result; a built-in, as a fold,
+        // or a routine whose result is a type parameter does not.
+        Expr::Call(..) | Expr::MethodCall(..) => {
+            return boogie_prelude_ctx().is_some_and(|ctx| {
+                callee_declares(e, m, &ctx, |_, rd| machine_range(&rd.ret_type) == Some(range))
+                    && infer_gardel_type(e, m, &ctx).is_some_and(|t| machine_range(&t) == Some(range))
+            });
+        }
+        _ => None,
+    };
+    declared.is_some_and(|t| machine_range(&t) == Some(range))
 }
 
 /// Checks a range fact. A function value's fact starts a verification condition of its own:
@@ -10133,6 +10394,7 @@ fn emit_boogie_parts_with_options(
     // order-independent, so they can follow their uses).
     let mut theory = theory;
     theory.push_str(&BOOGIE_LIFTED_LAMBDAS.with(|l| std::mem::take(&mut *l.borrow_mut())));
+    BOOGIE_LAMBDA_NAMES.with(|n| n.borrow_mut().clear());
 
     BoogieParts {
         preamble,
@@ -10941,8 +11203,16 @@ fn emit_boogie_verify_routine(
     }
     // A list of a machine type that this routine gives back has its elements in range, which
     // every caller assumes (Task H.0b). A list built from a value out of range stops here.
+    // So does a machine number out of its type's range, such as a `U64` result of
+    // `18446744073709551616` or of a `MATH_INT` (Task H.0d): its frame axiom states the range.
     if let Some(fact) = elements_fact(&r.ret_type, "Result") {
         s.push_str(&elements_obligation("  ", &format!("{}::range::elements", r.name), &fact));
+    } else if let Some(fact) = value_fact(&r.ret_type, "Result") {
+        let wraps = matches!(r.body, Expr::BinOp(..))
+            && machine_range(&r.ret_type).is_some_and(|range| known_in_range(&r.body, range, r, m));
+        if !wraps {
+            s.push_str(&elements_obligation("  ", &format!("{}::range::result", r.name), &fact));
+        }
     }
     for (tag, ens_e) in &r.ensures {
         s.push_str(&emit_from_scalar_obligation(
@@ -12794,6 +13064,12 @@ fn emit_call_arg_obligations(
                 s.push_str(&elements_obligation(&pad, &format!("{}::range::{pn}_elements", r.name), &fact));
             }
         }
+        // A machine number passed to a parameter of a machine type is in its range, which the
+        // callee assumes (Task H.0d): a `MATH_INT` passed as a `U64` is checked here.
+        if let Some((pn, pt)) = expected.as_ref().and_then(|ps| ps.get(i)) {
+            // Tagged apart from the name, which the source finds in the callee's header.
+            s.push_str(&machine_range_obligation(&format!("{pn}_range"), pt, a, r, m, revealed, &pad, strings));
+        }
         let Expr::Var(v) = a else {
             continue;
         };
@@ -13232,6 +13508,7 @@ fn emit_boogie_expr_obligations(
                 for (f, value) in fields {
                     if let Some((_, t)) = decl.iter().find(|(d, _)| d == f) {
                         s.push_str(&emit_field_elements_obligation(f, t, value, m, revealed, &pad, strings, &r.name));
+                        s.push_str(&machine_range_obligation(f, t, value, r, m, revealed, &pad, strings));
                     }
                 }
             }
@@ -13258,6 +13535,9 @@ fn emit_boogie_expr_obligations(
                 recv, r, m, revealed, indent, strings,
             ));
             s.push_str(&emit_call_arg_obligations(e, args, r, m, revealed, indent, strings));
+            s.push_str(&emit_list_length_trust(e, mname, args, m, revealed, &pad, strings));
+            s.push_str(&emit_generic_read_trust(e, m, revealed, &pad, strings));
+            s.push_str(&emit_map_fold_range(e, recv, mname, args, m, revealed, &pad, strings));
             // Applying a function, held or in a field, must establish its type's `require`.
             if mname == "apply" {
                 s.push_str(&emit_fn_application_obligations(recv, args, r, m, revealed, &pad, strings));
@@ -13366,9 +13646,11 @@ fn emit_boogie_expr_obligations(
         }
         Expr::Call(fname, args) => {
             s.push_str(&emit_call_arg_obligations(e, args, r, m, revealed, indent, strings));
+            s.push_str(&emit_generic_read_trust(e, m, revealed, &pad, strings));
             if let Some(fields) = ctor_fields(m, fname) {
                 for ((f, t), value) in fields.iter().zip(args.iter()) {
                     s.push_str(&emit_field_elements_obligation(f, t, value, m, revealed, &pad, strings, &r.name));
+                    s.push_str(&machine_range_obligation(f, t, value, r, m, revealed, &pad, strings));
                 }
             }
             if find_module_routine(m, fname).is_none() {
