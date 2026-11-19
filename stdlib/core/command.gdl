@@ -22,5 +22,7 @@ representation {ANY}
   | WriteFile(tag: NAT, path: STRING, data: BYTES)
   | ReadClock(tag: NAT)
   | Random(tag: NAT, count: NAT)
+  | Log(level: LOG_LEVEL, text: STRING)
+  | ReadEnv(tag: NAT, name: STRING)
 
 end

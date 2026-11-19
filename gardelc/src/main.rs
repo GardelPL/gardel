@@ -4210,6 +4210,10 @@ pub const STDLIB_SOURCES: &[(&str, &str)] = &[
         include_str!("../../stdlib/core/dir_entry.gdl"),
     ),
     (
+        "stdlib/core/log_level.gdl",
+        include_str!("../../stdlib/core/log_level.gdl"),
+    ),
+    (
         "stdlib/core/command.gdl",
         include_str!("../../stdlib/core/command.gdl"),
     ),
@@ -4271,6 +4275,8 @@ pub fn phase4_stdlib_source() -> &'static str {
         include_str!("../../stdlib/core/proc_id.gdl"),
         "\n",
         include_str!("../../stdlib/core/dir_entry.gdl"),
+        "\n",
+        include_str!("../../stdlib/core/log_level.gdl"),
         "\n",
         include_str!("../../stdlib/core/command.gdl"),
         "\n",
@@ -5927,7 +5933,7 @@ pub const GCC_NET_LIBS: &[&str] = if cfg!(windows) { &["-lws2_32"] } else { &[] 
 /// `STRING` is injected for modules that mention it, contain string literals or use `IO`
 /// (Task B.3: literals denote prelude `STRING` values); `LIST_OPS` / `FUNCTION_OPS` are realized by the built-in
 /// `Seq_*` / `Fn1_*` preamble theories already present in every Boogie file.
-const BOOGIE_INJECTED_PRELUDE: [&str; 20] = [
+const BOOGIE_INJECTED_PRELUDE: [&str; 21] = [
     "OPTION",
     "RESULT",
     "SEQ",
@@ -5942,6 +5948,7 @@ const BOOGIE_INJECTED_PRELUDE: [&str; 20] = [
     "CONN_ID",
     "PROC_ID",
     "DIR_ENTRY",
+    "LOG_LEVEL",
     "COMMAND",
     "KEY",
     "EVENT",
@@ -6073,6 +6080,10 @@ impl BoogiePreludeCtx {
         // `MAP` keeps its keys with `KEY_ORDER` and answers `get` with an `OPTION`.
         if wanted.contains("MAP") || m.name == "MAP" {
             wanted.insert("KEY_ORDER");
+            wanted.insert("OPTION");
+        }
+        // `LOG_LEVEL.from_ordinal`, derived (H.0c), gives an `OPTION` (Task H.2).
+        if wanted.contains("LOG_LEVEL") || m.name == "LOG_LEVEL" {
             wanted.insert("OPTION");
         }
         // `BYTES.index_of` gives an `OPTION`.
@@ -6208,6 +6219,10 @@ fn prelude_modules_wanted(m: &ModuleDecl) -> HashSet<&'static str> {
             // `IO.random(count): IO[RESULT[IO_ERROR, BYTES]]` (Task H.1).
             let read_line_use = read_line_use
                 || matches!(name, "RESULT" | "IO_ERROR" | "BYTES") && idents.contains("random") && idents.contains("IO");
+            // `IO.env(name): IO[OPTION[STRING]]` and `IO.log(level, text)` (Task H.2).
+            let read_line_use = read_line_use
+                || name == "OPTION" && idents.contains("env") && idents.contains("IO")
+                || name == "LOG_LEVEL" && idents.contains("log") && idents.contains("IO");
             if idents.contains(name) || ctor_used || string_use || read_line_use {
                 wanted.insert(name);
             }
@@ -9579,6 +9594,10 @@ fn emit_own_boogie_parts(
     out.push_str(&format!(
         "function IO_print_line(s: {str_ty}) returns (IO int);\n"
     ));
+    if string_mode && boogie_prelude_ctx().is_some_and(|c| c.module("LOG_LEVEL").is_some()) {
+        // `IO.log(level, text)` (Task H.2), typed, so a level of another type is refused.
+        out.push_str("function IO_log(level: LOG_LEVEL, s: STRING) returns (IO int);\n");
+    }
     out.push_str("function IO_exit(code: int) returns (IO int);\n\n");
 
     out.push_str("function Seq_empty<T>() returns (Seq T);\n");
@@ -12539,6 +12558,9 @@ const READ_LINE_RESULT_TYPE: &str = "RESULT[IO_ERROR, STRING]";
 /// Gardel type of `IO.random(count)`'s result (Task H.1).
 pub const RANDOM_RESULT_TYPE: &str = "RESULT[IO_ERROR, BYTES]";
 
+/// Gardel type of `IO.env(name)`'s result (Task H.2).
+pub const ENV_RESULT_TYPE: &str = "OPTION[STRING]";
+
 /// The most bytes one `IO.random` or `Random` gives; a larger count is an `Error`.
 pub const GARDEL_RANDOM_MAX: u64 = 1024;
 
@@ -12550,6 +12572,7 @@ fn io_fresh_type(e: &Expr) -> Option<&'static str> {
             match (r.as_str(), args.len()) {
                 ("now", 0) => Some("I64"),
                 ("random", 1) => Some(RANDOM_RESULT_TYPE),
+                ("env", 1) => Some(ENV_RESULT_TYPE),
                 _ => None,
             }
         }
@@ -12564,6 +12587,16 @@ fn io_fresh_type(e: &Expr) -> Option<&'static str> {
 fn io_fresh_wf(e: &Expr, v: &str, count: Option<&str>) -> Option<String> {
     match io_fresh_type(e)? {
         "I64" => Some(format!("in_i64({v})")),
+        // `IO.env(name)` (Task H.2): a value is a valid STRING, and nothing says which.
+        ENV_RESULT_TYPE => {
+            let ctx = boogie_prelude_ctx()?;
+            if ctx.module("OPTION").is_none() || ctx.module("STRING").is_none() {
+                return None;
+            }
+            Some(format!(
+                "OPTION__OPTION_Invariant({v}) && (OPTION__is_Some({v}) ==> STRING__STRING_Invariant(OPTION__Some_value({v})))"
+            ))
+        }
         _ => {
             let ctx = boogie_prelude_ctx()?;
             if ctx.module("RESULT").is_none() || ctx.module("BYTES").is_none() {
@@ -22838,7 +22871,7 @@ end
         let stdlib = parse_phase4_stdlib().expect("Phase 4 stdlib should parse");
         assert_eq!(stdlib.group, None);
         assert_eq!(stdlib.concepts.len(), 3);
-        assert_eq!(stdlib.modules.len(), 22);
+        assert_eq!(stdlib.modules.len(), 23);
         for m in &stdlib.modules {
             let mut diags = check_visibility_and_semantics(m);
             diags.extend(verify_module_phase3(
@@ -23330,7 +23363,7 @@ end
     #[test]
     fn test_plan3_multi_module_stdlib_pipeline() {
         let ast = parse_phase4_stdlib().expect("stdlib parses cleanly");
-        assert_eq!(ast.modules.len(), 22);
+        assert_eq!(ast.modules.len(), 23);
         let mut prog_env = ProgramEnv {
             modules: HashMap::new(),
             concepts: HashMap::new(),

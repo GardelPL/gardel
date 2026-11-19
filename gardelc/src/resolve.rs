@@ -541,6 +541,7 @@ impl<'a> Resolver<'a> {
                     match routine.as_str() {
                         "now" => return Some("I64".to_string()),
                         "random" => return Some("RESULT".to_string()),
+                        "env" => return Some("OPTION".to_string()),
                         _ => {}
                     }
                 }

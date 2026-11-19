@@ -1,0 +1,11 @@
+-- How much a `Log` line matters (Task H.2), lowest first. `GARDEL_LOG_LEVEL` names the lowest
+-- level the host writes; the order, `ordinal` and `all` are derived (H.0c).
+module LOG_LEVEL satisfies ORD
+
+representation {ANY}
+  | Debug
+  | Info
+  | Warn
+  | Severe
+
+end

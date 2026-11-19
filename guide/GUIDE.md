@@ -75,6 +75,7 @@ This guide is written for two audiences:
   - [Linear `IO[A]` Actions and `with IO`](#linear-ioa-actions-and-with-io)
   - [Reading Input: `IO.read_line`](#reading-input-ioread_line)
   - [The Time and Random Bytes: `IO.now`, `IO.random`](#the-time-and-random-bytes-ionow-iorandom)
+  - [Logging and the Environment: `IO.log`, `IO.env`](#logging-and-the-environment-iolog-ioenv)
   - [Boundary Ingestion: Untrusted Data to Verified ADTs](#boundary-ingestion-untrusted-data-to-verified-adts)
 - [14. Reactive Programs](#14-reactive-programs)
   - [Two Total Routines](#two-total-routines)
@@ -1401,6 +1402,25 @@ with IO
 end
 ```
 
+### Logging and the Environment: `IO.log`, `IO.env`
+
+```eiffel
+IO.log(level: LOG_LEVEL, text: STRING) : IO[UNIT]   -- one line on standard error
+IO.env(name: STRING) : IO[OPTION[STRING]]           -- an environment variable
+```
+
+`IO.print_line` is the program's output; `IO.log` is for what its operator reads, and goes to standard error as one line, such as `warn: disk almost full`. `LOG_LEVEL` is `Debug | Info | Warn | Severe`, in that order (it is an ordered enumeration, so `Info.less_than(Warn)` holds). `GARDEL_LOG_LEVEL` names the lowest level written, `info` when it is not set, in any case; any other value stops the program with exit status 2 before it runs. A control byte or a `\` in the text is written escaped, as `\x0a` or `\\`, so a line from a request cannot end its line early or forge another.
+
+`IO.env(name)` is a fresh value, as a line is: `None` when the variable is not set, or when its value is not UTF-8, and the verifier knows nothing more, not even that two reads agree. A variable set to nothing is `Some("")`. Windows matches names in any case, POSIX exactly.
+
+```eiffel
+with IO
+  port <- IO.env("PORT")
+  IO.log(Info, match port case Some(p) then "port ".concat(p) case None then "no port" end)
+  IO.exit(0)
+end
+```
+
 ### Boundary Ingestion: Untrusted Data to Verified ADTs
 
 External data (network packets, command line inputs, disk files) is inherently untrusted.
@@ -1456,11 +1476,12 @@ The runtime calls `init`, performs the commands it returns, waits for an event, 
 | Prelude type | Contents |
 | :--- | :--- |
 | `STEP[S]` | `Continue(next, cmds)` or `Stop(code, cmds)` |
-| `COMMAND` | `Print`, `Write`, `TerminalSize`, `SetTimer`, `CancelTimer`, `ReadLine`, `ReadKey`, `Listen`, `Connect`, `Send`, `Close`, `ReadFile`, `ListDir`, `RunProcess`, `WriteProcess`, `CloseInput`, `StopProcess`, `RunAttached`, `WriteFile`, `ReadClock`, `Random` |
-| `EVENT` | `Tick`, `Line`, `Key`, `Resized`, `Accepted`, `ListenFailed`, `Connected`, `ConnectFailed`, `Received`, `SendFailed`, `Closed`, `FileRead`, `DirListed`, `ProcessStarted`, `ProcessFailed`, `ProcessOutput`, `ProcessErrorOutput`, `ProcessExited`, `AttachedEnded`, `FileWritten`, `Pasted`, `Clock`, `RandomBytes`, `Shutdown` |
+| `COMMAND` | `Print`, `Write`, `TerminalSize`, `SetTimer`, `CancelTimer`, `ReadLine`, `ReadKey`, `Listen`, `Connect`, `Send`, `Close`, `ReadFile`, `ListDir`, `RunProcess`, `WriteProcess`, `CloseInput`, `StopProcess`, `RunAttached`, `WriteFile`, `ReadClock`, `Random`, `Log`, `ReadEnv` |
+| `EVENT` | `Tick`, `Line`, `Key`, `Resized`, `Accepted`, `ListenFailed`, `Connected`, `ConnectFailed`, `Received`, `SendFailed`, `Closed`, `FileRead`, `DirListed`, `ProcessStarted`, `ProcessFailed`, `ProcessOutput`, `ProcessErrorOutput`, `ProcessExited`, `AttachedEnded`, `FileWritten`, `Pasted`, `Clock`, `RandomBytes`, `EnvRead`, `Shutdown` |
 | `KEY` | `Char(c)`, arrows, `Enter`, `Escape`, `Backspace`, `Tab`, `Home`, `End`, `PageUp`, `PageDown`, `Delete`, `Insert`, `Function(n)`, `Ctrl(c)`, `Mod(key, shift, alt, ctrl)`, `Other`, `KeysEnded` |
 | `CONN_ID`, `PROC_ID` | Opaque connection and process handles: they can be compared and stored, never forged |
 | `DIR_ENTRY` | An entry of a listing: `name` and `is_dir` |
+| `LOG_LEVEL` | `Debug`, `Info`, `Warn`, `Severe`, in that order |
 
 Rules worth knowing:
 - There is no `main`, no `IO` type and no `with IO`. `Stop` is the only way out, and its `code` is the exit status.
@@ -1474,6 +1495,8 @@ Rules worth knowing:
 - `WriteFile(tag, path, data)` answers with `FileWritten(tag, res)`, the number of bytes written. It writes a new file beside `path` and renames it over `path`, so a crash leaves the old file or the new one, never half of one. It replaces a file that is there: read it first if that must not happen.
 - `ReadClock(tag)` answers with `Clock(tag, wall_millis, monotonic_millis)`. The wall clock is milliseconds since 1970 in UTC, for showing a date or stamping a record; it can jump when someone sets the system's clock. The monotonic clock is the one timers use: measure how long something took with it. The answer comes in the next step, as every answer does.
 - `Random(tag, count)` answers with `RandomBytes(tag, res)`: `count` bytes from the system's generator, at most 1024, for keys, tokens and ids that must not be guessed. The bytes are written to a recording, since a replay needs them, so **a recording of a program that makes secrets is itself a secret**: keep it as you keep the keys. An `Ok` holds `count` bytes, but the event does not say what you asked for, so check the length where you take them in (`if bs.length = 16 then ...`).
+- `Log(level, text)` writes one line on standard error, as `IO.log` does (above), at once and in order with what the step printed before it. It is logged and compared on a replay like `Print`, so a replay writes the same lines.
+- `ReadEnv(tag, name)` answers with `EnvRead(tag, value)`, the variable's value as an `OPTION[STRING]`, in the next step. A server reads its port this way, in `init`, and listens once the answer comes: see `examples/todo_api`.
 - `RunProcess(tag, program, args, dir)` starts a program, with no shell: each argument reaches it as you wrote it. It answers with `ProcessStarted(tag, proc)` or `ProcessFailed(tag, err)`. Then `ProcessOutput(proc, data)` and `ProcessErrorOutput(proc, data)` bring what it writes, and `ProcessExited(proc, code)` comes last. `WriteProcess(proc, data)` and `CloseInput(proc)` feed its input, and `StopProcess(proc)` kills it and whatever it started.
 - `RunAttached(tag, program, args, dir)` gives a program the terminal, say an editor or another full-screen program, and answers with `AttachedEnded(tag, res)` when it ends. Your keys go to it meanwhile. After it, `Resized` comes again, so a screen is drawn anew.
 - `Ctrl(c)` is Ctrl with a letter, given lowercase. Ctrl-H, Ctrl-I, Ctrl-J and Ctrl-M are `Backspace`, `Tab` and `Enter`, and Ctrl-C is always a `Shutdown`, so a program in raw mode can still be stopped and leaves the terminal as it found it.
@@ -1543,13 +1566,14 @@ A reactive program is a pure function of its arguments and its events, so a run 
 | :--- | :--- |
 | `GARDEL_EVENTS=<script>` | Run from a script, such as `Resized:80:24 Tick:1 Key:Up Key:Ctrl:s Line:hello%20there Shutdown`. The end of the script is a `Shutdown`. On Linux one variable holds at most 128 KiB, so a longer run is a replay. |
 | `GARDEL_RECORD=<file>` | Write a log of the run |
-| `GARDEL_REPLAY=<file>` | Run from a log, with no timers, reads, sockets, files, processes, clock or generator |
+| `GARDEL_REPLAY=<file>` | Run from a log, with no timers, reads, sockets, files, processes, clock, generator or environment |
 | `GARDEL_LISTEN_ADDR=<ip>` | Bind `Listen` to an address other than loopback |
 | `GARDEL_CONNECT_TIMEOUT_MS=<n>` | How long a `Connect` may take before it fails, 10000 by default |
+| `GARDEL_LOG_LEVEL=<level>` | The lowest level of `Log` and `IO.log` written: `debug`, `info` (the default), `warn` or `severe` |
 
 The log holds the commands and the exit code as well as the events. A replay compares each command before it takes effect, and the first difference stops the program with exit status 3 and the line that differs, so a log from a working build is a regression test for a changed one. These are environment variables, not flags, because the command line belongs to the program and is part of what is replayed.
 
-A log holds everything the program received, in the clear, and has no size limit: random bytes too, and the times read, so a replay on another day gives the same output, and a log of a program that makes keys from `Random` is as secret as the keys. In a script, `Clock:1:1795000000000:42` and `RandomBytes:2:%00%FF` give a time and two bytes. A replay shows that the commands repeat, not that their real effects did.
+A log holds everything the program received, in the clear, and has no size limit: random bytes too, and the times read, so a replay on another day gives the same output, and a log of a program that makes keys from `Random` is as secret as the keys. In a script, `Clock:1:1795000000000:42` and `RandomBytes:2:%00%FF` give a time and two bytes, and `EnvRead:3:8080` and `EnvMissing:3` a variable's value and its absence. The value of a variable read is in the log too. A replay shows that the commands repeat, not that their real effects did.
 
 ---
 

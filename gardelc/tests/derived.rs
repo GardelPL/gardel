@@ -153,7 +153,9 @@ fn an_enumeration_gets_its_instance() {
     assert_ok(&p.check());
     // Every law is an obligation of `LOG_LEVEL`'s own, `CANONICAL_EQ`'s too, which the
     // derived `equals` brings though the module names only `ORD`.
-    let bpl = p.generated("log_level.bpl");
+    // The prelude has a `LOG_LEVEL` of its own since H.2, so this one, which wins in its
+    // package, is written under the package's name.
+    let bpl = p.generated("pk8_instance_log_level.bpl");
     for law in [
         "ordinal_back",
         "all_listed",

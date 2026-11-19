@@ -49,9 +49,11 @@ From the repository root:
 
 ```powershell
 gardelc --project examples/todo_api --strict
-./build/todo_api_bin.exe        # on port 8091
+./build/todo_api_bin.exe        # on port 8091, or on $TODO_API_PORT when it is set
 ./build/todo_api_bin.exe 9000   # on port 9000
 ```
+
+Each request is logged on standard error, as `info: POST /todos`.
 
 In another terminal:
 

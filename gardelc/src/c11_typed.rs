@@ -360,6 +360,10 @@ pub(crate) struct TypedC<'a> {
     /// `IO.now` or `IO.random` (Task H.1).
     needs_clock_random: bool,
     needs_random: bool,
+    /// `IO.log` or `IO.env` (Task H.2).
+    needs_log_env: bool,
+    needs_log: bool,
+    needs_env: bool,
     /// The routine being emitted jumped to its own start (spec §10: tail calls are loops).
     tail_used: bool,
     needs_from_utf8: bool,
@@ -412,6 +416,9 @@ impl<'a> TypedC<'a> {
             needs_read_line: false,
             needs_clock_random: false,
             needs_random: false,
+            needs_log_env: false,
+            needs_log: false,
+            needs_env: false,
             tail_used: false,
             exiting: false,
             needs_from_utf8: false,
@@ -2695,6 +2702,23 @@ static bool {inst}__has(struct {inst}* xs, {ce} x) {{\n\
                     format!("IO[{}]", cnorm(RANDOM_RESULT_TYPE)),
                 ));
             }
+            ("IO", "log", 2) => {
+                self.needs_log_env = true;
+                self.needs_log = true;
+                let l = self.lower(cx, &args[0], Some("LOG_LEVEL"), hc)?;
+                let t = self.lower(cx, &args[1], Some("STRING"), hc)?;
+                return self.runtime_call("gardel_io_log", vec![l, t], "IO[UNIT]", true);
+            }
+            ("IO", "env", 1) => {
+                self.needs_log_env = true;
+                self.needs_env = true;
+                self.needs_validator = true;
+                self.ctype(ENV_RESULT_TYPE)?;
+                let a = self.lower(cx, &args[0], Some("STRING"), hc)?;
+                // Built at the option's C type, so a temporary of the name holds that, not `IO`'s.
+                let v = self.runtime_call("gardel_io_env", vec![a], ENV_RESULT_TYPE, true)?;
+                return Ok(V { ty: format!("IO[{}]", cnorm(ENV_RESULT_TYPE)), ..v });
+            }
             ("IO", "exit", 1) => {
                 // Nothing runs after the argument, so its scopes do not release.
                 let outer = std::mem::replace(&mut self.exiting, true);
@@ -2885,7 +2909,7 @@ static struct SEQ_STRING* gardel_main_args(int argc, char** argv) {
         let cmd = self.ctype("COMMAND")?;
         let cmds = self.ctype("LIST[COMMAND]")?;
         // Files and processes: their values are built by the host (`host_files::typed_runtime`).
-        let file_types = ["RESULT[IO_ERROR, BYTES]", "RESULT[IO_ERROR, LIST[DIR_ENTRY]]", "RESULT[IO_ERROR, I64]", "LIST[DIR_ENTRY]", "LIST[STRING]", "RESULT[IO_ERROR, U64]"];
+        let file_types = ["RESULT[IO_ERROR, BYTES]", "RESULT[IO_ERROR, LIST[DIR_ENTRY]]", "RESULT[IO_ERROR, I64]", "LIST[DIR_ENTRY]", "LIST[STRING]", "RESULT[IO_ERROR, U64]", ENV_RESULT_TYPE];
         for t in file_types {
             self.ctype(t)?;
         }
@@ -2893,7 +2917,9 @@ static struct SEQ_STRING* gardel_main_args(int argc, char** argv) {
         let files_typed = crate::host_files::typed_runtime(&names);
         let files_rt = crate::host_files::HOST_FILES_RUNTIME;
         self.needs_clock_random = false;
+        self.needs_log_env = false;
         let os_rt = crate::host_files::OS_CLOCK_RANDOM;
+        let log_rt = crate::host_files::OS_LOG_ENV;
         self.drain();
 
         // One case per variant, so a variant with no host code cannot be ignored at run time.
@@ -2923,13 +2949,14 @@ static struct SEQ_STRING* gardel_main_args(int argc, char** argv) {
         let drop_args = self.drop_stmt("SEQ[STRING]", "args")?;
         Ok((
             format!(
-                "{REACTIVE_RUNTIME}\n{os_rt}\n{files_rt}\n{files_typed}\
+                "{REACTIVE_RUNTIME}\n{os_rt}\n{log_rt}\n{files_rt}\n{files_typed}\
                  static void gardel_run_commands({cmds} p) {{\n    for (; p; p = p->tail) {{\n        {cmd} c = p->head;\n        switch (c->tag) {{\n{run}        default: abort();\n        }}\n    }}\n    gardel_log_flush();\n    /* The program may now wait for days: what it printed must already be out. */\n    fflush(stdout);\n}}\n\n\
                  static {keyt} gardel_key_plain(struct gardel_host_event ev) {{\n    switch (ev.key) {{\n{make_key}        default: abort();\n    }}\n}}\n\n\
                  /* A key with Shift, Alt or Ctrl is that key in a `Mod`. */\n\
                  static {keyt} gardel_key_value(struct gardel_host_event ev) {{\n    {keyt} k = gardel_key_plain(ev);\n    if (!ev.mods) return k;\n    return make_KEY_Mod(k, (ev.mods & GARDEL_MOD_SHIFT) != 0, (ev.mods & GARDEL_MOD_ALT) != 0, (ev.mods & GARDEL_MOD_CTRL) != 0);\n}}\n\n\
                  static {evt} gardel_event_value(struct gardel_host_event ev) {{\n    switch (ev.kind) {{\n{make}        default: abort();\n    }}\n}}\n\n\
                  int gardel_reactive_main(int argc, char** argv) {{\n\
+                 \x20   gardel_log_threshold(); /* a bad GARDEL_LOG_LEVEL stops the program before it starts */\n\
                  \x20   gardel_host_install();\n\
                  \x20   gardel_term_start();\n\
                  \x20   gardel_timer_count = 0;\n\
@@ -3041,6 +3068,42 @@ static struct SEQ_STRING* gardel_main_args(int argc, char** argv) {
         if self.needs_clock_random {
             out.push_str(crate::host_files::OS_CLOCK_RANDOM);
         }
+        if self.needs_log_env {
+            out.push_str(crate::host_files::OS_LOG_ENV);
+        }
+        if self.needs_log {
+            out.push_str(
+                "/* IO.log (Task H.2): one line on standard error, at the level's ordinal. */\n\
+                 static inline int64_t gardel_io_log(struct LOG_LEVEL* level, GardelString text) {\n\
+                 \x20   gardel_log_write((int)level->tag, text.data, (size_t)text.len);\n\
+                 \x20   return 0;\n\
+                 }\n\n",
+            );
+        }
+        if self.needs_env {
+            let o = c_instance_name(ENV_RESULT_TYPE);
+            out.push_str(&format!(
+                "/* IO.env (Task H.2): the variable's value, or None when it is not set or not UTF-8. */\n\
+                 static struct {o}* gardel_io_env(GardelString name) {{\n\
+                 \x20   size_t len = 0;\n\
+                 \x20   char* v = gardel_env_get(name.data, (size_t)name.len, &len);\n\
+                 \x20   if (!v) return make_{o}_None();\n\
+                 \x20   uint64_t chars = 0;\n\
+                 \x20   struct STRING_ERROR* bad = gardel_utf8_validate((const uint8_t*)v, (uint64_t)len, &chars);\n\
+                 \x20   if (bad) {{\n\
+                 \x20       drop_STRING_ERROR(bad);\n\
+                 \x20       free(v);\n\
+                 \x20       return make_{o}_None();\n\
+                 \x20   }}\n\
+                 \x20   void* owner = NULL;\n\
+                 \x20   char* data = gardel_buf_alloc(len + 1, &owner);\n\
+                 \x20   memcpy(data, v, len + 1);\n\
+                 \x20   free(v);\n\
+                 \x20   GardelString s = {{ data, (uint64_t)len, chars, owner }};\n\
+                 \x20   return make_{o}_Some(s);\n\
+                 }}\n\n"
+            ));
+        }
         if self.needs_random {
             let r = c_instance_name(RANDOM_RESULT_TYPE);
             out.push_str(&format!(
@@ -3083,7 +3146,7 @@ enum gardel_host_kind {
     GARDEL_HOST_CONNECTED, GARDEL_HOST_CONNECT_FAILED, GARDEL_HOST_RESIZED, GARDEL_HOST_FILE_READ,
     GARDEL_HOST_DIR_LISTED, GARDEL_HOST_PROC_STARTED, GARDEL_HOST_PROC_FAILED, GARDEL_HOST_PROC_OUT,
     GARDEL_HOST_PROC_ERR, GARDEL_HOST_PROC_EXITED, GARDEL_HOST_ATTACHED_ENDED, GARDEL_HOST_FILE_WRITTEN,
-    GARDEL_HOST_PASTED, GARDEL_HOST_CLOCK, GARDEL_HOST_RANDOM
+    GARDEL_HOST_PASTED, GARDEL_HOST_CLOCK, GARDEL_HOST_RANDOM, GARDEL_HOST_ENV
 };
 enum gardel_host_key {
     GARDEL_KEY_CHAR, GARDEL_KEY_UP, GARDEL_KEY_DOWN, GARDEL_KEY_LEFT, GARDEL_KEY_RIGHT,
@@ -5393,6 +5456,8 @@ pub(crate) fn host_command_code(variant: &str) -> Option<&'static str> {
         "WriteFile" => Some("gardel_host_write_file(c->WriteFile.tag, c->WriteFile.path, c->WriteFile.data);"),
         "ReadClock" => Some("gardel_host_read_clock(c->ReadClock.tag);"),
         "Random" => Some("gardel_host_random(c->Random.tag, c->Random.count);"),
+        "Log" => Some("gardel_host_log((int)c->Log.level->tag, c->Log.text);"),
+        "ReadEnv" => Some("gardel_host_read_env(c->ReadEnv.tag, c->ReadEnv.name);"),
         _ => None,
     }
 }
@@ -5423,6 +5488,8 @@ pub(crate) fn host_command_log(variant: &str) -> Option<&'static str> {
         "WriteFile" => Some("gardel_log_word(\"WriteFile:\"); gardel_log_number(c->WriteFile.tag); gardel_log_word(\":\"); gardel_log_text(c->WriteFile.path.data, c->WriteFile.path.len); gardel_log_word(\":\"); gardel_log_text((const char*)c->WriteFile.data.data, c->WriteFile.data.len);"),
         "ReadClock" => Some("gardel_log_word(\"ReadClock:\"); gardel_log_number(c->ReadClock.tag);"),
         "Random" => Some("gardel_log_word(\"Random:\"); gardel_log_number(c->Random.tag); gardel_log_word(\":\"); gardel_log_number(c->Random.count);"),
+        "Log" => Some("gardel_log_word(\"Log:\"); gardel_log_word(gardel_level_names[c->Log.level->tag]); gardel_log_word(\":\"); gardel_log_text(c->Log.text.data, c->Log.text.len);"),
+        "ReadEnv" => Some("gardel_log_word(\"ReadEnv:\"); gardel_log_number(c->ReadEnv.tag); gardel_log_word(\":\"); gardel_log_text(c->ReadEnv.name.data, c->ReadEnv.name.len);"),
         _ => None,
     }
 }
@@ -5454,6 +5521,7 @@ pub(crate) fn host_event_code(variant: &str) -> Option<&'static str> {
         "Pasted" => Some("case GARDEL_HOST_PASTED: return make_EVENT_Pasted(gardel_paste_value(ev));"),
         "Clock" => Some("case GARDEL_HOST_CLOCK: return make_EVENT_Clock(ev.tag, ev.code, ev.id);"),
         "RandomBytes" => Some("case GARDEL_HOST_RANDOM: return make_EVENT_RandomBytes(ev.tag, gardel_file_value(ev));"),
+        "EnvRead" => Some("case GARDEL_HOST_ENV: return make_EVENT_EnvRead(ev.tag, gardel_env_value(ev));"),
         _ => None,
     }
 }

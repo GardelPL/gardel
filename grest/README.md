@@ -49,7 +49,12 @@ end
 
 `REST_SERVER.start` listens on the port its first argument names, or on `8090` when there is
 none. A route whose pattern is not valid, or an argument that is not a port, stops the program
-with exit status 2 and a message, before it listens.
+with exit status 2 and a message, before it listens. `REST_SERVER.start_from(port, 8090, router,
+STORE.empty)` takes the port as an `OPTION[STRING]` instead, for one read at run time, as
+`examples/todo_api` reads `TODO_API_PORT` with `ReadEnv`.
+
+Each request is logged at `Info` on standard error when its bytes are complete, as
+`info: GET /todos/1`; `GARDEL_LOG_LEVEL=warn` turns the lines off.
 [`examples/todo_api`](../examples/todo_api) is a service with a state, and
 [`examples/hello_api`](../examples/hello_api) one of four routes whose handlers do not look at
 it, so its state is a `NAT` that stays `0`. [`examples/api_gateway`](../examples/api_gateway)

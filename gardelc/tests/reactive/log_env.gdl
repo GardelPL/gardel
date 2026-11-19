@@ -1,0 +1,50 @@
+-- Log and ReadEnv (Task H.2): writes a line at each level, one with bytes a line cannot hold,
+-- reads one variable that is set and one that is not, prints each answer, and stops when both
+-- have come. A Shutdown stops it with 4, so a script that ends early is told apart from one
+-- refused (2).
+reactive program LOG_ENV
+
+feature {ANY}
+
+  -- `a` and `b`, when they fit.
+  joined(a: STRING, b: STRING): STRING
+    do
+      if a.byte_length <= 100000 and b.byte_length <= 100000 then a.concat(b) else a end
+    end
+
+  -- One more answer; after the second, the program stops.
+  answered(s: NAT, line: STRING): STEP[NAT]
+    do
+      if s >= 1 then
+        Stop(0, LIST.empty.prepend(Log(Info, "done")).prepend(Print(line)))
+      else
+        Continue(s + 1, LIST.empty.prepend(Print(line)))
+      end
+    end
+
+  init(args: SEQ[STRING]): STEP[NAT]
+    do
+      Continue(0, LIST.empty
+        .prepend(ReadEnv(2, "GARDEL_TEST_UNSET"))
+        .prepend(ReadEnv(1, "GARDEL_TEST_VALUE"))
+        .prepend(Log(Severe, "severe line"))
+        .prepend(Log(Warn, "two\nlines \\ one"))
+        .prepend(Log(Info, "info line"))
+        .prepend(Log(Debug, "debug line")))
+    end
+
+  step(s: NAT, e: EVENT): STEP[NAT]
+    do
+      match e
+        case EnvRead(tag, v) then
+          let shown = match v
+            case Some(text) then joined("set ", text)
+            case None then "unset"
+          end
+          answered(s, joined(joined(joined("env ", NUMBER_TEXT.nat_to_text(tag)), " "), shown))
+        case Shutdown then Stop(4, LIST.empty)
+        case _ then Continue(s, LIST.empty)
+      end
+    end
+
+end
