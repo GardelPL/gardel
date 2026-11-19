@@ -9,6 +9,60 @@
 //! The C below is emitted after `REACTIVE_RUNTIME`, whose declarations it uses. The parts that
 //! name instance types (`LIST_STRING`, `RESULT_IO_ERROR_BYTES`, ...) are in `typed_runtime`.
 
+/// The wall clock and the system's generator (Task H.1), for the reactive host's `ReadClock`
+/// and `Random` and for a `program`'s `IO.now` and `IO.random`. Emitted once, before either.
+pub(crate) const OS_CLOCK_RANDOM: &str = r#"/* The wall clock and the system's generator (Task H.1). */
+#define GARDEL_RANDOM_MAX 1024
+#ifdef _WIN32
+#define GARDEL_RANDOM_ERR_INVALID 87 /* ERROR_INVALID_PARAMETER */
+#include <stddef.h>
+__declspec(dllimport) unsigned long __stdcall GetLastError(void);
+__declspec(dllimport) void __stdcall GetSystemTimePreciseAsFileTime(void*);
+__declspec(dllimport) void* __stdcall LoadLibraryW(const wchar_t*);
+__declspec(dllimport) void* __stdcall GetProcAddress(void*, const char*);
+static int64_t gardel_wall_ms(void) {
+    unsigned long ft[2]; /* FILETIME: 100 ns since 1601, low part first */
+    GetSystemTimePreciseAsFileTime(ft);
+    int64_t t = (int64_t)(((uint64_t)ft[1] << 32) | ft[0]);
+    return (t - 116444736000000000LL) / 10000;
+}
+/* BCryptGenRandom, found at run time, so a program links with nothing new. */
+typedef long (__stdcall* gardel_bcrypt_fn)(void*, unsigned char*, unsigned long, unsigned long);
+static int64_t gardel_os_random(unsigned char* buf, size_t n) {
+    static gardel_bcrypt_fn gen = NULL;
+    if (!gen) {
+        void* lib = LoadLibraryW(L"bcrypt.dll");
+        if (lib) gen = (gardel_bcrypt_fn)GetProcAddress(lib, "BCryptGenRandom");
+        if (!gen) return (int64_t)GetLastError();
+    }
+    /* BCRYPT_USE_SYSTEM_PREFERRED_RNG */
+    long st = gen(NULL, buf, (unsigned long)n, 2);
+    return st == 0 ? 0 : (int64_t)(st & 0xFFFF ? st & 0xFFFF : 31);
+}
+#else
+#include <errno.h>
+#include <sys/random.h>
+#include <time.h>
+#include <unistd.h>
+#define GARDEL_RANDOM_ERR_INVALID EINVAL
+static int64_t gardel_wall_ms(void) {
+    struct timespec t;
+    clock_gettime(CLOCK_REALTIME, &t);
+    int64_t ms = (int64_t)t.tv_sec * 1000 + (int64_t)(t.tv_nsec / 1000000);
+    return ms;
+}
+/* getentropy gives at most 256 bytes a call. */
+static int64_t gardel_os_random(unsigned char* buf, size_t n) {
+    for (size_t at = 0; at < n;) {
+        size_t k = n - at < 256 ? n - at : 256;
+        if (getentropy(buf + at, k) != 0) return errno ? (int64_t)errno : 5;
+        at += k;
+    }
+    return 0;
+}
+#endif
+"#;
+
 /// What the host does for files and processes, apart from building the events' values.
 pub(crate) const HOST_FILES_RUNTIME: &str = r#"/* Files and processes (spec 11.6). */
 #define GARDEL_FILE_MAX (256u * 1024u * 1024u) /* the longest file ReadFile reads */
@@ -872,6 +926,48 @@ static void gardel_host_write_file(uint64_t tag, GardelString path, GardelBytes 
     gardel_thread_run(gardel_write_main, j);
 }
 
+/* ReadClock and Random (Task H.1): answered at once, on the queue the helpers use, so the answer
+   comes as an event after the step that asked, as every other answer does. The monotonic clock
+   is the one timers use; the wall clock counts milliseconds since 1970 in UTC, as POSIX does,
+   with no leap seconds. Random takes the system's generator, and at most 1024 bytes a time. */
+static void gardel_host_read_clock(uint64_t tag) {
+    if (gardel_host_script) {
+        fprintf(stderr, "host: ReadClock %llu\n", (unsigned long long)tag);
+        return;
+    }
+    struct gardel_answer* a = gardel_answer_new(GARDEL_HOST_CLOCK);
+    a->ev.tag = tag;
+    a->ev.code = gardel_wall_ms();
+    a->ev.id = gardel_host_now_ms();
+    a->ev.ok = true;
+    gardel_loop_answered = true;
+    gardel_answer_post(a);
+}
+static void gardel_host_random(uint64_t tag, uint64_t count) {
+    if (gardel_host_script) {
+        fprintf(stderr, "host: Random %llu %llu\n", (unsigned long long)tag, (unsigned long long)count);
+        return;
+    }
+    struct gardel_answer* a = gardel_answer_new(GARDEL_HOST_RANDOM);
+    a->ev.tag = tag;
+    if (count > GARDEL_RANDOM_MAX) {
+        a->ev.err = GARDEL_RANDOM_ERR_INVALID;
+    } else {
+        a->ev.buf = (char*)malloc((size_t)count + 1);
+        if (!a->ev.buf) abort();
+        a->ev.buf_len = (size_t)count;
+        a->ev.err = gardel_os_random((unsigned char*)a->ev.buf, (size_t)count);
+        if (a->ev.err != 0) {
+            free(a->ev.buf);
+            a->ev.buf = NULL;
+            a->ev.buf_len = 0;
+        }
+    }
+    a->ev.ok = a->ev.err == 0;
+    gardel_loop_answered = true;
+    gardel_answer_post(a);
+}
+
 /* Processes. */
 static struct gardel_proc* gardel_proc_find(uint64_t id) {
     for (struct gardel_proc* p = gardel_procs; p; p = p->next) if (p->id == id) return p;
@@ -1166,6 +1262,7 @@ static void gardel_attach_end(void) {
 static void gardel_answer_taken(struct gardel_host_event* ev) {
     switch (ev->kind) {
     case GARDEL_HOST_FILE_READ:
+    case GARDEL_HOST_RANDOM:
     case GARDEL_HOST_PROC_OUT:
     case GARDEL_HOST_PROC_ERR:
     case GARDEL_HOST_PASTED:
@@ -1192,6 +1289,22 @@ static void gardel_answer_taken(struct gardel_host_event* ev) {
 /* Log lines of these events. */
 static bool gardel_log_host_event(struct gardel_host_event* ev) {
     switch (ev->kind) {
+    case GARDEL_HOST_CLOCK:
+        /* Clock:<tag>:<wall>:<monotonic>, the wall time with a `-` before 1970. */
+        gardel_log_word("Clock:");
+        gardel_log_number(ev->tag);
+        gardel_log_word(ev->code < 0 ? ":-" : ":");
+        gardel_log_number(ev->code < 0 ? (uint64_t)0 - (uint64_t)ev->code : (uint64_t)ev->code);
+        gardel_log_word(":");
+        gardel_log_number(ev->id);
+        return true;
+    case GARDEL_HOST_RANDOM:
+        gardel_log_word(ev->ok ? "RandomBytes:" : "RandomFailed:");
+        gardel_log_number(ev->tag);
+        gardel_log_word(":");
+        if (ev->ok) gardel_log_text((const char*)ev->data.data, ev->data.len);
+        else gardel_log_number((uint64_t)ev->err);
+        return true;
     case GARDEL_HOST_PASTED:
         gardel_log_word("Pasted:");
         gardel_log_text((const char*)ev->data.data, ev->data.len);
@@ -1259,7 +1372,27 @@ static bool gardel_script_host(const char* name, size_t n, struct gardel_host_ev
         {"ProcessOutput:", GARDEL_HOST_PROC_OUT, true}, {"ProcessErrorOutput:", GARDEL_HOST_PROC_ERR, true},
         {"ProcessExited:", GARDEL_HOST_PROC_EXITED, true},
         {"FileWritten:", GARDEL_HOST_FILE_WRITTEN, true}, {"WriteFailed:", GARDEL_HOST_FILE_WRITTEN, false},
+        {"RandomBytes:", GARDEL_HOST_RANDOM, true}, {"RandomFailed:", GARDEL_HOST_RANDOM, false},
     };
+    /* Clock:<tag>:<wall>:<monotonic>, where the wall time may start with `-`. */
+    if (n >= 6 && memcmp(name, "Clock:", 6) == 0) {
+        size_t i = 6;
+        uint64_t tag, wall, mono;
+        if (!gardel_script_number(name, n, &i, &tag) || i == n || name[i] != ':') return false;
+        i++;
+        bool before = i < n && name[i] == '-';
+        if (before) i++;
+        if (!gardel_script_number(name, n, &i, &wall) || i == n || name[i] != ':') return false;
+        if (wall > (uint64_t)INT64_MAX + (before ? 1u : 0u)) return false;
+        i++;
+        if (!gardel_script_number(name, n, &i, &mono) || i != n) return false;
+        ev->kind = GARDEL_HOST_CLOCK;
+        ev->tag = tag;
+        ev->code = before ? (int64_t)((uint64_t)0 - wall) : (int64_t)wall;
+        ev->id = mono;
+        ev->ok = true;
+        return true;
+    }
     /* Pasted:<text>, cleaned as a terminal's paste is. */
     if (n >= 7 && memcmp(name, "Pasted:", 7) == 0) {
         size_t len;
@@ -1282,7 +1415,8 @@ static bool gardel_script_host(const char* name, size_t n, struct gardel_host_ev
         if (!gardel_script_number(name, n, &i, &first) || i == n || name[i] != ':') return false;
         i++;
         bool text = kinds[k].ok && (kind == GARDEL_HOST_FILE_READ || kind == GARDEL_HOST_DIR_LISTED
-                                    || kind == GARDEL_HOST_PROC_OUT || kind == GARDEL_HOST_PROC_ERR);
+                                    || kind == GARDEL_HOST_PROC_OUT || kind == GARDEL_HOST_PROC_ERR
+                                    || kind == GARDEL_HOST_RANDOM);
         if (text) {
             size_t len;
             char* t = gardel_script_text(name, n, i, &len);

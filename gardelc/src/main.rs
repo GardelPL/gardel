@@ -6205,6 +6205,9 @@ fn prelude_modules_wanted(m: &ModuleDecl) -> HashSet<&'static str> {
             // `IO.read_line: IO[RESULT[IO_ERROR, STRING]]` (§11).
             let read_line_use =
                 matches!(name, "RESULT" | "IO_ERROR") && idents.contains("read_line");
+            // `IO.random(count): IO[RESULT[IO_ERROR, BYTES]]` (Task H.1).
+            let read_line_use = read_line_use
+                || matches!(name, "RESULT" | "IO_ERROR" | "BYTES") && idents.contains("random") && idents.contains("IO");
             if idents.contains(name) || ctor_used || string_use || read_line_use {
                 wanted.insert(name);
             }
@@ -8513,6 +8516,7 @@ fn infer_gardel_type(e: &Expr, m: &ModuleDecl, ctx: &BoogiePreludeCtx) -> Option
                 .to_string(),
             )
         }
+        Expr::MethodCall(..) if io_fresh_type(e).is_some() => io_fresh_type(e).map(str::to_string),
         Expr::MethodCall(recv, r, _) if conversion_result(recv, r).is_some() => {
             conversion_result(recv, r).map(str::to_string)
         }
@@ -12493,6 +12497,9 @@ fn infer_boogie_expr_type(e: &Expr, r: &RoutineDecl, m: &ModuleDecl) -> String {
         }
         Expr::MethodCall(recv, mname, _) => {
             if let Expr::Var(v) = &**recv {
+                if let Some(t) = io_fresh_type(e) {
+                    return map_boogie_type(t, m);
+                }
                 if v == "IO" && mname == "read_line" {
                     if boogie_prelude_ctx().is_some_and(|c| c.module("RESULT").is_some()) {
                         return map_boogie_type(READ_LINE_RESULT_TYPE, m);
@@ -12528,6 +12535,47 @@ fn infer_boogie_expr_type(e: &Expr, r: &RoutineDecl, m: &ModuleDecl) -> String {
 
 /// Gardel type of `IO.read_line`'s result (§11).
 const READ_LINE_RESULT_TYPE: &str = "RESULT[IO_ERROR, STRING]";
+
+/// Gardel type of `IO.random(count)`'s result (Task H.1).
+pub const RANDOM_RESULT_TYPE: &str = "RESULT[IO_ERROR, BYTES]";
+
+/// The most bytes one `IO.random` or `Random` gives; a larger count is an `Error`.
+pub const GARDEL_RANDOM_MAX: u64 = 1024;
+
+/// `IO.now` or `IO.random(count)`, the routines that read the clock and the system's
+/// generator (Task H.1), with the type of what they give.
+fn io_fresh_type(e: &Expr) -> Option<&'static str> {
+    match e {
+        Expr::MethodCall(recv, r, args) if matches!(&**recv, Expr::Var(v) if v == "IO") => {
+            match (r.as_str(), args.len()) {
+                ("now", 0) => Some("I64"),
+                ("random", 1) => Some(RANDOM_RESULT_TYPE),
+                _ => None,
+            }
+        }
+        _ => None,
+    }
+}
+
+/// What the runtime guarantees about `v` bound by `v <- IO.now` or `v <- IO.random(count)`,
+/// with `count` already in Boogie (Task H.1). The time is an `I64`. A result is a `RESULT`
+/// whose `Ok` payload is a valid `BYTES` of exactly `count` bytes, at most
+/// `GARDEL_RANDOM_MAX`: the C runtime fills that many or returns `Error`.
+fn io_fresh_wf(e: &Expr, v: &str, count: Option<&str>) -> Option<String> {
+    match io_fresh_type(e)? {
+        "I64" => Some(format!("in_i64({v})")),
+        _ => {
+            let ctx = boogie_prelude_ctx()?;
+            if ctx.module("RESULT").is_none() || ctx.module("BYTES").is_none() {
+                return None;
+            }
+            let n = count?;
+            Some(format!(
+                "RESULT__RESULT_Invariant({v}) && (RESULT__is_Ok({v}) ==> BYTES__BYTES_Invariant(RESULT__Ok_val({v})) && BYTES__fn_length(DefaultFuel, RESULT__Ok_val({v})) == {n} && {n} <= {GARDEL_RANDOM_MAX})"
+            ))
+        }
+    }
+}
 
 fn is_io_read_line(e: &Expr) -> bool {
     matches!(e, Expr::MethodCall(recv, r, args)
@@ -12772,6 +12820,25 @@ fn emit_boogie_proc_stmts_and_ret(
                             if let Some(wf) = read_line_result_wf(v) {
                                 s.push_str(&format!(
                                     "{pad}assume {wf}; // IO boundary: the runtime decodes and validates input (spec §11)\n"
+                                ));
+                            }
+                        } else if io_fresh_type(e).is_some() {
+                            // The clock and the generator give a fresh value at each call (H.1).
+                            let count = match e {
+                                Expr::MethodCall(_, _, args) if args.len() == 1 => Some(emit_boogie_expr_with_strings(
+                                    &args[0],
+                                    m,
+                                    &empty_fields,
+                                    revealed,
+                                    "DefaultFuel",
+                                    strings,
+                                )),
+                                _ => None,
+                            };
+                            s.push_str(&format!("{pad}havoc {v};\n"));
+                            if let Some(wf) = io_fresh_wf(e, v, count.as_deref()) {
+                                s.push_str(&format!(
+                                    "{pad}assume {wf}; // IO boundary: the runtime checks what it gives (Task H.1)\n"
                                 ));
                             }
                         } else {

@@ -357,6 +357,9 @@ pub(crate) struct TypedC<'a> {
     counter: usize,
     needs_validator: bool,
     needs_read_line: bool,
+    /// `IO.now` or `IO.random` (Task H.1).
+    needs_clock_random: bool,
+    needs_random: bool,
     /// The routine being emitted jumped to its own start (spec §10: tail calls are loops).
     tail_used: bool,
     needs_from_utf8: bool,
@@ -407,6 +410,8 @@ impl<'a> TypedC<'a> {
             counter: 0,
             needs_validator: false,
             needs_read_line: false,
+            needs_clock_random: false,
+            needs_random: false,
             tail_used: false,
             exiting: false,
             needs_from_utf8: false,
@@ -2676,6 +2681,20 @@ static bool {inst}__has(struct {inst}* xs, {ce} x) {{\n\
                     format!("IO[{}]", cnorm(READ_LINE_RESULT_TYPE)),
                 ));
             }
+            ("IO", "now", 0) => {
+                self.needs_clock_random = true;
+                return Ok(owned("gardel_wall_ms()".into(), "IO[I64]"));
+            }
+            ("IO", "random", 1) => {
+                self.needs_clock_random = true;
+                self.needs_random = true;
+                let a = self.lower(cx, &args[0], Some("NAT"), hc)?;
+                self.ctype(RANDOM_RESULT_TYPE)?;
+                return Ok(owned(
+                    format!("gardel_io_random({})", a.code),
+                    format!("IO[{}]", cnorm(RANDOM_RESULT_TYPE)),
+                ));
+            }
             ("IO", "exit", 1) => {
                 // Nothing runs after the argument, so its scopes do not release.
                 let outer = std::mem::replace(&mut self.exiting, true);
@@ -2873,6 +2892,8 @@ static struct SEQ_STRING* gardel_main_args(int argc, char** argv) {
         let names = file_types.map(c_instance_name);
         let files_typed = crate::host_files::typed_runtime(&names);
         let files_rt = crate::host_files::HOST_FILES_RUNTIME;
+        self.needs_clock_random = false;
+        let os_rt = crate::host_files::OS_CLOCK_RANDOM;
         self.drain();
 
         // One case per variant, so a variant with no host code cannot be ignored at run time.
@@ -2902,7 +2923,7 @@ static struct SEQ_STRING* gardel_main_args(int argc, char** argv) {
         let drop_args = self.drop_stmt("SEQ[STRING]", "args")?;
         Ok((
             format!(
-                "{REACTIVE_RUNTIME}\n{files_rt}\n{files_typed}\
+                "{REACTIVE_RUNTIME}\n{os_rt}\n{files_rt}\n{files_typed}\
                  static void gardel_run_commands({cmds} p) {{\n    for (; p; p = p->tail) {{\n        {cmd} c = p->head;\n        switch (c->tag) {{\n{run}        default: abort();\n        }}\n    }}\n    gardel_log_flush();\n    /* The program may now wait for days: what it printed must already be out. */\n    fflush(stdout);\n}}\n\n\
                  static {keyt} gardel_key_plain(struct gardel_host_event ev) {{\n    switch (ev.key) {{\n{make_key}        default: abort();\n    }}\n}}\n\n\
                  /* A key with Shift, Alt or Ctrl is that key in a `Mod`. */\n\
@@ -3017,6 +3038,28 @@ static struct SEQ_STRING* gardel_main_args(int argc, char** argv) {
         if self.needs_from_utf8 {
             out.push_str(&emit_c11_from_utf8_runtime());
         }
+        if self.needs_clock_random {
+            out.push_str(crate::host_files::OS_CLOCK_RANDOM);
+        }
+        if self.needs_random {
+            let r = c_instance_name(RANDOM_RESULT_TYPE);
+            out.push_str(&format!(
+                "/* IO.random (Task H.1): `count` bytes from the system's generator, at most GARDEL_RANDOM_MAX. */\n\
+                 static struct {r}* gardel_io_random(uint64_t count) {{\n\
+                 \x20   if (count > GARDEL_RANDOM_MAX) return make_{r}_Error(make_IO_ERROR_OsError(GARDEL_RANDOM_ERR_INVALID));\n\
+                 \x20   void* owner = NULL;\n\
+                 \x20   char* buf = gardel_buf_alloc((size_t)count + 1, &owner);\n\
+                 \x20   int64_t err = gardel_os_random((unsigned char*)buf, (size_t)count);\n\
+                 \x20   buf[count] = '\\0';\n\
+                 \x20   GardelBytes b = {{ (const uint8_t*)buf, count, owner }};\n\
+                 \x20   if (err != 0) {{\n\
+                 \x20       gardel_bytes_drop(b);\n\
+                 \x20       return make_{r}_Error(make_IO_ERROR_OsError(err));\n\
+                 \x20   }}\n\
+                 \x20   return make_{r}_Ok(b);\n\
+                 }}\n\n"
+            ));
+        }
         out.push_str(args_rt);
         for s in &self.protos {
             out.push_str(s);
@@ -3040,7 +3083,7 @@ enum gardel_host_kind {
     GARDEL_HOST_CONNECTED, GARDEL_HOST_CONNECT_FAILED, GARDEL_HOST_RESIZED, GARDEL_HOST_FILE_READ,
     GARDEL_HOST_DIR_LISTED, GARDEL_HOST_PROC_STARTED, GARDEL_HOST_PROC_FAILED, GARDEL_HOST_PROC_OUT,
     GARDEL_HOST_PROC_ERR, GARDEL_HOST_PROC_EXITED, GARDEL_HOST_ATTACHED_ENDED, GARDEL_HOST_FILE_WRITTEN,
-    GARDEL_HOST_PASTED
+    GARDEL_HOST_PASTED, GARDEL_HOST_CLOCK, GARDEL_HOST_RANDOM
 };
 enum gardel_host_key {
     GARDEL_KEY_CHAR, GARDEL_KEY_UP, GARDEL_KEY_DOWN, GARDEL_KEY_LEFT, GARDEL_KEY_RIGHT,
@@ -3082,6 +3125,8 @@ struct gardel_dir_item { char* name; size_t len; bool is_dir; };
 /* Files and processes (Task F.11a), defined after the log. */
 static volatile int gardel_attached_now = 0; /* a RunAttached child has the terminal: Ctrl-C is its own */
 static bool gardel_workers_started = false;
+/* The loop itself queued an answer (ReadClock, Random), so the queue must be read. */
+static bool gardel_loop_answered = false;
 static bool gardel_reader_gate(void);
 static void gardel_reader_gate_open(void);
 static void gardel_answer_taken(struct gardel_host_event* ev);
@@ -3544,6 +3589,7 @@ static void gardel_read_console_key(struct gardel_host_event* ev) {
 #include <pthread.h>
 #include <signal.h>
 #include <sys/ioctl.h>
+#include <sys/random.h>
 #include <sys/socket.h>
 #include <termios.h>
 #include <time.h>
@@ -4216,7 +4262,7 @@ static void gardel_reader_main(void) {
 }
 
 static bool gardel_take_answer(struct gardel_host_event* ev) {
-    if (!gardel_reader_started && !gardel_workers_started) return false;
+    if (!gardel_reader_started && !gardel_workers_started && !gardel_loop_answered) return false;
     gardel_lock();
     struct gardel_answer* a = gardel_answers;
     if (a) {
@@ -5345,6 +5391,8 @@ pub(crate) fn host_command_code(variant: &str) -> Option<&'static str> {
         "StopProcess" => Some("gardel_host_proc_stop(c->StopProcess.proc->id);"),
         "RunAttached" => Some("gardel_host_run_list(c->RunAttached.tag, c->RunAttached.program, c->RunAttached.args, c->RunAttached.dir, true);"),
         "WriteFile" => Some("gardel_host_write_file(c->WriteFile.tag, c->WriteFile.path, c->WriteFile.data);"),
+        "ReadClock" => Some("gardel_host_read_clock(c->ReadClock.tag);"),
+        "Random" => Some("gardel_host_random(c->Random.tag, c->Random.count);"),
         _ => None,
     }
 }
@@ -5373,6 +5421,8 @@ pub(crate) fn host_command_log(variant: &str) -> Option<&'static str> {
         "StopProcess" => Some("gardel_log_word(\"StopProcess:\"); gardel_log_number(c->StopProcess.proc->id);"),
         "RunAttached" => Some("gardel_log_word(\"RunAttached:\"); gardel_log_run(c->RunAttached.tag, c->RunAttached.program, c->RunAttached.args, c->RunAttached.dir);"),
         "WriteFile" => Some("gardel_log_word(\"WriteFile:\"); gardel_log_number(c->WriteFile.tag); gardel_log_word(\":\"); gardel_log_text(c->WriteFile.path.data, c->WriteFile.path.len); gardel_log_word(\":\"); gardel_log_text((const char*)c->WriteFile.data.data, c->WriteFile.data.len);"),
+        "ReadClock" => Some("gardel_log_word(\"ReadClock:\"); gardel_log_number(c->ReadClock.tag);"),
+        "Random" => Some("gardel_log_word(\"Random:\"); gardel_log_number(c->Random.tag); gardel_log_word(\":\"); gardel_log_number(c->Random.count);"),
         _ => None,
     }
 }
@@ -5402,6 +5452,8 @@ pub(crate) fn host_event_code(variant: &str) -> Option<&'static str> {
         "AttachedEnded" => Some("case GARDEL_HOST_ATTACHED_ENDED: return make_EVENT_AttachedEnded(ev.tag, gardel_attached_value(ev));"),
         "FileWritten" => Some("case GARDEL_HOST_FILE_WRITTEN: return make_EVENT_FileWritten(ev.tag, gardel_written_value(ev));"),
         "Pasted" => Some("case GARDEL_HOST_PASTED: return make_EVENT_Pasted(gardel_paste_value(ev));"),
+        "Clock" => Some("case GARDEL_HOST_CLOCK: return make_EVENT_Clock(ev.tag, ev.code, ev.id);"),
+        "RandomBytes" => Some("case GARDEL_HOST_RANDOM: return make_EVENT_RandomBytes(ev.tag, gardel_file_value(ev));"),
         _ => None,
     }
 }

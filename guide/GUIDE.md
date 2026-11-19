@@ -74,6 +74,7 @@ This guide is written for two audiences:
   - [Why Pure Modules Forbid Effects](#why-pure-modules-forbid-effects)
   - [Linear `IO[A]` Actions and `with IO`](#linear-ioa-actions-and-with-io)
   - [Reading Input: `IO.read_line`](#reading-input-ioread_line)
+  - [The Time and Random Bytes: `IO.now`, `IO.random`](#the-time-and-random-bytes-ionow-iorandom)
   - [Boundary Ingestion: Untrusted Data to Verified ADTs](#boundary-ingestion-untrusted-data-to-verified-adts)
 - [14. Reactive Programs](#14-reactive-programs)
   - [Two Total Routines](#two-total-routines)
@@ -1381,6 +1382,25 @@ Reading can fail, so the result is a `RESULT` that must be matched:
 
 For the verifier, every `<- IO.read_line` is a **fresh, unknown value**: two reads are never assumed equal. The only thing assumed is the boundary guarantee that an `Ok` payload is a valid `STRING`. The native C runtime establishes that guarantee by validating every byte before building the `STRING`.
 
+### The Time and Random Bytes: `IO.now`, `IO.random`
+
+```eiffel
+IO.now : IO[I64]                                  -- milliseconds since 1970, UTC
+IO.random(count: NAT) : IO[RESULT[IO_ERROR, BYTES]]  -- from the system's generator
+```
+
+Both are fresh values, as a line is. The verifier knows a time is an `I64` and nothing more: not that it is after 1970, and not that a second read is later than the first, since the system's clock can be set back. It knows an `Ok` of `IO.random(n)` holds exactly `n` bytes, so a routine that needs 16 can be given `IO.random(16)`'s bytes with no check, and two draws are never known to be equal. More than 1024 bytes in one call is an `Error`.
+
+```eiffel
+with IO
+  r <- IO.random(16)
+  match r
+    case Ok(key) then IO.exit(serve(key))   -- serve's `require key.length = 16` holds
+    case Error(_) then IO.exit(1)
+  end
+end
+```
+
 ### Boundary Ingestion: Untrusted Data to Verified ADTs
 
 External data (network packets, command line inputs, disk files) is inherently untrusted.
@@ -1436,8 +1456,8 @@ The runtime calls `init`, performs the commands it returns, waits for an event, 
 | Prelude type | Contents |
 | :--- | :--- |
 | `STEP[S]` | `Continue(next, cmds)` or `Stop(code, cmds)` |
-| `COMMAND` | `Print`, `Write`, `TerminalSize`, `SetTimer`, `CancelTimer`, `ReadLine`, `ReadKey`, `Listen`, `Connect`, `Send`, `Close`, `ReadFile`, `ListDir`, `RunProcess`, `WriteProcess`, `CloseInput`, `StopProcess`, `RunAttached`, `WriteFile` |
-| `EVENT` | `Tick`, `Line`, `Key`, `Resized`, `Accepted`, `ListenFailed`, `Connected`, `ConnectFailed`, `Received`, `SendFailed`, `Closed`, `FileRead`, `DirListed`, `ProcessStarted`, `ProcessFailed`, `ProcessOutput`, `ProcessErrorOutput`, `ProcessExited`, `AttachedEnded`, `FileWritten`, `Pasted`, `Shutdown` |
+| `COMMAND` | `Print`, `Write`, `TerminalSize`, `SetTimer`, `CancelTimer`, `ReadLine`, `ReadKey`, `Listen`, `Connect`, `Send`, `Close`, `ReadFile`, `ListDir`, `RunProcess`, `WriteProcess`, `CloseInput`, `StopProcess`, `RunAttached`, `WriteFile`, `ReadClock`, `Random` |
+| `EVENT` | `Tick`, `Line`, `Key`, `Resized`, `Accepted`, `ListenFailed`, `Connected`, `ConnectFailed`, `Received`, `SendFailed`, `Closed`, `FileRead`, `DirListed`, `ProcessStarted`, `ProcessFailed`, `ProcessOutput`, `ProcessErrorOutput`, `ProcessExited`, `AttachedEnded`, `FileWritten`, `Pasted`, `Clock`, `RandomBytes`, `Shutdown` |
 | `KEY` | `Char(c)`, arrows, `Enter`, `Escape`, `Backspace`, `Tab`, `Home`, `End`, `PageUp`, `PageDown`, `Delete`, `Insert`, `Function(n)`, `Ctrl(c)`, `Mod(key, shift, alt, ctrl)`, `Other`, `KeysEnded` |
 | `CONN_ID`, `PROC_ID` | Opaque connection and process handles: they can be compared and stored, never forged |
 | `DIR_ENTRY` | An entry of a listing: `name` and `is_dir` |
@@ -1452,6 +1472,8 @@ Rules worth knowing:
 - To draw a screen, `Write` text with no newline, VT sequences included: a step's output goes out together, and the bytes are the same on Linux and Windows. `TerminalSize` answers with `Resized(width, height)`, and every later resize arrives the same way. Output that is not a terminal is 80 by 24. The `gtui` package draws a screen this way, writing only the cells that change: see [A Package for Terminal Interfaces](#a-package-for-terminal-interfaces-gtui).
 - `ReadFile(tag, path)` answers with `FileRead(tag, res)`, the whole file as `BYTES`, and `ListDir(tag, path)` with `DirListed(tag, res)`, the entries sorted by name. Both run on a thread of their own.
 - `WriteFile(tag, path, data)` answers with `FileWritten(tag, res)`, the number of bytes written. It writes a new file beside `path` and renames it over `path`, so a crash leaves the old file or the new one, never half of one. It replaces a file that is there: read it first if that must not happen.
+- `ReadClock(tag)` answers with `Clock(tag, wall_millis, monotonic_millis)`. The wall clock is milliseconds since 1970 in UTC, for showing a date or stamping a record; it can jump when someone sets the system's clock. The monotonic clock is the one timers use: measure how long something took with it. The answer comes in the next step, as every answer does.
+- `Random(tag, count)` answers with `RandomBytes(tag, res)`: `count` bytes from the system's generator, at most 1024, for keys, tokens and ids that must not be guessed. The bytes are written to a recording, since a replay needs them, so **a recording of a program that makes secrets is itself a secret**: keep it as you keep the keys. An `Ok` holds `count` bytes, but the event does not say what you asked for, so check the length where you take them in (`if bs.length = 16 then ...`).
 - `RunProcess(tag, program, args, dir)` starts a program, with no shell: each argument reaches it as you wrote it. It answers with `ProcessStarted(tag, proc)` or `ProcessFailed(tag, err)`. Then `ProcessOutput(proc, data)` and `ProcessErrorOutput(proc, data)` bring what it writes, and `ProcessExited(proc, code)` comes last. `WriteProcess(proc, data)` and `CloseInput(proc)` feed its input, and `StopProcess(proc)` kills it and whatever it started.
 - `RunAttached(tag, program, args, dir)` gives a program the terminal, say an editor or another full-screen program, and answers with `AttachedEnded(tag, res)` when it ends. Your keys go to it meanwhile. After it, `Resized` comes again, so a screen is drawn anew.
 - `Ctrl(c)` is Ctrl with a letter, given lowercase. Ctrl-H, Ctrl-I, Ctrl-J and Ctrl-M are `Backspace`, `Tab` and `Enter`, and Ctrl-C is always a `Shutdown`, so a program in raw mode can still be stopped and leaves the terminal as it found it.
@@ -1521,13 +1543,13 @@ A reactive program is a pure function of its arguments and its events, so a run 
 | :--- | :--- |
 | `GARDEL_EVENTS=<script>` | Run from a script, such as `Resized:80:24 Tick:1 Key:Up Key:Ctrl:s Line:hello%20there Shutdown`. The end of the script is a `Shutdown`. |
 | `GARDEL_RECORD=<file>` | Write a log of the run |
-| `GARDEL_REPLAY=<file>` | Run from a log, with no timers, reads, sockets, files or processes |
+| `GARDEL_REPLAY=<file>` | Run from a log, with no timers, reads, sockets, files, processes, clock or generator |
 | `GARDEL_LISTEN_ADDR=<ip>` | Bind `Listen` to an address other than loopback |
 | `GARDEL_CONNECT_TIMEOUT_MS=<n>` | How long a `Connect` may take before it fails, 10000 by default |
 
 The log holds the commands and the exit code as well as the events. A replay compares each command before it takes effect, and the first difference stops the program with exit status 3 and the line that differs, so a log from a working build is a regression test for a changed one. These are environment variables, not flags, because the command line belongs to the program and is part of what is replayed.
 
-A log holds everything the program received, in the clear, and has no size limit. A replay shows that the commands repeat, not that their real effects did.
+A log holds everything the program received, in the clear, and has no size limit: random bytes too, and the times read, so a replay on another day gives the same output, and a log of a program that makes keys from `Random` is as secret as the keys. In a script, `Clock:1:1795000000000:42` and `RandomBytes:2:%00%FF` give a time and two bytes. A replay shows that the commands repeat, not that their real effects did.
 
 ---
 

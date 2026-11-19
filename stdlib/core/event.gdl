@@ -23,6 +23,8 @@ representation {ANY}
   | AttachedEnded(tag: NAT, res: RESULT[IO_ERROR, I64])
 | FileWritten(tag: NAT, res: RESULT[IO_ERROR, NAT])
 | Pasted(text: STRING)
+  | Clock(tag: NAT, wall_millis: I64, monotonic_millis: U64)
+  | RandomBytes(tag: NAT, res: RESULT[IO_ERROR, BYTES])
 
 feature {ANY}
 

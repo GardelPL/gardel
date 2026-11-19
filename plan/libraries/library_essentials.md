@@ -313,13 +313,26 @@ Found in H.0d (its known limits). A number read out of a generic container is tr
 
 Client: `gtime` (H.11), the rate limiter (H.16), request ids in `grest`. Needs decisions 1 to 3 and P8.
 
-- [ ] `ReadClock(tag)` answered by `Clock(tag, wall_millis: I64, monotonic_millis: U64)`. The monotonic value is the clock that timers already use.
-- [ ] `Random(tag, count: NAT)` answered by `RandomBytes(tag, res: RESULT[IO_ERROR, BYTES])`, from the system's generator (`BCryptGenRandom`, `getrandom`). A `count` above 1024 is an `Error`.
-- [ ] For a `program`: `IO.now: IO[I64]` and `IO.random(count: NAT): IO[RESULT[IO_ERROR, BYTES]]`. Each is a fresh value in the proof, as `IO.read_line` is.
-- [ ] Scripted forms `Clock:<tag>:<wall>:<mono>` and `RandomBytes:<tag>:<text>`, log forms, and replay.
-- [ ] Guide: a log holds the random bytes (decision 3).
-- [ ] `RandomBytes` has the postcondition a client needs stated on a gateway: an `Ok` payload has length `count`. The host checks it, so the assumption is justified, as with `read_line`'s length bound.
+**Status:** ✅ Completed (2026-11-19). Decisions 1 to 3 taken as proposed. P8 in part: the host's C ran on Linux in a container, not in CI (see below).
+
+- [x] `ReadClock(tag)` answered by `Clock(tag, wall_millis: I64, monotonic_millis: U64)`. The monotonic value is the clock that timers already use.
+- [x] `Random(tag, count: NAT)` answered by `RandomBytes(tag, res: RESULT[IO_ERROR, BYTES])`, from the system's generator (`BCryptGenRandom`, `getrandom`). A `count` above 1024 is an `Error`.
+- [x] For a `program`: `IO.now: IO[I64]` and `IO.random(count: NAT): IO[RESULT[IO_ERROR, BYTES]]`. Each is a fresh value in the proof, as `IO.read_line` is.
+- [x] Scripted forms `Clock:<tag>:<wall>:<mono>` and `RandomBytes:<tag>:<text>`, log forms, and replay.
+- [x] Guide: a log holds the random bytes (decision 3).
+- [x] `RandomBytes` has the postcondition a client needs stated on a gateway: an `Ok` payload has length `count`. The host checks it, so the assumption is justified, as with `read_line`'s length bound. Done for `IO.random`; see the limits for `RandomBytes`.
 - Acceptance: a reactive program prints the time and eight random bytes; its recording replays to the same output on another day. Two `Random` results are not provably equal.
+- **The host.** `ReadClock` and `Random` are answered by the loop itself, at once: the answer goes on the queue the helper threads use, so it comes as the next event, after the step's other commands, as every answer does. The loop reads that queue only once a reader or a helper has started, so a flag of its own (`gardel_loop_answered`) says that the loop queued one; without it the first `ReadClock` waited for ever. The wall clock is `GetSystemTimePreciseAsFileTime` or `clock_gettime(CLOCK_REALTIME)`, the monotonic clock `gardel_host_now_ms`, which timers use. The bytes come from `BCryptGenRandom`, found at run time with `LoadLibraryW`, so no program links with anything new, and from `getentropy` in pieces of 256 on POSIX. A `count` above 1024 is `Error(OsError(c))` with the system's invalid-argument code (87, `EINVAL`). The clock and the generator are one block of C, `OS_CLOCK_RANDOM`, emitted for the reactive host and for a `program` that calls `IO.now` or `IO.random`.
+- **Scripts and logs.** `Clock:<tag>:<wall>:<mono>`, with a `-` for a time before 1970, `RandomBytes:<tag>:<bytes>` and `RandomFailed:<tag>:<code>` are both a script's tokens and a log's lines; commands are logged as `ReadClock:<tag>` and `Random:<tag>:<count>`, and in a script or a replay written to standard error as `host: ReadClock 1`. A replay reads no clock and draws no bytes.
+- **The proof.** `t <- IO.now` is a fresh `I64` (`havoc`, then `assume in_i64(t)`). `r <- IO.random(n)` is a fresh `RESULT` whose `Ok` is a valid `BYTES` of exactly `n` bytes, with `n <= 1024`; so `IO.random(1025)` is known to be an `Error`. Nothing else is assumed: not that a time is after 1970, not that a second read is later, and not that two draws differ or agree.
+- **Result.** All 513 tests pass: the 234 unit tests and 38 suites, with `tests/clock_random.rs` new. The stdlib, the 8 single-file examples and every project are 0/0, and no package changed: each `match` on `EVENT` and `COMMAND` already had a `case _`.
+  - **Truths.** A real run prints a time within a second of the test's own clock, eight bytes each below 256, and `refused` for 1025; the log has each command and answer; the replay gives the same output with no clock read; a second run draws other bytes. A script gives a time before 1970, the extremes of `I64` and `U64`, bytes that are not text and a failure. A `program` passes `IO.random(8)`'s bytes to a routine that requires eight.
+  - **Lies.** Refused: two draws are equal, eight bytes are nine, a time is not before 1970, and a second read is not earlier than the first. Six malformed script tokens stop the program with status 2.
+  - **Linux.** The C that gardelc writes for `tests/reactive/clock_random.gdl`, built with gcc 13.3 on Ubuntu 24.04 (glibc 2.39) in a container, compiles with no warning, runs, records, replays to the same output and reads a script; `RandomFailed` there carries `EINVAL` (22).
+- **Mutations.** 11 of 12 mutations of the new code turn `tests/clock_random.rs` red. Three first survived, and the tests grew to kill them: the program stopped with 2 at a `Shutdown`, as at a refused token, so a script token out of range passed as refused (it now stops with 4); no run had a time before 1970 in a log (a recorded script now has one, and is replayed); and a `Random` in the same step set the flag a `ReadClock` sets (a run now asks for the clock alone). The 12th leaves out the `havoc` before the assumption, which changes nothing: a Boogie local that is not assigned is already any value, and each bind is a local of its own.
+- **Known limits.**
+  - `RandomBytes` does not carry the `count` asked for, so a reactive program cannot prove its `Ok` has `count` bytes and checks the length where it takes them in (the guide says so). An event that held the count, or a tag the verifier could relate to its command, would need the host's answers stated per command, which nothing does yet.
+  - P8 is done only by hand: the Linux run was in a local container, of one program. The workflow in `.github/workflows/ci.yml` is not tracked and has a Windows job only. A Linux job needs Boogie, Z3 and the test suite there, none of which has run on Linux yet.
 
 #### Task H.2: Logging and the Environment
 
