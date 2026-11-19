@@ -5074,7 +5074,9 @@ fn elements_fact(ty: &str, term: &str) -> Option<String> {
     if let Some(fact) = function_fact(ty, term) {
         return Some(fact);
     }
-    let (p, seq) = elements_range(ty)?;
+    let Some((p, seq)) = elements_range(ty) else {
+        return container_fact(ty, term);
+    };
     Some(if seq {
         format!("{p}(SEQ__fn_model(DefaultFuel, {term}))")
     } else {
@@ -5142,6 +5144,226 @@ fn value_fact(ty: &str, term: &str) -> Option<String> {
     machine_range(ty).map(|r| format!("{r}({term})")).or_else(|| elements_fact(ty, term))
 }
 
+thread_local! {
+    /// The module whose Boogie text is being emitted. Its own declaration is in no context.
+    static BOOGIE_OWN_MODULE: std::cell::RefCell<Option<Rc<ModuleDecl>>> = const { std::cell::RefCell::new(None) };
+    /// The containers whose ranges are being decided, so that a recursive one ends.
+    static RANGE_DECIDING: std::cell::RefCell<HashSet<(String, String)>> = std::cell::RefCell::new(HashSet::new());
+}
+
+/// Runs `f` with `m` as the module being emitted.
+fn with_own_boogie_module<T>(m: &ModuleDecl, f: impl FnOnce() -> T) -> T {
+    let saved = BOOGIE_OWN_MODULE.with(|o| o.replace(Some(Rc::new(m.clone()))));
+    let out = f();
+    BOOGIE_OWN_MODULE.with(|o| *o.borrow_mut() = saved);
+    out
+}
+
+/// The declaration of module `name`: the one being emitted, or one of its context.
+fn with_module_decl<T>(name: &str, f: impl FnOnce(&ModuleDecl) -> T) -> Option<T> {
+    if let Some(own) = BOOGIE_OWN_MODULE.with(|o| o.borrow().clone()).filter(|o| o.name == name) {
+        return Some(f(&own));
+    }
+    boogie_prelude_ctx()?.module(name).map(f)
+}
+
+/// The types of the fields of `d`'s representation, with `Current` spelled as `d`'s type.
+fn repr_field_types(d: &ModuleDecl) -> Vec<String> {
+    let own = module_self_type(d);
+    let fields: Vec<&String> = match &d.repr {
+        ReprKind::Sum(vs) => vs.iter().flat_map(|v| v.fields.iter().map(|(_, t)| t)).collect(),
+        ReprKind::Product(fs) => fs.iter().map(|(_, t)| t).collect(),
+    };
+    fields.into_iter().map(|t| if t == "Current" { own.clone() } else { t.clone() }).collect()
+}
+
+/// The range a value of type `ty` holds (Task H.0e): `leaf` gives it for a type, and a
+/// container holds the range of its one argument that has one, as `Rng__OPTION_A(Rng_u64)`
+/// of an `OPTION[U64]`. `None` when no single range states it: an argument that `mentions`
+/// a ranged type and has no range of its own, or two arguments with one.
+fn rng_term(ty: &str, leaf: &dyn Fn(&str) -> Option<String>, mentions: &dyn Fn(&str) -> bool) -> Option<String> {
+    let ty = ty.trim();
+    if let Some(r) = leaf(ty) {
+        return Some(r);
+    }
+    if split_top_level_arrow(ty).is_some() {
+        return None;
+    }
+    let (head, args) = split_type_app(ty);
+    let mut parts = Vec::new();
+    for (j, a) in args.iter().enumerate() {
+        match rng_term(a, leaf, mentions) {
+            Some(r) if head == "LIST" => parts.push(format!("Rng_seq({r})")),
+            Some(r) => parts.push(format!("{}({r})", container_rng_fn(head, j)?)),
+            None if mentions(a) => return None,
+            None => {}
+        }
+    }
+    // A container with several such arguments, as a `TUPLE[U64, U64]`, holds them all.
+    parts.into_iter().reduce(|a, b| format!("Rng_and({a}, {b})"))
+}
+
+/// The range of a machine number type, as a range term.
+fn machine_rng(ty: &str) -> Option<String> {
+    machine_range(ty).map(|r| format!("Rng_{}", &r[3..]))
+}
+
+/// The range a field of type `fty` holds when every `tp` value in it holds `p`.
+fn field_rng(fty: &str, tp: &str, p: &str) -> Option<String> {
+    rng_term(fty, &|t| (t == tp).then(|| p.to_string()), &|t| type_tokens(t).contains(&tp))
+}
+
+/// The range function of argument `j` of container `head`, as `Rng__OPTION_A`: `None` when
+/// its representation does not hold that argument's values in a way a range states.
+fn container_rng_fn(head: &str, j: usize) -> Option<String> {
+    if head == "TUPLE" {
+        return ["Rng__Tuple2_A", "Rng__Tuple2_B"].get(j).map(|s| s.to_string());
+    }
+    // A `SEQ`'s elements are its `model`'s.
+    if matches!(head, "LIST" | "SEQ") {
+        return None;
+    }
+    let tp = with_module_decl(head, |d| d.type_params.get(j).cloned()).flatten()?;
+    carries_range(head, &tp).then(|| format!("Rng__{head}_{tp}"))
+}
+
+/// Whether the representation of `g` holds its `tp` values in fields whose range a range term
+/// states, and holds some. A field of `g`'s own type is taken to, so that a tree is decided.
+fn carries_range(g: &str, tp: &str) -> bool {
+    let key = (g.to_string(), tp.to_string());
+    if !RANGE_DECIDING.with(|d| d.borrow_mut().insert(key.clone())) {
+        return true;
+    }
+    let carries = with_module_decl(g, repr_field_types).is_some_and(|fields| {
+        let holding: Vec<&String> = fields.iter().filter(|f| type_tokens(f).contains(&tp)).collect();
+        !holding.is_empty() && holding.iter().all(|f| field_rng(f, tp, "p").is_some())
+    });
+    RANGE_DECIDING.with(|d| d.borrow_mut().remove(&key));
+    carries
+}
+
+/// That every machine number in `term`, a container of type `ty` such as an `OPTION[U64]`, is
+/// in its type's range (Task H.0e): one `Rng_holds` for each argument with a range.
+fn container_fact(ty: &str, term: &str) -> Option<String> {
+    let ty = ty.trim();
+    if split_top_level_arrow(ty).is_some() {
+        return None;
+    }
+    let (head, args) = split_type_app(ty);
+    if matches!(head, "LIST" | "SEQ") {
+        return None;
+    }
+    let facts: Vec<String> = args
+        .iter()
+        .enumerate()
+        .filter_map(|(j, a)| {
+            let r = rng_term(a, &machine_rng, &|_| false)?;
+            Some(format!("Rng_holds({}({r}), {term})", container_rng_fn(head, j)?))
+        })
+        .collect();
+    (!facts.is_empty()).then(|| facts.join(" && "))
+}
+
+/// The theory of `Rng_holds` (Task H.0e): `Rng_holds(p, x)` means that every machine number
+/// in `x` is in the range `p` describes. A number's range is its type's, a list's is each
+/// element's (the same as `Seq_in_u64` and `Seq2_in_u64`), and a pair's that of a part.
+fn emit_container_range_base() -> String {
+    let mut out = String::new();
+    out.push_str("type Rng;\n");
+    out.push_str("function Rng_holds<T>(p: Rng, x: T) returns (bool);\n");
+    out.push_str("function Rng_seq(p: Rng) returns (Rng);\n");
+    out.push_str("function Rng_and(p: Rng, q: Rng) returns (Rng);\n");
+    out.push_str("axiom (forall<T> p: Rng, q: Rng, x: T :: { Rng_holds(Rng_and(p, q), x) } Rng_holds(Rng_and(p, q), x) <==> Rng_holds(p, x) && Rng_holds(q, x));\n");
+    for r in ["in_u64", "in_i64", "in_char"] {
+        let c = format!("Rng_{}", &r[3..]);
+        out.push_str(&format!("const unique {c}: Rng;\n"));
+        out.push_str(&format!("axiom (forall x: int :: {{ Rng_holds({c}, x) }} Rng_holds({c}, x) <==> {r}(x));\n"));
+        out.push_str(&format!("axiom (forall xs: Seq int :: {{ Rng_holds(Rng_seq({c}), xs) }} Rng_holds(Rng_seq({c}), xs) <==> Seq_{r}(xs));\n"));
+        out.push_str(&format!("axiom (forall xs: Seq (Seq int) :: {{ Rng_holds(Rng_seq(Rng_seq({c})), xs) }} Rng_holds(Rng_seq(Rng_seq({c})), xs) <==> Seq2_{r}(xs));\n"));
+    }
+    // A list of any ranged values, as `Seq_in_u64` is of numbers.
+    let p = "Rng_seq(p)";
+    out.push_str(&format!("axiom (forall<T> p: Rng :: {{ Rng_holds({p}, Seq_empty() : Seq T) }} Rng_holds({p}, Seq_empty() : Seq T));\n"));
+    out.push_str(&format!("axiom (forall<T> p: Rng, x: T, xs: Seq T :: {{ Rng_holds({p}, Seq_prepend(x, xs)) }} Rng_holds({p}, Seq_prepend(x, xs)) <==> Rng_holds(p, x) && Rng_holds({p}, xs));\n"));
+    out.push_str(&format!("axiom (forall<T> p: Rng, x: T :: {{ Rng_holds({p}, Seq_singleton(x)) }} Rng_holds({p}, Seq_singleton(x)) <==> Rng_holds(p, x));\n"));
+    out.push_str(&format!("axiom (forall<T> p: Rng, xs: Seq T, ys: Seq T :: {{ Rng_holds({p}, Seq_append(xs, ys)) }} Rng_holds({p}, Seq_append(xs, ys)) <==> Rng_holds({p}, xs) && Rng_holds({p}, ys));\n"));
+    out.push_str(&format!("axiom (forall<T> p: Rng, xs: Seq T :: {{ Rng_holds({p}, xs), Seq_head(xs) }} Rng_holds({p}, xs) && Seq_length(xs) > 0 ==> Rng_holds(p, Seq_head(xs)));\n"));
+    out.push_str(&format!("axiom (forall<T> p: Rng, xs: Seq T :: {{ Rng_holds({p}, xs), Seq_tail(xs) }} Rng_holds({p}, xs) ==> Rng_holds({p}, Seq_tail(xs)));\n"));
+    out.push_str(&format!("axiom (forall<T> p: Rng, xs: Seq T, i: int :: {{ Rng_holds({p}, xs), Seq_at(xs, i) }} Rng_holds({p}, xs) && 0 <= i && i < Seq_length(xs) ==> Rng_holds(p, Seq_at(xs, i)));\n"));
+    out.push_str(&format!("axiom (forall<T> p: Rng, xs: Seq T, x: T :: {{ Rng_holds({p}, xs), Seq_has(xs, x) }} Rng_holds({p}, xs) && Seq_has(xs, x) ==> Rng_holds(p, x));\n"));
+    out.push_str(&format!("axiom (forall<T> p: Rng, xs: Seq T, keep: Fn1 T bool :: {{ Rng_holds({p}, Seq_filter(xs, keep)) }} Rng_holds({p}, xs) ==> Rng_holds({p}, Seq_filter(xs, keep)));\n"));
+    // A pair holds a range in a part when that part does.
+    for (rf, part, sel) in [("Rng__Tuple2_A", "a", "Tuple2_first"), ("Rng__Tuple2_B", "b", "Tuple2_second")] {
+        out.push_str(&format!("function {rf}(p: Rng) returns (Rng);\n"));
+        out.push_str(&format!("axiom (forall<A, B> p: Rng, a: A, b: B :: {{ Rng_holds({rf}(p), Tuple2_mk(a, b)) }} Rng_holds({rf}(p), Tuple2_mk(a, b)) <==> Rng_holds(p, {part}));\n"));
+        out.push_str(&format!("axiom (forall<A, B> p: Rng, t: Tuple2 A B :: {{ Rng_holds({rf}(p), t), {sel}(t) }} Rng_holds({rf}(p), t) ==> Rng_holds(p, {sel}(t)));\n"));
+    }
+    out
+}
+
+/// The ranges of a generic module's type parameters (Task H.0e): for each one its fields hold
+/// in a stated way, `Rng__<M>_<tp>(p)` holds of a value whose `tp` values all hold `p`. A
+/// value built by a constructor holds it exactly when its fields do, and a field read from a
+/// value that holds it holds its part. Each is triggered by a term already there, a
+/// constructor's or a field's, so a recursive type unfolds no further than its terms.
+fn emit_container_range_theory(m: &ModuleDecl, tp_quant: &str, mod_bpl_ty: &str, hide_repr: bool) -> String {
+    let mut out = String::new();
+    let ctors: Vec<(String, Option<String>, Vec<(String, String)>)> = match &m.repr {
+        ReprKind::Sum(vs) => vs.iter().map(|v| (v.name.clone(), Some(v.name.clone()), v.fields.clone())).collect(),
+        ReprKind::Product(fs) => vec![(format!("{}_Ctor", m.name), None, fs.clone())],
+    };
+    let own = module_self_type(m);
+    for tp in &m.type_params {
+        if !carries_range(&m.name, tp) {
+            continue;
+        }
+        let rf = format!("Rng__{}_{tp}", m.name);
+        out.push_str(&format!("function {rf}(_rp: Rng) returns (Rng);\n"));
+        if hide_repr {
+            continue;
+        }
+        let holds = |x: &str| format!("Rng_holds({rf}(_rp), {x})");
+        let fact = |fty: &str, term: &str| -> Option<String> {
+            let fty = if fty == "Current" { own.as_str() } else { fty };
+            if !type_tokens(fty).contains(&tp.as_str()) {
+                return None;
+            }
+            Some(format!("Rng_holds({}, {term})", field_rng(fty, tp, "_rp")?))
+        };
+        for (ctor, variant, fields) in &ctors {
+            if fields.is_empty() && variant.is_none() {
+                continue;
+            }
+            let binders: Vec<String> = fields.iter().map(|(f, _)| boogie_reserved::field_binder(f)).collect();
+            let mut quant = vec!["_rp: Rng".to_string()];
+            quant.extend(fields.iter().zip(&binders).map(|((_, t), b)| format!("{b}: {}", map_boogie_type(t, m))));
+            let app = format!("({ctor}({}) : {mod_bpl_ty})", binders.join(", "));
+            let conj: Vec<String> = fields.iter().zip(&binders).filter_map(|((_, t), b)| fact(t, b)).collect();
+            let conj = if conj.is_empty() { "true".to_string() } else { conj.join(" && ") };
+            out.push_str(&format!(
+                "axiom (forall{tp_quant} {} :: {{ {} }} {} <==> {conj});\n",
+                quant.join(", "),
+                holds(&app),
+                holds(&app)
+            ));
+            for (f, t) in fields {
+                let sel = match variant {
+                    Some(v) => format!("{v}_{f}(_rx)"),
+                    None => format!("{}_{f}(_rx)", m.name),
+                };
+                let Some(ff) = fact(t, &sel) else { continue };
+                let guard = variant.as_ref().map(|v| format!(" && is_{v}(_rx)")).unwrap_or_default();
+                out.push_str(&format!(
+                    "axiom (forall{tp_quant} _rp: Rng, _rx: {mod_bpl_ty} :: {{ {}, {sel} }} {}{guard} ==> {ff});\n",
+                    holds("_rx"),
+                    holds("_rx")
+                ));
+            }
+        }
+    }
+    out
+}
+
 /// How a parameter of type `ty` can carry values of the type parameter `tp` into a routine:
 /// not at all, as a `tp` or a `LIST[tp]` (whose range a guard can state), or some other way.
 enum TpCarrier {
@@ -5173,11 +5395,13 @@ fn tp_carrier(ty: &str, tp: &str) -> TpCarrier {
 }
 
 /// Task H.0b: a generic routine has no value of a type parameter `A` but those its arguments
-/// carry, so where `A` is a machine number type and each argument of type `A` or `LIST[A]` is
-/// in a range, a result of type `A` or `LIST[A]` is too. `BYTES.list_drop(xs, n)` on a
-/// `LIST[U64]` then gives a `LIST[U64]` with its elements in range. One axiom per range, with
-/// `A` at `int`; the routine's `require` is not needed, as the result is made from the same
-/// values wherever it is defined.
+/// carry, so where `A` is a machine number type and each argument that carries `A` is in a
+/// range, a result that holds `A` is too. `BYTES.list_drop(xs, n)` on a `LIST[U64]` then gives
+/// a `LIST[U64]` with its elements in range. A carrier is an `A`, a list of them, or a
+/// container whose range states all its `A` values (H.0e), as the receiver of `get` of a
+/// `MAP[K, V]` at `V`, whose result `OPTION[V]` then holds the range. One axiom per range,
+/// with `A` at `int`; the routine's `require` is not needed, as the result is made from the
+/// same values wherever it is defined.
 fn emit_parametric_range_axioms(
     r: &RoutineDecl,
     has_current: bool,
@@ -5188,32 +5412,36 @@ fn emit_parametric_range_axioms(
 ) -> String {
     let mut out = String::new();
     for tp in r_all_tps {
-        let ret_list = match tp_carrier(&r.ret_type, tp) {
-            TpCarrier::Value => false,
-            TpCarrier::List => true,
-            _ => continue,
-        };
-        // The receiver of a generic module, such as a `SEQ[A]`, carries `A` in a way no guard
-        // states.
-        if has_current && m.type_params.contains(tp) {
+        if matches!(tp_carrier(&r.ret_type, tp), TpCarrier::None) {
             continue;
         }
-        let mut carriers = Vec::new();
+        let mut carriers: Vec<(String, String)> = Vec::new();
         let mut stated = true;
+        // The receiver carries `A` as an argument does. A `SEQ`'s range is its `model`'s, which
+        // no range term states: a guard on it would unfold `model` at every call.
+        if has_current && m.type_params.contains(tp) {
+            let own = module_self_type(m);
+            if field_rng(&own, tp, "p").is_some() {
+                carriers.push(("Current".to_string(), own));
+            } else {
+                stated = false;
+            }
+        }
         for (pn, pt) in &r.params {
             match tp_carrier(pt, tp) {
                 TpCarrier::None => {}
-                TpCarrier::Value => carriers.push((pn.clone(), false)),
-                TpCarrier::List => carriers.push((pn.clone(), true)),
+                TpCarrier::Value | TpCarrier::List => carriers.push((pn.clone(), pt.clone())),
+                // A container is a carrier when its range states each of its `A` values.
+                TpCarrier::Other if field_rng(pt, tp, "p").is_some() => carriers.push((pn.clone(), pt.clone())),
                 TpCarrier::Other => stated = false,
             }
         }
-        // Each other type parameter must stay fixed by an argument, or the application has
-        // no type in the axiom.
+        // Each other type parameter must stay fixed by an argument or by the result, whose
+        // type the axiom's term states, as `K` of `empty: MAP[K, V]`.
         let others: Vec<&String> = r_all_tps.iter().filter(|t| *t != tp).collect();
-        let fixed = others
-            .iter()
-            .all(|o| q_params.iter().any(|qp| type_tokens(qp).iter().any(|t| *t == o.as_str())));
+        let fixed = others.iter().all(|o| {
+            q_params.iter().chain(std::iter::once(&r.ret_type)).any(|qp| type_tokens(qp).iter().any(|t| *t == o.as_str()))
+        });
         if !stated || !fixed {
             continue;
         }
@@ -5222,27 +5450,57 @@ fn emit_parametric_range_axioms(
         } else {
             format!("<{}>", others.iter().map(|t| t.as_str()).collect::<Vec<_>>().join(", "))
         };
-        // `A` as a machine number, with the value and list predicates of its range, and `A`
-        // as a list of them, such as a line of a text.
-        let levels = ["in_u64", "in_i64", "in_char"].into_iter().flat_map(|r| {
-            [("int", r.to_string(), format!("Seq_{r}")), ("(Seq int)", format!("Seq_{r}"), format!("Seq2_{r}"))]
-        });
-        for (a_bty, value_p, list_p) in levels {
+        // `A` as a machine number, and as a list of them, such as a line of a text.
+        let levels = [
+            ("U64", "int"),
+            ("I64", "int"),
+            ("CHAR", "int"),
+            ("LIST[U64]", "(Seq int)"),
+            ("LIST[I64]", "(Seq int)"),
+            ("LIST[CHAR]", "(Seq int)"),
+        ];
+        for (a_ty, a_bty) in levels {
+            let at: HashMap<String, String> = [(tp.clone(), a_ty.to_string())].into_iter().collect();
+            let at_ty = |ty: &str| rename_boogie_idents(ty, &at);
             let map: HashMap<String, String> = [(tp.clone(), a_bty.to_string())].into_iter().collect();
             let params: Vec<String> = q_params.iter().map(|qp| rename_boogie_idents(qp, &map)).collect();
             let ret_bty = rename_boogie_idents(&map_boogie_type(&r.ret_type, m), &map);
             let term = format!("({fn_f_app} : {ret_bty})");
-            let guards: Vec<String> = carriers
-                .iter()
-                .map(|(pn, list)| if *list { format!("{list_p}({pn})") } else { format!("{value_p}({pn})") })
-                .collect();
+            let guards: Option<Vec<String>> = carriers.iter().map(|(pn, pt)| value_fact(&at_ty(pt), pn)).collect();
+            let (Some(guards), Some(fact)) = (guards, value_fact(&at_ty(&r.ret_type), &term)) else {
+                continue;
+            };
             let guard = if guards.is_empty() { String::new() } else { format!("{} ==> ", guards.join(" && ")) };
-            let fact = if ret_list { format!("{list_p}({term})") } else { format!("{value_p}({term})") };
             out.push_str(&format!(
                 "axiom (forall{quant} {} :: {{ {term} }} {guard}{fact});\n",
                 params.join(", ")
             ));
         }
+        // `A` at any range `p`, as an `OPTION[U64]` in a `MAP[STRING, OPTION[U64]]`. A number
+        // states its range with an inlined `in_u64`, which binds no `p`, so the axiom is
+        // triggered by a container's range: the result's, when it is to be proven, or a
+        // carrier's, when it is known.
+        let Some(ret_rng) = field_rng(&r.ret_type, tp, "_rp") else {
+            continue;
+        };
+        let Some(carrier_rngs) = carriers
+            .iter()
+            .map(|(pn, pt)| field_rng(pt, tp, "_rp").map(|g| format!("Rng_holds({g}, {pn})")))
+            .collect::<Option<Vec<String>>>()
+        else {
+            continue;
+        };
+        let all_tps = format!("<{}>", r_all_tps.join(", "));
+        let term = format!("({fn_f_app} : {})", map_boogie_type(&r.ret_type, m));
+        let fact = format!("Rng_holds({ret_rng}, {term})");
+        let mut triggers = vec![format!("{{ {fact} }}")];
+        triggers.extend(carrier_rngs.iter().filter(|g| !g.starts_with("Rng_holds(_rp,")).map(|g| format!("{{ {term}, {g} }}")));
+        let guard = if carrier_rngs.is_empty() { String::new() } else { format!("{} ==> ", carrier_rngs.join(" && ")) };
+        out.push_str(&format!(
+            "axiom (forall{all_tps} _rp: Rng, {} :: {} {guard}{fact});\n",
+            q_params.join(", "),
+            triggers.join(" ")
+        ));
     }
     out
 }
@@ -6200,7 +6458,7 @@ fn in_own_boogie_ctx<T>(n: &ModuleDecl, f: impl FnOnce() -> T) -> T {
     };
     let saved_ctx = BOOGIE_PRELUDE_CTX.with(|c| c.replace(own));
     let saved_env = BOOGIE_TYPE_ENV.with(|e| std::mem::take(&mut *e.borrow_mut()));
-    let out = with_fresh_boogie_numbering(f);
+    let out = with_own_boogie_module(n, || with_fresh_boogie_numbering(f));
     BOOGIE_PRELUDE_CTX.with(|c| *c.borrow_mut() = saved_ctx);
     BOOGIE_TYPE_ENV.with(|e| *e.borrow_mut() = saved_env);
     out
@@ -6255,7 +6513,7 @@ fn emit_linked_background_theory(
     text.push_str(&invariant_of_every_value(n, &text));
     let map: HashMap<String, String> = boogie_declared_names(&text)
         .into_iter()
-        .filter(|x| x != &n.name)
+        .filter(|x| x != &n.name && !x.starts_with("Rng__"))
         .map(|x| {
             let r = format!("{}__{x}", n.name);
             (x, r)
@@ -7971,51 +8229,10 @@ fn emit_list_length_trust(
     format!("{pad}assume in_u64({v});\n")
 }
 
-/// Task H.0d: a machine number read out of a generic container, as `o.get` of an
-/// `OPTION[NAT]` or `p.first` of a `TUPLE[U64, BOOL]`, is in its type's range, a trusted fact
-/// (decision taken 2026-11-18). The container's contents have no range in the proof; a
-/// container built from a value out of range is not refused yet (H.0e).
-fn emit_generic_read_trust(
-    e: &Expr,
-    m: &ModuleDecl,
-    revealed: &HashSet<String>,
-    pad: &str,
-    strings: &[String],
-) -> String {
-    let Some(ctx) = boogie_prelude_ctx() else {
-        return String::new();
-    };
-    let Some(range) = infer_gardel_type(e, m, &ctx).and_then(|t| machine_range(&t)) else {
-        return String::new();
-    };
-    if !reads_type_parameter(e, m, &ctx) {
-        return String::new();
-    }
-    let v = emit_boogie_expr_with_strings(e, m, &HashSet::new(), revealed, "DefaultFuel", strings);
-    format!("{pad}assume {range}({v});\n")
-}
-
-/// Whether the call `e` gives back a value of a type parameter of its routine or module:
-/// `get` of an `OPTION[T]`, or `first` and `second` of a tuple. A routine that declares a
-/// machine result is checked in its body, and is not trusted.
-fn reads_type_parameter(e: &Expr, m: &ModuleDecl, ctx: &BoogiePreludeCtx) -> bool {
-    if let Expr::MethodCall(recv, name, _) = e {
-        if infer_gardel_type(recv, m, ctx).is_some_and(|rt| type_head(&rt) == "TUPLE") {
-            return matches!(name.as_str(), "first" | "second");
-        }
-    }
-    // The container's own parameter, as `T` of `OPTION[T]`. A routine's own, as `B` of
-    // `fold[B]`, is made from its arguments, not read out of the container.
-    callee_declares(e, m, ctx, |owner, rd| {
-        let ret = rd.ret_type.trim();
-        owner.type_params.iter().any(|tp| tp == ret) && !rd.type_params.iter().any(|tp| tp == ret)
-    })
-}
-
 /// Task H.0d: `m.fold(init, f)` of a `MAP[K, V]` is in a machine range when `init` is and each
-/// step keeps it there, as `emit_fold_range_theory` states of a list. A value of a machine `V`
-/// is assumed in its range, the trust of a read out of a generic container; the axiom is
-/// stated here, where `V` is known, since a `MAP[K, MATH_INT]` holds ints too.
+/// step keeps it there, as `emit_fold_range_theory` states of a list. A step may assume its
+/// value in range when the map's values are (H.0e); the axiom is stated here, where `V` is
+/// known, since a `MAP[K, MATH_INT]` holds ints too.
 #[allow(clippy::too_many_arguments)]
 fn emit_map_fold_range(
     e: &Expr,
@@ -8054,8 +8271,12 @@ fn emit_map_fold_range(
     let (term, init_v, f_v) = (tr(e), tr(init), tr(f));
     let app = format!("Fn3_app({f_v}, b, k, v)");
     let v_guard = machine_range(v_ty).map(|rv| format!(" && {rv}(v)")).unwrap_or_default();
+    let values = match machine_rng(v_ty) {
+        Some(r) => format!("Rng_holds(Rng__MAP_V({r}), {}) && ", tr(recv)),
+        None => String::new(),
+    };
     format!(
-        "{pad}assume {range}({init_v}) && (forall b: int, k: {}, v: {} :: {{ {app} }} {range}(b){v_guard} ==> {range}({app})) ==> {range}({term});\n",
+        "{pad}assume {values}{range}({init_v}) && (forall b: int, k: {}, v: {} :: {{ {app} }} {range}(b){v_guard} ==> {range}({app})) ==> {range}({term});\n",
         map_boogie_type(k_ty, m),
         map_boogie_type(v_ty, m),
     )
@@ -9040,7 +9261,7 @@ fn emit_prelude_background_theory(
     text.push_str(&invariant_of_every_value(p, &text));
     let mut map: HashMap<String, String> = boogie_declared_names(&text)
         .into_iter()
-        .filter(|n| n != &p.name && !foreign.contains(n))
+        .filter(|n| n != &p.name && !foreign.contains(n) && !n.starts_with("Rng__"))
         .map(|n| {
             let r = format!("{}__{n}", p.name);
             (n, r)
@@ -9150,6 +9371,14 @@ fn emit_boogie_parts(m: &ModuleDecl, fuel_limit: usize) -> BoogieParts {
 }
 
 fn emit_boogie_parts_with_options(
+    m: &ModuleDecl,
+    fuel_limit: usize,
+    scope: BoogieEmitScope,
+) -> BoogieParts {
+    with_own_boogie_module(m, || emit_own_boogie_parts(m, fuel_limit, scope))
+}
+
+fn emit_own_boogie_parts(
     m: &ModuleDecl,
     fuel_limit: usize,
     scope: BoogieEmitScope,
@@ -9450,6 +9679,7 @@ fn emit_boogie_parts_with_options(
     out.push_str("axiom (forall<A> x: A, xs: Seq A, keep: Fn1 A bool :: { Seq_filter(Seq_prepend(x, xs), keep) } (Fn1_app(keep, x) ==> Seq_filter(Seq_prepend(x, xs), keep) == Seq_prepend(x, Seq_filter(xs, keep))) && (!Fn1_app(keep, x) ==> Seq_filter(Seq_prepend(x, xs), keep) == Seq_filter(xs, keep)));\n");
     out.push_str("axiom (forall<A> xs: Seq A, ys: Seq A, keep: Fn1 A bool :: { Seq_filter(Seq_append(xs, ys), keep) } Seq_filter(Seq_append(xs, ys), keep) == Seq_append(Seq_filter(xs, keep), Seq_filter(ys, keep)));\n\n");
     out.push_str(&emit_elements_range_theory());
+    out.push_str(&emit_container_range_base());
 
     out.push_str("function Seq_fold_left<A, B>(xs: Seq A, f: Fn2 B A B, init: B) returns (B);\n");
     out.push_str("axiom (forall<A, B> f: Fn2 B A B, init: B :: { Seq_fold_left(Seq_empty() : Seq A, f, init) } Seq_fold_left(Seq_empty() : Seq A, f, init) == init);\n");
@@ -9767,11 +9997,35 @@ fn emit_boogie_parts_with_options(
         }
         }
     }
+    if !m.type_params.is_empty() {
+        out.push_str(&emit_container_range_theory(m, &tp_quant, &mod_bpl_ty, hide_repr));
+    }
     out.push('\n');
 
     if m.name == "SEQ" && !hide_repr {
         out.push_str("axiom (forall<A> Current: (SEQ A) :: { Concat_left(Current) } is_Concat(Current) ==> fn_length(DefaultFuel, Current) == fn_length(DefaultFuel, Concat_left(Current)) + fn_length(DefaultFuel, Concat_right(Current)));\n");
-        out.push_str("axiom (forall<A> s: (SEQ A), p: (Fn1 A bool), q: (Fn1 A bool) :: { fn_filter(DefaultFuel, fn_filter(DefaultFuel, s, p), q) } SEQ_Invariant(s) ==> fn_equals(DefaultFuel, fn_filter(DefaultFuel, fn_filter(DefaultFuel, s, p), q), fn_filter(DefaultFuel, s, Fn1_and(p, q))));\n\n");
+        out.push_str("axiom (forall<A> s: (SEQ A), p: (Fn1 A bool), q: (Fn1 A bool) :: { fn_filter(DefaultFuel, fn_filter(DefaultFuel, s, p), q) } SEQ_Invariant(s) ==> fn_equals(DefaultFuel, fn_filter(DefaultFuel, fn_filter(DefaultFuel, s, p), q), fn_filter(DefaultFuel, s, Fn1_and(p, q))));\n");
+        // Task H.0e: a `SEQ`'s range is its `model`'s, and by `model`'s definition a leaf's
+        // value and a concatenation's parts hold it, as a match on the sequence reads them.
+        for r in ["in_u64", "in_i64", "in_char"] {
+            for (p, a, item) in [(format!("Seq_{r}"), "int", r.to_string()), (format!("Seq2_{r}"), "(Seq int)", format!("Seq_{r}"))] {
+                let holds = |x: &str| format!("{p}(fn_model(DefaultFuel, {x}))");
+                out.push_str(&format!(
+                    "axiom (forall s: (SEQ {a}) :: {{ {}, Leaf_value(s) }} {} && is_Leaf(s) ==> {item}(Leaf_value(s)));\n",
+                    holds("s"),
+                    holds("s")
+                ));
+                for part in ["Concat_left", "Concat_right"] {
+                    out.push_str(&format!(
+                        "axiom (forall s: (SEQ {a}) :: {{ {}, {part}(s) }} {} && is_Concat(s) ==> {});\n",
+                        holds("s"),
+                        holds("s"),
+                        holds(&format!("{part}(s)"))
+                    ));
+                }
+            }
+        }
+        out.push('\n');
     }
 
     // 4. Module Refinement Invariant (§6)
@@ -12466,13 +12720,6 @@ fn emit_boogie_proc_stmts_and_ret(
                                     c.ctor(),
                                     fname
                                 ));
-                                // A binder of a machine type, such as `id` in `case Some(id)` on
-                                // an `OPTION[NAT]`, is in its range: every value of the type is.
-                                // The field's declared type is the generic `A`, so the range is
-                                // read from the binder's own type at this instance.
-                                if let Some(fact) = boogie_env_type(bname).and_then(|t| value_fact(&t, bname)) {
-                                    s.push_str(&format!("{pad}  assume {fact};\n"));
-                                }
                                 if is_own
                                     && !m.invariants.is_empty()
                                     && (fty == &m.name
@@ -13536,7 +13783,6 @@ fn emit_boogie_expr_obligations(
             ));
             s.push_str(&emit_call_arg_obligations(e, args, r, m, revealed, indent, strings));
             s.push_str(&emit_list_length_trust(e, mname, args, m, revealed, &pad, strings));
-            s.push_str(&emit_generic_read_trust(e, m, revealed, &pad, strings));
             s.push_str(&emit_map_fold_range(e, recv, mname, args, m, revealed, &pad, strings));
             // Applying a function, held or in a field, must establish its type's `require`.
             if mname == "apply" {
@@ -13646,7 +13892,6 @@ fn emit_boogie_expr_obligations(
         }
         Expr::Call(fname, args) => {
             s.push_str(&emit_call_arg_obligations(e, args, r, m, revealed, indent, strings));
-            s.push_str(&emit_generic_read_trust(e, m, revealed, &pad, strings));
             if let Some(fields) = ctor_fields(m, fname) {
                 for ((f, t), value) in fields.iter().zip(args.iter()) {
                     s.push_str(&emit_field_elements_obligation(f, t, value, m, revealed, &pad, strings, &r.name));
