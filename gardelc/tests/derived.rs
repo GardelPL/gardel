@@ -170,7 +170,8 @@ fn an_enumeration_gets_its_instance() {
 {bpl}");
     }
     // The map's first key is `Debug` (0); four levels; `Warn` is 2; `Info < Warn`.
-    assert_eq!(p.run_binary(), 421);
+    // POSIX keeps an exit status's low eight bits.
+    assert_eq!(p.run_binary(), if cfg!(windows) { 421 } else { 421 % 256 });
 }
 
 const LIES: &str = "module LIES

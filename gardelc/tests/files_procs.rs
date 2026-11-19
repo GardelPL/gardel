@@ -43,7 +43,8 @@ fn build(program: &str, name: &str) -> (Dir, PathBuf, PathBuf) {
         .expect("gardelc runs");
     assert!(out.status.success() && all(&out).contains("0 errors, 0 warnings"), "{}", all(&out));
     let stem = program.trim_end_matches(".gdl");
-    let bin = dir.0.join(format!("build/{stem}_bin{}", std::env::consts::EXE_SUFFIX));
+    // gardelc names the binary `_bin.exe` on every platform.
+    let bin = dir.0.join(format!("build/{stem}_bin.exe"));
     assert!(bin.exists(), "no binary at {}:\n{}", bin.display(), all(&out));
     let child = dir.0.join(format!("child{}", std::env::consts::EXE_SUFFIX));
     let cc = Command::new("gcc")

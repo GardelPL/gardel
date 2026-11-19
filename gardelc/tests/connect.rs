@@ -43,7 +43,8 @@ fn client(name: &str) -> (Dir, PathBuf) {
         .output()
         .expect("gardelc runs");
     assert!(out.status.success() && all(&out).contains("0 errors, 0 warnings"), "{}", all(&out));
-    let bin = dir.0.join(format!("build/net_client_bin{}", std::env::consts::EXE_SUFFIX));
+    // gardelc names the binary `_bin.exe` on every platform.
+    let bin = dir.0.join("build/net_client_bin.exe");
     assert!(bin.exists(), "no binary at {}:\n{}", bin.display(), all(&out));
     (dir, bin)
 }

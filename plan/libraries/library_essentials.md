@@ -47,9 +47,21 @@ Some tasks cannot start until the compiler or an earlier phase provides somethin
 | P5 | **Pure foreign routines** (G.0 to G.3) | Phase G | SHA-2 and HMAC in H.12, math in H.8 |
 | P6 | **Native commands** (G.6b) | Phase G | H.15 (TLS), H.17 (rows) |
 | P7 | **Files and processes** (F.11) | Phase F | H.9, H.10, H.13, H.18 |
-| P8 | **Linux CI** | Not planned anywhere yet | Every task with host code: H.1, H.2, H.14, H.15 |
+| P8 | **Linux CI** | Done here, after H.1 ✅ (2026-11-19): `scripts/linux`, and a Linux job in CI | Every task with host code: H.1, H.2, H.14, H.15 |
 
 P8 is the one with no owner. F.7's POSIX code has never run, and every host task below adds more. Set up a Linux runner before H.1.
+
+**P8, done (2026-11-19).** `scripts/linux/Dockerfile` is the toolchain CI pins for Windows, on Ubuntu 24.04: Rust stable, .NET 6 with Boogie 3.4.3, Z3 4.12.1 (checked against its hash) and gcc 13. `scripts/linux/test.sh` copies the tree into it, without `.git`, the build outputs and the Windows tools, and does what CI does: builds gardelc, verifies the stdlib and every example, and runs `cargo test --no-fail-fast`; its arguments go to `cargo test`. Where apt cannot reach its mirrors, `GARDEL_LINUX_BASE` names an Ubuntu 24.04 image that already has gcc. `.github/workflows/ci.yml` gets the same steps as a job `verify-linux` on `ubuntu-24.04`.
+- **Result.** The stdlib and the 16 examples are 0/0 on Linux, and their C builds there. The first run of the tests had 499 of 514 passing (Linux has one unit test more, behind `cfg(unix)`); the 15 failures were in the tests, not in the host or the compiler, and after the fixes all 514 pass, the timing tests alone as on Windows. F.7's sockets, F.11's files and processes, F.16's `WriteFile` and H.1's clock and generator, on POSIX, pass every test written for them on Windows: a connect that is refused, times out or reaches a server and replays, a flood of process output in order, a child given the terminal, a file replaced whole.
+- **What the tests had wrong.**
+  - `connect.rs` and `files_procs.rs` looked for `build/<stem>_bin` with the platform's suffix, which is none on Linux; gardelc writes `_bin.exe` on every platform, as the other tests know. 11 tests.
+  - `derived.rs` expected exit status 421; POSIX keeps the low eight bits, 165.
+  - `gtui.rs` and `tablon.rs` gave a 5000-line text in one script token, each byte as `%XX`: about 150 KB, and Linux refuses an environment variable over 128 KiB (`E2BIG`) before the program starts. Only what a script cannot hold as it is is escaped now (84 KB and 106 KB), and Tablon's lines lost their two leading spaces.
+  - `gtui`'s full redraw took 24.6 ms a frame beside the other `gtui` tests, and 145 s for the test alone passed; it is one of the tests `check.sh` already runs alone.
+- **Known limits.**
+  - A script is one environment variable, so on Linux it holds at most 128 KiB. A longer run is a replay of a recorded log, which has no such limit. A `GARDEL_EVENTS_FILE` would lift it, if a test or a user needs one.
+  - The CI job has not run: `.github/` is not tracked, and the workflow runs on `main` and `libraries` only. It needs a push to know whether the hosted runner's times fit `timeout-minutes: 120`; the local run took 1 h 50 min in a debug build, as CI builds.
+  - macOS is not run anywhere. Its `getentropy` and `clock_gettime` are there, but nothing has compiled the host's C on it.
 
 ---
 
@@ -313,7 +325,7 @@ Found in H.0d (its known limits). A number read out of a generic container is tr
 
 Client: `gtime` (H.11), the rate limiter (H.16), request ids in `grest`. Needs decisions 1 to 3 and P8.
 
-**Status:** ✅ Completed (2026-11-19). Decisions 1 to 3 taken as proposed. P8 in part: the host's C ran on Linux in a container, not in CI (see below).
+**Status:** ✅ Completed (2026-11-19). Decisions 1 to 3 taken as proposed. P8 was done after it (see §2): its tests pass on Linux too.
 
 - [x] `ReadClock(tag)` answered by `Clock(tag, wall_millis: I64, monotonic_millis: U64)`. The monotonic value is the clock that timers already use.
 - [x] `Random(tag, count: NAT)` answered by `RandomBytes(tag, res: RESULT[IO_ERROR, BYTES])`, from the system's generator (`BCryptGenRandom`, `getrandom`). A `count` above 1024 is an `Error`.
@@ -332,7 +344,7 @@ Client: `gtime` (H.11), the rate limiter (H.16), request ids in `grest`. Needs d
 - **Mutations.** 11 of 12 mutations of the new code turn `tests/clock_random.rs` red. Three first survived, and the tests grew to kill them: the program stopped with 2 at a `Shutdown`, as at a refused token, so a script token out of range passed as refused (it now stops with 4); no run had a time before 1970 in a log (a recorded script now has one, and is replayed); and a `Random` in the same step set the flag a `ReadClock` sets (a run now asks for the clock alone). The 12th leaves out the `havoc` before the assumption, which changes nothing: a Boogie local that is not assigned is already any value, and each bind is a local of its own.
 - **Known limits.**
   - `RandomBytes` does not carry the `count` asked for, so a reactive program cannot prove its `Ok` has `count` bytes and checks the length where it takes them in (the guide says so). An event that held the count, or a tag the verifier could relate to its command, would need the host's answers stated per command, which nothing does yet.
-  - P8 is done only by hand: the Linux run was in a local container, of one program. The workflow in `.github/workflows/ci.yml` is not tracked and has a Windows job only. A Linux job needs Boogie, Z3 and the test suite there, none of which has run on Linux yet.
+  - P8 came after the task, so H.1 was first run on Linux by hand, in a container, as one program. The whole suite has since run there (§2).
 
 #### Task H.2: Logging and the Environment
 

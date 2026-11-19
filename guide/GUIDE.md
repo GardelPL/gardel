@@ -1541,7 +1541,7 @@ A reactive program is a pure function of its arguments and its events, so a run 
 
 | Variable | Effect |
 | :--- | :--- |
-| `GARDEL_EVENTS=<script>` | Run from a script, such as `Resized:80:24 Tick:1 Key:Up Key:Ctrl:s Line:hello%20there Shutdown`. The end of the script is a `Shutdown`. |
+| `GARDEL_EVENTS=<script>` | Run from a script, such as `Resized:80:24 Tick:1 Key:Up Key:Ctrl:s Line:hello%20there Shutdown`. The end of the script is a `Shutdown`. On Linux one variable holds at most 128 KiB, so a longer run is a replay. |
 | `GARDEL_RECORD=<file>` | Write a log of the run |
 | `GARDEL_REPLAY=<file>` | Run from a log, with no timers, reads, sockets, files, processes, clock or generator |
 | `GARDEL_LISTEN_ADDR=<ip>` | Bind `Listen` to an address other than loopback |

@@ -866,7 +866,13 @@ fn an_editor_scrolls_both_ways_to_keep_the_cursor_and_a_key_on_5000_lines_is_qui
     for i in 0..5000 {
         text += &format!("line {i}\r\n");
     }
-    let pasted = format!("Pasted:{} ", text.bytes().map(|b| format!("%{b:02X}")).collect::<String>());
+    // Only what a script cannot hold as it is is escaped: Linux takes at most 128 KiB in one
+    // variable, and every byte as `%XX` would be 150 KB.
+    let escaped: String = text
+        .bytes()
+        .map(|b| if b.is_ascii_graphic() && b != b'%' { char::from(b).to_string() } else { format!("%{b:02X}") })
+        .collect();
+    let pasted = format!("Pasted:{escaped} ");
     let script = format!("Resized:30:6 {pasted}Key:Ctrl+Home Key:End Resized:30:6 Key:Down Key:End Resized:30:6 Key:Home Resized:30:6 Key:Escape");
     let ran = run(&p.0.bin("editor"), &script, &[]);
     assert_eq!(ran.status.code(), Some(0), "{}", all(&ran));

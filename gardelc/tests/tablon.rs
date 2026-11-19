@@ -683,14 +683,20 @@ fn a_session_that_edits_and_saves_replays_to_the_same_screen_and_bytes_with_no_f
 #[test]
 fn a_key_on_a_file_of_5000_lines_draws_within_a_frame() {
     let mut text = String::new();
+    // A script is one variable, which Linux takes up to 128 KiB: so the lines are short, and
+    // only what a script cannot hold as it is is escaped.
     for i in 0..5000 {
-        text += &format!("  line {i}: NAT\n");
+        text += &format!("line {i}: NAT\n");
     }
+    let escaped: String = text
+        .bytes()
+        .map(|b| if b.is_ascii_graphic() && b != b'%' { char::from(b).to_string() } else { format!("%{b:02X}") })
+        .collect();
     let open = format!(
         "{}{}Key:Down Key:Right Key:Down Key:Down Key:Enter FileRead:1001:{} Key:Tab Key:Enter Key:Ctrl+End ",
         start(),
         keys("f"),
-        enc(text.as_bytes())
+        escaped
     );
     let typed: String = (0..200).map(|i| if i % 20 == 19 { "Key:Enter ".to_string() } else { "Key:97 ".to_string() }).collect::<String>()
         + &"Key:Up ".repeat(100);
