@@ -1950,7 +1950,7 @@ Every program automatically sees the **Standard Prelude**:
 | :--- | :--- |
 | Concepts | `EQ`, `CANONICAL_EQ`, `ORD` |
 | Core types | `OPTION[A]`, `RESULT[E, A]`, `IO_ERROR` |
-| Collections | `SEQ[A]`, `LIST[A]`, `LIST_OPS`, `MAP[K, V]`, `KEY_ORDER[K]` |
+| Collections | `SEQ[A]`, `LIST[A]`, `LIST_OPS`, `MAP[K, V]`, `KEY_ORDER[K]`, `GENERATOR[S, A]`, `UNFOLD[S, A]` |
 | Numbers | `BIGNAT`, `NUMBER_TEXT`, `NUMBER_ERROR` |
 | Text | `STRING`, `STRING_ERROR`, `BYTES`, `BYTES_BUILDER` |
 | Functions | `FUNCTION_OPS` |
@@ -2003,6 +2003,97 @@ Two limits:
 - `take`, `map` and the other operations recurse once per item, so a list of millions of items can exhaust the C stack.
 
 `SEQ.reduce(f, e)` folds the two sides of each `Concat` apart, so they may run in parallel. The law `SEQ.reduce_folds(s, f, e)` has the same monoid premises as `fold_duality_first`. It states that `reduce` then equals both `fold_left` and `fold_right` of the model, proven by `fold_homomorphism` and the first duality theorem.
+
+### Endless Sequences: `GENERATOR` and `UNFOLD`
+
+A `GENERATOR[S, A]` is an endless sequence held as a finite value: a `state: S` and a step `next: S -> TUPLE[A, S]` that gives the item at a state and the state after it. `take(n)` is the first `n` items.
+
+```eiffel
+  naturals(from: NAT): GENERATOR[NAT, NAT]
+    do
+      GENERATOR.make(from, fn(s: NAT): TUPLE[NAT, NAT] do (s, s +% 1) end)
+    end
+
+  fibs(a: NAT): GENERATOR[TUPLE[NAT, NAT], NAT]
+    do
+      GENERATOR.make((a, 1), fn(p: TUPLE[NAT, NAT]): TUPLE[NAT, TUPLE[NAT, NAT]] do (p.first, (p.second, p.first +% p.second)) end)
+    end
+
+  tenth: NAT
+    do
+      fibs(0).nth(9)
+    ensure
+      is_34: Result = 34      -- proven from the contracts of `nth` and `make`
+    end
+```
+
+A step never ends, so you choose what it does at the end of a bounded type: wrap with `+%`, as above, or count with `BIGNAT`. A step written `s + 1` over `NAT` is refused as an overflow.
+
+What you can do with a generator:
+- **Read it:** `head`, `tail`, `take(n)`, `nth(n)` and `drop(n)`.
+- **Build one:** `make(s, f)`, `GENERATOR.iterate(x, f)` (`x`, `f(x)`, `f(f(x))` and so on), and `GENERATOR.cycle(xs)` for a non-empty list.
+- **Combine:** `map(f)`, `zip(other)`, `zip_with(other, h)` and `scan(f, init)`. `zip`'s state is the pair of both states.
+- **Search, with a bound:** `find_within(k, p)` and `take_while_within(k, p)` look at the first `k` items only.
+
+There is no `filter`. A generator's next item that passes might never come, so a filter could run forever. Take a prefix first, and filter that. B&W §7.3's sieve on a bounded prefix:
+
+```eiffel
+  sieve(xs: LIST[NAT]): LIST[NAT]
+    variant
+      xs.length
+    do
+      if xs.length = 0 then
+        LIST.empty
+      else
+        let p = xs.head
+        sieve(LIST_OPS.filter(xs.tail, fn(x: NAT): BOOL do if p = 0 then True else x % p != 0 end end)).prepend(p)
+      end
+    end
+```
+
+`sieve(LIST_OPS.range(2, 30))` gives the ten primes below 30.
+
+Laws let a client reason about a prefix with `LIST_OPS`' laws:
+- `nth_take(g, n, k)`: for `k < n`, `g.nth(k) = LIST_OPS.at(g.take(n), k)`.
+- `take_split(g, n, m)`: for `m <= n`, `g.take(n) = g.take(m).append(g.drop(m).take(n - m))`.
+- `map_take(g, f, n)`: `g.map(f).take(n) = LIST_OPS.map(g.take(n), f)`.
+
+Each combinator states its step (`stepping`), so `GENERATOR.iterate(x, f).next(s)` is known to be `(s, f(s))`. `cycle` is the exception: it states only where it starts.
+
+**What holds of every item.** A property holds of every item when it holds of the first state and the step keeps it. That is an induction on the number of items. Here it bounds a retry schedule:
+
+```eiffel
+  delays: GENERATOR[NAT, NAT]
+    do
+      GENERATOR.iterate(100, fn(d: NAT): NAT do if d >= 5000 then 10000 else d * 2 end end)
+    end
+
+  capped(g: GENERATOR[NAT, NAT], n: NAT): BOOL
+    require
+      starts: g.state >= 0 and g.state <= 10000
+      keeps: forall d: NAT. d <= 10000 implies
+        (g.next(d).first >= 0 and g.next(d).first <= 10000 and g.next(d).second >= 0 and g.next(d).second <= 10000)
+    variant
+      n
+    do
+      if n = 0 then True else capped(g.tail, n - 1) end
+    ensure
+      holds: Result
+      bounded: forall k: NAT. k < n implies (g.nth(k) >= 0 and g.nth(k) <= 10000)
+    end
+```
+
+A call `capped(delays, k + 1)` in a `check` then proves that `delays.nth(k)` is at most 10 s. A generic version over any property needs a concept bound on the state, which this library does not have yet.
+
+The `>= 0` above is not redundant. **The verifier does not know that a generator's items are in their type's range.** They come from a function, and ranges are not tracked through function-valued fields. So `naturals(1).take(5)` is known to be a `LIST[NAT]`, as the verifier can unfold it, but `g.take(n)` for any `g` or `n` is not. When a routine needs the range, prove it with a property like `capped`, or compare the value instead of passing it on.
+
+An `UNFOLD[S, A]` is a sequence that may end, like Elixir's `Stream.unfold`: its step gives an `OPTION`, and `None` ends it. `take(n)` gives at most `n` items. `to_list(measure)` gives all of them, if you prove the sequence ends: `measure` of the state is never negative, and it shrinks at each step. Over a `NAT` state, "never negative" quantifies over every integer, so a measure such as a list's length is the easy case.
+
+Compared with Elixir's `Stream` (`unfold`, `iterate`, `cycle`, `Enum.take`):
+- A search that may never end is refused, where Elixir would loop.
+- Overflow is the client's choice, not a bignum.
+- The state's type is visible in the generator's type, as there are no existential types.
+- There are no effects; those belong to reactive programs.
 
 ### Multi-File Projects
 

@@ -1818,6 +1818,17 @@ static bool {inst}__has(struct {inst}* xs, {ce} x) {{\n\
                 }
             }
         }
+        // A static routine whose signature names none of its module's type parameters, as
+        // `GENERATOR.iterate[T](x: T, ..): GENERATOR[T, T]`, is the same for every instance
+        // of them; any one will do (Task H.22).
+        if !Self::has_current(md, kind) {
+            let sig: Vec<String> = rd.params.iter().map(|(_, t)| t.clone()).chain([rd.ret_type.clone()]).collect();
+            for tp in &md.type_params {
+                if !map.contains_key(tp) && rd.ret_type.trim() != "Current" && !sig.iter().any(|t| mentions_any(t, std::slice::from_ref(tp))) {
+                    map.insert(tp.clone(), "BOOL".to_string());
+                }
+            }
+        }
         if let Some(tp) = tps.iter().find(|t| !map.contains_key(*t)) {
             return Err(format!(
                 "{NEED_TYPE}cannot infer type parameter `{tp}` of `{}.{r}`",

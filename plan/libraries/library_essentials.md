@@ -437,17 +437,61 @@ Client: sorting (H.3) needs `merge`, `take` and `reverse`; `join` and `split` (H
 
 #### Task H.22: `GENERATOR`
 
-Client: H.9's property generators (SplitMix64 from a seed is a state and a step), H.16's retry schedule (an endless list of delays, of which a client takes the first `n`), and B&W ch. 7's examples. Needs H.21 and decision 15. No compiler work: a prototype verified 0/0 under `--strict` and ran in C on 2026-11-16.
+Client: H.9's property generators (SplitMix64 from a seed is a state and a step), H.16's retry schedule (an endless list of delays, of which a client takes the first `n`), and B&W ch. 7's examples. Needs H.21 and decision 15. A prototype verified 0/0 under `--strict` and ran in C on 2026-11-16.
 
-- [ ] `module GENERATOR[S, A]`, `representation {ANY}` with fields `state: S` and `next: S -> TUPLE[A, S]`. `make(s, f)` in `create`. `head`, `tail`, `take(n): LIST[A]` (ensure `Result.length = n`), `nth(n)` and `drop(n)`, each with `variant n`.
-- [ ] Total combinators: `map`, `zip`, `zip_with`, `scan`, `iterate(x, f)` and `cycle(xs)` of a non-empty list, with the index as the state. `zip` of two generators has a pair as its state.
-- [ ] Laws, with triggers: `take(n).length = n`, `nth(k) = LIST_OPS.at(take(n), k)` for `k < n`, `take(m + n) = take(m).append(drop(m).take(n))`, and `map(g, f).take(n) = LIST_OPS.map(g.take(n), f)`, so a client reasons about a prefix with H.21's list laws.
-- [ ] `module UNFOLD[S, A]` with `next: S -> OPTION[TUPLE[A, S]]` (decision 15): `take(n)` gives at most `n` items, and `to_list` takes a `variant` the client supplies on `S`.
-- [ ] Searches are bounded: `find_within(k, p): OPTION[A]` and `take_while_within(k, p)`. There is no `filter` on a generator, since its next item may never come. Say so in the guide, with the B&W §7.3 prime sieve written with a bound as the example.
-- [ ] A worked law in the guide: every item of a generator satisfies `P` when `P` holds of the first state and `next` keeps it, proven by induction on `n` for a named generator. A generic version over any `P` needs a concept bound on the state and waits for H.0a.
-- [ ] Look into `E0199` from the prototype: a record literal `{ state = ..., next = ... }` of `GENERATOR` written in another module is typed as that module's record, and the verifier cannot translate it. Until fixed, clients build through `make`.
-- [ ] Guide: a comparison with Elixir's `Stream` (`unfold`, `iterate`, `cycle`, `Enum.take`). The differences are a search that may never end (refused here), overflow (chosen by the client), a visible state type (no existentials), and no effects (those are reactive programs).
-- Acceptance: `naturals` and `fibs` from the prototype, SplitMix64 and a retry schedule are clients that see no body. A client proves `fibs(0).nth(9) = 34` by the laws, and a step written with `s + 1` over `NAT` is refused as an overflow.
+**Status:** ✅ Completed (2026-11-20). Decision 15 taken as proposed: both forms, and the library does not pick wrapping for the client. The task took compiler work after all (see "The compiler"), and one gap is recorded as a limit (decision taken 2026-11-20, see "Known limits").
+
+- [x] `module GENERATOR[S, A]` in `stdlib/collections/generator.gdl`, with fields `state: S` and `next: S -> TUPLE[A, S]`. It has `make(s, f)`, `head`, `tail`, `take(n)` (`Result.length = n`), `nth(n)` and `drop(n)`, each recursive one with `variant n` and a contract that unfolds it once.
+- [x] Combinators: `map`, `zip` (a pair as its state), `zip_with`, `scan`, `GENERATOR.iterate(x, f)` and `GENERATOR.cycle(xs)` of a non-empty list, with the index as the state. Each but `cycle` states its step (`stepping`), as a client sees no body with a lambda in it.
+- [x] Laws: `nth_take`, `take_split` and `map_take`, and `take`'s length is a contract.
+  - `take_split` is `g.take(n) = g.take(m).append(g.drop(m).take(n - m))` for `m <= n`, rather than `take(m + n)`, which would overflow.
+  - `map`'s step is built by a static `mapped_step(step, f)`, so that a generator and its `tail` map to the same step, which `map_take` needs.
+- [x] `module UNFOLD[S, A]` in `stdlib/collections/unfold.gdl`, with `next: S -> OPTION[TUPLE[A, S]]`. `take(n)` gives at most `n` items, and `to_list(measure)` takes a measure the client supplies, never negative and shrinking at each step.
+- [x] Bounded searches `find_within(k, p)` and `take_while_within(k, p)`, and no `filter`. The guide says why, with B&W §7.3's sieve on a bounded prefix.
+- [x] The worked law in the guide, `capped`: every item of a generator is in a bound when the state is and the step keeps it, by induction on `n`. A client uses it to prove that no delay of a retry schedule is over 10 s.
+- [x] The `E0199` from the prototype is fixed (see "The compiler"): a client may build a generator with a record literal.
+- [x] The guide compares with Elixir's `Stream`.
+- Acceptance: met. `naturals`, `fibs`, SplitMix64 and a retry schedule are clients that see no body. `fibs(0).nth(9) = 34` is proven from the contracts, and a step `s + 1` over `NAT` is refused as an overflow.
+- **The compiler.** Four fixes, each found by a prelude routine that failed:
+  - **Lambda lifting.** A lambda in a routine with its own type parameters (`map[B]`'s step has a `B`) was lifted with the module's alone, so Boogie saw an undeclared `B`. The parameters in scope are now the module's and those of its routines and laws. A lambda that used `Current`, after a `let step = Current.next` was inlined into it, did not capture it. It does now.
+  - **Unused module type parameters.** A static creator such as `iterate[T](x: T, f: T -> T): GENERATOR[T, T]` names none of its module's parameters. Boogie refuses a function or procedure with a type parameter that no argument mentions, so the routine's function and its `Verify_` procedure now keep only those that its signature names. The C backend could not infer them either, and now fixes each to `BOOL`, as any instance is the same routine.
+  - **Record literals.** `{ state = 0, next = f }` in a client was translated as the client's own record (`MAIN_Ctor`). When the fields are not the module's own, the record is now the routine's result type's, if that type has exactly those fields. A literal nested inside an argument is not covered.
+  - **Tuple ranges.** A lambda that gives a tuple of machine numbers, such as the step `(s, s +% 1)`, now states the range of its parts, for arguments and captures in theirs, as a lambda that gives a number did. The body is already proven to put only values in range there. This made SplitMix64's prefix provable.
+- **Result.** `tests/generator.rs` has two tests.
+  - **Truths.**
+    - Clients see no body: `naturals`, `fibs`, SplitMix64 and a retry schedule. `fibs(0).nth(9) = 34` and `first_five`'s length are proven from the contracts.
+    - The three laws are called with `BOOL` items.
+    - `capped` proves that no delay is over 10 s, B&W's sieve counts the ten primes below 30, and `pairs_of` is an `UNFOLD` over a list with its length as the measure. A generator is also built with a record literal.
+    - The program runs in C and prints 22 lines. SplitMix64's first three outputs from seed 0 are the reference values. The combinators' lines compare the value they compute, as their items' range is not known.
+  - **Lies.** Seven are refused, each by a counterexample, which the test checks; a refusal for want of time proves nothing:
+    - a step `s + 1` over `NAT`;
+    - `fibs.nth(4) = 4`;
+    - `take(n).length = n + 1`;
+    - `map_take` with another function;
+    - `nth_take` at `k = n`;
+    - `cycle` of a list that may be empty;
+    - `to_list` with a measure that does not shrink.
+
+    `fibs.nth(9) = 35` was first used. It was refused only after the seed retries, and with seed 0 by timeout, so a shallower lie replaced it.
+  - **Totals.** All 521 tests pass, the 234 unit tests and 41 suites. The stdlib (25 modules, 0/0 in 65 s), the 8 single-file examples, every project and every package are 0/0.
+    - In the full run Tablon's `TABLON_STATE` ran out of time (2644 s for the project). Its `.bpl` is byte-identical under H.21's binary and this one, as is `gjson/tests`'s, and `tests/tablon.rs` builds Tablon with `--strict` and passes (802 s).
+    - Every project took 1.5 to 2 times as long as in H.21's run, with the same VCs where compared, so the machine was slower.
+  - **Linux.** `generator`, `list_ops`, `refined` and `generic_handlers` pass in `scripts/linux/test.sh`, the C with no warning.
+- **Mutations.** All seven mutations of the compiler changes turn a test red:
+  - the lambda's routine type parameters (the stdlib unit test);
+  - `Current` not captured (the stdlib unit test);
+  - unused type parameters kept on the function (the stdlib unit test and `generator`);
+  - unused type parameters kept on the procedure (the stdlib unit test);
+  - the C backend not fixing them (`generator`);
+  - the record literal (`generator`);
+  - the tuple range (`generator`).
+
+  The first two only the stdlib catches: a client sees `GENERATOR`'s contracts, not its lambdas.
+- **Known limits.**
+  - **Item ranges.** The verifier does not know that a `GENERATOR[NAT, NAT]`'s items are `NAT`s: they come from a function-valued field, which H.0e's container ranges do not cover. A prefix it can unfold is known, such as `naturals(1).take(5)`. A prefix of any generator, or of any length, is not, so `g.take(n)` cannot be returned as a `LIST[NAT]`. A client proves the range with a property kept by the step (`capped`'s `>= 0`), or compares a value instead of passing it on. The fix is a range theory for function fields, in which a generator's items hold their range when its state does and its step keeps it, as a follow-up task.
+  - `cycle`'s step is not stated. With `%` and `+%` the solver ran out of resources, and without `+%` the step needs a bound on the list's length, which the verifier does not have. Its items can be run, not reasoned about.
+  - `UNFOLD.to_list`'s measure must be non-negative for every value of the state type. Over `NAT`, that means every integer, so a measure such as a list's length is the easy case.
+  - A generic "every item satisfies `P`" law needs a concept bound on the state (H.0a); the guide's version is for one bound, written by the client.
 
 #### Task H.5: `ARRAY[A]`
 

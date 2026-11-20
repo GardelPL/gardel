@@ -9,6 +9,19 @@ All notable changes, theoretical soundess fixes, verification overhauls, front-e
 Spec draft v0.5. [plan/Roadmap.md](plan/Roadmap.md) holds the detail for each task.
 
 ### Language and runtime
+- **Endless sequences: `GENERATOR` and `UNFOLD`** (H.22). New prelude modules.
+  - **`GENERATOR[S, A]`** is a `state` and a step `next: S -> TUPLE[A, S]`. It has `make`, `iterate(x, f)` and `cycle(xs)`; `head`, `tail`, `take(n)`, `nth(n)` and `drop(n)`; and `map`, `zip`, `zip_with` and `scan`, each stating its step, except `cycle`.
+  - **Searches are bounded:** `find_within(k, p)` and `take_while_within(k, p)`. There is no `filter`, since the next item that passes might never come.
+  - **Laws:** `nth_take`, `take_split` and `map_take`, so a client reasons about a prefix with `LIST_OPS`' laws. A client proves `fibs(0).nth(9) = 34` from the contracts.
+  - **`UNFOLD[S, A]`** may end, as Elixir's `Stream.unfold`: its step gives an `OPTION`. `take(n)` gives at most `n` items, and `to_list(measure)` all of them, given a measure that shrinks.
+  - **Overflow is the client's choice.** A step `s + 1` over `NAT` is refused; write `s +% 1` or count with `BIGNAT`.
+  - **Compiler fixes found on the way:**
+    - A lambda in a routine with its own type parameters (`map[B]`) was lifted without them, and one that used `Current` did not capture it.
+    - A static creator of a generic module that names none of its type parameters (`iterate[T]: GENERATOR[T, T]`) was refused by Boogie and could not be compiled to C.
+    - A record literal of another module (`{ state = 0, next = f }` returned as a `GENERATOR`) was translated as the enclosing module's.
+    - A lambda returning a tuple of machine numbers now states their range, as a scalar one did.
+  - **Limit:** the verifier does not know a generator's items to be in their type's range, as they come from a function. A prefix it can unfold is known, such as `naturals(1).take(5)`. For others, a client proves the range with a property kept by the step, as the guide shows.
+  - `tests/generator.rs`: naturals, Fibonacci, SplitMix64, a retry schedule, B&W's sieve and the combinators, verified and run in C, with seven false versions refused.
 - **List operations and their laws** (H.21). `LIST_OPS` gains `take`, `drop`, `reverse`, `reverse_onto`, `concat`, `take_while`, `drop_while`, `zip`, `zip_with`, `last`, `init`, `concat_map`, `range(lo, hi)` and `iterate_n(f, x, n)`. Each is total but `last` and `init`, which need a non-empty list, and runs in C. A client sees each one's length and one step of its unfolding.
   - **Laws** (Bird and Wadler §3.3 to §3.5), proven by induction in `LIST_OPS` and called by a client where it needs them:
     - lists: `take_drop`, `take_while_drop_while`, `reverse_reverse`, `reverse_append`, `reverse_cons`, `init_last`, `map_fusion` and `filter_map`;

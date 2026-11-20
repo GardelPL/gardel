@@ -4186,6 +4186,14 @@ pub const STDLIB_SOURCES: &[(&str, &str)] = &[
         include_str!("../../stdlib/collections/list_ops.gdl"),
     ),
     (
+        "stdlib/collections/generator.gdl",
+        include_str!("../../stdlib/collections/generator.gdl"),
+    ),
+    (
+        "stdlib/collections/unfold.gdl",
+        include_str!("../../stdlib/collections/unfold.gdl"),
+    ),
+    (
         "stdlib/collections/key_order.gdl",
         include_str!("../../stdlib/collections/key_order.gdl"),
     ),
@@ -4263,6 +4271,10 @@ pub fn phase4_stdlib_source() -> &'static str {
         include_str!("../../stdlib/core/io_error.gdl"),
         "\n",
         include_str!("../../stdlib/collections/list_ops.gdl"),
+        "\n",
+        include_str!("../../stdlib/collections/generator.gdl"),
+        "\n",
+        include_str!("../../stdlib/collections/unfold.gdl"),
         "\n",
         include_str!("../../stdlib/collections/key_order.gdl"),
         "\n",
@@ -5933,8 +5945,9 @@ pub const GCC_NET_LIBS: &[&str] = if cfg!(windows) { &["-lws2_32"] } else { &[] 
 /// `STRING` is injected for modules that mention it, contain string literals or use `IO`
 /// (Task B.3: literals denote prelude `STRING` values); `LIST_OPS` / `FUNCTION_OPS` are realized by the built-in
 /// `Seq_*` / `Fn1_*` preamble theories already present in every Boogie file.
-const BOOGIE_INJECTED_PRELUDE: [&str; 22] = [
+const BOOGIE_INJECTED_PRELUDE: [&str; 24] = [
     "LIST_OPS",
+    "GENERATOR",
     "OPTION",
     "RESULT",
     "SEQ",
@@ -5956,6 +5969,7 @@ const BOOGIE_INJECTED_PRELUDE: [&str; 22] = [
     "STEP",
     "KEY_ORDER",
     "MAP",
+    "UNFOLD",
 ];
 
 /// Marker on the opaque declaration of another prelude module's sort that a module's
@@ -6081,6 +6095,10 @@ impl BoogiePreludeCtx {
         // `MAP` keeps its keys with `KEY_ORDER` and answers `get` with an `OPTION`.
         if wanted.contains("MAP") || m.name == "MAP" {
             wanted.insert("KEY_ORDER");
+            wanted.insert("OPTION");
+        }
+        // `UNFOLD`'s step gives an `OPTION`, and `GENERATOR.find_within` one (Task H.22).
+        if wanted.contains("UNFOLD") || m.name == "UNFOLD" || wanted.contains("GENERATOR") || m.name == "GENERATOR" {
             wanted.insert("OPTION");
         }
         // `LOG_LEVEL.from_ordinal`, derived (H.0c), gives an `OPTION` (Task H.2).
@@ -6717,7 +6735,23 @@ fn lift_boogie_lambda(
     if params.is_empty() || params.len() > 3 {
         return None;
     }
-    let mentions_tp = |t: &str| type_tokens(t).iter().any(|tok| m.type_params.iter().any(|p| p == tok));
+    // The type parameters in scope: the module's, and those of its routines and laws, as a
+    // lambda in `map[B]` has a `B` (Task H.22). Type parameters are named apart from types,
+    // so taking every routine's is safe.
+    let mut scope_tps: Vec<String> = m.type_params.clone();
+    let routine_tps = m
+        .create_routines
+        .iter()
+        .chain(&m.feature_routines)
+        .chain(&m.specify_routines)
+        .flat_map(|(_, r)| r.type_params.iter())
+        .chain(m.specify_laws.iter().flat_map(|(_, l)| l.type_params.iter()));
+    for tp in routine_tps {
+        if !scope_tps.contains(tp) {
+            scope_tps.push(tp.clone());
+        }
+    }
+    let mentions_tp = |t: &str| type_tokens(t).iter().any(|tok| scope_tps.iter().any(|p| p == tok));
     let param_names: Vec<String> = params.iter().map(|(p, _)| p.clone()).collect();
     let mut free = Vec::new();
     let mut bound = param_names.clone();
@@ -6732,10 +6766,15 @@ fn lift_boogie_lambda(
     let captures: Vec<(String, String)> = free
         .into_iter()
         .filter(|v| !implicit_fields.contains(v))
-        .filter_map(|v| boogie_env_type(&v).map(|t| (v, t)))
+        .filter_map(|v| {
+            // `Current` in a module's routine is captured as any local is (Task H.22).
+            if v == "Current" && m.kind == ModuleKind::Module {
+                return Some((v, module_self_type(m)));
+            }
+            boogie_env_type(&v).map(|t| (v, t))
+        })
         .collect();
-    let lam_tps: Vec<String> = m
-        .type_params
+    let lam_tps: Vec<String> = scope_tps
         .iter()
         .filter(|tp| {
             let here = |t: &str| type_tokens(t).iter().any(|tok| tok == *tp);
@@ -6849,6 +6888,15 @@ fn lift_boogie_lambda(
             }
         }
         BOOGIE_LIFTED_LAMBDAS.with(|l| l.borrow_mut().push_str(&lam_axioms));
+    } else if let Some(fact) = (!generic).then(|| container_fact(ret_ty, &applied)).flatten() {
+        // A lambda that gives a container of machine numbers, as a step `(s, s +% 1)` of a
+        // `GENERATOR[NAT, NAT]` does: its body is proven to put only values in range there,
+        // for arguments and captures in theirs (Task H.22).
+        let mut guards: Vec<String> = captures.iter().filter_map(|(v, t)| value_fact(t, v)).collect();
+        guards.extend(params.iter().filter_map(|(p, t)| value_fact(t, p)));
+        let guard = if guards.is_empty() { String::new() } else { format!("{} ==> ", guards.join(" && ")) };
+        let axiom = format!("axiom (forall {} :: {{ {applied} }} {guard}{fact});\n", quant.join(", "));
+        BOOGIE_LIFTED_LAMBDAS.with(|l| l.borrow_mut().push_str(&axiom));
     }
     Some(call)
 }
@@ -10192,18 +10240,28 @@ fn emit_own_boogie_parts(
 
     for (r, has_current) in &all_routines {
         set_boogie_type_env(m, &r.params, Some(&r.ret_type));
+        let uses_curr = *has_current && !current_indep.contains(&r.name);
         let mut r_all_tps = m.type_params.clone();
         for tp in &r.type_params {
             if !r_all_tps.contains(tp) {
                 r_all_tps.push(tp.clone());
             }
         }
+        // Boogie refuses a type parameter that no argument or result mentions, as a module's
+        // own in a static creator `iterate[T](x: T, ..): GENERATOR[T, T]` (Task H.22).
+        if !uses_curr {
+            let sig: Vec<&str> = r.params.iter().map(|(_, t)| t.as_str()).chain([r.ret_type.as_str()]).collect();
+            r_all_tps.retain(|tp| {
+                !m.type_params.contains(tp)
+                    || r.ret_type == "Current"
+                    || sig.iter().any(|t| type_tokens(t).iter().any(|tok| tok == tp))
+            });
+        }
         let r_tp_quant = if r_all_tps.is_empty() {
             String::new()
         } else {
             format!("<{}>", r_all_tps.join(", "))
         };
-        let uses_curr = *has_current && !current_indep.contains(&r.name);
         let mut sig_params = vec!["fuel: Fuel".to_string()];
         let mut q_params = vec!["_fuel: Fuel".to_string()];
         let mut call_args_succ = vec!["SuccFuel(_fuel)".to_string()];
@@ -11406,6 +11464,13 @@ fn emit_boogie_verify_routine(
         if !all_tps.contains(tp) {
             all_tps.push(tp.clone());
         }
+    }
+    // As for the routine's function: only the type parameters its signature mentions.
+    if !has_current && r.ret_type != "Current" {
+        let sig: Vec<&str> = r.params.iter().map(|(_, t)| t.as_str()).chain([r.ret_type.as_str()]).collect();
+        all_tps.retain(|tp| {
+            !m.type_params.contains(tp) || sig.iter().any(|t| type_tokens(t).iter().any(|tok| tok == tp))
+        });
     }
     let tp_quant = if all_tps.is_empty() {
         String::new()
@@ -15709,6 +15774,33 @@ fn emit_boogie_expr_with_strings(
             acc.unwrap_or(s_str)
         }
         Expr::RecordLit(fields) => {
+            // A record of another module, such as `{ state = 0, next = f }` returned as a
+            // `GENERATOR[NAT, NAT]` by a client: its fields are not this module's, and the
+            // routine's result type names its module (Task H.22).
+            let same_fields = |d: &ModuleDecl| {
+                matches!(&d.repr, ReprKind::Product(fs)
+                    if fs.len() == fields.len() && fs.iter().all(|(f, _)| fields.iter().any(|(k, _)| k == f)))
+            };
+            if !same_fields(m) {
+                let owner = boogie_result_type().map(|t| type_head(&t).to_string()).filter(|h| *h != m.name);
+                let decl_fields = owner.as_ref().and_then(|h| {
+                    with_module_decl(h, |d| match &d.repr {
+                        ReprKind::Product(fs) if same_fields(d) => Some(fs.clone()),
+                        _ => None,
+                    })
+                    .flatten()
+                });
+                if let (Some(h), Some(decl_fields)) = (owner, decl_fields) {
+                    let args: Vec<String> = decl_fields
+                        .iter()
+                        .map(|(fnm, _)| {
+                            let fe = &fields.iter().find(|(k, _)| k == fnm).expect("same fields").1;
+                            emit_boogie_expr_with_strings(fe, m, implicit_fields, revealed, fuel_var, strings)
+                        })
+                        .collect();
+                    return format!("{h}__{h}_Ctor({})", args.join(", "));
+                }
+            }
             if let ReprKind::Product(decl_fields) = &m.repr {
                 let args: Vec<String> = decl_fields
                     .iter()
@@ -22912,7 +23004,7 @@ end
         let stdlib = parse_phase4_stdlib().expect("Phase 4 stdlib should parse");
         assert_eq!(stdlib.group, None);
         assert_eq!(stdlib.concepts.len(), 3);
-        assert_eq!(stdlib.modules.len(), 23);
+        assert_eq!(stdlib.modules.len(), 25);
         for m in &stdlib.modules {
             let mut diags = check_visibility_and_semantics(m);
             diags.extend(verify_module_phase3(
@@ -23404,7 +23496,7 @@ end
     #[test]
     fn test_plan3_multi_module_stdlib_pipeline() {
         let ast = parse_phase4_stdlib().expect("stdlib parses cleanly");
-        assert_eq!(ast.modules.len(), 23);
+        assert_eq!(ast.modules.len(), 25);
         let mut prog_env = ProgramEnv {
             modules: HashMap::new(),
             concepts: HashMap::new(),
