@@ -16,9 +16,9 @@ feature {ANY}
           s.body_limit = state.body_limit
         case Complete(q, rest) then
           rest.length <= buf.length and q.body.length <= buf.length - rest.length and
-          rest.model = BYTES.list_take(BYTES.list_drop(buf.model, buf.length - rest.length), rest.length) and
-          q.body.model = BYTES.list_take(
-            BYTES.list_drop(buf.model, buf.length - rest.length - q.body.length), q.body.length)
+          rest.model = LIST_OPS.take(LIST_OPS.drop(buf.model, buf.length - rest.length), rest.length) and
+          q.body.model = LIST_OPS.take(
+            LIST_OPS.drop(buf.model, buf.length - rest.length - q.body.length), q.body.length)
         case Failed(_) then
           True
       end
@@ -49,9 +49,9 @@ feature {ANY}
           check
             rest_fits: rest.length <= buf.length
             body_fits: full.body.length <= buf.length - rest.length
-            rest_tail: rest.model = BYTES.list_take(BYTES.list_drop(buf.model, buf.length - rest.length), rest.length)
-            body_before: full.body.model = BYTES.list_take(
-              BYTES.list_drop(buf.model, buf.length - rest.length - full.body.length), full.body.length)
+            rest_tail: rest.model = LIST_OPS.take(LIST_OPS.drop(buf.model, buf.length - rest.length), rest.length)
+            body_before: full.body.model = LIST_OPS.take(
+              LIST_OPS.drop(buf.model, buf.length - rest.length - full.body.length), full.body.length)
           end
           Complete(full, rest)
         end end end

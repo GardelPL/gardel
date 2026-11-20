@@ -1,7 +1,7 @@
 -- A REST service with a state: todos, created, read, replaced and deleted over JSON.
 --
 --   gardelc examples/todo_api --strict
---   build/todo_api_bin.exe [port]          (else TODO_API_PORT, else 8091)
+--   build/todo_api_bin [port]          (else TODO_API_PORT, else 8091)
 --
 --   GET    /todos       every todo, in ascending order of id
 --   POST   /todos       {"title":"...","done":false} -> 201 and the todo, with its id

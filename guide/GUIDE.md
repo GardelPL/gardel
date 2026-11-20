@@ -548,7 +548,7 @@ end
 
 A field of a number type keeps the range of its type. In `| Box(n: NAT, i: I64)`, the `n` that `case Box(n, i)` binds is known to be in $[0, 2^{64} - 1]$ and `i` in $[-2^{63}, 2^{63} - 1]$, so a contract that needs that range applies to them. The same holds for a record's fields, and for `U64` and `CHAR`.
 
-An element of a `LIST` or `SEQ` of a number type keeps its range too. `xs.head`, `xs.tail.head`, `LIST_OPS.at(xs, i)`, an `x` with `xs.has(x)`, a fold's argument and the result of a generic routine such as `BYTES.list_drop(xs, n)` are all known to be in range. So is a character of a line of a text, a `LIST[LIST[CHAR]]`. A byte read from `b.model` of a `BYTES` is also below 256, from the laws `model_octets`, `octets_head`, `octets_tail` and `octets_at`. A plain `LIST[U64]` is only in the range of `U64`, so to know that its elements are bytes, check them, as `if b < 256 then`.
+An element of a `LIST` or `SEQ` of a number type keeps its range too. `xs.head`, `xs.tail.head`, `LIST_OPS.at(xs, i)`, an `x` with `xs.has(x)`, a fold's argument and the result of a generic routine such as `LIST_OPS.drop(xs, n)` are all known to be in range. So is a character of a line of a text, a `LIST[LIST[CHAR]]`. A byte read from `b.model` of a `BYTES` is also below 256, from the laws `model_octets`, `octets_head`, `octets_tail` and `octets_at`. A plain `LIST[U64]` is only in the range of `U64`, so to know that its elements are bytes, check them, as `if b < 256 then`.
 
 The range is checked where a list is built. A routine that returns a `LIST[U64]`, an argument passed as one, and a field of that type must each have their elements in range, so `LIST.singleton(n)` with `n: MATH_INT` is refused there, as a `Range Violation`. A lambda keeps its result type's range, so `s.map(fn(x: U64): U64 do x *% 2 end)` is still a list of `U64`s.
 
@@ -1958,6 +1958,52 @@ Every program automatically sees the **Standard Prelude**:
 
 The prelude is verified once, on its own (`gardelc --stdlib`). In user programs its contracts and laws are trusted facts, and calls into it must still establish its preconditions. You may declare a name the prelude already uses: the bare name then means yours, and `GARDEL::NAME` means the prelude's. Pass `--no-prelude` only to build a prelude-free program on purpose.
 
+### Lists and Their Laws: `LIST_OPS`
+
+`LIST_OPS` has the list operations of Bird and Wadler's *Introduction to Functional Programming*, §3.2 to §3.5. Each is total and runs in C:
+
+| Operation | Gives |
+| :--- | :--- |
+| `map`, `filter`, `fold_left`, `fold_right`, `at(xs, i)` | As usual. `at` needs `i < xs.length` |
+| `take(xs, n)`, `drop(xs, n)` | The first `n` items and the rest. With fewer than `n` items, `take` gives them all and `drop` none |
+| `take_while(xs, p)`, `drop_while(xs, p)` | The longest prefix whose items satisfy `p`, and what follows it |
+| `reverse(xs)`, `reverse_onto(xs, acc)` | The items in reverse order; the second puts them in front of `acc` |
+| `concat(xss)`, `concat_map(xs, f)` | The lists one after another; `concat_map` concatenates the lists `f` gives |
+| `zip(xs, ys)`, `zip_with(xs, ys, f)` | Pairs `(x, y)` or `f(x, y)` of items at the same place, as long as the shorter list |
+| `last(xs)`, `init(xs)` | The last item, and every item but it. Both need `xs.length > 0` |
+| `range(lo, hi)`, `iterate_n(f, x, n)` | `lo` up to but not including `hi`; and `x`, `f(x)`, `f(f(x))` and so on, `n` items |
+
+A contract states each one's length and how it unfolds once (`empty_case`, `cons_case`). What takes induction to prove is a law. Call the law where you need it:
+
+```eiffel
+  twice(xs: LIST[U64]): LIST[U64]
+    do
+      check
+        back: LIST_OPS.reverse_reverse(xs)
+      end
+      LIST_OPS.reverse(LIST_OPS.reverse(xs))
+    ensure
+      same: Result = xs
+    end
+```
+
+The laws:
+- **Lists:** `take_drop` (`take(xs, n).append(drop(xs, n)) = xs`), `take_while_drop_while`, `reverse_reverse`, `reverse_append` (`reverse(xs.append(ys)) = reverse(ys).append(reverse(xs))`), `reverse_cons`, `init_last`, `map_fusion` (`map(map(xs, g), f) = map(xs, FUNCTION_OPS.compose(f, g))`), `filter_map`, `map_append` and `filter_append`.
+- **Folds:**
+  - `fold_duality_first`: over a monoid, `fold_right` and `fold_left` agree.
+  - `fold_duality_second`: the same for two functions that associate with each other.
+  - `fold_duality_third`: `fold_right(xs, f, a) = fold_left(reverse(xs), g, a)`, where `g` is `f` with its arguments swapped.
+  - `fold_homomorphism`: a monoid fold of `xs.append(ys)` combines the folds of each.
+- **`concat_map`:** it is `concat` after `map` (`concat_map_is_concat_map`). It also has the monad laws, named as `OPTION.and_then`'s are: `concat_map_left_unit`, `concat_map_right_identity` and `concat_map_associative`.
+
+A law about a function needs something of that function. It asks for it as `forall` premises in its `require`, and your call must prove them for the function you pass. So `fold_duality_first(xs, f, e)` needs `f` to be associative with `e` as its identity on both sides. A function you write as `fn(p: BOOL, q: BOOL): BOOL do p or q end` meets that. A law takes the function another law would build, such as `g` for the third theorem or `h` for associativity, as a parameter, with a premise saying what it is: a law that holds an `fn` is not given to clients.
+
+Two limits:
+- A premise over a number type quantifies over every integer, not only those of the type, so a function on `NAT` must meet it for negative numbers too. A function on `BOOL`, or one that never does arithmetic, meets it most easily.
+- `take`, `map` and the other operations recurse once per item, so a list of millions of items can exhaust the C stack.
+
+`SEQ.reduce(f, e)` folds the two sides of each `Concat` apart, so they may run in parallel. The law `SEQ.reduce_folds(s, f, e)` has the same monoid premises as `fold_duality_first`. It states that `reduce` then equals both `fold_left` and `fold_right` of the model, proven by `fold_homomorphism` and the first duality theorem.
+
 ### Multi-File Projects
 
 Give `gardelc` several files, a directory (searched recursively, skipping `build/` and `target/`), or a wildcard pattern, and they form **one project** with a flat module namespace:
@@ -2297,6 +2343,8 @@ A normal run reports five steps:
 [4/5] Emitted Bend v2 target    -> build/<module>.bend
 [5/5] Emitted C11 runtime target -> build/<module>.c
 ```
+
+A `program` or a reactive program is then compiled to `build/<module>_bin`, or `build/<module>_bin.exe` on Windows. Both shells there also run it as `build/<module>_bin`.
 
 ```bash
 # Write the Standard Prelude embedded in gardelc to build/stdlib/ (or --emit-stdlib <DIR>); never overwrites edited files

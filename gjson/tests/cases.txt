@@ -1,6 +1,6 @@
 # Cases for GJSON_TEST, read on standard input:
 #
-#   build/gjson_test_bin.exe < gjson/tests/cases.txt
+#   build/gjson_test_bin < gjson/tests/cases.txt
 #
 # Each line is a document, ` => `, and what `JSON.parse` must say of it: `ok` and the value
 # written back, or `error`, the reason and the byte offset. Every accepted value must also

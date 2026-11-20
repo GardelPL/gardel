@@ -1132,7 +1132,7 @@ end</code></pre></div>
   <div class="panel" id="panel-30" role="tabpanel"><pre tabindex="0"><code data-lang="term">$ gardelc lengths.gdl --strict
 [2/5] Checked §4 Visibility, §9 Concept Laws, §11 IO Boundary &amp; §12 Direct Verification:
       0 errors, 0 warnings — all visibility, concept laws, IO linearity, overflow, and contract obligations satisfied.
-      Compiled native executable              -&gt; build/lengths_bin.exe
+      Compiled native executable              -&gt; build/lengths_bin
 $ build/lengths_bin   # the input, and the exit code it gives
   héllo                    exit 1
   bytes 62 61 64 20 FF     exit 101
@@ -1176,7 +1176,7 @@ end</code></pre><div class="source"><a href="../examples/greeter.gdl">examples/g
   <div class="panel" id="panel-32" role="tabpanel"><pre tabindex="0"><code data-lang="term">$ gardelc examples/greeter.gdl --strict
 [2/5] Checked §4 Visibility, §9 Concept Laws, §11 IO Boundary &amp; §12 Direct Verification:
       0 errors, 0 warnings — all visibility, concept laws, IO linearity, overflow, and contract obligations satisfied.
-      Compiled native executable              -&gt; build/greeter_bin.exe
+      Compiled native executable              -&gt; build/greeter_bin
 $ echo Ada | build/greeter_bin
 Hello, Ada
 $ echo $?
@@ -1430,7 +1430,7 @@ end</code></pre><div class="source"><a href="../examples/reactive_game/reactive_
       examples/reactive_game/track_board.gdl: group None, ["Module TRACK_BOARD"]
 [2/5] Checked §4 Visibility, §9 Concept Laws, §11 IO Boundary &amp; §12 Direct Verification:
       0 errors, 0 warnings — all visibility, concept laws, IO linearity, overflow, and contract obligations satisfied.
-      Compiled native executable              -&gt; build/reactive_game_bin.exe</code></pre></div>
+      Compiled native executable              -&gt; build/reactive_game_bin</code></pre></div>
   <div class="panel" id="panel-43" role="tabpanel"><pre tabindex="0"><code data-lang="term">$ GARDEL_EVENTS='Key:Right Key:Right Key:Left Key:Right Key:Right Key:Right' build/reactive_game_bin
 Reach the G. Arrows or h and l move, q quits.
 @...G

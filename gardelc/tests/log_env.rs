@@ -6,6 +6,9 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 
+/// The suffix gardelc gives an executable: `.exe` on Windows, none elsewhere.
+const EXE: &str = std::env::consts::EXE_SUFFIX;
+
 struct Dir(PathBuf);
 
 impl Drop for Dir {
@@ -51,7 +54,7 @@ fn build(file: &str, name: &str) -> (Dir, PathBuf) {
     assert!(out.status.success() && all(&out).contains("0 errors, 0 warnings"), "{}", all(&out));
     assert!(!all(&out).contains("warning:"), "the C has warnings:\n{}", all(&out));
     let stem = base.trim_end_matches(".gdl");
-    let bin = dir.0.join(format!("build/{stem}_bin.exe"));
+    let bin = dir.0.join(format!("build/{stem}_bin{EXE}"));
     assert!(bin.exists(), "no binary at {}:\n{}", bin.display(), all(&out));
     (dir, bin)
 }

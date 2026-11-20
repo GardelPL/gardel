@@ -5,6 +5,9 @@ use std::fs;
 use std::path::PathBuf;
 use std::process::{Command, Output};
 
+/// The suffix gardelc gives an executable: `.exe` on Windows, none elsewhere.
+const EXE: &str = std::env::consts::EXE_SUFFIX;
+
 struct Project {
     dir: PathBuf,
 }
@@ -142,7 +145,7 @@ fn a_key_must_be_ordered() {
 fn the_map_runs_in_c_and_frees_what_it_allocates() {
     let p = Project::new("runtime", &[("main.gdl", include_str!("map_program.gdl"))]);
     assert_ok(&p.check());
-    let out = Command::new(p.dir.join("build").join("main_bin.exe")).output().expect("the program runs");
+    let out = Command::new(p.dir.join("build").join(format!("main_bin{EXE}"))).output().expect("the program runs");
     assert!(out.status.success(), "{out:?}");
     let text = String::from_utf8(out.stdout).expect("UTF-8 output").replace("\r\n", "\n");
     assert_eq!(

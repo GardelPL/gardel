@@ -232,7 +232,7 @@ answer), and what it must give:
 
 ```text
 gardelc --project grest/tests --strict
-grest/tests/build/grest_test_bin.exe < grest/tests/cases.txt
+grest/tests/build/grest_test_bin < grest/tests/cases.txt
 ```
 
 Exit code 0 means every case holds. `cargo test --test grest` does both.

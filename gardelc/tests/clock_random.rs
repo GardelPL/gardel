@@ -7,6 +7,9 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+/// The suffix gardelc gives an executable: `.exe` on Windows, none elsewhere.
+const EXE: &str = std::env::consts::EXE_SUFFIX;
+
 struct Dir(PathBuf);
 
 impl Drop for Dir {
@@ -46,7 +49,7 @@ fn build(file: &str, name: &str) -> (Dir, PathBuf) {
     let (dir, out) = check(base, &source, name);
     assert!(out.status.success() && all(&out).contains("0 errors, 0 warnings"), "{}", all(&out));
     let stem = base.trim_end_matches(".gdl");
-    let bin = dir.0.join(format!("build/{stem}_bin.exe"));
+    let bin = dir.0.join(format!("build/{stem}_bin{EXE}"));
     assert!(bin.exists(), "no binary at {}:\n{}", bin.display(), all(&out));
     (dir, bin)
 }

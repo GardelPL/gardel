@@ -5402,7 +5402,7 @@ fn tp_carrier(ty: &str, tp: &str) -> TpCarrier {
 
 /// Task H.0b: a generic routine has no value of a type parameter `A` but those its arguments
 /// carry, so where `A` is a machine number type and each argument that carries `A` is in a
-/// range, a result that holds `A` is too. `BYTES.list_drop(xs, n)` on a `LIST[U64]` then gives
+/// range, a result that holds `A` is too. `LIST_OPS.drop(xs, n)` on a `LIST[U64]` then gives
 /// a `LIST[U64]` with its elements in range. A carrier is an `A`, a list of them, or a
 /// container whose range states all its `A` values (H.0e), as the receiver of `get` of a
 /// `MAP[K, V]` at `V`, whose result `OPTION[V]` then holds the range. One axiom per range,
@@ -5933,7 +5933,8 @@ pub const GCC_NET_LIBS: &[&str] = if cfg!(windows) { &["-lws2_32"] } else { &[] 
 /// `STRING` is injected for modules that mention it, contain string literals or use `IO`
 /// (Task B.3: literals denote prelude `STRING` values); `LIST_OPS` / `FUNCTION_OPS` are realized by the built-in
 /// `Seq_*` / `Fn1_*` preamble theories already present in every Boogie file.
-const BOOGIE_INJECTED_PRELUDE: [&str; 21] = [
+const BOOGIE_INJECTED_PRELUDE: [&str; 22] = [
+    "LIST_OPS",
     "OPTION",
     "RESULT",
     "SEQ",
@@ -6115,6 +6116,12 @@ impl BoogiePreludeCtx {
                 break;
             }
         }
+        // `BYTES` states its slices with `LIST_OPS.take` and `drop` (Task H.21). After the
+        // loop, as a representation may bring `BYTES` in.
+        // `SEQ.reduce` is proven by `LIST_OPS`' fold laws.
+        if wanted.contains("BYTES") || m.name == "BYTES" || m.name == "SEQ" {
+            wanted.insert("LIST_OPS");
+        }
         let mut modules: Vec<ModuleDecl> = BOOGIE_INJECTED_PRELUDE
             .iter()
             .filter(|n| wanted.contains(*n) && !linked.iter().any(|lm| lm.name == **n))
@@ -6188,6 +6195,15 @@ fn module_referenced_idents(m: &ModuleDecl) -> HashSet<String> {
 
 /// Standard Prelude modules referenced by `m` (empty unless prelude injection is enabled
 /// and `m` is not itself a prelude module).
+/// Whether the `Debug` text of a module calls a `LIST_OPS` routine that is not a built-in.
+fn calls_list_ops_function(debug: &str) -> bool {
+    const CALL: &str = "Var(\"LIST_OPS\"), \"";
+    debug.match_indices(CALL).any(|(i, _)| {
+        let rest = &debug[i + CALL.len()..];
+        rest.split('"').next().is_some_and(|r| !is_list_ops_builtin(r))
+    })
+}
+
 fn prelude_modules_wanted(m: &ModuleDecl) -> HashSet<&'static str> {
     let mut wanted: HashSet<&'static str> = HashSet::new();
     if !prelude_injection_enabled() || standard_prelude().declares(&m.name) {
@@ -6223,7 +6239,9 @@ fn prelude_modules_wanted(m: &ModuleDecl) -> HashSet<&'static str> {
             let read_line_use = read_line_use
                 || name == "OPTION" && idents.contains("env") && idents.contains("IO")
                 || name == "LOG_LEVEL" && idents.contains("log") && idents.contains("IO");
-            if idents.contains(name) || ctor_used || string_use || read_line_use {
+            // `LIST_OPS`' built-in routines need no theory; its others do (Task H.21).
+            let named = if name == "LIST_OPS" { calls_list_ops_function(&debug) } else { idents.contains(name) };
+            if named || ctor_used || string_use || read_line_use {
                 wanted.insert(name);
             }
         }
@@ -6308,15 +6326,21 @@ impl LinkTable {
         let Some(&mf) = self.file_of.get(&m.name) else {
             return Vec::new();
         };
-        let idents = if self.is_external_for(root_caller, &m.name) {
+        let external = self.is_external_for(root_caller, &m.name);
+        let idents = if external {
             module_referenced_idents(&contract_only_module(m))
         } else {
             module_referenced_idents(m)
         };
+        // `LIST_OPS` is linked only for its ordinary routines; its built-ins need no theory.
+        let list_ops_used = || {
+            let view = if external { format!("{:?}", contract_only_module(m)) } else { format!("{m:?}") };
+            calls_list_ops_function(&view)
+        };
         self.modules
             .iter()
             .filter(|n| n.name != m.name && self.file_of.get(&n.name) != Some(&mf))
-            .filter(|n| n.name != "LIST_OPS" && n.name != "FUNCTION_OPS")
+            .filter(|n| n.name != "FUNCTION_OPS" && (n.name != "LIST_OPS" || list_ops_used()))
             .filter(|n| {
                 let ctors_visible =
                     !(self.is_external_for(root_caller, &n.name) && n.repr_vis == Visibility::None);
@@ -8721,6 +8745,12 @@ fn prelude_result_head<'c>(e: &Expr, ctx: &'c BoogiePreludeCtx) -> Option<&'c st
     (ret == "Current" || type_head(ret) == owner.name).then_some(owner.name.as_str())
 }
 
+/// The `LIST_OPS` routines the verifier realizes as built-in `Seq_*` functions. Its other
+/// routines are ordinary prelude functions (Task H.21).
+fn is_list_ops_builtin(r: &str) -> bool {
+    matches!(r, "map" | "filter" | "fold_left" | "fold_right" | "at")
+}
+
 fn resolve_prelude_receiver(
     recv: &Expr,
     mname: &str,
@@ -8803,7 +8833,7 @@ fn prelude_call_target(
     };
     if let Expr::Var(v) = &**recv {
         if v == "LIST"
-            || v == "LIST_OPS"
+            || (v == "LIST_OPS" && is_list_ops_builtin(r))
             || v == "FUNCTION_OPS"
             || (v == "SEQ" && ctx.module("SEQ").is_none())
         {
@@ -8861,7 +8891,7 @@ fn emit_boogie_prelude_ref(
         Expr::MethodCall(recv, r, args) => {
             if let Expr::Var(v) = &**recv {
                 if v == "LIST"
-            || v == "LIST_OPS"
+            || (v == "LIST_OPS" && is_list_ops_builtin(r))
             || v == "FUNCTION_OPS"
             || (v == "SEQ" && ctx.module("SEQ").is_none())
         {
@@ -11423,24 +11453,22 @@ fn emit_boogie_verify_routine(
     }
     let empty_fields = HashSet::new();
     let mut revealed = HashSet::new();
+    let mut generic_foralls = Vec::new();
     for (tag, req_e) in &r.requires {
-        s.push_str(&format!(
-            "  requires {}; // require:{tag}\n",
-            emit_boogie_expr_with_strings(
-                req_e,
-                m,
-                &empty_fields,
-                &revealed,
-                "DefaultFuel",
-                strings
-            )
-        ));
+        let req = emit_boogie_expr_with_strings(req_e, m, &empty_fields, &revealed, "DefaultFuel", strings);
+        if req.contains("forall") && !(r.type_params.is_empty() && m.type_params.is_empty()) {
+            generic_foralls.push(req.clone());
+        }
+        s.push_str(&format!("  requires {req}; // require:{tag}\n"));
     }
     s.push_str("{\n");
 
     let mut locals = Vec::new();
     collect_proc_locals(&r.stmts, &r.body, r, m, &mut locals);
-    let mut code = emit_string_literal_lemma_calls();
+    let mut code = String::new();
+    // After the locals, which Boogie wants first.
+    push_generic_forall_assumes(&mut code, &generic_foralls);
+    code.push_str(&emit_string_literal_lemma_calls());
     code.push_str("  //LITERAL_BYTE_LEMMAS_MARKER\n");
     for (_, req_e) in &r.requires {
         code.push_str(&emit_from_scalar_obligation(
@@ -11562,20 +11590,16 @@ fn emit_boogie_verify_law(
             s.push_str(&format!("  requires {fact};\n"));
         }
     }
+    let mut generic_foralls = Vec::new();
     for (tag, req_e) in &law.requires {
-        s.push_str(&format!(
-            "  requires {}; // require:{tag}\n",
-            emit_boogie_expr_with_strings(
-                req_e,
-                m,
-                &empty_fields,
-                &revealed,
-                "DefaultFuel",
-                strings
-            )
-        ));
+        let req = emit_boogie_expr_with_strings(req_e, m, &empty_fields, &revealed, "DefaultFuel", strings);
+        if req.contains("forall") && !(law.type_params.is_empty() && m.type_params.is_empty()) {
+            generic_foralls.push(req.clone());
+        }
+        s.push_str(&format!("  requires {req}; // require:{tag}\n"));
     }
     s.push_str("{\n");
+    push_generic_forall_assumes(&mut s, &generic_foralls);
     s.push_str(&emit_string_literal_lemma_calls());
     s.push_str("  //LITERAL_BYTE_LEMMAS_MARKER\n");
     let law_ctx = format!("{vis_prefix}{}", law.name);
@@ -13199,6 +13223,15 @@ fn wf_walk(k: WfKind<'_>, e: &Expr) -> Option<Expr> {
             }
             and_wf(acc, wf_walk(k, final_e))
         }
+    }
+}
+
+/// Boogie 3.4.3 never assumes a `requires` that quantifies over a type parameter of its
+/// procedure, while the same formula assumed in the body holds (Task H.21). A generic
+/// routine's or law's quantified `require` is therefore also assumed where its body starts.
+fn push_generic_forall_assumes(s: &mut String, reqs: &[String]) {
+    for req in reqs {
+        s.push_str(&format!("  assume {req}; // generic forall premise\n"));
     }
 }
 
@@ -15357,7 +15390,15 @@ fn emit_boogie_expr_with_strings(
                         "at" => {
                             return format!("Seq_at({}, {})", a_str[0], a_str[1]);
                         }
-                        _ => {}
+                        // Its other routines are ordinary functions (Task H.21): its own,
+                        // or injected into a client as any prelude module's are.
+                        _ => {
+                            let call_fuel = if revealed.contains(mname.as_str()) { "RevealFuel" } else { fuel_var };
+                            let mut full_args = vec![call_fuel.to_string()];
+                            full_args.extend(a_str);
+                            let owner = if m.name == "LIST_OPS" { String::new() } else { "LIST_OPS__".to_string() };
+                            return format!("{owner}fn_{mname}({})", full_args.join(", "));
+                        }
                     }
                 } else if v == "FUNCTION_OPS" {
                     let a_str: Vec<String> = args
@@ -22523,7 +22564,7 @@ fn main() {
             primary_bpl = bpl_path;
             primary_bend = bend_path;
             primary_c = c_path;
-            primary_exe = format!("build/{stem}_bin.exe");
+            primary_exe = format!("build/{stem}_bin{}", std::env::consts::EXE_SUFFIX);
         }
     }
 

@@ -48,8 +48,8 @@ From the repository root:
 
 ```powershell
 gardelc --project examples/hello_api --strict
-./build/hello_api_bin.exe        # on port 8090
-./build/hello_api_bin.exe 9000   # on port 9000
+./build/hello_api_bin        # on port 8090
+./build/hello_api_bin 9000   # on port 9000
 ```
 
 The executable is built in `build/` under the current directory.
@@ -87,7 +87,7 @@ A reactive program (spec §11.6) can run from a script of events instead of the 
 or digit:
 
 ```bash
-GARDEL_EVENTS="Accepted:1 Received:1:GET%20/hello/ana%20HTTP/1.1%0D%0A%0D%0A Shutdown" ./build/hello_api_bin.exe
+GARDEL_EVENTS="Accepted:1 Received:1:GET%20/hello/ana%20HTTP/1.1%0D%0A%0D%0A Shutdown" ./build/hello_api_bin
 ```
 
 ```text

@@ -6,6 +6,9 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
+/// The suffix gardelc gives an executable: `.exe` on Windows, none elsewhere.
+const EXE: &str = std::env::consts::EXE_SUFFIX;
+
 /// False at one input, which the verifier finds.
 const FALSE_AT_ONE_POINT: &str = "functions HIDE
 
@@ -397,7 +400,7 @@ fn a_build_names_its_executable_and_a_failed_c_compiler_is_a_diagnostic() {
     assert_eq!(note.get("level").str(), "note");
     assert_eq!(note.get("tag").str(), "executable");
     let exe = note.get("span").get("file").str();
-    assert_eq!(exe, "build/says_hi_bin.exe");
+    assert_eq!(exe, format!("build/says_hi_bin{EXE}"));
     assert!(dir.join(exe).is_file(), "{}", text(&out));
     // The steps are on standard error, so standard output stays one document.
     assert!(String::from_utf8_lossy(&out.stderr).contains("[5/5]"), "{}", text(&out));
@@ -431,7 +434,7 @@ fn a_build_names_its_executable_and_a_failed_c_compiler_is_a_diagnostic() {
     assert_eq!(d.get("span").get("file").str(), "build/says_hi.c");
     assert_eq!(d.get("span").get("line"), &Json::Number("3".to_string()));
     assert!(d.get("message").str().contains("build/says_hi.c:3:5: error: fake failure"), "{}", text(&failed));
-    assert!(!dir.join("build/says_hi_bin.exe").exists());
+    assert!(!dir.join(format!("build/says_hi_bin{EXE}")).exists());
 
     let plain = gardelc(&dir).arg("says_hi.gdl").env("PATH", &path).output().expect("gardelc runs");
     assert!(!plain.status.success(), "{}", text(&plain));

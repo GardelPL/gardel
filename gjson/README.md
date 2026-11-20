@@ -52,7 +52,7 @@ Two equal values are written as the same bytes: the writer adds no white space a
 
 ```
 gardelc --project gjson/tests --strict
-gjson/tests/build/gjson_test_bin.exe < gjson/tests/cases.txt
+gjson/tests/build/gjson_test_bin < gjson/tests/cases.txt
 ```
 
 ## Costs

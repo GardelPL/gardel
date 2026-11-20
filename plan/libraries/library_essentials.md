@@ -54,7 +54,7 @@ P8 is the one with no owner. F.7's POSIX code has never run, and every host task
 **P8, done (2026-11-19).** `scripts/linux/Dockerfile` is the toolchain CI pins for Windows, on Ubuntu 24.04: Rust stable, .NET 6 with Boogie 3.4.3, Z3 4.12.1 (checked against its hash) and gcc 13. `scripts/linux/test.sh` copies the tree into it, without `.git`, the build outputs and the Windows tools, and does what CI does: builds gardelc, verifies the stdlib and every example, and runs `cargo test --no-fail-fast`; its arguments go to `cargo test`. Where apt cannot reach its mirrors, `GARDEL_LINUX_BASE` names an Ubuntu 24.04 image that already has gcc. `.github/workflows/ci.yml` gets the same steps as a job `verify-linux` on `ubuntu-24.04`.
 - **Result.** The stdlib and the 16 examples are 0/0 on Linux, and their C builds there. The first run of the tests had 499 of 514 passing (Linux has one unit test more, behind `cfg(unix)`); the 15 failures were in the tests, not in the host or the compiler, and after the fixes all 514 pass, the timing tests alone as on Windows. F.7's sockets, F.11's files and processes, F.16's `WriteFile` and H.1's clock and generator, on POSIX, pass every test written for them on Windows: a connect that is refused, times out or reaches a server and replays, a flood of process output in order, a child given the terminal, a file replaced whole.
 - **What the tests had wrong.**
-  - `connect.rs` and `files_procs.rs` looked for `build/<stem>_bin` with the platform's suffix, which is none on Linux; gardelc writes `_bin.exe` on every platform, as the other tests know. 11 tests.
+  - `connect.rs` and `files_procs.rs` looked for `build/<stem>_bin` with the platform's suffix, which is none on Linux; gardelc then wrote `_bin.exe` on every platform, as the other tests knew. 11 tests. Since H.21, gardelc writes `_bin` with the platform's suffix, none on Linux and macOS, and every test asks for it so.
   - `derived.rs` expected exit status 421; POSIX keeps the low eight bits, 165.
   - `gtui.rs` and `tablon.rs` gave a 5000-line text in one script token, each byte as `%XX`: about 150 KB, and Linux refuses an environment variable over 128 KiB (`E2BIG`) before the program starts. Only what a script cannot hold as it is is escaped now (84 KB and 106 KB), and Tablon's lines lost their two leading spaces.
   - `gtui`'s full redraw took 24.6 ms a frame beside the other `gtui` tests, and 145 s for the test alone passed; it is one of the tests `check.sh` already runs alone.
@@ -379,22 +379,61 @@ Client: every server example. `Print` writes to standard output with a newline, 
 
 #### Task H.21: List Operations and Their Laws
 
-Client: sorting (H.3) needs `merge`, `take` and `reverse`; `join` and `split` (H.6) need `concat`; `gparse` (H.7) needs `take_while`. Without this task each writes its own copy, as `BYTES` already did with `list_take`. Needs P1. No compiler work. Brings `LIST_OPS` up to B&W §3.3 to §3.5.
+Client: sorting (H.3) needs `merge`, `take` and `reverse`; `join` and `split` (H.6) need `concat`; `gparse` (H.7) needs `take_while`. Without this task each writes its own copy, as `BYTES` already did with `list_take`. Needs P1. Brings `LIST_OPS` up to B&W §3.3 to §3.5.
 
-- [ ] Move `list_take` and `list_drop` from `stdlib/text/bytes.gdl` into `LIST_OPS` as `take` and `drop`, and have `BYTES` use them.
-- [ ] Add `reverse`, `concat`, `take_while`, `drop_while`, `zip`, `zip_with`, `last`, `init`, `concat_map`, `range(lo, hi)` and `iterate_n(f, x, n)`. Each is total, with a `variant`.
-- [ ] Give `filter` a `cons_case`, as `map` has. Today it states only `not_longer` and `empty_case`, so a client cannot prove which items are kept.
-- [ ] Laws on lists (B&W §3.3, §3.4): `take(n, xs).append(drop(n, xs)) = xs`, `take_while` and `drop_while` the same, `reverse(reverse(xs)) = xs`, `reverse(xs.append(ys)) = reverse(ys).append(reverse(xs))`, `zip`'s length is the shorter one's, map fusion on `LIST` (only `SEQ` has it), and `filter(map(xs, f), p) = map(filter(xs, compose(p, f)), f)`.
-- [ ] Fold laws (B&W §3.5.1), each stated with a `require` that the operators are associative and `init` is their identity, as quantified premises:
-  - First duality theorem: `fold_right` and `fold_left` agree over a monoid.
-  - Second duality theorem: for two operators that associate with each other.
-  - Third duality theorem: `fold_right(xs, f, a) = fold_left(reverse(xs), flip(f), a)`.
-  - Homomorphism: a monoid fold of `xs.append(ys)` is the operator applied to the folds of each.
-- [ ] Use the first duality theorem in `SEQ`: its parallel fold matches the sequential `LIST` model, which is what H.3's parallel merge sort and F.14's cutoff rest on.
-- [ ] `concat_map` gets the monad laws `OPTION` and `RESULT` have, under the same names.
-- [ ] Fix spec §4.1, which lists `append`, `length` and `reverse` in `LIST_OPS`: the first two are `LIST` built-ins, and the third is added here.
-- Acceptance: every law is proven, and each is used by a client that sees no body, with a false version refused. A client writes B&W §3.2's `[(i, j) | i <- [1..4]; j <- [i+1..4]]` as two `concat_map` calls over `range` and proves its length is 6.
-- Risk: a law with a `forall` over a function's associativity can stall the solver. If one does, state it for a named operator in a concept once H.0a exists (`MONOID`), and record which.
+**Status:** ✅ Completed (2026-11-19). It took compiler work after all: see "The proof".
+
+- [x] `list_take` and `list_drop` moved from `stdlib/text/bytes.gdl` into `LIST_OPS` as `take` and `drop`, total, and `BYTES`, `STRING` and `ghttp` use them.
+- [x] `reverse` (with `reverse_onto`), `concat`, `take_while`, `drop_while`, `zip`, `zip_with`, `last`, `init`, `concat_map`, `range(lo, hi)` and `iterate_n(f, x, n)`. Each has a `variant`, and each is total except `last` and `init`, which need a non-empty list.
+- [x] `filter` states which items it keeps (`kept_case`, `dropped_case`).
+- [x] Laws on lists:
+  - `take_drop`, `take_while_drop_while`, `reverse_reverse`, `reverse_append`, `reverse_cons`, `init_last`, `map_fusion` and `filter_map`;
+  - `zip`'s length, which is the shorter list's, is a contract (`len`).
+- [x] Fold laws: `fold_duality_first`, `fold_duality_second`, `fold_duality_third` and `fold_homomorphism`. Each takes its premises as quantified `require`s. The third takes the flipped function as a parameter `g` with the premise `g(q, p) = f(p, q)`, since a law that holds an `fn` is not given to clients.
+- [x] `SEQ.reduce(f, e)` folds the two sides of a `Concat` apart. The law `SEQ.reduce_folds` makes it both sequential folds of the model over a monoid, by `fold_homomorphism` and the first duality theorem.
+- [x] `concat_map`:
+  - `concat_map_is_concat_map` (it is `concat` after `map`) and `concat_map_append`;
+  - the monad laws `concat_map_left_unit`, `concat_map_right_identity` and `concat_map_associative`, named as `OPTION`'s. The last two take the unit and the composed function as parameters with premises, for the same reason as the third duality theorem.
+- [x] Spec §4.1 lists the built-ins, the new routines and the laws. §3's `slice` says `LIST_OPS.take(LIST_OPS.drop(...))`.
+- Acceptance: met. Every law is proven, used by a client and refused in a false version (`tests/list_ops.rs`). The B&W §3.2 pairs are two `concat_map`s over `range(1, 5)`, proven to number six and printed by the program.
+- **The proof.**
+  - **Built-ins.** `map`, `filter`, `fold_left`, `fold_right` and `at` stay the verifier's built-in `Seq_*` functions, with their trusted axioms.
+  - **Ordinary routines.** The new routines are ordinary prelude functions with fuel-guarded definitions and contract axioms, as `BYTES`' are. `LIST_OPS` was never injected into a client, and every `LIST_OPS.x` call was taken for a built-in, so three places changed:
+    - a call to any other routine is translated as a call to `LIST_OPS__fn_x`, or to `fn_x` inside `LIST_OPS`;
+    - the prelude call target and the call rewriting stop at the five built-ins only, so a client's call to `last` has its `require` checked;
+    - `LIST_OPS` is injected, or linked under `--stdlib`, into a module that calls one of its ordinary routines, and into `BYTES` and `SEQ`. That rule follows the loop over representations, which can bring `BYTES` in, as `COMMAND` does. A module that uses only the built-ins gets the same `.bpl` as before.
+  - **Boogie bug.** Boogie 3.4.3 never assumes a `requires` that quantifies over a type parameter of its own procedure: `requires (forall p: A :: Fn2_app(f, e, p) == p)` does not prove `Fn2_app(f, e, a) == a` in a ten-line file, while the same formula as an `assume` does, under `/typeEncoding:p` and `:a` alike. A generic routine's or law's quantified `require` is therefore also assumed where its body starts, after the locals. Before this, each fold law failed and one ran out of resources.
+  - **Facts.** Inside `LIST_OPS` a law is not an axiom, so the induction steps that other proofs need are private BOOL routines (`onto_fact`, `snoc_fact`, `append_fact`, `monoid_acc_fact`, `mixed_acc_fact` and `concat_map_append_fact`), as `LIST_FACTS` does in `gtui`. Their equalities sit in `check` blocks, since `=` on a list may not run.
+- **Result.** `tests/list_ops.rs` has two tests.
+  - **Truths.** A program calls each new law and `SEQ.reduce_folds` in a `check`, and proves what the law states. It proves the B&W §3.2 pairs number six. It runs in C and prints `take`, `drop` (also past the end), `reverse`, `take_while`, `drop_while`, `zip_with`, `zip`'s length, `last`, `init`, `concat`, `iterate_n`, `reduce` and the first pair.
+  - **Lies.** Nine are refused, one each:
+    - `take(xs, n).length = n` without `fits`;
+    - `reverse(xs) = xs`;
+    - `reverse_append` in the wrong order;
+    - the first duality theorem for a function that is no monoid's;
+    - the third for a function that is not the flip;
+    - `concat_map_associative` with an `h` that is not `f` then `g`;
+    - `reduce_folds` for `and` with `False`;
+    - `last` of a list that may be empty;
+    - seven pairs.
+  - **Totals.** All 519 tests pass, the 234 unit tests and 40 suites. The stdlib, the 8 single-file examples, every project and every package are 0/0. Each was proven again, as the prelude changed: `ghttp`, on the moved `take` and `drop`, in 298 s, `api_gateway` in 398 s, `gtui` in 197 s and `grest` in 164 s, and Tablon builds (`tests/tablon.rs`).
+  - **Linux.** `scripts/linux/test.sh` passes `list_ops`, `elements`, `inspect_json` and `packages`, the program built by gcc 13 with no warning and run as `build/main_bin`. The suites renamed for the executable without `.exe` (`connect`, `files_procs`, `log_env`, `clock_random`, `derived` and `list_length`) pass there too.
+- **Mutations.** Six of seven mutations of the compiler change turn a test red:
+  - a client's call to `last` with its `require` unchecked (`list_ops`);
+  - the generic `forall` premises not assumed (the stdlib unit test);
+  - `LIST_OPS` not injected for a client's call (`list_ops`);
+  - `BYTES` not bringing `LIST_OPS` (`elements`);
+  - `--stdlib` linking never linking `LIST_OPS` (the project-mode stdlib unit test, not the other one);
+  - `last` taken for a built-in (`list_ops`).
+
+  The seventh names a client's call `fn_x` in the fallback for `LIST_OPS` calls, and is equivalent: a client's call is renamed `LIST_OPS__fn_x` by the prelude call rewriting before it reaches the fallback.
+- **Known limits.**
+  - A premise over a number type quantifies over every integer, because a lambda is defined for every integer. A function on `NAT` such as `max` with identity `0` therefore fails `left_identity` at `-1`. The tests use `BOOL` operators.
+  - `SEQ.reduce` first had the monoid premises as its own `require`. A client then had to prove three nested `forall`s inside the instantiated contract axiom, and ran out of resources even on a true call. As a law, `reduce_folds`, the premises are proven once, at the call to the law, as for `LIST_OPS`' laws. A `MONOID` concept (H.0a) would remove the premises altogether, and is not done.
+  - A `LIST[U64]` built by `map` or `concat_map` from a function argument that returns a `U64` is not known to hold `U64`s (H.0b's rule for function values covers only a function's own result). The tests map to `BOOL`.
+  - A list's length is not known to fit in a `U64`, so `take(xs, n).length + drop(xs, n).length` may overflow in a proof.
+  - Each operation recurses once per item, so a list of millions of items can exhaust the C stack. `gtui`'s `LIST_CUT` builds with an accumulator for this, and could now use `reverse_onto`.
+  - `gtui`'s `LIST_FACTS` and `LIST_CUT` duplicate part of `LIST_OPS` and are left as they are.
 
 #### Task H.22: `GENERATOR`
 

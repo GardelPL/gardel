@@ -23,6 +23,9 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::sync::OnceLock;
 
+/// The suffix gardelc gives an executable: `.exe` on Windows, none elsewhere.
+const EXE: &str = std::env::consts::EXE_SUFFIX;
+
 fn root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("..")
 }
@@ -50,7 +53,7 @@ fn tablon() -> &'static Path {
             .expect("gardelc runs");
         assert!(out.status.success(), "{}", all(&out));
         assert!(all(&out).contains("0 errors, 0 warnings"), "{}", all(&out));
-        dir.join("build/tablon_bin.exe")
+        dir.join(format!("build/tablon_bin{EXE}"))
     })
 }
 

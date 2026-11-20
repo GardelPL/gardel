@@ -13,6 +13,9 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
+/// The suffix gardelc gives an executable: `.exe` on Windows, none elsewhere.
+const EXE: &str = std::env::consts::EXE_SUFFIX;
+
 fn root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("..")
 }
@@ -154,7 +157,7 @@ fn connect(port: u16) -> TcpStream {
 
 /// The gateway, on `port`, in front of the upstream on `up`, once it listens.
 fn gateway(dir: &Dir, port: u16, up: u16) -> Child {
-    let child = Command::new(dir.0.join("build/api_gateway_bin.exe"))
+    let child = Command::new(dir.0.join(format!("build/api_gateway_bin{EXE}")))
         .args([port.to_string(), up.to_string()])
         .spawn()
         .expect("the gateway starts");

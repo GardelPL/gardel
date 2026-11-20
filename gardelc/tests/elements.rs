@@ -120,7 +120,7 @@ create {ANY}
     require
       fits: n <= xs.length
     do
-      BYTES.list_drop(xs, n)
+      LIST_OPS.drop(xs, n)
     end
 
   seq_head(s: SEQ[I64]): BOOL

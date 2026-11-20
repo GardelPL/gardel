@@ -8,6 +8,9 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 
+/// The suffix gardelc gives an executable: `.exe` on Windows, none elsewhere.
+const EXE: &str = std::env::consts::EXE_SUFFIX;
+
 fn root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("..")
 }
@@ -79,7 +82,7 @@ fn grest_verifies_and_holds_every_case() {
     let tests = root().join("grest/tests");
     assert_ok(&check_at(&tests, &cache));
     let cases = fs::read(tests.join("cases.txt")).expect("cases.txt");
-    let mut run = Command::new(tests.join("build/grest_test_bin.exe"))
+    let mut run = Command::new(tests.join(format!("build/grest_test_bin{EXE}")))
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .spawn()
@@ -314,7 +317,7 @@ end
 
 /// A scripted run of `service`, with `args` and the events `events`.
 fn run_service(service: &Project, args: &[&str], events: &str) -> Output {
-    Command::new(service.dir.join("build/client_bin.exe"))
+    Command::new(service.dir.join(format!("build/client_bin{EXE}")))
         .args(args)
         .env("GARDEL_EVENTS", events)
         .output()

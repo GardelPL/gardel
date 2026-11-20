@@ -220,7 +220,7 @@ flowchart TD
 - **Definition:** `module BYTES` is an opaque Standard Prelude ADT (`representation {NONE}`) encapsulating a sequence of 8-bit octets (`items: LIST[U64]` with module invariant `all_octets(items)`, every element $< 256$) and exposing the canonical ghost model `specify model: LIST[U64]`. It also hosts the UTF-8 theory of octet sequences: `valid_utf8(bs)` (RFC 3629 well-formedness: shortest form, no surrogates, at most U+10FFFF), the decoder `decode_utf8(bs): LIST[CHAR]` (requires `valid_utf8(bs)`), and three laws proven by structural induction: `utf8_octets` (well-formed sequences are octets), `utf8_append` (well-formedness is closed under concatenation and decoding distributes over it) and `decode_injective` (decoding is injective on well-formed sequences, which makes `STRING.equals` byte equality and character equality at once).
 - **Operations (Task F.2).** Each one is stated on `model`:
   - `concat(other: BYTES): BYTES`. Precondition: the total length fits a `U64`. Postcondition: `Result.model = Current.model.append(other.model)`.
-  - `slice(lo, hi)`: `Result.model = list_take(list_drop(Current.model, lo), hi - lo)`, with `lo <= hi <= Current.length`. In C it shares the buffer.
+  - `slice(lo, hi)`: `Result.model = LIST_OPS.take(LIST_OPS.drop(Current.model, lo), hi - lo)`, with `lo <= hi <= Current.length`. In C it shares the buffer.
   - `matches_at(other, offset, i)`, `starts_with(prefix)`, `index_of_byte(b, from)` and `index_of(other, from)`. The two searches give the first offset at or after `from`, and `None` only when there is none (`found`, `first`, `absent`, as for `STRING.find`).
   - `list_less(xs, ys)` is the byte order that `STRING` uses, with the laws `less_irreflexive`, `less_transitive` and `less_total`. `utf8_offset(bs, i)` is the byte offset of scalar `i`.
   - `at(i)` is constant time in C. On 64 KB input, summing every byte with `at`, and `find`, stay within start-up noise. `concat` copies both sides, so building a buffer one byte at a time with it is quadratic: use `BYTES_BUILDER`.
@@ -319,7 +319,7 @@ The Standard Prelude provides an irreducible core of verified concepts, algebrai
 - **Mathematical Ghost Types & Specification Modules (§2, §6, §8):**
   - `LIST[A]`: The canonical inductive sequence ADT (`Nil | Cons(head: A, tail: LIST[A])`). `LIST` has **dual status**: it is the canonical ghost model of Dual-Layer Model Refinement (§2) *and* an ordinary sequential runtime structure that may appear in `representation` sections (e.g., `BOUNDED_STACK.items`, `BIGNAT.limbs`, `STRING.bytes`) and in runtime `do` bodies. Only its use as a model (inside `specify` queries and contracts) is erased.
   - `MATH_INT`: The built-in unbounded mathematical integer sort ($\mathbb{Z}$) mapping directly to native SMT linear integer arithmetic (`Int`). Unlike `LIST`, `MATH_INT` is **strictly ghost-only** (§3).
-  - `functions LIST_OPS`: Inductive list operations over `LIST[A]` (`at`, `map`, `filter`, `fold_left`, `fold_right`; `append`, `length`, `head`, `tail`, `prepend` and `has` are `LIST` built-ins, and `reverse` with the rest of the list operations is planned in Phase H, task H.21) serving as reference targets for Dual-Layer Model Refinement (§2). Its `feature {ANY}` routines are executable (sequential, $O(n)$); its `specify` laws are erased.
+  - `functions LIST_OPS`: Inductive list operations over `LIST[A]` (`at`, `map`, `filter`, `fold_left`, `fold_right`, which the verifier realizes as built-ins, and `take`, `drop`, `reverse`, `reverse_onto`, `concat`, `take_while`, `drop_while`, `zip`, `zip_with`, `last`, `init`, `concat_map`, `range` and `iterate_n`, ordinary functions proven by their own laws; `append`, `length`, `head`, `tail`, `prepend` and `has` are `LIST` built-ins). Its laws include B&W §3.3 to §3.5: `take_drop`, `take_while_drop_while`, `reverse_reverse`, `reverse_append`, `map_fusion`, `filter_map`, the three duality theorems and `fold_homomorphism`, and the monad laws of `concat_map`. A law about a function argument states what it needs of it as `forall` premises in its `require` serving as reference targets for Dual-Layer Model Refinement (§2). Its `feature {ANY}` routines are executable (sequential, $O(n)$); its `specify` laws are erased.
   - `functions FUNCTION_OPS`: Pointwise combinators (`id_fn`, `compose`) with verified category-theoretic identity and associativity laws.
 
 #### 3. Namespace Collision, Shadowing & Bootstrap Rules
@@ -2520,7 +2520,7 @@ The array is the same document whatever the run does: with `--json-diagnostics` 
 | :--- | :--- | :--- |
 | `E0401: c_compile_failed` | `error` | The C compiler refused the C file of a program that verified. `span` is the first place it names in that file (else its first line), and `message` quotes its first 20 lines. The proofs stand; there is no executable, and the run exits with 1. |
 | `W0401: c_compiler_missing` | `warning` | `gcc` could not be started, so there is no executable. |
-| `Build` | `note` | The executable was built: `tag` is `"executable"` and `span.file` its path, such as `build/main_bin.exe`. |
+| `Build` | `note` | The executable was built: `tag` is `"executable"` and `span.file` its path, such as `build/main_bin` (`build/main_bin.exe` on Windows). |
 
 `--run` runs that executable after the build; the proofs were checked before it.
 

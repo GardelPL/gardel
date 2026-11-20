@@ -20,6 +20,9 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::time::{Duration, Instant};
 
+/// The suffix gardelc gives an executable: `.exe` on Windows, none elsewhere.
+const EXE: &str = std::env::consts::EXE_SUFFIX;
+
 fn root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("..")
 }
@@ -54,7 +57,7 @@ impl Dir {
     }
 
     fn bin(&self, program: &str) -> PathBuf {
-        self.0.join(format!("build/{program}_bin.exe"))
+        self.0.join(format!("build/{program}_bin{EXE}"))
     }
 }
 

@@ -1,6 +1,6 @@
 # Cases for GREST_TEST, read on standard input:
 #
-#   build/grest_test_bin.exe < grest/tests/cases.txt
+#   build/grest_test_bin < grest/tests/cases.txt
 #
 # Each line is a case, ` => `, and what it must give. See `src/grest_text.gdl` for the kinds.
 # Lines that start with # and empty lines are skipped.

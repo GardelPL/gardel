@@ -1,6 +1,6 @@
 # Parser cases for GHTTP_TEST, read on standard input:
 #
-#   build/ghttp_test_bin.exe < ghttp/tests/cases.txt
+#   build/ghttp_test_bin < ghttp/tests/cases.txt
 #
 # Each line is a request, ` => `, and what the parser must say of it, whole and cut into
 # two reads at every byte. In the request, \r, \n, \t and \\ stand for CR, LF, tab and a

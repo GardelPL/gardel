@@ -50,7 +50,7 @@ A successful run outputs:
 [3/5] Emitted direct Boogie VCs & fuel axioms -> build/echo_server.bpl, build/server_state.bpl (one per module; primary `ECHO_SERVER`)
 [4/5] Emitted monomorphized Bend v2 target    -> build/echo_server.bend
 [5/5] Emitted C11 runtime target              -> build/echo_server.c
-      Compiled native executable              -> build/echo_server_bin.exe
+      Compiled native executable              -> build/echo_server_bin
 ```
 
 ---
@@ -62,7 +62,7 @@ Start the server via `gardelc --run` or by running the compiled executable direc
 ```bash
 gardelc --project examples/echo_server --run
 # or directly:
-./build/echo_server_bin.exe
+./build/echo_server_bin
 ```
 
 By default, `Listen(8888)` binds to loopback (`127.0.0.1:8888`). To bind to another address, set `GARDEL_LISTEN_ADDR` (for example `GARDEL_LISTEN_ADDR=0.0.0.0`).
@@ -118,13 +118,13 @@ You can test connection admission, echoing, and the 64-connection limit without 
 **PowerShell:**
 ```powershell
 $env:GARDEL_EVENTS = "Accepted:1 Accepted:2 Received:1:hi%20there Closed:1 Received:2:%FF%00 Closed:2 Shutdown"
-./build/echo_server_bin.exe
+./build/echo_server_bin
 Remove-Item Env:\GARDEL_EVENTS
 ```
 
 **Bash:**
 ```bash
-GARDEL_EVENTS="Accepted:1 Accepted:2 Received:1:hi%20there Closed:1 Received:2:%FF%00 Closed:2 Shutdown" ./build/echo_server_bin.exe
+GARDEL_EVENTS="Accepted:1 Accepted:2 Received:1:hi%20there Closed:1 Received:2:%FF%00 Closed:2 Shutdown" ./build/echo_server_bin
 ```
 
 **Output (on `stderr`):**
@@ -143,7 +143,7 @@ To see the exact connection IDs and payloads of real TCP clients connecting to t
 **PowerShell:**
 ```powershell
 $env:GARDEL_RECORD = "echo_session.log"
-./build/echo_server_bin.exe
+./build/echo_server_bin
 # Connect with clients in another terminal, then press Ctrl+C to stop the server
 Remove-Item Env:\GARDEL_RECORD
 Get-Content echo_session.log
@@ -151,7 +151,7 @@ Get-Content echo_session.log
 
 **Bash:**
 ```bash
-GARDEL_RECORD=echo_session.log ./build/echo_server_bin.exe
+GARDEL_RECORD=echo_session.log ./build/echo_server_bin
 # Connect with clients in another terminal, then press Ctrl+C
 cat echo_session.log
 ```
@@ -165,13 +165,13 @@ Any log recorded with `GARDEL_RECORD` can be replayed offline as a regression te
 **PowerShell:**
 ```powershell
 $env:GARDEL_REPLAY = "echo_session.log"
-./build/echo_server_bin.exe
+./build/echo_server_bin
 Remove-Item Env:\GARDEL_REPLAY
 ```
 
 **Bash:**
 ```bash
-GARDEL_REPLAY=echo_session.log ./build/echo_server_bin.exe
+GARDEL_REPLAY=echo_session.log ./build/echo_server_bin
 ```
 
 During replay, no sockets are opened: the runtime feeds the recorded events into `init` and `step` and verifies that every emitted command and the exit status match the recording (exiting with status `3` on the first mismatch).

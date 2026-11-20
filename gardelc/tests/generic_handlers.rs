@@ -14,6 +14,9 @@ use std::fs;
 use std::path::PathBuf;
 use std::process::{Command, Output, Stdio};
 
+/// The suffix gardelc gives an executable: `.exe` on Windows, none elsewhere.
+const EXE: &str = std::env::consts::EXE_SUFFIX;
+
 struct World {
     dir: PathBuf,
 }
@@ -275,7 +278,7 @@ fn a_chain_of_generic_calls_with_handlers_verifies_and_runs() {
     ));
     let out = world.check();
     assert!(out.status.success() && all(&out).contains("0 errors, 0 warnings"), "{}", all(&out));
-    let run = Command::new(world.dir.join("app/build/app_bin.exe"))
+    let run = Command::new(world.dir.join(format!("app/build/app_bin{EXE}")))
         .stdout(Stdio::piped())
         .output()
         .expect("the program runs");

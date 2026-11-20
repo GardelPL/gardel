@@ -299,20 +299,20 @@ feature {ANY}
         first_left: BYTES.utf8_split_left(Current.bytes, lo)
         first_right: BYTES.utf8_split_right(Current.bytes, lo)
       end
-      let rest = BYTES.list_drop(Current.bytes, a)
+      let rest = LIST_OPS.drop(Current.bytes, a)
       let b = BYTES.utf8_offset(rest, hi - lo)
       check
         second_left: BYTES.utf8_split_left(rest, hi - lo)
         second_right: BYTES.utf8_split_right(rest, hi - lo)
       end
-      { bytes = BYTES.list_take(rest, b),
+      { bytes = LIST_OPS.take(rest, b),
         size = b,
         char_count = hi - lo,
         limit = if b = 0 then 1 else b end }
     ensure
       count: Result.code_point_count = hi - lo
       no_longer: Result.byte_length <= Current.byte_length
-      chars_slice: Result.chars = BYTES.list_take(BYTES.list_drop(Current.chars, lo), hi - lo)
+      chars_slice: Result.chars = LIST_OPS.take(LIST_OPS.drop(Current.chars, lo), hi - lo)
     end
 
   -- Whether `other` occurs at scalar index `offset`, from its index `i` on.
@@ -479,8 +479,8 @@ feature {ANY}
       Current.slice(lo, Current.space_start(Current.code_point_count, lo))
     ensure
       no_longer: Result.byte_length <= Current.byte_length
-      trimmed: Result.chars = BYTES.list_take(
-        BYTES.list_drop(Current.chars, Current.space_end(0)),
+      trimmed: Result.chars = LIST_OPS.take(
+        LIST_OPS.drop(Current.chars, Current.space_end(0)),
         Current.space_start(Current.code_point_count, Current.space_end(0)) - Current.space_end(0))
     end
 

@@ -3,7 +3,7 @@
 -- goes on serving other requests.
 --
 --   gardelc --project examples/api_gateway --strict
---   build/api_gateway_bin.exe [port] [upstream port]   (8092 and 8091 when not given)
+--   build/api_gateway_bin [port] [upstream port]   (8092 and 8091 when not given)
 --
 --   GET /health      200 "ok", from the gateway itself
 --   GET /todos/:id   the upstream's status, media type and body for GET /todos/:id;

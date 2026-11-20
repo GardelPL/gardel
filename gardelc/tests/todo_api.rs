@@ -7,6 +7,9 @@ use std::io::{Read, Write};
 use std::path::PathBuf;
 use std::process::{Command, Output};
 
+/// The suffix gardelc gives an executable: `.exe` on Windows, none elsewhere.
+const EXE: &str = std::env::consts::EXE_SUFFIX;
+
 fn root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("..")
 }
@@ -122,7 +125,7 @@ fn todo_api_verifies_and_serves_crud_over_sockets() {
 
     // A port nothing holds: the one the system gives, let go of.
     let port = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("a free port").local_addr().expect("its address").port();
-    let mut server = Command::new(dir.0.join("build/todo_api_bin.exe"))
+    let mut server = Command::new(dir.0.join(format!("build/todo_api_bin{EXE}")))
         .arg(port.to_string())
         .spawn()
         .expect("the service starts");
@@ -200,7 +203,7 @@ fn todo_api_verifies_and_serves_crud_over_sockets() {
 /// it answers at `Info` on standard error; the run's recording replays to the same lines.
 fn logs_each_request_on_the_port_from_the_environment(dir: &Dir) {
     let port = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("a free port").local_addr().expect("its address").port();
-    let mut server = Command::new(dir.0.join("build/todo_api_bin.exe"))
+    let mut server = Command::new(dir.0.join(format!("build/todo_api_bin{EXE}")))
         .current_dir(&dir.0)
         .env("TODO_API_PORT", port.to_string())
         .env("GARDEL_RECORD", "env.log")
@@ -243,7 +246,7 @@ fn logs_each_request_on_the_port_from_the_environment(dir: &Dir) {
 
     // The recording stops where the service was killed; its replay listens on nothing, reads
     // no variable, and writes the same lines.
-    let again = Command::new(dir.0.join("build/todo_api_bin.exe"))
+    let again = Command::new(dir.0.join(format!("build/todo_api_bin{EXE}")))
         .current_dir(&dir.0)
         .env("GARDEL_REPLAY", "env.log")
         .env_remove("TODO_API_PORT")

@@ -85,9 +85,9 @@ From the repository root:
 ```powershell
 gardelc --project examples/todo_api --strict
 gardelc --project examples/api_gateway --strict
-./build/todo_api_bin.exe                 # on port 8091
-./build/api_gateway_bin.exe              # on port 8092, in front of 8091
-./build/api_gateway_bin.exe 9000 9001    # on port 9000, in front of 9001
+./build/todo_api_bin                 # on port 8091
+./build/api_gateway_bin              # on port 8092, in front of 8091
+./build/api_gateway_bin 9000 9001    # on port 9000, in front of 9001
 ```
 
 In another terminal:

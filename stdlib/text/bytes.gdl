@@ -182,38 +182,6 @@ create {ANY}
       end
     end
 
-  -- The first `n` elements and what follows them. These are what a slice means. They are
-  -- generic because `STRING` states the same thing over `chars`.
-  list_take[A](xs: LIST[A], n: NAT): LIST[A]
-    require
-      fits: n <= xs.length
-    variant
-      n
-    do
-      if n = 0 then
-        LIST.empty
-      else
-        list_take(xs.tail, n - 1).prepend(xs.head)
-      end
-    ensure
-      len: Result.length = n
-    end
-
-  list_drop[A](xs: LIST[A], n: NAT): LIST[A]
-    require
-      fits: n <= xs.length
-    variant
-      n
-    do
-      if n = 0 then
-        xs
-      else
-        list_drop(xs.tail, n - 1)
-      end
-    ensure
-      len: Result.length = xs.length - n
-    end
-
 create {NONE}
 
   -- `utf8_step_2` as a routine: inside this module a law is not an axiom, a contract is.
@@ -299,7 +267,7 @@ create {NONE}
         octets_take(xs.tail, n - 1).prepend(xs.head)
       end
     ensure
-      same: Result = list_take(xs, n)
+      same: Result = LIST_OPS.take(xs, n)
       octets: all_octets(Result)
     end
 
@@ -316,7 +284,7 @@ create {NONE}
         octets_drop(xs.tail, n - 1)
       end
     ensure
-      same: Result = list_drop(xs, n)
+      same: Result = LIST_OPS.drop(xs, n)
       octets: all_octets(Result)
     end
 
@@ -574,12 +542,12 @@ specify {ANY}
           bs.tail.prepend(bs.head) = bs and
           decode_utf8(bs) = decode_utf8(bs.tail).prepend(CHAR.from_scalar(bs.head)) and
           utf8_offset(bs, i) = k + 1 and
-          list_take(bs, k + 1) = list_take(bs.tail, k).prepend(bs.head) and
-          list_take(bs, k + 1) = list_take(bs.tail, k).prepend(bs.head) and
-          valid_utf8(list_take(bs.tail, k).prepend(bs.head)) and
-          decode_utf8(list_take(bs.tail, k).prepend(bs.head)) =
-            decode_utf8(list_take(bs.tail, k)).prepend(CHAR.from_scalar(bs.head)) and
-          list_take(decode_utf8(bs), i) = list_take(decode_utf8(bs.tail), i - 1).prepend(decode_utf8(bs).head)
+          LIST_OPS.take(bs, k + 1) = LIST_OPS.take(bs.tail, k).prepend(bs.head) and
+          LIST_OPS.take(bs, k + 1) = LIST_OPS.take(bs.tail, k).prepend(bs.head) and
+          valid_utf8(LIST_OPS.take(bs.tail, k).prepend(bs.head)) and
+          decode_utf8(LIST_OPS.take(bs.tail, k).prepend(bs.head)) =
+            decode_utf8(LIST_OPS.take(bs.tail, k)).prepend(CHAR.from_scalar(bs.head)) and
+          LIST_OPS.take(decode_utf8(bs), i) = LIST_OPS.take(decode_utf8(bs.tail), i - 1).prepend(decode_utf8(bs).head)
         else
           if bs.head <= 223 then
             let k = utf8_offset(bs.tail.tail, i - 1)
@@ -588,11 +556,11 @@ specify {ANY}
             bs.tail.tail.prepend(bs.tail.head) = bs.tail and
             step_2(bs.head, bs.tail.head, bs.tail.tail) and
             utf8_offset(bs, i) = k + 2 and
-            list_take(bs, k + 2) = list_take(bs.tail, k + 1).prepend(bs.head) and
-            list_take(bs.tail, k + 1) = list_take(bs.tail.tail, k).prepend(bs.tail.head) and
-            list_take(bs, k + 2) = list_take(bs.tail.tail, k).prepend(bs.tail.head).prepend(bs.head) and
-            step_2(bs.head, bs.tail.head, list_take(bs.tail.tail, k)) and
-            list_take(decode_utf8(bs), i) = list_take(decode_utf8(bs.tail.tail), i - 1).prepend(decode_utf8(bs).head)
+            LIST_OPS.take(bs, k + 2) = LIST_OPS.take(bs.tail, k + 1).prepend(bs.head) and
+            LIST_OPS.take(bs.tail, k + 1) = LIST_OPS.take(bs.tail.tail, k).prepend(bs.tail.head) and
+            LIST_OPS.take(bs, k + 2) = LIST_OPS.take(bs.tail.tail, k).prepend(bs.tail.head).prepend(bs.head) and
+            step_2(bs.head, bs.tail.head, LIST_OPS.take(bs.tail.tail, k)) and
+            LIST_OPS.take(decode_utf8(bs), i) = LIST_OPS.take(decode_utf8(bs.tail.tail), i - 1).prepend(decode_utf8(bs).head)
           else
             if bs.head <= 239 then
               let k = utf8_offset(bs.tail.tail.tail, i - 1)
@@ -602,12 +570,12 @@ specify {ANY}
               bs.tail.tail.tail.prepend(bs.tail.tail.head) = bs.tail.tail and
               step_3(bs.head, bs.tail.head, bs.tail.tail.head, bs.tail.tail.tail) and
               utf8_offset(bs, i) = k + 3 and
-              list_take(bs, k + 3) = list_take(bs.tail, k + 2).prepend(bs.head) and
-              list_take(bs.tail, k + 2) = list_take(bs.tail.tail, k + 1).prepend(bs.tail.head) and
-              list_take(bs.tail.tail, k + 1) = list_take(bs.tail.tail.tail, k).prepend(bs.tail.tail.head) and
-              list_take(bs, k + 3) = list_take(bs.tail.tail.tail, k).prepend(bs.tail.tail.head).prepend(bs.tail.head).prepend(bs.head) and
-              step_3(bs.head, bs.tail.head, bs.tail.tail.head, list_take(bs.tail.tail.tail, k)) and
-              list_take(decode_utf8(bs), i) = list_take(decode_utf8(bs.tail.tail.tail), i - 1).prepend(decode_utf8(bs).head)
+              LIST_OPS.take(bs, k + 3) = LIST_OPS.take(bs.tail, k + 2).prepend(bs.head) and
+              LIST_OPS.take(bs.tail, k + 2) = LIST_OPS.take(bs.tail.tail, k + 1).prepend(bs.tail.head) and
+              LIST_OPS.take(bs.tail.tail, k + 1) = LIST_OPS.take(bs.tail.tail.tail, k).prepend(bs.tail.tail.head) and
+              LIST_OPS.take(bs, k + 3) = LIST_OPS.take(bs.tail.tail.tail, k).prepend(bs.tail.tail.head).prepend(bs.tail.head).prepend(bs.head) and
+              step_3(bs.head, bs.tail.head, bs.tail.tail.head, LIST_OPS.take(bs.tail.tail.tail, k)) and
+              LIST_OPS.take(decode_utf8(bs), i) = LIST_OPS.take(decode_utf8(bs.tail.tail.tail), i - 1).prepend(decode_utf8(bs).head)
             else
               let k = utf8_offset(bs.tail.tail.tail.tail, i - 1)
               utf8_split_left(bs.tail.tail.tail.tail, i - 1) and
@@ -617,20 +585,20 @@ specify {ANY}
               bs.tail.tail.tail.tail.prepend(bs.tail.tail.tail.head) = bs.tail.tail.tail and
               step_4(bs.head, bs.tail.head, bs.tail.tail.head, bs.tail.tail.tail.head, bs.tail.tail.tail.tail) and
               utf8_offset(bs, i) = k + 4 and
-              list_take(bs, k + 4) = list_take(bs.tail, k + 3).prepend(bs.head) and
-              list_take(bs.tail, k + 3) = list_take(bs.tail.tail, k + 2).prepend(bs.tail.head) and
-              list_take(bs.tail.tail, k + 2) = list_take(bs.tail.tail.tail, k + 1).prepend(bs.tail.tail.head) and
-              list_take(bs.tail.tail.tail, k + 1) = list_take(bs.tail.tail.tail.tail, k).prepend(bs.tail.tail.tail.head) and
-              list_take(bs, k + 4) = list_take(bs.tail.tail.tail.tail, k).prepend(bs.tail.tail.tail.head).prepend(bs.tail.tail.head).prepend(bs.tail.head).prepend(bs.head) and
-              step_4(bs.head, bs.tail.head, bs.tail.tail.head, bs.tail.tail.tail.head, list_take(bs.tail.tail.tail.tail, k)) and
-              list_take(decode_utf8(bs), i) = list_take(decode_utf8(bs.tail.tail.tail.tail), i - 1).prepend(decode_utf8(bs).head)
+              LIST_OPS.take(bs, k + 4) = LIST_OPS.take(bs.tail, k + 3).prepend(bs.head) and
+              LIST_OPS.take(bs.tail, k + 3) = LIST_OPS.take(bs.tail.tail, k + 2).prepend(bs.tail.head) and
+              LIST_OPS.take(bs.tail.tail, k + 2) = LIST_OPS.take(bs.tail.tail.tail, k + 1).prepend(bs.tail.tail.head) and
+              LIST_OPS.take(bs.tail.tail.tail, k + 1) = LIST_OPS.take(bs.tail.tail.tail.tail, k).prepend(bs.tail.tail.tail.head) and
+              LIST_OPS.take(bs, k + 4) = LIST_OPS.take(bs.tail.tail.tail.tail, k).prepend(bs.tail.tail.tail.head).prepend(bs.tail.tail.head).prepend(bs.tail.head).prepend(bs.head) and
+              step_4(bs.head, bs.tail.head, bs.tail.tail.head, bs.tail.tail.tail.head, LIST_OPS.take(bs.tail.tail.tail.tail, k)) and
+              LIST_OPS.take(decode_utf8(bs), i) = LIST_OPS.take(decode_utf8(bs.tail.tail.tail.tail), i - 1).prepend(decode_utf8(bs).head)
             end
           end
         end
       end
     ensure
-      left_valid: valid_utf8(list_take(bs, utf8_offset(bs, i)))
-      left_chars: decode_utf8(list_take(bs, utf8_offset(bs, i))) = list_take(decode_utf8(bs), i)
+      left_valid: valid_utf8(LIST_OPS.take(bs, utf8_offset(bs, i)))
+      left_chars: decode_utf8(LIST_OPS.take(bs, utf8_offset(bs, i))) = LIST_OPS.take(decode_utf8(bs), i)
     end
 
   law utf8_split_right(bs: LIST[U64], i: NAT)
@@ -650,8 +618,8 @@ specify {ANY}
           bs.tail.prepend(bs.head) = bs and
           decode_utf8(bs) = decode_utf8(bs.tail).prepend(CHAR.from_scalar(bs.head)) and
           utf8_offset(bs, i) = k + 1 and
-          list_drop(bs, k + 1) = list_drop(bs.tail, k) and
-          list_drop(decode_utf8(bs), i) = list_drop(decode_utf8(bs.tail), i - 1)
+          LIST_OPS.drop(bs, k + 1) = LIST_OPS.drop(bs.tail, k) and
+          LIST_OPS.drop(decode_utf8(bs), i) = LIST_OPS.drop(decode_utf8(bs.tail), i - 1)
         else
           if bs.head <= 223 then
             let k = utf8_offset(bs.tail.tail, i - 1)
@@ -660,9 +628,9 @@ specify {ANY}
             bs.tail.tail.prepend(bs.tail.head) = bs.tail and
             step_2(bs.head, bs.tail.head, bs.tail.tail) and
             utf8_offset(bs, i) = k + 2 and
-            list_drop(bs, k + 2) = list_drop(bs.tail, k + 1) and
-            list_drop(bs.tail, k + 1) = list_drop(bs.tail.tail, k) and
-            list_drop(decode_utf8(bs), i) = list_drop(decode_utf8(bs.tail.tail), i - 1)
+            LIST_OPS.drop(bs, k + 2) = LIST_OPS.drop(bs.tail, k + 1) and
+            LIST_OPS.drop(bs.tail, k + 1) = LIST_OPS.drop(bs.tail.tail, k) and
+            LIST_OPS.drop(decode_utf8(bs), i) = LIST_OPS.drop(decode_utf8(bs.tail.tail), i - 1)
           else
             if bs.head <= 239 then
               let k = utf8_offset(bs.tail.tail.tail, i - 1)
@@ -672,10 +640,10 @@ specify {ANY}
               bs.tail.tail.tail.prepend(bs.tail.tail.head) = bs.tail.tail and
               step_3(bs.head, bs.tail.head, bs.tail.tail.head, bs.tail.tail.tail) and
               utf8_offset(bs, i) = k + 3 and
-              list_drop(bs, k + 3) = list_drop(bs.tail, k + 2) and
-              list_drop(bs.tail, k + 2) = list_drop(bs.tail.tail, k + 1) and
-              list_drop(bs.tail.tail, k + 1) = list_drop(bs.tail.tail.tail, k) and
-              list_drop(decode_utf8(bs), i) = list_drop(decode_utf8(bs.tail.tail.tail), i - 1)
+              LIST_OPS.drop(bs, k + 3) = LIST_OPS.drop(bs.tail, k + 2) and
+              LIST_OPS.drop(bs.tail, k + 2) = LIST_OPS.drop(bs.tail.tail, k + 1) and
+              LIST_OPS.drop(bs.tail.tail, k + 1) = LIST_OPS.drop(bs.tail.tail.tail, k) and
+              LIST_OPS.drop(decode_utf8(bs), i) = LIST_OPS.drop(decode_utf8(bs.tail.tail.tail), i - 1)
             else
               let k = utf8_offset(bs.tail.tail.tail.tail, i - 1)
               utf8_split_right(bs.tail.tail.tail.tail, i - 1) and
@@ -685,21 +653,21 @@ specify {ANY}
               bs.tail.tail.tail.tail.prepend(bs.tail.tail.tail.head) = bs.tail.tail.tail and
               step_4(bs.head, bs.tail.head, bs.tail.tail.head, bs.tail.tail.tail.head, bs.tail.tail.tail.tail) and
               utf8_offset(bs, i) = k + 4 and
-              list_drop(bs, k + 4) = list_drop(bs.tail, k + 3) and
-              list_drop(bs.tail, k + 3) = list_drop(bs.tail.tail, k + 2) and
-              list_drop(bs.tail.tail, k + 2) = list_drop(bs.tail.tail.tail, k + 1) and
-              list_drop(bs.tail.tail.tail, k + 1) = list_drop(bs.tail.tail.tail.tail, k) and
-              list_drop(decode_utf8(bs), i) = list_drop(decode_utf8(bs.tail.tail.tail.tail), i - 1)
+              LIST_OPS.drop(bs, k + 4) = LIST_OPS.drop(bs.tail, k + 3) and
+              LIST_OPS.drop(bs.tail, k + 3) = LIST_OPS.drop(bs.tail.tail, k + 2) and
+              LIST_OPS.drop(bs.tail.tail, k + 2) = LIST_OPS.drop(bs.tail.tail.tail, k + 1) and
+              LIST_OPS.drop(bs.tail.tail.tail, k + 1) = LIST_OPS.drop(bs.tail.tail.tail.tail, k) and
+              LIST_OPS.drop(decode_utf8(bs), i) = LIST_OPS.drop(decode_utf8(bs.tail.tail.tail.tail), i - 1)
             end
           end
         end
       end
     ensure
-      right_valid: valid_utf8(list_drop(bs, utf8_offset(bs, i)))
-      right_chars: decode_utf8(list_drop(bs, utf8_offset(bs, i))) = list_drop(decode_utf8(bs), i)
+      right_valid: valid_utf8(LIST_OPS.drop(bs, utf8_offset(bs, i)))
+      right_chars: decode_utf8(LIST_OPS.drop(bs, utf8_offset(bs, i))) = LIST_OPS.drop(decode_utf8(bs), i)
     end
 
-  -- Reading back through `list_take` and `list_drop`.
+  -- Reading back through `LIST_OPS.take` and `drop`.
   law take_at[A](xs: LIST[A], n: NAT, i: NAT)
     require
       fits: n <= xs.length
@@ -713,7 +681,7 @@ specify {ANY}
         take_at(xs.tail, n - 1, i - 1)
       end
     ensure
-      same: LIST_OPS.at(list_take(xs, n), i) = LIST_OPS.at(xs, i)
+      same: LIST_OPS.at(LIST_OPS.take(xs, n), i) = LIST_OPS.at(xs, i)
     end
 
   law drop_at[A](xs: LIST[A], n: NAT, i: NAT)
@@ -731,7 +699,7 @@ specify {ANY}
         LIST_OPS.at(xs, n + i) = LIST_OPS.at(xs.tail, n - 1 + i)
       end
     ensure
-      shifted: LIST_OPS.at(list_drop(xs, n), i) = LIST_OPS.at(xs, n + i)
+      shifted: LIST_OPS.at(LIST_OPS.drop(xs, n), i) = LIST_OPS.at(xs, n + i)
     end
 
   -- An item of a slice is the item of the whole at the slice's offset. With its trigger the
@@ -741,22 +709,22 @@ specify {ANY}
       fits: lo + n <= xs.length
       in_bounds: k < n
     trigger
-      LIST_OPS.at(list_take(list_drop(xs, lo), n), k)
+      LIST_OPS.at(LIST_OPS.take(LIST_OPS.drop(xs, lo), n), k)
     variant
       lo + k
     do
       if lo > 0 then
-        list_drop(xs, lo) = list_drop(xs.tail, lo - 1) and xs.tail.prepend(xs.head) = xs and
+        LIST_OPS.drop(xs, lo) = LIST_OPS.drop(xs.tail, lo - 1) and xs.tail.prepend(xs.head) = xs and
         slice_at(xs.tail, lo - 1, n, k)
       else if k > 0 then
-        list_drop(xs, 0) = xs and list_drop(xs.tail, 0) = xs.tail and
-        list_take(xs, n) = list_take(xs.tail, n - 1).prepend(xs.head) and
+        LIST_OPS.drop(xs, 0) = xs and LIST_OPS.drop(xs.tail, 0) = xs.tail and
+        LIST_OPS.take(xs, n) = LIST_OPS.take(xs.tail, n - 1).prepend(xs.head) and
         xs.tail.prepend(xs.head) = xs and slice_at(xs.tail, 0, n - 1, k - 1)
       else
-        list_drop(xs, 0) = xs and list_take(xs, n) = list_take(xs.tail, n - 1).prepend(xs.head)
+        LIST_OPS.drop(xs, 0) = xs and LIST_OPS.take(xs, n) = LIST_OPS.take(xs.tail, n - 1).prepend(xs.head)
       end end
     ensure
-      same: LIST_OPS.at(list_take(list_drop(xs, lo), n), k) = LIST_OPS.at(xs, lo + k)
+      same: LIST_OPS.at(LIST_OPS.take(LIST_OPS.drop(xs, lo), n), k) = LIST_OPS.at(xs, lo + k)
     end
 
   law take_drop[A](xs: LIST[A], n: NAT)
@@ -771,7 +739,7 @@ specify {ANY}
         take_drop(xs.tail, n - 1)
       end
     ensure
-      whole: list_take(xs, n).append(list_drop(xs, n)) = xs
+      whole: LIST_OPS.take(xs, n).append(LIST_OPS.drop(xs, n)) = xs
     end
 
   -- Lists of one length that agree at every index are the same list.
@@ -910,7 +878,7 @@ feature {ANY}
       { items = octets_take(octets_drop(Current.items, lo), hi - lo), size = hi - lo }
     ensure
       len: Result.length = hi - lo
-      model_slice: Result.model = list_take(list_drop(Current.model, lo), hi - lo)
+      model_slice: Result.model = LIST_OPS.take(LIST_OPS.drop(Current.model, lo), hi - lo)
     end
 
   -- Whether `other` occurs at offset `at`. Compiled from this source, not hand-written C.
