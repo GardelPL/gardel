@@ -2151,7 +2151,11 @@ Each combinator states its step (`stepping`), so `GENERATOR.iterate(x, f).next(s
 
 A call `capped(delays, k + 1)` in a `check` then proves that `delays.nth(k)` is at most 10 s. A generic version over any property needs a concept bound on the state, which this library does not have yet.
 
-The `>= 0` above is not redundant. **The verifier does not know that a generator's items are in their type's range.** They come from a function, and ranges are not tracked through function-valued fields. So `naturals(1).take(5)` is known to be a `LIST[NAT]`, as the verifier can unfold it, but `g.take(n)` for any `g` or `n` is not. When a routine needs the range, prove it with a property like `capped`, or compare the value instead of passing it on.
+**A generator's items are in their type's range.** The verifier knows this of any generator, not only of a prefix it can unfold. So a routine can return `g.take(n)` as a `LIST[NAT]`, or `g.nth(k)` as a `NAT`, for any `g`, `n` and `k`. The combinators carry ranges too. For example, `naturals(1).map(f)`'s items are in `f`'s result range.
+
+The verifier states this range over the state and the item together. The state is in its type's range, and the step takes a state in range to an item in range and a next state in range. Every lambda and every function parameter is proven to keep that promise, so every generator built from them does too.
+
+A bound other than the type's, such as `<= 10000` above, still needs a property like `capped`.
 
 An `UNFOLD[S, A]` is a sequence that may end, like Elixir's `Stream.unfold`: its step gives an `OPTION`, and `None` ends it. `take(n)` gives at most `n` items. `to_list(measure)` gives all of them, if you prove the sequence ends: `measure` of the state is never negative, and it shrinks at each step. Over a `NAT` state, "never negative" quantifies over every integer, so a measure such as a list's length is the easy case.
 

@@ -153,8 +153,7 @@ create {ANY}
             BASE64.last_two_symbols(xs.head % 256, xs.tail.head % 256, url, pad)
           else
             check
-              padded_step: (xs.length - 3 + 2) / 3 * 4 + 4 = (xs.length + 2) / 3 * 4
-              unpadded_step: ((xs.length - 3) * 4 + 2) / 3 + 4 = (xs.length * 4 + 2) / 3
+              lengths: BASE64.group_lengths(xs.length)
             end
             BASE64.group(xs.head % 256, xs.tail.head % 256, xs.tail.tail.head % 256, url)
               .append(BASE64.symbols(xs.tail.tail.tail, url, pad))
@@ -231,6 +230,19 @@ create {ANY}
     ensure
       octets: Result.is_ok implies BYTES.all_octets(Result.get)
       shorter: Result.is_ok implies Result.get.length <= ys.length
+    end
+
+  -- Lemma: a group of three bytes takes four symbols, padded or not. Apart from `symbols`,
+  -- whose proof was seed-fragile with the division in it.
+  group_lengths(n: NAT): BOOL
+    require
+      three: n >= 3
+    do
+      True
+    ensure
+      holds: Result
+      padded_step: (n - 3 + 2) / 3 * 4 + 4 = (n + 2) / 3 * 4
+      unpadded_step: ((n - 3) * 4 + 2) / 3 + 4 = (n * 4 + 2) / 3
     end
 
   -- Lemma: three bytes split into four six-bit values and back.

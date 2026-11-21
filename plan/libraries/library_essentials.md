@@ -466,7 +466,7 @@ Client: H.9's property generators (SplitMix64 from a seed is a state and a step)
     - Clients see no body: `naturals`, `fibs`, SplitMix64 and a retry schedule. `fibs(0).nth(9) = 34` and `first_five`'s length are proven from the contracts.
     - The three laws are called with `BOOL` items.
     - `capped` proves that no delay is over 10 s, B&W's sieve counts the ten primes below 30, and `pairs_of` is an `UNFOLD` over a list with its length as the measure. A generator is also built with a record literal.
-    - The program runs in C and prints 22 lines. SplitMix64's first three outputs from seed 0 are the reference values. The combinators' lines compare the value they compute, as their items' range is not known.
+    - The program runs in C and prints 22 lines. SplitMix64's first three outputs from seed 0 are the reference values. The combinators' lines compare the value they compute, as their items' range is not known (until H.22b).
   - **Lies.** Seven are refused, each by a counterexample, which the test checks; a refusal for want of time proves nothing:
     - a step `s + 1` over `NAT`;
     - `fibs.nth(4) = 4`;
@@ -492,10 +492,54 @@ Client: H.9's property generators (SplitMix64 from a seed is a state and a step)
 
   The first two only the stdlib catches: a client sees `GENERATOR`'s contracts, not its lambdas.
 - **Known limits.**
-  - **Item ranges.** The verifier does not know that a `GENERATOR[NAT, NAT]`'s items are `NAT`s: they come from a function-valued field, which H.0e's container ranges do not cover. A prefix it can unfold is known, such as `naturals(1).take(5)`. A prefix of any generator, or of any length, is not, so `g.take(n)` cannot be returned as a `LIST[NAT]`. A client proves the range with a property kept by the step (`capped`'s `>= 0`), or compares a value instead of passing it on. The fix is a range theory for function fields, in which a generator's items hold their range when its state does and its step keeps it, as a follow-up task.
+  - **Item ranges (fixed by H.22b).** The verifier does not know that a `GENERATOR[NAT, NAT]`'s items are `NAT`s: they come from a function-valued field, which H.0e's container ranges do not cover. A prefix it can unfold is known, such as `naturals(1).take(5)`. A prefix of any generator, or of any length, is not, so `g.take(n)` cannot be returned as a `LIST[NAT]`. A client proves the range with a property kept by the step (`capped`'s `>= 0`), or compares a value instead of passing it on. The fix is a range theory for function fields, in which a generator's items hold their range when its state does and its step keeps it, as a follow-up task.
   - `cycle`'s step is not stated. With `%` and `+%` the solver ran out of resources, and without `+%` the step needs a bound on the list's length, which the verifier does not have. Its items can be run, not reasoned about.
   - `UNFOLD.to_list`'s measure must be non-negative for every value of the state type. Over `NAT`, that means every integer, so a measure such as a list's length is the easy case.
   - A generic "every item satisfies `P`" law needs a concept bound on the state (H.0a); the guide's version is for one bound, written by the client.
+
+#### Task H.22b: Ranges of Function Fields
+
+H.22's first known limit: a `GENERATOR[NAT, NAT]`'s items were not known to be `NAT`s, as they come from a function-valued field, which H.0e's container ranges do not cover.
+
+- [x] **Ranges of functions.** `Rng_fn1(p, q)` and `Rng_fn2(p, q, r)` hold of a function that gives a value in the last range for arguments in the others.
+  - Only the elimination is an axiom: an application to an argument known in `p` is in `q`.
+  - That a function holds one is stated where it is known: of each lifted lambda (with its captures in their ranges, and for a generic lambda with its type parameters' parts at `Rng_any`), as a parameter's fact assumed in the body, and as an obligation where a function is passed or returned.
+  - A general introduction axiom ("holds if every application is in range") was tried and removed. Its nested quantifier made Z3 search without end: `truth_nth` went from out of resource to 1.5 s without it.
+  - The identity and a composition are not lifted (`Fn1_id`, `Fn1_compose`) and state their ranges by two axioms of their own. The identity was found by `tests/elements.rs`: `applied(fn(x: NAT): NAT do x end, n)` was refused.
+    - Each axiom is triggered by the fact it states, so it works only where that fact is asked for.
+    - A first version was triggered on every `Rng_fn1(p, p)` with a guard `f == Fn1_id()`, and on every composition. It made `generator`'s `tenth` (`fibs(0).nth(9) = 34`) run out of resource on every seed. Without either axiom, `tenth` took 15M to 22M resources.
+- [x] **`Rng_any`** holds of every value. It is the range of a type parameter that has none, such as `BOOL`'s, in a range stated over all of a module's parameters. It is used through equations, so that a range made of it reduces to it, or to the other part of an `Rng_and`. Without them, the step of a `GENERATOR[NAT, BOOL]` did not match its lambda.
+- [x] **Joint ranges.** A generic module with a field whose type is a function that mentions a type parameter gets one range over all its parameters, `Rng__GENERATOR(rs, ra)`. A value holds it when its state is in `rs` and its step holds `Rng_fn1(rs, Rng_and(Rng__Tuple2_A(ra), Rng__Tuple2_B(rs)))`. The constructor and selector axioms are H.0e's. This is sound by the logical-relations (parametricity) reading of a range.
+- [x] **Parametric axioms over joint types.** A routine whose signature mentions a joint type states, for every range of each type parameter, that its result holds the range when its arguments do. The triggers are the fact, or the term with the containers' facts. Up to two type parameters that nothing covers are also instantiated at `U64`, `I64` and `CHAR`'s ranges.
+- [x] The guide's paragraph on `>= 0` is replaced by "A generator's items are in their type's range". A tighter bound, such as `capped`'s `<= 10000`, still needs a property the step keeps.
+- **Result.** `tests/generator.rs` has two tests.
+  - **Truths.** Clients return `g.take(n)`, `g.nth(n)`, `g.drop(n).tail.take(3)` and `find_within` of a generator parameter of `NAT`s. A `GENERATOR[NAT, BOOL]` is built. The combinators' lines print the values they compute instead of comparing them, except `zip`'s (see the limits). The program prints 23 lines.
+  - **Lies.** Ten are refused by a counterexample. The three new ones: a bound the step does not keep (`counting(0).nth(n) < 100`), a generator of `I64`s taken as one of `NAT`s, and `map` to `-1`.
+- **Mutations.** All four turn a test red:
+  - a function argument's range not a guard (`generator`'s lies);
+  - no joint range (both `generator` tests);
+  - no `Rng_any` equations (`generator`'s truths);
+  - no fact for a generic lambda (the stdlib's `cycle`).
+- **`gtui`'s `TEXT_AREA.keyed`** ran out of resources in each of the 12 `gtui` tests in the full run. It is seed-fragile under HEAD too. With seeds 0 to 9 at the 30M limit, it ran out on 4 of 10 under HEAD and 3 of 10 under this change. It is now three routines (`keyed`, `plain_keyed`, `mod_keyed`), each between 1.5M and 5.6M on all ten seeds.
+- **`BASE64.symbols`** failed the two stdlib unit tests by wall-clock timeouts under parallel load. It is seed-fragile since H.6: out of resource on 3 of 10 seeds under HEAD and under this change. Each of its 24 obligations passes alone on every seed, so the cost is in proving them together. Its length arithmetic is now a lemma, `group_lengths`, and it runs out on 1 of 10 seeds. A per-procedure split option in `gardelc` would remove the rest.
+- **Totals.** No single full run used the final binary, so the result is in parts.
+  - **The first full run** (before the fixes below) passed every suite it reached but `elements` and `gtui`, which the fixes address. It was stopped at 9000 s inside `tablon`, under heavy load: `grest` took 3438 s. Run alone, `grest` and `ghttp` took 379 s and 235 s, against 410 s and 252 s under HEAD.
+  - **After the fixes:**
+    - the 234 unit tests;
+    - `generator` (100 s, no seed retry), `gtui` (12, 660 s), `tablon` (18), `todo_api`, `text`, `text_format`, `variant_scope` and `elements`;
+    - `container_range`, `list_ops`, `map`, `refined`, `generic_handlers`, `machine_range` and `call_value`.
+
+    The stdlib is 0/0 in 151 s.
+  - `gtui`'s frame-time test (16 ms per frame) failed once at 16.5 ms in a run with other suites, and passed alone.
+- **Known limits.**
+  - A function type with `require` or `ensure`, or with more than two arguments, has no range.
+  - **`zip` is costly.** An item of a `zip` of two generators, one of them with a pair as state, is in range, but proving it takes 4M to 30M resources, also over any `n` (`zipped(n) = naturals(1).zip(fibs(0)).nth(n)`). The profile shows `nth`'s unfolding through `zip`'s pointwise step, not a matching loop: 27k instantiations. `generator`'s `line_zip` compares the value, as under H.22 (0.5M on every seed).
+  - `tenth` costs a little more than under HEAD: 6.4M to 13.6M resources over seeds 0 to 9, against 5M to 10M.
+  - Two translation faults were found on the way, both older than this task:
+    - a client lambda `fn(x: NAT): OPTION[NAT] do Some(x) end` is shortened to `Fn1_Some()`, which a client does not declare;
+    - `fn(x: NAT): NAT do inc(dbl(x)) end` over two routines is shortened to `Fn1_compose(inc, dbl)`, which names the routines as if they were values.
+
+    Each gives `E0199`.
 
 #### Task H.5: `ARRAY[A]`
 

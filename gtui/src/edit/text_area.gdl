@@ -559,21 +559,36 @@ feature {ANY}
   keyed(k: KEY, page: NAT): TEXT_AREA
     do
       match k
+        case Ctrl(c) then Current.ctrl_keyed(c)
+        case Mod(m, shift, alt, ctrl) then Current.mod_keyed(m, page, shift, alt, ctrl)
+        case _ then Current.plain_keyed(k, page)
+      end
+    end
+
+  -- Edited or moved by `k`, a key with no modifier. The three routines are apart so that
+  -- each proof is small enough not to depend on the solver's seed.
+  plain_keyed(k: KEY, page: NAT): TEXT_AREA
+    do
+      match k
         case Char(c) then Current.type_char(c)
         case Enter then Current.newline
         case Tab then Current.paste_chars(LIST.empty.prepend(' ').prepend(' '))
         case Backspace then Current.backspace
         case Delete then Current.delete
-        case Ctrl(c) then Current.ctrl_keyed(c)
-        case Mod(m, shift, alt, ctrl) then
-          if alt then Current
-          else if Current.is_insert(m) and ctrl and not shift then Current.copy
-          else if Current.is_insert(m) and shift and not ctrl then Current.paste_chars(Current.clip)
-          else if Current.is_delete(m) and shift and not ctrl then Current.cut
-          else Current.moved(m, page, shift, ctrl)
-          end end end end
         case _ then Current.moved(k, page, False, False)
       end
+    end
+
+  -- Changed by `m` with modifiers: Ctrl+Insert copies, Shift+Insert pastes, Shift+Delete
+  -- cuts, Alt changes nothing, and other keys move.
+  mod_keyed(m: KEY, page: NAT, shift: BOOL, alt: BOOL, ctrl: BOOL): TEXT_AREA
+    do
+      if alt then Current
+      else if Current.is_insert(m) and ctrl and not shift then Current.copy
+      else if Current.is_insert(m) and shift and not ctrl then Current.paste_chars(Current.clip)
+      else if Current.is_delete(m) and shift and not ctrl then Current.cut
+      else Current.moved(m, page, shift, ctrl)
+      end end end end
     end
 
   -- Whether `k` is Insert, or Delete.

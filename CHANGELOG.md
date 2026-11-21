@@ -9,6 +9,14 @@ All notable changes, theoretical soundess fixes, verification overhauls, front-e
 Spec draft v0.5. [plan/Roadmap.md](plan/Roadmap.md) holds the detail for each task.
 
 ### Language and runtime
+- **A generator's items are in their type's range** (H.22b). The verifier now knows that every item of a `GENERATOR[NAT, NAT]` is a `NAT`, for any prefix, any index and what follows a prefix, so `g.take(n)` can be returned as a `LIST[NAT]`. Before, only a prefix it could unfold was known.
+  - **Ranges of functions.** A function holds `Rng_fn1(p, q)` when it gives a value in `q` for each argument in `p`. A lambda states it for its own types, a function parameter assumes it, and a call that passes a function proves it.
+  - **A joint range for a module with a function field.** `GENERATOR` holds its range when its state is in the state's range and its step gives an item in the item's range and a next state in the state's. `GENERATOR`'s laws and combinators carry it through, as H.0e's container ranges do for lists.
+  - **The identity and composition**, which are not lifted as lambdas, state their ranges too: the identity keeps any range, and a composition chains its parts'.
+  - **`gtui` `TEXT_AREA.keyed`** is now three routines (`keyed`, `plain_keyed`, `mod_keyed`). Its proof was seed-fragile before this change, out of resource on 4 of 10 seeds, and the new axioms only moved which seeds failed. Now each part takes 1.5M to 5.6M resources on every seed, against a limit of 30M.
+  - **`BASE64.symbols`** gets its length arithmetic from a new lemma, `group_lengths`. It was seed-fragile since H.6, out of resource on 3 of 10 seeds, and failed the stdlib unit tests by wall-clock timeouts under parallel load. Now it fails on 1 of 10, which the seed retries cover.
+  - `tests/generator.rs`: clients return the items of a generator parameter, the combinators' lines print the values they compute, and three new false versions are refused: a bound the step does not keep, a generator of `I64`s taken as one of `NAT`s, and `map` to a negative number.
+  - **Limits:** a function type with `require` or `ensure`, or with more than two arguments, has no range. An item of a `zip` is in range, but costly to prove (4M to 30M resources), so `generator`'s `zip` line compares the value. A bound tighter than the type's, such as `<= 10000`, still needs a property kept by the step, as `capped` in the guide shows.
 - **Formatting and encodings** (H.6; `SHOW` moves to H.6b). New prelude modules.
   - **`STRING_BUILDER`** builds text in linear time: `empty`, `add`, `add_char`, `add_nat`, `add_i64` and `to_string`, with model `LIST[CHAR]`. Each `add` states the characters it appends.
   - **`TEXT_FORMAT`**: `pad_left`, `pad_right`, `repeat`, `join` (and `join_fits`, its bound as a test that runs in C), and ASCII `to_lower` and `to_upper`, each stated on `chars`.
@@ -30,7 +38,7 @@ Spec draft v0.5. [plan/Roadmap.md](plan/Roadmap.md) holds the detail for each ta
     - A static creator of a generic module that names none of its type parameters (`iterate[T]: GENERATOR[T, T]`) was refused by Boogie and could not be compiled to C.
     - A record literal of another module (`{ state = 0, next = f }` returned as a `GENERATOR`) was translated as the enclosing module's.
     - A lambda returning a tuple of machine numbers now states their range, as a scalar one did.
-  - **Limit:** the verifier does not know a generator's items to be in their type's range, as they come from a function. A prefix it can unfold is known, such as `naturals(1).take(5)`. For others, a client proves the range with a property kept by the step, as the guide shows.
+  - **Limit (fixed by H.22b):** the verifier did not know a generator's items to be in their type's range, as they come from a function. Only a prefix it could unfold was known, such as `naturals(1).take(5)`.
   - `tests/generator.rs`: naturals, Fibonacci, SplitMix64, a retry schedule, B&W's sieve and the combinators, verified and run in C, with seven false versions refused.
 - **List operations and their laws** (H.21). `LIST_OPS` gains `take`, `drop`, `reverse`, `reverse_onto`, `concat`, `take_while`, `drop_while`, `zip`, `zip_with`, `last`, `init`, `concat_map`, `range(lo, hi)` and `iterate_n(f, x, n)`. Each is total but `last` and `init`, which need a non-empty list, and runs in C. A client sees each one's length and one step of its unfolding.
   - **Laws** (Bird and Wadler §3.3 to §3.5), proven by induction in `LIST_OPS` and called by a client where it needs them:

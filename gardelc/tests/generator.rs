@@ -1,5 +1,6 @@
 //! `GENERATOR` and `UNFOLD` (Task H.22), through the command line: clients that see no body
-//! prove what the laws state, run in C, and a false version of each claim is refused.
+//! prove what the laws state, run in C, and a false version of each claim is refused. Since
+//! H.22b, the items of a generator of numbers are known to be in range, for any prefix.
 
 use std::fs;
 use std::path::PathBuf;
@@ -94,8 +95,7 @@ feature {ANY}
     end
 
   -- Every item is a number up to 10000 when the state is and the step keeps it: by induction
-  -- on the number of items. The bound below, `>= 0`, is the range a client cannot otherwise
-  -- know of a generator's items.
+  -- on the number of items.
   capped(g: GENERATOR[NAT, NAT], n: NAT): BOOL
     require
       starts: g.state >= 0 and g.state <= 10000
@@ -144,8 +144,35 @@ feature {ANY}
       length: Result.length = 5
     end
 
-  -- The law clients take generators of `BOOL`: the items of a generator of numbers are known
-  -- to be in range only for a prefix the verifier can unfold.
+  -- The items of any generator of numbers are in range (H.22b): a prefix of any length, an
+  -- item at any index, and those of what follows a prefix, as numbers the client returns.
+  prefix(g: GENERATOR[NAT, NAT], n: NAT): LIST[NAT]
+    do
+      g.take(n)
+    end
+
+  item(g: GENERATOR[NAT, NAT], n: NAT): NAT
+    do
+      g.nth(n)
+    end
+
+  later(g: GENERATOR[NAT, NAT], n: NAT): LIST[NAT]
+    do
+      g.drop(n).tail.take(3)
+    end
+
+  found(g: GENERATOR[NAT, NAT]): OPTION[NAT]
+    do
+      g.find_within(10, fn(x: NAT): BOOL do x > 5 end)
+    end
+
+  -- A generator of truth values from a state of numbers.
+  flags: GENERATOR[NAT, BOOL]
+    do
+      GENERATOR.make(0, fn(s: NAT): TUPLE[BOOL, NAT] do (s % 2 = 0, s +% 1) end)
+    end
+
+  -- The law clients take generators of `BOOL`.
   at_in_prefix(g: GENERATOR[NAT, BOOL], n: NAT, k: NAT): BOOL
     require
       inside: k < n
@@ -208,27 +235,29 @@ feature {ANY}
       NUMBER_TEXT.nat_to_text(n)
     end
 
-  -- Each line the program prints, proven on its own. A combinator's items are not known to
-  -- be in range (its step is a lambda of the prelude), so those lines compare the value.
+  -- Each line the program prints, proven on its own. A combinator's items are in range as its
+  -- arguments' are (H.22b), so each line prints the value it computes. `zip`'s line compares
+  -- it: an item of a zip of pairs at a fixed index took 5M to 30M resources to prove in range.
   line_naturals: STRING do show(naturals(1).take(5)) end
   line_mix_0: STRING do num(LIST_OPS.at(splitmix(0).take(3), 0)) end
   line_mix_1: STRING do num(LIST_OPS.at(splitmix(0).take(3), 1)) end
   line_mix_2: STRING do num(LIST_OPS.at(splitmix(0).take(3), 2)) end
-  line_delays_sum: STRING do if LIST_OPS.fold_left(delays.take(8), fn(acc: NAT, x: NAT): NAT do acc +% x end, 0) = 22700 then "22700" else "wrong" end end
-  line_delays_last: STRING do if LIST_OPS.last(delays.take(8)) = 10000 then "10000" else "wrong" end end
-  line_cycle: STRING do if LIST_OPS.fold_left(GENERATOR.cycle(LIST.empty.prepend(3).prepend(2).prepend(1)).take(7), fn(acc: U64, x: U64): U64 do acc *% 10 +% x end, 0) = 1231231 then "1231231" else "wrong" end end
-  line_zip_with: STRING do if LIST_OPS.fold_left(naturals(1).zip_with(naturals(10), fn(a: NAT, b: NAT): NAT do a *% b end).take(3), fn(acc: U64, x: U64): U64 do acc *% 10 +% x end, 0) = 1256 then "1256" else "wrong" end end
+  line_delays_sum: STRING do num(LIST_OPS.fold_left(delays.take(8), fn(acc: NAT, x: NAT): NAT do acc +% x end, 0)) end
+  line_delays_last: STRING do num(LIST_OPS.last(delays.take(8))) end
+  line_cycle: STRING do show(GENERATOR.cycle(LIST.empty.prepend(3).prepend(2).prepend(1)).take(7)) end
+  line_zip_with: STRING do show(naturals(1).zip_with(naturals(10), fn(a: NAT, b: NAT): NAT do a *% b end).take(3)) end
   line_zip: STRING do if naturals(1).zip(fibs(0)).nth(6).second = 8 then "8" else "wrong" end end
-  line_scan: STRING do if LIST_OPS.fold_left(naturals(1).scan(fn(acc: NAT, x: NAT): NAT do acc +% x end, 0).take(5), fn(acc: U64, x: U64): U64 do acc *% 10 +% x end, 0) = 1370 then "1370" else "wrong" end end
+  line_scan: STRING do show(naturals(1).scan(fn(acc: NAT, x: NAT): NAT do acc +% x end, 0).take(5)) end
   line_drop: STRING do show(naturals(0).drop(4).take(3)) end
-  line_found: STRING do if naturals(0).find_within(10, fn(x: NAT): BOOL do x > 5 end).unwrap_or(99) = 6 then "6" else "wrong" end end
-  line_not_found: STRING do if naturals(0).find_within(3, fn(x: NAT): BOOL do x > 5 end).unwrap_or(99) = 99 then "99" else "wrong" end end
-  line_while: STRING do if LIST_OPS.fold_left(naturals(0).take_while_within(10, fn(x: NAT): BOOL do x < 3 end), fn(acc: U64, x: U64): U64 do acc *% 10 +% x end, 0) = 12 then "12" else "wrong" end end
+  line_found: STRING do num(naturals(0).find_within(10, fn(x: NAT): BOOL do x > 5 end).unwrap_or(99)) end
+  line_not_found: STRING do num(naturals(0).find_within(3, fn(x: NAT): BOOL do x > 5 end).unwrap_or(99)) end
+  line_while: STRING do show(naturals(0).take_while_within(10, fn(x: NAT): BOOL do x < 3 end)) end
   line_pairs: STRING do num(pairs_of(LIST.empty.prepend(True).prepend(False).prepend(True).prepend(True).prepend(False)).length) end
   line_paired: STRING do num(LIST_OPS.concat(pairs_of(LIST.empty.prepend(True).prepend(False).prepend(True).prepend(True).prepend(False))).length) end
   line_primes: STRING do num(sieve(LIST_OPS.range(2, 30)).length) end
   line_delay: STRING do num(delay_at(1000)) end
-  line_literal: STRING do if LIST_OPS.fold_left(literal_naturals.take(4), fn(acc: U64, x: U64): U64 do acc *% 10 +% x end, 0) = 123 then "123" else "wrong" end end
+  line_literal: STRING do show(literal_naturals.take(4)) end
+  line_flags: STRING do num(flags.take(4).length) end
   line_countdown: STRING do if LIST_OPS.fold_left(countdown(5).take(3), fn(acc: U64, x: U64): U64 do acc *% 10 +% x end, 0) = 543 then "543" else "wrong" end end
   line_short: STRING do if LIST_OPS.fold_left(countdown(2).take(9), fn(acc: U64, x: U64): U64 do acc *% 10 +% x end, 0) = 21 then "21" else "wrong" end end
 
@@ -257,6 +286,7 @@ feature {ANY}
         IO.print_line(line_literal)
         IO.print_line(line_countdown)
         IO.print_line(line_short)
+        IO.print_line(line_flags)
         IO.exit(0)
       end
     end
@@ -298,6 +328,7 @@ fn clients_prove_the_laws_and_the_generators_run() {
             "123",
             "543",
             "21",
+            "4",
         ],
         "{printed}"
     );
@@ -352,6 +383,37 @@ feature {ANY}
       True
     end
 
+  counting(from: NAT): GENERATOR[NAT, NAT]
+    do
+      GENERATOR.make(from, fn(s: NAT): TUPLE[NAT, NAT] do (s, s +% 1) end)
+    end
+
+  -- An item's range is its type's, not a bound the step does not keep.
+  small(n: NAT): NAT
+    require
+      some: n < 1000
+    do
+      counting(0).nth(n)
+    ensure
+      lie: Result < 100
+    end
+
+  -- A generator of `I64`s is not one of `NAT`s.
+  signed(g: GENERATOR[I64, I64]): I64
+    do
+      g.head
+    ensure
+      lie: Result >= 0
+    end
+
+  -- `map`'s items are its function's, in its range.
+  mapped_signed: I64
+    do
+      counting(0).map(fn(x: NAT): I64 do -1 end).head
+    ensure
+      lie: Result >= 0
+    end
+
   any_cycle(xs: LIST[NAT]): GENERATOR[NAT, NAT]
     do
       GENERATOR.cycle(xs)
@@ -375,13 +437,13 @@ fn a_false_version_of_each_is_refused() {
     let text = all(&out);
     assert!(!out.status.success(), "must fail:\n{text}");
     let errors: Vec<&str> = text.lines().filter(|l| l.contains("[ERROR]")).collect();
-    for routine in ["naturals", "fifth", "longer", "wrong_map", "outside", "any_cycle", "forever"] {
+    for routine in ["naturals", "fifth", "longer", "wrong_map", "outside", "small", "signed", "mapped_signed", "any_cycle", "forever"] {
         assert!(
             errors.iter().any(|l| l.contains(&format!("in `{routine}`"))),
             "`{routine}` must be refused:\n{text}"
         );
     }
-    assert_eq!(errors.len(), 7, "one refusal each:\n{text}");
+    assert_eq!(errors.len(), 10, "one refusal each:\n{text}");
     // A refusal for want of time proves nothing false.
     assert!(!errors.iter().any(|l| l.contains("Timeout")), "refused by a counterexample, not a timeout:\n{text}");
 }

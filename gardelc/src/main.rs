@@ -5184,7 +5184,12 @@ fn function_fact(ty: &str, term: &str) -> Option<String> {
         guards.extend(value_fact(t, n));
     }
     let guard = if guards.is_empty() { String::new() } else { format!("{} ==> ", guards.join(" && ")) };
-    Some(format!("(forall {} :: {{ {applied} }} {guard}{fact})", decls.join(", ")))
+    let all = format!("(forall {} :: {{ {applied} }} {guard}{fact})", decls.join(", "));
+    // Its range as a function as well, for a container whose range is joint (Task H.22b).
+    Some(match split_top_level_arrow(ty).and_then(|(l, r)| fn_rng_term(l, r, &machine_rng, &|_| false)) {
+        Some(rng) => format!("({all} && Rng_holds({rng}, {term}))"),
+        None => all,
+    })
 }
 
 /// Whether a value of type `ty` has a range fact beyond a machine number's own, to be checked
@@ -5240,10 +5245,27 @@ fn rng_term(ty: &str, leaf: &dyn Fn(&str) -> Option<String>, mentions: &dyn Fn(&
     if let Some(r) = leaf(ty) {
         return Some(r);
     }
-    if split_top_level_arrow(ty).is_some() {
-        return None;
+    if let Some((lhs, rhs)) = split_top_level_arrow(ty) {
+        return fn_rng_term(lhs, rhs, leaf, mentions);
     }
     let (head, args) = split_type_app(ty);
+    // A container whose range is stated over all its arguments at once, as a `GENERATOR`'s:
+    // an argument with no range holds `Rng_any`.
+    if joint_range(head) {
+        let mut slots = Vec::new();
+        let mut any = false;
+        for a in &args {
+            match rng_term(a, leaf, mentions) {
+                Some(r) => {
+                    any = true;
+                    slots.push(r);
+                }
+                None if mentions(a) => return None,
+                None => slots.push("Rng_any".to_string()),
+            }
+        }
+        return any.then(|| format!("Rng__{head}({})", slots.join(", ")));
+    }
     let mut parts = Vec::new();
     for (j, a) in args.iter().enumerate() {
         match rng_term(a, leaf, mentions) {
@@ -5255,6 +5277,62 @@ fn rng_term(ty: &str, leaf: &dyn Fn(&str) -> Option<String>, mentions: &dyn Fn(&
     }
     // A container with several such arguments, as a `TUPLE[U64, U64]`, holds them all.
     parts.into_iter().reduce(|a, b| format!("Rng_and({a}, {b})"))
+}
+
+/// The range of a function of one or two arguments (Task H.22b): `Rng_fn1(p, q)` holds of a
+/// function that gives a value in `q` for an argument in `p`. An argument with no range is in
+/// `Rng_any`. `None` when the result has no range, or the function has a contract of its own,
+/// under which alone it is proven.
+fn fn_rng_term(lhs: &str, rhs: &str, leaf: &dyn Fn(&str) -> Option<String>, mentions: &dyn Fn(&str) -> bool) -> Option<String> {
+    if rhs.contains(" require ") || rhs.contains(" ensure ") {
+        return None;
+    }
+    let ret = rng_term(rhs, leaf, mentions)?;
+    let lhs = lhs.trim();
+    let lhs = lhs.strip_prefix('(').and_then(|a| a.strip_suffix(')')).unwrap_or(lhs).trim();
+    let arg_tys: Vec<&str> =
+        split_top_level_commas(lhs).into_iter().map(|p| p.split_once(':').map_or(p, |(_, t)| t).trim()).collect();
+    if lhs.is_empty() || arg_tys.len() > 2 {
+        return None;
+    }
+    let mut parts = Vec::new();
+    for a in arg_tys {
+        match rng_term(a, leaf, mentions) {
+            Some(r) => parts.push(r),
+            None if mentions(a) => return None,
+            None => parts.push("Rng_any".to_string()),
+        }
+    }
+    parts.push(ret);
+    Some(format!("Rng_fn{}({})", parts.len() - 1, parts.join(", ")))
+}
+
+/// Whether module `head` states its range over all its type parameters at once (Task H.22b):
+/// a field of a function type holds its values, as `GENERATOR`'s `next: S -> TUPLE[A, S]`,
+/// whose items are in `A`'s range only for states in `S`'s. Every field that holds a type
+/// parameter's values must have a range term, or the module has no range.
+fn joint_range(head: &str) -> bool {
+    let key = (head.to_string(), "->".to_string());
+    if RANGE_DECIDING.with(|d| d.borrow().contains(&key)) {
+        return true;
+    }
+    let Some((tps, fields)) = with_module_decl(head, |d| (d.type_params.clone(), repr_field_types(d))) else {
+        return false;
+    };
+    let mentions = |t: &str| type_tokens(t).iter().any(|x| tps.iter().any(|p| p == x));
+    if tps.is_empty() || !fields.iter().any(|f| f.contains("->") && mentions(f)) {
+        return false;
+    }
+    RANGE_DECIDING.with(|d| d.borrow_mut().insert(key.clone()));
+    let leaf = |t: &str| tps.iter().position(|p| p == t).map(|i| format!("_r{i}"));
+    let stated = fields.iter().filter(|f| mentions(f)).all(|f| rng_term(f, &leaf, &mentions).is_some());
+    RANGE_DECIDING.with(|d| d.borrow_mut().remove(&key));
+    stated
+}
+
+/// Whether a type names a module whose range is stated jointly.
+fn involves_joint(ty: &str) -> bool {
+    type_tokens(ty).iter().any(|t| joint_range(t))
 }
 
 /// The range of a machine number type, as a range term.
@@ -5307,6 +5385,9 @@ fn container_fact(ty: &str, term: &str) -> Option<String> {
     if matches!(head, "LIST" | "SEQ") {
         return None;
     }
+    if joint_range(head) {
+        return rng_term(ty, &machine_rng, &|_| false).map(|r| format!("Rng_holds({r}, {term})"));
+    }
     let facts: Vec<String> = args
         .iter()
         .enumerate()
@@ -5351,7 +5432,32 @@ fn emit_container_range_base() -> String {
         out.push_str(&format!("function {rf}(p: Rng) returns (Rng);\n"));
         out.push_str(&format!("axiom (forall<A, B> p: Rng, a: A, b: B :: {{ Rng_holds({rf}(p), Tuple2_mk(a, b)) }} Rng_holds({rf}(p), Tuple2_mk(a, b)) <==> Rng_holds(p, {part}));\n"));
         out.push_str(&format!("axiom (forall<A, B> p: Rng, t: Tuple2 A B :: {{ Rng_holds({rf}(p), t), {sel}(t) }} Rng_holds({rf}(p), t) ==> Rng_holds(p, {sel}(t)));\n"));
+        out.push_str(&format!("axiom {rf}(Rng_any) == Rng_any;\n"));
     }
+    // Task H.22b: `Rng_any` holds of every value: the range of a type parameter that has none,
+    // in a range stated over all of a container's parameters. A range made of it alone is it,
+    // and a conjunction with it is the other part, as equations, so that `Rng_and(Rng__Tuple2_A(
+    // Rng_any), q)`, in the step of a generator of `BOOL` items, matches a lambda's stated `q`.
+    out.push_str("const unique Rng_any: Rng;\n");
+    out.push_str("axiom (forall<T> x: T :: { Rng_holds(Rng_any, x) } Rng_holds(Rng_any, x));\n");
+    out.push_str("axiom Rng_seq(Rng_any) == Rng_any;\n");
+    out.push_str("axiom (forall p: Rng :: { Rng_and(Rng_any, p) } Rng_and(Rng_any, p) == p);\n");
+    out.push_str("axiom (forall p: Rng :: { Rng_and(p, Rng_any) } Rng_and(p, Rng_any) == p);\n");
+    // A function holds `Rng_fn1(p, q)` when it gives a value in `q` for each argument in `p`:
+    // an application to an argument known in `p` is in `q`. That a function holds it is a fact
+    // stated where it is known, of a lambda or a parameter, not derived.
+    out.push_str("function Rng_fn1(p: Rng, q: Rng) returns (Rng);\n");
+    out.push_str("axiom (forall<A, B> p: Rng, q: Rng, f: Fn1 A B, x: A :: { Rng_holds(Rng_fn1(p, q), f), Fn1_app(f, x) } Rng_holds(Rng_fn1(p, q), f) && Rng_holds(p, x) ==> Rng_holds(q, Fn1_app(f, x)));\n");
+    out.push_str("axiom (forall p: Rng :: { Rng_fn1(p, Rng_any) } Rng_fn1(p, Rng_any) == Rng_any);\n");
+    // The lambdas written as built-in functions, not lifted: the identity keeps any range, and
+    // a composition gives what its outer function gives for what its inner one gives. Each is
+    // triggered by the fact it states, so it works only where that fact is asked for: one on
+    // every `Rng_fn1` or every composition made `tenth`, `fibs(0).nth(9)`, run out of resource.
+    out.push_str("axiom (forall<A> p: Rng :: { Rng_holds(Rng_fn1(p, p), Fn1_id() : Fn1 A A) } Rng_holds(Rng_fn1(p, p), Fn1_id() : Fn1 A A));\n");
+    out.push_str("axiom (forall<A, B, C> p: Rng, q: Rng, r: Rng, f: Fn1 B C, g: Fn1 A B :: { Rng_holds(Rng_fn1(p, r), Fn1_compose(f, g)), Rng_holds(Rng_fn1(q, r), f) } Rng_holds(Rng_fn1(q, r), f) && Rng_holds(Rng_fn1(p, q), g) ==> Rng_holds(Rng_fn1(p, r), Fn1_compose(f, g)));\n");
+    out.push_str("function Rng_fn2(p: Rng, q: Rng, r: Rng) returns (Rng);\n");
+    out.push_str("axiom (forall p: Rng, q: Rng :: { Rng_fn2(p, q, Rng_any) } Rng_fn2(p, q, Rng_any) == Rng_any);\n");
+    out.push_str("axiom (forall<A, B, C> p: Rng, q: Rng, r: Rng, f: Fn2 A B C, x: A, y: B :: { Rng_holds(Rng_fn2(p, q, r), f), Fn2_app(f, x, y) } Rng_holds(Rng_fn2(p, q, r), f) && Rng_holds(p, x) && Rng_holds(q, y) ==> Rng_holds(r, Fn2_app(f, x, y)));\n");
     out
 }
 
@@ -5367,12 +5473,16 @@ fn emit_container_range_theory(m: &ModuleDecl, tp_quant: &str, mod_bpl_ty: &str,
         ReprKind::Product(fs) => vec![(format!("{}_Ctor", m.name), None, fs.clone())],
     };
     let own = module_self_type(m);
+    if joint_range(&m.name) {
+        return emit_joint_range_theory(m, &ctors, tp_quant, mod_bpl_ty, hide_repr);
+    }
     for tp in &m.type_params {
         if !carries_range(&m.name, tp) {
             continue;
         }
         let rf = format!("Rng__{}_{tp}", m.name);
         out.push_str(&format!("function {rf}(_rp: Rng) returns (Rng);\n"));
+        out.push_str(&format!("axiom {rf}(Rng_any) == Rng_any;\n"));
         if hide_repr {
             continue;
         }
@@ -5414,6 +5524,198 @@ fn emit_container_range_theory(m: &ModuleDecl, tp_quant: &str, mod_bpl_ty: &str,
                 ));
             }
         }
+    }
+    out
+}
+
+/// The range of a module whose fields hold its type parameters' values in functions (Task
+/// H.22b): `Rng__M(r0, r1, ...)` takes one range for each parameter and holds of a value whose
+/// fields hold theirs. For `GENERATOR[S, A]`, the state is in `r0` and the step takes a state
+/// in `r0` to an item in `r1` and a state in `r0`, so each item and state reached is in range.
+/// With every parameter at `Rng_any` it holds of every value.
+fn emit_joint_range_theory(
+    m: &ModuleDecl,
+    ctors: &[(String, Option<String>, Vec<(String, String)>)],
+    tp_quant: &str,
+    mod_bpl_ty: &str,
+    hide_repr: bool,
+) -> String {
+    let mut out = String::new();
+    let own = module_self_type(m);
+    let vars: Vec<String> = (0..m.type_params.len()).map(|i| format!("_r{i}")).collect();
+    let rf = format!("Rng__{}", m.name);
+    let decls: Vec<String> = vars.iter().map(|v| format!("{v}: Rng")).collect();
+    out.push_str(&format!("function {rf}({}) returns (Rng);\n", decls.join(", ")));
+    let anys = vec!["Rng_any"; vars.len()].join(", ");
+    out.push_str(&format!("axiom {rf}({anys}) == Rng_any;\n"));
+    if hide_repr {
+        return out;
+    }
+    let tps = &m.type_params;
+    let leaf = |t: &str| tps.iter().position(|p| p == t).map(|i| vars[i].clone());
+    let mentions = |t: &str| type_tokens(t).iter().any(|x| tps.iter().any(|p| p == x));
+    let holds = |x: &str| format!("Rng_holds({rf}({}), {x})", vars.join(", "));
+    let fact = |fty: &str, term: &str| -> Option<String> {
+        let fty = if fty == "Current" { own.as_str() } else { fty };
+        if !mentions(fty) {
+            return None;
+        }
+        Some(format!("Rng_holds({}, {term})", rng_term(fty, &leaf, &mentions)?))
+    };
+    for (ctor, variant, fields) in ctors {
+        if fields.is_empty() && variant.is_none() {
+            continue;
+        }
+        let binders: Vec<String> = fields.iter().map(|(f, _)| boogie_reserved::field_binder(f)).collect();
+        let mut quant = decls.clone();
+        quant.extend(fields.iter().zip(&binders).map(|((_, t), b)| format!("{b}: {}", map_boogie_type(t, m))));
+        let app = format!("({ctor}({}) : {mod_bpl_ty})", binders.join(", "));
+        let conj: Vec<String> = fields.iter().zip(&binders).filter_map(|((_, t), b)| fact(t, b)).collect();
+        let conj = if conj.is_empty() { "true".to_string() } else { conj.join(" && ") };
+        out.push_str(&format!(
+            "axiom (forall{tp_quant} {} :: {{ {} }} {} <==> {conj});\n",
+            quant.join(", "),
+            holds(&app),
+            holds(&app)
+        ));
+        for (f, t) in fields {
+            let sel = match variant {
+                Some(v) => format!("{v}_{f}(_rx)"),
+                None => format!("{}_{f}(_rx)", m.name),
+            };
+            let Some(ff) = fact(t, &sel) else { continue };
+            let guard = variant.as_ref().map(|v| format!(" && is_{v}(_rx)")).unwrap_or_default();
+            out.push_str(&format!(
+                "axiom (forall{tp_quant} {}, _rx: {mod_bpl_ty} :: {{ {}, {sel} }} {}{guard} ==> {ff});\n",
+                decls.join(", "),
+                holds("_rx"),
+                holds("_rx")
+            ));
+        }
+    }
+    out
+}
+
+/// The ranges a generic routine's result holds over a module whose range is joint (Task
+/// H.22b), as `GENERATOR.take`'s items: by parametricity, for any range of each type
+/// parameter, a routine given arguments in those ranges gives a result in them. Each type
+/// parameter's range is a variable `_rg_T`, a machine number type's its own. Every argument
+/// that can carry a type parameter's values is a guard, and the routine has no axiom when one
+/// has no range term. A function argument that gives back no such value, as `p: A -> BOOL`,
+/// carries none.
+///
+/// The axiom is triggered by the result's range, when it is to be proven, or by the routine's
+/// term with the ranges of its container arguments, when they are known. A variable that only
+/// a function argument fixes, as `B` of `map[B](f: A -> B)`, is then instantiated at each
+/// machine number range, as are all of them for a routine with no container argument, as
+/// `cycle(xs)`, whose axioms the call alone triggers.
+fn emit_joint_parametric_axioms(r: &RoutineDecl, has_current: bool, m: &ModuleDecl, r_all_tps: &[String], q_params: &[String], fn_f_app: &str) -> String {
+    let mut out = String::new();
+    let tps: Vec<&String> =
+        r_all_tps.iter().filter(|tp| q_params.iter().any(|qp| type_tokens(qp).contains(&tp.as_str()))).collect();
+    if r_all_tps.iter().any(|tp| !tps.contains(&tp) && type_tokens(&r.ret_type).contains(&tp.as_str())) {
+        return out;
+    }
+    let var = |tp: &str| format!("_rg_{tp}");
+    let leaf = |t: &str| tps.iter().find(|p| p.as_str() == t).map(|p| var(p)).or_else(|| machine_rng(t));
+    let mentions = |t: &str| type_tokens(t).iter().any(|x| tps.iter().any(|p| p.as_str() == *x));
+    let Some(ret_rng) = rng_term(&r.ret_type, &leaf, &mentions) else {
+        return out;
+    };
+    let mut sig: Vec<(String, String)> = Vec::new();
+    if has_current {
+        sig.push(("Current".to_string(), module_self_type(m)));
+    }
+    sig.extend(r.params.iter().cloned());
+    let mut guards = Vec::new();
+    let mut trigger_guards = Vec::new();
+    for (pn, pt) in &sig {
+        if !mentions(pt) {
+            continue;
+        }
+        if let Some((lhs, rhs)) = split_top_level_arrow(pt) {
+            if !lhs.contains("->") && !rhs.contains("->") && !mentions(rhs) {
+                continue;
+            }
+        }
+        let Some(g) = rng_term(pt, &leaf, &mentions) else {
+            return out;
+        };
+        let holds = format!("Rng_holds({g}, {pn})");
+        // A container argument's range is a fact the caller has; a number's or a function's
+        // is not stated as a `Rng_holds` term until the axiom is used.
+        let (head, _) = split_type_app(pt);
+        if split_top_level_arrow(pt).is_none() && !matches!(head, "LIST" | "SEQ") && !tps.iter().any(|p| p.as_str() == pt.trim()) {
+            trigger_guards.push(holds.clone());
+        }
+        guards.push(holds);
+    }
+    let vars_in = |s: &str| -> Vec<String> {
+        tps.iter().map(|tp| var(tp)).filter(|v| type_tokens(s).contains(&v.as_str())).collect()
+    };
+    let fact_vars = vars_in(&ret_rng);
+    if fact_vars.is_empty() {
+        return out;
+    }
+    let mut used: Vec<String> = fact_vars.clone();
+    for g in &guards {
+        for v in vars_in(g) {
+            if !used.contains(&v) {
+                used.push(v);
+            }
+        }
+    }
+    let ret_bty = map_boogie_type(&r.ret_type, m);
+    let term = format!("({fn_f_app} : {ret_bty})");
+    let tp_quant = if tps.is_empty() {
+        String::new()
+    } else {
+        format!("<{}>", tps.iter().map(|t| t.as_str()).collect::<Vec<_>>().join(", "))
+    };
+    let covered: Vec<String> = trigger_guards.iter().flat_map(|g| vars_in(g)).collect();
+    let uncovered: Vec<String> = used.iter().filter(|v| !covered.contains(v)).cloned().collect();
+    // One assignment of the uncovered variables to machine number ranges, or none to leave them
+    // all quantified.
+    let ranges = ["Rng_u64", "Rng_i64", "Rng_char"];
+    let mut assignments: Vec<HashMap<String, String>> = vec![HashMap::new()];
+    if !uncovered.is_empty() && uncovered.len() <= 2 {
+        for v in &uncovered {
+            assignments = assignments
+                .into_iter()
+                .flat_map(|a| {
+                    ranges.iter().map(move |r| {
+                        let mut a = a.clone();
+                        a.insert(v.clone(), r.to_string());
+                        a
+                    })
+                })
+                .collect();
+        }
+        // The general axiom, triggered by the result's range, stays as well.
+        assignments.insert(0, HashMap::new());
+    }
+    for a in assignments {
+        let at = |s: &str| rename_boogie_idents(s, &a);
+        let fact = at(&format!("Rng_holds({ret_rng}, {term})"));
+        let guards: Vec<String> = guards.iter().map(|g| at(g)).collect();
+        let quantified: Vec<String> = used.iter().filter(|v| !a.contains_key(*v)).cloned().collect();
+        let mut triggers = Vec::new();
+        if quantified.iter().all(|v| vars_in(&fact).contains(v)) {
+            triggers.push(format!("{{ {fact} }}"));
+        }
+        // With no container argument, as `cycle(xs)` or `make(s, f)`, the call alone, once each
+        // variable is a machine number range.
+        if quantified.iter().all(|v| covered.contains(v)) {
+            let tg: Vec<String> = std::iter::once(term.clone()).chain(trigger_guards.iter().map(|g| at(g))).collect();
+            triggers.push(format!("{{ {} }}", tg.join(", ")));
+        }
+        if triggers.is_empty() {
+            continue;
+        }
+        let mut quant: Vec<String> = quantified.iter().map(|v| format!("{v}: Rng")).collect();
+        quant.extend(q_params.iter().cloned());
+        let guard = if guards.is_empty() { String::new() } else { format!("{} ==> ", guards.join(" && ")) };
+        out.push_str(&format!("axiom (forall{tp_quant} {} :: {} {guard}{fact});\n", quant.join(", "), triggers.join(" ")));
     }
     out
 }
@@ -5464,9 +5766,13 @@ fn emit_parametric_range_axioms(
     q_params: &[String],
     fn_f_app: &str,
 ) -> String {
+    let own_joint = has_current && involves_joint(&module_self_type(m));
+    if own_joint || involves_joint(&r.ret_type) || r.params.iter().any(|(_, t)| involves_joint(t)) {
+        return emit_joint_parametric_axioms(r, has_current, m, r_all_tps, q_params, fn_f_app);
+    }
     let mut out = String::new();
     for tp in r_all_tps {
-        if matches!(tp_carrier(&r.ret_type, tp), TpCarrier::None) {
+        if matches!(tp_carrier(&r.ret_type, tp), TpCarrier::None) || r.ret_type.contains("->") {
             continue;
         }
         let mut carriers: Vec<(String, String)> = Vec::new();
@@ -5486,7 +5792,10 @@ fn emit_parametric_range_axioms(
                 TpCarrier::None => {}
                 TpCarrier::Value | TpCarrier::List => carriers.push((pn.clone(), pt.clone())),
                 // A container is a carrier when its range states each of its `A` values.
-                TpCarrier::Other if field_rng(pt, tp, "p").is_some() => carriers.push((pn.clone(), pt.clone())),
+                // A function's range is stated only over a joint container's (H.22b).
+                TpCarrier::Other if !pt.contains("->") && field_rng(pt, tp, "p").is_some() => {
+                    carriers.push((pn.clone(), pt.clone()))
+                }
                 TpCarrier::Other => stated = false,
             }
         }
@@ -6922,6 +7231,24 @@ fn lift_boogie_lambda(
         quant.join(", ")
     );
     BOOGIE_LIFTED_LAMBDAS.with(|l| l.borrow_mut().push_str(&decl));
+    // Task H.22b: the lambda's range as a function, `Rng_fn1(p, q)`, for captures in theirs,
+    // as a container whose range is joint needs of its step. It is a fact here, from the
+    // same proof of the body as the axioms below, rather than a rule that derives it for any
+    // function, whose nested quantifier the solver searched without end.
+    // A generic one states it with its type parameters' parts at `Rng_any`, as `cycle`'s step.
+    if (1..=2).contains(&params.len()) && !(generic && cap_decls.is_empty()) {
+        let lhs = format!("({})", params.iter().map(|(p, t)| format!("{p}: {t}")).collect::<Vec<_>>().join(", "));
+        if let Some(rng) = fn_rng_term(&lhs, ret_ty, &machine_rng, &|_| false) {
+            let cap_guards: Vec<String> = captures.iter().filter_map(|(v, t)| value_fact(t, v)).collect();
+            let guard = if cap_guards.is_empty() { String::new() } else { format!("{} ==> ", cap_guards.join(" && ")) };
+            let fact = if cap_decls.is_empty() {
+                format!("axiom Rng_holds({rng}, {call});\n")
+            } else {
+                format!("axiom (forall{tp_quant} {} :: {{ {call} }} {guard}Rng_holds({rng}, {call}));\n", cap_decls.join(", "))
+            };
+            BOOGIE_LIFTED_LAMBDAS.with(|l| l.borrow_mut().push_str(&fact));
+        }
+    }
     // Task H.0b: a lambda of a machine result type gives a value in that range for arguments
     // and captures in theirs, as its body is proven under those. The axiom above holds for
     // any argument, so the fact is guarded. Mapped over a list whose elements are in range, it
@@ -6949,14 +7276,15 @@ fn lift_boogie_lambda(
             }
         }
         BOOGIE_LIFTED_LAMBDAS.with(|l| l.borrow_mut().push_str(&lam_axioms));
-    } else if let Some(fact) = (!generic).then(|| container_fact(ret_ty, &applied)).flatten() {
+    } else if let Some(fact) = container_fact(ret_ty, &applied) {
         // A lambda that gives a container of machine numbers, as a step `(s, s +% 1)` of a
         // `GENERATOR[NAT, NAT]` does: its body is proven to put only values in range there,
-        // for arguments and captures in theirs (Task H.22).
+        // for arguments and captures in theirs (Task H.22). A generic one states its parts of
+        // a machine number type, as the state in `cycle`'s step `(T, NAT)` (H.22b).
         let mut guards: Vec<String> = captures.iter().filter_map(|(v, t)| value_fact(t, v)).collect();
         guards.extend(params.iter().filter_map(|(p, t)| value_fact(t, p)));
         let guard = if guards.is_empty() { String::new() } else { format!("{} ==> ", guards.join(" && ")) };
-        let axiom = format!("axiom (forall {} :: {{ {applied} }} {guard}{fact});\n", quant.join(", "));
+        let axiom = format!("axiom (forall{tp_quant} {} :: {{ {applied} }} {guard}{fact});\n", quant.join(", "));
         BOOGIE_LIFTED_LAMBDAS.with(|l| l.borrow_mut().push_str(&axiom));
     }
     Some(call)
