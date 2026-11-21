@@ -41,7 +41,7 @@ Some tasks cannot start until the compiler or an earlier phase provides somethin
 | # | Prerequisite | Where it comes from | Needed by |
 | :--- | :--- | :--- | :--- |
 | P1 | **F.13 and F.15 closed.** Recursive helpers with a `require`, and facts at the value of a call | Phase F | Every proof-heavy task: H.3, H.4, H.7, H.11, H.21 |
-| P2 | **User concepts as bounds.** Today only `EQ`, `CANONICAL_EQ` and `ORD` have a theory (`E0320`) | New compiler task, H.0a | `HASH` in H.4 and H.12, `SHOW` in H.6 |
+| P2 | **User concepts as bounds.** Today only `EQ`, `CANONICAL_EQ` and `ORD` have a theory (`E0320`) | New compiler task, H.0a | `HASH` in H.4 and H.12, `SHOW` in H.6b |
 | P3 | **A `BYTE` type, or element ranges for `LIST` and `SEQ` of a machine type.** Today an element of `LIST[U64]` has no range in the proof, so `gjson` checks each byte it reads | New compiler task, H.0b | H.6, H.7, H.12 |
 | P4 | **A contiguous buffer in the C backend** with a `LIST` model | New compiler task, inside H.5 | H.5, and through it H.3 and H.4 |
 | P5 | **Pure foreign routines** (G.0 to G.3) | Phase G | SHA-2 and HMAC in H.12, math in H.8 |
@@ -80,6 +80,7 @@ flowchart TD
     H4["H.4 SET, QUEUE, HEAP, MAP laws"]
     H5["H.5 ARRAY"]
     H6["H.6 Formatting and encoders"]
+    H6b["H.6b SHOW"]
     H7["H.7 gparse"]
     H8["H.8 F64 text and math"]
     H9["H.9 gtest"]
@@ -96,6 +97,8 @@ flowchart TD
     H20["H.20 Trace properties"]
     H0a --> H4
     H0a --> H6
+    H0a --> H6b
+    H6 --> H6b
     H0b --> H6
     H0b --> H7
     H0c --> H2
@@ -136,6 +139,7 @@ flowchart TD
 | H.4 | M | `SET`, `QUEUE`, `HEAP`, more `MAP` laws | Heap-order proofs |
 | H.5 | L | `ARRAY[A]` with constant-time index | Update in place needs ownership (C.4, deferred) |
 | H.6 | M | `STRING_BUILDER`, `TEXT_FORMAT`, hex, base64, percent-encoding | Round-trip proofs for base64 |
+| H.6b | M | `concept SHOW` and its instances, derived for enumerations | Built-in instances in the type checker, Boogie and C |
 | H.7 | L | `gparse`, a cursor with proven progress | Moving three parsers onto it without losing proofs |
 | H.8 | L | `F64` to and from text, a math module | `F64` has only bound axioms in the verifier |
 | H.9 | M | `gtest`, `gardelc test` | Keeping test time down |
@@ -187,7 +191,7 @@ Every task follows the rules of Phases E and F:
 
 #### Task H.0a: User Concepts as Bounds
 
-Client: `HASH` (H.4, H.12) and `SHOW` (H.6). Closes F.1's first known limit.
+Client: `HASH` (H.4, H.12) and `SHOW` (H.6b). Closes F.1's first known limit.
 
 **Status:** ✅ Completed (2026-11-16).
 
@@ -241,14 +245,14 @@ Client: every parser. Needs decision 4. Closes F.2's first known limit.
 
 Client: `LOG_LEVEL` in H.2 (`GARDEL_LOG_LEVEL` sets the lowest level written, so levels need an order), months and weekdays in H.11, the breaker states in H.16. Today `HTTP_METHOD` and every other enumeration write `equals` by hand. Needs decision 13. Adds what B&W §8.1 gives an enumerated type.
 
-**Status:** ✅ Completed (2026-11-17), except `HASH` and `SHOW`, which move to H.12 and H.6. Decision 13 taken as proposed.
+**Status:** ✅ Completed (2026-11-17), except `HASH` and `SHOW`, which move to H.12 and H.6b. Decision 13 taken as proposed.
 
 - [x] On a sum whose variants all have no fields, `satisfies CANONICAL_EQ` or `satisfies ORD` with no bodies gets `equals` and `less_than` from the compiler. The order is the order of declaration.
 - [x] `ordinal: NAT`, `from_ordinal(n): OPTION[T]` and `all: LIST[T]`, with laws: `from_ordinal(t.ordinal) = Some(t)`, `a.less_than(b) = (a.ordinal < b.ordinal)`, `all.length` is the number of variants, and every value is in `all`.
 - [x] The concept's laws are proven for the generated bodies, as for written ones, so no derived instance is trusted.
 - [x] A body written by hand still wins, and a sum with a field asks for one (a new error code).
 - [x] Move `HTTP_METHOD` and `HTTP_VERSION` onto it, and record the lines removed.
-- [ ] With H.0a: `HASH` and `SHOW` derived the same way. Moved to H.12 and H.6: neither concept is in the prelude yet, and the compiler cannot tell what a user's `hash` or `show` should mean from its name.
+- [ ] With H.0a: `HASH` and `SHOW` derived the same way. Moved to H.12 and H.6b: neither concept is in the prelude yet, and the compiler cannot tell what a user's `hash` or `show` should mean from its name.
 - Acceptance: `module LOG_LEVEL satisfies ORD` with four variants and no feature verifies, and a client proves `Debug.less_than(Error)`. All existing `.bpl` output is byte-identical.
 - **Fix: the derivation.** `check_and_expand_concepts` calls `derive_enumeration_instance` before it checks a module's methods. For an enumeration (a sum with no type parameters whose variants have no fields) that leaves out `equals` (for `EQ`) or `less_than` (for `ORD`), the compiler writes the module's instance as Gardel source (`enumeration_source`), parses it, and adds each routine and law the module does not write: `equals` as `Current = other`, `less_than` as `Current.ordinal < other.ordinal`, each with `ensure def`; `ordinal` by a `match`; `from_ordinal` by nested `if`s; `all` by `prepend`s, with `count` and `has_each`; the laws `ordinal_back`, `all_listed` (by cases) and `all_at_ordinal`; and every law of the concepts that the module does not state, under its concept's `specify`. A derived `equals` is structural, so the module also satisfies `CANONICAL_EQ` (otherwise `E0311` refuses its own `=`). A client calls the laws as any other: `LOG_LEVEL.all_listed(t)`.
 - **Fix: `E0323: underivable_instance`.** A type that is not an enumeration and leaves out `equals` or `less_than` is refused with a message that says only an enumeration gets them. Other missing methods keep `Missing Concept Operation`.
@@ -536,15 +540,46 @@ Client: `grest`'s waiting table, which F.8 built as a list because `MAP` had no 
 
 Client: every program that prints. Today text is built with `concat`, and there is no interpolation. Needs H.0b.
 
-- [ ] `STRING_BUILDER`, as `BYTES_BUILDER`: `add`, `add_char`, `add_nat`, `add_i64`, `to_string`, with model `LIST[CHAR]`.
-- [ ] `TEXT_FORMAT`: `pad_left`, `pad_right`, `join(parts, sep)`, `repeat`, ASCII `to_lower` and `to_upper`, each stated on `chars`.
-- [ ] `join` and a per-step contract for `split`, which F.2 left stating only the number of parts. Law: `join(split(s, c), c)` gives `s` back.
-- [ ] `HEX`: bytes to text and back, with the round trip proven. `NUMBER_TEXT` gains `nat_to_hex` and `parse_hex` of any length.
-- [ ] `BASE64`: standard and URL-safe alphabets, with and without padding. Decoding is total and returns `RESULT`. Proven: `decode(encode(bs)) = Ok(bs)`.
-- [ ] Percent-encoding: the encoder for `grest`'s `URL_TEXT`, which only decodes. Proven: `decode(encode(s)) = Ok(s)`.
-- [ ] With H.0a: `concept SHOW` with `show: STRING`, and instances for the number types, `BOOL`, `CHAR`, `STRING`, `OPTION` and `LIST`.
+**Status:** ✅ The library is done (2026-11-20). `SHOW` is its own task, H.6b (decided 2026-11-20). The interpolation decision is open.
+
+- [x] `STRING_BUILDER`, as `BYTES_BUILDER`: `add`, `add_char`, `add_nat`, `add_i64`, `to_string`, with model `LIST[CHAR]`.
+- [x] `TEXT_FORMAT`: `pad_left`, `pad_right`, `join(parts, sep)`, `repeat`, ASCII `to_lower` and `to_upper`, each stated on `chars`.
+- [x] `join` and a per-step contract for `split`, which F.2 left stating only the number of parts. Law: `join(split(s, c), c)` gives `s` back.
+- [x] `HEX`: bytes to text and back, with the round trip proven. `NUMBER_TEXT` gains `nat_to_hex` and `parse_hex` of any length.
+- [x] `BASE64`: standard and URL-safe alphabets, with and without padding. Decoding is total and returns `RESULT`. Proven: `decode(encode(bs)) = Ok(bs)`.
+- [x] Percent-encoding: the encoder for `grest`'s `URL_TEXT`, which only decodes. Proven: `decode(encode(s)) = Ok(s)`.
+- Moved to H.6b: `concept SHOW` and its instances.
 - [ ] Decide whether string interpolation (`"Hello, {name}"`) is worth a language change once `STRING_BUILDER` exists. This plan says no for now.
 - Acceptance: the three round trips are proven. `hello_api` builds its answers with no `concat`.
+
+**Results.**
+- New modules: `STRING_BUILDER`, `TEXT_FORMAT`, `CODEC_ERROR`, `HEX`, `BASE64`, `PERCENT`. `STRING`, `NUMBER_TEXT`, `BYTES` and `LIST_OPS` gain the routines and laws they needed.
+- The three round trips are laws, proven, and `tests/text_format.rs` has clients use them and refuses seven false versions. `hello_api` has no `concat`.
+- The codecs are loops over `BYTES` into a `BYTES_BUILDER`, so they run in constant stack in C. 32 MB round trips run. The recursive models stay as specifications.
+- Ten mutations of the code each fail a proof:
+  - hex: a digit, the two digits swapped, and `nat_to_hex`'s digits;
+  - percent: `&` for `%`;
+  - base64: the alphabet, the third decoded byte, and the order of a group's bytes;
+  - `pad_left` padding on the right, `join` losing its first part, and `STRING_BUILDER.add` dropping its string.
+
+  Four of them, base64's third byte and byte order, `pad_left` and `join`, fail only as timeouts, which still leave the proof undone.
+- `BASE64`'s proof is about forty small lemmas. Each unfolds `symbols` or `read_groups` once. `decode_from` and `encode_from` only apply them, with a lemma for each way decoding fails.
+
+**Known limits.**
+- `STRING.find` is sensitive to the seed: from about 1.4M to 172M resources. The seed retries cover it.
+- Text bounds are the caller's: each `add` and `pad_*` asks that the result fit `U64`. `TEXT_FORMAT.join_fits` tests the bound in C, as `MATH_INT` has no C form.
+- Recursive routines in C use the stack: `STRING.split_from` and `LIST_OPS`' non-tail routines overflow Windows' 1 MiB stack on long inputs.
+- Verification time: the stdlib went from 77 s to 120–160 s, most of it `BASE64`. One proposal was tried and rejected: `{:split_here}` on every `check` made `BASE64` worse (106 min, 10 errors). A per-routine option to split the verification condition, if one is ever needed, would be a language decision.
+
+#### Task H.6b: `SHOW`
+
+Client: every program that prints a value, and `gtest`'s failure messages (H.9). Needs H.0a and H.6. Split from H.6 on 2026-11-20: it is compiler work, where H.6 was a library.
+
+- [ ] `concept SHOW` in the prelude with `show: STRING`, and an `ensure` on its text a client can use, as H.0a's `LABEL.show` needed.
+- [ ] Built-in instances for the number types, `BOOL`, `CHAR` and `STRING`, in the type checker, Boogie and C, each stating its text with `NUMBER_TEXT` and `STRING_BUILDER`.
+- [ ] Instances for `OPTION[A]` and `LIST[A]` given `A: SHOW`.
+- [ ] A derived `SHOW` for an enumeration (H.0c), printing the variant's name.
+- Acceptance: a client prints `Some([1, 2])` through `SHOW` and proves its text. A false claim about a shown value is refused.
 
 #### Task H.7: `gparse`
 

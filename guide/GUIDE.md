@@ -383,9 +383,11 @@ Every operation states its result on `chars` (or, for `BYTES`, on `model`), so a
 | `s.starts_with(p)`, `s.ends_with(p)` | Whether `p` is at the start or the end. |
 | `s.trim` | `s` without ASCII white space at either end. |
 | `s.split(c)` | The parts between each `c`: `count_char(c, 0) + 1` of them. |
+| `s.to_chars` | The scalars as a `LIST[CHAR]`, to walk. C decodes the bytes once. |
+| `STRING.from_char(c)` | The text of one scalar. |
 | `a.less_than(b)` | Byte order of the UTF-8 form, so `STRING` is a key for a generic `[K: ORD]`. It is not a collation: `"Z"` comes before `"a"`. |
 
-The contract of `split` gives the number of parts, not their text, so the verifier knows nothing more about them. When a proof depends on the pieces, cut the text with `find_char` or `find` and `slice`, whose contracts are exact:
+The contract of `split` gives the number of parts and one step of the scan at a time, which is enough for laws such as `TEXT_FORMAT.join_split` below, but not the text of a given part. When a proof depends on one piece, cut the text with `find_char` or `find` and `slice`, whose contracts are exact:
 
 ```eiffel
 -- The text before the first `:`, or the whole line when there is none.
@@ -430,6 +432,69 @@ read_back(n: NAT): RESULT[NUMBER_ERROR, NAT]
 ```
 
 `NUMBER_TEXT.digits(n, rest)` puts the decimal digits of `n` in front of the byte list `rest`, as ASCII codes. A client cannot see its body, so the law `digits_step` gives one step of it: `digits(n, rest) = rest.prepend(48 + n)` when `n < 10`, and `digits(n / 10, rest.prepend(48 + n % 10))` otherwise. It has no trigger, so a proof calls it where it needs it, as in `check s: NUMBER_TEXT.digits_step(n, rest) end`.
+
+#### Building, formatting and encoding text
+
+`STRING_BUILDER` builds text by appending, as `BYTES_BUILDER` builds bytes. Each `add` keeps the part, and `to_string` copies every part once, so building is linear where a chain of `concat` would copy the text again at each step:
+
+```eiffel
+greeting(name: STRING, visits: NAT): STRING
+  require
+    short: name.byte_length <= 1000
+  do
+    STRING_BUILDER.empty.add("Hello, ").add(name).add_char('!')
+      .add(" Visit #").add_nat(visits).to_string
+  end
+```
+
+Its model is the scalars added so far: `b.add(s).model = b.model.append(s.chars)`, and `to_string.chars` is the model. Each `add` requires the text to fit a `U64` (`fits`), as `BYTES_BUILDER`'s does. `add_nat` and `add_i64` add at most 20 bytes, and `add_char(c)` adds `STRING.char_width(c)`, one to four.
+
+`TEXT_FORMAT` has the usual formatting, each stated on `chars`:
+
+| Routine | Gives |
+| :--- | :--- |
+| `pad_left(s, width, c)`, `pad_right(s, width, c)` | `s` with copies of `c` before or after it, up to `width` scalars. A longer `s` is kept as it is. |
+| `repeat(s, n)` | `n` copies of `s`. Needs `n * s.byte_length` to fit. |
+| `join(parts, sep)` | The parts with `sep` between each two. Needs `joined_bytes(parts, sep)` to fit. |
+| `to_lower(s)`, `to_upper(s)` | ASCII `A` to `Z` as `a` to `z`, or back. Every other scalar is kept, so `é` stays `é`, and the byte length is the same. |
+
+`split`'s contract now states each step, and the law `join_split` states that joining the parts again gives the text back, for any text and separator:
+
+```eiffel
+rejoin(s: STRING, c: CHAR): STRING
+  do
+    TEXT_FORMAT.join(s.split(c), STRING.from_char(c))
+  ensure
+    same: Result.equals(s)
+  end
+```
+
+The law `join_split_fits` gives the call its `fits`. For parts of unknown length and another separator, test it at run time with `join_fits`, whose contract is that `fits`: `if TEXT_FORMAT.join_fits(parts, ", ") then TEXT_FORMAT.join(parts, ", ") else ... end`.
+
+Three codecs turn bytes into text and back. Encoding is total and decoding returns a `RESULT[CODEC_ERROR, _]`, whose errors are `BadLength`, `BadSymbol(at)` with the byte offset, and `NotText`:
+
+| Module | Encodes | Decodes |
+| :--- | :--- | :--- |
+| `HEX` | `encode(b)`: two lowercase digits per byte | `decode(s)`: either case |
+| `BASE64` | `encode(b)`: RFC 4648's standard alphabet, padded. `encode_with(b, url, pad)` picks the URL-safe alphabet and whether to pad. | `decode(s)`, `decode_with(s, url, pad)`. A symbol outside the alphabet, padding out of place, and unused bits that are not zero are refused, so a text decodes in at most one way. |
+| `PERCENT` | `encode(s)`: RFC 3986's unreserved bytes as they are, every other byte as `%` and two uppercase digits | `decode(s)`: `NotText` if the bytes are not UTF-8. `+` is not a space here. |
+
+Each round trip is a proven law: `HEX.round_trip`, `BASE64.round_trip` (for both alphabets, padded or not) and `PERCENT.round_trip`. A client gets it with no extra work:
+
+```eiffel
+back(b: BYTES): BOOL
+  require
+    short: b.length <= 1000000
+  do
+    True
+  ensure
+    same: BASE64.decode(BASE64.encode(b)).is_ok and BASE64.decode(BASE64.encode(b)).get.model = b.model
+  end
+```
+
+The decoded value is the same bytes or text, so the law states that its `model` (or `equals`) is the same. `=` on a `BYTES` or a `STRING` compares the representation, which a client does not see.
+
+`NUMBER_TEXT.nat_to_hex(n)` writes `n` in lowercase hex, and `parse_hex(s)` reads hex of any length and either case, with `OutOfRange` above `U64`. The law `hex_round_trip` states that one reads back the other.
 
 `MAP[K, V]` maps keys to values. `K` must be ordered (`ORD`): `STRING` and every number type are. Its representation is hidden, so what a client can prove comes from its laws, and each law reaches a client by itself:
 
@@ -1952,7 +2017,8 @@ Every program automatically sees the **Standard Prelude**:
 | Core types | `OPTION[A]`, `RESULT[E, A]`, `IO_ERROR` |
 | Collections | `SEQ[A]`, `LIST[A]`, `LIST_OPS`, `MAP[K, V]`, `KEY_ORDER[K]`, `GENERATOR[S, A]`, `UNFOLD[S, A]` |
 | Numbers | `BIGNAT`, `NUMBER_TEXT`, `NUMBER_ERROR` |
-| Text | `STRING`, `STRING_ERROR`, `BYTES`, `BYTES_BUILDER` |
+| Text | `STRING`, `STRING_ERROR`, `BYTES`, `BYTES_BUILDER`, `STRING_BUILDER`, `TEXT_FORMAT` |
+| Encodings | `HEX`, `BASE64`, `PERCENT`, `CODEC_ERROR` |
 | Functions | `FUNCTION_OPS` |
 | Reactive programs | `STEP[S]`, `COMMAND`, `EVENT`, `KEY`, `CONN_ID` |
 

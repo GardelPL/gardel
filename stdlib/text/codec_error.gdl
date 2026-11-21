@@ -1,0 +1,12 @@
+-- Why a text did not decode (Task H.6): `HEX`, `BASE64` and `PERCENT`.
+module CODEC_ERROR
+
+representation {ANY}
+  -- The text's length is not one an encoder gives.
+  | BadLength
+  -- The byte at offset `at` is not a symbol of the code, or not one allowed there.
+  | BadSymbol(at: NAT)
+  -- The decoded bytes are not UTF-8, where text was wanted.
+  | NotText
+
+end

@@ -321,6 +321,27 @@ specify {ANY}
       octets: all_octets(b.model)
     end
 
+  -- `all_octets` of the empty list, and of one `prepend` (Task H.6). A client sees no body, so
+  -- these are what let it build a `BYTES` from a list it writes. With their triggers a proof
+  -- also sees through any number of `prepend`s, where a body unfolds only as far as the fuel.
+  law octets_empty(xs: LIST[U64])
+    require
+      empty: xs.length = 0
+    trigger
+      all_octets(xs)
+    ensure
+      none: all_octets(xs)
+    end
+
+  law octets_prepend(x: U64, xs: LIST[U64])
+    trigger
+      all_octets(xs.prepend(x))
+    do
+      xs.prepend(x).tail = xs
+    ensure
+      step: all_octets(xs.prepend(x)) = (x < 256 and all_octets(xs))
+    end
+
   law octets_head(xs: LIST[U64])
     require
       octets: all_octets(xs)

@@ -4178,6 +4178,30 @@ pub const STDLIB_SOURCES: &[(&str, &str)] = &[
         include_str!("../../stdlib/text/number_text.gdl"),
     ),
     (
+        "stdlib/text/string_builder.gdl",
+        include_str!("../../stdlib/text/string_builder.gdl"),
+    ),
+    (
+        "stdlib/text/text_format.gdl",
+        include_str!("../../stdlib/text/text_format.gdl"),
+    ),
+    (
+        "stdlib/text/codec_error.gdl",
+        include_str!("../../stdlib/text/codec_error.gdl"),
+    ),
+    (
+        "stdlib/text/hex.gdl",
+        include_str!("../../stdlib/text/hex.gdl"),
+    ),
+    (
+        "stdlib/text/base64.gdl",
+        include_str!("../../stdlib/text/base64.gdl"),
+    ),
+    (
+        "stdlib/text/percent.gdl",
+        include_str!("../../stdlib/text/percent.gdl"),
+    ),
+    (
         "stdlib/core/io_error.gdl",
         include_str!("../../stdlib/core/io_error.gdl"),
     ),
@@ -4267,6 +4291,18 @@ pub fn phase4_stdlib_source() -> &'static str {
         include_str!("../../stdlib/text/number_error.gdl"),
         "\n",
         include_str!("../../stdlib/text/number_text.gdl"),
+        "\n",
+        include_str!("../../stdlib/text/string_builder.gdl"),
+        "\n",
+        include_str!("../../stdlib/text/text_format.gdl"),
+        "\n",
+        include_str!("../../stdlib/text/codec_error.gdl"),
+        "\n",
+        include_str!("../../stdlib/text/hex.gdl"),
+        "\n",
+        include_str!("../../stdlib/text/base64.gdl"),
+        "\n",
+        include_str!("../../stdlib/text/percent.gdl"),
         "\n",
         include_str!("../../stdlib/core/io_error.gdl"),
         "\n",
@@ -5945,7 +5981,7 @@ pub const GCC_NET_LIBS: &[&str] = if cfg!(windows) { &["-lws2_32"] } else { &[] 
 /// `STRING` is injected for modules that mention it, contain string literals or use `IO`
 /// (Task B.3: literals denote prelude `STRING` values); `LIST_OPS` / `FUNCTION_OPS` are realized by the built-in
 /// `Seq_*` / `Fn1_*` preamble theories already present in every Boogie file.
-const BOOGIE_INJECTED_PRELUDE: [&str; 24] = [
+const BOOGIE_INJECTED_PRELUDE: [&str; 30] = [
     "LIST_OPS",
     "GENERATOR",
     "OPTION",
@@ -5958,6 +5994,12 @@ const BOOGIE_INJECTED_PRELUDE: [&str; 24] = [
     "BYTES_BUILDER",
     "NUMBER_ERROR",
     "NUMBER_TEXT",
+    "STRING_BUILDER",
+    "TEXT_FORMAT",
+    "CODEC_ERROR",
+    "HEX",
+    "BASE64",
+    "PERCENT",
     "IO_ERROR",
     "CONN_ID",
     "PROC_ID",
@@ -6090,6 +6132,25 @@ impl BoogiePreludeCtx {
             wanted.insert("STRING");
         }
         if wanted.contains("BYTES_BUILDER") || m.name == "BYTES_BUILDER" {
+            wanted.insert("STRING");
+        }
+        // The codecs read and write text as `NUMBER_TEXT` does, build their output with a
+        // `BYTES_BUILDER`, and fail with a `CODEC_ERROR` (Task H.6).
+        if ["HEX", "BASE64", "PERCENT"].iter().any(|c| wanted.contains(c) || m.name == *c) {
+            wanted.insert("BYTES_BUILDER");
+            wanted.insert("CODEC_ERROR");
+            wanted.insert("NUMBER_TEXT");
+            wanted.insert("NUMBER_ERROR");
+            wanted.insert("STRING");
+        }
+        // `TEXT_FORMAT` builds with `STRING_BUILDER` (Task H.6).
+        if wanted.contains("TEXT_FORMAT") || m.name == "TEXT_FORMAT" {
+            wanted.insert("STRING_BUILDER");
+        }
+        // `STRING_BUILDER` adds numbers with `NUMBER_TEXT` (Task H.6).
+        if wanted.contains("STRING_BUILDER") || m.name == "STRING_BUILDER" {
+            wanted.insert("NUMBER_TEXT");
+            wanted.insert("NUMBER_ERROR");
             wanted.insert("STRING");
         }
         // `MAP` keeps its keys with `KEY_ORDER` and answers `get` with an `OPTION`.
@@ -23004,7 +23065,7 @@ end
         let stdlib = parse_phase4_stdlib().expect("Phase 4 stdlib should parse");
         assert_eq!(stdlib.group, None);
         assert_eq!(stdlib.concepts.len(), 3);
-        assert_eq!(stdlib.modules.len(), 25);
+        assert_eq!(stdlib.modules.len(), 31);
         for m in &stdlib.modules {
             let mut diags = check_visibility_and_semantics(m);
             diags.extend(verify_module_phase3(
@@ -23496,7 +23557,7 @@ end
     #[test]
     fn test_plan3_multi_module_stdlib_pipeline() {
         let ast = parse_phase4_stdlib().expect("stdlib parses cleanly");
-        assert_eq!(ast.modules.len(), 25);
+        assert_eq!(ast.modules.len(), 31);
         let mut prog_env = ProgramEnv {
             modules: HashMap::new(),
             concepts: HashMap::new(),

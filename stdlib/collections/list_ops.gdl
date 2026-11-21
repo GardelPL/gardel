@@ -535,6 +535,24 @@ specify {ANY}
       commutes: LIST_OPS.filter(LIST_OPS.map(xs, f), p) = LIST_OPS.map(LIST_OPS.filter(xs, FUNCTION_OPS.compose(p, f)), f)
     end
 
+  -- What follows the first `i` items is the item at `i`, then what follows it (Task H.6). A
+  -- loop over a list by index calls it at each step, to read the list's model one item on.
+  law drop_step[A](xs: LIST[A], i: NAT)
+    require
+      in_bounds: i < xs.length
+      small: i < 18446744073709551615
+    variant
+      i
+    do
+      if i = 0 then
+        xs.tail.prepend(xs.head) = xs
+      else
+        drop_step(xs.tail, i - 1)
+      end
+    ensure
+      step: LIST_OPS.drop(xs, i) = LIST_OPS.drop(xs, i + 1).prepend(LIST_OPS.at(xs, i))
+    end
+
   -- B&W §3.4: the first `n` items, then the rest, are the list.
   law take_drop[A](xs: LIST[A], n: NAT)
     variant

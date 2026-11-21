@@ -908,6 +908,69 @@ static bool {inst}__has(struct {inst}* xs, {ce} x) {{\n\
         Ok(name)
     }
 
+    /// `STRING.to_chars` (Task H.6): decodes the bytes from the end, so that each scalar is
+    /// prepended once. The bytes are well-formed UTF-8, as every `STRING`'s are.
+    fn string_chars_helper(&mut self) -> Result<String, String> {
+        self.ctype("LIST[CHAR]")?;
+        let inst = c_instance_name("LIST[CHAR]");
+        let name = "gardel_string_to_chars".to_string();
+        if self.done_helpers.insert(name.clone()) {
+            let body = format!(
+                "static struct {inst}* {name}(GardelString s) {{\n\
+    const uint8_t* p = (const uint8_t*)s.data;\n\
+    struct {inst}* xs = NULL;\n\
+    uint64_t i = s.len;\n\
+    while (i > 0) {{\n\
+        uint64_t j = i - 1;\n\
+        while ((p[j] & 0xC0) == 0x80) j--;\n\
+        uint32_t b0 = p[j], c;\n\
+        if (b0 < 0x80) c = b0;\n\
+        else if (b0 < 0xE0) c = ((b0 & 0x1F) << 6) | (p[j + 1] & 0x3F);\n\
+        else if (b0 < 0xF0) c = ((b0 & 0x0F) << 12) | ((uint32_t)(p[j + 1] & 0x3F) << 6) | (p[j + 2] & 0x3F);\n\
+        else c = ((b0 & 0x07) << 18) | ((uint32_t)(p[j + 1] & 0x3F) << 12) | ((uint32_t)(p[j + 2] & 0x3F) << 6) | (p[j + 3] & 0x3F);\n\
+        struct {inst}* n = {inst}__prepend(xs, c);\n\
+        drop_{inst}(xs);\n\
+        xs = n;\n\
+        i = j;\n\
+    }}\n\
+    return xs;\n}}\n\n"
+            );
+            let proto = body.lines().next().unwrap_or_default().trim_end_matches(" {").to_string();
+            self.protos.push(format!("{proto};\n"));
+            self.bodies.push(body);
+        }
+        Ok(name)
+    }
+
+    /// `STRING_BUILDER.join_reversed` (Task H.6): as `BYTES_BUILDER`'s, and the scalar count
+    /// is the sum of the parts'. Borrows the list.
+    fn string_join_reversed_helper(&mut self) -> Result<String, String> {
+        self.ctype("LIST[STRING]")?;
+        let inst = c_instance_name("LIST[STRING]");
+        let name = "gardel_string_join_reversed".to_string();
+        if self.done_helpers.insert(name.clone()) {
+            let body = format!(
+                "static GardelString {name}(struct {inst}* parts) {{\n\
+    uint64_t n = 0, chars = 0;\n\
+    for (struct {inst}* p = parts; p; p = p->tail) {{ n += p->head.len; chars += p->head.chars; }}\n\
+    void* owner = NULL;\n\
+    char* buf = gardel_buf_alloc((size_t)(n + 1), &owner);\n\
+    uint64_t at = n;\n\
+    for (struct {inst}* p = parts; p; p = p->tail) {{\n\
+        at -= p->head.len;\n\
+        if (p->head.len) memcpy(buf + at, p->head.data, (size_t)p->head.len);\n\
+    }}\n\
+    buf[n] = '\\0';\n\
+    GardelString s = {{ buf, n, chars, owner }};\n\
+    return s;\n}}\n\n"
+            );
+            let proto = body.lines().next().unwrap_or_default().trim_end_matches(" {").to_string();
+            self.protos.push(format!("{proto};\n"));
+            self.bodies.push(body);
+        }
+        Ok(name)
+    }
+
     /// Whether values of `ty` can be compared with `=`: a function can not, and neither can
     /// anything that holds one.
     fn has_equality(&self, ty: &str) -> bool {
@@ -1936,6 +1999,10 @@ static bool {inst}__has(struct {inst}* xs, {ce} x) {{\n\
             ("BYTES", "concat", 1, "BYTES"),
             ("BYTES", "slice", 2, "BYTES"),
         ];
+        if rt == "STRING" && m == "to_chars" && args.is_empty() {
+            let f = self.string_chars_helper()?;
+            return self.runtime_call(&f, vec![rv], "LIST[CHAR]", true);
+        }
         if rt == "BYTES" && m == "to_list" && args.is_empty() {
             let f = self.list_bytes_helper("to_list")?;
             return self.runtime_call(&f, vec![rv], "LIST[U64]", true);
@@ -2744,6 +2811,11 @@ static bool {inst}__has(struct {inst}* xs, {ce} x) {{\n\
                 self.ctype(FROM_UTF8_RESULT_TYPE)?;
                 let a = self.lower(cx, &args[0], Some("BYTES"), hc)?;
                 return self.runtime_call("gardel_string_from_utf8", vec![a], &cnorm(FROM_UTF8_RESULT_TYPE), true);
+            }
+            ("STRING_BUILDER", "join_reversed", 1) => {
+                let a = self.lower(cx, &args[0], Some("LIST[STRING]"), hc)?;
+                let f = self.string_join_reversed_helper()?;
+                return self.runtime_call(&f, vec![a], "STRING", true);
             }
             ("BYTES_BUILDER", "join_reversed", 1) => {
                 let a = self.lower(cx, &args[0], Some("LIST[BYTES]"), hc)?;

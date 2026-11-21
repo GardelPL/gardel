@@ -9,6 +9,16 @@ All notable changes, theoretical soundess fixes, verification overhauls, front-e
 Spec draft v0.5. [plan/Roadmap.md](plan/Roadmap.md) holds the detail for each task.
 
 ### Language and runtime
+- **Formatting and encodings** (H.6; `SHOW` moves to H.6b). New prelude modules.
+  - **`STRING_BUILDER`** builds text in linear time: `empty`, `add`, `add_char`, `add_nat`, `add_i64` and `to_string`, with model `LIST[CHAR]`. Each `add` states the characters it appends.
+  - **`TEXT_FORMAT`**: `pad_left`, `pad_right`, `repeat`, `join` (and `join_fits`, its bound as a test that runs in C), and ASCII `to_lower` and `to_upper`, each stated on `chars`.
+  - **`STRING`**: `split` states each part (`split_from`), and `join(split(s, c), c) = s` is a law (`join_split`, `join_split_fits`). `to_chars` and `from_char` are new, and `byte_width` relates a string's length to its characters' widths.
+  - **`HEX`**, **`BASE64`** (standard and URL-safe, with and without padding) and **`PERCENT`** encode `BYTES` as text and decode it back. Decoding is total and returns a `RESULT` with the new `CODEC_ERROR` (`BadLength`, `BadSymbol(at)`, `NotText`). Each has a `round_trip` law, proven: decoding the encoding gives the bytes back.
+  - **`NUMBER_TEXT`**: `nat_to_hex` and `parse_hex`, with the law `hex_round_trip`.
+  - **Laws added on the way:** `BYTES.octets_empty` and `octets_prepend`, `NUMBER_TEXT.ascii_prepend`, and `LIST_OPS.drop_step`.
+  - **The codecs run as loops in C.** Each is a tail-recursive loop over `BYTES` into a `BYTES_BUILDER`; its recursive model stays a specification. A recursive version overflowed Windows' 1 MiB stack at about 8 KiB of input. 32 MB round trips run.
+  - `tests/text_format.rs`: clients prove the round trips and print the formatted text, and seven false versions are refused.
+  - **Limits:** `STRING.find` is sensitive to the solver's seed (from about 1.4M to 172M resources), and the seed retries cover it. A text that would pass `U64`'s range must be bounded by the caller, as `fits` in each `add` and `pad_*` asks. The stdlib's verification time rose from 77 s to 120–160 s, most of it `BASE64`.
 - **Endless sequences: `GENERATOR` and `UNFOLD`** (H.22). New prelude modules.
   - **`GENERATOR[S, A]`** is a `state` and a step `next: S -> TUPLE[A, S]`. It has `make`, `iterate(x, f)` and `cycle(xs)`; `head`, `tail`, `take(n)`, `nth(n)` and `drop(n)`; and `map`, `zip`, `zip_with` and `scan`, each stating its step, except `cycle`.
   - **Searches are bounded:** `find_within(k, p)` and `take_while_within(k, p)`. There is no `filter`, since the next item that passes might never come.

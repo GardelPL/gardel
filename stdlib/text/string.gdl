@@ -54,6 +54,107 @@ create {ANY}
       c.code = 32 or c.code = 9 or c.code = 10 or c.code = 13
     end
 
+  -- The UTF-8 encoding of `c`, one to four bytes (Task H.6).
+  encode_char(c: CHAR): LIST[U64]
+    do
+      let n = c.code
+      let none: LIST[U64] = LIST.empty
+      if n < 128 then
+        none.prepend(n)
+      else
+        if n < 2048 then
+          none.prepend(128 + n % 64).prepend(192 + n / 64)
+        else
+          if n < 65536 then
+            none.prepend(128 + n % 64).prepend(128 + n / 64 % 64).prepend(224 + n / 4096)
+          else
+            none.prepend(128 + n % 64).prepend(128 + n / 64 % 64).prepend(128 + n / 4096 % 64)
+              .prepend(240 + n / 262144)
+          end
+        end
+      end
+    ensure
+      valid: BYTES.valid_utf8(Result)
+      decodes: BYTES.decode_utf8(Result) = LIST.singleton(c)
+      width: Result.length = STRING.char_width(c)
+    end
+
+  -- How many bytes UTF-8 takes for `c`.
+  char_width(c: CHAR): NAT
+    do
+      if c.code < 128 then 1 else if c.code < 2048 then 2 else if c.code < 65536 then 3 else 4 end end end
+    ensure
+      bounded: 1 <= Result and Result <= 4
+    end
+
+  -- The string of the one scalar `c`.
+  from_char(c: CHAR): STRING
+    do
+      let bs = STRING.encode_char(c)
+      match STRING.from_utf8(BYTES.from_list(bs))
+        case Ok(s) then s
+        case Error(_) then STRING.make_empty(1)
+      end
+    ensure
+      one: Result.chars = LIST.singleton(c)
+      count: Result.code_point_count = 1
+      width: Result.byte_length = STRING.char_width(c)
+    end
+
+  -- How many bytes UTF-8 takes for `cs`.
+  width_sum(cs: LIST[CHAR]): MATH_INT
+    variant
+      cs.length
+    do
+      if cs.length = 0 then 0 else STRING.width_sum(cs.tail) + STRING.char_width(cs.head) end
+    ensure
+      natural: Result >= 0
+    end
+
+  -- Lemma: well-formed UTF-8 is as long as the widths of the scalars it decodes to.
+  utf8_widths(bs: LIST[U64]): BOOL
+    require
+      valid: BYTES.valid_utf8(bs)
+    variant
+      bs.length
+    do
+      if bs.length = 0 then
+        True
+      else
+        if bs.head < 128 then
+          STRING.utf8_widths(bs.tail)
+        else
+          if bs.head <= 223 then
+            STRING.utf8_widths(bs.tail.tail)
+          else
+            if bs.head <= 239 then
+              STRING.utf8_widths(bs.tail.tail.tail)
+            else
+              STRING.utf8_widths(bs.tail.tail.tail.tail)
+            end
+          end
+        end
+      end
+    ensure
+      holds: Result
+      widths: bs.length = STRING.width_sum(BYTES.decode_utf8(bs))
+    end
+
+  -- Lemma: the width of an append is the sum of the widths.
+  width_append(xs: LIST[CHAR], ys: LIST[CHAR]): BOOL
+    variant
+      xs.length
+    do
+      if xs.length = 0 then
+        True
+      else
+        xs.tail.prepend(xs.head) = xs and STRING.width_append(xs.tail, ys)
+      end
+    ensure
+      holds: Result
+      sum: STRING.width_sum(xs.append(ys)) = STRING.width_sum(xs) + STRING.width_sum(ys)
+    end
+
 create {NONE}
 
   nth_char(bs: LIST[U64], i: NAT): CHAR
@@ -529,6 +630,12 @@ feature {ANY}
       end
     ensure
       parts: Result.length = Current.count_char(sep, i) + 1
+      -- Each step as a contract (Task H.6), for `TEXT_FORMAT.join_split`.
+      at_end: i = Current.code_point_count implies Result = LIST.singleton(Current.slice(start, i))
+      hit: (i < Current.code_point_count and LIST_OPS.at(Current.chars, i) = sep) implies
+        Result = Current.split_from(sep, i + 1, i + 1).prepend(Current.slice(start, i))
+      miss: (i < Current.code_point_count and LIST_OPS.at(Current.chars, i) != sep) implies
+        Result = Current.split_from(sep, start, i + 1)
     end
 
   -- `"a,b,,c".split(',')` is `["a", "b", "", "c"]`: one more part than there are separators.
@@ -537,6 +644,7 @@ feature {ANY}
       Current.split_from(sep, 0, 0)
     ensure
       parts: Result.length = Current.count_char(sep, 0) + 1
+      def: Result = Current.split_from(sep, 0, 0)
     end
 
   -- The only precondition is that the total byte length is representable.
@@ -561,6 +669,14 @@ feature {ANY}
     ensure
       model_matches: Result.model = Current.byte_model
       valid: BYTES.valid_utf8(Result.model)
+    end
+
+  -- The scalars, as a list to walk (Task H.6). C decodes the bytes once.
+  to_chars: LIST[CHAR]
+    do
+      BYTES.decode_utf8(Current.bytes)
+    ensure
+      model: Result = Current.chars
     end
 
   -- Builders used by string-literal desugaring (§3.1.4). Each prepends one complete,
@@ -645,6 +761,19 @@ feature {ANY}
       bytes_prepended: Result.byte_model = Current.byte_model.prepend(b3).prepend(b2).prepend(b1).prepend(b0)
       non_empty: not Result.is_empty
       same_capacity: Result.capacity = Current.capacity
+    end
+
+specify {ANY}
+
+  -- A string's byte length is the width of its scalars (Task H.6). It is what lets a proof
+  -- about scalars, such as `TEXT_FORMAT.join_split`, show that the bytes fit.
+  law byte_width(s: STRING)
+    trigger
+      STRING.width_sum(s.chars)
+    do
+      STRING.utf8_widths(s.byte_model)
+    ensure
+      widths: s.byte_length = STRING.width_sum(s.chars)
     end
 
 specify {EQ}
