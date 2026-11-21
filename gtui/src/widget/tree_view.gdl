@@ -213,6 +213,41 @@ feature {ANY}
       end
     end
 
+  -- Moved by a mouse event inside `r`: left-clicking a visible row selects it, and toggles
+  -- open/close when the row is already selected or the click hits its disclosure indicator;
+  -- the wheel steps the selection by 3 rows.
+  on_mouse(m: MOUSE, r: RECT): TREE_VIEW
+    do
+      if not r.has(m.x, m.y) then
+        Current
+      else if m.is_left_down then
+        let dy = m.y - r.y
+        let top = Current.view.top
+        let idx = if top <= 18446744073709551615 - dy then top + dy else 18446744073709551615 end
+        if idx < Current.visible.length then
+          let row = LIST_OPS.at(Current.visible, idx)
+          let indent = if row.depth <= 32000 then 2 * row.depth else 64000 end
+          let dx = m.x - r.x
+          let on_disclosure = dx >= indent and dx <= indent + 1
+          let was_selected = idx = Current.view.selected
+          let moved: TREE_VIEW = { Current with view = Current.view.select(idx, r.height) }
+          if was_selected or on_disclosure then
+            moved.toggled(r.height)
+          else
+            moved
+          end
+        else
+          Current
+        end
+      else if m.is_wheel_up then
+        { Current with view = Current.view.up(3, r.height) }
+      else if m.is_wheel_down then
+        { Current with view = Current.view.down(3, r.height) }
+      else
+        Current
+      end end end end
+    end
+
   -- The rows drawn in `r`, in style `st`, the selected one across its row in `mark`.
   draw(s: SCREEN, r: RECT, st: STYLE, mark: STYLE): SCREEN
     do

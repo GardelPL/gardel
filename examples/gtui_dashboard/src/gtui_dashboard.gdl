@@ -13,6 +13,7 @@ feature {ANY}
       match e
         case Resized(w, h) then TUI_NEXT.next(s.sized(w, h))
         case Key(k) then s.on_key(k)
+        case Mouse(m) then s.on_mouse(m)
         case _ then TUI_NEXT.next(s)
       end
     end
@@ -26,18 +27,22 @@ feature {ANY}
     do
       let t = s.theme
       let area = blank.area
+      let tabs_r = DASH_LAYOUT.tabs_bar(area)
       let left = DASH_LAYOUT.left(area)
       let right = DASH_LAYOUT.right(area)
       let bottom = DASH_LAYOUT.bottom(area)
       let status_rect = DASH_LAYOUT.status(area)
       let kind = s.border_kind
 
+      -- 0. Top tabs bar.
+      let s_tabs = s.tabs.draw(blank, tabs_r, t.base, t.active_tab)
+
       -- 1. Left pane: Framed TABLE + right-edge vertical SCROLLBAR.
-      let s0 = FRAME.draw_titled(blank, left, kind, "Modules", "GT.7", "", edge(s, 0), t.active_tab)
-      let left_inner = FRAME.inner(left)
-      let tbl_area = left_inner.drop_right(1)
+      let left_title = if s.tabs.selected = 0 then "Modules" else s.tabs.selected_title end
+      let s0 = FRAME.draw_titled(s_tabs, left, kind, left_title, "GT.7", "", edge(s, 0), t.active_tab)
+      let tbl_area = DASH_LAYOUT.table_area(area)
       let s1 = s.table.draw(s0, tbl_area, t.base, t.keyword.bold, t.selection)
-      let s2 = s.scrollbar.draw(s1, left_inner, t.gutter, t.focused_border)
+      let s2 = s.scrollbar.draw(s1, DASH_LAYOUT.scrollbar_area(area), t.gutter, t.focused_border)
 
       -- 2. Right pane: Framed GAUGEs + SPARKLINE, with shared vertical border merged via FRAME.merge_borders.
       let s3 = FRAME.draw_titled(s2, right, kind, "Telemetry", s.border_name, "Space: sample", edge(s, 1), t.active_tab)
@@ -53,7 +58,7 @@ feature {ANY}
       -- 3. Bottom pane: Framed PARAGRAPH inspector with live wrap & alignment modes.
       let meta = GLYPHS.join(GLYPHS.join("wrap:", s.wrap_name), GLYPHS.join(" align:", s.align_name))
       let s8 = FRAME.draw_titled(s7, bottom, kind, "Inspector", meta, "", t.border, t.active_tab)
-      let s9 = s.inspector.draw(s8, FRAME.inner_padded(bottom, PADDING.symmetric(0, 1)), t.base)
+      let s9 = s.inspector.draw(s8, DASH_LAYOUT.inspector_area(area), t.base)
 
       -- 4. Status bar + optional Help POPUP overlay.
       let left_status = GLYPHS.join("Theme: ", t.name)

@@ -6,6 +6,7 @@ representation {NONE}
   wide: NAT
   high: NAT
   keys_at: FOCUS
+  view_tabs: TABS
   mod_table: TABLE
   history: LIST[NAT]
   tick_count: NAT
@@ -13,9 +14,34 @@ representation {NONE}
   border_idx: NAT
   wrap_idx: NAT
   align_idx: NAT
+  detail_para: PARAGRAPH
+  help_modal: POPUP
   help_shown: BOOL
 
 create {ANY}
+
+  make_tabs: TABS
+    do
+      TABS.empty.with("Overview", '1').with("Tasks", '2').with("Events", '3').with("Unicode", '4')
+    end
+
+  make_help(kind: BORDER_KIND): POPUP
+    do
+      let l1 = "Up/Down/PgUp/PgDn/Home/End: select module\n"
+      let l2 = "Space: record solver sample | Tab: focus\n"
+      let l3 = "t: theme | b: border | w: wrap | a: align\n"
+      let l4 = "1-4: switch tabs | ?: toggle help | q: quit\n"
+      let l5 = "Mouse: click tabs to switch dashboard view\n"
+      let l6 = "Click table rows or drag scrollbar to jump\n"
+      let l7 = "Wheel scrolls table, inspector & help modal\n"
+      let l8 = "Click outside modal to dismiss"
+      let p1 = GLYPHS.join(GLYPHS.join(l1, l2), GLYPHS.join(l3, l4))
+      let p2 = GLYPHS.join(GLYPHS.join(l5, l6), GLYPHS.join(l7, l8))
+      POPUP.of_text("Dashboard Controls", GLYPHS.join(p1, p2), 54, 8)
+        .with_border(kind)
+        .with_padding(PADDING.symmetric(0, 1))
+        .with_footer("Esc/? to close")
+    end
 
   make: DASH_STATE
     do
@@ -38,10 +64,14 @@ create {ANY}
         .prepend(7).prepend(5).prepend(8).prepend(6)
         .prepend(4).prepend(7).prepend(3).prepend(6)
         .prepend(5).prepend(2).prepend(4).prepend(1)
+      let para = PARAGRAPH.of_text(DASH_STATE.detail_for(0, 0)).with_wrap(WRAP_MODE.wrap_word).with_align(ALIGN.left)
       { wide = 80, high = 24, keys_at = FOCUS.make(2),
+        view_tabs = DASH_STATE.make_tabs,
         mod_table = TABLE.with_headers(widths, hdr, rows),
         history = hist, tick_count = 0,
         theme_idx = 0, border_idx = 0, wrap_idx = 0, align_idx = 0,
+        detail_para = para,
+        help_modal = DASH_STATE.make_help(BORDER_KIND.rounded),
         help_shown = False }
     end
 
@@ -51,28 +81,44 @@ create {ANY}
       none.prepend(d).prepend(c).prepend(b).prepend(a)
     end
 
-  detail_for(sel: NAT): STRING
+  tab_note(tab_idx: NAT): STRING
     do
-      if sel = 0 then
-        GLYPHS.join("LAYOUT (GT.3): SIZE.min, SIZE.max, SIZE.percent, ", "columns_with_gap, rows_with_gap, and JUSTIFY.")
-      else if sel = 1 then
-        GLYPHS.join("FRAME (GT.4): Rounded, Plain, Double, and Thick ", "BORDER_KIND, PADDING, multi-titles, and merge_borders.")
-      else if sel = 2 then
-        GLYPHS.join("PARAGRAPH (GT.5): Word/char wrap and Left/Center/", "Right ALIGN measured by terminal display width.")
-      else if sel = 3 then
-        GLYPHS.join("POPUP & CLEAR (GT.6): Centered modal overlays via ", "RECT.centered, CLEAR blanking, and framed body.")
-      else if sel = 4 then
-        GLYPHS.join("TABLE (GT.7): Multi-column grid using LAYOUT ", "constraints, optional header row, and scrolling.")
-      else if sel = 5 then
-        GLYPHS.join("SCROLLBAR (GT.7): Vertical and horizontal track ", "and proportional thumb indicators.")
-      else if sel = 6 then
-        GLYPHS.join("SPARKLINE (GT.7): 8-level vertical block trend ", "chart with automatic or explicit ceiling.")
-      else
-        let p1 = GLYPHS.join("CHAR_WIDTH (GT.8): Unicode 16.0 ", "\u{1FA89}\u{1FAC6}\u{1FAE9}")
-        let p2 = GLYPHS.join(" + UAX #29 ZWJ ", "\u{1F469}\u{200D}\u{1F4BB}\u{1F3F3}\u{FE0F}\u{200D}\u{1F308}")
-        let p3 = GLYPHS.join(", tone \u{1F44D}\u{1F3FD}", ", flag \u{1F1FA}\u{1F1F8}.")
-        GLYPHS.join(GLYPHS.join(p1, p2), p3)
-      end end end end end end end
+      if tab_idx = 0 then "View: Overview — live verification summary"
+      else if tab_idx = 1 then "View: Tasks — interactive verification queue"
+      else if tab_idx = 2 then "View: Events — SGR 1006 mouse & key stream"
+      else "View: Unicode — Unicode 16.0 & UAX #29 clusters"
+      end end end
+    end
+
+  detail_for(sel: NAT, tab_idx: NAT): STRING
+    do
+      let lead =
+        if sel = 0 then
+          GLYPHS.join("LAYOUT (GT.3): SIZE.min, SIZE.max, SIZE.percent, ", "columns_with_gap, rows_with_gap, and JUSTIFY.")
+        else if sel = 1 then
+          GLYPHS.join("FRAME (GT.4): Rounded, Plain, Double, and Thick ", "BORDER_KIND, PADDING, multi-titles, and merge_borders.")
+        else if sel = 2 then
+          GLYPHS.join("PARAGRAPH (GT.5): Word/char wrap and Left/Center/", "Right ALIGN measured by terminal display width.")
+        else if sel = 3 then
+          GLYPHS.join("POPUP & CLEAR (GT.6): Centered modal overlays via ", "RECT.centered, CLEAR blanking, and framed body.")
+        else if sel = 4 then
+          GLYPHS.join("TABLE (GT.7): Multi-column grid using LAYOUT ", "constraints, optional header row, and scrolling.")
+        else if sel = 5 then
+          GLYPHS.join("SCROLLBAR (GT.7): Vertical and horizontal track ", "and proportional thumb indicators.")
+        else if sel = 6 then
+          GLYPHS.join("SPARKLINE (GT.7): 8-level vertical block trend ", "chart with automatic or explicit ceiling.")
+        else
+          let p1 = GLYPHS.join("CHAR_WIDTH (GT.8): Unicode 16.0 ", "\u{1FA89}\u{1FAC6}\u{1FAE9}")
+          let p2 = GLYPHS.join(" + UAX #29 ZWJ ", "\u{1F469}\u{200D}\u{1F4BB}\u{1F3F3}\u{FE0F}\u{200D}\u{1F308}")
+          let p3 = GLYPHS.join(", tone \u{1F44D}\u{1F3FD}", ", flag \u{1F1FA}\u{1F1F8}.")
+          GLYPHS.join(GLYPHS.join(p1, p2), p3)
+        end end end end end end end
+      let l2 = GLYPHS.join("\n", DASH_STATE.tab_note(tab_idx))
+      let l3 = "\nContracts: verified statically under --strict with Z3."
+      let l4 = "\nLayout: shared pure DASH_LAYOUT powers view & hit-testing."
+      let l5 = "\nScrollbar: click or drag right track edge to jump rows."
+      let l6 = "\nMouse tip: wheel here scrolls detail notes."
+      GLYPHS.join(GLYPHS.join(lead, l2), GLYPHS.join(GLYPHS.join(l3, l4), GLYPHS.join(l5, l6)))
     end
 
 feature {ANY}
@@ -185,6 +231,11 @@ feature {ANY}
       SPARKLINE.make(Current.history).with_max(8)
     end
 
+  tabs: TABS
+    do
+      Current.view_tabs
+    end
+
   scrollbar: SCROLLBAR
     do
       let vis = DASH_LAYOUT.table_rows(Current.area)
@@ -193,21 +244,19 @@ feature {ANY}
 
   inspector: PARAGRAPH
     do
-      let text = DASH_STATE.detail_for(Current.mod_table.selected)
-      PARAGRAPH.of_text(text).with_wrap(Current.wrap_mode).with_align(Current.align_mode)
+      Current.detail_para
     end
 
   help_popup: POPUP
     do
-      let l1 = "Up/Down/PgUp/PgDn/Home/End: select module\n"
-      let l2 = "Space: record solver sample | Tab: focus\n"
-      let l3 = "t: theme | b: border | w: wrap | a: align\n"
-      let l4 = "?: toggle help | q: quit"
-      let help_text = GLYPHS.join(GLYPHS.join(l1, l2), GLYPHS.join(l3, l4))
-      POPUP.of_text("Dashboard Controls", help_text, 54, 8)
-        .with_border(Current.border_kind)
-        .with_padding(PADDING.symmetric(0, 1))
-        .with_footer("Esc/? to close")
+      Current.help_modal
+    end
+
+  refresh_inspector: DASH_STATE
+    do
+      let text = DASH_STATE.detail_for(Current.mod_table.selected, Current.view_tabs.selected)
+      let para = PARAGRAPH.of_text(text).with_wrap(Current.wrap_mode).with_align(Current.align_mode)
+      { Current with detail_para = para }
     end
 
   sized(w: NAT, h: NAT): DASH_STATE
@@ -236,7 +285,7 @@ feature {ANY}
             else if c = '?' then TUI_NEXT.next({ Current with help_shown = False })
             else TUI_NEXT.next(Current)
             end end
-          case _ then TUI_NEXT.next(Current)
+          case _ then TUI_NEXT.next({ Current with help_modal = Current.help_modal.on_key(k, Current.area) })
         end
       else
         match k
@@ -244,17 +293,89 @@ feature {ANY}
           case Tab then TUI_NEXT.next({ Current with keys_at = Current.keys_at.next })
           case Char(c) then
             if c = 'q' then TUI_NEXT.quit(0)
-            else if c = '?' then TUI_NEXT.next({ Current with help_shown = True })
+            else if c = '?' then TUI_NEXT.next({ Current with help_shown = True, help_modal = DASH_STATE.make_help(Current.border_kind) })
             else if c = 't' then TUI_NEXT.next({ Current with theme_idx = if Current.theme_idx < 3 then Current.theme_idx + 1 else 0 end })
-            else if c = 'b' then TUI_NEXT.next({ Current with border_idx = if Current.border_idx < 3 then Current.border_idx + 1 else 0 end })
-            else if c = 'w' then TUI_NEXT.next({ Current with wrap_idx = if Current.wrap_idx < 2 then Current.wrap_idx + 1 else 0 end })
-            else if c = 'a' then TUI_NEXT.next({ Current with align_idx = if Current.align_idx < 2 then Current.align_idx + 1 else 0 end })
+            else if c = 'b' then
+              let next_b = if Current.border_idx < 3 then Current.border_idx + 1 else 0 end
+              let next_kind =
+                if next_b = 0 then BORDER_KIND.rounded
+                else if next_b = 1 then BORDER_KIND.plain
+                else if next_b = 2 then BORDER_KIND.double
+                else BORDER_KIND.thick
+                end end end
+              TUI_NEXT.next({ Current with border_idx = next_b, help_modal = Current.help_modal.with_border(next_kind) })
+            else if c = 'w' then
+              let next_w = if Current.wrap_idx < 2 then Current.wrap_idx + 1 else 0 end
+              TUI_NEXT.next({ Current with wrap_idx = next_w }.refresh_inspector)
+            else if c = 'a' then
+              let next_a = if Current.align_idx < 2 then Current.align_idx + 1 else 0 end
+              TUI_NEXT.next({ Current with align_idx = next_a }.refresh_inspector)
             else if c = ' ' then TUI_NEXT.next(Current.stepped_sample)
+            else if Current.view_tabs.takes(k) then
+              TUI_NEXT.next({ Current with view_tabs = Current.view_tabs.on_key(k) }.refresh_inspector)
             else TUI_NEXT.next(Current)
-            end end end end end end end
+            end end end end end end end end
           case _ then
             let vis = DASH_LAYOUT.table_rows(Current.area)
-            TUI_NEXT.next({ Current with mod_table = Current.mod_table.on_key(k, vis) })
+            let next_tbl = Current.mod_table.on_key(k, vis)
+            let updated: DASH_STATE = { Current with mod_table = next_tbl }
+            TUI_NEXT.next(if next_tbl.selected != Current.mod_table.selected then updated.refresh_inspector else updated end)
+        end
+      end
+    end
+
+  on_mouse(m: MOUSE): TUI_NEXT[DASH_STATE]
+    do
+      let area = Current.area
+      if Current.help_shown then
+        if Current.help_modal.contains(area, m.x, m.y) then
+          TUI_NEXT.next({ Current with help_modal = Current.help_modal.on_mouse(m, area) })
+        else if m.is_left_down then
+          TUI_NEXT.next({ Current with help_shown = False })
+        else
+          TUI_NEXT.next(Current)
+        end end
+      else
+        let tabs_r = DASH_LAYOUT.tabs_bar(area)
+        let sb_r = DASH_LAYOUT.scrollbar_area(area)
+        let tbl_r = DASH_LAYOUT.table_area(area)
+        let insp_r = DASH_LAYOUT.inspector_area(area)
+        let left_r = DASH_LAYOUT.left(area)
+        let right_r = DASH_LAYOUT.right(area)
+        if tabs_r.has(m.x, m.y) then
+          let next_tabs = Current.view_tabs.on_mouse(m, tabs_r)
+          let updated: DASH_STATE = { Current with view_tabs = next_tabs }
+          TUI_NEXT.next(if next_tabs.selected != Current.view_tabs.selected then updated.refresh_inspector else updated end)
+        else
+          let vis = DASH_LAYOUT.table_rows(area)
+          match Current.scrollbar.scroll_for_mouse(m, sb_r, Current.mod_table.row_count, vis)
+            case Some(pos) then
+              let cur_top = Current.mod_table.top
+              let target =
+                if pos > cur_top and vis > 0 and pos <= 18446744073709551615 - vis then
+                  pos + vis - 1
+                else
+                  pos
+                end
+              let next_tbl = Current.mod_table.select(target, vis)
+              let updated: DASH_STATE = { Current with mod_table = next_tbl, keys_at = Current.keys_at.moved_to(0) }
+              TUI_NEXT.next(if next_tbl.selected != Current.mod_table.selected then updated.refresh_inspector else updated end)
+            case None then
+              if tbl_r.has(m.x, m.y) then
+                let next_tbl = Current.mod_table.on_mouse(m, tbl_r)
+                let next_focus = if m.is_left_down then Current.keys_at.moved_to(0) else Current.keys_at end
+                let updated: DASH_STATE = { Current with mod_table = next_tbl, keys_at = next_focus }
+                TUI_NEXT.next(if next_tbl.selected != Current.mod_table.selected then updated.refresh_inspector else updated end)
+              else if insp_r.has(m.x, m.y) then
+                TUI_NEXT.next({ Current with detail_para = Current.detail_para.on_mouse(m, insp_r) })
+              else if m.is_left_down and left_r.has(m.x, m.y) then
+                TUI_NEXT.next({ Current with keys_at = Current.keys_at.moved_to(0) })
+              else if m.is_left_down and right_r.has(m.x, m.y) then
+                TUI_NEXT.next({ Current with keys_at = Current.keys_at.moved_to(1) })
+              else
+                TUI_NEXT.next(Current)
+              end end end end
+          end
         end
       end
     end

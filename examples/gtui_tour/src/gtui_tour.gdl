@@ -19,6 +19,7 @@ feature {ANY}
       match e
         case Resized(w, h) then TUI_NEXT.next(s.sized(w, h))
         case Key(k) then if s.palette_open then s.in_palette(k) else s.browse(k) end
+        case Mouse(m) then s.handle_mouse(m)
         case AttachedEnded(tag, r) then
           match r
             case Ok(code) then TUI_NEXT.next(s.logged(GLYPHS.join("The program ended with ", NUMBER_TEXT.i64_to_text(code))))

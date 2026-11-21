@@ -18,11 +18,24 @@ representation {NONE}
   log: LIST[STRING]
   commands: PALETTE
   commands_open: BOOL
+  help_modal: POPUP
   help_shown: BOOL
   child: STRING
   look: THEME
 
 create {ANY}
+
+  make_help: POPUP
+    do
+      let l1 = "Tab: move between panes | m/f/o/p: switch tabs\n"
+      let l2 = "Arrows/Enter: browse tree & mark problem line\n"
+      let l3 = "/: command palette | ?: toggle help | q: quit\n"
+      let l4 = "Mouse: click pane to focus, click tabs/tree\n"
+      let l5 = "Wheel scrolls tree, source, problems & help\n"
+      let l6 = "Click outside modal or palette to dismiss"
+      let text = GLYPHS.join(GLYPHS.join(l1, l2), GLYPHS.join(GLYPHS.join(l3, l4), GLYPHS.join(l5, l6)))
+      POPUP.of_text("Help", text, 50, 7).with_footer("Esc/? to close").with_padding(PADDING.symmetric(0, 1))
+    end
 
   -- The tour, with `program` as the program `/shell` runs attached, none when it is "".
   make(program: STRING): TOUR_STATE
@@ -42,6 +55,7 @@ create {ANY}
         log = LIST.empty.prepend("Tab moves between panes; / opens the commands; q quits."),
         commands = PALETTE.make(TOUR_STATE.palette_entries),
         commands_open = False,
+        help_modal = TOUR_STATE.make_help,
         help_shown = False,
         child = program,
         look = THEME.dark }
@@ -193,8 +207,7 @@ feature {ANY}
 
   help_popup: POPUP
     do
-      let text = "Tab: move between panes | m/f/o/p: switch tabs\nArrows/Enter: browse tree & mark problem line\n/: command palette | ?: toggle help | q: quit"
-      POPUP.of_text("Help", text, 50, 7).with_footer("Esc/? to close").with_padding(PADDING.symmetric(0, 1))
+      Current.help_modal
     end
 
   theme: THEME
@@ -241,14 +254,14 @@ feature {ANY}
             else if c = '?' then TUI_NEXT.next({ Current with help_shown = False })
             else TUI_NEXT.next(Current)
             end end
-          case _ then TUI_NEXT.next(Current)
+          case _ then TUI_NEXT.next({ Current with help_modal = Current.help_modal.on_key(k, Current.area) })
         end
       else
         match k
           case Char(c) then
             if c = 'q' then TUI_NEXT.quit(0)
             else if c = '/' then TUI_NEXT.next({ Current with commands = PALETTE.make(TOUR_STATE.palette_entries), commands_open = True })
-            else if c = '?' then TUI_NEXT.next({ Current with help_shown = True })
+            else if c = '?' then TUI_NEXT.next({ Current with help_shown = True, help_modal = TOUR_STATE.make_help })
             else TUI_NEXT.next(Current.in_pane(k))
             end end end
           case Tab then TUI_NEXT.next({ Current with keys_at = Current.keys_at.next })
@@ -330,7 +343,7 @@ feature {ANY}
         let t = THEME.named(args)
         TUI_NEXT.next({ Current with look = t }.logged(GLYPHS.join("Theme ", t.name)))
       else if name.equals("help") then
-        TUI_NEXT.next({ Current with help_shown = True })
+        TUI_NEXT.next({ Current with help_shown = True, help_modal = TOUR_STATE.make_help })
       else if name.equals("shell") then
         if Current.child.is_empty then
           TUI_NEXT.next(Current.logged("No program was given to the tour to run."))
@@ -341,6 +354,82 @@ feature {ANY}
       else
         TUI_NEXT.next(Current.logged(GLYPHS.join("Unknown command ", name)))
       end end end end end end
+    end
+
+  -- A mouse event routed through overlays and panes using `TOUR_LAYOUT`.
+  handle_mouse(m: MOUSE): TUI_NEXT[TOUR_STATE]
+    do
+      let area = Current.area
+      if Current.help_shown then
+        if Current.help_modal.contains(area, m.x, m.y) then
+          TUI_NEXT.next({ Current with help_modal = Current.help_modal.on_mouse(m, area) })
+        else if m.is_left_down then
+          TUI_NEXT.next({ Current with help_shown = False })
+        else
+          TUI_NEXT.next(Current)
+        end end
+      else if Current.commands_open then
+        let pal_r = TOUR_LAYOUT.palette(area, Current.commands)
+        if not pal_r.has(m.x, m.y) and m.is_left_down then
+          TUI_NEXT.next({ Current with commands_open = False })
+        else
+          TUI_NEXT.next(Current)
+        end
+      else
+        let left = TOUR_LAYOUT.left(area)
+        let right = TOUR_LAYOUT.right(area)
+        let bottom = TOUR_LAYOUT.bottom(area)
+        if left.has(m.x, m.y) then
+          let focused: TOUR_STATE = if m.is_left_down then { Current with keys_at = Current.keys_at.moved_to(0) } else Current end
+          let title_r = FRAME.title_area(left)
+          let inner = FRAME.inner(left)
+          if title_r.has(m.x, m.y) then
+            TUI_NEXT.next({ focused with left_tabs = focused.left_tabs.on_mouse(m, title_r) })
+          else if inner.has(m.x, m.y) then
+            if focused.left_tabs.selected = 0 then
+              TUI_NEXT.next({ focused with module_tree = focused.module_tree.on_mouse(m, inner) })
+            else
+              TUI_NEXT.next({ focused with file_tree = focused.file_tree.on_mouse(m, inner) })
+            end
+          else
+            TUI_NEXT.next(focused)
+          end end
+        else if right.has(m.x, m.y) then
+          let focused: TOUR_STATE = if m.is_left_down then { Current with keys_at = Current.keys_at.moved_to(1) } else Current end
+          let inner = FRAME.inner(right)
+          if inner.has(m.x, m.y) then
+            TUI_NEXT.next({ focused with source = focused.source.on_mouse(m, inner) })
+          else
+            TUI_NEXT.next(focused)
+          end
+        else if bottom.has(m.x, m.y) then
+          let focused: TOUR_STATE = if m.is_left_down then { Current with keys_at = Current.keys_at.moved_to(2) } else Current end
+          let title_r = FRAME.title_area(bottom)
+          let inner = FRAME.inner(bottom)
+          if title_r.has(m.x, m.y) then
+            TUI_NEXT.next({ focused with low_tabs = focused.low_tabs.on_mouse(m, title_r) })
+          else if inner.has(m.x, m.y) and focused.low_tabs.selected = 1 then
+            let next_issues = focused.issues.on_mouse(m, inner)
+            if m.is_left_down then
+              let dy = m.y - inner.y
+              let idx = if focused.issues.top <= 18446744073709551615 - dy then focused.issues.top + dy else 18446744073709551615 end
+              if idx < focused.issues.count then
+                let line = TOUR_STATE.nth(focused.issue_lines, next_issues.selected)
+                let text_rows = TOUR_LAYOUT.rows_in(right)
+                TUI_NEXT.next({ focused with issues = next_issues, mark_line = Some(line), source = focused.source.showing(line, text_rows) })
+              else
+                TUI_NEXT.next({ focused with issues = next_issues })
+              end
+            else
+              TUI_NEXT.next({ focused with issues = next_issues })
+            end
+          else
+            TUI_NEXT.next(focused)
+          end end
+        else
+          TUI_NEXT.next(Current)
+        end end end
+      end end
     end
 
 create {ANY}

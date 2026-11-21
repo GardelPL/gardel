@@ -74,6 +74,33 @@ create {ANY}
       same_height: Result.height = s.height
     end
 
+  -- The index into `names` of the tab whose label (and optional `(k)`) on `row` starting at
+  -- column `x` covers column `cx`, or `18446744073709551615` when none does.
+  find_tab(row: RECT, names: LIST[STRING], keys: LIST[CHAR], x: NAT, cx: NAT): NAT
+    variant
+      names.length
+    do
+      if names.length = 0 or keys.length = 0 or x >= row.right or cx < x then
+        18446744073709551615
+      else
+        let title = names.head
+        let k = keys.head
+        let n = GLYPHS.width(title)
+        let kx = x + n
+        let after = if k = ' ' then kx else kx + 3 end
+        if cx < after then
+          0
+        else if names.tail.length = 0 then
+          18446744073709551615
+        else
+          let r = TABS.find_tab(row, names.tail, keys.tail, after + 3, cx)
+          if r < 18446744073709551615 then r + 1 else 18446744073709551615 end
+        end end
+      end
+    ensure
+      found_valid: Result < 18446744073709551615 implies Result < names.length
+    end
+
 feature {ANY}
 
   count: NAT
@@ -156,6 +183,36 @@ feature {ANY}
         case Tab then Current.next
         case Char(c) then if c = ' ' then Current else Current.choose(TABS.key_index(Current.hot, c)) end
         case _ then Current
+      end
+    ensure
+      same_count: Result.count = Current.count
+    end
+
+  -- Index of the tab whose rendered label (and optional key) on the top row of `r`
+  -- covers cell `(cx, cy)`, or `None` when outside or on a separator.
+  tab_at(r: RECT, cx: NAT, cy: NAT): OPTION[NAT]
+    do
+      let row = r.take_top(1)
+      if row.has(cx, cy) then
+        let i = TABS.find_tab(row, Current.names, Current.hot, row.x, cx)
+        if i < 18446744073709551615 then Some(i) else None end
+      else
+        None
+      end
+    ensure
+      valid: match Result case Some(i) then i >= 0 and i < Current.count and i < 18446744073709551615 case None then True end
+    end
+
+  -- Chosen by a mouse event: left-clicking a tab on the top row of `r` selects it.
+  on_mouse(m: MOUSE, r: RECT): TABS
+    do
+      if m.is_left_down then
+        match Current.tab_at(r, m.x, m.y)
+          case Some(i) then Current.choose(i)
+          case None then Current
+        end
+      else
+        Current
       end
     ensure
       same_count: Result.count = Current.count

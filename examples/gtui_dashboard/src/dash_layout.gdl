@@ -1,5 +1,6 @@
 -- Layout geometry for `gtui_dashboard`:
--- - Top main area split into two touching columns (`left` table pane and `right` metrics/sparkline pane,
+-- - 1-row top `tabs_bar`.
+-- - Main upper area split into two touching columns (`left` table pane and `right` metrics/sparkline pane,
 --   sharing a 1-column vertical border so `FRAME.merge_borders` joins their corners into `┬` and `┴`).
 -- - Bottom inspector pane (`bottom`) for `PARAGRAPH` details.
 -- - 1-row `status` bar at the bottom of the screen.
@@ -7,31 +8,37 @@ functions DASH_LAYOUT
 
 feature {ANY}
 
-  -- Vertical split of `area`: main upper area, 6-row inspector pane, and 1-row status bar.
+  -- Vertical split of `area`: 1-row tabs bar, main upper area, 6-row inspector pane, and 1-row status bar.
   vertical_parts(area: RECT): LIST[RECT]
     do
       let sizes: LIST[SIZE] = LIST.empty
         .prepend(SIZE.fixed(1))
         .prepend(SIZE.fixed(6))
         .prepend(SIZE.min(8))
+        .prepend(SIZE.fixed(1))
       LAYOUT.rows(area, sizes)
     ensure
-      three: Result.length = 3
+      four: Result.length = 4
     end
 
-  upper(area: RECT): RECT
+  tabs_bar(area: RECT): RECT
     do
       LIST_OPS.at(DASH_LAYOUT.vertical_parts(area), 0)
     end
 
-  bottom(area: RECT): RECT
+  upper(area: RECT): RECT
     do
       LIST_OPS.at(DASH_LAYOUT.vertical_parts(area), 1)
     end
 
-  status(area: RECT): RECT
+  bottom(area: RECT): RECT
     do
       LIST_OPS.at(DASH_LAYOUT.vertical_parts(area), 2)
+    end
+
+  status(area: RECT): RECT
+    do
+      LIST_OPS.at(DASH_LAYOUT.vertical_parts(area), 3)
     end
 
   -- Left (`TABLE` + `SCROLLBAR`) and right (`GAUGE` + `SPARKLINE`) panes inside `upper(area)`,
@@ -50,10 +57,30 @@ feature {ANY}
       u.drop_left(if lw > 0 then lw - 1 else 0 end)
     end
 
+  left_inner(area: RECT): RECT
+    do
+      FRAME.inner(DASH_LAYOUT.left(area))
+    end
+
+  table_area(area: RECT): RECT
+    do
+      DASH_LAYOUT.left_inner(area).drop_right(1)
+    end
+
+  scrollbar_area(area: RECT): RECT
+    do
+      DASH_LAYOUT.left_inner(area)
+    end
+
+  inspector_area(area: RECT): RECT
+    do
+      FRAME.inner_padded(DASH_LAYOUT.bottom(area), PADDING.symmetric(0, 1))
+    end
+
   -- Visible data rows inside the left `TABLE` pane (excluding border and 1-row table header).
   table_rows(area: RECT): NAT
     do
-      let inner = FRAME.inner(DASH_LAYOUT.left(area))
+      let inner = DASH_LAYOUT.table_area(area)
       if inner.height > 1 then inner.height - 1 else 1 end
     end
 

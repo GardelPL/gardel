@@ -50,8 +50,8 @@ feature {ANY}
       not_more: Result <= cmds.length
     end
 
-  -- A read of the next key after a key or a paste, which answers a read as a key does, until
-  -- keys end; nothing after any other event.
+  -- A read of the next key after a key, paste, or mouse event, which answers a read as a key
+  -- does, until keys end; nothing after any other event.
   reads_after(e: EVENT): LIST[COMMAND]
     do
       match e
@@ -61,6 +61,7 @@ feature {ANY}
             case _ then LIST.empty.prepend(ReadKey)
           end
         case Pasted(_) then LIST.empty.prepend(ReadKey)
+        case Mouse(_) then LIST.empty.prepend(ReadKey)
         case _ then LIST.empty
       end
     end

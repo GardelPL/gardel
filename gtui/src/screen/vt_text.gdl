@@ -55,18 +55,20 @@ feature {ANY}
     end
 
   -- Entering a full-screen interface: the alternate screen, cleared, with the cursor hidden
-  -- and shaped as a bar for when a view shows it, and pastes bracketed, so that the host
-  -- gives a paste as one `Pasted` event.
+  -- and shaped as a bar for when a view shows it, pastes bracketed so that the host
+  -- gives a paste as one `Pasted` event, and button, button-drag, and SGR 1006 mouse
+  -- reporting enabled (`?1000h`, `?1002h`, `?1006h`).
   enter: STRING
     do
-      "\u{1b}[?1049h\u{1b}[0m\u{1b}[2J\u{1b}[?25l\u{1b}[6 q\u{1b}[?2004h"
+      "\u{1b}[?1049h\u{1b}[0m\u{1b}[2J\u{1b}[?25l\u{1b}[6 q\u{1b}[?2004h\u{1b}[?1000h\u{1b}[?1002h\u{1b}[?1006h"
     end
 
-  -- Leaving it: pastes as typed, the pen reset, the cursor in the terminal's own shape and
-  -- shown, and the screen that was there before.
+  -- Leaving it: mouse reporting disabled in reverse order (`?1006l`, `?1002l`, `?1000l`),
+  -- pastes as typed, the pen reset, the cursor in the terminal's own shape and shown, and
+  -- the screen that was there before.
   leave: STRING
     do
-      "\u{1b}[?2004l\u{1b}[0m\u{1b}[0 q\u{1b}[?25h\u{1b}[?1049l"
+      "\u{1b}[?1006l\u{1b}[?1002l\u{1b}[?1000l\u{1b}[?2004l\u{1b}[0m\u{1b}[0 q\u{1b}[?25h\u{1b}[?1049l"
     end
 
   -- The OSC 52 sequence that puts `text` on the terminal's clipboard. Most terminals take it;

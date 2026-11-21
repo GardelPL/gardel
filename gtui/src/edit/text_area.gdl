@@ -103,6 +103,85 @@ create {ANY}
       end
     end
 
+  -- The character index in `cs` corresponding to display column `target` under UAX #29
+  -- cluster widths (stopping at cluster boundaries and returning `cs.length` past the end).
+  col_at_x(cs: LIST[CHAR], target: NAT): NAT
+    do
+      TEXT_AREA.col_at_x_clusters(cs, target, 0, 0, 0, 0, False, False)
+    end
+
+  col_at_x_clusters(cs: LIST[CHAR], target: NAT, acc: NAT, k: NAT, cluster_start: NAT,
+                    cur_w: NAT, after_zwj: BOOL, ri_open: BOOL): NAT
+    require
+      fits: acc <= 65535
+      valid_cur: cur_w <= 2
+    variant
+      cs.length
+    do
+      if cs.length = 0 or k = 18446744073709551615 then
+        k
+      else
+        let c = cs.head
+        let w = CHAR_WIDTH.of(c)
+        if after_zwj and cur_w > 0 then
+          let promote = cur_w = 1 and (w = 2 or CHAR_WIDTH.is_skin_tone(c) or CHAR_WIDTH.is_vs16(c))
+          let next_acc = acc + (if promote then 1 else 0 end)
+          let next_w = if promote then 2 else cur_w end
+          if next_acc > target then
+            cluster_start
+          else if next_acc >= 65535 then
+            k + 1
+          else
+            TEXT_AREA.col_at_x_clusters(cs.tail, target, next_acc, k + 1, cluster_start, next_w, CHAR_WIDTH.is_zwj(c), False)
+          end end
+        else if CHAR_WIDTH.is_zwj(c) and cur_w > 0 then
+          TEXT_AREA.col_at_x_clusters(cs.tail, target, acc, k + 1, cluster_start, cur_w, True, False)
+        else if (CHAR_WIDTH.is_vs16(c) or CHAR_WIDTH.is_skin_tone(c)) and cur_w > 0 then
+          let delta = if cur_w = 1 then 1 else 0 end
+          let next_acc = acc + delta
+          if next_acc > target then
+            cluster_start
+          else if next_acc >= 65535 then
+            k + 1
+          else
+            TEXT_AREA.col_at_x_clusters(cs.tail, target, next_acc, k + 1, cluster_start, 2, False, False)
+          end end
+        else if w = 0 and cur_w > 0 then
+          TEXT_AREA.col_at_x_clusters(cs.tail, target, acc, k + 1, cluster_start, cur_w, False, False)
+        else if CHAR_WIDTH.is_regional_indicator(c) and ri_open and cur_w = 1 then
+          let next_acc = acc + 1
+          if next_acc > target then
+            cluster_start
+          else if next_acc >= 65535 then
+            k + 1
+          else
+            TEXT_AREA.col_at_x_clusters(cs.tail, target, next_acc, k + 1, cluster_start, 2, False, False)
+          end end
+        else if acc >= target then
+          k
+        else if CHAR_WIDTH.is_zwj(c) or w = 0 then
+          TEXT_AREA.col_at_x_clusters(cs.tail, target, acc, k + 1, k, 0, False, False)
+        else if CHAR_WIDTH.is_regional_indicator(c) then
+          let next_acc = acc + 1
+          if next_acc >= 65535 then
+            k + 1
+          else
+            TEXT_AREA.col_at_x_clusters(cs.tail, target, next_acc, k + 1, k, 1, False, True)
+          end
+        else
+          let step = if w = 2 then 2 else 1 end
+          let next_acc = acc + step
+          if next_acc > target then
+            k
+          else if next_acc >= 65535 then
+            k + 1
+          else
+            TEXT_AREA.col_at_x_clusters(cs.tail, target, next_acc, k + 1, k, step, False, False)
+          end end
+        end end end end end end end end
+      end
+    end
+
   -- The first index at or after `i` where `pat` starts in `cs` (whose first character is
   -- index `i`), or 2^64 - 1 when there is none. (A number, not an `OPTION`: one taken out of
   -- an `OPTION` is not known to the prover to be a `NAT`.)
@@ -555,6 +634,104 @@ feature {ANY}
       Current.keyed(k, if rows > 1 then rows - 1 else 1 end).followed(r)
     end
 
+  -- Moved or scrolled by a mouse event inside `r`: left-click places the cursor (with Shift
+  -- extending the selection), left-drag extends the selection, and the wheel scrolls 3 lines.
+  on_mouse(m: MOUSE, r: RECT): TEXT_AREA
+    do
+      if not r.has(m.x, m.y) then
+        Current
+      else
+        let shift = match m
+          case MouseMod(_, s, _, _) then s
+          case _ then False
+        end
+        match m.plain
+          case MouseDown(b, _, _) then
+            if b = 0 then
+              Current.mouse_move(m.x, m.y, r, shift)
+            else
+              Current
+            end
+          case MouseDrag(b, _, _) then
+            if b = 0 then
+              Current.mouse_move(m.x, m.y, r, True)
+            else
+              Current
+            end
+          case WheelUp(_, _) then
+            Current.wheel_scroll(r, False)
+          case WheelDown(_, _) then
+            Current.wheel_scroll(r, True)
+          case _ then
+            Current
+        end
+      end
+    ensure
+      same_text: Result.state.lines = Current.state.lines
+    end
+
+  -- Move the cursor to the cell `(mx, my)` inside `r`, extending the selection when `extend`.
+  mouse_move(mx: NAT, my: NAT, r: RECT, extend: BOOL): TEXT_AREA
+    require
+      inside: r.has(mx, my)
+    do
+      let t = TEXT_AREA.text_part(r, Current.zip.line_count)
+      let dy = my - r.y
+      let raw_line = if Current.top_line <= 18446744073709551615 - dy then Current.top_line + dy else 18446744073709551615 end
+      let count = Current.zip.line_count
+      let line_idx = if raw_line < count then raw_line else count - 1 end
+      let col =
+        if raw_line >= count then
+          4294967295
+        else if mx >= t.x then
+          let target_col = Current.left_column + (mx - t.x)
+          TEXT_AREA.col_at_x(Current.zip.line_at(line_idx), target_col)
+        else
+          0
+        end end
+      Current.moved_to(Current.zip.to(line_idx, col), extend, True).followed(r)
+    ensure
+      same_text: Result.state.lines = Current.state.lines
+    end
+
+  -- Scroll the viewport vertically by 3 lines (down when `down` is true, else up), clamping
+  -- the cursor inside the new viewport so `followed(r)` keeps the scrolled position.
+  wheel_scroll(r: RECT, down: BOOL): TEXT_AREA
+    do
+      let t = TEXT_AREA.text_part(r, Current.zip.line_count)
+      let rows = t.height
+      if rows = 0 then
+        Current
+      else
+        let count = Current.zip.line_count
+        let max_top = if count > rows then count - rows else 0 end
+        let next_top =
+          if down then
+            if Current.top_line <= max_top then
+              if Current.top_line + 3 <= max_top then Current.top_line + 3 else max_top end
+            else
+              max_top
+            end
+          else
+            let raw = if Current.top_line >= 3 then Current.top_line - 3 else 0 end
+            if raw <= max_top then raw else max_top end
+          end
+        let n = Current.zip.line_number
+        let bottom_line = next_top + rows - 1
+        let moved =
+          if n < next_top then
+            Current.moved_to(Current.zip.to(next_top, Current.goal), Current.marking, False)
+          else if n > bottom_line then
+            Current.moved_to(Current.zip.to(bottom_line, Current.goal), Current.marking, False)
+          else
+            Current
+          end end
+        { moved with top_line = next_top }
+      end
+    ensure
+      same_text: Result.state.lines = Current.state.lines
+    end
+
   -- Edited or moved by `k`, a page being `page` lines.
   keyed(k: KEY, page: NAT): TEXT_AREA
     do
@@ -638,6 +815,8 @@ feature {ANY}
           { Current with marking = shift and Current.marking }
         end
       { anchored with zip = z, goal = if along then z.column else Current.goal end, copied = False }
+    ensure
+      state_set: Result.state = z
     end
 
   -- Moved a page to `z`, `d` lines, the page scrolled by as much (`down`, or up).

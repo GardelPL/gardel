@@ -20079,6 +20079,17 @@ fn print_inspect_json(verified: bool, modules: &[String], concepts: &[String], d
 }
 
 fn main() {
+    let child = std::thread::Builder::new()
+        .name("gardelc".to_string())
+        .stack_size(16 * 1024 * 1024)
+        .spawn(run_main)
+        .expect("spawn gardelc main thread");
+    if let Err(payload) = child.join() {
+        std::panic::resume_unwind(payload);
+    }
+}
+
+fn run_main() {
     let args: Vec<String> = env::args().collect();
     if args.len() < 2 && !std::path::Path::new("Gardel.toml").is_file() {
         eprintln!(

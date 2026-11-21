@@ -147,12 +147,16 @@ feature {ANY}
     do
       let next = if Current.scroll_y <= 18446744073709551615 - n then Current.scroll_y + n else 18446744073709551615 end
       Current.scrolled_to(next, width, rows)
+    ensure
+      top_bounded: Result.top <= Current.last_top(width, rows)
     end
 
   scroll_up(n: NAT, width: NAT, rows: NAT): PARAGRAPH
     do
       let next = if Current.scroll_y >= n then Current.scroll_y - n else 0 end
       Current.scrolled_to(next, width, rows)
+    ensure
+      top_bounded: Result.top <= Current.last_top(width, rows)
     end
 
   with_scroll_x(col: NAT): PARAGRAPH
@@ -187,6 +191,22 @@ feature {ANY}
         case Left then Current.scroll_left(1)
         case _ then Current
       end
+    end
+
+  -- Scrolled by a mouse event inside `r`: the wheel scrolls 3 lines up or down within `last_top`.
+  on_mouse(m: MOUSE, r: RECT): PARAGRAPH
+    do
+      if not r.has(m.x, m.y) then
+        Current
+      else if m.is_wheel_up then
+        Current.scroll_up(3, r.width, r.height)
+      else if m.is_wheel_down then
+        Current.scroll_down(3, r.width, r.height)
+      else
+        Current
+      end end end
+    ensure
+      wheel_bounded: (r.has(m.x, m.y) and (m.is_wheel_up or m.is_wheel_down)) implies Result.top <= Current.last_top(r.width, r.height)
     end
 
   -- Draw visible wrapped and aligned lines inside `r` in style `st`.

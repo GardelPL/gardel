@@ -259,6 +259,11 @@ struct Terminal {
     copies: Vec<String>,
     sync_depth: usize,
     sync_frames: usize,
+    mouse_1000: bool,
+    mouse_1002: bool,
+    mouse_1006: bool,
+    mouse_enters: usize,
+    mouse_leaves: usize,
     after_zwj: bool,
     ri_open: bool,
 }
@@ -280,6 +285,11 @@ impl Terminal {
             copies: Vec::new(),
             sync_depth: 0,
             sync_frames: 0,
+            mouse_1000: false,
+            mouse_1002: false,
+            mouse_1006: false,
+            mouse_enters: 0,
+            mouse_leaves: 0,
             after_zwj: false,
             ri_open: false,
         }
@@ -322,6 +332,39 @@ impl Terminal {
                 match (private, fin) {
                     (true, 'h') if params == vec![25] => self.cursor = Some((self.row, self.col)),
                     (true, 'l') if params == vec![25] => self.cursor = None,
+                    (true, 'h') if params == vec![1000] => self.mouse_1000 = true,
+                    (true, 'h') if params == vec![1002] => {
+                        assert!(self.mouse_1000, "?1002h must follow ?1000h");
+                        self.mouse_1002 = true;
+                    }
+                    (true, 'h') if params == vec![1006] => {
+                        assert!(self.mouse_1000 && self.mouse_1002, "?1006h must follow ?1000h and ?1002h");
+                        self.mouse_1006 = true;
+                        self.mouse_enters += 1;
+                    }
+                    (true, 'l') if params == vec![1006] => {
+                        assert!(self.mouse_1006, "?1006l without ?1006h");
+                        self.mouse_1006 = false;
+                    }
+                    (true, 'l') if params == vec![1002] => {
+                        assert!(!self.mouse_1006 && self.mouse_1002, "?1002l must follow ?1006l");
+                        self.mouse_1002 = false;
+                    }
+                    (true, 'l') if params == vec![1000] => {
+                        assert!(!self.mouse_1006 && !self.mouse_1002 && self.mouse_1000, "?1000l must follow ?1006l and ?1002l");
+                        self.mouse_1000 = false;
+                        self.mouse_leaves += 1;
+                    }
+                    (true, 'l') if params == vec![1049] => {
+                        assert!(
+                            !self.mouse_1000
+                                && !self.mouse_1002
+                                && !self.mouse_1006
+                                && self.mouse_enters == self.mouse_leaves
+                                && self.mouse_leaves > 0,
+                            "mouse modes must be cleanly disabled before ?1049l"
+                        );
+                    }
                     (true, 'h') if params == vec![2026] => self.sync_depth += 1,
                     (true, 'l') if params == vec![2026] => {
                         assert!(self.sync_depth > 0, "unmatched ?2026l");
@@ -478,7 +521,11 @@ fn a_session_draws_only_inside_the_screen() {
     assert!(shown.contains("[x] item"), "{shown}");
     assert!(shown.contains("] a very long item that does not fit é in forty column "), "{shown}");
     assert!(shown.contains("[ ] t ??"), "the tab, escape and bell are shown as a space and `?`:\n{shown}");
-    assert!(ran.stdout.ends_with(b"\x1b[?2004l\x1b[0m\x1b[0 q\x1b[?25h\x1b[?1049l"), "the screen is put back");
+    assert!(ran.stdout.ends_with(b"\x1b[?1006l\x1b[?1002l\x1b[?1000l\x1b[?2004l\x1b[0m\x1b[0 q\x1b[?25h\x1b[?1049l"), "the screen is put back");
+    assert!(
+        term.mouse_enters == 1 && term.mouse_leaves == 1 && !term.mouse_1000 && !term.mouse_1002 && !term.mouse_1006,
+        "mouse tracking entered once and left cleanly"
+    );
 }
 
 #[test]
@@ -489,8 +536,14 @@ fn a_shutdown_puts_the_terminal_back_and_a_replay_repeats_the_run() {
     let script = format!("Resized:50:6 Key:97 {}Key:Enter Key:32", keys("milk"));
     let first = run(&dir.bin("todo_tui"), &script, &[("GARDEL_RECORD", &log)]);
     assert_eq!(first.status.code(), Some(1), "the end of a script is a shutdown: {}", all(&first));
-    assert!(first.stdout.starts_with(b"\x1b[?1049h\x1b[0m\x1b[2J\x1b[?25l\x1b[6 q\x1b[?2004h"), "the alternate screen is taken, with pastes bracketed");
-    assert!(first.stdout.ends_with(b"\x1b[?2004l\x1b[0m\x1b[0 q\x1b[?25h\x1b[?1049l"), "and given back");
+    assert!(
+        first.stdout.starts_with(b"\x1b[?1049h\x1b[0m\x1b[2J\x1b[?25l\x1b[6 q\x1b[?2004h\x1b[?1000h\x1b[?1002h\x1b[?1006h"),
+        "the alternate screen is taken, with pastes bracketed and SGR mouse enabled"
+    );
+    assert!(
+        first.stdout.ends_with(b"\x1b[?1006l\x1b[?1002l\x1b[?1000l\x1b[?2004l\x1b[0m\x1b[0 q\x1b[?25h\x1b[?1049l"),
+        "and given back"
+    );
     let mut term = Terminal::new(sizes(&script));
     term.feed(&first.stdout);
     assert!(term.text().contains("[x] milk"), "{}", term.text());
@@ -765,7 +818,7 @@ fn an_attached_child_gets_the_terminal_and_the_tour_comes_back() {
     assert!(started.elapsed() < Duration::from_secs(20));
     assert_eq!(out.status.code(), Some(0), "{}", all(&out));
     let text = String::from_utf8(out.stdout.clone()).expect("UTF-8");
-    let leave = "\x1b[?2004l\x1b[0m\x1b[0 q\x1b[?25h\x1b[?1049l";
+    let leave = "\x1b[?1006l\x1b[?1002l\x1b[?1000l\x1b[?2004l\x1b[0m\x1b[0 q\x1b[?25h\x1b[?1049l";
     let enter = "\x1b[?1049h";
     let gone = text.find(leave).unwrap_or_else(|| panic!("the screen is put back: {text:?}"));
     let rest = gone + leave.len();
@@ -775,8 +828,21 @@ fn an_attached_child_gets_the_terminal_and_the_tour_comes_back() {
     // A terminal reads the rest: a pipe's size is 80 by 24, before and after.
     let mut before = Terminal::new(vec![(80, 24); 4]);
     before.feed(text[..gone].as_bytes());
+    assert!(
+        before.mouse_1000 && before.mouse_1002 && before.mouse_1006 && before.mouse_enters == 1 && before.mouse_leaves == 0,
+        "mouse modes must be active before leave"
+    );
+    before.feed(text[gone..rest].as_bytes());
+    assert!(
+        !before.mouse_1000 && !before.mouse_1002 && !before.mouse_1006 && before.mouse_leaves == 1,
+        "mouse modes must be disabled cleanly before attached child runs"
+    );
     let mut after = Terminal::new(vec![(80, 24); 4]);
     after.feed(&text.as_bytes()[back..]);
+    assert!(
+        after.mouse_enters == 1 && after.mouse_leaves == 1 && !after.mouse_1000 && !after.mouse_1002 && !after.mouse_1006,
+        "mouse modes must re-enter after AttachedEnded and leave cleanly at exit"
+    );
     let shown = after.text();
     assert!(shown.contains("The program ended with 3"), "{shown}");
     assert!(shown.starts_with("╭─Modules(m)"), "the screen is drawn whole again:\n{shown}");
@@ -2397,4 +2463,349 @@ fn gtui_dashboard_example_verifies_and_renders_all_widgets() {
     let final_screen = term.text();
     assert!(!final_screen.contains("Dashboard Controls"), "{final_screen}");
     assert!(final_screen.contains("2/8 modules"), "{final_screen}");
+}
+
+#[test]
+fn mouse_hit_test_and_widgets_verify_and_handle_events() {
+    // 1. Formal client contract proofs for RECT.has_inside, RECT.has_disjoint, and widget on_mouse/tab_at/scroll_for_mouse.
+    let contracts = r#"functions CLIENT
+
+feature {ANY}
+
+  check_mouse(r: RECT, sizes: LIST[SIZE], m: MOUSE, i: NAT, j: NAT,
+              tabs: TABS, lv: LIST_VIEW, tbl: TABLE, tv: TEXT_VIEW,
+              sb: SCROLLBAR, pop: POPUP, ta: TEXT_AREA, total: NAT, vp: NAT): BOOL
+    do
+      let cols = LAYOUT.columns(r, sizes)
+      let rows = LAYOUT.rows(r, sizes)
+      if i < j and j < sizes.length then
+        let ci = LIST_OPS.at(cols, i)
+        let cj = LIST_OPS.at(cols, j)
+        let ri = LIST_OPS.at(rows, i)
+        let rj = LIST_OPS.at(rows, j)
+        check
+          ci_in: LAYOUT.across_inside(cols, r.x, r, i)
+          ri_in: LAYOUT.down_inside(rows, r.y, r, i)
+          c_apart: LAYOUT_APART.columns_apart(cols, r.x, r, i, j)
+          r_apart: LAYOUT_APART.rows_apart(rows, r.y, r, i, j)
+          c_has_in: RECT.has_inside(ci, r, m.x, m.y)
+          r_has_in: RECT.has_inside(ri, r, m.x, m.y)
+          c_has_disj: RECT.has_disjoint(ci, cj, m.x, m.y)
+          r_has_disj: RECT.has_disjoint(ri, rj, m.x, m.y)
+        end
+        True
+      else if i < sizes.length then
+        let ci = LIST_OPS.at(cols, i)
+        let ri = LIST_OPS.at(rows, i)
+        check
+          ci_in: LAYOUT.across_inside(cols, r.x, r, i)
+          ri_in: LAYOUT.down_inside(rows, r.y, r, i)
+          c_has_in: RECT.has_inside(ci, r, m.x, m.y)
+          r_has_in: RECT.has_inside(ri, r, m.x, m.y)
+        end
+        True
+      else
+        True
+      end end
+    ensure
+      col_click_in_outer: (i < sizes.length and LIST_OPS.at(LAYOUT.columns(r, sizes), i).has(m.x, m.y)) implies r.has(m.x, m.y)
+      row_click_in_outer: (i < sizes.length and LIST_OPS.at(LAYOUT.rows(r, sizes), i).has(m.x, m.y)) implies r.has(m.x, m.y)
+      col_click_exclusive: (i < j and j < sizes.length) implies not (LIST_OPS.at(LAYOUT.columns(r, sizes), i).has(m.x, m.y) and LIST_OPS.at(LAYOUT.columns(r, sizes), j).has(m.x, m.y))
+      row_click_exclusive: (i < j and j < sizes.length) implies not (LIST_OPS.at(LAYOUT.rows(r, sizes), i).has(m.x, m.y) and LIST_OPS.at(LAYOUT.rows(r, sizes), j).has(m.x, m.y))
+      tab_count: tabs.on_mouse(m, r).count = tabs.count
+      tab_bound: match tabs.tab_at(r, m.x, m.y) case Some(k) then k >= 0 and k < tabs.count case None then True end
+      list_count: lv.on_mouse(m, r).count = lv.count
+      table_count: tbl.on_mouse(m, r).row_count = tbl.row_count
+      sb_bound: match sb.scroll_for_mouse(m, r, total, vp) case Some(pos) then pos <= total case None then True end
+      tv_count: tv.on_mouse(m, r).line_count = tv.line_count
+      ta_lines: ta.on_mouse(m, r).state.lines = ta.state.lines
+      pop_contains: pop.contains(r, m.x, m.y) = pop.bounds(r).has(m.x, m.y)
+    end
+
+end
+"#;
+    let contract_proj = Project::new("gtui_mouse_contracts", contracts);
+    assert_ok(&contract_proj.check());
+
+    let bad_contracts = r#"functions CLIENT
+
+feature {ANY}
+
+  bad(r: RECT, sizes: LIST[SIZE], m: MOUSE, i: NAT, j: NAT): BOOL
+    do
+      True
+    ensure
+      overlap: (i < j and j < sizes.length and LIST_OPS.at(LAYOUT.columns(r, sizes), i).has(m.x, m.y)) implies LIST_OPS.at(LAYOUT.columns(r, sizes), j).has(m.x, m.y)
+    end
+
+end
+"#;
+    let bad_proj = Project::new("gtui_mouse_bad_overlap", bad_contracts);
+    let bad_out = bad_proj.check();
+    assert!(!bad_out.status.success(), "overlapping click claim must be refused: {}", all(&bad_out));
+    assert!(all(&bad_out).contains("`overlap`"), "{}", all(&bad_out));
+
+    // 2. Runtime unit checks for all widgets under `on_mouse` / `tab_at` / `scroll_for_mouse`.
+    let unit_prog = r#"reactive program MOUSE_WIDGETS
+
+feature {ANY}
+
+  update(done: BOOL, e: EVENT): TUI_NEXT[BOOL]
+    do
+      match e
+        case Key(k) then
+          match k
+            case Char(c) then if c = 'q' then TUI_NEXT.quit(0) else TUI_NEXT.next(done) end
+            case KeysEnded then TUI_NEXT.quit(0)
+            case _ then TUI_NEXT.next(done)
+          end
+        case _ then TUI_NEXT.next(done)
+      end
+    end
+
+  status_text: STRING
+    do
+      let tabs = TABS.empty.with("Alpha", 'a').with("Beta", 'b').with("Gamma", ' ')
+      let tab_r = RECT.make(0, 0, 30, 2)
+      let tabs_ok =
+        (match tabs.tab_at(tab_r, 0, 0) case Some(i) then i = 0 case None then False end)
+        and (match tabs.tab_at(tab_r, 7, 0) case Some(i) then i = 0 case None then False end)
+        and tabs.tab_at(tab_r, 8, 0).is_none
+        and (match tabs.tab_at(tab_r, 11, 0) case Some(i) then i = 1 case None then False end)
+        and (match tabs.tab_at(tab_r, 22, 0) case Some(i) then i = 2 case None then False end)
+        and tabs.tab_at(tab_r, 0, 1).is_none
+        and tabs.on_mouse(MOUSE.MouseDown(0, 11, 0), tab_r).selected = 1
+        and tabs.on_mouse(MOUSE.MouseDown(2, 22, 0), tab_r).selected = 0
+
+      let none_s: LIST[STRING] = LIST.empty
+      let lv = LIST_VIEW.make(none_s.prepend("f").prepend("e").prepend("d").prepend("c").prepend("b").prepend("a"))
+      let lv_r = RECT.make(0, 0, 10, 4)
+      let list_ok =
+        lv.on_mouse(MOUSE.MouseDown(0, 2, 2), lv_r).selected = 2
+        and lv.on_mouse(MOUSE.WheelDown(2, 2), lv_r).selected = 3
+        and lv.on_mouse(MOUSE.WheelDown(2, 2), lv_r).on_mouse(MOUSE.WheelUp(2, 2), lv_r).selected = 0
+        and lv.on_mouse(MOUSE.MouseDown(0, 2, 4), lv_r).selected = 0
+
+      let widths: LIST[SIZE] = LIST.empty.prepend(SIZE.flex(1)).prepend(SIZE.fixed(3))
+      let hdr = none_s.prepend("V").prepend("K")
+      let mk = fn(a: STRING, b: STRING): LIST[STRING] do none_s.prepend(b).prepend(a) end
+      let t_rows: LIST[LIST[STRING]] = LIST.empty
+        .prepend(mk("k4", "4")).prepend(mk("k3", "3")).prepend(mk("k2", "2")).prepend(mk("k1", "1")).prepend(mk("k0", "0"))
+      let tbl = TABLE.with_headers(widths, hdr, t_rows)
+      let tbl_r = RECT.make(0, 0, 10, 4)
+      let table_ok =
+        tbl.on_mouse(MOUSE.MouseDown(0, 1, 0), tbl_r).selected = 0
+        and tbl.on_mouse(MOUSE.MouseDown(0, 1, 3), tbl_r).selected = 2
+        and tbl.on_mouse(MOUSE.WheelDown(1, 2), tbl_r).selected = 3
+        and tbl.on_mouse(MOUSE.WheelDown(1, 2), tbl_r).on_mouse(MOUSE.WheelUp(1, 2), tbl_r).selected = 0
+
+      let none_tn: LIST[TREE_NODE] = LIST.empty
+      let tv_nodes = none_tn
+        .prepend(TREE_NODE.make("tail", 0))
+        .prepend(TREE_NODE.make("b", 1))
+        .prepend(TREE_NODE.make("a", 1))
+        .prepend(TREE_NODE.make("dir", 0))
+      let tree = TREE_VIEW.make(tv_nodes)
+      let tree_r = RECT.make(0, 0, 12, 4)
+      let tree_row1 = tree.on_mouse(MOUSE.MouseDown(0, 5, 1), tree_r)
+      let tree_open = tree.on_mouse(MOUSE.MouseDown(0, 0, 0), tree_r)
+      let tree_label_sel = tree_open.on_mouse(MOUSE.MouseDown(0, 5, 1), tree_r).on_mouse(MOUSE.MouseDown(0, 5, 0), tree_r)
+      let tree_toggle_sel = tree_label_sel.on_mouse(MOUSE.MouseDown(0, 5, 0), tree_r)
+      let tree_ok =
+        tree_row1.selected_row = 1 and tree_row1.count = 2
+        and tree_open.selected_row = 0 and tree_open.count = 4
+        and tree_label_sel.selected_row = 0 and tree_label_sel.count = 4
+        and tree_toggle_sel.selected_row = 0 and tree_toggle_sel.count = 2
+        and tree_open.on_mouse(MOUSE.WheelDown(2, 1), tree_r).selected_row = 3
+
+      let sbv = SCROLLBAR.vertical(21, 6, 0)
+      let sbv_r = RECT.make(0, 0, 10, 6)
+      let sbh = SCROLLBAR.horizontal(21, 6, 0)
+      let sbh_r = RECT.make(0, 0, 6, 4)
+      let sb_ok =
+        (match sbv.scroll_for_mouse(MOUSE.MouseDown(0, 9, 0), sbv_r, 21, 6) case Some(p) then p = 0 case None then False end)
+        and (match sbv.scroll_for_mouse(MOUSE.MouseDown(0, 9, 2), sbv_r, 21, 6) case Some(p) then p = 6 case None then False end)
+        and (match sbv.scroll_for_mouse(MOUSE.MouseDrag(0, 9, 5), sbv_r, 21, 6) case Some(p) then p = 15 case None then False end)
+        and sbv.scroll_for_mouse(MOUSE.MouseDown(0, 8, 2), sbv_r, 21, 6).is_none
+        and (match sbh.scroll_for_mouse(MOUSE.MouseDown(0, 5, 3), sbh_r, 21, 6) case Some(p) then p = 15 case None then False end)
+        and (match sbh.scroll_for_mouse(MOUSE.MouseDrag(0, 0, 3), sbh_r, 21, 6) case Some(p) then p = 0 case None then False end)
+
+      let tv = TEXT_VIEW.make(none_s.prepend("l5").prepend("l4").prepend("l3").prepend("l2").prepend("l1").prepend("l0"))
+      let vr = RECT.make(0, 0, 10, 3)
+      let tv_ok =
+        tv.on_mouse(MOUSE.WheelDown(1, 1), vr).top = 3
+        and tv.on_mouse(MOUSE.WheelDown(1, 1), vr).on_mouse(MOUSE.WheelUp(1, 1), vr).top = 0
+        and tv.on_mouse(MOUSE.WheelDown(10, 1), vr).top = 0
+
+      let pa = PARAGRAPH.of_text("l0\nl1\nl2\nl3\nl4\nl5")
+      let para_ok =
+        pa.on_mouse(MOUSE.WheelDown(1, 1), vr).top = 3
+        and pa.on_mouse(MOUSE.WheelDown(1, 1), vr).on_mouse(MOUSE.WheelUp(1, 1), vr).top = 0
+        and pa.on_mouse(MOUSE.WheelDown(10, 1), vr).top = 0
+
+      let modal = POPUP.of_text("T", "a\nb\nc\nd\ne\nf", 10, 5)
+      let area = RECT.make(0, 0, 20, 10)
+      let pop_ok =
+        modal.contains(area, 5, 2)
+        and not modal.contains(area, 4, 2)
+        and modal.on_mouse(MOUSE.WheelDown(5, 2), area).body.top = 3
+        and modal.on_mouse(MOUSE.WheelDown(4, 2), area).body.top = 0
+
+      let ta = TEXT_AREA.of_text("ab\u{754C}cd\ne\u{0301}xy\nline2\nline3\nline4\nline5\nline6\nline7")
+      let tar = RECT.make(0, 0, 20, 4)
+      let ta_c = ta.on_mouse(MOUSE.MouseDown(0, 6, 0), tar)
+      let ta_w = ta.on_mouse(MOUSE.MouseDown(0, 5, 0), tar)
+      let ta_m = ta.on_mouse(MOUSE.MouseDown(0, 3, 1), tar)
+      let ta_click_ok =
+        ta_c.line_number = 0 and ta_c.column = 3
+        and ta_w.line_number = 0 and ta_w.column = 2
+        and ta_m.line_number = 1 and ta_m.column = 2
+      let ta_drag = ta.on_mouse(MOUSE.MouseDown(0, 3, 0), tar).on_mouse(MOUSE.MouseDrag(0, 7, 0), tar)
+      let ta_drag_ok = ta_drag.has_selection and ta_drag.selected_text.equals("b\u{754C}c")
+      let ta_shift = ta.on_mouse(MOUSE.MouseDown(0, 2, 0), tar).on_mouse(MOUSE.MouseMod(MOUSE.MouseDown(0, 3, 1), True, False, False), tar)
+      let ta_shift_ok =
+        ta_shift.has_selection
+        and ta_shift.selection_start_line = 0 and ta_shift.selection_start_column = 0
+        and ta_shift.selection_end_line = 1 and ta_shift.selection_end_column = 2
+      let ta_wd = ta.on_mouse(MOUSE.WheelDown(5, 1), tar)
+      let ta_wu = ta_wd.on_mouse(MOUSE.WheelUp(5, 1), tar)
+      let ta_wheel_ok =
+        ta_wd.top = 3 and ta_wd.followed(tar).top = 3 and ta_wu.top = 0
+
+      if not tabs_ok then "FAIL_TABS"
+      else if not list_ok then "FAIL_LIST"
+      else if not table_ok then "FAIL_TABLE"
+      else if not tree_ok then "FAIL_TREE"
+      else if not sb_ok then "FAIL_SB"
+      else if not tv_ok then "FAIL_TV"
+      else if not para_ok then "FAIL_PARA"
+      else if not pop_ok then "FAIL_POP"
+      else if not ta_click_ok then "FAIL_TA_CLICK"
+      else if not ta_drag_ok then "FAIL_TA_DRAG"
+      else if not ta_shift_ok then "FAIL_TA_SHIFT"
+      else if not ta_wheel_ok then "FAIL_TA_WHEEL"
+      else "ALL_OK"
+      end end end end end end end end end end end end
+    end
+
+  view(done: BOOL, blank: SCREEN): SCREEN
+    do
+      blank.text(blank.area, 0, 0, status_text, STYLE.plain)
+    end
+
+  init(args: SEQ[STRING]): STEP[TUI[BOOL]]
+    do
+      TUI.start(True, update, view)
+    end
+
+  step(t: TUI[BOOL], e: EVENT): STEP[TUI[BOOL]]
+    do
+      t.step(e)
+    end
+
+end
+"#;
+    let unit_proj = Project::new("gtui_mouse_widgets", unit_prog);
+    let unit_src = unit_proj.0 .0.join("p/src");
+    fs::rename(unit_src.join("client.gdl"), unit_src.join("mouse_widgets.gdl")).expect("named after its module");
+    assert_ok(&unit_proj.check());
+    let unit_script = "Resized:40:10 Key:113";
+    let unit_ran = run(&unit_proj.0.bin("mouse_widgets"), unit_script, &[]);
+    assert_eq!(unit_ran.status.code(), Some(0), "{}", all(&unit_ran));
+    let mut unit_term = Terminal::new(sizes(unit_script));
+    unit_term.feed(&unit_ran.stdout);
+    let unit_text = unit_term.text();
+    assert!(unit_text.contains("ALL_OK"), "widget mouse unit checks failed:\n{unit_text}");
+
+    // 3. Scripted VT session for `examples/gtui_dashboard` with Mouse events.
+    let dash_dir = Dir::new("dashboard_mouse");
+    assert_ok(&dash_dir.check(&root().join("examples/gtui_dashboard")));
+    let dash_script = concat!(
+        "Resized:80:16 ",
+        "Mouse:Down:0:16:0 Resized:80:16 ",
+        "Mouse:Down:0:5:5 Resized:80:16 ",
+        "Mouse:Down:0:42:7 Resized:80:16 ",
+        "Mouse:WheelDown:10:11 Resized:80:16 ",
+        "Key:63 Mouse:WheelDown:30:7 Resized:80:16 ",
+        "Mouse:Down:0:1:1 Resized:80:16 Key:113"
+    );
+    let dash_ran = run(&dash_dir.bin("gtui_dashboard"), dash_script, &[]);
+    assert_eq!(dash_ran.status.code(), Some(0), "{}", all(&dash_ran));
+    let mut dash_term = Terminal::new(sizes(dash_script));
+    dash_term.feed(&dash_ran.stdout);
+    assert_eq!(dash_term.mouse_enters, 1, "dashboard enables mouse modes once on enter");
+    assert_eq!(dash_term.mouse_leaves, 1, "dashboard disables mouse modes cleanly on exit");
+    assert!(!dash_term.mouse_1000 && !dash_term.mouse_1002 && !dash_term.mouse_1006);
+    assert_eq!(
+        dash_term.before_clear.last().expect("last clear"),
+        &dash_term.grid,
+        "dashboard diffs match full redraw"
+    );
+
+    let d1 = screen_text(&dash_term.before_clear[2]);
+    assert_eq!(pen_at(&dash_term.before_clear[2], "Tasks"), vec![1, 4, 93], "Tasks tab highlighted:\n{d1}");
+    assert!(d1.contains("╭─ Tasks ─"), "left pane shows active tab title:\n{d1}");
+
+    let d2 = screen_text(&dash_term.before_clear[3]);
+    assert!(d2.contains("3/8 modules") && d2.contains("PARAGRAPH (GT.5)"), "table click selects row 2:\n{d2}");
+
+    let d3 = screen_text(&dash_term.before_clear[4]);
+    assert!(d3.contains("8/8 modules") && d3.contains("CHAR_WIDTH (GT.8)"), "scrollbar click jumps to end:\n{d3}");
+
+    let d4 = screen_text(&dash_term.before_clear[5]);
+    assert!(d4.contains("Mouse tip: wheel here scrolls detail notes."), "wheel scrolls inspector paragraph:\n{d4}");
+
+    let d5 = screen_text(&dash_term.before_clear[6]);
+    assert!(
+        d5.contains("Dashboard Controls") && d5.contains("Click outside modal to dismiss"),
+        "wheel inside help popup scrolls inner body:\n{d5}"
+    );
+
+    let d6 = screen_text(&dash_term.before_clear[7]);
+    assert!(!d6.contains("Dashboard Controls") && d6.contains("8/8 modules"), "click outside dismisses modal:\n{d6}");
+
+    // 4. Scripted VT session for `examples/gtui_tour` with Mouse events.
+    let tour_dir = Dir::new("tour_mouse");
+    assert_ok(&tour_dir.check(&root().join("examples/gtui_tour")));
+    let tour_script = concat!(
+        "Resized:90:24 ",
+        "Mouse:Down:0:3:2 Resized:90:24 ",
+        "Mouse:Down:0:17:0 Resized:90:24 ",
+        "Mouse:Down:0:45:5 Mouse:WheelDown:45:5 Resized:90:24 ",
+        "Mouse:Down:0:18:16 Mouse:Down:0:10:18 Resized:90:24 ",
+        "Key:63 Resized:90:24 ",
+        "Mouse:Down:0:1:1 Resized:90:24 Key:113"
+    );
+    let tour_ran = run(&tour_dir.bin("gtui_tour"), tour_script, &[]);
+    assert_eq!(tour_ran.status.code(), Some(0), "{}", all(&tour_ran));
+    let mut tour_term = Terminal::new(sizes(tour_script));
+    tour_term.feed(&tour_ran.stdout);
+    assert_eq!(tour_term.mouse_enters, 1, "tour enables mouse modes once on enter");
+    assert_eq!(tour_term.mouse_leaves, 1, "tour disables mouse modes cleanly on exit");
+    assert!(!tour_term.mouse_1000 && !tour_term.mouse_1002 && !tour_term.mouse_1006);
+    assert_eq!(
+        tour_term.before_clear.last().expect("last clear"),
+        &tour_term.grid,
+        "tour diffs match full redraw"
+    );
+
+    let t1 = screen_text(&tour_term.before_clear[2]);
+    assert!(t1.contains("│  ▾ screen") && t1.contains("│      CELL"), "tree disclosure toggles open on click:\n{t1}");
+
+    let t2 = screen_text(&tour_term.before_clear[3]);
+    assert!(t2.contains("│▾ src"), "Files tab click switches left tree:\n{t2}");
+    assert_eq!(pen_at(&tour_term.before_clear[3], "Files"), vec![1, 4, 93]);
+
+    let t3 = screen_text(&tour_term.before_clear[4]);
+    assert_eq!(pen_at(&tour_term.before_clear[4], "╭─ screen Text"), vec![1, 36], "click focuses source pane:\n{t3}");
+    assert!(!t3.contains("│ 1 -- A row") && t3.contains("│ 4 representation"), "wheel scrolls source down:\n{t3}");
+
+    let t4 = screen_text(&tour_term.before_clear[5]);
+    assert!(t4.contains("tabs.gdl:29") && t4.contains("29       else 1 + TABS.key_index"), "clicking problem row marks line 29:\n{t4}");
+
+    let t5 = screen_text(&tour_term.before_clear[6]);
+    assert!(t5.contains("╭─ Help ─"), "help popup opens:\n{t5}");
+
+    let t6 = screen_text(&tour_term.before_clear[7]);
+    assert!(!t6.contains("Esc/? to close"), "click outside dismisses tour help popup:\n{t6}");
 }

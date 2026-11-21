@@ -105,6 +105,50 @@ feature {ANY}
       bounded: Result + Current.thumb_size(track_len) <= track_len
     end
 
+  -- Map a left-button press or drag on the scrollbar track edge of `r` to a proportional
+  -- scroll offset in `0..max(0, total - viewport)` (bounded by `total`). Works whether `r`
+  -- is the 1-cell track itself or the full bounding rectangle passed to `draw`.
+  scroll_for_mouse(m: MOUSE, r: RECT, total: NAT, viewport: NAT): OPTION[NAT]
+    do
+      let active = match m.plain
+        case MouseDown(b, _, _) then b = 0
+        case MouseDrag(b, _, _) then b = 0
+        case _ then False
+      end
+      let bar = if Current.vert_flag then r.take_right(1) else r.take_bottom(1) end
+      if not active or not bar.has(m.x, m.y) then
+        None
+      else
+        let track_len = if Current.vert_flag then bar.height else bar.width end
+        let off = if Current.vert_flag then m.y - bar.y else m.x - bar.x end
+        let max_off = if total > viewport then total - viewport else 0 end
+        if max_off = 0 or track_len <= 1 then
+          Some(0)
+        else
+          let denom = track_len - 1
+          let raw =
+            if max_off <= 1000000000000 then
+              off * max_off / denom
+            else
+              let q = max_off / denom
+              if q <= 281479271743487 then off * q else max_off end
+            end
+          let pos = if raw <= max_off then raw else max_off end
+          Some(pos)
+        end
+      end
+    ensure
+      bounded: match Result case Some(pos) then pos >= 0 and pos <= total case None then True end
+    end
+
+  -- Convenience overload using `Current.total` and `Current.viewport`.
+  on_mouse(m: MOUSE, r: RECT): OPTION[NAT]
+    do
+      Current.scroll_for_mouse(m, r, Current.total_items, Current.viewport_items)
+    ensure
+      bounded: match Result case Some(pos) then pos >= 0 and pos <= Current.total case None then True end
+    end
+
   -- Draw the scrollbar along the right (vertical) or bottom (horizontal) edge of `r`.
   -- TODO(proof-GT.7): prove SCROLLBAR.draw modifies only the 1-cell edge of r
   draw(s: SCREEN, r: RECT, track_style: STYLE, thumb_style: STYLE): SCREEN

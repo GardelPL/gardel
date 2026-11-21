@@ -141,6 +141,31 @@ feature {ANY}
       { Current with content = Current.content.on_key(k, Current.content_area(area)) }
     end
 
+  -- Whether cell `(cx, cy)` lies inside the popup's bounding box centered in `area`.
+  contains(area: RECT, cx: NAT, cy: NAT): BOOL
+    do
+      Current.bounds(area).has(cx, cy)
+    ensure
+      def: Result = Current.bounds(area).has(cx, cy)
+    end
+
+  -- Route scroll-wheel events inside the popup bounds to its inner `PARAGRAPH`.
+  on_mouse(m: MOUSE, area: RECT): POPUP
+    do
+      if Current.contains(area, m.x, m.y) then
+        let inner = Current.content_area(area)
+        if m.is_wheel_up then
+          { Current with content = Current.content.scroll_up(3, inner.width, inner.height) }
+        else if m.is_wheel_down then
+          { Current with content = Current.content.scroll_down(3, inner.width, inner.height) }
+        else
+          Current
+        end end
+      else
+        Current
+      end
+    end
+
   -- Clear `Current.bounds(area)` in style `bg`, draw the frame, and render `Current.body`.
   -- TODO(proof-GT.6): prove POPUP.draw modifies only cells inside Current.bounds(area)
   draw(s: SCREEN, area: RECT, bg: STYLE, edge: STYLE, title_style: STYLE): SCREEN

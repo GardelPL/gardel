@@ -114,6 +114,27 @@ feature {ANY}
       same_count: Result.count = Current.count
     end
 
+  -- Moved by a mouse event inside `r`: left-clicking a row selects it, and the wheel steps
+  -- the selection by 3 items.
+  on_mouse(m: MOUSE, r: RECT): LIST_VIEW
+    do
+      if not r.has(m.x, m.y) then
+        Current
+      else if m.is_left_down then
+        let dy = m.y - r.y
+        let idx = if Current.topmost <= 18446744073709551615 - dy then Current.topmost + dy else 18446744073709551615 end
+        if idx < Current.entries.length then Current.select(idx, r.height) else Current end
+      else if m.is_wheel_up then
+        Current.up(3, r.height)
+      else if m.is_wheel_down then
+        Current.down(3, r.height)
+      else
+        Current
+      end end end end
+    ensure
+      same_count: Result.count = Current.count
+    end
+
   -- The item a key moves the selection to, `rows` items shown.
   target(k: KEY, rows: NAT): NAT
     do

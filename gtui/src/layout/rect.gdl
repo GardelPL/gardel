@@ -312,4 +312,16 @@ specify {ANY}
       pq: p.disjoint(q)
     end
 
+  -- Any cell inside a sub-rectangle is inside the outer rectangle.
+  law has_inside(r: RECT, outer: RECT, cx: NAT, cy: NAT)
+    ensure
+      in_outer: (r.inside(outer) and r.has(cx, cy)) implies outer.has(cx, cy)
+    end
+
+  -- Two rectangles that do not overlap share no cell.
+  law has_disjoint(a: RECT, b: RECT, cx: NAT, cy: NAT)
+    ensure
+      exclusive: a.disjoint(b) implies not (a.has(cx, cy) and b.has(cx, cy))
+    end
+
 end

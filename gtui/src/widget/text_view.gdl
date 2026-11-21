@@ -83,11 +83,17 @@ feature {ANY}
   down(n: NAT, rows: NAT): TEXT_VIEW
     do
       Current.scrolled_to(if Current.topmost <= 18446744073709551615 - n then Current.topmost + n else Current.topmost end, rows)
+    ensure
+      top_set: Result.top <= Current.last_top(rows)
+      same_lines: Result.line_count = Current.line_count
     end
 
   up(n: NAT, rows: NAT): TEXT_VIEW
     do
       Current.scrolled_to(if Current.topmost >= n then Current.topmost - n else 0 end, rows)
+    ensure
+      top_set: Result.top <= Current.last_top(rows)
+      same_lines: Result.line_count = Current.line_count
     end
 
   -- Scrolled by a key: a line for an arrow, a page for Page Up and Page Down, and to either
@@ -104,6 +110,22 @@ feature {ANY}
         case End then Current.scrolled_to(Current.last_top(rows), rows)
         case _ then Current
       end
+    end
+
+  -- Scrolled by a mouse event inside `r`: the wheel scrolls 3 lines up or down within `last_top`.
+  on_mouse(m: MOUSE, r: RECT): TEXT_VIEW
+    do
+      if not r.has(m.x, m.y) then
+        Current
+      else if m.is_wheel_up then
+        Current.up(3, r.height)
+      else if m.is_wheel_down then
+        Current.down(3, r.height)
+      else
+        Current
+      end end end
+    ensure
+      same_lines: Result.line_count = Current.line_count
     end
 
   -- The view drawn in `r`, each line in style `st`, cut at the right edge. Rows below the
