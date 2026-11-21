@@ -1,0 +1,59 @@
+-- Stage D of the round trip: one step of `HTTP_HEAD_PARSER.fields`, from the facts it reads.
+-- Apart from the facts about the bytes, so that the solver sees the parser's step alone.
+functions HTTP_FIELD_STEP
+
+specify {ANY}
+
+  -- A line at `pos` that ends at `e` and holds a field that frames nothing: `fields` adds it
+  -- and goes on after the line.
+  law plain_step(buf: BYTES, pos: NAT, e: NAT, he: NAT, acc: HTTP_HEADERS, cl: OPTION[NAT], te: BOOL)
+    require
+      in_buf: he + 4 <= buf.length
+      line: pos < e and e <= he
+      found: buf.index_of(HTTP_HEAD_PARSER.crlf, pos).is_some and buf.index_of(HTTP_HEAD_PARSER.crlf, pos).get = e
+      room: acc.has_header_room
+      read: HTTP_HEAD_PARSER.field_at(buf, pos, e).is_ok
+      not_length: not HTTP_HEAD_PARSER.ascii_equal_ci(HTTP_HEAD_PARSER.field_at(buf, pos, e).get.name.to_utf8,
+        HTTP_HEAD_PARSER.content_length_name, 0)
+      not_coding: not HTTP_HEAD_PARSER.ascii_equal_ci(HTTP_HEAD_PARSER.field_at(buf, pos, e).get.name.to_utf8,
+        HTTP_HEAD_PARSER.transfer_encoding_name, 0)
+    ensure
+      step_ok: HTTP_READ_FIELD.outcome_ok(HTTP_HEAD_PARSER.fields(buf, pos, he, acc, cl, te)) =
+        HTTP_READ_FIELD.outcome_ok(HTTP_HEAD_PARSER.fields(buf, e + 2, he, acc.add(HTTP_HEAD_PARSER.field_at(buf, pos, e).get), cl, te))
+      step_names: HTTP_READ_FIELD.outcome_names(HTTP_HEAD_PARSER.fields(buf, pos, he, acc, cl, te)) =
+        HTTP_READ_FIELD.outcome_names(HTTP_HEAD_PARSER.fields(buf, e + 2, he, acc.add(HTTP_HEAD_PARSER.field_at(buf, pos, e).get), cl, te))
+      step_values: HTTP_READ_FIELD.outcome_values(HTTP_HEAD_PARSER.fields(buf, pos, he, acc, cl, te)) =
+        HTTP_READ_FIELD.outcome_values(HTTP_HEAD_PARSER.fields(buf, e + 2, he, acc.add(HTTP_HEAD_PARSER.field_at(buf, pos, e).get), cl, te))
+      step_length: HTTP_READ_FIELD.outcome_length(HTTP_HEAD_PARSER.fields(buf, pos, he, acc, cl, te)) =
+        HTTP_READ_FIELD.outcome_length(HTTP_HEAD_PARSER.fields(buf, e + 2, he, acc.add(HTTP_HEAD_PARSER.field_at(buf, pos, e).get), cl, te))
+      step_chunked: HTTP_READ_FIELD.outcome_chunked(HTTP_HEAD_PARSER.fields(buf, pos, he, acc, cl, te)) =
+        HTTP_READ_FIELD.outcome_chunked(HTTP_HEAD_PARSER.fields(buf, e + 2, he, acc.add(HTTP_HEAD_PARSER.field_at(buf, pos, e).get), cl, te))
+    end
+
+  -- A `Content-Length` line at `pos`, the first, that ends at `e` and declares `n`: `fields`
+  -- adds it, takes `n` as the body's length, and goes on after the line.
+  law length_step(buf: BYTES, pos: NAT, e: NAT, he: NAT, acc: HTTP_HEADERS, n: NAT, te: BOOL)
+    require
+      in_buf: he + 4 <= buf.length
+      line: pos < e and e <= he
+      found: buf.index_of(HTTP_HEAD_PARSER.crlf, pos).is_some and buf.index_of(HTTP_HEAD_PARSER.crlf, pos).get = e
+      room: acc.has_header_room
+      read: HTTP_HEAD_PARSER.field_at(buf, pos, e).is_ok
+      length: HTTP_HEAD_PARSER.ascii_equal_ci(HTTP_HEAD_PARSER.field_at(buf, pos, e).get.name.to_utf8,
+        HTTP_HEAD_PARSER.content_length_name, 0)
+      declares: NUMBER_TEXT.parse_nat(HTTP_HEAD_PARSER.field_at(buf, pos, e).get.value) = Ok(n)
+    ensure
+      step_ok: HTTP_READ_FIELD.outcome_ok(HTTP_HEAD_PARSER.fields(buf, pos, he, acc, None, te)) =
+        HTTP_READ_FIELD.outcome_ok(HTTP_HEAD_PARSER.fields(buf, e + 2, he, acc.add(HTTP_HEAD_PARSER.field_at(buf, pos, e).get), Some(n), te))
+      step_names: HTTP_READ_FIELD.outcome_names(HTTP_HEAD_PARSER.fields(buf, pos, he, acc, None, te)) =
+        HTTP_READ_FIELD.outcome_names(HTTP_HEAD_PARSER.fields(buf, e + 2, he, acc.add(HTTP_HEAD_PARSER.field_at(buf, pos, e).get), Some(n), te))
+      step_values: HTTP_READ_FIELD.outcome_values(HTTP_HEAD_PARSER.fields(buf, pos, he, acc, None, te)) =
+        HTTP_READ_FIELD.outcome_values(HTTP_HEAD_PARSER.fields(buf, e + 2, he, acc.add(HTTP_HEAD_PARSER.field_at(buf, pos, e).get), Some(n), te))
+      step_length: HTTP_READ_FIELD.outcome_length(HTTP_HEAD_PARSER.fields(buf, pos, he, acc, None, te)) =
+        HTTP_READ_FIELD.outcome_length(HTTP_HEAD_PARSER.fields(buf, e + 2, he, acc.add(HTTP_HEAD_PARSER.field_at(buf, pos, e).get), Some(n), te))
+      step_chunked: HTTP_READ_FIELD.outcome_chunked(HTTP_HEAD_PARSER.fields(buf, pos, he, acc, None, te)) =
+        HTTP_READ_FIELD.outcome_chunked(HTTP_HEAD_PARSER.fields(buf, e + 2, he, acc.add(HTTP_HEAD_PARSER.field_at(buf, pos, e).get), Some(n), te))
+    end
+
+end
+

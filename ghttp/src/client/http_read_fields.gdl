@@ -1,0 +1,90 @@
+-- Stage D of the round trip, all the field lines: what `HTTP_HEAD_PARSER.fields` reads from
+-- the field lines the writer writes for `hs`, one field from each, in the order they were
+-- added (`HTTP_READ_STEPS` shows that it reads them).
+--
+-- Each step is its own law, over the start `p` and the line break `e` of the line of
+-- `hs.head`, so that the solver sees small terms, and `HTTP_READ_BACK.reads_back` only chains
+-- them. Each law a proof uses is in another module than the proof: a call to a law of the
+-- same module asserts its ensures again, from the law's axiom, rather than giving them.
+functions HTTP_READ_FIELDS
+
+feature {ANY}
+
+  -- What `fields` adds to `acc` for the field lines of `hs` at `pos`: the field it reads from
+  -- each, the line of the field added first first.
+  reads(buf: BYTES, pos: NAT, hs: LIST[HTTP_HEADER], acc: HTTP_HEADERS): HTTP_HEADERS
+    variant
+      hs.length
+    do
+      if hs.length = 0 or hs.length > 64 or pos > 1000000000 then
+        acc
+      else
+        let before = reads(buf, pos, hs.tail, acc)
+        let p = pos + HTTP_REQUEST_WRITER.fields_text(hs.tail).byte_length
+        let e = p + hs.head.serialize_line.byte_length - 2
+        if e <= buf.length and before.has_header_room then
+          match HTTP_HEAD_PARSER.field_at(buf, p, e)
+            case Ok(h) then before.add(h)
+            case Error(_) then before
+          end
+        else
+          before
+        end
+      end
+    end
+
+specify {ANY}
+
+  -- The field lines of `hs` are those of its tail, then the line of its head.
+  law text_step(hs: LIST[HTTP_HEADER])
+    require
+      some: hs.length > 0
+      few: hs.length <= 64
+    ensure
+      text: HTTP_REQUEST_WRITER.fields_text(hs).byte_model =
+        HTTP_REQUEST_WRITER.fields_text(hs.tail).byte_model.append(hs.head.serialize_line.byte_model)
+      size: HTTP_REQUEST_WRITER.fields_text(hs).byte_model.length =
+        HTTP_REQUEST_WRITER.fields_text(hs.tail).byte_model.length + hs.head.serialize_line.byte_model.length
+    end
+
+  -- Bytes that hold the field lines of `hs` at `pos` hold those of its tail there, and the
+  -- line of its head at `p`, after them.
+  law split_holds(buf: BYTES, pos: NAT, p: NAT, hs: LIST[HTTP_HEADER])
+    require
+      some: hs.length > 0
+      few: hs.length <= 64
+      at: p = pos + HTTP_REQUEST_WRITER.fields_text(hs.tail).byte_model.length
+      holds: forall k: NAT. (pos <= k and k < pos + HTTP_REQUEST_WRITER.fields_text(hs).byte_model.length) implies
+        LIST_OPS.at(buf.model, k) = LIST_OPS.at(HTTP_REQUEST_WRITER.fields_text(hs).byte_model, k - pos)
+    do
+      text_step(hs)
+    ensure
+      tail_holds: forall k: NAT. (pos <= k and k < pos + HTTP_REQUEST_WRITER.fields_text(hs.tail).byte_model.length) implies
+        LIST_OPS.at(buf.model, k) = LIST_OPS.at(HTTP_REQUEST_WRITER.fields_text(hs.tail).byte_model, k - pos)
+      line_holds: forall k: NAT. (p <= k and k < p + hs.head.serialize_line.byte_model.length) implies
+        LIST_OPS.at(buf.model, k) = LIST_OPS.at(hs.head.serialize_line.byte_model, k - p)
+    end
+
+  -- One step of `reads`: the field read from the line of `hs.head` added to what the tail's
+  -- lines give.
+  law reads_step(buf: BYTES, pos: NAT, hs: LIST[HTTP_HEADER], acc: HTTP_HEADERS, p: NAT, e: NAT)
+    require
+      some: hs.length > 0
+      few: hs.length <= 64
+      small: pos <= 1000000000
+      at: p = pos + HTTP_REQUEST_WRITER.fields_text(hs.tail).byte_model.length
+      ends: e + 2 = p + hs.head.serialize_line.byte_model.length
+      in_buf: e <= buf.length
+      room: reads(buf, pos, hs.tail, acc).has_header_room
+      read: HTTP_HEAD_PARSER.field_at(buf, p, e).is_ok
+    do
+      HTTP_REQUEST_WRITER.fields_text(hs.tail).byte_length = HTTP_REQUEST_WRITER.fields_text(hs.tail).byte_model.length and
+      hs.head.serialize_line.byte_length = hs.head.serialize_line.byte_model.length and
+      HTTP_READ_FIELD.add_counts(reads(buf, pos, hs.tail, acc), HTTP_HEAD_PARSER.field_at(buf, p, e).get)
+    ensure
+      count: reads(buf, pos, hs, acc).num_headers = reads(buf, pos, hs.tail, acc).num_headers + 1
+      cap: reads(buf, pos, hs, acc).max_headers = reads(buf, pos, hs.tail, acc).max_headers
+      first: reads(buf, pos, hs, acc).fields = reads(buf, pos, hs.tail, acc).fields.prepend(HTTP_HEAD_PARSER.field_at(buf, p, e).get)
+    end
+
+end

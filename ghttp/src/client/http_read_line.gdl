@@ -1,0 +1,107 @@
+-- Stage D of the round trip, one line: the field read from a field line the writer writes,
+-- and where the line ends; and the same of its `Content-Length` line. `HTTP_LINE_READS` makes
+-- a field line one step of `HTTP_HEAD_PARSER.fields`.
+functions HTTP_READ_LINE
+
+specify {ANY}
+
+  -- The field read from a field line of `h` is `h`'s name and value.
+  law line_field(buf: BYTES, pos: NAT, h: HTTP_HEADER)
+    require
+      ok: HTTP_REQUEST_WRITER.field_ok(h)
+      holds: forall k: NAT. (pos <= k and k < pos + h.serialize_line.byte_model.length) implies
+        LIST_OPS.at(buf.model, k) = LIST_OPS.at(h.serialize_line.byte_model, k - pos)
+      in_buf: pos + h.serialize_line.byte_model.length <= buf.length
+    do
+      HTTP_WRITER_LINES.field_line(h) and
+      h.serialize_line.byte_model.length = h.name.byte_length + 2 + h.value.byte_length + 2 and
+      h.name.to_utf8.model = h.name.byte_model and
+      h.value.to_utf8.model = h.value.byte_model and
+      HTTP_HEAD_PARSER.is_token(h.name.to_utf8, 0) and
+      not HTTP_HEAD_PARSER.ascii_equal_ci(h.name.to_utf8, HTTP_HEAD_PARSER.content_length_name, 0) and
+      not HTTP_HEAD_PARSER.ascii_equal_ci(h.name.to_utf8, HTTP_HEAD_PARSER.transfer_encoding_name, 0) and
+      HTTP_HEAD_PARSER.all_field_bytes(h.value.to_utf8, 0, h.value.to_utf8.length) and
+      (h.value.to_utf8.length > 0 implies
+        (h.value.to_utf8.at(0) = LIST_OPS.at(h.value.byte_model, 0) and
+         h.value.to_utf8.at(h.value.to_utf8.length - 1) = LIST_OPS.at(h.value.byte_model, h.value.byte_length - 1))) and
+      HTTP_READ_FIELD.field_reads(buf, pos, pos + h.serialize_line.byte_model.length - 2, h.name, h.value) and
+      HTTP_HEAD_PARSER.field_at(buf, pos, pos + h.serialize_line.byte_model.length - 2).get.name.to_utf8.model = h.name.to_utf8.model
+    ensure
+      read: HTTP_HEAD_PARSER.field_at(buf, pos, pos + h.serialize_line.byte_model.length - 2).is_ok and
+        HTTP_HEAD_PARSER.field_at(buf, pos, pos + h.serialize_line.byte_model.length - 2).get.name.byte_model = h.name.byte_model and
+        HTTP_HEAD_PARSER.field_at(buf, pos, pos + h.serialize_line.byte_model.length - 2).get.value.byte_model = h.value.byte_model
+    end
+
+  -- A field line of `h` at `pos`, whose line break is at `e`: the parser finds that break
+  -- first, after at least one byte.
+  law line_found(buf: BYTES, pos: NAT, e: NAT, h: HTTP_HEADER)
+    require
+      ok: HTTP_REQUEST_WRITER.field_ok(h)
+      holds: forall k: NAT. (pos <= k and k < pos + h.serialize_line.byte_model.length) implies
+        LIST_OPS.at(buf.model, k) = LIST_OPS.at(h.serialize_line.byte_model, k - pos)
+      ends: e + 2 = pos + h.serialize_line.byte_model.length
+      in_buf: e + 2 <= buf.length
+    do
+      HTTP_WRITER_LINES.field_line(h) and
+      h.serialize_line.byte_model.length = h.name.byte_length + 2 + h.value.byte_length + 2 and
+      HTTP_LINE_FACTS.token_bytes(h.name.to_utf8, 0) and
+      h.name.to_utf8.model = h.name.byte_model and
+      LIST_OPS.at(buf.model, e) = LIST_OPS.at(h.serialize_line.byte_model, e - pos) and
+      LIST_OPS.at(buf.model, e + 1) = LIST_OPS.at(h.serialize_line.byte_model, e + 1 - pos) and
+      (forall k: NAT. (pos <= k and k < e) implies LIST_OPS.at(buf.model, k) != 13) and
+      HTTP_WIRE_FACTS.crlf_found(buf, HTTP_HEAD_PARSER.crlf, pos, e)
+    ensure
+      found: buf.index_of(HTTP_HEAD_PARSER.crlf, pos).is_some and buf.index_of(HTTP_HEAD_PARSER.crlf, pos).get = e
+      line: pos < e
+    end
+
+  -- The `Content-Length` line of `req`, the last before the blank line, ends where the
+  -- blank line starts.
+  law length_line_ends(buf: BYTES, pos: NAT, he: NAT, req: HTTP_REQUEST)
+    require
+      sent: HTTP_REQUEST_WRITER.needs_length(req)
+      holds: forall k: NAT. (pos <= k and k < pos + HTTP_REQUEST_WRITER.length_line(req).byte_model.length) implies
+        LIST_OPS.at(buf.model, k) = LIST_OPS.at(HTTP_REQUEST_WRITER.length_line(req).byte_model, k - pos)
+      fits: pos + HTTP_REQUEST_WRITER.length_line(req).byte_model.length = he + 2
+      in_buf: he + 4 <= buf.length
+    do
+      HTTP_REQUEST_WRITER.length_line_bytes(req) and
+      HTTP_REQUEST_WRITER.content_length_field.byte_length = 14 and
+      HTTP_REQUEST_WRITER.length_line(req).byte_model.length = 14 + 2 + HTTP_REQUEST_WRITER.length_digits(req).byte_length + 2 and
+      NUMBER_TEXT.nat_to_text(req.request_body_length).byte_model = NUMBER_TEXT.digits(req.request_body_length, LIST.empty) and
+      HTTP_LINE_FACTS.digits_are_digits(req.request_body_length, LIST.empty) and
+      (forall k: NAT. (pos <= k and k < he) implies LIST_OPS.at(buf.model, k) != 13) and
+      HTTP_WIRE_FACTS.crlf_found(buf, HTTP_HEAD_PARSER.crlf, pos, he)
+    ensure
+      found: buf.index_of(HTTP_HEAD_PARSER.crlf, pos).is_some and buf.index_of(HTTP_HEAD_PARSER.crlf, pos).get = he
+      line: pos < he
+    end
+
+  -- The field of the `Content-Length` line of `req` is `Content-Length`, with the digits of
+  -- the body's length, which read back as that length.
+  law length_line_field(buf: BYTES, pos: NAT, he: NAT, req: HTTP_REQUEST)
+    require
+      sent: HTTP_REQUEST_WRITER.needs_length(req)
+      holds: forall k: NAT. (pos <= k and k < pos + HTTP_REQUEST_WRITER.length_line(req).byte_model.length) implies
+        LIST_OPS.at(buf.model, k) = LIST_OPS.at(HTTP_REQUEST_WRITER.length_line(req).byte_model, k - pos)
+      fits: pos + HTTP_REQUEST_WRITER.length_line(req).byte_model.length = he + 2
+      in_buf: he + 4 <= buf.length
+    do
+      HTTP_REQUEST_WRITER.length_line_bytes(req) and
+      HTTP_WRITER_LENGTH.content_length_spelling(0) and
+      HTTP_WRITER_LENGTH.length_digits_field(req) and
+      HTTP_REQUEST_WRITER.content_length_field.byte_length = 14 and
+      HTTP_READ_FIELD.field_reads(buf, pos, he, HTTP_REQUEST_WRITER.content_length_field, HTTP_REQUEST_WRITER.length_digits(req)) and
+      HTTP_HEAD_PARSER.field_at(buf, pos, he).get.name.to_utf8.model = HTTP_REQUEST_WRITER.content_length_field.to_utf8.model and
+      HTTP_LINE_FACTS.ci_same(HTTP_HEAD_PARSER.field_at(buf, pos, he).get.name.to_utf8, HTTP_REQUEST_WRITER.content_length_field.to_utf8, HTTP_HEAD_PARSER.content_length_name, 0) and
+      HTTP_HEAD_PARSER.field_at(buf, pos, he).get.value.byte_model = NUMBER_TEXT.nat_to_text(req.request_body_length).byte_model and
+      NUMBER_TEXT.parse_nat(HTTP_HEAD_PARSER.field_at(buf, pos, he).get.value) = NUMBER_TEXT.parse_nat(NUMBER_TEXT.nat_to_text(req.request_body_length))
+    ensure
+      read: HTTP_HEAD_PARSER.field_at(buf, pos, he).is_ok
+      name: HTTP_HEAD_PARSER.field_at(buf, pos, he).get.name.byte_model = HTTP_REQUEST_WRITER.content_length_field.byte_model
+      value: HTTP_HEAD_PARSER.field_at(buf, pos, he).get.value.byte_model = NUMBER_TEXT.nat_to_text(req.request_body_length).byte_model
+      length: HTTP_HEAD_PARSER.ascii_equal_ci(HTTP_HEAD_PARSER.field_at(buf, pos, he).get.name.to_utf8, HTTP_HEAD_PARSER.content_length_name, 0)
+      declares: NUMBER_TEXT.parse_nat(HTTP_HEAD_PARSER.field_at(buf, pos, he).get.value) = Ok(req.request_body_length)
+    end
+
+end

@@ -13,7 +13,7 @@ After Phases F and G, Gardel can serve JSON over HTTP, call another service, dra
 The phase delivers, in this order:
 
 1. Host essentials: a clock, entropy, logging and the environment.
-2. Core data: sorting, searching, sets, queues, heaps and a flat array.
+2. Core data: the list operations and laws of Bird and Wadler, generators for infinite sequences, sorting, searching, sets, queues, heaps and a flat array.
 3. Text and numbers: formatting, encoders, a shared parsing cursor and `F64` text.
 4. Testing: a test runner and a mutation tool.
 5. Time, hashes and configuration.
@@ -25,6 +25,13 @@ The phase delivers, in this order:
 
 **Not in this phase:** HTTP/2, WebSockets, locale collation, time zones other than UTC, Unicode normalization and display width, a package registry, GPU backends.
 
+**Not in this phase, from Bird and Wadler's *Introduction to Functional Programming*:** each was weighed against the existing features and left out.
+
+- **List comprehension syntax** (B&W §3.2). It desugars to `concat_map` and `filter`, so it would be a second way to write `LIST_OPS` and would need the same laws to verify. H.21 adds `concat_map` and `range`, which cover its uses.
+- **Infinite and lazy lists** (B&W ch. 7). Every routine is total and terminates (principle 2), `LIST` is inductive, a `variant` measures `xs.length`, evaluation is strict, and reference counting cannot hold the cyclic structures of B&W §7.6. Laziness would break each of these. What B&W use infinite lists for is covered without them: an infinite sequence becomes a finite value, a state and a step, in H.22's `GENERATOR` (as Elixir's `Stream.unfold`); streams of input are the reactive program's event loop (§11.6); reasoning over infinite runs becomes H.20's trace properties over finite logs.
+- **Tuples of more than two fields** (B&W §2.4). `TUPLE[A, B]` covers pairs, and a record covers the rest, with names and an invariant.
+- **A composition operator, user operators, sections and currying** (B&W §2.6). `.` is already a method call, `FUNCTION_OPS.compose` carries the laws, and method chains read as pipelines. A partial application is a lambda.
+
 ---
 
 ## 2. Prerequisites
@@ -33,7 +40,7 @@ Some tasks cannot start until the compiler or an earlier phase provides somethin
 
 | # | Prerequisite | Where it comes from | Needed by |
 | :--- | :--- | :--- | :--- |
-| P1 | **F.13 and F.15 closed.** Recursive helpers with a `require`, and facts at the value of a call | Phase F | Every proof-heavy task: H.3, H.4, H.7, H.11 |
+| P1 | **F.13 and F.15 closed.** Recursive helpers with a `require`, and facts at the value of a call | Phase F | Every proof-heavy task: H.3, H.4, H.7, H.11, H.21 |
 | P2 | **User concepts as bounds.** Today only `EQ`, `CANONICAL_EQ` and `ORD` have a theory (`E0320`) | New compiler task, H.0a | `HASH` in H.4 and H.12, `SHOW` in H.6 |
 | P3 | **A `BYTE` type, or element ranges for `LIST` and `SEQ` of a machine type.** Today an element of `LIST[U64]` has no range in the proof, so `gjson` checks each byte it reads | New compiler task, H.0b | H.6, H.7, H.12 |
 | P4 | **A contiguous buffer in the C backend** with a `LIST` model | New compiler task, inside H.5 | H.5, and through it H.3 and H.4 |
@@ -52,6 +59,9 @@ P8 is the one with no owner. F.7's POSIX code has never run, and every host task
 flowchart TD
     H0a["H.0a User concepts as bounds"]
     H0b["H.0b BYTE or element ranges"]
+    H0c["H.0c Derived instances for enumerations"]
+    H21["H.21 List operations and laws"]
+    H22["H.22 GENERATOR"]
     H1["H.1 Clock and entropy"]
     H2["H.2 Logging and environment"]
     H3["H.3 Sort and search"]
@@ -76,6 +86,15 @@ flowchart TD
     H0a --> H6
     H0b --> H6
     H0b --> H7
+    H0c --> H2
+    H0c --> H11
+    H0c --> H16
+    H21 --> H3
+    H21 --> H6
+    H21 --> H7
+    H21 --> H22
+    H22 --> H9
+    H22 --> H16
     H5 --> H3 --> H4
     H1 --> H11
     H1 --> H16
@@ -96,6 +115,9 @@ flowchart TD
 | :--- | :--- | :--- | :--- |
 | H.0a | L | A user's own concept as a bound | Touches the verifier core, as F.1 did |
 | H.0b | M | Bytes that carry their range | Changing how every list of numbers is typed |
+| H.0c | S | `EQ`, `ORD` and ordinals derived for an enumeration | Keeping derived laws out of user proofs' way |
+| H.21 | M | The rest of B&W §3.3 in `LIST_OPS`, and the fold laws of §3.5.1 | The duality theorems' quantified premises |
+| H.22 | S | `GENERATOR[S, A]`: an infinite sequence as a state and a step | Searches that may not end (`filter`, `find`) |
 | H.1 | S | `ReadClock`, `Random` | Secrets in the event log |
 | H.2 | S | `Log`, environment variables | Prelude name clashes |
 | H.3 | M | Sort and binary search, proven | The permutation proof |
@@ -133,6 +155,9 @@ flowchart TD
 10. **Test discovery.** Proposed: a package's `tests/` directory is a client package, as `ghttp/tests` and `gjson/tests` already are, and `gardelc test` runs each `program` in it.
 11. **Formatter style.** Proposed: one style, no options.
 12. **Trace property language.** Proposed: a pure Gardel routine over a list of log entries, so no new language is needed.
+13. **Derived instances for enumerations (H.0c).** Proposed: a sum whose variants all have no fields may write `satisfies CANONICAL_EQ` or `satisfies ORD` with no method bodies, and the compiler supplies them, ordered by declaration as in B&W §8.1. No new syntax. A sum with fields still writes its own.
+14. **`LIST_OPS` calling style.** `LIST` uses `LIST_OPS.map(xs, f)`, while `SEQ`, `OPTION` and `RESULT` use `s.map(f)`. Proposed: keep both, since `LIST` is also the ghost model, but give every law the same name on every type (`map_fusion`, `filter_append`, ...), as there is no functor concept to share them.
+15. **A generator at the end of a bounded type (H.22).** A step over `NAT` overflows after 2^64 items, and the verifier refuses `s + 1` in a step's lambda. Proposed: the library offers both forms, `GENERATOR` with a step that never ends (the client wraps with `+%` or uses `BIGNAT`) and `UNFOLD` with a step that returns `OPTION`, as Elixir's `Stream.unfold` returns `nil`. It does not pick wrapping for the client.
 
 ---
 
@@ -169,6 +194,18 @@ Client: every parser. Needs decision 4. Closes F.2's first known limit.
 - [ ] Soundness test: a list built from a value out of range must be refused where it is built.
 - Acceptance: a client proves `bs.model.head < 256` for a non-empty `BYTES` with no check in its body. `gjson` is 0/0 with the checks removed.
 
+#### Task H.0c: Derived Instances for Enumerations
+
+Client: `LOG_LEVEL` in H.2 (`GARDEL_LOG_LEVEL` sets the lowest level written, so levels need an order), months and weekdays in H.11, the breaker states in H.16. Today `HTTP_METHOD` and every other enumeration write `equals` by hand. Needs decision 13. Adds what B&W §8.1 gives an enumerated type.
+
+- [ ] On a sum whose variants all have no fields, `satisfies CANONICAL_EQ` or `satisfies ORD` with no bodies gets `equals` and `less_than` from the compiler. The order is the order of declaration.
+- [ ] `ordinal: NAT`, `from_ordinal(n): OPTION[T]` and `all: LIST[T]`, with laws: `from_ordinal(t.ordinal) = Some(t)`, `a.less_than(b) = (a.ordinal < b.ordinal)`, `all.length` is the number of variants, and every value is in `all`.
+- [ ] The concept's laws are proven for the generated bodies, as for written ones, so no derived instance is trusted.
+- [ ] A body written by hand still wins, and a sum with a field asks for one (a new error code).
+- [ ] Move `HTTP_METHOD` and `HTTP_VERSION` onto it, and record the lines removed.
+- [ ] With H.0a: `HASH` and `SHOW` derived the same way.
+- Acceptance: `module LOG_LEVEL satisfies ORD` with four variants and no feature verifies, and a client proves `Debug.less_than(Error)`. All existing `.bpl` output is byte-identical.
+
 ### Step 1: Host essentials
 
 #### Task H.1: Clock and Entropy
@@ -187,7 +224,7 @@ Client: `gtime` (H.11), the rate limiter (H.16), request ids in `grest`. Needs d
 
 Client: every server example. `Print` writes to standard output with a newline, so a server has nowhere to write a diagnostic today.
 
-- [ ] `Log(level: LOG_LEVEL, text: STRING)`: one line on standard error. `LOG_LEVEL` is `Debug | Info | Warn | Error`. `GARDEL_LOG_LEVEL` sets the lowest level written.
+- [ ] `Log(level: LOG_LEVEL, text: STRING)`: one line on standard error. `LOG_LEVEL` is `Debug | Info | Warn | Error`, ordered by H.0c. `GARDEL_LOG_LEVEL` sets the lowest level written.
 - [ ] `init` receives the environment: decide between a second parameter and a command `ReadEnv(tag, name)`. A command keeps `init`'s signature and is logged like any input, so it is proposed.
 - [ ] `IO.log` and `IO.env(name): IO[OPTION[STRING]]` for a `program`. A value that is not UTF-8 is `None`.
 - [ ] Scripted and log forms. A replay compares `Log` commands as it compares `Print`.
@@ -195,6 +232,39 @@ Client: every server example. `Print` writes to standard output with a newline, 
 - Acceptance: `todo_api` reads its port from the environment and logs each request, and a replay reproduces the log lines.
 
 ### Step 2: Core data
+
+#### Task H.21: List Operations and Their Laws
+
+Client: sorting (H.3) needs `merge`, `take` and `reverse`; `join` and `split` (H.6) need `concat`; `gparse` (H.7) needs `take_while`. Without this task each writes its own copy, as `BYTES` already did with `list_take`. Needs P1. No compiler work. Brings `LIST_OPS` up to B&W §3.3 to §3.5.
+
+- [ ] Move `list_take` and `list_drop` from `stdlib/text/bytes.gdl` into `LIST_OPS` as `take` and `drop`, and have `BYTES` use them.
+- [ ] Add `reverse`, `concat`, `take_while`, `drop_while`, `zip`, `zip_with`, `last`, `init`, `concat_map`, `range(lo, hi)` and `iterate_n(f, x, n)`. Each is total, with a `variant`.
+- [ ] Give `filter` a `cons_case`, as `map` has. Today it states only `not_longer` and `empty_case`, so a client cannot prove which items are kept.
+- [ ] Laws on lists (B&W §3.3, §3.4): `take(n, xs).append(drop(n, xs)) = xs`, `take_while` and `drop_while` the same, `reverse(reverse(xs)) = xs`, `reverse(xs.append(ys)) = reverse(ys).append(reverse(xs))`, `zip`'s length is the shorter one's, map fusion on `LIST` (only `SEQ` has it), and `filter(map(xs, f), p) = map(filter(xs, compose(p, f)), f)`.
+- [ ] Fold laws (B&W §3.5.1), each stated with a `require` that the operators are associative and `init` is their identity, as quantified premises:
+  - First duality theorem: `fold_right` and `fold_left` agree over a monoid.
+  - Second duality theorem: for two operators that associate with each other.
+  - Third duality theorem: `fold_right(xs, f, a) = fold_left(reverse(xs), flip(f), a)`.
+  - Homomorphism: a monoid fold of `xs.append(ys)` is the operator applied to the folds of each.
+- [ ] Use the first duality theorem in `SEQ`: its parallel fold matches the sequential `LIST` model, which is what H.3's parallel merge sort and F.14's cutoff rest on.
+- [ ] `concat_map` gets the monad laws `OPTION` and `RESULT` have, under the same names.
+- [ ] Fix spec §4.1, which lists `append`, `length` and `reverse` in `LIST_OPS`: the first two are `LIST` built-ins, and the third is added here.
+- Acceptance: every law is proven, and each is used by a client that sees no body, with a false version refused. A client writes B&W §3.2's `[(i, j) | i <- [1..4]; j <- [i+1..4]]` as two `concat_map` calls over `range` and proves its length is 6.
+- Risk: a law with a `forall` over a function's associativity can stall the solver. If one does, state it for a named operator in a concept once H.0a exists (`MONOID`), and record which.
+
+#### Task H.22: `GENERATOR`
+
+Client: H.9's property generators (SplitMix64 from a seed is a state and a step), H.16's retry schedule (an endless list of delays, of which a client takes the first `n`), and B&W ch. 7's examples. Needs H.21 and decision 15. No compiler work: a prototype verified 0/0 under `--strict` and ran in C on 2026-11-16.
+
+- [ ] `module GENERATOR[S, A]`, `representation {ANY}` with fields `state: S` and `next: S -> TUPLE[A, S]`. `make(s, f)` in `create`. `head`, `tail`, `take(n): LIST[A]` (ensure `Result.length = n`), `nth(n)` and `drop(n)`, each with `variant n`.
+- [ ] Total combinators: `map`, `zip`, `zip_with`, `scan`, `iterate(x, f)` and `cycle(xs)` of a non-empty list, with the index as the state. `zip` of two generators has a pair as its state.
+- [ ] Laws, with triggers: `take(n).length = n`, `nth(k) = LIST_OPS.at(take(n), k)` for `k < n`, `take(m + n) = take(m).append(drop(m).take(n))`, and `map(g, f).take(n) = LIST_OPS.map(g.take(n), f)`, so a client reasons about a prefix with H.21's list laws.
+- [ ] `module UNFOLD[S, A]` with `next: S -> OPTION[TUPLE[A, S]]` (decision 15): `take(n)` gives at most `n` items, and `to_list` takes a `variant` the client supplies on `S`.
+- [ ] Searches are bounded: `find_within(k, p): OPTION[A]` and `take_while_within(k, p)`. There is no `filter` on a generator, since its next item may never come. Say so in the guide, with the B&W §7.3 prime sieve written with a bound as the example.
+- [ ] A worked law in the guide: every item of a generator satisfies `P` when `P` holds of the first state and `next` keeps it, proven by induction on `n` for a named generator. A generic version over any `P` needs a concept bound on the state and waits for H.0a.
+- [ ] Look into `E0199` from the prototype: a record literal `{ state = ..., next = ... }` of `GENERATOR` written in another module is typed as that module's record, and the verifier cannot translate it. Until fixed, clients build through `make`.
+- [ ] Guide: a comparison with Elixir's `Stream` (`unfold`, `iterate`, `cycle`, `Enum.take`). The differences are a search that may never end (refused here), overflow (chosen by the client), a visible state type (no existentials), and no effects (those are reactive programs).
+- Acceptance: `naturals` and `fibs` from the prototype, SplitMix64 and a retry schedule are clients that see no body. A client proves `fibs(0).nth(9) = 34` by the laws, and a step written with `s + 1` over `NAT` is refused as an overflow.
 
 #### Task H.5: `ARRAY[A]`
 
@@ -304,7 +374,7 @@ Client: this plan's own rule. Phases E and F made well over a hundred mutations 
 
 #### Task H.11: `gtime`
 
-Client: an HTTP `Date` header, timestamps in `todo_api`, log lines. Needs H.1 and H.6.
+Client: an HTTP `Date` header, timestamps in `todo_api`, log lines. Needs H.0c, H.1 and H.6.
 
 - [ ] `module DATE`: year, month, day, with the invariant that the day exists. `from_days(n: I64)` and `to_days`, for years 1 to 9999.
 - [ ] Proven: `from_days(to_days(d)) = d` and `to_days(from_days(n)) = n` in range, and that `to_days` is strictly increasing in calendar order. This is the showcase proof of the task.
@@ -365,7 +435,7 @@ Client: any service not behind a proxy, and any client of a public API. Needs de
 
 #### Task H.16: Limits on Callers
 
-Client: `grest` and `api_gateway`. Needs H.1 and H.4. These are small state machines with invariants, which is what the language is best at.
+Client: `grest` and `api_gateway`. Needs H.0c, H.1 and H.4. These are small state machines with invariants, which is what the language is best at.
 
 - [ ] `RATE_LIMITER`: a token bucket per key, in a bounded `MAP`. Proven: no key is granted more than its burst between two refills, and the table stays within its limit.
 - [ ] `RETRY`: a schedule with exponential backoff and a cap. Proven: at most `n` tries, and each delay within the cap. Jitter takes its random bytes as an argument.
@@ -440,7 +510,7 @@ Each milestone can ship alone.
 
 ## 7. Order
 
-H.0a and H.0b come first, with P1 and P8: half the tasks rest on them. Step 1 is small and unblocks `gtime` and the limiter. Step 4 (testing) can move ahead of steps 2 and 3 if hand-made mutations and Rust harnesses become the bottleneck; it needs only H.6's builder. Steps 6 and 7 need Phase G. Step 8 can run beside anything after H.13.
+H.0a and H.0b come first, with P1 and P8: half the tasks rest on them. H.0c is small and goes before H.2. H.21 needs only P1 and goes before H.3, H.6 and H.7. H.22 follows H.21 and goes before H.9 and H.16. Step 1 is small and unblocks `gtime` and the limiter. Step 4 (testing) can move ahead of steps 2 and 3 if hand-made mutations and Rust harnesses become the bottleneck; it needs only H.6's builder. Steps 6 and 7 need Phase G. Step 8 can run beside anything after H.13.
 
 If only three tasks can be done, do H.1, H.9 and H.3: the time, a test runner and a sort are what a new user looks for first.
 

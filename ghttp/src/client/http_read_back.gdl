@@ -1,0 +1,45 @@
+-- Stage D of the round trip, all the field lines: `HTTP_HEAD_PARSER.fields` reads from the
+-- field lines the writer writes for `hs` a field of each, with its name and value, the
+-- line of the field added first first (`HTTP_READ_FIELDS.reads`).
+functions HTTP_READ_BACK
+
+specify {ANY}
+
+  law reads_back(buf: BYTES, pos: NAT, he: NAT, hs: LIST[HTTP_HEADER], acc: HTTP_HEADERS)
+    require
+      ok: HTTP_REQUEST_WRITER.fields_ok(hs)
+      few: hs.length <= 64
+      holds: forall k: NAT. (pos <= k and k < pos + HTTP_REQUEST_WRITER.fields_text(hs).byte_model.length) implies
+        LIST_OPS.at(buf.model, k) = LIST_OPS.at(HTTP_REQUEST_WRITER.fields_text(hs).byte_model, k - pos)
+      fits: pos + HTTP_REQUEST_WRITER.fields_text(hs).byte_model.length <= he + 2
+      in_buf: he + 4 <= buf.length
+      room: acc.num_headers + hs.length <= acc.max_headers
+      small: pos <= 1000000000
+    variant
+      hs.length
+    do
+      if hs.length = 0 then
+        HTTP_READ_FIELDS.reads(buf, pos, hs, acc).fields = acc.fields and
+        HTTP_READ_FIELDS.reads(buf, pos, hs, acc).num_headers = acc.num_headers and
+        HTTP_READ_FIELDS.reads(buf, pos, hs, acc).max_headers = acc.max_headers and
+        HTTP_READ_FIELD.names_of(hs).length = 0 and HTTP_READ_FIELD.values_of(hs).length = 0
+      else
+        HTTP_REQUEST_WRITER.field_ok(hs.head) and
+        HTTP_REQUEST_WRITER.fields_ok(hs.tail) and
+        HTTP_WRITER_LINES.field_line(hs.head) and
+        HTTP_READ_FIELDS.text_step(hs) and
+        HTTP_READ_FIELDS.split_holds(buf, pos, pos + HTTP_REQUEST_WRITER.fields_text(hs.tail).byte_model.length, hs) and
+        reads_back(buf, pos, he, hs.tail, acc) and
+        HTTP_BACK_STEP.back_step(buf, pos, he, hs, acc, pos + HTTP_REQUEST_WRITER.fields_text(hs.tail).byte_model.length,
+          pos + HTTP_REQUEST_WRITER.fields_text(hs.tail).byte_model.length + hs.head.serialize_line.byte_model.length - 2)
+      end
+    ensure
+      count: HTTP_READ_FIELDS.reads(buf, pos, hs, acc).num_headers = acc.num_headers + hs.length
+      cap: HTTP_READ_FIELDS.reads(buf, pos, hs, acc).max_headers = acc.max_headers
+      names: HTTP_READ_FIELD.names_of(HTTP_READ_FIELDS.reads(buf, pos, hs, acc).fields) =
+        HTTP_READ_FIELD.names_of(hs).append(HTTP_READ_FIELD.names_of(acc.fields))
+      values: HTTP_READ_FIELD.values_of(HTTP_READ_FIELDS.reads(buf, pos, hs, acc).fields) =
+        HTTP_READ_FIELD.values_of(hs).append(HTTP_READ_FIELD.values_of(acc.fields))
+    end
+
+end
