@@ -2016,7 +2016,7 @@ Every program automatically sees the **Standard Prelude**:
 | :--- | :--- |
 | Concepts | `EQ`, `CANONICAL_EQ`, `ORD` |
 | Core types | `OPTION[A]`, `RESULT[E, A]`, `IO_ERROR` |
-| Collections | `SEQ[A]`, `LIST[A]`, `LIST_OPS`, `MAP[K, V]`, `KEY_ORDER[K]`, `GENERATOR[S, A]`, `UNFOLD[S, A]` |
+| Collections | `SEQ[A]`, `LIST[A]`, `LIST_OPS`, `MAP[K, V]`, `KEY_ORDER[K]`, `SORTING[K]`, `GENERATOR[S, A]`, `UNFOLD[S, A]` |
 | Numbers | `BIGNAT`, `NUMBER_TEXT`, `NUMBER_ERROR` |
 | Text | `STRING`, `STRING_ERROR`, `BYTES`, `BYTES_BUILDER`, `STRING_BUILDER`, `TEXT_FORMAT` |
 | Encodings | `HEX`, `BASE64`, `PERCENT`, `CODEC_ERROR` |
@@ -2070,6 +2070,50 @@ Two limits:
 - `take`, `map` and the other operations recurse once per item, so a list of millions of items can exhaust the C stack.
 
 `SEQ.reduce(f, e)` folds the two sides of each `Concat` apart, so they may run in parallel. The law `SEQ.reduce_folds(s, f, e)` has the same monoid premises as `fold_duality_first`. It states that `reduce` then equals both `fold_left` and `fold_right` of the model, proven by `fold_homomorphism` and the first duality theorem.
+
+### Sorting: `SORTING`
+
+`SORTING[K: ORD]` sorts a `LIST[K]` of any ordered type: numbers, `STRING`, `BIGNAT`, an enumeration, or a module of yours that satisfies `ORD`.
+
+| Routine | Gives |
+| :--- | :--- |
+| `SORTING.sort(xs)` | The items of `xs` in order, by merge sort |
+| `SORTING.merge(xs, ys)` | The items of both, in order when both are |
+| `SORTING.sorted(xs)` | Whether each item is at most the next, by `less_or_equal` |
+| `SORTING.count(xs, x)` | How many items are `x` itself. It is ghost: contracts only |
+
+`sort`'s contract has three parts:
+- `ordered`: `SORTING.sorted(Result)`.
+- `same_length`: `Result.length = xs.length`.
+- `permutation`: `forall x: K. SORTING.count(Result, x) = SORTING.count(xs, x)`. The result has the same items, each as many times.
+
+`count` compares with `=`, which a contract may use on any type, so the permutation holds even where `equals` is not `=`, as for `STRING`.
+
+The law `first_least(xs, j)` says that the first item of a sorted list is at most the item at `j`. Its proof chains `less_or_equal` along the list, which needs `equals` and `less_than` to agree. `ORD` does not promise that, so the law asks for it as the premise `agrees: forall a: K. forall b: K. a.equals(b) = (a = b)`. For a `NAT`, or any `CANONICAL_EQ` key, it holds at once:
+
+```eiffel
+  smallest(xs: LIST[NAT], j: NAT): NAT
+    require
+      inside: j < xs.length
+    do
+      check
+        nat_agrees: forall a: NAT. forall b: NAT. a.equals(b) = (a = b)
+        least: SORTING.first_least(SORTING.sort(xs), j)
+      end
+      SORTING.sort(xs).head
+    ensure
+      at_most: Result <= LIST_OPS.at(SORTING.sort(xs), j)
+    end
+```
+
+The sort is stable: items that are `equals` but differ keep their order. A module that orders records by a key, as `less_than` on `Current.key < other.key`, gets them back in the order they came. This is tested, not proven (see the limits below).
+
+In C, every step of the sort is a loop, so a list of millions of items cannot exhaust the stack. The two halves of each split are independent `let`s, so they run as parallel tasks. Each step builds new list cells, so a million `U64`s take about 2 s, against 0.13 s for C's `qsort` on an array. A sort on an `ARRAY` is Task H.5's.
+
+Limits:
+- Stability is tested, not proven. For a key whose `equals` is not `=`, the proof needs `equals` and `less_than` to agree (`a.equals(b) and b.less_than(c) implies a.less_than(c)`). As a premise that quantifies over three values, the solver cannot use it.
+- There is no `sort` for `SEQ`: a client cannot see how a `SEQ`'s model unfolds. Sort its items as a list, such as the one `s.fold_right` builds with `prepend`.
+- `binary_search` needs `ARRAY` (Task H.5).
 
 ### Endless Sequences: `GENERATOR` and `UNFOLD`
 

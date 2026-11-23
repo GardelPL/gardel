@@ -4223,6 +4223,10 @@ pub const STDLIB_SOURCES: &[(&str, &str)] = &[
         include_str!("../../stdlib/collections/key_order.gdl"),
     ),
     (
+        "stdlib/collections/sorting.gdl",
+        include_str!("../../stdlib/collections/sorting.gdl"),
+    ),
+    (
         "stdlib/collections/map.gdl",
         include_str!("../../stdlib/collections/map.gdl"),
     ),
@@ -4314,6 +4318,8 @@ pub fn phase4_stdlib_source() -> &'static str {
         include_str!("../../stdlib/collections/unfold.gdl"),
         "\n",
         include_str!("../../stdlib/collections/key_order.gdl"),
+        "\n",
+        include_str!("../../stdlib/collections/sorting.gdl"),
         "\n",
         include_str!("../../stdlib/collections/map.gdl"),
         "\n",
@@ -6320,7 +6326,7 @@ fn write_if_changed(path: &str, text: &str) -> std::io::Result<()> {
 /// `STRING` is injected for modules that mention it, contain string literals or use `IO`
 /// (Task B.3: literals denote prelude `STRING` values); `LIST_OPS` / `FUNCTION_OPS` are realized by the built-in
 /// `Seq_*` / `Fn1_*` preamble theories already present in every Boogie file.
-const BOOGIE_INJECTED_PRELUDE: [&str; 30] = [
+const BOOGIE_INJECTED_PRELUDE: [&str; 31] = [
     "LIST_OPS",
     "GENERATOR",
     "OPTION",
@@ -6349,6 +6355,7 @@ const BOOGIE_INJECTED_PRELUDE: [&str; 30] = [
     "EVENT",
     "STEP",
     "KEY_ORDER",
+    "SORTING",
     "MAP",
     "UNFOLD",
 ];
@@ -6538,6 +6545,11 @@ impl BoogiePreludeCtx {
         // loop, as a representation may bring `BYTES` in.
         // `SEQ.reduce` is proven by `LIST_OPS`' fold laws.
         if wanted.contains("BYTES") || m.name == "BYTES" || m.name == "SEQ" {
+            wanted.insert("LIST_OPS");
+        }
+        // `SORTING` splits and merges with `LIST_OPS`' `take`, `drop` and `reverse_onto`
+        // (Task H.3).
+        if wanted.contains("SORTING") || m.name == "SORTING" {
             wanted.insert("LIST_OPS");
         }
         let mut modules: Vec<ModuleDecl> = BOOGIE_INJECTED_PRELUDE
@@ -8878,14 +8890,22 @@ fn module_has_variant(m: &ModuleDecl, name: &str) -> bool {
     matches!(&m.repr, ReprKind::Sum(vs) if vs.iter().any(|v| v.name == name))
 }
 
+/// Whether `m`'s `specify` routines take a `Current` receiver. A module with no
+/// representation, as `SORTING` (Task H.3), has no value to pass: its ghost routines are
+/// called as `SORTING.count(xs, x)`, as its `create` routines are. Its features keep a
+/// receiver, since a client may call them on a value (`c.least(a, b)`).
+fn specify_takes_current(m: &ModuleDecl) -> bool {
+    m.kind == ModuleKind::Module && !matches!(&m.repr, ReprKind::Product(fields) if fields.is_empty())
+}
+
 /// Finds routine `name` in `m`; the flag is true when it takes a `Current` receiver.
 fn find_module_routine<'a>(m: &'a ModuleDecl, name: &str) -> Option<(&'a RoutineDecl, bool)> {
     let is_adt = m.kind == ModuleKind::Module;
     m.feature_routines
         .iter()
-        .chain(m.specify_routines.iter())
         .find(|(_, r)| r.name == name)
         .map(|(_, r)| (r, is_adt))
+        .or_else(|| m.specify_routines.iter().find(|(_, r)| r.name == name).map(|(_, r)| (r, specify_takes_current(m))))
         .or_else(|| {
             m.create_routines
                 .iter()
@@ -10662,7 +10682,7 @@ fn emit_own_boogie_parts(
     let all_routines: Vec<(&RoutineDecl, bool)> = m
         .specify_routines
         .iter()
-        .map(|(_, r)| (r, is_adt))
+        .map(|(_, r)| (r, specify_takes_current(m)))
         .chain(m.feature_routines.iter().map(|(_, r)| (r, is_adt)))
         .chain(m.create_routines.iter().map(|(_, r)| (r, false)))
         .collect();
@@ -15833,9 +15853,8 @@ fn emit_boogie_expr_with_strings(
                     fuel_var
                 };
                 let mut full_args = vec![call_fuel.to_string()];
-                if m.kind == ModuleKind::Module
-                    && (m.feature_routines.iter().any(|(_, r)| r.name == *fname)
-                        || m.specify_routines.iter().any(|(_, r)| r.name == *fname))
+                if (m.kind == ModuleKind::Module && m.feature_routines.iter().any(|(_, r)| r.name == *fname))
+                    || (specify_takes_current(m) && m.specify_routines.iter().any(|(_, r)| r.name == *fname))
                 {
                     full_args.push("Current".to_string());
                 }
@@ -18240,7 +18259,7 @@ fn verify_module_obligations(
         .iter()
         .map(|(_, r)| (r, false))
         .chain(m.feature_routines.iter().map(|(_, r)| (r, is_adt)))
-        .chain(m.specify_routines.iter().map(|(_, r)| (r, is_adt)))
+        .chain(m.specify_routines.iter().map(|(_, r)| (r, specify_takes_current(m))))
         .collect();
 
     // 1. Audit / Strict check on `assume` statements (§7)
@@ -23526,7 +23545,7 @@ end
         let stdlib = parse_phase4_stdlib().expect("Phase 4 stdlib should parse");
         assert_eq!(stdlib.group, None);
         assert_eq!(stdlib.concepts.len(), 3);
-        assert_eq!(stdlib.modules.len(), 31);
+        assert_eq!(stdlib.modules.len(), 32);
         for m in &stdlib.modules {
             let mut diags = check_visibility_and_semantics(m);
             diags.extend(verify_module_phase3(
@@ -24018,7 +24037,7 @@ end
     #[test]
     fn test_plan3_multi_module_stdlib_pipeline() {
         let ast = parse_phase4_stdlib().expect("stdlib parses cleanly");
-        assert_eq!(ast.modules.len(), 31);
+        assert_eq!(ast.modules.len(), 32);
         let mut prog_env = ProgramEnv {
             modules: HashMap::new(),
             concepts: HashMap::new(),

@@ -1,0 +1,149 @@
+-- `SORTING` in C (Task H.3): numbers and text, with repeats, the empty and one-item lists, a
+-- merge, items that the order ties (a stable sort keeps their tags in order), and a million
+-- numbers, which only loops can sort without running out of stack.
+program MAIN
+
+feature {ANY}
+
+  -- The numbers joined by commas.
+  nats(xs: LIST[NAT]): STRING
+    variant
+      xs.length
+    do
+      if xs.length = 0 then
+        ""
+      else if xs.length = 1 then
+        NUMBER_TEXT.nat_to_text(xs.head)
+      else
+        let rest = nats(xs.tail)
+        let first = NUMBER_TEXT.nat_to_text(xs.head)
+        if first.byte_length <= 1000000 and rest.byte_length <= 1000000 then
+          first.concat(",").concat(rest)
+        else
+          first
+        end
+      end end
+    end
+
+  texts(xs: LIST[STRING]): STRING
+    variant
+      xs.length
+    do
+      if xs.length = 0 then
+        ""
+      else if xs.length = 1 then
+        xs.head
+      else
+        let rest = texts(xs.tail)
+        if xs.head.byte_length <= 1000000 and rest.byte_length <= 1000000 then
+          xs.head.concat(",").concat(rest)
+        else
+          xs.head
+        end
+      end end
+    end
+
+  -- Each item as key:tag.
+  items(xs: LIST[ITEM]): STRING
+    variant
+      xs.length
+    do
+      if xs.length = 0 then
+        ""
+      else
+        let first = NUMBER_TEXT.nat_to_text(xs.head.key).concat(":").concat(NUMBER_TEXT.nat_to_text(xs.head.tag))
+        let rest = items(xs.tail)
+        if xs.length = 1 then
+          first
+        else if first.byte_length <= 1000000 and rest.byte_length <= 1000000 then
+          first.concat(",").concat(rest)
+        else
+          first
+        end end
+      end
+    end
+
+  -- `n` numbers from a linear congruential sequence, onto `acc`.
+  numbers(n: NAT, seed: U64, acc: LIST[U64]): LIST[U64]
+    variant
+      n
+    do
+      if n = 0 then
+        acc
+      else
+        let item = seed >> 20
+        numbers(n - 1, next(seed), acc.prepend(item))
+      end
+    end
+
+  -- The next number of a linear congruential sequence.
+  next(seed: U64): U64
+    do
+      seed *% 6364136223846793005 +% 1442695040888963407
+    end
+
+  -- Each item at most the next, as a loop.
+  in_order(xs: LIST[U64]): BOOL
+    variant
+      xs.length
+    do
+      if xs.length <= 1 then
+        True
+      else if xs.head <= xs.tail.head then
+        in_order(xs.tail)
+      else
+        False
+      end end
+    end
+
+  big: STRING
+    do
+      let none: LIST[U64] = LIST.empty
+      let s = SORTING.sort(numbers(1000000, 42, none))
+      let shown = if in_order(s) then " in order" else " OUT OF ORDER" end
+      NUMBER_TEXT.nat_to_text(s.length).concat(shown)
+    end
+
+  -- `a` and `b` joined by ` | `, or `a` alone if that would not fit.
+  and_then(a: STRING, b: STRING): STRING
+    do
+      if a.byte_length <= 1000000 and b.byte_length <= 1000000 then
+        a.concat(" | ").concat(b)
+      else
+        a
+      end
+    end
+
+  -- Every case but the million numbers.
+  small: STRING
+    do
+      let a = SORTING.sort(LIST.empty.prepend(7).prepend(0).prepend(3).prepend(1).prepend(9).prepend(3).prepend(5))
+      let b = SORTING.sort(LIST.empty.prepend("apple").prepend("fig").prepend("apple").prepend("pear"))
+      let none: LIST[NAT] = LIST.empty
+      let c = SORTING.sort(none)
+      let d = SORTING.sort(LIST.empty.prepend(42))
+      let e = SORTING.merge(LIST.empty.prepend(8).prepend(4).prepend(1), LIST.empty.prepend(9).prepend(4).prepend(2))
+      let tied = LIST.empty.prepend(ITEM.make(1, 6)).prepend(ITEM.make(2, 5)).prepend(ITEM.make(1, 4)).prepend(ITEM.make(2, 3)).prepend(ITEM.make(1, 2)).prepend(ITEM.make(0, 1))
+      let f = SORTING.sort(tied)
+      and_then(and_then(and_then(and_then(and_then(nats(a), texts(b)), nats(c)), nats(d)), nats(e)), items(f))
+    end
+
+  report: STRING
+    do
+      and_then(small, big)
+    end
+
+  small_length: NAT
+    do
+      small.byte_length
+    end
+
+  main(args: SEQ[STRING]): IO[EXIT_CODE]
+    do
+      with IO
+        IO.print_line(report)
+        IO.exit(if small_length > 0 then 0 else 1 end)
+      end
+    end
+
+end

@@ -558,13 +558,40 @@ Client: sorting (H.3), the heap (H.4), `gtui`'s screen grid (F.10). Needs decisi
 
 Client: `MAP.keys` consumers, `gtui` list views, `gtime` tables. Needs decision 5, H.5 and P1.
 
-- [ ] `module SORTING[K: ORD]`, a module of routines as `KEY_ORDER` is: `sorted(xs)`, `sort(xs: LIST[K])`, `sort_array`, `merge`.
-- [ ] Merge sort on `LIST`, and on `SEQ` with the two halves as independent `let`s, so it runs in parallel. F.14's cost model decides the cutoff.
-- [ ] Proven: `sorted(Result)`, `Result.length = xs.length`, and `permutation(xs, Result)`, stated by decision 5.
-- [ ] Stability, as a separate law, if the permutation proof leaves room. Otherwise tested.
-- [ ] `binary_search(a: ARRAY[K], k): OPTION[NAT]` with `require sorted`, and `found`, `absent` postconditions as `STRING.find` has. The midpoint is the spec's own §3 example.
-- [ ] Benchmark against C `qsort` on 1,000,000 `U64`, on 1 and on all threads.
-- Acceptance: all three properties of `sort` proven. A client proves that the first item of a sorted non-empty list is at most every other.
+**Status:** ✅ Completed on `LIST` (2026-11-23). `sort_array` and `binary_search` wait for H.5, as the user chose: they need `ARRAY`. Decision 5 taken as proposed.
+
+- [x] `module SORTING[K: ORD]`, a module of routines as `KEY_ORDER` is: `sorted(xs)`, `sort(xs)`, `merge(xs, ys)`, and the ghost `count(xs, x)`. `sort_array` waits for H.5.
+- [x] Merge sort on `LIST`. The two halves are independent `let`s, so they run as parallel tasks under the existing depth cap.
+  - Each step is a loop, since the C backend makes only a self tail call a loop: `take_onto` takes the front half, `merge_onto` merges in reverse onto an accumulator, and `reverse_onto` turns it round. Each is proven equal to the plain recursive definition, `merged`, which the proofs reason about.
+  - No `SEQ` version: a client of `SEQ` sees no definition of its model, so it cannot relate a `Concat` to its sides. The `LIST` sort already runs its halves in parallel.
+- [x] Proven: `sorted(Result)`, `Result.length = xs.length`, and `forall x: K. count(Result, x) = count(xs, x)`.
+  - `sorted` uses `less_or_equal` alone, between neighbours, so `merge` keeps it with no premise.
+  - The permutation counts with `=`. A contract may use `=` on a type parameter (only code that runs needs `CANONICAL_EQ`), so this holds for every key. It is stronger than the weaker contract decision 5 allowed for plain `ORD` keys.
+  - The law `first_least(xs, j)`: the first item of a sorted list is at most the one at `j`. Chaining `less_or_equal` needs `equals` to be `=`, the premise `agrees`.
+- [x] Stability tested, not proven. A program sorts items that tie on their key (`ITEM` in `tests/sorting_item.gdl`) and they keep their order.
+  - A proof was written: `keyed(xs, k)` (the items `equals` to `k`), `keyed(sort(xs), k) = keyed(xs, k)`, through `merged` and a lemma that nothing above `y` in a sorted list is `equals` to it.
+  - It needs `equals` and `less_than` to agree, `a.equals(b) and b.less_than(c) implies a.less_than(c)` and its mirror. As a `forall` premise over three values, Z3 never uses it: it is three nested quantifiers, and even flattened it has no trigger Z3 picks. With `{K_eq(a, b), K_less(b, c)}` as triggers, added by hand to the `.bpl`, the lemma's steps go through. Its result still fails, because the guard of its contract keeps the nested form.
+  - Two ways on: `forall` with triggers in Gardel, or a concept that refines `ORD` with these laws, whose laws are axioms with triggers already.
+- [ ] `binary_search(a: ARRAY[K], k)`: waits for H.5.
+- [x] Benchmark against C `qsort` on 1,000,000 `U64` from one linear congruential sequence, the median of five runs.
+  - `SORTING.sort`: 2.19 s on one thread and 1.80 s on 20.
+  - `qsort` on an array: 0.127 s.
+  - Each merge level allocates new cells, about 80 million in all, so the sort is bound by allocation and gains little from threads. A sort as fast as `qsort` needs `ARRAY`.
+- Acceptance: met. All three properties of `sort` are proven. A `NAT` client proves that the first item of a sorted list is at most every other, through the contracts alone (`tests/sorting.rs`).
+
+**Compiler change.** A module with no representation, as `SORTING`, has no value to pass as `Current`. Its `specify` routines took one in the verifier, while a call as `SORTING.count(xs, x)` passed none (E0199, "wrong number of arguments"). They now take none (`specify_takes_current`), as its `create` routines do, so a module of routines can have ghost helpers. Its features keep a receiver: a first version made them static too, and `tests/bounds.rs` showed a client calling one on a value (`c.least(a, a)`). `SORTING` keeps its private helpers in `create {NONE}`.
+
+**Tests.** `tests/sorting.rs` (4 tests):
+- a client proves `sorted`, the length, `count`, `merge`'s contract and `first_least`;
+- six false claims are refused, each by a failed proof rather than the solver's limits;
+- `BYTES` and a client's own module are refused as keys (E0317);
+- a program sorts numbers, text, ties and a million numbers in C, with the expected output, and a leak harness finds no live block after 51 calls.
+
+**Totals.** All 534 tests pass: the 235 unit tests and 299 in 44 suites (the `gtui` frame-time test alone). The stdlib is 0/0 (32 modules, 194 s).
+
+**Known limits.**
+- A recursive law's call to itself in its `do` is asserted, not assumed as an induction hypothesis with its premises. Induction goes in a private `BOOL` fact routine, as `KEY_ORDER`'s are.
+- `LIST_OPS.reverse`'s contract does not say it is `reverse_onto(xs, LIST.empty)`, so `SORTING` uses `reverse_onto` throughout and proves its own double reversal (`back_fact`).
 
 #### Task H.4: `SET`, `QUEUE`, `HEAP` and `MAP` Laws
 
