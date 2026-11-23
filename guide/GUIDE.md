@@ -2016,7 +2016,7 @@ Every program automatically sees the **Standard Prelude**:
 | :--- | :--- |
 | Concepts | `EQ`, `CANONICAL_EQ`, `ORD` |
 | Core types | `OPTION[A]`, `RESULT[E, A]`, `IO_ERROR` |
-| Collections | `SEQ[A]`, `LIST[A]`, `LIST_OPS`, `MAP[K, V]`, `KEY_ORDER[K]`, `SORTING[K]`, `GENERATOR[S, A]`, `UNFOLD[S, A]` |
+| Collections | `SEQ[A]`, `LIST[A]`, `LIST_OPS`, `ARRAY[A]`, `MAP[K, V]`, `KEY_ORDER[K]`, `SORTING[K]`, `GENERATOR[S, A]`, `UNFOLD[S, A]` |
 | Numbers | `BIGNAT`, `NUMBER_TEXT`, `NUMBER_ERROR` |
 | Text | `STRING`, `STRING_ERROR`, `BYTES`, `BYTES_BUILDER`, `STRING_BUILDER`, `TEXT_FORMAT` |
 | Encodings | `HEX`, `BASE64`, `PERCENT`, `CODEC_ERROR` |
@@ -2039,6 +2039,7 @@ The prelude is verified once, on its own (`gardelc --stdlib`). In user programs 
 | `zip(xs, ys)`, `zip_with(xs, ys, f)` | Pairs `(x, y)` or `f(x, y)` of items at the same place, as long as the shorter list |
 | `last(xs)`, `init(xs)` | The last item, and every item but it. Both need `xs.length > 0` |
 | `range(lo, hi)`, `iterate_n(f, x, n)` | `lo` up to but not including `hi`; and `x`, `f(x)`, `f(f(x))` and so on, `n` items |
+| `update(xs, i, x)` | `xs` with `x` at `i`, or `xs` itself when `i` is past the end |
 
 A contract states each one's length and how it unfolds once (`empty_case`, `cons_case`). What takes induction to prove is a law. Call the law where you need it:
 
@@ -2055,7 +2056,7 @@ A contract states each one's length and how it unfolds once (`empty_case`, `cons
 ```
 
 The laws:
-- **Lists:** `take_drop` (`take(xs, n).append(drop(xs, n)) = xs`), `take_while_drop_while`, `reverse_reverse`, `reverse_append` (`reverse(xs.append(ys)) = reverse(ys).append(reverse(xs))`), `reverse_cons`, `init_last`, `map_fusion` (`map(map(xs, g), f) = map(xs, FUNCTION_OPS.compose(f, g))`), `filter_map`, `map_append` and `filter_append`.
+- **Lists:** `at_update_same` and `at_update_other` (what `at` gives after an `update`; the solver applies them on its own), `take_drop` (`take(xs, n).append(drop(xs, n)) = xs`), `take_while_drop_while`, `reverse_reverse`, `reverse_append` (`reverse(xs.append(ys)) = reverse(ys).append(reverse(xs))`), `reverse_cons`, `init_last`, `map_fusion` (`map(map(xs, g), f) = map(xs, FUNCTION_OPS.compose(f, g))`), `filter_map`, `map_append` and `filter_append`.
 - **Folds:**
   - `fold_duality_first`: over a monoid, `fold_right` and `fold_left` agree.
   - `fold_duality_second`: the same for two functions that associate with each other.
@@ -2108,12 +2109,79 @@ The law `first_least(xs, j)` says that the first item of a sorted list is at mos
 
 The sort is stable: items that are `equals` but differ keep their order. A module that orders records by a key, as `less_than` on `Current.key < other.key`, gets them back in the order they came. This is tested, not proven (see the limits below).
 
-In C, every step of the sort is a loop, so a list of millions of items cannot exhaust the stack. The two halves of each split are independent `let`s, so they run as parallel tasks. Each step builds new list cells, so a million `U64`s take about 2 s, against 0.13 s for C's `qsort` on an array. A sort on an `ARRAY` is Task H.5's.
+In C, every step of the sort is a loop, so a list of millions of items cannot exhaust the stack. The two halves of each split are independent `let`s, so they run as parallel tasks. Each step builds new list cells, so a million `U64`s take about 2 s, against 0.13 s for C's `qsort` on an array. A sort that changes an `ARRAY` in place, `sort_array`, is still to come.
 
 Limits:
 - Stability is tested, not proven. For a key whose `equals` is not `=`, the proof needs `equals` and `less_than` to agree (`a.equals(b) and b.less_than(c) implies a.less_than(c)`). As a premise that quantifies over three values, the solver cannot use it.
 - There is no `sort` for `SEQ`: a client cannot see how a `SEQ`'s model unfolds. Sort its items as a list, such as the one `s.fold_right` builds with `prepend`.
-- `binary_search` needs `ARRAY` (Task H.5).
+- `binary_search` and `sort_array` on an `ARRAY` are still to come.
+
+### Arrays: `ARRAY`
+
+An `ARRAY[A]` holds a fixed number of items, read and changed by index.
+
+| Routine | Gives |
+| :--- | :--- |
+| `ARRAY.make(n, x)` | `n` items, each `x` |
+| `ARRAY.from_list(xs)` | The items of `xs` |
+| `ARRAY.empty` | No items |
+| `a.length` | The number of items |
+| `a.at(i)` | The item at `i`, for `i < a.length` |
+| `a.set(i, x)` | The array with `x` at `i`, for `i < a.length` |
+| `a.swap(i, j)` | The array with the items at `i` and `j` exchanged |
+| `a.slice(lo, hi)` | The items from `lo` up to, not including, `hi`, as a new array |
+| `a.to_list` | The items, as a list |
+| `a.fold(f, init)` | The items combined from the first, as `LIST_OPS.fold_left` |
+
+A proof sees an array as the list of its items, `a.model`, and every contract is stated on it. `set`'s says `Result.model = LIST_OPS.update(a.model, i, x)`. Two laws, applied wherever a changed array is read, say what `at` gives after a `set`:
+- `at_set_same`: `a.set(i, x).at(i) = x`.
+- `at_set_other`: `a.set(i, x).at(j) = a.at(j)` when `i != j`.
+
+So a client proves this from the contracts alone:
+
+```eiffel
+  put_read(a: ARRAY[NAT], i: NAT, x: NAT): NAT
+    require
+      inside: i < a.length
+    do
+      a.set(i, x).at(i)
+    ensure
+      same: Result = x
+    end
+```
+
+An index past the end is refused by `at`'s and `set`'s `in_bounds`. There is no `=` on arrays in running code, as for `MAP`: compare `a.to_list`.
+
+In C an array is one block, so `at` and `length` take constant time. `set` and `swap` change the array in place when nothing else holds it, and copy it otherwise. Nothing else holds it when the caller is done with it:
+- the array is the result of another call, as in `ARRAY.make(n, 0).set(0, 1)`;
+- it is a `let` that nothing after the `set` reads;
+- it is a parameter that nothing after the `set` reads. A loop owns its parameters from its second iteration, and from its first when its caller gave it the array.
+
+Every step of this loop changes the array in place, and `fill(ARRAY.make(1000000, 0), 0)` makes no copy:
+
+```eiffel
+  fill(a: ARRAY[NAT], i: NAT): ARRAY[NAT]
+    require
+      inside: i <= a.length
+    variant
+      a.length - i
+    do
+      if i = a.length then
+        a
+      else
+        fill(a.set(i, i), i + 1)
+      end
+    ensure
+      len: Result.length = a.length
+    end
+```
+
+`let b = a.set(i, i)` then `fill(b, i + 1)` is the same. A million `set`s through it take about 15 ms, the allocation of the array included.
+
+A copy is never wrong, only slow, and nothing warns you of it. Keep the old array out of anything after the `set`:
+- `let b = fill(a, 0)` followed by a read of `a` copies `a` once, at the first `set`, since `a` is still needed. That is right when you want both.
+- `a.set(i, x).set(j, a.at(k))` copies at the first `set`: the second call reads `a` after it. Read first: `let y = a.at(k)`, then `a.set(i, x).set(j, y)`.
+- In a loop, an argument that reads the array beside the one that changes it, as `loop(a.set(i, x), a.length)`, makes every step copy. Read `a.length` inside the loop instead.
 
 ### Endless Sequences: `GENERATOR` and `UNFOLD`
 

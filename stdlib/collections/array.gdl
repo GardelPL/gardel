@@ -1,0 +1,182 @@
+-- Arrays: a fixed number of items, read and changed by index (Task H.5).
+--
+-- A proof sees an array as the list of its items, `model`, as it sees a `STRING`, and every
+-- contract below is stated on that list. In C an array is one block: `at` and `length` take
+-- constant time, and `set` and `swap` write in place when nothing else holds the array, and
+-- copy it otherwise (decision 6 of the libraries plan). An array is held by nothing else when
+-- the caller is done with it: a `let` not used after the call, the result of another call, or
+-- a loop's parameter passed on to the next iteration. No proof sees the difference.
+module ARRAY[A]
+
+representation {NONE}
+  items: LIST[A]
+
+create {ANY}
+
+  empty: ARRAY[A]
+    do
+      { items = LIST.empty }
+    ensure
+      none: Result.length = 0
+      empty_model: Result.model = LIST.empty
+    end
+
+  -- `n` items, each `x`.
+  make(n: NAT, x: A): ARRAY[A]
+    do
+      { items = ARRAY.repeat(n, x) }
+    ensure
+      len: Result.length = n
+      each: forall i: NAT. i < n implies LIST_OPS.at(Result.model, i) = x
+    end
+
+  from_list(xs: LIST[A]): ARRAY[A]
+    do
+      { items = xs }
+    ensure
+      len: Result.length = xs.length
+      model_eq: Result.model = xs
+    end
+
+create {NONE}
+
+  repeat(n: NAT, x: A): LIST[A]
+    variant
+      n
+    do
+      if n = 0 then
+        LIST.empty
+      else
+        ARRAY.repeat(n - 1, x).prepend(x)
+      end
+    ensure
+      len: Result.length = n
+      each: forall i: NAT. i < n implies LIST_OPS.at(Result, i) = x
+    end
+
+feature {ANY}
+
+  length: NAT
+    do
+      Current.items.length
+    ensure
+      def: Result = Current.model.length
+    end
+
+  to_list: LIST[A]
+    do
+      Current.items
+    ensure
+      is_model: Result = Current.model
+    end
+
+  at(i: NAT): A
+    require
+      in_bounds: i < Current.length
+    do
+      LIST_OPS.at(Current.items, i)
+    ensure
+      model_at: Result = LIST_OPS.at(Current.model, i)
+    end
+
+  -- The array with `x` at `i`.
+  set(i: NAT, x: A): ARRAY[A]
+    require
+      in_bounds: i < Current.length
+    do
+      { items = LIST_OPS.update(Current.items, i, x) }
+    ensure
+      len: Result.length = Current.length
+      model_set: Result.model = LIST_OPS.update(Current.model, i, x)
+    end
+
+  -- The array with the items at `i` and `j` exchanged.
+  swap(i: NAT, j: NAT): ARRAY[A]
+    require
+      i_in_bounds: i < Current.length
+      j_in_bounds: j < Current.length
+    do
+      Current.set(i, Current.at(j)).set(j, Current.at(i))
+    ensure
+      len: Result.length = Current.length
+      model_swap: Result.model = LIST_OPS.update(LIST_OPS.update(Current.model, i, Current.at(j)), j, Current.at(i))
+    end
+
+  -- The items from `lo` up to, not including, `hi`, as a new array.
+  slice(lo: NAT, hi: NAT): ARRAY[A]
+    require
+      ordered: lo <= hi
+      in_bounds: hi <= Current.length
+    do
+      { items = LIST_OPS.take(LIST_OPS.drop(Current.items, lo), hi - lo) }
+    ensure
+      len: Result.length = hi - lo
+      model_slice: Result.model = LIST_OPS.take(LIST_OPS.drop(Current.model, lo), hi - lo)
+    end
+
+  -- The items combined from the first, as `LIST_OPS.fold_left` combines the model's. Compiled
+  -- from this source in C: a loop over `at`.
+  fold[B](f: (acc: B, x: A) -> B, init: B): B
+    do
+      check
+        whole: LIST_OPS.drop(Current.model, 0) = Current.model
+      end
+      Current.fold_from(0, f, init)
+    ensure
+      def: Result = LIST_OPS.fold_left(Current.model, f, init)
+    end
+
+feature {NONE}
+
+  fold_from[B](i: NAT, f: (acc: B, x: A) -> B, acc: B): B
+    require
+      inside: i <= Current.length
+    variant
+      Current.length - i
+    do
+      if i = Current.length then
+        check
+          none: LIST_OPS.drop(Current.model, i) = LIST.empty
+        end
+        acc
+      else
+        check
+          step: LIST_OPS.drop_step(Current.model, i)
+          next: LIST_OPS.drop(Current.model, i) = LIST_OPS.drop(Current.model, i + 1).prepend(Current.at(i))
+        end
+        Current.fold_from(i + 1, f, f(acc, Current.at(i)))
+      end
+    ensure
+      def: Result = LIST_OPS.fold_left(LIST_OPS.drop(Current.model, i), f, acc)
+    end
+
+specify {ANY}
+
+  model: LIST[A]
+    do
+      Current.items
+    end
+
+  -- What `at` reads after a `set`. With their triggers a proof applies them wherever a
+  -- changed array is read, and needs no `LIST_OPS` law.
+  law at_set_same(a: ARRAY[A], i: NAT, x: A)
+    require
+      in_bounds: i < a.length
+    trigger
+      a.set(i, x).at(i)
+    ensure
+      same: a.set(i, x).at(i) = x
+    end
+
+  law at_set_other(a: ARRAY[A], i: NAT, x: A, j: NAT)
+    require
+      i_in_bounds: i < a.length
+      j_in_bounds: j < a.length
+      other: i != j
+    trigger
+      a.set(i, x).at(j)
+    ensure
+      unchanged: a.set(i, x).at(j) = a.at(j)
+    end
+
+end

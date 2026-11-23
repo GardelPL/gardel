@@ -4227,6 +4227,10 @@ pub const STDLIB_SOURCES: &[(&str, &str)] = &[
         include_str!("../../stdlib/collections/sorting.gdl"),
     ),
     (
+        "stdlib/collections/array.gdl",
+        include_str!("../../stdlib/collections/array.gdl"),
+    ),
+    (
         "stdlib/collections/map.gdl",
         include_str!("../../stdlib/collections/map.gdl"),
     ),
@@ -4320,6 +4324,8 @@ pub fn phase4_stdlib_source() -> &'static str {
         include_str!("../../stdlib/collections/key_order.gdl"),
         "\n",
         include_str!("../../stdlib/collections/sorting.gdl"),
+        "\n",
+        include_str!("../../stdlib/collections/array.gdl"),
         "\n",
         include_str!("../../stdlib/collections/map.gdl"),
         "\n",
@@ -6326,7 +6332,7 @@ fn write_if_changed(path: &str, text: &str) -> std::io::Result<()> {
 /// `STRING` is injected for modules that mention it, contain string literals or use `IO`
 /// (Task B.3: literals denote prelude `STRING` values); `LIST_OPS` / `FUNCTION_OPS` are realized by the built-in
 /// `Seq_*` / `Fn1_*` preamble theories already present in every Boogie file.
-const BOOGIE_INJECTED_PRELUDE: [&str; 31] = [
+const BOOGIE_INJECTED_PRELUDE: [&str; 32] = [
     "LIST_OPS",
     "GENERATOR",
     "OPTION",
@@ -6356,6 +6362,7 @@ const BOOGIE_INJECTED_PRELUDE: [&str; 31] = [
     "STEP",
     "KEY_ORDER",
     "SORTING",
+    "ARRAY",
     "MAP",
     "UNFOLD",
 ];
@@ -6550,6 +6557,10 @@ impl BoogiePreludeCtx {
         // `SORTING` splits and merges with `LIST_OPS`' `take`, `drop` and `reverse_onto`
         // (Task H.3).
         if wanted.contains("SORTING") || m.name == "SORTING" {
+            wanted.insert("LIST_OPS");
+        }
+        // `ARRAY.set` states its result with `LIST_OPS.update` (Task H.5).
+        if wanted.contains("ARRAY") || m.name == "ARRAY" {
             wanted.insert("LIST_OPS");
         }
         let mut modules: Vec<ModuleDecl> = BOOGIE_INJECTED_PRELUDE
@@ -20147,9 +20158,17 @@ uint64_t gardel_live_allocations(void) {
 }
 #define GARDEL_LIVE_ADD() atomic_fetch_add(&g_gardel_live_allocs, 1)
 #define GARDEL_LIVE_SUB() atomic_fetch_sub(&g_gardel_live_allocs, 1)
+/* Copies of an `ARRAY` that `set` or `swap` made because the array had another reference
+   (Task H.5), for the tests that show when an update is in place. */
+static _Atomic uint64_t g_gardel_array_copies = 0;
+uint64_t gardel_array_copies(void) {
+    return atomic_load(&g_gardel_array_copies);
+}
+#define GARDEL_ARRAY_COPY() atomic_fetch_add(&g_gardel_array_copies, 1)
 #else
 #define GARDEL_LIVE_ADD() ((void)0)
 #define GARDEL_LIVE_SUB() ((void)0)
+#define GARDEL_ARRAY_COPY() ((void)0)
 #endif
 
 static void gardel_out_of_memory(void) {
@@ -23545,7 +23564,7 @@ end
         let stdlib = parse_phase4_stdlib().expect("Phase 4 stdlib should parse");
         assert_eq!(stdlib.group, None);
         assert_eq!(stdlib.concepts.len(), 3);
-        assert_eq!(stdlib.modules.len(), 32);
+        assert_eq!(stdlib.modules.len(), 33);
         for m in &stdlib.modules {
             let mut diags = check_visibility_and_semantics(m);
             diags.extend(verify_module_phase3(
@@ -24037,7 +24056,7 @@ end
     #[test]
     fn test_plan3_multi_module_stdlib_pipeline() {
         let ast = parse_phase4_stdlib().expect("stdlib parses cleanly");
-        assert_eq!(ast.modules.len(), 32);
+        assert_eq!(ast.modules.len(), 33);
         let mut prog_env = ProgramEnv {
             modules: HashMap::new(),
             concepts: HashMap::new(),

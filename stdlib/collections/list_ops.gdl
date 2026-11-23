@@ -312,7 +312,56 @@ feature {ANY}
       cons_case: n > 0 implies Result = iterate_n(f, f(x), n - 1).prepend(x)
     end
 
+  -- `xs` with its item at `i` replaced by `x`, or `xs` itself when `i` is past the end (Task
+  -- H.5). `ARRAY.set` states its result with it.
+  update[A](xs: LIST[A], i: NAT, x: A): LIST[A]
+    variant
+      i
+    do
+      if xs.length = 0 then
+        xs
+      else if i = 0 then
+        xs.tail.prepend(x)
+      else
+        update(xs.tail, i - 1, x).prepend(xs.head)
+      end end
+    ensure
+      len: Result.length = xs.length
+      empty_case: xs.length = 0 implies Result = xs
+      head_case: (xs.length > 0 and i = 0) implies Result = xs.tail.prepend(x)
+      step_case: (xs.length > 0 and i > 0) implies Result = update(xs.tail, i - 1, x).prepend(xs.head)
+    end
+
 feature {NONE}
+
+  -- The item at `j` of `update(xs, i, x)`: `x` at `i`, and the item of `xs` elsewhere.
+  update_fact[A](xs: LIST[A], i: NAT, x: A, j: NAT): BOOL
+    require
+      inside: j < xs.length
+    variant
+      j
+    do
+      if j = 0 then
+        True
+      else if i = 0 then
+        check
+          put: LIST_OPS.at(xs.tail.prepend(x), j) = LIST_OPS.at(xs.tail, j - 1)
+          was: LIST_OPS.at(xs, j) = LIST_OPS.at(xs.tail, j - 1)
+        end
+        True
+      else
+        check
+          step: update_fact(xs.tail, i - 1, x, j - 1)
+          put: LIST_OPS.at(update(xs.tail, i - 1, x).prepend(xs.head), j) = LIST_OPS.at(update(xs.tail, i - 1, x), j - 1)
+          was: LIST_OPS.at(xs, j) = LIST_OPS.at(xs.tail, j - 1)
+        end
+        True
+      end end
+    ensure
+      holds: Result
+      same: i = j implies LIST_OPS.at(update(xs, i, x), j) = x
+      other: i != j implies LIST_OPS.at(update(xs, i, x), j) = LIST_OPS.at(xs, j)
+    end
 
   -- Inside this module a law is not an axiom, a contract is: each fact below is a routine
   -- that states a fact for its arguments and holds, so a proof calls it where it needs it.
@@ -487,6 +536,31 @@ specify {ANY}
     ensure
       left: k < xs.length implies LIST_OPS.at(xs.append(ys), k) = LIST_OPS.at(xs, k)
       right: k >= xs.length implies LIST_OPS.at(xs.append(ys), k) = LIST_OPS.at(ys, k - xs.length)
+    end
+
+  -- The item `update` puts, and every other item, unchanged (Task H.5). With their triggers
+  -- the solver applies them wherever an updated list is indexed.
+  law at_update_same[A](xs: LIST[A], i: NAT, x: A)
+    require
+      inside: i < xs.length
+    trigger
+      LIST_OPS.at(LIST_OPS.update(xs, i, x), i)
+    do
+      update_fact(xs, i, x, i)
+    ensure
+      same: LIST_OPS.at(LIST_OPS.update(xs, i, x), i) = x
+    end
+
+  law at_update_other[A](xs: LIST[A], i: NAT, x: A, j: NAT)
+    require
+      inside: j < xs.length
+      other: i != j
+    trigger
+      LIST_OPS.at(LIST_OPS.update(xs, i, x), j)
+    do
+      update_fact(xs, i, x, j)
+    ensure
+      unchanged: LIST_OPS.at(LIST_OPS.update(xs, i, x), j) = LIST_OPS.at(xs, j)
     end
 
   -- An item of the tail is the next item of the list.

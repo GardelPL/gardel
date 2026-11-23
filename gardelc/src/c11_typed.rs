@@ -74,6 +74,33 @@ fn retype_request(e: &str) -> Option<(&str, &str)> {
     e.strip_prefix(RETYPE)?.split_once('\u{0}')
 }
 
+/// The variable a chain of `set` and `swap` calls starts from (`a.set(i, x).swap(j, k)`
+/// starts from `a`), and the arguments of every call of the chain but the first. The first
+/// call's arguments are read before it changes the array; the others' after (Task H.5).
+fn array_chain(e: &Expr) -> Option<(&str, Vec<&Expr>)> {
+    let mut later = Vec::new();
+    let mut cur = e;
+    loop {
+        match cur {
+            Expr::MethodCall(recv, m, args) if (m == "set" || m == "swap") && args.len() == 2 => {
+                if let Expr::Var(v) = &**recv {
+                    return Some((v, later));
+                }
+                later.extend(args.iter());
+                cur = recv;
+            }
+            _ => return None,
+        }
+    }
+}
+
+/// Whether `v` occurs free in `e`.
+fn mentions(e: &Expr, v: &str) -> bool {
+    let mut free = Vec::new();
+    expr_free_vars(e, &mut Vec::new(), &mut free);
+    free.iter().any(|f| f == v)
+}
+
 /// Operators whose result has the type of their operands.
 fn is_arith_op(op: &str) -> bool {
     matches!(op, "+" | "-" | "*" | "/" | "%" | "+%" | "-%" | "*%" | "&" | "|" | "^" | "<<" | ">>")
@@ -260,6 +287,13 @@ struct Ctx {
     fn_cname: String,
     /// The routine's C parameters, `Current` first.
     params: Vec<(String, String)>,
+    /// Arrays the next `set` or `swap` on them may take (Task H.5): the C name of a local
+    /// or parameter, and the C condition under which it is given (`true`, or `_owned` for a
+    /// parameter, which a loop owns after its first iteration).
+    gives: Vec<(String, String)>,
+    /// Like `moves`, the array parameters nothing evaluated after the next expression reads.
+    /// A loop owns them from its second iteration, so a `set` may take them then.
+    param_moves: Vec<String>,
 }
 
 impl Ctx {
@@ -370,6 +404,8 @@ pub(crate) struct TypedC<'a> {
     /// Inside the argument of `IO.exit`: the process ends right after, so scopes do not
     /// release what they own (Task C.4.1).
     exiting: bool,
+    /// The routine being emitted gave a parameter to a `set` on the condition `_owned`.
+    owned_flag: bool,
     /// The expression being lowered may do unbounded work: it reaches a recursive routine,
     /// applies a function value or does IO (Task F.14). A `let` group forks only when at
     /// least two of its `let`s set it.
@@ -421,6 +457,7 @@ impl<'a> TypedC<'a> {
             needs_env: false,
             tail_used: false,
             exiting: false,
+            owned_flag: false,
             needs_from_utf8: false,
             cost_hit: false,
             cost_memo: HashMap::new(),
@@ -464,6 +501,11 @@ impl<'a> TypedC<'a> {
             t if type_head(t) == "LIST" => {
                 let elem = split_type_app(t).1.first().map(|s| cnorm(s)).unwrap_or_default();
                 self.ensure_list(&elem)?;
+                format!("struct {}*", c_instance_name(t))
+            }
+            t if type_head(t) == "ARRAY" => {
+                let elem = split_type_app(t).1.first().map(|s| cnorm(s)).unwrap_or_default();
+                self.ensure_array(&elem)?;
                 format!("struct {}*", c_instance_name(t))
             }
             t => {
@@ -839,6 +881,102 @@ static bool {inst}__has(struct {inst}* xs, {ce} x) {{\n\
             ));
         }
         self.bodies.push("\n".to_string());
+        Ok(())
+    }
+
+    /// The `ARRAY[elem]` runtime (Task H.5): one counted block holding the length and the
+    /// items. Every routine borrows its array and returns a new one, except the `_give`
+    /// forms of `set` and `swap`, which take the array when `give` is true: with no other
+    /// reference they change it in place, and otherwise copy it and release it.
+    fn ensure_array(&mut self, elem: &str) -> Result<(), String> {
+        let at = format!("ARRAY[{elem}]");
+        let inst = c_instance_name(&at);
+        if !self.done_types.insert(inst.clone()) {
+            return Ok(());
+        }
+        let ce = self.ctype(elem)?;
+        self.ctype(&format!("LIST[{elem}]"))?;
+        let list = c_instance_name(&format!("LIST[{elem}]"));
+        let dup_x = self.dup(elem, "x")?;
+        let dup_y = self.dup(elem, "y")?;
+        let dup_i = self.dup(elem, "a->data[k]")?;
+        let dup_h = self.dup(elem, "xs->head")?;
+        let drop_k = self.drop_stmt(elem, "p->data[k]")?;
+        let drop_i = self.drop_stmt(elem, "a->data[i]")?;
+        let drop_i_copy = self.drop_stmt(elem, "r->data[i]")?;
+        self.struct_fwd.push(format!("struct {inst};\n"));
+        self.type_defs.push(format!(
+            "struct {inst} {{ _Atomic uint64_t _rc; uint64_t len; {ce} data[]; }};\n\
+             static inline struct {inst}* dup_{inst}(struct {inst}* p) {{\n    atomic_fetch_add_explicit(&p->_rc, 1, memory_order_relaxed);\n    return p;\n}}\n\n"
+        ));
+        self.rc_protos.push(format!("static void drop_{inst}(struct {inst}* p);\n"));
+        self.protos.push(format!(
+            "static struct {inst}* {inst}__make(uint64_t n, {ce} x);\n\
+             static struct {inst}* {inst}__from_list(struct {list}* xs);\n\
+             static struct {list}* {inst}__to_list(struct {inst}* a);\n\
+             static uint64_t {inst}__length(struct {inst}* a);\n\
+             static {ce} {inst}__at(struct {inst}* a, uint64_t i);\n\
+             static struct {inst}* {inst}__set_give(struct {inst}* a, uint64_t i, {ce} x, bool give);\n\
+             static struct {inst}* {inst}__swap_give(struct {inst}* a, uint64_t i, uint64_t j, bool give);\n\
+             static struct {inst}* {inst}__slice(struct {inst}* a, uint64_t lo, uint64_t hi);\n"
+        ));
+        // A copy of a counted item takes a reference; the old item at `i` is released after
+        // the new one is referenced, since `x` may be that very item (`a.set(i, a.at(i))`).
+        self.bodies.push(format!(
+            "/* ARRAY[{elem}] runtime (Task H.5): a counted block of items */\n\
+static size_t {inst}_bytes(uint64_t n) {{\n\
+    if (n > (SIZE_MAX - sizeof(struct {inst})) / sizeof({ce})) gardel_out_of_memory();\n\
+    return sizeof(struct {inst}) + (size_t)n * sizeof({ce});\n}}\n\
+static struct {inst}* {inst}_alloc(uint64_t n) {{\n\
+    struct {inst}* a = (struct {inst}*)gardel_alloc({inst}_bytes(n));\n\
+    atomic_init(&a->_rc, 1);\n    a->len = n;\n    return a;\n}}\n\
+static void drop_{inst}(struct {inst}* p) {{\n\
+    if (p && gardel_rc_release(&p->_rc)) {{\n\
+        for (uint64_t k = 0; k < p->len; k++) {{ {drop_k} }}\n\
+        gardel_free(p, {inst}_bytes(p->len));\n    }}\n}}\n\
+static struct {inst}* {inst}_copy(struct {inst}* a) {{\n\
+    GARDEL_ARRAY_COPY();\n\
+    struct {inst}* r = {inst}_alloc(a->len);\n\
+    for (uint64_t k = 0; k < a->len; k++) r->data[k] = {dup_i};\n\
+    return r;\n}}\n\
+static struct {inst}* {inst}__make(uint64_t n, {ce} x) {{\n\
+    struct {inst}* a = {inst}_alloc(n);\n\
+    for (uint64_t k = 0; k < n; k++) a->data[k] = {dup_x};\n\
+    return a;\n}}\n\
+static struct {inst}* {inst}__from_list(struct {list}* xs) {{\n\
+    struct {inst}* a = {inst}_alloc({list}__length(xs));\n\
+    for (uint64_t k = 0; xs; xs = xs->tail, k++) a->data[k] = {dup_h};\n\
+    return a;\n}}\n\
+static struct {list}* {inst}__to_list(struct {inst}* a) {{\n\
+    struct {list}* xs = NULL;\n\
+    for (uint64_t k = a->len; k > 0; k--) {{\n\
+        struct {list}* c = {list}__prepend(xs, a->data[k - 1]);\n\
+        drop_{list}(xs);\n        xs = c;\n    }}\n\
+    return xs;\n}}\n\
+static uint64_t {inst}__length(struct {inst}* a) {{\n    return a->len;\n}}\n\
+static {ce} {inst}__at(struct {inst}* a, uint64_t i) {{\n    return a->data[i];\n}}\n\
+/* Whether the array taken has no other reference, so that it can be changed in place. */\n\
+static bool {inst}_alone(struct {inst}* a) {{\n\
+    return atomic_load_explicit(&a->_rc, memory_order_acquire) == 1;\n}}\n\
+static struct {inst}* {inst}__set_give(struct {inst}* a, uint64_t i, {ce} x, bool give) {{\n\
+    {ce} y = {dup_x};\n\
+    if (give && {inst}_alone(a)) {{\n\
+        {drop_i}        a->data[i] = y;\n        return a;\n    }}\n\
+    struct {inst}* r = {inst}_copy(a);\n\
+    {drop_i_copy}    r->data[i] = y;\n\
+    if (give) drop_{inst}(a);\n\
+    return r;\n}}\n\
+static struct {inst}* {inst}__swap_give(struct {inst}* a, uint64_t i, uint64_t j, bool give) {{\n\
+    struct {inst}* r = a;\n\
+    if (!(give && {inst}_alone(a))) {{\n\
+        r = {inst}_copy(a);\n        if (give) drop_{inst}(a);\n    }}\n\
+    {ce} t = r->data[i];\n    r->data[i] = r->data[j];\n    r->data[j] = t;\n\
+    return r;\n}}\n\
+static struct {inst}* {inst}__slice(struct {inst}* a, uint64_t lo, uint64_t hi) {{\n\
+    struct {inst}* r = {inst}_alloc(hi - lo);\n\
+    for (uint64_t k = lo; k < hi; k++) {{ {ce} y = a->data[k]; r->data[k - lo] = {dup_y}; }}\n\
+    return r;\n}}\n\n"
+        ));
         Ok(())
     }
 
@@ -1291,48 +1429,60 @@ static bool {inst}__has(struct {inst}* xs, {ce} x) {{\n\
         let self_ty = Self::self_type(md, &req.mod_targs);
         tmap.insert("Current".into(), self_ty.clone());
         let has_cur = Self::has_current(md, kind);
-        let mut cx = Ctx {
-            owner: md.name.clone(),
-            self_ty: if md.kind == ModuleKind::Module { Some(self_ty.clone()) } else { None },
-            tmap: tmap.clone(),
-            locals: Vec::new(),
-            used: HashSet::new(),
-            tail: true,
-            tail_site: false,
-            tail_drops: Vec::new(),
-            moves: Vec::new(),
-            moved: Vec::new(),
-            sink_params: Vec::new(),
-            fn_cname: req.cname.clone(),
-            params: Vec::new(),
-        };
-        self.tail_used = false;
-        self.nontail_self = false;
-        self.pending_groups.clear();
-        cx.used.insert("Current".into());
-        let mut params = Vec::new();
-        if has_cur {
-            params.push(format!("{} Current", self.ctype(&self_ty)?));
-            cx.params.push(("Current".to_string(), self_ty.clone()));
-        }
-        for (p, t) in &rd.params {
-            let ty = subst(t, &tmap);
-            let ct = self.ctype(&ty)?;
-            let cn = cx.bind(p, &ty);
-            params.push(format!("{ct} {cn}"));
-            cx.params.push((cn, ty));
-        }
-        if req.sink {
-            cx.sink_params = cx.params.clone();
-        }
         let ret = subst(&rd.ret_type, &tmap);
         let cret = self.ctype(&ret)?;
-        let body = self.lower_block(&mut cx, &rd.stmts, &rd.body, Some(&ret), has_cur)?;
-        let body = self.own(body)?;
-        let body = self.settle_groups(body);
-        if req.sink && self.tail_used {
-            return Err("a routine that owns its parameters cannot be a loop".into());
-        }
+        // A routine that owns its parameters and is a loop (Task H.5) is lowered again as a
+        // loop that owns them from its first iteration.
+        let mut owns_loop = false;
+        let (cx, params, body) = loop {
+            let mut cx = Ctx {
+                owner: md.name.clone(),
+                self_ty: if md.kind == ModuleKind::Module { Some(self_ty.clone()) } else { None },
+                tmap: tmap.clone(),
+                locals: Vec::new(),
+                used: HashSet::new(),
+                tail: true,
+                tail_site: false,
+                tail_drops: Vec::new(),
+                moves: Vec::new(),
+                moved: Vec::new(),
+                sink_params: Vec::new(),
+                fn_cname: req.cname.clone(),
+                params: Vec::new(),
+                gives: Vec::new(),
+                param_moves: Vec::new(),
+            };
+            self.tail_used = false;
+            self.nontail_self = false;
+            self.pending_groups.clear();
+            cx.used.insert("Current".into());
+            let mut params = Vec::new();
+            if has_cur {
+                params.push(format!("{} Current", self.ctype(&self_ty)?));
+                cx.params.push(("Current".to_string(), self_ty.clone()));
+            }
+            for (p, t) in &rd.params {
+                let ty = subst(t, &tmap);
+                let ct = self.ctype(&ty)?;
+                let cn = cx.bind(p, &ty);
+                params.push(format!("{ct} {cn}"));
+                cx.params.push((cn, ty));
+            }
+            if req.sink && !owns_loop {
+                cx.sink_params = cx.params.clone();
+            } else {
+                cx.param_moves = cx.params.iter().filter(|(c, t)| c != "Current" && type_head(t) == "ARRAY").map(|(c, _)| c.clone()).collect();
+            }
+            self.owned_flag = false;
+            let body = self.lower_block(&mut cx, &rd.stmts, &rd.body, Some(&ret), has_cur)?;
+            let body = self.own(body)?;
+            let body = self.settle_groups(body);
+            if req.sink && self.tail_used && !owns_loop {
+                owns_loop = true;
+                continue;
+            }
+            break (cx, params, body);
+        };
         let sig = format!(
             "static {cret} {}({})",
             req.cname,
@@ -1340,9 +1490,13 @@ static bool {inst}__has(struct {inst}* xs, {ce} x) {{\n\
         );
         self.protos.push(format!("{sig};\n"));
         let code = if self.tail_used {
-            // Parameters are borrowed on the first iteration and owned after a tail call.
+            // Parameters are borrowed on the first iteration and owned after a tail call, or
+            // owned from the first in a routine that owns its parameters.
             let drops = self.param_drops(&cx)?;
-            format!("    bool _owned = false;\n_tail:;\n    {cret} _res = {body};\n    if (_owned) {{\n{drops}}}\n    return _res;\n")
+            format!("    bool _owned = {owns_loop};\n_tail:;\n    {cret} _res = {body};\n    if (_owned) {{\n{drops}}}\n    return _res;\n")
+        } else if self.owned_flag {
+            // A `set` gave a parameter on the condition that the routine owns it: it does not.
+            format!("    const bool _owned = false;\n    return {body};\n")
         } else {
             format!("    return {body};\n")
         };
@@ -1395,6 +1549,7 @@ static bool {inst}__has(struct {inst}* xs, {ce} x) {{\n\
         for (cn, ty) in cx.tail_drops.iter().rev() {
             code.push_str(&self.drop_stmt(ty, cn)?);
         }
+        // A parameter a `set` took (Task H.5) is NULL, which releases nothing.
         let drops = self.param_drops(cx)?;
         let cret = self.ctype(ret)?;
         self.tail_used = true;
@@ -1436,9 +1591,11 @@ static bool {inst}__has(struct {inst}* xs, {ce} x) {{\n\
         let depth = cx.tail_drops.len();
         let mut retyped: HashMap<String, String> = HashMap::new();
         let sink_params = std::mem::take(&mut cx.sink_params);
+        let param_moves = std::mem::take(&mut cx.param_moves);
         loop {
             cx.tail = tail;
             cx.sink_params = sink_params.clone();
+            cx.param_moves = param_moves.clone();
             let res = self.lower_block_once(cx, stmts, body, expect, has_cur, &retyped);
             cx.tail_drops.truncate(depth);
             let Err(e) = &res else { return res };
@@ -1474,6 +1631,8 @@ static bool {inst}__has(struct {inst}* xs, {ce} x) {{\n\
         let mark = cx.locals.len();
         let mut code = String::new();
         let mut owned_locals: Vec<(String, String)> = std::mem::take(&mut cx.sink_params);
+        // Parameters nothing after this block reads (Task H.5).
+        let inherited: Vec<(String, String)> = std::mem::take(&mut cx.param_moves).into_iter().map(|c| (c, String::new())).collect();
         let groups = analyze_parallel_lets(stmts);
         // The declared type of each `let`, in the order `groups` holds them.
         let mut declared = stmts.iter().enumerate().filter(|(_, s)| matches!(s, Stmt::Let(..))).map(|(i, _)| crate::declared_let_type(stmts, i));
@@ -1483,8 +1642,10 @@ static bool {inst}__has(struct {inst}* xs, {ce} x) {{\n\
                 let want = declared.next().flatten();
                 let soft = want.is_none() && !retyped.contains_key(v) && cx.untyped_num(e);
                 cx.moves = Self::unused_after(cx, &owned_locals, &groups[at + 1..], body);
+                cx.param_moves = Self::unused_after(cx, &inherited, &groups[at + 1..], body);
                 let x = self.lower(cx, e, want.or(retyped.get(v).map(String::as_str)), has_cur);
                 cx.moves.clear();
+                cx.param_moves.clear();
                 Self::settle_moves(cx, &mut owned_locals);
                 let x = x?;
                 Self::check_declared(v, want, &x.ty)?;
@@ -1581,8 +1742,10 @@ static bool {inst}__has(struct {inst}* xs, {ce} x) {{\n\
         }
         // Nothing of this block runs after its result, so all its locals may be taken over.
         cx.moves = owned_locals.iter().map(|(cn, _)| cn.clone()).collect();
+        cx.param_moves = inherited.iter().map(|(cn, _)| cn.clone()).collect();
         let b = self.lower(cx, body, expect, has_cur);
         cx.moves.clear();
+        cx.param_moves.clear();
         Self::settle_moves(cx, &mut owned_locals);
         let b = b?;
         cx.locals.truncate(mark);
@@ -1837,6 +2000,30 @@ static bool {inst}__has(struct {inst}* xs, {ce} x) {{\n\
         if let Some(e) = expect {
             unify(&fix_cur(&rd.ret_type), e, &tps, &mut map);
         }
+        // An argument that is a chain of `set` and `swap` on an array nothing after this call
+        // reads may take it (Task H.5), as `fill(a.set(i, x), i + 1)` does in a loop. No
+        // other argument may read it, since C evaluates them in no fixed order, and the
+        // receiver must be a name, which reads nothing.
+        let param_moves = std::mem::take(&mut cx.param_moves);
+        let mut chain_gives: Vec<String> = Vec::new();
+        let plain_recv = recv.as_ref().is_none_or(|rv| rv.code.chars().all(|c| c.is_ascii_alphanumeric() || c == '_'));
+        for (k, a) in args.iter().enumerate() {
+            let Some((v, later)) = array_chain(a) else { continue };
+            let Some(l) = cx.local(v) else { continue };
+            let give = if moves.contains(&l.cname) {
+                "true"
+            } else if param_moves.contains(&l.cname) {
+                "_owned"
+            } else {
+                continue;
+            };
+            let receiver = recv.as_ref().is_some_and(|rv| rv.code == l.cname);
+            let elsewhere = args.iter().enumerate().any(|(j, b)| j != k && mentions(b, v)) || later.iter().any(|b| mentions(b, v));
+            if type_head(&l.ty) == "ARRAY" && plain_recv && !receiver && !elsewhere {
+                chain_gives.push(l.cname.clone());
+                cx.gives.push((l.cname.clone(), give.to_string()));
+            }
+        }
         let mut lowered: Vec<Option<V>> = vec![None; args.len()];
         for (i, ((_, pt), a)) in rd.params.iter().zip(args).enumerate() {
             let pt = subst(&fix_cur(pt), &map);
@@ -1898,6 +2085,11 @@ static bool {inst}__has(struct {inst}* xs, {ce} x) {{\n\
                 md.name
             ));
         }
+        if !chain_gives.is_empty() {
+            cx.gives.retain(|(c, _)| !chain_gives.contains(c));
+            // What a chain took is no longer the caller's to give again.
+            moves.retain(|m| !cx.moved.contains(m));
+        }
         let mod_targs: Vec<String> = md.type_params.iter().map(|t| map[t].clone()).collect();
         let rtargs: Vec<String> = rd.type_params.iter().map(|t| map[t].clone()).collect();
         self.check_bounds(md, &mod_targs)?;
@@ -1905,7 +2097,8 @@ static bool {inst}__has(struct {inst}* xs, {ce} x) {{\n\
             self.cost_hit = true;
         }
         let cname = self.request_fn(&md.name, &mod_targs, r, &rtargs);
-        if tail_site && cname == cx.fn_cname {
+        // The variant that owns its parameters jumps to itself too.
+        if tail_site && (cname == cx.fn_cname || cx.fn_cname == format!("sink_{cname}")) {
             let self_ty = Self::self_type(md, &mod_targs);
             let mut vals = Vec::new();
             if Self::has_current(md, kind) {
@@ -1921,7 +2114,12 @@ static bool {inst}__has(struct {inst}* xs, {ce} x) {{\n\
             self.nontail_self = true;
         }
         let takes_current = Self::has_current(md, kind);
-        if Self::is_sink(md, rd) && (!takes_current || recv.is_some() || (hc && md.name == cx.owner)) {
+        // A routine given an array its caller is done with owns it, so that a `set` on it
+        // may change it in place (Task H.5).
+        let ctor_sink = Self::is_sink(md, rd);
+        let array_param = |t: &str| type_head(&cnorm(t)) == "ARRAY";
+        let array_sink = rd.params.iter().any(|(_, t)| array_param(&subst(&fix_cur(t), &map)));
+        if (ctor_sink || array_sink) && (!takes_current || recv.is_some() || (hc && md.name == cx.owner)) {
             let self_ty = Self::self_type(md, &mod_targs);
             let mut vals = Vec::new();
             if takes_current {
@@ -1932,7 +2130,8 @@ static bool {inst}__has(struct {inst}* xs, {ce} x) {{\n\
             // otherwise release right after the call.
             let mut gives = false;
             for v in &vals {
-                gives |= self.is_rc(&v.ty) && (v.owned || moves.contains(&v.code));
+                let counts = if ctor_sink { self.is_rc(&v.ty) } else { array_param(&v.ty) };
+                gives |= counts && (v.owned || moves.contains(&v.code));
             }
             if gives {
                 let sink = self.request_sink(&md.name, &mod_targs, r, &rtargs);
@@ -2028,6 +2227,74 @@ static bool {inst}__has(struct {inst}* xs, {ce} x) {{\n\
         self.runtime_call(&format!("{prefix}{m}"), vals, ret, true)
     }
 
+    /// A routine of `ARRAY` (Task H.5): the primitives call the runtime, and the rest
+    /// (`fold`) compile from their verified source over them. `set` and `swap` take the
+    /// array when it is the result of another call, or when `cx.gives` holds it.
+    fn lower_array_method(&mut self, cx: &mut Ctx, rv: V, m: &str, args: &[Expr], hc: bool) -> Lowered {
+        let rt = cnorm(&rv.ty);
+        let elem = split_type_app(&rt).1.first().map(|s| cnorm(s)).unwrap_or_default();
+        self.ctype(&rt)?;
+        let inst = c_instance_name(&rt);
+        match (m, args.len()) {
+            ("length", 0) => self.runtime_call(&format!("{inst}__length"), vec![rv], "NAT", true),
+            ("to_list", 0) => self.runtime_call(&format!("{inst}__to_list"), vec![rv], &format!("LIST[{elem}]"), true),
+            ("at", 1) => {
+                let i = self.lower(cx, &args[0], Some("NAT"), hc)?;
+                self.runtime_call(&format!("{inst}__at"), vec![rv, i], &elem, false)
+            }
+            ("slice", 2) => {
+                let lo = self.lower(cx, &args[0], Some("NAT"), hc)?;
+                let hi = self.lower(cx, &args[1], Some("NAT"), hc)?;
+                self.runtime_call(&format!("{inst}__slice"), vec![rv, lo, hi], &rt, true)
+            }
+            ("set", 2) | ("swap", 2) => {
+                let given = if rv.owned {
+                    None
+                } else {
+                    cx.gives.iter().find(|(c, _)| *c == rv.code).map(|(_, g)| g.clone())
+                };
+                // The arguments are read before the array changes, and no `set` among them
+                // may take it.
+                let hidden: Vec<(String, String)> = cx.gives.iter().filter(|(c, _)| *c == rv.code).cloned().collect();
+                cx.gives.retain(|(c, _)| *c != rv.code);
+                let second = if m == "set" { elem.clone() } else { "NAT".to_string() };
+                let a = self.lower(cx, &args[0], Some("NAT"), hc);
+                let b = self.lower(cx, &args[1], Some(&second), hc);
+                cx.gives.extend(hidden);
+                let (a, b) = (a?, b?);
+                let mut t = Temps::default();
+                let (recv, give) = match &given {
+                    _ if rv.owned => (rv.code.clone(), "true".to_string()),
+                    Some(g) => {
+                        if g == "true" && !cx.moved.contains(&rv.code) {
+                            cx.moved.push(rv.code.clone());
+                        }
+                        (rv.code.clone(), g.clone())
+                    }
+                    None => (self.borrow(rv, &mut t)?, "false".to_string()),
+                };
+                let ac = self.borrow(a, &mut t)?;
+                let bc = self.borrow(b, &mut t)?;
+                let mut call = format!("{inst}__{m}_give({recv}, {ac}, {bc}, {give})");
+                if given.as_deref() == Some("_owned") {
+                    // The parameter is the loop's to release: once taken, it holds nothing.
+                    self.owned_flag = true;
+                    let k = self.next();
+                    let ct = self.ctype(&rt)?;
+                    call = format!("({{ {ct} _g{k} = {call}; if (_owned) {recv} = NULL; _g{k}; }})");
+                }
+                Ok(owned(self.with_temps(t, call, &rt)?, rt))
+            }
+            _ => {
+                let md = self.module("ARRAY").ok_or("no `ARRAY` module")?;
+                match Self::find_routine(md, m) {
+                    Some(_) => self.lower_call(cx, md, m, Some(rv), args, None, hc),
+                    None => Err(format!("`ARRAY.{m}` has no C runtime implementation")),
+                }
+            }
+        }
+    }
+
     fn lower_list_method(&mut self, cx: &mut Ctx, rv: V, m: &str, args: &[Expr], hc: bool) -> Lowered {
         let rt = rv.ty.clone();
         let elem = split_type_app(&rt).1.first().map(|s| cnorm(s)).unwrap_or_default();
@@ -2114,6 +2381,8 @@ static bool {inst}__has(struct {inst}* xs, {ce} x) {{\n\
             sink_params: Vec::new(),
             fn_cname: String::new(),
             params: Vec::new(),
+            gives: Vec::new(),
+            param_moves: Vec::new(),
         };
         let mut prologue = String::new();
         let mut env_fields = String::new();
@@ -2217,6 +2486,7 @@ static bool {inst}__has(struct {inst}* xs, {ce} x) {{\n\
 
     fn lower_match(&mut self, cx: &mut Ctx, scrut: &Expr, cases: &[MatchCase], expect: Option<&str>, hc: bool) -> Lowered {
         let tail = std::mem::take(&mut cx.tail);
+        let param_moves = std::mem::take(&mut cx.param_moves);
         let depth = cx.tail_drops.len();
         let sv0 = self.lower(cx, scrut, None, hc)?;
         let st = sv0.ty.clone();
@@ -2278,6 +2548,7 @@ static bool {inst}__has(struct {inst}* xs, {ce} x) {{\n\
             let untyped = cx.untyped_num(&c.body);
             let arm_expect = if soft_result { None } else { result_ty.as_deref() };
             cx.tail = tail;
+            cx.param_moves = param_moves.clone();
             let bv = self.lower_block(cx, &c.stmts, &c.body, arm_expect, hc)?;
             if soft_result && result_ty.as_deref().is_some_and(|t| numeric_conflict(t, &bv.ty)) {
                 // Earlier arms were untyped numbers: this arm decides the type of the `match`.
@@ -2345,6 +2616,7 @@ static bool {inst}__has(struct {inst}* xs, {ce} x) {{\n\
         cx.tail_site = false;
         // Like `tail`, for this expression only, and only a constructor or a call uses it.
         let moves = std::mem::take(&mut cx.moves);
+        let param_moves = std::mem::take(&mut cx.param_moves);
         let expect_n = expect.map(norm_type);
         let expect = expect_n.as_deref();
         match e {
@@ -2450,6 +2722,7 @@ static bool {inst}__has(struct {inst}* xs, {ce} x) {{\n\
                 if Self::find_routine(owner, f).is_some() {
                     cx.tail_site = tail;
                     cx.moves = moves;
+                    cx.param_moves = param_moves;
                     return self.lower_call(cx, owner, f, None, args, expect, hc);
                 }
                 Err(format!("unknown function `{f}`"))
@@ -2470,6 +2743,26 @@ static bool {inst}__has(struct {inst}* xs, {ce} x) {{\n\
                         return self.lower_static(cx, v, m, args, expect, hc);
                     }
                 }
+                // `a.set(i, x)` on a local nothing after it uses: the `set` may take the
+                // array, if no later call of the chain reads it (Task H.5).
+                if let Some((v, outer)) = array_chain(e) {
+                    let take = cx.local(v).filter(|l| type_head(&l.ty) == "ARRAY" && !outer.iter().any(|a| mentions(a, v)));
+                    let give = take.and_then(|l| {
+                        if moves.contains(&l.cname) {
+                            Some((l.cname.clone(), "true"))
+                        } else if param_moves.contains(&l.cname) {
+                            Some((l.cname.clone(), "_owned"))
+                        } else {
+                            None
+                        }
+                    });
+                    if let Some((c, g)) = give {
+                        cx.gives.push((c.clone(), g.to_string()));
+                        let r = self.lower(cx, recv, None, hc).and_then(|rv| self.lower_array_method(cx, rv, m, args, hc));
+                        cx.gives.retain(|(g, _)| *g != c);
+                        return r;
+                    }
+                }
                 let rv = match self.lower(cx, recv, None, hc) {
                     // `SEQ.empty.concat(s)`, `LIST.empty.prepend(x)`: the receiver's type
                     // comes from the method's arguments or the expected result type.
@@ -2482,6 +2775,11 @@ static bool {inst}__has(struct {inst}* xs, {ce} x) {{\n\
                 let rt = rv.ty.clone();
                 if rt == "STRING" || rt == "BYTES" {
                     return self.lower_text_method(cx, rv, m, args, hc);
+                }
+                if type_head(&rt) == "ARRAY" {
+                    // A routine compiled from source, as `fold_from`, may be a loop.
+                    cx.tail_site = tail;
+                    return self.lower_array_method(cx, rv, m, args, hc);
                 }
                 // `equals` on a type without its own `equals` routine (scalars,
                 // `CANONICAL_EQ` elements) is Leibniz equality.
@@ -2537,12 +2835,14 @@ static bool {inst}__has(struct {inst}* xs, {ce} x) {{\n\
                 }
                 cx.tail_site = tail;
                 cx.moves = moves;
+                cx.param_moves = param_moves;
                 self.lower_call(cx, md, m, Some(rv), args, expect, hc)
             }
             // A block written as an expression by pattern compilation. Its dead branch is a
             // copy, and lowering it would double the C at every nested level.
             Expr::If(c, ts, te, _, _) if matches!(**c, Expr::Bool(true)) => {
                 cx.tail = tail;
+                cx.param_moves = param_moves;
                 self.lower_block(cx, ts, te, expect, hc)
             }
             Expr::If(c, ts, te, es, ee) => {
@@ -2550,6 +2850,7 @@ static bool {inst}__has(struct {inst}* xs, {ce} x) {{\n\
                 // An untyped number takes its type from the other branch.
                 let else_first = expect.is_none() && cx.untyped_num(te) && !cx.untyped_num(ee);
                 cx.tail = tail;
+                cx.param_moves = param_moves.clone();
                 let first = if else_first {
                     Err(NEED_TYPE.to_string())
                 } else {
@@ -2559,9 +2860,11 @@ static bool {inst}__has(struct {inst}* xs, {ce} x) {{\n\
                     Ok(x) => x,
                     Err(e) if need(&e) && expect.is_none() => {
                         cx.tail = tail;
+                        cx.param_moves = param_moves.clone();
                         let b = self.lower_block(cx, es, ee, None, hc)?;
                         let tb = b.ty.clone();
                         cx.tail = tail;
+                        cx.param_moves = param_moves.clone();
                         let a = self.lower_block(cx, ts, te, Some(&tb), hc)?;
                         let (ac, bc) = (self.own(a)?, self.own(b)?);
                         return Ok(owned(format!("({cc} ? ({ac}) : ({bc}))"), tb));
@@ -2570,12 +2873,14 @@ static bool {inst}__has(struct {inst}* xs, {ce} x) {{\n\
                 };
                 let ta = a.ty.clone();
                 cx.tail = tail;
+                cx.param_moves = param_moves;
                 let b = self.lower_block(cx, es, ee, Some(expect.unwrap_or(&ta)), hc)?;
                 let (ac, bc) = (self.own(a)?, self.own(b)?);
                 Ok(owned(format!("({cc} ? ({ac}) : ({bc}))"), ta))
             }
             Expr::Match(scrut, cases) => {
                 cx.tail = tail;
+                cx.param_moves = param_moves;
                 self.lower_match(cx, scrut, cases, expect, hc)
             }
             Expr::RecordLit(fields) => {
@@ -2855,6 +3160,40 @@ static bool {inst}__has(struct {inst}* xs, {ce} x) {{\n\
             ("CHAR", "from_scalar", 1) => {
                 let a = self.lower(cx, &args[0], Some("NAT"), hc)?;
                 return Ok(owned(format!("((uint32_t)({}))", a.code), "CHAR"));
+            }
+            ("ARRAY", "make", 2) | ("ARRAY", "from_list", 1) | ("ARRAY", "empty", 0) => {
+                let elem = expect
+                    .filter(|e| type_head(e) == "ARRAY")
+                    .and_then(|e| split_type_app(e).1.first().map(|s| cnorm(s)));
+                let (vals, elem) = match m {
+                    "make" => {
+                        let n = self.lower(cx, &args[0], Some("NAT"), hc)?;
+                        let x = self.lower(cx, &args[1], elem.as_deref(), hc)?;
+                        let t = cnorm(&x.ty);
+                        (vec![n, x], t)
+                    }
+                    "from_list" => {
+                        let want = elem.as_ref().map(|t| format!("LIST[{t}]"));
+                        let xs = self.lower(cx, &args[0], want.as_deref(), hc)?;
+                        let t = split_type_app(&cnorm(&xs.ty)).1.first().map(|s| cnorm(s)).unwrap_or_default();
+                        (vec![xs], t)
+                    }
+                    _ => (Vec::new(), elem.ok_or(NEED_TYPE.to_string())?),
+                };
+                let at = format!("ARRAY[{elem}]");
+                self.ctype(&at)?;
+                let inst = c_instance_name(&at);
+                if m == "empty" {
+                    return Ok(owned(format!("{inst}_alloc(0)"), at));
+                }
+                return self.runtime_call(&format!("{inst}__{m}"), vals, &at, true);
+            }
+            ("ARRAY", _, _) => {
+                let md = self.module(v).ok_or_else(|| format!("unknown name `{v}`"))?;
+                return match Self::find_routine(md, m) {
+                    Some((_, kind)) if kind == "create" && m != "repeat" => self.lower_call(cx, md, m, None, args, expect, hc),
+                    _ => Err(format!("`ARRAY.{m}` has no C runtime implementation")),
+                };
             }
             ("LIST", "empty", 0) => {
                 let lt = expect.filter(|e| type_head(e) == "LIST").ok_or(NEED_TYPE.to_string())?;

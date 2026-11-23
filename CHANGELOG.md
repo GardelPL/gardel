@@ -9,6 +9,17 @@ All notable changes, theoretical soundess fixes, verification overhauls, front-e
 Spec draft v0.5. [plan/Roadmap.md](plan/Roadmap.md) holds the detail for each task.
 
 ### Language and runtime
+- **Arrays: `ARRAY[A]`** (H.5). A new prelude module holds a fixed number of items, read and changed by index.
+  - **`make(n, x)`, `from_list`, `empty`, `length`, `at(i)`, `set(i, x)`, `swap(i, j)`, `slice(lo, hi)`, `to_list` and `fold(f, init)`.** A proof sees an array as the list of its items, `model`, and each contract is stated on it: `set` gives `LIST_OPS.update(model, i, x)`. The laws `at_set_same` and `at_set_other`, each with a trigger, say what `at` reads after a `set`, so a client proves `a.set(i, x).at(i) = x` through the contracts alone.
+  - **`LIST_OPS.update(xs, i, x)`**, with the laws `at_update_same` and `at_update_other`.
+  - **In C, one block.** `at` and `length` take constant time. `ARRAY`'s `set` and `swap` are runtime routines, and the rest compile from their verified source over them: `fold` is a loop over `at`.
+  - **Decision 6, taken as proposed: `set` and `swap` change the array in place when nothing else holds it,** checked at run time by its reference count, and copy it otherwise. No ownership rule enters the language. The compiler gives a `set` the array when the caller is done with it:
+    - the array is the result of another call;
+    - it is a `let`, or a parameter, that nothing evaluated after the `set` reads;
+    - it is a chain of `set`s and `swap`s that a call passes on, as a loop's `fill(a.set(i, x), i + 1)`.
+    A loop owns its parameters from its second iteration. A routine given an array its caller is done with gets a variant that owns its parameters from the first, so `fill(ARRAY.make(1000000, 0), 0)` makes no copy.
+  - **Benchmark:** a million `set`s on an array held once take 15 ms, allocation and a fold included, with no copy. Held twice, they take 29 ms and copy once. The guide shows the patterns that copy at every step, such as an argument that reads the array beside the one that changes it.
+  - `tests/array.rs`: a client proves seven facts through the contracts, six false claims are refused, an index past the end is refused, and a program counts its copies: none for a million `set`s through a loop, through a `let`, or a million swaps, one for an array held twice, and it leaks nothing.
 - **Sorting, proven: `SORTING[K: ORD]`** (H.3). A new prelude module sorts a `LIST` of any ordered type.
   - **`SORTING.sort(xs)`** is a merge sort. Its contract: the result is `sorted`, has `xs`'s length, and holds each value as many times as `xs` does (`permutation`, counted with `=` by the ghost `SORTING.count`). **`SORTING.merge(xs, ys)`** keeps both lists' items, in order when both are.
   - **Decision 5, taken as proposed.** `sorted` uses only `less_or_equal`. The permutation is stated with `=`, which holds for every key, as a contract may use `=` on any type. The law `first_least(xs, j)`, that the first item of a sorted list is at most every other, needs `equals` to be `=` (`agrees`), as for `NAT` or any `CANONICAL_EQ` key.

@@ -545,20 +545,46 @@ H.22's first known limit: a `GENERATOR[NAT, NAT]`'s items were not known to be `
 
 Client: sorting (H.3), the heap (H.4), `gtui`'s screen grid (F.10). Needs decision 6. Listed first in this step because H.3 and H.4 build on it.
 
-- [ ] `module ARRAY[A]`, `representation {NONE}`, ghost model `model: LIST[A]`. `make(n, x)`, `from_list`, `to_list`, `length`, `at(i)`, `set(i, x)`, `swap(i, j)`, `slice`, `fold`.
-- [ ] Contracts on the model: `set` gives `LIST_OPS.update(model, i, x)`, with laws `at_set_same` and `at_set_other`, each with a trigger, as `MAP` has.
-- [ ] C backend (P4): one contiguous block. `at` is constant time. `set` writes in place when the reference count is 1, and copies otherwise.
-- [ ] The verification model stays a list, as `STRING`'s does, so no proof sees the buffer.
-- [ ] Benchmark: a loop of 1,000,000 `set` calls on an array held once makes no allocation. The same loop on an array held twice copies once.
-- [ ] Leak test in the C.3 style.
-- Acceptance: the laws are proven, the benchmark is recorded, and a client proves `a.set(i, x).at(i) = x` through the contract alone.
-- Risk: a `let` that keeps the old array alive turns each `set` into a copy, silently. The benchmark must show how to write the loop, and the guide must say it.
+**Status:** ✅ Completed (2026-11-23). Decision 6 taken as proposed.
+
+- [x] `module ARRAY[A]`, `representation {NONE}` over `items: LIST[A]`, ghost model `model: LIST[A]`. `make(n, x)`, `from_list`, `empty`, `to_list`, `length`, `at(i)`, `set(i, x)`, `swap(i, j)`, `slice(lo, hi)`, `fold(f, init)`.
+- [x] Contracts on the model: `set` gives `LIST_OPS.update(model, i, x)`, with the laws `at_set_same` and `at_set_other`, each with a trigger, as `MAP` has.
+  - `LIST_OPS.update(xs, i, x)` is new, with the laws `at_update_same` and `at_update_other`, proven by the fact routine `update_fact`. `ARRAY`'s laws follow from them with no `do`.
+  - `make`'s contract gives every item (`each`), `swap`'s is two `update`s, `slice`'s is `take` after `drop`, and `fold`'s is `LIST_OPS.fold_left` of the model, proven by a loop over `at` with `LIST_OPS.drop_step`.
+- [x] C backend (P4): one counted block, `{ rc, len, data[] }`. `at` and `length` are constant time.
+  - `make`, `from_list`, `empty`, `to_list`, `length`, `at`, `set`, `swap` and `slice` are runtime routines. The rest compile from their verified source over them: `fold` is a loop over `at`.
+  - `set` and `swap` have one runtime form, `_give(a, …, give)`. With `give` true they take the array: they change it in place when its count is 1, and otherwise copy it and release it. With `give` false they copy.
+- [x] When a `set` is given the array. Decision 6 checks the count at run time, but a call borrows its arguments, so a count of 1 means nothing unless the caller is done with the array. The backend gives it:
+  - when the array is the result of another call, as each later link of `a.set(i, x).set(j, y)`;
+  - when it is a `let` that nothing evaluated after the `set` reads, the same analysis that lets a constructor take a `let` (C.4.3);
+  - when it is a parameter that nothing evaluated after the `set` reads. A loop owns its parameters after its first iteration, so the `set` takes it on the condition `_owned`, and the parameter is then `NULL`, which releases nothing;
+  - when a chain of `set`s and `swap`s is an argument of a call, as `fill(a.set(i, x), i + 1)`, and no other argument reads the array, since C evaluates arguments in no fixed order.
+  - A routine with an `ARRAY` parameter, given an array its caller is done with, gets a variant that owns its parameters (`sink_`, C.4.3). A loop of that kind now owns them from its first iteration (`_owned` starts true); before, such a routine could not be a loop.
+  - The arguments of a `set` are read before it changes the array, so `a.set(i, a.at(j))` is in place. A counted item is referenced before the old one is released, as `x` may be that item.
+- [x] The verification model stays a list, as `STRING`'s does, so no proof sees the buffer.
+- [x] Benchmark, the median of five runs at `-O3`: a loop of 1,000,000 `set` calls on an array held once makes no copy and takes 15 ms, allocating the array and folding it included. The same loop on an array held twice copies once and takes 29 ms. `-DGARDEL_COUNT_ALLOCS` now also counts the copies, `gardel_array_copies()`.
+- [x] Leak test in the C.3 style: no live block after 51 runs of the small cases, with counted `STRING` items among them.
+- Acceptance: met. The laws are proven, the benchmark is recorded, and a client proves `a.set(i, x).at(i) = x` through the contract alone (`tests/array.rs`).
+- Risk, as planned: a copy is silent. The guide shows the loop, the `let` form, and the three patterns that copy: reading the old array after the loop, a later link of a chain that reads it, and a loop argument that reads it beside the one that changes it.
+
+**Tests.** `tests/array.rs` (4 tests):
+- a client proves seven facts through the contracts: `at` after `set` at the same index and another, `swap`, `make`, `from_list` then `to_list`, `slice`'s length and `fold`;
+- six false claims are refused, each by a failed proof rather than the solver's limits;
+- an index past the end is refused, for `at` and for `set`;
+- a program (`tests/array_program.gdl`) runs in C with the expected output. A harness counts its copies: two per run of the small cases, where the program still reads the array; none for a million `set`s through a loop, none through a `let` followed by a million swaps; one for an array held twice. It leaks nothing.
+
+**Totals.** 235 unit tests and 303 integration tests in 45 suites pass (the `gtui` frame-time test run alone); the stdlib verifies 33 modules with 0 errors.
+
+**Known limits.**
+- No `=` on arrays in running code: like `MAP`'s, the representation is hidden (E0311). Compare `a.to_list`.
+- A `set` whose array is read later in the same expression copies, and nothing warns of it. A warning when a loop's `set` copies at every step would need the analysis to report what it did not give.
+- `sort_array` and `binary_search` (H.3) and `HEAP` (H.4) can now be written on `ARRAY`.
 
 #### Task H.3: Sort and Search
 
 Client: `MAP.keys` consumers, `gtui` list views, `gtime` tables. Needs decision 5, H.5 and P1.
 
-**Status:** ✅ Completed on `LIST` (2026-11-23). `sort_array` and `binary_search` wait for H.5, as the user chose: they need `ARRAY`. Decision 5 taken as proposed.
+**Status:** ✅ Completed on `LIST` (2026-11-23). `sort_array` and `binary_search` waited for H.5, as the user chose: they need `ARRAY`, which H.5 has now added. Decision 5 taken as proposed.
 
 - [x] `module SORTING[K: ORD]`, a module of routines as `KEY_ORDER` is: `sorted(xs)`, `sort(xs)`, `merge(xs, ys)`, and the ghost `count(xs, x)`. `sort_array` waits for H.5.
 - [x] Merge sort on `LIST`. The two halves are independent `let`s, so they run as parallel tasks under the existing depth cap.
