@@ -1,0 +1,38 @@
+-- SplitMix64 (Steele, Lea and Flood, 2014), the generator behind property tests (Task H.9).
+-- The state is a `U64` that grows by a fixed odd step, wrapping, and each output mixes the
+-- state. It is pure, so a seed gives the same values on every run and every system.
+functions SPLIT_MIX
+
+feature {ANY}
+
+  -- The output for the state `z`: the finalizer of MurmurHash3, with SplitMix64's constants.
+  mix(z: U64): U64
+    do
+      let a = (z ^ (z >> 30)) *% 13787848793156543929
+      let b = (a ^ (a >> 27)) *% 10723151780598845931
+      b ^ (b >> 31)
+    end
+
+  -- The output after the state `s`, and the next state.
+  step(s: U64): TUPLE[U64, U64]
+    do
+      SPLIT_MIX.at(s +% 11400714819323198485)
+    ensure
+      next_state: Result.second = s +% 11400714819323198485
+    end
+
+  -- The output for the state `t`, and `t`.
+  at(t: U64): TUPLE[U64, U64]
+    do
+      (SPLIT_MIX.mix(t), t)
+    ensure
+      kept: Result.second = t
+    end
+
+  -- The outputs from `seed` on.
+  stream(seed: U64): GENERATOR[U64, U64]
+    do
+      GENERATOR.make(seed, fn(s: U64): TUPLE[U64, U64] do SPLIT_MIX.step(s) end)
+    end
+
+end

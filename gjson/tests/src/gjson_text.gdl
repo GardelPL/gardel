@@ -61,35 +61,6 @@ feature {ANY}
       end
     end
 
-  -- `raw` with each `%XX` replaced by the byte with hex value `XX`, from index `i`.
-  unescape(raw: BYTES, i: NAT, out: BYTES_BUILDER): BYTES
-    require
-      inside: i <= raw.length
-    variant
-      raw.length - i
-    do
-      if i = raw.length or out.length >= 1000000 then
-        out.to_bytes
-      else
-        let b = raw.at(i)
-        if b = 37 and raw.length - i > 2 then
-          let x = NUMBER_TEXT.hex_value(raw.at(i + 1)) * 16 + NUMBER_TEXT.hex_value(raw.at(i + 2))
-          if x < 256 then unescape(raw, i + 3, out.add_byte(x)) else out.to_bytes end
-        else
-          unescape(raw, i + 1, out.add_byte(b))
-        end
-      end
-    end
-
-  -- `s` with each `%XX` replaced by its byte, as text.
-  decoded(s: STRING): STRING
-    do
-      match STRING.from_utf8(unescape(s.to_utf8, 0, BYTES_BUILDER.empty))
-        case Ok(t) then t
-        case Error(_) then s
-      end
-    end
-
   -- `n` copies of `part`, after `out`.
   repeat(part: BYTES, n: NAT, out: BYTES_BUILDER): BYTES_BUILDER
     variant
@@ -143,40 +114,25 @@ feature {ANY}
       end end end end end end
     end
 
-  -- 0 if a line of `cases.txt` holds, or is a comment, else 1.
-  check_line(line: STRING): NAT
+  -- What `JSON.parse` says of the document a case stands for: its bytes, with `%XX` read as
+  -- a byte, or `@kind n` for a generated one, summed up.
+  got(doc: STRING): STRING
     do
-      if line.code_point_count = 0 or line.starts_with("#") then
-        0
-      else
-        match line.find(" => ", 0)
-          case None then
-            1
-          case Some(i) then
-            if i + 4 > line.code_point_count then
-              1
+      if doc.starts_with("@") then
+        match doc.find_char(' ', 0)
+          case None then "bad case"
+          case Some(sp) then
+            if sp + 1 <= doc.code_point_count then
+              match NUMBER_TEXT.parse_nat(doc.slice(sp + 1, doc.code_point_count))
+                case Ok(n) then describe(JSON.parse(generated(doc.slice(1, sp), n)), True)
+                case Error(_) then "bad count"
+              end
             else
-              let doc = line.slice(0, i)
-              let expected = decoded(line.slice(i + 4, line.code_point_count))
-              let got = if doc.starts_with("@") then
-                  match doc.find_char(' ', 0)
-                    case None then "bad case"
-                    case Some(sp) then
-                      if sp + 1 <= doc.code_point_count then
-                        match NUMBER_TEXT.parse_nat(doc.slice(sp + 1, doc.code_point_count))
-                          case Ok(n) then describe(JSON.parse(generated(doc.slice(1, sp), n)), True)
-                          case Error(_) then "bad count"
-                        end
-                      else
-                        "bad case"
-                      end
-                  end
-                else
-                  describe(JSON.parse(unescape(doc.to_utf8, 0, BYTES_BUILDER.empty)), False)
-                end
-              if got.equals(expected) then 0 else 1 end
+              "bad case"
             end
         end
+      else
+        describe(JSON.parse(CASES.bytes(doc)), False)
       end
     end
 

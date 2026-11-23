@@ -1,0 +1,68 @@
+-- The runner (Task H.9): what a test program prints of its checks, each failure with its
+-- name and then a count, and the exit status `gardelc test` reads. Only a `program` does IO
+-- (spec 11.1), so its `main` prints and exits:
+--
+--   main(args: SEQ[STRING]): IO[EXIT_CODE]
+--     do
+--       let rs = LIST.empty.prepend(CHECK.equal_nat("sum", 1 + 1, 2))
+--       with IO
+--         IO.print_line(TESTS.report(rs))
+--         IO.exit(TESTS.exit_code(rs))
+--       end
+--     end
+functions TESTS
+
+feature {ANY}
+
+  -- How many of `rs` failed.
+  failures(rs: LIST[TEST_RESULT]): NAT
+    variant
+      rs.length
+    do
+      if rs.length = 0 then
+        0
+      else
+        let rest = TESTS.failures(rs.tail)
+        if rs.head.passed then rest else rest + 1 end
+      end
+    ensure
+      at_most: Result <= rs.length
+    end
+
+  -- A line for each failure of `rs`, after `b`, in order.
+  failure_lines(rs: LIST[TEST_RESULT], b: STRING_BUILDER): STRING_BUILDER
+    variant
+      rs.length
+    do
+      if rs.length = 0 then
+        b
+      else
+        match rs.head
+          case Pass(_) then
+            TESTS.failure_lines(rs.tail, b)
+          case Fail(name, message) then
+            let line = CHECK.add(CHECK.add(CHECK.add(CHECK.add(b, "FAIL "), name), ": "), message)
+            TESTS.failure_lines(rs.tail, CHECK.add(line, "\n"))
+        end
+      end
+    end
+
+  -- What the runner prints: each failure, then how many checks passed and failed.
+  report(rs: LIST[TEST_RESULT]): STRING
+    do
+      let lines = TESTS.failure_lines(rs, STRING_BUILDER.empty)
+      let n = TESTS.failures(rs)
+      let count = CHECK.add(CHECK.add(lines, NUMBER_TEXT.nat_to_text(rs.length)), " checks: ")
+      let passed = CHECK.add(CHECK.add(count, NUMBER_TEXT.nat_to_text(rs.length - n)), " passed, ")
+      CHECK.add(CHECK.add(passed, NUMBER_TEXT.nat_to_text(n)), " failed").to_string
+    end
+
+  -- 0 when every check passed, else 1.
+  exit_code(rs: LIST[TEST_RESULT]): EXIT_CODE
+    do
+      if TESTS.failures(rs) = 0 then 0 else 1 end
+    ensure
+      passes: (Result = 0) = (TESTS.failures(rs) = 0)
+    end
+
+end

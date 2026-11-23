@@ -656,14 +656,52 @@ Client: JSON numbers, which decision 2 of Phase F keeps as text because nothing 
 
 Client: every package. Today each package's tests are a `cases.txt` read on standard input and a Rust test in `gardelc/tests` that runs it. A user without the compiler's source tree has no way to test. Needs decision 10, H.6 and P7.
 
-- [ ] `gardelc test`: verifies and builds each `program` in `tests/`, runs it, and reports by exit status. `--filter <name>`.
-- [ ] A shared proof cache for one `gardelc test` run. F.6 measured 8 minutes for `cargo test --test grest`, because each client project had a cache of its own.
-- [ ] Package `gtest`: `CHECK.equal`, `CHECK.is_ok` and others returning a `TEST_RESULT`; a runner that takes a list of named checks, prints each failure with its name, and returns the exit status.
-- [ ] `CASES`: the `cases.txt` pattern as a library. A reader of lines into fields, used by `ghttp`, `gjson` and `grest` today in three copies.
-- [ ] Property tests: a pure generator (`SplitMix64`, with wrapping operators) from a seed, generators for numbers, lists and text, and `for_all(gen, n, prop)` that reports the seed of a failure. Deterministic, so a failure reproduces.
-- [ ] Scripted reactive tests: a helper that runs a `step` over a list of events and collects the commands, in Gardel, so the `GARDEL_EVENTS` tests need no Rust.
-- [ ] Move `gjson/tests` onto `gtest` as the first client.
-- Acceptance: `gardelc test` in `gjson` runs its 70 cases with no Rust harness, and a second run with no change takes under 5 seconds.
+**Status:** ✅ Completed (2026-11-22). Decision 10 taken as proposed. A test program gets `tests/cases.txt` on its standard input, since only a reactive program can read a file (decision taken 2026-11-22). The runner is pure, as IO belongs to a `program` (spec §11.1).
+
+- [x] `gardelc test [DIR]`: verifies and builds `DIR/tests` once, runs each entry point in it in `tests/` with `cases.txt` on its standard input, and reports each by its exit status, with a failing program's output. `--filter <name>`. Exit 0, 1 for a failure or a build that fails, 2 for a wrong command line. A program is stopped after ten minutes. `--fuel`, `--z3-seed`, `--z3-rlimit` and `--verify-deps` go to the build.
+- [x] A shared proof cache: one build verifies the package and its tests against the user's cache, so nothing is proven twice in a run or across runs.
+- [x] An unchanged program is not compiled again: a C file is written only when its text changes, and an executable no older than it is kept. This took gcc's 1.4 s off a warm run of `gjson`.
+- [x] Package `gtest`:
+  - `CHECK.that`, `equal_text`, `equal_nat`, `equal_int`, `equal_shown`, `is_ok`, `is_error`, `is_some` and `is_none`, each giving a `TEST_RESULT`.
+  - `TESTS.report` (each failure with its name, then the count) and `TESTS.exit_code`.
+  - Without `SHOW` (H.6b) a generic `equal` takes the equality and a `show` function.
+- [x] `CASES`: `read` (`Blank`, `Pair(input, expected)`, `NoArrow`), `%XX` decoding (`text`, `bytes`), and `check`, which names a case by its line. `ghttp` and `grest` keep their copies for now: their escapes differ (`\r\n`).
+- [x] Property tests: `SPLIT_MIX` (checked against SplitMix64's reference outputs from seed 0), `GEN[A]` and `GENS`, and `PROPERTY.for_all` and `for_all_shown`, which report the seed a failing case was made from, so a run from it makes it first.
+- [x] Scripted reactive tests: `SCRIPT.play(step, state, events)` gives `Running` or `Stopped` with every command, and `SCRIPT.printed`. The `GARDEL_EVENTS` tests in Rust are not moved.
+- [x] `gjson/tests` moved onto `gtest`, and `tests/gjson.rs` calls `gardelc test`.
+- Acceptance: met. `gardelc test gjson` runs its 77 cases with no Rust harness. A second run with no change takes 3.1 s: 1.9 s for the build, all from the cache, and 1.2 s for the cases.
+
+**Compiler changes found on the way.**
+- `let xs = LIST.empty.prepend(x)` and `let p = (a, b)` were typed `int` for the verifier, and Boogie refused them (E0199). A test's `main` is written so. Now the list is typed by what is put in it, and a pair by its parts.
+- A function whose results are in `Rng_and(q, r)` is now in `Rng_fn1(p, q)` and `Rng_fn1(p, r)`. A lambda giving a pair states both halves (H.22b), while `GEN[A].make` at `NAT` asks only for the half that is not `A`'s.
+  - Both axioms are triggered by the fact asked for.
+  - They are emitted only into a module with an `assert` of a function's range. A first version, triggered by the stated fact and emitted everywhere, made `api_gateway` fail. `ghttp`'s `HTTP_ROUND_TRIP.request_line_reads_back` passed on 2 of 10 seeds with it, against 4 of 10 without.
+  - That law is near its limit with or without them: every pass takes 23M to 29M of 30M. A quantifier profile puts 154k of its 585k instances on one axiom over pairs of `BYTES.decode_utf8` terms, and none on the range axioms. Its verification condition is now the same as before H.9. Split per assertion, it takes 9 s on a seed that fails whole; a first try at moving its facts into a lemma made it worse (0 of 10 seeds).
+  - `HTTP_READS_ADD` and `HTTP_READ_FIELDS` need a seed retry, as they did before H.9.
+- **A routine the solver gave up on is tried again one assertion at a time.** `api_gateway` and two `packages` tests (`ghttp`'s cases, a service on `grest`) failed in `HTTP_ROUND_TRIP` with the last commit's compiler too, on a byte-identical verification condition. H.22b's final runs did not include them.
+  - Under the default seed, `fields_read_back` needs more than the first try's 120 s; under seeds 1 to 3, `request_line_reads_back` runs out at 30.9M. A retry accepts a seed only when the whole module completes, so no seed did.
+  - Split per assertion, the module verifies under all four seeds in 8 s to 16 s, each obligation below the limit.
+  - Now, when the solver gives up, the module is verified again under the default seed with Boogie's `{:vcs_split_on_every_assert}` on the procedures it gave up on, and then under seeds 1 to 3, splitting each procedure given up on so far. A name that matches no procedure, as a module-wide failure, splits them all. It costs time only where a proof did not complete.
+  - A unit test covers which procedures are split.
+
+**Tests.** `gtest/tests` has three programs, run by `gardelc test`: 11 checks of the checks and the report, 27 of `CASES`, SplitMix64, the generators, properties and `SCRIPT`, and 4 cases from its `cases.txt`. `tests/gtest.rs` (6 tests) runs them. It also covers:
+- a package with two test programs, one failing, so both are built and the failure is reported;
+- `--filter`;
+- the cases file, passing and failing;
+- a second run that proves and compiles nothing again, and a change that is compiled again;
+- the `let` typings;
+- wrong command lines.
+
+**Totals.** All 530 tests pass: the 235 unit tests and 295 in 43 suites. The stdlib is 0/0 (31 modules, 150 s).
+- The `ranges` and `small` groups ran before the split retry, which only adds a pass where the solver gives up. `seed_retry` ran again after it.
+- Everything else ran on the final binary but for the verifier ID's new file, which a unit test then checked. That includes `packages` (49) and `api_gateway` together in 1843 s, `todo_api`, `grest` and `gtui` in 3547 s, `tablon` (18) in 598 s, and `gtui`'s frame-time test alone in 150 s.
+
+**Known limits.**
+- A tuple on the line after a `let` is read as a call of the `let`'s value (`let r = f(s)`, then `(a, b)`). A parser fix, left for now; `GENS.both` builds the pairs.
+- `SCRIPT.play` is generic, so its result has no range: a routine that returns a `SCRIPTED[NAT]` cannot show its state in range. A test keeps the run in a `let`.
+- Inside a lambda, `=` on a value whose type the checker cannot infer is refused (E0311).
+- The report stops at about a megabyte of text.
+- `ghttp`'s `request_line_reads_back` is fragile as one condition, as above; the split retry proves it, at about 2 extra minutes for each project that verifies `ghttp`. Making it cheap whole is a task of its own: the `decode_utf8` pairs axiom is what costs.
 
 #### Task H.10: `gardelc mutate`
 

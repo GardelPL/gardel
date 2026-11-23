@@ -1,0 +1,36 @@
+-- `gtest`'s own checks: each check's result and message, and the runner's report.
+program GTEST_SELF
+
+feature {ANY}
+
+  results: LIST[TEST_RESULT]
+    do
+      let fail = CHECK.equal_nat("n", 3, 4)
+      let text = CHECK.equal_text("t", "ab", "abc")
+      let int = CHECK.equal_int("i", -2, 5)
+      LIST.empty
+        .prepend(CHECK.that("that passes", CHECK.that("x", 1 < 2).passed))
+        .prepend(CHECK.that("that fails", not CHECK.that("x", 2 < 1).passed))
+        .prepend(CHECK.equal_text("nat message", match fail case Fail(_, m) then m case Pass(_) then "" end, "expected 4, got 3"))
+        .prepend(CHECK.equal_text("text message", match text case Fail(_, m) then m case Pass(_) then "" end, "expected \"abc\", got \"ab\""))
+        .prepend(CHECK.equal_text("int message", match int case Fail(_, m) then m case Pass(_) then "" end, "expected 5, got -2"))
+        .prepend(CHECK.is_ok("ok", NUMBER_TEXT.parse_nat("12")))
+        .prepend(CHECK.is_error("error", NUMBER_TEXT.parse_nat("x")))
+        .prepend(CHECK.is_some("some", "abc".find("b", 0)))
+        .prepend(CHECK.is_none("none", "abc".find("z", 0)))
+        .prepend(CHECK.equal_text("report",
+          TESTS.report(LIST.empty.prepend(fail).prepend(CHECK.that("y", True))),
+          "FAIL n: expected 4, got 3\n2 checks: 1 passed, 1 failed"))
+        .prepend(CHECK.equal_nat("exit code", TESTS.exit_code(LIST.empty.prepend(fail)), 1))
+    end
+
+  main(args: SEQ[STRING]): IO[EXIT_CODE]
+    do
+      let rs = GTEST_SELF.results
+      with IO
+        IO.print_line(TESTS.report(rs))
+        IO.exit(TESTS.exit_code(rs))
+      end
+    end
+
+end

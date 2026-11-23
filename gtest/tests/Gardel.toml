@@ -1,0 +1,6 @@
+[project]
+name = "gtest-tests"
+version = "0.1.0"
+
+[dependencies]
+gtest = { path = ".." }

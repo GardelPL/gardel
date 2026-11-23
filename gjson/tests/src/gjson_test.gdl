@@ -1,50 +1,46 @@
--- The `gjson` cases, read on standard input:
+-- The `gjson` cases, which `gardelc test` sends on standard input from `cases.txt`:
 --
---   gardelc --project gjson/tests --strict
---   build/gjson_test_bin < gjson/tests/cases.txt
+--   gardelc test gjson
 --
--- Exit code 0 means every case holds; 100 + n means line n is the first that does not,
--- and it is printed.
+-- Each case is checked with `gtest`'s `CASES`, and every failure is printed with its line,
+-- what it expected and what it got. The exit status is 0 when every case holds.
 program GJSON_TEST
 
 feature {ANY}
 
-  run_cases(n: NAT): IO[EXIT_CODE]
+  finish(rs: LIST[TEST_RESULT]): IO[EXIT_CODE]
+    do
+      let ordered = LIST_OPS.reverse(rs)
+      with IO
+        IO.print_line(TESTS.report(ordered))
+        IO.exit(TESTS.exit_code(ordered))
+      end
+    end
+
+  run_cases(n: NAT, rs: LIST[TEST_RESULT]): IO[EXIT_CODE]
     require
-      bounded: n <= 10000
+      bounded: n <= 100000
     variant
-      10000 - n
+      100000 - n
     do
       with IO
         line_res <- IO.read_line
         match line_res
-          case Error(_) then
-            IO.exit(0)
           case Ok(line) then
-            if GJSON_TEXT.check_line(line) = 0 and n < 10000 then
-              run_cases(n + 1)
+            if n < 100000 then
+              run_cases(n + 1, CASES.check(rs, n, line, fn(doc: STRING): STRING do GJSON_TEXT.got(doc) end))
             else
-              report(line, n)
+              finish(rs)
             end
-        end
-      end
-    end
-
-  report(line: STRING, n: NAT): IO[EXIT_CODE]
-    do
-      if GJSON_TEXT.check_line(line) = 0 then
-        IO.exit(0)
-      else
-        with IO
-          IO.print_line(line)
-          IO.exit(if n <= 150 then 100 + n else 250 end)
+          case Error(_) then
+            finish(rs)
         end
       end
     end
 
   main(args: SEQ[STRING]): IO[EXIT_CODE]
     do
-      run_cases(1)
+      run_cases(1, LIST.empty)
     end
 
 end

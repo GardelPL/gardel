@@ -1,0 +1,27 @@
+-- Where a scripted run ended (Task H.9): still running, with its state, or stopped, with its
+-- exit code. Either way, every command it gave, in order.
+module SCRIPTED[S]
+
+representation {ANY}
+  | Running(state: S, cmds: LIST[COMMAND])
+  | Stopped(code: EXIT_CODE, cmds: LIST[COMMAND])
+
+feature {ANY}
+
+  commands: LIST[COMMAND]
+    do
+      match Current
+        case Running(_, c) then c
+        case Stopped(_, c) then c
+      end
+    end
+
+  is_stopped: BOOL
+    do
+      match Current
+        case Running(_, _) then False
+        case Stopped(_, _) then True
+      end
+    end
+
+end

@@ -1,0 +1,12 @@
+-- A line of a cases file (Task H.9), as `CASES.read` sees it.
+module CASE_LINE
+
+representation {ANY}
+  -- An empty line, or a comment: one that starts with `#`.
+  | Blank
+  -- `input => expected`, split at the first ` => `.
+  | Pair(input: STRING, expected: STRING)
+  -- Neither: a line with no ` => `.
+  | NoArrow
+
+end

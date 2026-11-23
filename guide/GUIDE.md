@@ -97,6 +97,7 @@ This guide is written for two audiences:
   - [Project Manifests (`Gardel.toml`)](#project-manifests-gardeltoml)
   - [Dependencies](#dependencies)
   - [A Package for JSON: `gjson`](#a-package-for-json-gjson)
+  - [Testing a Package: `gardelc test` and `gtest`](#testing-a-package-gardelc-test-and-gtest)
   - [Checking a New Version](#checking-a-new-version)
   - [Name Resolution](#name-resolution)
   - [The Standard Library Sources (`stdlib/`)](#the-standard-library-sources-stdlib)
@@ -2292,6 +2293,43 @@ step(t: TUI[TODO_STATE], e: EVENT): STEP[TUI[TODO_STATE]] do t.step(e) end
 
 `tools/tablon` is a workbench for a Gardel project, written in Gardel on `gtui` and `gjson`. Build it from `tools/tablon` with `gardelc --project . --strict`, as `gardelc` writes `build/` under the directory it runs in, and run `tools/tablon/build/tablon_bin DIR [GARDELC] [EDITOR]` in a terminal, where `DIR` is a project, `GARDELC` the compiler, `gardelc` on the `PATH` when it is not given, and `EDITOR` the command line that edits a file, `vi` when it is not given. It reads the project's modules from `gardelc --inspect --json-diagnostics --no-verify`, so it browses a project whose proofs fail. Tab moves between the panes; `m` and `f` choose Modules or Files on the left; `t`, `s`, `f`, `n`, `l`, `i`, `a`, `d`, `c` and `u` choose a view on the right (text, short form, features, creators, laws, invariants, concepts, instances, clients, suppliers); Enter opens a node, a part's line or a module; `/` opens the commands; `q` quits. Ctrl-K checks the project, and Problems lists its failures, Enter going to each one's line; Ctrl-B builds it; Ctrl-R builds and runs it, an ordinary program with its output in Run and the keys typing to its input, a reactive one attached; in Text, Enter edits the file shown and Escape stops, Ctrl-S saves it and checks again, and quitting with unsaved files asks first; Ctrl-E edits the file shown in your own editor, then checks again; Ctrl-X stops what runs; `/new NAME` writes a new module's file under `src`, where there is none, opens it and reads the modules again. `tools/tablon/README.md` has the details.
 
+### Testing a Package: `gardelc test` and `gtest`
+
+A package's tests are a package of their own in its `tests/` directory, with a `Gardel.toml` that depends on the package, so they see only its contracts. Each `program` in it is a test. `gardelc test DIR` verifies that package under `--strict` and builds it, once, runs each program in `DIR/tests` with `tests/cases.txt` on its standard input when there is one, and reports each by its exit status. Its own exit status is 0 when every program passed, and 1 when one failed or the tests did not verify or build. A failing program's output is shown under its name.
+
+```text
+$ gardelc test gjson
+[test] `gjson\tests` verified: 0 modules verified now, 23 proven earlier on this machine (1.9 s)
+[test] GJSON_TEST ... ok (1.2 s)
+[test] 1 program: 1 passed, 0 failed (3.1 s)
+```
+
+`--filter NAME` runs only the programs whose name contains `NAME`. The package and its tests share one build and the proof cache, and an executable whose C file has not changed is not compiled again, so a run with nothing changed takes a few seconds. A program that runs for ten minutes is stopped and fails.
+
+The package `gtest` (in `gtest/`) is what a test program is written with. Add `gtest = { path = ".../gtest" }` to the tests' manifest.
+
+- **Checks.** `CHECK.that(name, b)`, `equal_text`, `equal_nat`, `equal_int`, `equal_shown(name, got, expected, same, show)`, `is_ok`, `is_error`, `is_some` and `is_none` each give a `TEST_RESULT`: `Pass(name)` or `Fail(name, message)`, where the message says what was expected and what came, as `expected 4, got 3`.
+- **The runner.** IO belongs to a `program`, so its `main` prints `TESTS.report(rs)`, each failure with its name and then the count, and exits with `TESTS.exit_code(rs)`:
+
+```eiffel
+main(args: SEQ[STRING]): IO[EXIT_CODE]
+  do
+    let rs = LIST.empty
+      .prepend(CHECK.equal_nat("twice", DOUBLE.twice(21), 42))
+      .prepend(CHECK.is_error("not a number", NUMBER_TEXT.parse_nat("x")))
+    with IO
+      IO.print_line(TESTS.report(rs))
+      IO.exit(TESTS.exit_code(rs))
+    end
+  end
+```
+
+- **Cases files.** `CASES` reads a line `input => expected`. Empty lines and lines that start with `#` are skipped, and `%XX` stands for a byte. `CASES.check(rs, n, line, run)` adds the result of line `n`: `run(input)` compared with the expected text. A program reads its lines with `IO.read_line` and checks each, as `gjson/tests/src/gjson_test.gdl` does; `CASES.bytes(s)` gives an input that need not be text.
+- **Property tests.** `PROPERTY.for_all(name, gen, n, seed, prop)` checks `prop` on `n` values of a generator made from `seed`. A failure says which case and the seed it was made from, so a run from that seed makes it first; `for_all_shown` also shows the value. The values come from SplitMix64 (`SPLIT_MIX`), pure and the same on every system. `GENS` has `u64`, `nat_below(n)`, `nat_in(lo, hi)`, `bool`, `list(g, max)`, `text(max)`, `text_from(alphabet, max)`, `map` and `pair`, and `GEN.make` takes any step from a state to a value and the next state.
+- **Reactive steps.** `SCRIPT.play(step, state, events)` runs a `step` over a list of events and gives `Running(state, commands)` or `Stopped(code, commands)`, with every command in order; `SCRIPT.printed(commands)` is the text of each `Print` and `Write`. The `step` must be a routine of a module, as a `reactive program` cannot be named. Keep the run in a `let`: a routine that returns a `SCRIPTED[NAT]` must show its state in range, and a generic routine's result has no range.
+
+`gjson`, `gtest` and its own tests (`gtest/tests`) use it. `ghttp` and `grest` still read their cases from Rust tests.
+
 ### Checking a New Version
 
 Before releasing a package, compare it with the version your clients use:
@@ -2490,6 +2528,10 @@ gardelc <file.gdl> --run
 
 # Report what would break a client of an older version of this package
 gardelc --compare-with <old-dir>
+
+# Verify and build DIR/tests (default ./tests), run each program in it with tests/cases.txt
+# on its standard input, and report each by its exit status
+gardelc test [DIR] [--filter <NAME>]
 ```
 
 `gardelc` remembers what this machine has proven, in `GARDEL_CACHE_DIR` or your user cache directory. A module whose verification condition has not changed is not given to the solver again, and the run says how many came from the cache. Changing `gardelc`, Boogie, Z3 or a limit verifies everything again. If Boogie or Z3 cannot give its version, the run uses no cache, and a `[cache] off` line names the tool and the reason. All other checks run every time, so `--strict` cannot be answered by an earlier run. The cache only saves time: deleting it is always safe.
@@ -2505,7 +2547,7 @@ A normal run reports five steps:
 [5/5] Emitted C11 runtime target -> build/<module>.c
 ```
 
-A `program` or a reactive program is then compiled to `build/<module>_bin`, or `build/<module>_bin.exe` on Windows. Both shells there also run it as `build/<module>_bin`.
+A `program` or a reactive program is then compiled to `build/<module>_bin`, or `build/<module>_bin.exe` on Windows. Both shells there also run it as `build/<module>_bin`. A C file is written only when its text changes, and an executable no older than its C file is not compiled again: the run then says `Native executable up to date`.
 
 ```bash
 # Write the Standard Prelude embedded in gardelc to build/stdlib/ (or --emit-stdlib <DIR>); never overwrites edited files

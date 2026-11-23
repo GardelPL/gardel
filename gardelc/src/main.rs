@@ -24,6 +24,7 @@ mod patterns;
 mod proof_cache;
 mod refined;
 mod resolve;
+mod test_cmd;
 pub use c11_typed::emit_c11_typed;
 
 /// In a `program` or `functions` module (no `Current`), a free name that is a routine of
@@ -5449,6 +5450,13 @@ fn emit_container_range_base() -> String {
     out.push_str("function Rng_fn1(p: Rng, q: Rng) returns (Rng);\n");
     out.push_str("axiom (forall<A, B> p: Rng, q: Rng, f: Fn1 A B, x: A :: { Rng_holds(Rng_fn1(p, q), f), Fn1_app(f, x) } Rng_holds(Rng_fn1(p, q), f) && Rng_holds(p, x) ==> Rng_holds(q, Fn1_app(f, x)));\n");
     out.push_str("axiom (forall p: Rng :: { Rng_fn1(p, Rng_any) } Rng_fn1(p, Rng_any) == Rng_any);\n");
+    // A function whose values are in both of two ranges is in each (Task H.9). A lambda states
+    // both halves of a pair it gives, as `Rng_and(Rng__Tuple2_A(Rng_u64), Rng__Tuple2_B(
+    // Rng_u64))`, where `GEN[A].make` at `NAT` asks only for the half that is not `A`'s. Each
+    // half is triggered by the fact asked for as well: triggered by the stated fact alone, it
+    // fired on every lambda giving a pair, and `ghttp`'s `request_line_reads_back` failed.
+    out.push_str("axiom (forall<A, B> p: Rng, q: Rng, r: Rng, f: Fn1 A B :: { Rng_holds(Rng_fn1(p, q), f), Rng_holds(Rng_fn1(p, Rng_and(q, r)), f) } Rng_holds(Rng_fn1(p, Rng_and(q, r)), f) ==> Rng_holds(Rng_fn1(p, q), f));\n");
+    out.push_str("axiom (forall<A, B> p: Rng, q: Rng, r: Rng, f: Fn1 A B :: { Rng_holds(Rng_fn1(p, r), f), Rng_holds(Rng_fn1(p, Rng_and(q, r)), f) } Rng_holds(Rng_fn1(p, Rng_and(q, r)), f) ==> Rng_holds(Rng_fn1(p, r), f));\n");
     // The lambdas written as built-in functions, not lifted: the identity keeps any range, and
     // a composition gives what its outer function gives for what its inner one gives. Each is
     // triggered by the fact it states, so it works only where that fact is asked for: one on
@@ -6285,6 +6293,28 @@ pub fn check_module_dependency_cycles(units: &[SourceUnit], table: &LinkTable) -
 /// What the reactive host links with for sockets (spec 11.6). A library no code calls adds
 /// nothing to the program.
 pub const GCC_NET_LIBS: &[&str] = if cfg!(windows) { &["-lws2_32"] } else { &[] };
+
+/// Compiles a program's C file into its executable, as every build does.
+pub fn compile_program_c(c_path: &str, exe: &str) -> std::io::Result<std::process::Output> {
+    Command::new("gcc").args(["-O3", "-fopenmp", c_path, "-o", exe]).args(GCC_NET_LIBS).output()
+}
+
+/// Whether `exe` was built from `c_path` as it stands: it exists and is no older. A C file is
+/// rewritten only when its text changes (`write_if_changed`), so an unchanged program is not
+/// compiled again. The C file holds its whole runtime, so nothing else goes into the build.
+pub fn executable_is_current(c_path: &str, exe: &str) -> bool {
+    let modified = |p: &str| fs::metadata(p).and_then(|m| m.modified()).ok();
+    matches!((modified(c_path), modified(exe)), (Some(c), Some(e)) if e >= c)
+}
+
+/// Writes `text` to `path` unless it already holds exactly that, so its time stays that of
+/// its last change.
+fn write_if_changed(path: &str, text: &str) -> std::io::Result<()> {
+    if fs::read(path).is_ok_and(|old| old == text.as_bytes()) {
+        return Ok(());
+    }
+    fs::write(path, text)
+}
 
 /// Prelude modules whose background theory is injected into user Boogie contexts.
 /// `STRING` is injected for modules that mention it, contain string literals or use `IO`
@@ -9089,6 +9119,12 @@ fn infer_gardel_type(e: &Expr, m: &ModuleDecl, ctx: &BoogiePreludeCtx) -> Option
             }
             let rt = match infer_gardel_type(recv, m, ctx) {
                 Some(t) => t,
+                // `LIST.empty.prepend(x)`, as a test's list of checks is written: the empty
+                // list has no element type, so what is put in it gives the list's (Task H.9).
+                None if r == "prepend" && is_empty_list(recv) => {
+                    return arg_tys.first().cloned().flatten().map(|t| format!("LIST[{t}]"));
+                }
+                None if r == "append" && is_empty_list(recv) => return arg_tys.first().cloned().flatten(),
                 None => {
                     // `M.make(4).push(10)`: the receiver's type arguments are fixed only
                     // by this call's arguments; infer the result from the routine of the
@@ -9155,6 +9191,12 @@ fn infer_gardel_type(e: &Expr, m: &ModuleDecl, ctx: &BoogiePreludeCtx) -> Option
         // The type of the first arm whose type is known. The arms' binders are typed first,
         // by `collect_proc_locals`, so an arm that is a binder has its type.
         Expr::Match(_, cases) => cases.iter().find_map(|c| infer_gardel_type(&c.body, m, ctx)),
+        // A pair whose parts' types are known (Task H.9): `let out = (r.first % n, r.second)`.
+        Expr::TupleLit(parts) if parts.len() == 2 => {
+            let a = infer_gardel_type(&parts[0], m, ctx)?;
+            let b = infer_gardel_type(&parts[1], m, ctx)?;
+            Some(format!("TUPLE[{a}, {b}]"))
+        }
         // A lambda's parameter and result types are annotated.
         Expr::Lambda(ps, ret, _, _) => Some(c11_typed::norm_type(&format!(
             "({}) -> {ret}",
@@ -9162,6 +9204,11 @@ fn infer_gardel_type(e: &Expr, m: &ModuleDecl, ctx: &BoogiePreludeCtx) -> Option
         ))),
         _ => None,
     }
+}
+
+/// `LIST.empty`.
+fn is_empty_list(e: &Expr) -> bool {
+    matches!(e, Expr::MethodCall(recv, r, args) if r == "empty" && args.is_empty() && matches!(&**recv, Expr::Var(v) if v == "LIST"))
 }
 
 /// Decides whether `recv.mname(..)` in user module `m` targets an injected prelude
@@ -9805,8 +9852,30 @@ enum BoogieEmitScope {
 
 pub fn emit_boogie(m: &ModuleDecl, fuel_limit: usize) -> String {
     let bpl = with_fresh_boogie_numbering(|| emit_boogie_numbered(m, fuel_limit));
+    let bpl = without_unasked_fn_splits(&bpl);
     boogie_params::scalars_last(&fill_literal_lemmas_in_module(&bpl))
 }
+
+/// The axioms that split a function's range over `Rng_and` (Task H.9) serve only an
+/// assertion that a function holds a range. Elsewhere they are left out: an axiom more moved
+/// `ghttp`'s `request_line_reads_back`, already near its limit by a `decode_utf8` axiom's
+/// instances, onto seeds that fail. Leaving an axiom out is always sound.
+fn without_unasked_fn_splits(bpl: &str) -> String {
+    let asked = bpl.lines().any(|l| l.trim_start().starts_with("assert") && l.contains("Rng_holds(Rng_fn1("));
+    if asked {
+        return bpl.to_string();
+    }
+    let mut out = String::with_capacity(bpl.len());
+    for line in bpl.split_inclusive('\n') {
+        if !line.contains(FN_SPLIT_TAG) {
+            out.push_str(line);
+        }
+    }
+    out
+}
+
+/// What marks the `Rng_and` split axioms, so `without_unasked_fn_splits` finds them.
+const FN_SPLIT_TAG: &str = "Rng_holds(Rng_fn1(p, Rng_and(q, r)), f) }";
 
 fn emit_boogie_numbered(m: &ModuleDecl, fuel_limit: usize) -> String {
     let ctx = Rc::new(BoogiePreludeCtx::for_module(m));
@@ -16740,6 +16809,7 @@ const VERIFIER_SOURCES: &[(&str, &str)] = &[
     ("proof_cache.rs", include_str!("proof_cache.rs")),
     ("refined.rs", include_str!("refined.rs")),
     ("resolve.rs", include_str!("resolve.rs")),
+    ("test_cmd.rs", include_str!("test_cmd.rs")),
 ];
 
 fn verifier_id() -> String {
@@ -17013,18 +17083,31 @@ fn run_boogie_with_retries(
     // limit per procedure when other seeds will follow: a proof that needs longer gets the
     // full limit under them.
     let first_limit = if retrying { FIRST_TRY_SECS.min(solver_backstop_secs()) } else { solver_backstop_secs() };
-    let first = run_boogie_verification_once(m, fuel_limit, boogie_path, z3_path, src, input_path, first_limit)?;
+    let none = HashSet::new();
+    let first = run_boogie_verification_once(m, fuel_limit, boogie_path, z3_path, src, input_path, first_limit, &none)?;
     if !retrying || !first.iter().any(solver_gave_up) {
         return Ok(first);
     }
+    // The routines the solver gave up on are tried again one obligation at a time: a law whose
+    // obligations each take a second can run out of resources as one condition, as ghttp's
+    // `HTTP_ROUND_TRIP.request_line_reads_back` did under seeds 1 to 3 (H.9). Each later
+    // try splits every routine given up on so far.
+    let mut split: HashSet<String> = first.iter().filter(|d| solver_gave_up(d)).map(|d| d.routine.clone()).collect();
+    let again = run_boogie_verification_once(m, fuel_limit, boogie_path, z3_path, src, input_path, solver_backstop_secs(), &split)?;
+    if !again.iter().any(solver_gave_up) {
+        eprintln!("      [seed] `{}` ran out of resources under Z3's default seed, and completed with its obligations split", m.name);
+        return Ok(again);
+    }
+    split.extend(again.iter().filter(|d| solver_gave_up(d)).map(|d| d.routine.clone()));
     for seed in RETRY_SEEDS {
         let again = with_z3_seed(Some(seed), || {
-            run_boogie_verification_once(m, fuel_limit, boogie_path, z3_path, src, input_path, solver_backstop_secs())
+            run_boogie_verification_once(m, fuel_limit, boogie_path, z3_path, src, input_path, solver_backstop_secs(), &split)
         })?;
         if !again.iter().any(solver_gave_up) {
             eprintln!("      [seed] `{}` ran out of resources under Z3's default seed, and completed under seed {seed}", m.name);
             return Ok(again);
         }
+        split.extend(again.iter().filter(|d| solver_gave_up(d)).map(|d| d.routine.clone()));
     }
     eprintln!("      [seed] `{}`: the solver gave up under Z3's default seed and under seeds 1, 2 and 3", m.name);
     Ok(first)
@@ -17162,6 +17245,35 @@ fn boogie_seed_args(seed: u32) -> [String; 2] {
     ]
 }
 
+/// Marks the procedures of `routines` for Boogie to verify one assertion at a time. A routine
+/// `r` is the procedure `Verify_r` or, for a law, `Verify_law_r`. When a name matches no
+/// procedure (a module-wide failure names the module), every procedure is split.
+fn split_procedures(bpl: &str, routines: &HashSet<String>) -> String {
+    if routines.is_empty() {
+        return bpl.to_string();
+    }
+    let proc_name = |line: &str| -> Option<String> {
+        let rest = line.strip_prefix("procedure ")?.trim_start();
+        let name = rest.strip_prefix("Verify_")?;
+        Some(name.split(|c: char| c == '(' || c == '<' || c.is_whitespace()).next()?.to_string())
+    };
+    let names: HashSet<String> = bpl.lines().filter_map(proc_name).collect();
+    let all = routines.iter().any(|r| !names.contains(r) && !names.contains(&format!("law_{r}")));
+    let chosen = |p: &str| all || routines.contains(p) || p.strip_prefix("law_").is_some_and(|r| routines.contains(r));
+    let mut out = String::with_capacity(bpl.len() + 64);
+    for line in bpl.split_inclusive('\n') {
+        match proc_name(line) {
+            Some(p) if chosen(&p) => {
+                out.push_str("procedure {:vcs_split_on_every_assert} ");
+                out.push_str(&line["procedure ".len()..]);
+            }
+            _ => out.push_str(line),
+        }
+    }
+    out
+}
+
+#[allow(clippy::too_many_arguments)]
 fn run_boogie_verification_once(
     m: &ModuleDecl,
     fuel_limit: usize,
@@ -17170,8 +17282,9 @@ fn run_boogie_verification_once(
     src: &str,
     input_path: &str,
     proc_limit: u32,
+    split: &HashSet<String>,
 ) -> Result<Vec<Diagnostic>, String> {
-    let bpl_code = emit_boogie(m, fuel_limit);
+    let bpl_code = split_procedures(&emit_boogie(m, fuel_limit), split);
     // Unique per call: concurrent verifications of the same module (e.g. parallel tests)
     // must not overwrite each other's VC file.
     static VERIFY_SEQ: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
@@ -22167,10 +22280,14 @@ fn print_inspect_json(verified: bool, modules: &[String], concepts: &[String], d
 
 fn main() {
     let args: Vec<String> = env::args().collect();
+    if args.get(1).is_some_and(|a| a == "test") {
+        std::process::exit(test_cmd::run(&args[2..]));
+    }
     if args.len() < 2 && !std::path::Path::new("Gardel.toml").is_file() {
         eprintln!(
             "Usage: gardelc <input.gdl ... | DIR | --project <DIR> | --stdlib> [--no-prelude] [--inspect [MODULE]] [--emit-stdlib [DIR]] [--json-diagnostics] [--fuel <N>] [--z3-seed <N>] [--z3-rlimit <N>] [--audit] [--strict] [--bounded-check] [--verify-deps] [--run] [--no-verify]"
         );
+        eprintln!("       gardelc test [DIR] [--filter <NAME>]  verify, build and run each program of DIR/tests (§4.2)");
         eprintln!(
             "  --no-verify  with --inspect: show the short forms after type checking, proving nothing"
         );
@@ -23036,7 +23153,7 @@ fn main() {
         if m.name == module.name {
             c_backend_errors = errs;
         }
-        if let Err(e) = fs::write(&c_path, c_code) {
+        if let Err(e) = write_if_changed(&c_path, &c_code) {
             eprintln!("[ERROR] Failed to write C11 output '{c_path}': {e}");
             std::process::exit(1);
         }
@@ -23051,12 +23168,11 @@ fn main() {
 
     // The build's own diagnostics: a C compiler that fails or is missing (Task F.11b).
     let mut build_diags: Vec<Diagnostic> = Vec::new();
-    let gcc_compiled = if module.kind.is_entry_point() {
-        let gcc = Command::new("gcc")
-            .args(["-O3", "-fopenmp", &primary_c, "-o", &primary_exe])
-            .args(GCC_NET_LIBS)
-            .output();
-        match gcc {
+    let exe_current = module.kind.is_entry_point() && executable_is_current(&primary_c, &primary_exe);
+    let gcc_compiled = if exe_current {
+        true
+    } else if module.kind.is_entry_point() {
+        match compile_program_c(&primary_c, &primary_exe) {
             Ok(out) if out.status.success() => {
                 // Its warnings, if any, are the C compiler's to show, not a result of the run.
                 std::io::Write::write_all(&mut std::io::stderr(), &out.stderr).ok();
@@ -23100,7 +23216,9 @@ fn main() {
     for e in &c_backend_errors {
         say(&format!("      [C backend] {e} (the C file starts with #error)"));
     }
-    if gcc_compiled {
+    if exe_current {
+        say(&format!("      Native executable up to date            -> {primary_exe}"));
+    } else if gcc_compiled {
         say(&format!("      Compiled native executable              -> {primary_exe}"));
     }
 
@@ -23217,6 +23335,21 @@ mod tests {
     /// A run is retried under other seeds only where the solver gave up: a timeout, or a run
     /// `gardelc` stopped. A failed obligation, or a Boogie run that ended without a clean
     /// summary for another reason, is the answer, and is not retried.
+    #[test]
+    fn a_retry_splits_only_the_procedures_given_up_on() {
+        let bpl = "procedure Verify_law_slow(x: int)\n{ assert x == x; }\nprocedure Verify_fast(x: int)\n{ }\nprocedure helper();\n";
+        let set = |names: &[&str]| names.iter().map(|s| s.to_string()).collect::<HashSet<String>>();
+        assert_eq!(split_procedures(bpl, &set(&[])), bpl);
+        let laws = split_procedures(bpl, &set(&["slow"]));
+        assert!(laws.contains("procedure {:vcs_split_on_every_assert} Verify_law_slow(x: int)\n"), "{laws}");
+        assert!(laws.contains("procedure Verify_fast("), "{laws}");
+        assert!(laws.contains("procedure helper();"), "{laws}");
+        assert_eq!(split_procedures(bpl, &set(&["law_slow"])), laws);
+        let all = split_procedures(bpl, &set(&["MODULE"]));
+        assert!(all.contains("{:vcs_split_on_every_assert} Verify_law_slow") && all.contains("{:vcs_split_on_every_assert} Verify_fast"), "{all}");
+        assert!(all.contains("procedure helper();"), "{all}");
+    }
+
     #[test]
     fn only_a_solver_that_gave_up_is_retried() {
         let d = |rule: &'static str, msg: &str| Diagnostic::basic("error", rule, "r".into(), "t".into(), msg.into());

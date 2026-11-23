@@ -48,11 +48,10 @@ Two equal values are written as the same bytes: the writer adds no white space a
 
 ## Tests
 
-`gjson/tests` is a package that depends on `gjson`, so it sees only contracts. Its cases are in `gjson/tests/cases.txt`, read on standard input. Each case is a document and what `parse` must say of it. Every accepted value must also read back as itself from what it writes, which covers the round trip of arrays and objects. Generated cases reach the limits: 64 and 65 levels of nesting, 200,000 items, 300,000 bytes of text, 50,000 escapes, 3,000 fields in reverse order, and a document over 4 MiB.
+`gjson/tests` is a package that depends on `gjson` and on `gtest`, so it sees only contracts. Its cases are in `gjson/tests/cases.txt`, which `gardelc test` sends on standard input, and `gtest`'s `CASES` checks each line, printing every failure with its line, what it expected and what it got. Each case is a document and what `parse` must say of it. Every accepted value must also read back as itself from what it writes, which covers the round trip of arrays and objects. Generated cases reach the limits: 64 and 65 levels of nesting, 200,000 items, 300,000 bytes of text, 50,000 escapes, 3,000 fields in reverse order, and a document over 4 MiB.
 
 ```
-gardelc --project gjson/tests --strict
-gjson/tests/build/gjson_test_bin < gjson/tests/cases.txt
+gardelc test gjson
 ```
 
 ## Costs
