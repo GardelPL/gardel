@@ -1,0 +1,563 @@
+-- Application state and event routing for `contable`.
+-- Coordinates `LEDGER_HISTORY` with `gtui` 0.6.0 widgets (`MENU`, `BREADCRUMB`, `TABLE`,
+-- `TABS`, `GAUGE`, `SPARKLINE`, `BUTTON`, `SLIDER`, `DIALOG`, `POPUP`, `TOAST`, `INPUT_LINE`).
+module CONTABLE_STATE
+
+representation {NONE}
+  wide: NAT
+  high: NAT
+  keys_at: FOCUS
+  bar_menu: MENU
+  right_tabs: TABS
+  contracts_view: TEXT_VIEW
+  hist: LEDGER_HISTORY
+  preset_idx: NAT
+  acct_sel: NAT
+  journal_sel: NAT
+  history_slider: SLIDER
+  toast_queue: TOAST
+  tick_seq: NAT
+  help_modal: POPUP
+  help_shown: BOOL
+  quit_dialog: DIALOG
+  rev_dialog: DIALOG
+  post_open: BOOL
+  post_input: INPUT_LINE
+  post_err: STRING
+  theme_idx: NAT
+
+create {ANY}
+
+  make_menu: MENU
+    do
+      let none: LIST[MENU_ITEM] = LIST.empty
+      let file_items = none
+        .prepend(MENU_ITEM.item("Quit", 12).with_shortcut("q"))
+        .prepend(MENU_ITEM.separator)
+        .prepend(MENU_ITEM.item("Jump to Latest", 10).with_shortcut("End"))
+      let ledger_items = none
+        .prepend(MENU_ITEM.item("Contracts & Short Form", 22).with_shortcut("c"))
+        .prepend(MENU_ITEM.separator)
+        .prepend(MENU_ITEM.item("Reverse Selected Entry...", 21).with_shortcut("r"))
+        .prepend(MENU_ITEM.item("New Balanced Entry...", 20).with_shortcut("n"))
+      let preset_items = none
+        .prepend(MENU_ITEM.item("Small Cafe", 32).with_shortcut("3"))
+        .prepend(MENU_ITEM.item("Personal Monthly Budget", 31).with_shortcut("2"))
+        .prepend(MENU_ITEM.item("Freelance Studio", 30).with_shortcut("1"))
+      let theme_items = none
+        .prepend(MENU_ITEM.item("Dracula", 43))
+        .prepend(MENU_ITEM.item("Nord", 42))
+        .prepend(MENU_ITEM.item("Light", 41))
+        .prepend(MENU_ITEM.item("Dark", 40))
+      let help_items = none
+        .prepend(MENU_ITEM.item("About Boogie/Z3 Proofs", 51))
+        .prepend(MENU_ITEM.item("Controls & Keys", 50).with_shortcut("?"))
+      let entries = none
+        .prepend(MENU_ITEM.submenu("Help", help_items))
+        .prepend(MENU_ITEM.submenu("Theme", theme_items))
+        .prepend(MENU_ITEM.submenu("Presets", preset_items))
+        .prepend(MENU_ITEM.submenu("Ledger", ledger_items))
+        .prepend(MENU_ITEM.submenu("File", file_items))
+      MENU.make(entries).with_border(BORDER_KIND.rounded)
+    end
+
+  make_help: POPUP
+    do
+      let l1 = "n: Post New Balanced Entry | r: Reverse Selected Entry\n"
+      let l2 = "Up / Down / j / k: Navigate focused Accounts or Journal table\n"
+      let l3 = "Left / Right / Home / End: Scrub Ledger History timeline\n"
+      let l4 = "b / e / c: Budgets / Entry Legs / Contracts tabs | Tab: Focus\n"
+      let l5 = "1-3: Switch Books | t: Cycle Theme | F10: Menu | q: Quit\n"
+      let l6 = "Mouse: Click rows, buttons, tabs, menu, or drag History slider."
+      let p1 = GLYPHS.join(GLYPHS.join(l1, l2), GLYPHS.join(l3, l4))
+      let p2 = GLYPHS.join(l5, l6)
+      POPUP.of_text("Contable — Controls", GLYPHS.join(p1, p2), 66, 8)
+        .with_border(BORDER_KIND.rounded)
+        .with_padding(PADDING.symmetric(0, 1))
+        .with_footer("Esc / ? to close")
+    end
+
+  make_quit_dialog: DIALOG
+    do
+      DIALOG.confirm("Leave Contable?", "Exit the verified double-entry ledger?")
+        .with_border(BORDER_KIND.rounded)
+    end
+
+  make_rev_dialog: DIALOG
+    do
+      DIALOG.confirm(
+        "Append Compensating Reversal?",
+        "Entries are immutable. Append a balanced reversal entry?"
+      ).with_border(BORDER_KIND.rounded)
+    end
+
+  slider_for(h: LEDGER_HISTORY): SLIDER
+    do
+      let max_s = if h.last_step > 0 then h.last_step else 1 end
+      SLIDER.make(0, max_s, 1, h.step_index).with_label
+    end
+
+  make: CONTABLE_STATE
+    do
+      let h = LEDGER_PRESETS.make_preset(0)
+      { wide = 104,
+        high = 30,
+        keys_at = FOCUS.make(3),
+        bar_menu = CONTABLE_STATE.make_menu,
+        right_tabs = TABS.empty.with("Budgets", 'b').with("Entry", 'e').with("Contracts", 'c'),
+        contracts_view = TEXT_VIEW.make(CONTABLE_PANELS.short_form_lines),
+        hist = h,
+        preset_idx = 0,
+        acct_sel = 0,
+        journal_sel = 0,
+        history_slider = CONTABLE_STATE.slider_for(h),
+        toast_queue = TOAST.empty.with_max_visible(1),
+        tick_seq = 0,
+        help_modal = CONTABLE_STATE.make_help,
+        help_shown = False,
+        quit_dialog = CONTABLE_STATE.make_quit_dialog,
+        rev_dialog = CONTABLE_STATE.make_rev_dialog,
+        post_open = False,
+        post_input = INPUT_LINE.of_text("6 0 75.00 Domain Renewal"),
+        post_err = "",
+        theme_idx = 0 }
+    end
+
+feature {ANY}
+
+  area: RECT
+    do
+      RECT.sized(Current.wide, Current.high)
+    end
+
+  focus: FOCUS
+    do
+      Current.keys_at
+    end
+
+  top_menu: MENU
+    do
+      Current.bar_menu
+    end
+
+  tabs: TABS
+    do
+      Current.right_tabs
+    end
+
+  contracts: TEXT_VIEW
+    do
+      Current.contracts_view
+    end
+
+  history: LEDGER_HISTORY
+    do
+      Current.hist
+    end
+
+  ledger: LEDGER
+    do
+      Current.hist.current
+    end
+
+  selected_account: NAT
+    do
+      Current.acct_sel
+    end
+
+  selected_journal: NAT
+    do
+      Current.journal_sel
+    end
+
+  timeline: SLIDER
+    do
+      Current.history_slider
+    end
+
+  toasts: TOAST
+    do
+      Current.toast_queue
+    end
+
+  help_open: BOOL
+    do
+      Current.help_shown
+    end
+
+  help_popup: POPUP
+    do
+      Current.help_modal
+    end
+
+  quit_dlg: DIALOG
+    do
+      Current.quit_dialog
+    end
+
+  rev_dlg: DIALOG
+    do
+      Current.rev_dialog
+    end
+
+  post_modal_open: BOOL
+    do
+      Current.post_open
+    end
+
+  post_line: INPUT_LINE
+    do
+      Current.post_input
+    end
+
+  post_error: STRING
+    do
+      Current.post_err
+    end
+
+  active_tab_name: STRING
+    do
+      if Current.right_tabs.selected = 0 then "Budgets"
+      else if Current.right_tabs.selected = 1 then "Entry Detail"
+      else "Contracts"
+      end end
+    end
+
+  breadcrumb: BREADCRUMB
+    do
+      let empty: LIST[STRING] = LIST.empty
+      let crumbs = empty
+        .prepend(Current.active_tab_name)
+        .prepend(Current.ledger.book_name)
+        .prepend("Contable")
+      BREADCRUMB.make(crumbs)
+    end
+
+  theme: THEME
+    do
+      if Current.theme_idx = 0 then THEME.dark
+      else if Current.theme_idx = 1 then THEME.light
+      else if Current.theme_idx = 2 then THEME.nord
+      else THEME.dracula
+      end end end
+    end
+
+  sized(w: NAT, h: NAT): CONTABLE_STATE
+    do
+      { Current with wide = w, high = h }
+    end
+
+  notify_info(msg: STRING): CONTABLE_STATE
+    do
+      let nt = if Current.tick_seq < 1000000 then Current.tick_seq + 1 else 0 end
+      let q = TOAST.empty.with_max_visible(1).push_info(msg, 2).tick(nt)
+      { Current with tick_seq = nt, toast_queue = q }
+    end
+
+  notify_success(msg: STRING): CONTABLE_STATE
+    do
+      let nt = if Current.tick_seq < 1000000 then Current.tick_seq + 1 else 0 end
+      let q = TOAST.empty.with_max_visible(1).push_success(msg, 3).tick(nt)
+      { Current with tick_seq = nt, toast_queue = q }
+    end
+
+  sync_history(h: LEDGER_HISTORY): CONTABLE_STATE
+    do
+      let n_j = h.current.entry_count
+      let js = if n_j = 0 then 0 else if Current.journal_sel < n_j then Current.journal_sel else n_j - 1 end end
+      let n_a = h.current.account_count
+      let asel = if Current.acct_sel < n_a then Current.acct_sel else n_a - 1 end
+      { Current with hist = h, history_slider = CONTABLE_STATE.slider_for(h), journal_sel = js, acct_sel = asel }
+    end
+
+  load_preset(idx: NAT): CONTABLE_STATE
+    do
+      let p = if idx < 3 then idx else 0 end
+      let h = LEDGER_PRESETS.make_preset(p)
+      let s1 = Current.sync_history(h)
+      { s1 with preset_idx = p, acct_sel = 0, journal_sel = 0 }
+        .notify_info(GLYPHS.join("Loaded book: ", LEDGER_PRESETS.preset_name(p)))
+    end
+
+  open_reverse_confirm: CONTABLE_STATE
+    do
+      let cur = Current.hist.latest
+      if cur.entry_count = 0 then
+        Current.notify_info("No entries to reverse.")
+      else if not Current.hist.at_latest then
+        Current.sync_history(Current.hist.scrub(Current.hist.last_step))
+          .notify_info("Jumped to latest snapshot — press r again to reverse.")
+      else
+        { Current with rev_dialog = Current.rev_dialog.open }
+      end end
+    end
+
+  confirm_reverse: CONTABLE_STATE
+    do
+      let cur = Current.hist.latest
+      let idx = if Current.journal_sel < cur.entry_count then Current.journal_sel else 0 end
+      if idx < cur.entry_count and cur.can_reverse(idx) then
+        let orig = LIST_OPS.at(cur.entries, idx)
+        let next_l = cur.reverse_entry(idx, "2026-11-23")
+        let next_h = Current.hist.push(next_l)
+        let msg = GLYPHS.join("✓ Appended compensating reversal for #", NUMBER_TEXT.nat_to_text(orig.id))
+        { Current.sync_history(next_h) with journal_sel = 0, rev_dialog = Current.rev_dialog.clear_answer }
+          .notify_success(msg)
+      else
+        { Current with rev_dialog = Current.rev_dialog.clear_answer }
+          .notify_info("Cannot reverse: balance limit reached.")
+      end
+    end
+
+  submit_post_modal: CONTABLE_STATE
+    do
+      let cur = Current.hist.latest
+      match CONTABLE_PARSER.parse_transfer(Current.post_input.text, cur.next_entry_id, "2026-11-23", cur.account_count)
+        case None then
+          { Current with post_err = "Use: <debit#> <credit#> <amount> [memo] (distinct valid accounts)" }
+        case Some(entry) then
+          if cur.can_post(entry) then
+            let next_l = cur.post_entry(entry)
+            let next_h = Current.hist.push(next_l)
+            let msg = GLYPHS.join("✓ Posted #", GLYPHS.join(NUMBER_TEXT.nat_to_text(entry.id), " · Trial Balance = $0.00"))
+            { Current.sync_history(next_h) with journal_sel = 0, post_open = False, post_err = "" }
+              .notify_success(msg)
+          else
+            { Current with post_err = "Rejected: would exceed account overflow ceiling." }
+          end
+      end
+    end
+
+  apply_menu_choice(id: NAT): TUI_NEXT[CONTABLE_STATE]
+    do
+      if id = 10 then
+        TUI_NEXT.next(Current.sync_history(Current.hist.scrub(Current.hist.last_step)).notify_info("Jumped to latest snapshot"))
+      else if id = 12 then
+        TUI_NEXT.next({ Current with quit_dialog = Current.quit_dialog.open })
+      else if id = 20 then
+        TUI_NEXT.next({ Current with post_open = True, post_err = "" })
+      else if id = 21 then
+        TUI_NEXT.next(Current.open_reverse_confirm)
+      else if id = 22 then
+        TUI_NEXT.next({ Current with right_tabs = Current.right_tabs.choose(2) })
+      else if id >= 30 and id <= 32 then
+        TUI_NEXT.next(Current.load_preset(id - 30))
+      else if id >= 40 and id <= 43 then
+        let nt = id - 40
+        TUI_NEXT.next({ Current with theme_idx = nt }.notify_info("Theme updated"))
+      else if id = 50 then
+        TUI_NEXT.next({ Current with help_shown = True })
+      else if id = 51 then
+        TUI_NEXT.next(Current.notify_info("Conservation, overflow freedom & audit trail proved by Z3"))
+      else
+        TUI_NEXT.next(Current)
+      end end end end end end end end end
+    end
+
+  move_selection_up: CONTABLE_STATE
+    do
+      if Current.keys_at.has(0) then
+        let na = if Current.acct_sel > 0 then Current.acct_sel - 1 else 0 end
+        { Current with acct_sel = na }
+      else if Current.keys_at.has(1) then
+        let nj = if Current.journal_sel > 0 then Current.journal_sel - 1 else 0 end
+        { Current with journal_sel = nj }
+      else if Current.right_tabs.selected = 2 then
+        let vis = CONTABLE_LAYOUT.right_inner(Current.area).drop_top(5).height
+        { Current with contracts_view = Current.contracts_view.on_key(Up, vis) }
+      else
+        Current
+      end end end
+    end
+
+  move_selection_down: CONTABLE_STATE
+    do
+      if Current.keys_at.has(0) then
+        let max_a = Current.ledger.account_count - 1
+        let na = if Current.acct_sel < max_a then Current.acct_sel + 1 else max_a end
+        { Current with acct_sel = na }
+      else if Current.keys_at.has(1) then
+        let n_j = Current.ledger.entry_count
+        let nj = if n_j > 0 and Current.journal_sel < 18446744073709551615 and Current.journal_sel + 1 < n_j then
+          Current.journal_sel + 1
+        else
+          Current.journal_sel
+        end
+        { Current with journal_sel = nj }
+      else if Current.right_tabs.selected = 2 then
+        let vis = CONTABLE_LAYOUT.right_inner(Current.area).drop_top(5).height
+        { Current with contracts_view = Current.contracts_view.on_key(Down, vis) }
+      else
+        Current
+      end end end
+    end
+
+  handle_key(k: KEY): TUI_NEXT[CONTABLE_STATE]
+    do
+      if Current.quit_dialog.is_open then
+        match k
+          case KeysEnded then TUI_NEXT.quit(0)
+          case _ then
+            let next_dlg = Current.quit_dialog.on_key(k)
+            match next_dlg.answer
+              case Some(ans) then
+                if ans = 0 then TUI_NEXT.quit(0)
+                else TUI_NEXT.next({ Current with quit_dialog = next_dlg.clear_answer })
+                end
+              case None then TUI_NEXT.next({ Current with quit_dialog = next_dlg })
+            end
+        end
+      else if Current.rev_dialog.is_open then
+        match k
+          case KeysEnded then TUI_NEXT.quit(0)
+          case _ then
+            let next_dlg = Current.rev_dialog.on_key(k)
+            match next_dlg.answer
+              case Some(ans) then
+                if ans = 0 then TUI_NEXT.next(Current.confirm_reverse)
+                else TUI_NEXT.next({ Current with rev_dialog = next_dlg.clear_answer })
+                end
+              case None then TUI_NEXT.next({ Current with rev_dialog = next_dlg })
+            end
+        end
+      else if Current.post_open then
+        match k
+          case KeysEnded then TUI_NEXT.quit(0)
+          case Escape then TUI_NEXT.next({ Current with post_open = False, post_err = "" })
+          case Enter then TUI_NEXT.next(Current.submit_post_modal)
+          case _ then TUI_NEXT.next({ Current with post_input = Current.post_input.on_key(k), post_err = "" })
+        end
+      else if Current.bar_menu.is_open then
+        match k
+          case KeysEnded then TUI_NEXT.quit(0)
+          case _ then
+            let next_m = Current.bar_menu.on_key(k)
+            match next_m.chosen
+              case Some(id) then { Current with bar_menu = next_m.clear_chosen }.apply_menu_choice(id)
+              case None then TUI_NEXT.next({ Current with bar_menu = next_m })
+            end
+        end
+      else if Current.help_shown then
+        match k
+          case KeysEnded then TUI_NEXT.quit(0)
+          case Escape then TUI_NEXT.next({ Current with help_shown = False })
+          case Enter then TUI_NEXT.next({ Current with help_shown = False })
+          case Char(c) then
+            if c = '?' then TUI_NEXT.next({ Current with help_shown = False })
+            else if c = 'q' then TUI_NEXT.quit(0)
+            else TUI_NEXT.next(Current)
+            end end
+          case _ then TUI_NEXT.next({ Current with help_modal = Current.help_modal.on_key(k, Current.area) })
+        end
+      else
+        match k
+          case KeysEnded then TUI_NEXT.quit(0)
+          case Function(n) then
+            if n = 10 then TUI_NEXT.next({ Current with bar_menu = Current.bar_menu.open })
+            else TUI_NEXT.next(Current)
+            end
+          case Tab then TUI_NEXT.next({ Current with keys_at = Current.keys_at.next })
+          case Up then TUI_NEXT.next(Current.move_selection_up)
+          case Down then TUI_NEXT.next(Current.move_selection_down)
+          case Left then TUI_NEXT.next(Current.sync_history(Current.hist.step_back))
+          case Right then TUI_NEXT.next(Current.sync_history(Current.hist.step_forward))
+          case Home then TUI_NEXT.next(Current.sync_history(Current.hist.scrub(0)))
+          case End then TUI_NEXT.next(Current.sync_history(Current.hist.scrub(Current.hist.last_step)))
+          case Char(c) then
+            if c = 'q' then TUI_NEXT.quit(0)
+            else if c = 'n' then TUI_NEXT.next({ Current with post_open = True, post_err = "" })
+            else if c = 'r' then TUI_NEXT.next(Current.open_reverse_confirm)
+            else if c = 'k' then TUI_NEXT.next(Current.move_selection_up)
+            else if c = 'j' then TUI_NEXT.next(Current.move_selection_down)
+            else if c = '?' then TUI_NEXT.next({ Current with help_shown = True })
+            else if c = 't' then
+              let nt = if Current.theme_idx < 3 then Current.theme_idx + 1 else 0 end
+              TUI_NEXT.next({ Current with theme_idx = nt })
+            else if c = '1' then TUI_NEXT.next(Current.load_preset(0))
+            else if c = '2' then TUI_NEXT.next(Current.load_preset(1))
+            else if c = '3' then TUI_NEXT.next(Current.load_preset(2))
+            else if Current.right_tabs.takes(k) then
+              TUI_NEXT.next({ Current with right_tabs = Current.right_tabs.on_key(k) })
+            else
+              TUI_NEXT.next(Current)
+            end end end end end end end end end end end
+          case _ then TUI_NEXT.next(Current)
+        end
+      end end end end end
+    end
+
+  handle_mouse(m: MOUSE): TUI_NEXT[CONTABLE_STATE]
+    do
+      let area = Current.area
+      let menu_r = CONTABLE_LAYOUT.menu_bar(area)
+      if Current.quit_dialog.is_open then
+        let next_dlg = Current.quit_dialog.on_mouse(m, area)
+        match next_dlg.answer
+          case Some(ans) then
+            if ans = 0 then TUI_NEXT.quit(0)
+            else TUI_NEXT.next({ Current with quit_dialog = next_dlg.clear_answer })
+            end
+          case None then TUI_NEXT.next({ Current with quit_dialog = next_dlg })
+        end
+      else if Current.rev_dialog.is_open then
+        let next_dlg = Current.rev_dialog.on_mouse(m, area)
+        match next_dlg.answer
+          case Some(ans) then
+            if ans = 0 then TUI_NEXT.next(Current.confirm_reverse)
+            else TUI_NEXT.next({ Current with rev_dialog = next_dlg.clear_answer })
+            end
+          case None then TUI_NEXT.next({ Current with rev_dialog = next_dlg })
+        end
+      else if Current.post_open then
+        TUI_NEXT.next(Current)
+      else if Current.help_shown then
+        if Current.help_modal.contains(area, m.x, m.y) then
+          TUI_NEXT.next({ Current with help_modal = Current.help_modal.on_mouse(m, area) })
+        else if m.is_left_down then
+          TUI_NEXT.next({ Current with help_shown = False })
+        else
+          TUI_NEXT.next(Current)
+        end end
+      else if Current.bar_menu.is_open or Current.bar_menu.contains(menu_r, area, m.x, m.y) then
+        let next_m = Current.bar_menu.on_mouse(m, menu_r, area)
+        match next_m.chosen
+          case Some(id) then { Current with bar_menu = next_m.clear_chosen }.apply_menu_choice(id)
+          case None then TUI_NEXT.next({ Current with bar_menu = next_m })
+        end
+      else if m.is_left_down and Current.toast_queue.toast_id_at(area, m.x, m.y).is_some then
+        TUI_NEXT.next({ Current with toast_queue = Current.toast_queue.on_mouse(m, area) })
+      else
+        let tabs_r = CONTABLE_LAYOUT.right_tabs_area(area)
+        let b_new = CONTABLE_LAYOUT.btn_new_area(area)
+        let b_rev = CONTABLE_LAYOUT.btn_rev_area(area)
+        let b_back = CONTABLE_LAYOUT.btn_back_area(area)
+        let b_next = CONTABLE_LAYOUT.btn_next_area(area)
+        let sl_r = CONTABLE_LAYOUT.history_slider_area(area)
+        let a_in = CONTABLE_LAYOUT.accounts_inner(area)
+        let j_in = CONTABLE_LAYOUT.journal_inner(area)
+        if tabs_r.has(m.x, m.y) then
+          TUI_NEXT.next({ Current with right_tabs = Current.right_tabs.on_mouse(m, tabs_r), keys_at = Current.keys_at.moved_to(2) })
+        else if m.is_left_down and b_new.has(m.x, m.y) then
+          TUI_NEXT.next({ Current with post_open = True, post_err = "" })
+        else if m.is_left_down and b_rev.has(m.x, m.y) then
+          TUI_NEXT.next(Current.open_reverse_confirm)
+        else if m.is_left_down and b_back.has(m.x, m.y) then
+          TUI_NEXT.next(Current.sync_history(Current.hist.step_back))
+        else if m.is_left_down and b_next.has(m.x, m.y) then
+          TUI_NEXT.next(Current.sync_history(Current.hist.step_forward))
+        else if sl_r.has(m.x, m.y) then
+          let next_sl = Current.history_slider.on_mouse(m, sl_r)
+          TUI_NEXT.next({ Current.sync_history(Current.hist.scrub(next_sl.value)) with history_slider = next_sl })
+        else if a_in.has(m.x, m.y) then
+          let tbl = CONTABLE_PANELS.accounts_table(Current.ledger, Current.acct_sel, a_in.height).on_mouse(m, a_in)
+          TUI_NEXT.next({ Current with acct_sel = tbl.selected, keys_at = Current.keys_at.moved_to(0) })
+        else if j_in.has(m.x, m.y) then
+          let tbl = CONTABLE_PANELS.journal_table(Current.ledger, Current.journal_sel, j_in.height).on_mouse(m, j_in)
+          TUI_NEXT.next({ Current with journal_sel = tbl.selected, keys_at = Current.keys_at.moved_to(1) })
+        else
+          TUI_NEXT.next(Current)
+        end end end end end end end end
+      end end end end end end
+    end
+
+end

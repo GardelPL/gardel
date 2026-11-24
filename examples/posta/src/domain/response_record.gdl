@@ -1,0 +1,169 @@
+-- Completed HTTP response snapshot & live `gjson` validation helpers for `posta`.
+module RESPONSE_RECORD
+
+representation {NONE}
+  has_resp: BOOL
+  code: NAT
+  elapsed_ms: NAT
+  body_len: NAT
+  body_txt: STRING
+  json_ok: BOOL
+  json_status: STRING
+  err_txt: STRING
+  hdr_rows: LIST[LIST[STRING]]
+
+invariant
+  code_valid: not has_resp or (code >= 100 and code <= 599)
+
+create {ANY}
+
+  empty: RESPONSE_RECORD
+    do
+      { has_resp = False, code = 0, elapsed_ms = 0, body_len = 0,
+        body_txt = "Press Ctrl+S (or click Send) to execute an HTTP request.",
+        json_ok = False, json_status = "", err_txt = "", hdr_rows = LIST.empty }
+    ensure
+      none: not Result.has_response
+    end
+
+  from_error(msg: STRING, elapsed: NAT): RESPONSE_RECORD
+    do
+      let m = if msg.is_empty then "Request failed" else msg end
+      { has_resp = False, code = 0, elapsed_ms = elapsed, body_len = 0,
+        body_txt = m, json_ok = False, json_status = "", err_txt = m, hdr_rows = LIST.empty }
+    ensure
+      no_resp: not Result.has_response
+    end
+
+  row2(a: STRING, b: STRING): LIST[STRING]
+    do
+      let empty: LIST[STRING] = LIST.empty
+      empty.prepend(b).prepend(a)
+    end
+
+  header_rows_of(hs: LIST[HTTP_HEADER]): LIST[LIST[STRING]]
+    variant
+      hs.length
+    do
+      if hs.length = 0 then
+        LIST.empty
+      else
+        let h = hs.head
+        let row = RESPONSE_RECORD.row2(h.name, h.value)
+        RESPONSE_RECORD.header_rows_of(hs.tail).prepend(row)
+      end
+    end
+
+  validate_json_text(s: STRING): BOOL
+    do
+      match JSON.parse_text(s)
+        case Ok(_) then True
+        case Error(_) then False
+      end
+    end
+
+  json_badge(s: STRING): STRING
+    do
+      if s.is_empty then
+        "Empty body"
+      else
+        match JSON.parse_text(s)
+          case Ok(_) then "✓ Valid JSON (gjson)"
+          case Error(e) then
+            GLYPHS.join("✗ JSON error at byte ", NUMBER_TEXT.nat_to_text(e.offset))
+        end
+      end
+    end
+
+  from_http(q: HTTP_CLIENT_RESPONSE, elapsed: NAT): RESPONSE_RECORD
+    do
+      let b_len = q.body.length
+      let body_s =
+        match STRING.from_utf8(q.body)
+          case Ok(s) then s
+          case Error(_) then "<binary response body>"
+        end
+      let j_ok = if body_s.is_empty then False else RESPONSE_RECORD.validate_json_text(body_s) end
+      let j_st = if body_s.is_empty then "Empty body" else RESPONSE_RECORD.json_badge(body_s) end
+      let rows = RESPONSE_RECORD.header_rows_of(q.headers.fields)
+      { has_resp = True,
+        code = q.status_code,
+        elapsed_ms = elapsed,
+        body_len = b_len,
+        body_txt = if body_s.is_empty then "(empty response body)" else body_s end,
+        json_ok = j_ok,
+        json_status = j_st,
+        err_txt = "",
+        hdr_rows = rows }
+    ensure
+      present: Result.has_response
+      code_set: Result.status_code = q.status_code
+    end
+
+feature {ANY}
+
+  has_response: BOOL
+    do
+      Current.has_resp
+    end
+
+  has_error: BOOL
+    do
+      not Current.err_txt.is_empty
+    end
+
+  status_code: NAT
+    do
+      Current.code
+    end
+
+  elapsed: NAT
+    do
+      Current.elapsed_ms
+    end
+
+  byte_count: NAT
+    do
+      Current.body_len
+    end
+
+  body_text: STRING
+    do
+      Current.body_txt
+    end
+
+  is_json: BOOL
+    do
+      Current.json_ok
+    end
+
+  json_label: STRING
+    do
+      Current.json_status
+    end
+
+  error_message: STRING
+    do
+      Current.err_txt
+    end
+
+  header_rows: LIST[LIST[STRING]]
+    do
+      Current.hdr_rows
+    end
+
+  status_banner: STRING
+    do
+      if Current.has_resp then
+        let c_txt = NUMBER_TEXT.nat_to_text(Current.code)
+        let ms_txt = GLYPHS.join(NUMBER_TEXT.nat_to_text(Current.elapsed_ms), "ms")
+        let b_txt = GLYPHS.join(NUMBER_TEXT.nat_to_text(Current.body_len), " B")
+        GLYPHS.join(GLYPHS.join("HTTP ", c_txt), GLYPHS.join(" · ", GLYPHS.join(ms_txt, GLYPHS.join(" · ", b_txt))))
+      else if not Current.err_txt.is_empty then
+        GLYPHS.join("Error: ", Current.err_txt)
+      else
+        "Idle — no response yet"
+      end end
+    end
+
+end

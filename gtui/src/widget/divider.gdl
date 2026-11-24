@@ -1,0 +1,146 @@
+-- A horizontal or vertical rule with an optional aligned label on a horizontal rule.
+module DIVIDER
+
+representation {NONE}
+  horiz: BOOL
+  border: BORDER_KIND
+  title: STRING
+  align: ALIGN
+  pad: NAT
+
+create {ANY}
+
+  horizontal: DIVIDER
+    do
+      { horiz = True, border = BORDER_KIND.plain, title = "", align = ALIGN.left, pad = 1 }
+    ensure
+      is_horiz: Result.is_horizontal
+    end
+
+  vertical: DIVIDER
+    do
+      { horiz = False, border = BORDER_KIND.plain, title = "", align = ALIGN.left, pad = 1 }
+    ensure
+      is_vert: not Result.is_horizontal
+    end
+
+  titled(label: STRING): DIVIDER
+    do
+      DIVIDER.horizontal.with_label(label)
+    end
+
+feature {ANY}
+
+  is_horizontal: BOOL
+    do
+      Current.horiz
+    end
+
+  border_kind: BORDER_KIND
+    do
+      Current.border
+    end
+
+  label: STRING
+    do
+      Current.title
+    end
+
+  label_align: ALIGN
+    do
+      Current.align
+    end
+
+  label_padding: NAT
+    do
+      Current.pad
+    end
+
+  glyph: CHAR
+    do
+      if Current.horiz then Current.border.horizontal else Current.border.vertical end
+    end
+
+  with_border(k: BORDER_KIND): DIVIDER
+    do
+      { Current with border = k }
+    end
+
+  with_label(text: STRING): DIVIDER
+    do
+      { Current with title = text }
+    end
+
+  without_label: DIVIDER
+    do
+      { Current with title = "" }
+    end
+
+  with_align(a: ALIGN): DIVIDER
+    do
+      { Current with align = a }
+    end
+
+  with_padding(p: NAT): DIVIDER
+    do
+      { Current with pad = p }
+    end
+
+  -- Rectangle actually drawn by this divider inside `r`: top row (horizontal) or left column (vertical).
+  rule_area(r: RECT): RECT
+    do
+      if Current.horiz then r.take_top(1) else r.take_left(1) end
+    ensure
+      within: Result.inside(r)
+    end
+
+  -- Draw the rule inside `r` with `line_st` and any fitting label in `label_st`.
+  -- TODO(proof-GW.2): prove DIVIDER.draw modifies only cells in rule_area(r) and keeps end cells intact
+  draw_labeled(s: SCREEN, r: RECT, line_st: STYLE, label_st: STYLE): SCREEN
+    do
+      let area = Current.rule_area(r)
+      if area.is_empty then
+        s
+      else
+        let lined = s.fill(area, Current.glyph, line_st)
+        if not Current.horiz or Current.title.is_empty or area.width < 3 then
+          lined
+        else
+          let inner_w = area.width - 2
+          let pad = if Current.pad <= 32767 then Current.pad else 32767 end
+          let two_pad = 2 * pad
+          if inner_w <= two_pad then
+            lined
+          else
+            let max_label_w = inner_w - two_pad
+            let shown_w = GLYPHS.fitting_width(Current.title, max_label_w)
+            if shown_w = 0 then
+              lined
+            else
+              let total_w = shown_w + two_pad
+              let max_off = inner_w - total_w
+              let raw_off = Current.align.offset(total_w, inner_w)
+              let offset = if raw_off <= max_off then raw_off else max_off end
+              let start_x = area.x + 1 + offset
+              let clear_rect = RECT.make(start_x, area.y, total_w, 1)
+              let cleared = lined.fill(clear_rect, ' ', line_st)
+              let label_rect = RECT.make(start_x + pad, area.y, shown_w, 1)
+              cleared.text(label_rect, label_rect.x, area.y, Current.title, label_st)
+            end
+          end
+        end
+      end
+    ensure
+      same_width: Result.width = s.width
+      same_height: Result.height = s.height
+    end
+
+  draw(s: SCREEN, r: RECT, st: STYLE): SCREEN
+    do
+      Current.draw_labeled(s, r, st, st)
+    ensure
+      same_width: Result.width = s.width
+      same_height: Result.height = s.height
+    end
+
+end

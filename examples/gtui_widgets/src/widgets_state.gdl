@@ -1,0 +1,501 @@
+-- Application state for the `gtui_widgets` 0.6.0 showcase.
+module WIDGETS_STATE
+
+representation {NONE}
+  wide: NAT
+  high: NAT
+  bar_menu: MENU
+  path_crumbs: BREADCRUMB
+  wrap_chk: CHECKBOX
+  nums_chk: CHECKBOX
+  bold_chk: CHECKBOX
+  width_sld: SLIDER
+  indent_sld: SLIDER
+  apply_btn: BUTTON
+  toast_btn: BUTTON
+  reset_btn: BUTTON
+  focus_idx: NAT
+  toast_q: TOAST
+  toast_pos: NAT
+  toast_seq: NAT
+  active_dlg: DIALOG
+  dlg_mode: NAT
+  look: THEME
+  status_msg: STRING
+
+invariant
+  valid_size: wide <= 65535 and high <= 65535
+  valid_focus: focus_idx <= 7
+  valid_toast_pos: 1 <= toast_pos and toast_pos <= 6
+  valid_dlg_mode: dlg_mode <= 3
+
+create {ANY}
+
+  build_menu: MENU
+    do
+      let file_items: LIST[MENU_ITEM] =
+        LIST.empty
+          .prepend(MENU_ITEM.item("Quit", 13).with_shortcut("q"))
+          .prepend(MENU_ITEM.item("Export...", 12).with_enabled(False))
+          .prepend(MENU_ITEM.separator)
+          .prepend(MENU_ITEM.item("Reset Defaults", 11).with_shortcut("r"))
+          .prepend(MENU_ITEM.item("Apply Settings", 10))
+      let theme_items: LIST[MENU_ITEM] =
+        LIST.empty
+          .prepend(MENU_ITEM.item("Light", 26))
+          .prepend(MENU_ITEM.item("Dracula", 25))
+          .prepend(MENU_ITEM.item("Nord", 24))
+          .prepend(MENU_ITEM.item("Dark", 23))
+      let ctrl_items: LIST[MENU_ITEM] =
+        LIST.empty
+          .prepend(MENU_ITEM.submenu("Theme", theme_items))
+          .prepend(MENU_ITEM.separator)
+          .prepend(MENU_ITEM.item("Toggle Bold Heading", 22))
+          .prepend(MENU_ITEM.item("Toggle Line Numbers", 21))
+          .prepend(MENU_ITEM.item("Toggle Wrap Preview", 20))
+      let toast_items: LIST[MENU_ITEM] =
+        LIST.empty
+          .prepend(MENU_ITEM.item("Clear All", 35).with_shortcut("c"))
+          .prepend(MENU_ITEM.item("Cycle Position", 34).with_shortcut("p"))
+          .prepend(MENU_ITEM.separator)
+          .prepend(MENU_ITEM.item("Push Error", 33).with_shortcut("e"))
+          .prepend(MENU_ITEM.item("Push Warning", 32).with_shortcut("w"))
+          .prepend(MENU_ITEM.item("Push Success", 31).with_shortcut("s"))
+          .prepend(MENU_ITEM.item("Push Info", 30).with_shortcut("i"))
+      let help_items: LIST[MENU_ITEM] =
+        LIST.empty
+          .prepend(MENU_ITEM.item("About Studio", 40))
+      let entries: LIST[MENU_ITEM] =
+        LIST.empty
+          .prepend(MENU_ITEM.submenu("Help", help_items))
+          .prepend(MENU_ITEM.submenu("Toast", toast_items))
+          .prepend(MENU_ITEM.submenu("Controls", ctrl_items))
+          .prepend(MENU_ITEM.submenu("File", file_items))
+      MENU.make(entries)
+    end
+
+  build_crumbs: BREADCRUMB
+    do
+      let cs: LIST[STRING] =
+        LIST.empty
+          .prepend("Preview")
+          .prepend("Appearance")
+          .prepend("Studio")
+      BREADCRUMB.make(cs).choose(2)
+    end
+
+  pos_name(pos: NAT): STRING
+    do
+      if pos = 1 then "top-left"
+      else if pos = 2 then "top-center"
+      else if pos = 3 then "top-right"
+      else if pos = 4 then "bottom-left"
+      else if pos = 5 then "bottom-center"
+      else "bottom-right"
+      end end end end end
+    end
+
+  next_pos(pos: NAT): NAT
+    do
+      if pos = 3 then 6
+      else if pos = 6 then 5
+      else if pos = 5 then 4
+      else if pos = 4 then 1
+      else if pos = 1 then 2
+      else 3
+      end end end end end
+    ensure
+      valid: 1 <= Result and Result <= 6
+    end
+
+  next_theme(t: THEME): THEME
+    do
+      if t.name.equals("dark") then THEME.nord
+      else if t.name.equals("nord") then THEME.dracula
+      else if t.name.equals("dracula") then THEME.light
+      else THEME.dark
+      end end end
+    end
+
+  make: WIDGETS_STATE
+    do
+      let q0 = TOAST.empty.with_position(TOAST.top_right).push_info("Welcome to gtui 0.6.0 Studio!", 4000)
+      { wide = 80, high = 24,
+        bar_menu = WIDGETS_STATE.build_menu,
+        path_crumbs = WIDGETS_STATE.build_crumbs,
+        wrap_chk = CHECKBOX.make("Wrap preview", True),
+        nums_chk = CHECKBOX.make("Line numbers", True),
+        bold_chk = CHECKBOX.make("Bold heading", True),
+        width_sld = SLIDER.make(20, 80, 5, 60).with_label,
+        indent_sld = SLIDER.make(0, 8, 1, 2).with_label,
+        apply_btn = BUTTON.make("Apply"),
+        toast_btn = BUTTON.make("Toast"),
+        reset_btn = BUTTON.make("Reset"),
+        focus_idx = 0,
+        toast_q = q0,
+        toast_pos = 3,
+        toast_seq = 1,
+        active_dlg = DIALOG.confirm("Quit?", "Exit the gtui 0.6.0 widgets studio?").with_border(BORDER_KIND.rounded),
+        dlg_mode = 0,
+        look = THEME.dark,
+        status_msg = "Ready" }
+    end
+
+feature {ANY}
+
+  area: RECT do RECT.make(0, 0, Current.wide, Current.high) end
+  menu: MENU do Current.bar_menu end
+  crumbs: BREADCRUMB do Current.path_crumbs end
+  wrap_checkbox: CHECKBOX do Current.wrap_chk end
+  nums_checkbox: CHECKBOX do Current.nums_chk end
+  bold_checkbox: CHECKBOX do Current.bold_chk end
+  width_slider: SLIDER do Current.width_sld end
+  indent_slider: SLIDER do Current.indent_sld end
+  apply_button: BUTTON do Current.apply_btn end
+  toast_button: BUTTON do Current.toast_btn end
+  reset_button: BUTTON do Current.reset_btn end
+  focus: NAT do Current.focus_idx end
+  toasts: TOAST do Current.toast_q end
+  toast_position: NAT do Current.toast_pos end
+  dialog: DIALOG do Current.active_dlg end
+  dialog_open: BOOL do Current.active_dlg.is_open end
+  theme: THEME do Current.look end
+  last_action: STRING do Current.status_msg end
+
+  sized(w: NAT, h: NAT): WIDGETS_STATE
+    do
+      let cw = if w <= 65535 then w else 65535 end
+      let ch = if h <= 65535 then h else 65535 end
+      { Current with wide = cw, high = ch }
+    end
+
+  section_title: STRING
+    do
+      if Current.path_crumbs.has_selection then
+        let i = Current.path_crumbs.selected
+        if i = 0 then "Studio Overview"
+        else if i = 1 then "Appearance Controls"
+        else "Live Preview"
+        end end
+      else
+        "Live Preview"
+      end
+    end
+
+  preview_paragraph: PARAGRAPH
+    do
+      let p1 = if Current.nums_chk.is_checked then "1 | " else "" end
+      let p2 = if Current.nums_chk.is_checked then "2 | " else "" end
+      let p3 = if Current.nums_chk.is_checked then "3 | " else "" end
+      let p4 = if Current.nums_chk.is_checked then "4 | " else "" end
+      let sec = Current.section_title
+      let l1 = GLYPHS.join(p1, GLYPHS.join("Section: ", sec))
+      let l2 = GLYPHS.join(p2, GLYPHS.join("Width = ", GLYPHS.join(NUMBER_TEXT.nat_to_text(Current.width_sld.value),
+        GLYPHS.join(", Indent = ", NUMBER_TEXT.nat_to_text(Current.indent_sld.value)))))
+      let l3 = GLYPHS.join(p3, GLYPHS.join("Theme = ", GLYPHS.join(Current.look.name,
+        GLYPHS.join(", Toast = ", WIDGETS_STATE.pos_name(Current.toast_pos)))))
+      let body_txt = "gtui 0.6.0 widgets use pure functional value semantics with verified geometry and bounds."
+      let l4 = GLYPHS.join(p4, body_txt)
+      let lines: LIST[STRING] = LIST.empty.prepend(l4).prepend(l3).prepend(l2).prepend(l1)
+      let base = PARAGRAPH.make(lines)
+      if Current.wrap_chk.is_checked then base.wrap_word else base.no_wrap end
+    end
+
+  push_next_toast: WIDGETS_STATE
+    do
+      let k = Current.toast_seq % 4
+      let next_seq = if Current.toast_seq < 1000000 then Current.toast_seq + 1 else 0 end
+      let q =
+        if k = 0 then Current.toast_q.push_info("Info: pure value widget updated.", 3500)
+        else if k = 1 then Current.toast_q.push_success("Success: settings applied cleanly.", 3500)
+        else if k = 2 then Current.toast_q.push_warning("Warning: indent exceeds default.", 3500)
+        else Current.toast_q.push_error("Error: simulated alert notification.", 3500)
+        end end end
+      { Current with toast_q = q, toast_seq = next_seq, status_msg = "Pushed toast" }
+    end
+
+  apply_settings: WIDGETS_STATE
+    do
+      let msg = GLYPHS.join("Applied (w=", GLYPHS.join(NUMBER_TEXT.nat_to_text(Current.width_sld.value),
+        GLYPHS.join(", i=", GLYPHS.join(NUMBER_TEXT.nat_to_text(Current.indent_sld.value), ")"))))
+      { Current with toast_q = Current.toast_q.push_success(msg, 3500), status_msg = msg }
+    end
+
+  open_reset_dialog: WIDGETS_STATE
+    do
+      let d = DIALOG.confirm("Reset Defaults?", "Restore all checkboxes and sliders to defaults?")
+        .with_border(BORDER_KIND.rounded).open
+      { Current with active_dlg = d, dlg_mode = 1, status_msg = "Confirm reset?" }
+    end
+
+  open_quit_dialog: WIDGETS_STATE
+    do
+      let d = DIALOG.confirm("Quit Studio?", "Exit the gtui 0.6.0 widgets studio?")
+        .with_border(BORDER_KIND.rounded).open
+      { Current with active_dlg = d, dlg_mode = 2, status_msg = "Confirm quit?" }
+    end
+
+  open_about_dialog: WIDGETS_STATE
+    do
+      let d = DIALOG.alert("About gtui 0.6.0", "Showcasing MENU, BREADCRUMB, DIVIDER, CHECKBOX, SLIDER, BUTTON, DIALOG, and TOAST.")
+        .with_border(BORDER_KIND.rounded).open
+      { Current with active_dlg = d, dlg_mode = 3, status_msg = "About dialog" }
+    end
+
+  restore_defaults: WIDGETS_STATE
+    do
+      { Current with
+        wrap_chk = CHECKBOX.make("Wrap preview", True),
+        nums_chk = CHECKBOX.make("Line numbers", True),
+        bold_chk = CHECKBOX.make("Bold heading", True),
+        width_sld = SLIDER.make(20, 80, 5, 60).with_label,
+        indent_sld = SLIDER.make(0, 8, 1, 2).with_label,
+        path_crumbs = WIDGETS_STATE.build_crumbs,
+        toast_q = Current.toast_q.push_info("Defaults restored.", 3500),
+        status_msg = "Defaults restored" }
+    end
+
+  cycle_toast_position: WIDGETS_STATE
+    do
+      let np = WIDGETS_STATE.next_pos(Current.toast_pos)
+      let name = WIDGETS_STATE.pos_name(np)
+      let msg = GLYPHS.join("Toast position: ", name)
+      { Current with toast_pos = np, toast_q = Current.toast_q.with_position(np).push_info(msg, 3000), status_msg = msg }
+    end
+
+  handle_dialog_result(next_dlg: DIALOG): TUI_NEXT[WIDGETS_STATE]
+    do
+      match next_dlg.answer
+        case Some(ans) then
+          let cleared = next_dlg.clear_answer
+          if Current.dlg_mode = 2 and ans = 0 then
+            TUI_NEXT.quit(0)
+          else if Current.dlg_mode = 1 and ans = 0 then
+            TUI_NEXT.next({ Current with active_dlg = cleared, dlg_mode = 0 }.restore_defaults)
+          else
+            TUI_NEXT.next({ Current with active_dlg = cleared, dlg_mode = 0, status_msg = "Dialog closed" })
+          end end
+        case None then
+          TUI_NEXT.next({ Current with active_dlg = next_dlg })
+      end
+    end
+
+  run_menu_action(id: NAT): TUI_NEXT[WIDGETS_STATE]
+    do
+      if id = 10 then TUI_NEXT.next(Current.apply_settings)
+      else if id = 11 then TUI_NEXT.next(Current.open_reset_dialog)
+      else if id = 13 then TUI_NEXT.next(Current.open_quit_dialog)
+      else if id = 20 then TUI_NEXT.next({ Current with wrap_chk = Current.wrap_chk.toggle, status_msg = "Toggled Wrap" })
+      else if id = 21 then TUI_NEXT.next({ Current with nums_chk = Current.nums_chk.toggle, status_msg = "Toggled Line numbers" })
+      else if id = 22 then TUI_NEXT.next({ Current with bold_chk = Current.bold_chk.toggle, status_msg = "Toggled Bold heading" })
+      else if id = 23 then TUI_NEXT.next({ Current with look = THEME.dark, status_msg = "Theme: dark" })
+      else if id = 24 then TUI_NEXT.next({ Current with look = THEME.nord, status_msg = "Theme: nord" })
+      else if id = 25 then TUI_NEXT.next({ Current with look = THEME.dracula, status_msg = "Theme: dracula" })
+      else if id = 26 then TUI_NEXT.next({ Current with look = THEME.light, status_msg = "Theme: light" })
+      else if id = 30 then TUI_NEXT.next({ Current with toast_q = Current.toast_q.push_info("Info notification.", 3500), status_msg = "Info toast" })
+      else if id = 31 then TUI_NEXT.next({ Current with toast_q = Current.toast_q.push_success("Success notification.", 3500), status_msg = "Success toast" })
+      else if id = 32 then TUI_NEXT.next({ Current with toast_q = Current.toast_q.push_warning("Warning notification.", 3500), status_msg = "Warning toast" })
+      else if id = 33 then TUI_NEXT.next({ Current with toast_q = Current.toast_q.push_error("Error notification.", 3500), status_msg = "Error toast" })
+      else if id = 34 then TUI_NEXT.next(Current.cycle_toast_position)
+      else if id = 35 then TUI_NEXT.next({ Current with toast_q = Current.toast_q.clear, status_msg = "Toasts cleared" })
+      else if id = 40 then TUI_NEXT.next(Current.open_about_dialog)
+      else TUI_NEXT.next(Current)
+      end end end end end end end end end end end end end end end end end
+    end
+
+  activate_focused: WIDGETS_STATE
+    do
+      if Current.focus_idx = 0 then { Current with wrap_chk = Current.wrap_chk.toggle, status_msg = "Toggled Wrap" }
+      else if Current.focus_idx = 1 then { Current with nums_chk = Current.nums_chk.toggle, status_msg = "Toggled Line numbers" }
+      else if Current.focus_idx = 2 then { Current with bold_chk = Current.bold_chk.toggle, status_msg = "Toggled Bold heading" }
+      else if Current.focus_idx = 3 then { Current with width_sld = Current.width_sld.increase, status_msg = "Width stepped" }
+      else if Current.focus_idx = 4 then { Current with indent_sld = Current.indent_sld.increase, status_msg = "Indent stepped" }
+      else if Current.focus_idx = 5 then Current.apply_settings
+      else if Current.focus_idx = 6 then Current.push_next_toast
+      else Current.open_reset_dialog
+      end end end end end end end
+    end
+
+  on_char(c: CHAR): TUI_NEXT[WIDGETS_STATE]
+    do
+      if c = ' ' then TUI_NEXT.next(Current.activate_focused)
+      else if c = 'q' then TUI_NEXT.next(Current.open_quit_dialog)
+      else if c = 'r' then TUI_NEXT.next(Current.open_reset_dialog)
+      else if c = 't' then
+        let nt = WIDGETS_STATE.next_theme(Current.look)
+        TUI_NEXT.next({ Current with look = nt, status_msg = GLYPHS.join("Theme: ", nt.name) })
+      else if c = 'i' then TUI_NEXT.next({ Current with toast_q = Current.toast_q.push_info("Info toast pushed.", 3500), status_msg = "Info toast" })
+      else if c = 's' then TUI_NEXT.next({ Current with toast_q = Current.toast_q.push_success("Success toast pushed.", 3500), status_msg = "Success toast" })
+      else if c = 'w' then TUI_NEXT.next({ Current with toast_q = Current.toast_q.push_warning("Warning toast pushed.", 3500), status_msg = "Warning toast" })
+      else if c = 'e' then TUI_NEXT.next({ Current with toast_q = Current.toast_q.push_error("Error toast pushed.", 3500), status_msg = "Error toast" })
+      else if c = 'p' then TUI_NEXT.next(Current.cycle_toast_position)
+      else if c = 'c' then TUI_NEXT.next({ Current with toast_q = Current.toast_q.clear, status_msg = "Toasts cleared" })
+      else TUI_NEXT.next(Current)
+      end end end end end end end end end end
+    end
+
+  on_nav_key(k: KEY, is_lr: BOOL): TUI_NEXT[WIDGETS_STATE]
+    do
+      if Current.focus_idx = 3 then TUI_NEXT.next({ Current with width_sld = Current.width_sld.on_key(k) })
+      else if Current.focus_idx = 4 then TUI_NEXT.next({ Current with indent_sld = Current.indent_sld.on_key(k) })
+      else if is_lr then TUI_NEXT.next({ Current with path_crumbs = Current.path_crumbs.on_key(k) })
+      else TUI_NEXT.next(Current)
+      end end end
+    end
+
+  on_mod_key(inner: KEY, shift: BOOL, alt: BOOL, ctrl: BOOL): TUI_NEXT[WIDGETS_STATE]
+    do
+      if shift and not alt and not ctrl then
+        match inner
+          case Tab then
+            let pf = if Current.focus_idx > 0 then Current.focus_idx - 1 else 7 end
+            TUI_NEXT.next({ Current with focus_idx = pf })
+          case _ then TUI_NEXT.next(Current)
+        end
+      else if alt and not ctrl then
+        match inner
+          case Char(ch) then
+            match Current.bar_menu.entry_with_initial(ch)
+              case Some(i) then TUI_NEXT.next({ Current with bar_menu = Current.bar_menu.open_entry(i), status_msg = "Menu open" })
+              case None then TUI_NEXT.next(Current)
+            end
+          case _ then TUI_NEXT.next(Current)
+        end
+      else
+        TUI_NEXT.next(Current)
+      end end
+    end
+
+  on_key_normal(k: KEY): TUI_NEXT[WIDGETS_STATE]
+    do
+      match k
+        case KeysEnded then TUI_NEXT.quit(0)
+        case Function(n) then
+          if n = 10 then TUI_NEXT.next({ Current with bar_menu = Current.bar_menu.open, status_msg = "Menu open" })
+          else TUI_NEXT.next(Current)
+          end
+        case Tab then
+          let nf = if Current.focus_idx < 7 then Current.focus_idx + 1 else 0 end
+          TUI_NEXT.next({ Current with focus_idx = nf })
+        case Enter then TUI_NEXT.next(Current.activate_focused)
+        case Left then Current.on_nav_key(k, True)
+        case Right then Current.on_nav_key(k, True)
+        case Home then Current.on_nav_key(k, False)
+        case End then Current.on_nav_key(k, False)
+        case Mod(inner, shift, alt, ctrl) then Current.on_mod_key(inner, shift, alt, ctrl)
+        case Char(c) then Current.on_char(c)
+        case _ then TUI_NEXT.next(Current)
+      end
+    end
+
+  on_dialog_key(k: KEY): TUI_NEXT[WIDGETS_STATE]
+    do
+      match k
+        case KeysEnded then TUI_NEXT.quit(0)
+        case _ then Current.handle_dialog_result(Current.active_dlg.on_key(k))
+      end
+    end
+
+  on_menu_key(k: KEY): TUI_NEXT[WIDGETS_STATE]
+    do
+      match k
+        case KeysEnded then TUI_NEXT.quit(0)
+        case _ then
+          let nm = Current.bar_menu.on_key(k)
+          match nm.chosen
+            case Some(id) then { Current with bar_menu = nm.clear_chosen }.run_menu_action(id)
+            case None then TUI_NEXT.next({ Current with bar_menu = nm })
+          end
+      end
+    end
+
+  on_dialog_mouse(m: MOUSE): TUI_NEXT[WIDGETS_STATE]
+    do
+      Current.handle_dialog_result(Current.active_dlg.on_mouse(m, Current.area))
+    end
+
+  menu_handles_mouse(m: MOUSE): BOOL
+    do
+      let a = Current.area
+      let menu_r = WIDGETS_LAYOUT.menu_bar(a)
+      Current.bar_menu.is_open or Current.bar_menu.contains(menu_r, a, m.x, m.y)
+    end
+
+  on_menu_mouse(m: MOUSE): TUI_NEXT[WIDGETS_STATE]
+    do
+      let a = Current.area
+      let menu_r = WIDGETS_LAYOUT.menu_bar(a)
+      let nm = Current.bar_menu.on_mouse(m, menu_r, a)
+      match nm.chosen
+        case Some(id) then { Current with bar_menu = nm.clear_chosen }.run_menu_action(id)
+        case None then TUI_NEXT.next({ Current with bar_menu = nm })
+      end
+    end
+
+  on_mouse_controls(m: MOUSE, a: RECT): TUI_NEXT[WIDGETS_STATE]
+    do
+      let w_chk_r = WIDGETS_LAYOUT.chk_wrap_area(a)
+      let n_chk_r = WIDGETS_LAYOUT.chk_nums_area(a)
+      let b_chk_r = WIDGETS_LAYOUT.chk_bold_area(a)
+      let w_sld_r = WIDGETS_LAYOUT.sld_width_area(a)
+      let i_sld_r = WIDGETS_LAYOUT.sld_indent_area(a)
+      if Current.wrap_chk.hit(w_chk_r, m.x, m.y) then
+        TUI_NEXT.next({ Current with focus_idx = 0, wrap_chk = Current.wrap_chk.on_mouse(m, w_chk_r), status_msg = "Toggled Wrap" })
+      else if Current.nums_chk.hit(n_chk_r, m.x, m.y) then
+        TUI_NEXT.next({ Current with focus_idx = 1, nums_chk = Current.nums_chk.on_mouse(m, n_chk_r), status_msg = "Toggled Line numbers" })
+      else if Current.bold_chk.hit(b_chk_r, m.x, m.y) then
+        TUI_NEXT.next({ Current with focus_idx = 2, bold_chk = Current.bold_chk.on_mouse(m, b_chk_r), status_msg = "Toggled Bold heading" })
+      else if w_sld_r.has(m.x, m.y) then
+        TUI_NEXT.next({ Current with focus_idx = 3, width_sld = Current.width_sld.on_mouse(m, w_sld_r), status_msg = "Width updated" })
+      else if i_sld_r.has(m.x, m.y) then
+        TUI_NEXT.next({ Current with focus_idx = 4, indent_sld = Current.indent_sld.on_mouse(m, i_sld_r), status_msg = "Indent updated" })
+      else
+        Current.on_mouse_buttons(m, a)
+      end end end end end
+    end
+
+  on_mouse_buttons(m: MOUSE, a: RECT): TUI_NEXT[WIDGETS_STATE]
+    do
+      let apply_r = WIDGETS_LAYOUT.btn_apply_area(a)
+      let toast_r = WIDGETS_LAYOUT.btn_toast_area(a)
+      let reset_r = WIDGETS_LAYOUT.btn_reset_area(a)
+      if Current.apply_btn.hit(apply_r, m.x, m.y) then
+        TUI_NEXT.next({ Current with focus_idx = 5 }.apply_settings)
+      else if Current.toast_btn.hit(toast_r, m.x, m.y) then
+        TUI_NEXT.next({ Current with focus_idx = 6 }.push_next_toast)
+      else if Current.reset_btn.hit(reset_r, m.x, m.y) then
+        TUI_NEXT.next({ Current with focus_idx = 7 }.open_reset_dialog)
+      else
+        TUI_NEXT.next(Current)
+      end end end
+    end
+
+  on_mouse_normal(m: MOUSE): TUI_NEXT[WIDGETS_STATE]
+    do
+      let a = Current.area
+      if m.is_left_down then
+        match Current.toast_q.toast_id_at(WIDGETS_LAYOUT.body(a), m.x, m.y)
+          case Some(tid) then
+            TUI_NEXT.next({ Current with toast_q = Current.toast_q.dismiss_id(tid), status_msg = "Toast dismissed" })
+          case None then
+            let bc_r = WIDGETS_LAYOUT.breadcrumb_bar(a)
+            if bc_r.has(m.x, m.y) then
+              TUI_NEXT.next({ Current with path_crumbs = Current.path_crumbs.on_mouse(m, bc_r), status_msg = "Breadcrumb selected" })
+            else
+              Current.on_mouse_controls(m, a)
+            end
+        end
+      else
+        let w_sld_r = WIDGETS_LAYOUT.sld_width_area(a)
+        let i_sld_r = WIDGETS_LAYOUT.sld_indent_area(a)
+        if w_sld_r.has(m.x, m.y) then
+          TUI_NEXT.next({ Current with focus_idx = 3, width_sld = Current.width_sld.on_mouse(m, w_sld_r) })
+        else if i_sld_r.has(m.x, m.y) then
+          TUI_NEXT.next({ Current with focus_idx = 4, indent_sld = Current.indent_sld.on_mouse(m, i_sld_r) })
+        else
+          TUI_NEXT.next(Current)
+        end end
+      end
+    end
+
+end

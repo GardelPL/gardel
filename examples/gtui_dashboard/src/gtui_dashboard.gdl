@@ -55,19 +55,25 @@ feature {ANY}
       let s6 = s.cache_gauge.draw(s5, g2_rect, t.gutter, t.keyword)
       let s7 = s.sparkline.draw(s6, sp_rect, t.comment.patch(STYLE.plain.fg(COLOR.yellow)))
 
-      -- 3. Bottom pane: Framed PARAGRAPH inspector with live wrap & alignment modes.
+      -- 3. Bottom pane: Framed PARAGRAPH inspector + DIVIDERs + CHECKBOXes + SLIDER.
       let meta = GLYPHS.join(GLYPHS.join("wrap:", s.wrap_name), GLYPHS.join(" align:", s.align_name))
       let s8 = FRAME.draw_titled(s7, bottom, kind, "Inspector", meta, "", t.border, t.active_tab)
-      let s9 = s.inspector.draw(s8, DASH_LAYOUT.inspector_area(area), t.base)
+      let s9 = s.inspector.draw(s8, DASH_LAYOUT.inspector_notes_area(area), t.base)
+      let s9a = DIVIDER.vertical.with_border(kind).draw(s9, DASH_LAYOUT.inspector_divider_area(area), t.border)
+      let s9b = s.auto_checkbox.draw(s9a, DASH_LAYOUT.auto_checkbox_area(area), t.base, False)
+      let s9c = s.finished_checkbox.draw(s9b, DASH_LAYOUT.finished_checkbox_area(area), t.base, False)
+      let s9d = DIVIDER.horizontal.with_border(kind).with_label("Rate").draw_labeled(s9c, DASH_LAYOUT.rate_divider_area(area), t.border, t.keyword)
+      let s9e = s.rate_slider.draw(s9d, DASH_LAYOUT.rate_slider_area(area), t.gutter, t.string, t.active_tab)
 
-      -- 4. Status bar + optional Help POPUP overlay.
+      -- 4. Status bar + TOAST notifications + optional Help POPUP overlay.
       let left_status = GLYPHS.join("Theme: ", t.name)
-      let right_status = "t:theme b:border w:wrap a:align Space:tick ?:help q:quit"
-      let s10 = STATUS_BAR.draw(s9, status_rect, left_status, right_status, t.selection)
+      let right_status = "t:theme b:border w/a:wrap r/f:chk +/-:rate s:toast ?:help q:quit"
+      let s10 = STATUS_BAR.draw(s9e, status_rect, left_status, right_status, t.selection)
+      let s11 = s.toasts.with_border(kind).draw(s10, area, t.base, t.focused_border, t.string, t.active_tab, t.keyword)
       if s.help_open then
-        s.help_popup.draw(s10, area, t.base, t.focused_border, t.active_tab)
+        s.help_popup.draw(s11, area, t.base, t.focused_border, t.active_tab)
       else
-        s10
+        s11
       end
     end
 

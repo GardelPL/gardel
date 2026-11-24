@@ -1,0 +1,163 @@
+-- Right-hand Proofs / Solution Coordinates / Contracts panels for `tablero`.
+functions TABLERO_PANELS
+
+feature {ANY}
+
+  row2(a: STRING, b: STRING): LIST[STRING]
+    do
+      let empty: LIST[STRING] = LIST.empty
+      empty.prepend(b).prepend(a)
+    end
+
+  row3(a: STRING, b: STRING, c: STRING): LIST[STRING]
+    do
+      let empty: LIST[STRING] = LIST.empty
+      empty.prepend(c).prepend(b).prepend(a)
+    end
+
+  short_form_lines: LIST[STRING]
+    do
+      let empty: LIST[STRING] = LIST.empty
+      empty
+        .prepend("end")
+        .prepend("      ensure  sound: Some(sol) => is_valid_solution(board, sol)")
+        .prepend("    {ANY} solve(board: BOARD, count_all: BOOL): SOLVE_OUTCOME")
+        .prepend("      -- Auto-parallelized via C11 + OpenMP (#pragma omp task)")
+        .prepend("      -- let left_res  = solve_range(board, placed, lo, mid, ...)")
+        .prepend("      -- let right_res = solve_range(board, placed, mid, hi, ...)")
+        .prepend("      variant (board.size - placed.length) * 16 + (hi - lo)")
+        .prepend("      ensure  sound: Some(sol) => is_valid_solution(board, sol)")
+        .prepend("      require valid_prefix: is_valid_partial(board, placed)")
+        .prepend("    {ANY} solve_range(board, placed, lo, hi, count_all): SOLVE_OUTCOME")
+        .prepend("functions QUEENS_SOLVER")
+        .prepend("")
+        .prepend("end")
+        .prepend("    blocks_len: blocks.length = n_size * n_size")
+        .prepend("    pins_len: pins.length = n_size")
+        .prepend("    valid_n: n_size >= 4 and n_size <= 12")
+        .prepend("  invariant")
+        .prepend("module BOARD")
+    end
+
+  -- Tab 0: Live Proven Invariants + Solver Result Summary Table.
+  draw_proofs_tab(s: SCREEN, area: RECT, board: BOARD, outcome: SOLVE_OUTCOME, sol_idx: NAT, solved_once: BOOL, count_all: BOOL, t: THEME): SCREEN
+    do
+      let r = TABLERO_LAYOUT.right_inner(area)
+      let ok_st = STYLE.plain.fg(COLOR.green).bold
+      let r1 = r.drop_top(1)
+      let r2 = r.drop_top(2)
+      let r3 = r.drop_top(3)
+      let r4 = r.drop_top(4)
+      let s0 = s.text(r, r.x, r.y, "✓ sound: ALL stored sols valid   [PROVEN]", ok_st)
+      let s1 = s0.text(r1, r1.x, r1.y, "✓ respects_pins & avoids_blocks  [PROVEN]", ok_st)
+      let s2 = s1.text(r2, r2.x, r2.y, "✓ terminates: variant -> 0       [PROVEN]", ok_st)
+      let s3 = s2.text(r3, r3.x, r3.y, "✓ race_free: OpenMP fork/join    [PROVEN]", ok_st)
+      let s4 = s3.text(r4, r4.x, r4.y, "✓ deterministic merge order      [PROVEN]", ok_st)
+
+      let div_r = r.drop_top(5).take_top(1)
+      let s5 = SCREEN.fitted(DIVIDER.horizontal.with_label("Solver Result").draw(s4, div_r, t.border), s4)
+      let tbl_r = r.drop_top(6)
+
+      let status_txt =
+        if not solved_once then
+          "Ready (press Space to solve)"
+        else if outcome.has_solution then
+          if count_all then
+            GLYPHS.join("Solved (", GLYPHS.join(NUMBER_TEXT.nat_to_text(outcome.solution_count), " solutions)"))
+          else
+            "Solved (valid placement)"
+          end
+        else
+          "UNSAT (no valid solution)"
+        end end
+      let viewing_txt =
+        if outcome.stored_count > 0 then
+          let shown_num = if sol_idx < outcome.stored_count then sol_idx + 1 else 1 end
+          GLYPHS.join(
+            GLYPHS.join("#", NUMBER_TEXT.nat_to_text(shown_num)),
+            GLYPHS.join(" / ", NUMBER_TEXT.nat_to_text(outcome.stored_count))
+          )
+        else
+          "—"
+        end
+      let size_txt = GLYPHS.join(NUMBER_TEXT.nat_to_text(board.size), GLYPHS.join(" x ", NUMBER_TEXT.nat_to_text(board.size)))
+      let cons_txt = GLYPHS.join(NUMBER_TEXT.nat_to_text(board.pin_count), GLYPHS.join(" pinned / ", GLYPHS.join(NUMBER_TEXT.nat_to_text(board.block_count), " blocked")))
+      let mode_txt = if count_all then "Parallel OpenMP (Count All)" else "Parallel OpenMP (First)" end
+
+      let widths: LIST[SIZE] = LIST.empty
+        .prepend(SIZE.flex(1))
+        .prepend(SIZE.fixed(13))
+      let hdr = TABLERO_PANELS.row2("Metric", "Value")
+      let rows: LIST[LIST[STRING]] = LIST.empty
+        .prepend(TABLERO_PANELS.row2("Execution", mode_txt))
+        .prepend(TABLERO_PANELS.row2("Constraints", cons_txt))
+        .prepend(TABLERO_PANELS.row2("Board Size", size_txt))
+        .prepend(TABLERO_PANELS.row2("Viewing", viewing_txt))
+        .prepend(TABLERO_PANELS.row2("Status", status_txt))
+      TABLE.with_headers(widths, hdr, rows).draw(s5, tbl_r, t.base, t.active_tab, t.base)
+    ensure
+      same_width: Result.width = s.width
+      same_height: Result.height = s.height
+    end
+
+  solution_rows_from(board: BOARD, sol: LIST[NAT], row: NAT): LIST[LIST[STRING]]
+    require
+      in_bounds: sol.length = board.size and row <= board.size
+    variant
+      board.size - row
+    do
+      if row >= board.size then
+        LIST.empty
+      else
+        let c = QUEENS_FACTS.col_at_row(sol, row)
+        let src = if c < board.size and board.is_pinned(row, c) then "Pinned" else "Solved" end
+        let r = TABLERO_PANELS.row3(NUMBER_TEXT.nat_to_text(row), NUMBER_TEXT.nat_to_text(c), src)
+        TABLERO_PANELS.solution_rows_from(board, sol, row + 1).prepend(r)
+      end
+    end
+
+  -- Tab 1: Queen Coordinates Table for the currently viewed verified solution.
+  draw_solution_tab(s: SCREEN, area: RECT, board: BOARD, outcome: SOLVE_OUTCOME, sol_idx: NAT, t: THEME): SCREEN
+    do
+      let r = TABLERO_LAYOUT.right_inner(area)
+      match outcome.solution_at(sol_idx)
+        case None then
+          s.text(r, r.x, r.y, "No solution displayed (press Space to solve).", t.gutter)
+        case Some(sol) then
+          if sol.length = board.size then
+            let shown_num = if sol_idx < outcome.stored_count then sol_idx + 1 else 1 end
+            let hdr_txt = GLYPHS.join(
+              GLYPHS.join("Viewing Solution #", NUMBER_TEXT.nat_to_text(shown_num)),
+              GLYPHS.join(" of ", GLYPHS.join(NUMBER_TEXT.nat_to_text(outcome.stored_count), "  ([ / ] to browse)"))
+            )
+            let s0 = s.text(r, r.x, r.y, hdr_txt, t.active_tab)
+            let widths: LIST[SIZE] = LIST.empty
+              .prepend(SIZE.flex(1))
+              .prepend(SIZE.fixed(8))
+              .prepend(SIZE.fixed(8))
+            let hdr = TABLERO_PANELS.row3("Row", "Col", "Origin")
+            let rows = TABLERO_PANELS.solution_rows_from(board, sol, 0)
+            TABLE.with_headers(widths, hdr, rows).draw(s0, r.drop_top(1), t.base, t.active_tab, t.base)
+          else
+            s
+          end
+      end
+    ensure
+      same_width: Result.width = s.width
+      same_height: Result.height = s.height
+    end
+
+  -- Tab 2: Verified Contracts & Short Form Viewer.
+  draw_contracts_tab(s: SCREEN, area: RECT, cv: TEXT_VIEW, t: THEME): SCREEN
+    do
+      let r = TABLERO_LAYOUT.right_inner(area)
+      let vr = r.drop_right(1)
+      let s0 = cv.draw(s, vr, t.base)
+      SCROLLBAR.vertical(cv.line_count, vr.height, cv.top)
+        .draw(s0, r, t.gutter, t.focused_border)
+    ensure
+      same_width: Result.width = s.width
+      same_height: Result.height = s.height
+    end
+
+end

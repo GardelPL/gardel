@@ -1,0 +1,464 @@
+-- A single-row navigation breadcrumb (`src › widget › tree.gdl`) with 3-stage middle collapse,
+-- keyboard selection (`Left`/`Right`), and mouse hit-testing (`crumb_at` / `on_mouse`).
+module BREADCRUMB
+
+representation {NONE}
+  items: LIST[STRING]
+  sep: STRING
+  picked: NAT
+  has_sel: BOOL
+
+invariant
+  valid_pick: picked < items.length or (items.length = 0 and picked = 0)
+
+create {ANY}
+
+  empty: BREADCRUMB
+    do
+      { items = LIST.empty, sep = " › ", picked = 0, has_sel = False }
+    ensure
+      none: Result.count = 0
+    end
+
+  make(crumbs: LIST[STRING]): BREADCRUMB
+    do
+      let p = if crumbs.length > 0 then crumbs.length - 1 else 0 end
+      { items = crumbs, sep = " › ", picked = p, has_sel = False }
+    ensure
+      same_count: Result.count = crumbs.length
+    end
+
+  chevron: STRING
+    do
+      " › "
+    end
+
+  slash: STRING
+    do
+      " / "
+    end
+
+  arrow: STRING
+    do
+      " > "
+    end
+
+  add_sat(a: NAT, b: NAT): NAT
+    do
+      if a <= 65535 and b <= 65535 - a then a + b else 65535 end
+    ensure
+      bounded: Result <= 65535
+    end
+
+  sum_widths(cs: LIST[STRING], sep_w: NAT): NAT
+    variant
+      cs.length
+    do
+      if cs.length = 0 then
+        0
+      else if cs.tail.length = 0 then
+        GLYPHS.width(cs.head)
+      else
+        let rest = BREADCRUMB.sum_widths(cs.tail, sep_w)
+        BREADCRUMB.add_sat(GLYPHS.width(cs.head), BREADCRUMB.add_sat(sep_w, rest))
+      end end
+    ensure
+      bounded: Result <= 65535
+    end
+
+  first_cluster_width(s: STRING): NAT
+    do
+      let cs = GLYPHS.of_text(s)
+      if cs.length = 0 then 0 else
+        let w = CHAR_WIDTH.of(cs.head)
+        if w <= 2 then w else 2 end
+      end
+    ensure
+      bounded: Result <= 2
+    end
+
+  -- Earliest index `k` (`2 <= k < items.length`) such that crumbs `k .. n-1` with separators
+  -- fit in `avail`, or `items.length` if even the last crumb alone exceeds `avail`.
+  tail_start(items: LIST[STRING], k: NAT, sep_w: NAT, avail: NAT): NAT
+    require
+      k_min: k >= 2 and k <= items.length
+    variant
+      items.length - k
+    do
+      if k >= items.length or k = 18446744073709551615 then
+        items.length
+      else
+        let sub = LIST_CUT.drop(items, k)
+        let w = BREADCRUMB.sum_widths(sub, sep_w)
+        if w <= avail then
+          k
+        else
+          BREADCRUMB.tail_start(items, k + 1, sep_w, avail)
+        end
+      end
+    ensure
+      in_range: Result >= k and Result <= items.length
+    end
+
+  draw_run(s: SCREEN, row: RECT, items: LIST[STRING], sep: STRING, idx: NAT, last_idx: NAT,
+           picked: NAT, has_sel: BOOL, x: NAT, st: STYLE, current_st: STYLE, selected_st: STYLE, sep_st: STYLE): SCREEN
+    variant
+      items.length
+    do
+      if items.length = 0 or x >= row.right or idx = 18446744073709551615 then
+        s
+      else
+        let c = items.head
+        let cw = GLYPHS.width(c)
+        let base = if idx = last_idx then current_st else st end
+        let cst = if has_sel and idx = picked then selected_st else base end
+        let drawn = s.text(row, x, row.y, c, cst)
+        let nx = BREADCRUMB.add_sat(x, cw)
+        if items.tail.length = 0 or nx >= row.right then
+          drawn
+        else
+          let sep_drawn = drawn.text(row, nx, row.y, sep, sep_st)
+          let nx2 = BREADCRUMB.add_sat(nx, GLYPHS.width(sep))
+          BREADCRUMB.draw_run(sep_drawn, row, items.tail, sep, idx + 1, last_idx, picked, has_sel, nx2, st, current_st, selected_st, sep_st)
+        end
+      end
+    ensure
+      same_width: Result.width = s.width
+      same_height: Result.height = s.height
+    end
+
+  find_in_run(row: RECT, items: LIST[STRING], sep_w: NAT, idx: NAT, x: NAT, cx: NAT): OPTION[NAT]
+    variant
+      items.length
+    do
+      if items.length = 0 or x >= row.right or cx < x or idx = 18446744073709551615 then
+        None
+      else
+        let cw = GLYPHS.width(items.head)
+        let end_x = BREADCRUMB.add_sat(x, cw)
+        let vis_end = if end_x <= row.right then end_x else row.right end
+        if cx < vis_end then
+          Some(idx)
+        else
+          let nx = BREADCRUMB.add_sat(end_x, sep_w)
+          BREADCRUMB.find_in_run(row, items.tail, sep_w, idx + 1, nx, cx)
+        end
+      end
+    end
+
+  draw_step1(s: SCREEN, row: RECT, items: LIST[STRING], sep: STRING, picked: NAT, has_sel: BOOL,
+             st: STYLE, current_st: STYLE, selected_st: STYLE, sep_st: STYLE): SCREEN
+    require
+      at_least_three: items.length >= 3
+      valid_pick: picked < items.length
+    do
+      let n = items.length
+      let sep_w = GLYPHS.width(sep)
+      let first = LIST_OPS.at(items, 0)
+      let w_first = GLYPHS.width(first)
+      let ell_w = GLYPHS.width("…")
+      let head_w = BREADCRUMB.add_sat(w_first, BREADCRUMB.add_sat(sep_w, BREADCRUMB.add_sat(ell_w, sep_w)))
+      let avail = if row.width >= head_w then row.width - head_w else 0 end
+      let k = BREADCRUMB.tail_start(items, 2, sep_w, avail)
+      let s0 = s.text(row, row.x, row.y, first, if has_sel and picked = 0 then selected_st else st end)
+      let x1 = BREADCRUMB.add_sat(row.x, w_first)
+      let s1 = s0.text(row, x1, row.y, sep, sep_st)
+      let x2 = BREADCRUMB.add_sat(x1, sep_w)
+      let hidden_sel = has_sel and picked > 0 and picked < k
+      let s2 = s1.text(row, x2, row.y, "…", if hidden_sel then selected_st else sep_st end)
+      let x3 = BREADCRUMB.add_sat(x2, ell_w)
+      let s3 = s2.text(row, x3, row.y, sep, sep_st)
+      let tail_x = BREADCRUMB.add_sat(x3, sep_w)
+      let res = BREADCRUMB.draw_run(s3, row, LIST_CUT.drop(items, k), sep, k, n - 1, picked, has_sel, tail_x, st, current_st, selected_st, sep_st)
+      SCREEN.fitted(res, s)
+    ensure
+      same_width: Result.width = s.width
+      same_height: Result.height = s.height
+    end
+
+  draw_step2(s: SCREEN, row: RECT, items: LIST[STRING], sep: STRING, picked: NAT, has_sel: BOOL,
+             st: STYLE, current_st: STYLE, selected_st: STYLE, sep_st: STYLE): SCREEN
+    require
+      at_least_two: items.length >= 2
+      valid_pick: picked < items.length
+    do
+      let n = items.length
+      let sep_w = GLYPHS.width(sep)
+      let first = LIST_OPS.at(items, 0)
+      let last = LIST_OPS.at(items, n - 1)
+      let w_first = GLYPHS.width(first)
+      let ell_w = GLYPHS.width("…")
+      let head_w = BREADCRUMB.add_sat(w_first, BREADCRUMB.add_sat(sep_w, BREADCRUMB.add_sat(ell_w, sep_w)))
+      let prefix_w = if n >= 3 then head_w else BREADCRUMB.add_sat(w_first, sep_w) end
+      let s0 = s.text(row, row.x, row.y, first, if has_sel and picked = 0 then selected_st else st end)
+      let x1 = BREADCRUMB.add_sat(row.x, w_first)
+      let s1 = s0.text(row, x1, row.y, sep, sep_st)
+      let x2 = BREADCRUMB.add_sat(x1, sep_w)
+      let s3 =
+        if n >= 3 then
+          let hidden_sel = has_sel and picked > 0 and picked < n - 1
+          let se = s1.text(row, x2, row.y, "…", if hidden_sel then selected_st else sep_st end)
+          let x3 = BREADCRUMB.add_sat(x2, ell_w)
+          se.text(row, x3, row.y, sep, sep_st)
+        else
+          s1
+        end
+      let tail_x = BREADCRUMB.add_sat(row.x, prefix_w)
+      let last_st = if has_sel and picked = n - 1 then selected_st else current_st end
+      s3.text(row, tail_x, row.y, last, last_st)
+    ensure
+      same_width: Result.width = s.width
+      same_height: Result.height = s.height
+    end
+
+feature {ANY}
+
+  count: NAT
+    do
+      Current.items.length
+    end
+
+  crumbs: LIST[STRING]
+    do
+      Current.items
+    end
+
+  separator: STRING
+    do
+      Current.sep
+    end
+
+  selected: NAT
+    do
+      Current.picked
+    ensure
+      a_crumb: Result < Current.count or (Current.count = 0 and Result = 0)
+    end
+
+  has_selection: BOOL
+    do
+      Current.has_sel and Current.items.length > 0
+    end
+
+  selected_crumb: STRING
+    do
+      if Current.picked < Current.items.length then LIST_OPS.at(Current.items, Current.picked) else "" end
+    end
+
+  width: NAT
+    do
+      BREADCRUMB.sum_widths(Current.items, GLYPHS.width(Current.sep))
+    ensure
+      bounded: Result <= 65535
+    end
+
+  is_collapsed(r: RECT): BOOL
+    do
+      Current.items.length > 0 and Current.width > r.width
+    end
+
+  with_separator(s: STRING): BREADCRUMB
+    do
+      { Current with sep = s }
+    ensure
+      same_count: Result.count = Current.count
+    end
+
+  with_crumbs(cs: LIST[STRING]): BREADCRUMB
+    do
+      let p = if cs.length = 0 then 0 else if Current.picked < cs.length then Current.picked else cs.length - 1 end end
+      { items = cs, sep = Current.sep, picked = p, has_sel = Current.has_sel and cs.length > 0 }
+    ensure
+      same_count: Result.count = cs.length
+    end
+
+  choose(i: NAT): BREADCRUMB
+    do
+      if i < Current.items.length then
+        { Current with picked = i, has_sel = True }
+      else
+        Current
+      end
+    ensure
+      same_count: Result.count = Current.count
+      chosen: i < Current.count implies (Result.selected = i and Result.has_selection)
+    end
+
+  clear_selection: BREADCRUMB
+    do
+      { Current with has_sel = False }
+    ensure
+      same_count: Result.count = Current.count
+      no_sel: not Result.has_selection
+    end
+
+  left: BREADCRUMB
+    do
+      if Current.items.length = 0 then
+        Current
+      else if not Current.has_sel then
+        { Current with picked = Current.items.length - 1, has_sel = True }
+      else if Current.picked > 0 then
+        { Current with picked = Current.picked - 1, has_sel = True }
+      else
+        { Current with has_sel = True }
+      end end end
+    ensure
+      same_count: Result.count = Current.count
+    end
+
+  right: BREADCRUMB
+    do
+      if Current.items.length = 0 then
+        Current
+      else if not Current.has_sel then
+        { Current with picked = 0, has_sel = True }
+      else if Current.picked < 18446744073709551615 and Current.picked + 1 < Current.items.length then
+        { Current with picked = Current.picked + 1, has_sel = True }
+      else
+        { Current with has_sel = True }
+      end end end
+    ensure
+      same_count: Result.count = Current.count
+    end
+
+  on_key(k: KEY): BREADCRUMB
+    do
+      match k
+        case Left then Current.left
+        case Right then Current.right
+        case _ then Current
+      end
+    ensure
+      same_count: Result.count = Current.count
+    end
+
+  -- Index of the visible crumb covering cell `(cx, cy)` on the top row of `r`, or `None`.
+  -- Separators, ellipsis `…`, and hidden crumbs return `None`.
+  crumb_at(r: RECT, cx: NAT, cy: NAT): OPTION[NAT]
+    do
+      let row = r.take_top(1)
+      let n = Current.items.length
+      if not row.has(cx, cy) or n = 0 then
+        None
+      else
+        let sep_w = GLYPHS.width(Current.sep)
+        let w = row.width
+        if Current.width <= w then
+          let res = BREADCRUMB.find_in_run(row, Current.items, sep_w, 0, row.x, cx)
+          match res
+            case Some(i) then if i < n then Some(i) else None end
+            case None then None
+          end
+        else
+          let first = LIST_OPS.at(Current.items, 0)
+          let last = LIST_OPS.at(Current.items, n - 1)
+          let w_first = GLYPHS.width(first)
+          let w_last = GLYPHS.width(last)
+          let ell_w = GLYPHS.width("…")
+          let head_w = BREADCRUMB.add_sat(w_first, BREADCRUMB.add_sat(sep_w, BREADCRUMB.add_sat(ell_w, sep_w)))
+          if n >= 3 and head_w <= w and w_last <= w - head_w then
+            -- Step 1: first + sep + … + sep + tail
+            let end_first = BREADCRUMB.add_sat(row.x, w_first)
+            if cx < end_first then
+              Some(0)
+            else
+              let tail_x = BREADCRUMB.add_sat(row.x, head_w)
+              let k = BREADCRUMB.tail_start(Current.items, 2, sep_w, w - head_w)
+              if k < n and cx >= tail_x then
+                let res = BREADCRUMB.find_in_run(row, LIST_CUT.drop(Current.items, k), sep_w, k, tail_x, cx)
+                match res
+                  case Some(i) then if i < n then Some(i) else None end
+                  case None then None
+                end
+              else
+                None
+              end
+            end
+          else
+            let prefix_w = if n >= 3 then head_w else BREADCRUMB.add_sat(w_first, sep_w) end
+            let last_min = BREADCRUMB.first_cluster_width(last)
+            if n >= 2 and prefix_w <= w and last_min > 0 and last_min <= w - prefix_w then
+              -- Step 2: first + sep (+ … + sep) + clipped last
+              let end_first = BREADCRUMB.add_sat(row.x, w_first)
+              if cx < end_first then
+                Some(0)
+              else
+                let tail_x = BREADCRUMB.add_sat(row.x, prefix_w)
+                let shown_last = GLYPHS.fitting_width(last, w - prefix_w)
+                if cx >= tail_x and cx < BREADCRUMB.add_sat(tail_x, shown_last) then
+                  Some(n - 1)
+                else
+                  None
+                end
+              end
+            else
+              -- Step 3: clipped last only
+              let shown_last = GLYPHS.fitting_width(last, w)
+              if cx < BREADCRUMB.add_sat(row.x, shown_last) then
+                Some(n - 1)
+              else
+                None
+              end
+            end
+          end
+        end
+      end
+    ensure
+      valid: match Result case Some(i) then i < Current.count case None then True end
+    end
+
+  on_mouse(m: MOUSE, r: RECT): BREADCRUMB
+    do
+      if m.is_left_down then
+        match Current.crumb_at(r, m.x, m.y)
+          case Some(i) then Current.choose(i)
+          case None then Current
+        end
+      else
+        Current
+      end
+    ensure
+      same_count: Result.count = Current.count
+    end
+
+  -- Draw the breadcrumb on the top row of `r`, collapsing middle crumbs when `width > r.width`.
+  -- TODO(proof-GW.1): prove draw modifies only cells on the top row of `r` and preserves selection visibility in steps 1-2
+  draw(s: SCREEN, r: RECT, st: STYLE, current_st: STYLE, selected_st: STYLE, sep_st: STYLE): SCREEN
+    do
+      let row = r.take_top(1)
+      let n = Current.items.length
+      if row.is_empty or n = 0 then
+        s
+      else
+        let sep_w = GLYPHS.width(Current.sep)
+        let w = row.width
+        if Current.width <= w then
+          SCREEN.fitted(BREADCRUMB.draw_run(s, row, Current.items, Current.sep, 0, n - 1, Current.picked, Current.has_sel, row.x, st, current_st, selected_st, sep_st), s)
+        else
+          let first = LIST_OPS.at(Current.items, 0)
+          let last = LIST_OPS.at(Current.items, n - 1)
+          let w_first = GLYPHS.width(first)
+          let w_last = GLYPHS.width(last)
+          let ell_w = GLYPHS.width("…")
+          let head_w = BREADCRUMB.add_sat(w_first, BREADCRUMB.add_sat(sep_w, BREADCRUMB.add_sat(ell_w, sep_w)))
+          if n >= 3 and head_w <= w and w_last <= w - head_w then
+            SCREEN.fitted(BREADCRUMB.draw_step1(s, row, Current.items, Current.sep, Current.picked, Current.has_sel, st, current_st, selected_st, sep_st), s)
+          else
+            let prefix_w = if n >= 3 then head_w else BREADCRUMB.add_sat(w_first, sep_w) end
+            let last_min = BREADCRUMB.first_cluster_width(last)
+            if n >= 2 and prefix_w <= w and last_min > 0 and last_min <= w - prefix_w then
+              BREADCRUMB.draw_step2(s, row, Current.items, Current.sep, Current.picked, Current.has_sel, st, current_st, selected_st, sep_st)
+            else
+              let last_st = if Current.has_sel and Current.picked = n - 1 then selected_st else current_st end
+              s.text(row, row.x, row.y, last, last_st)
+            end
+          end
+        end
+      end
+    ensure
+      same_width: Result.width = s.width
+      same_height: Result.height = s.height
+    end
+
+end

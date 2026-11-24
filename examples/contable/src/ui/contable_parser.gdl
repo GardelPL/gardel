@@ -1,0 +1,161 @@
+-- Pure, tuple-free parser for the interactive "Post Entry" modal input.
+-- Format: `<debit_acct> <credit_acct> <dollars>[.<cents>] [memo...]`
+-- Example: `6 0 75.00 Domain Renewal` -> Debit #6, Credit #0, $75.00, memo "Domain Renewal".
+functions CONTABLE_PARSER
+
+feature {ANY}
+
+  is_space(b: U64): BOOL
+    do
+      b = 32 or b = 9
+    end
+
+  skip_spaces(bs: LIST[U64]): LIST[U64]
+    variant
+      bs.length
+    do
+      if bs.length = 0 then
+        bs
+      else if CONTABLE_PARSER.is_space(bs.head) then
+        CONTABLE_PARSER.skip_spaces(bs.tail)
+      else
+        bs
+      end end
+    ensure
+      no_longer: Result.length <= bs.length
+    end
+
+  -- Drop non-space token bytes to reach the remainder after a token.
+  drop_token(bs: LIST[U64]): LIST[U64]
+    variant
+      bs.length
+    do
+      if bs.length = 0 or CONTABLE_PARSER.is_space(bs.head) then
+        bs
+      else
+        CONTABLE_PARSER.drop_token(bs.tail)
+      end
+    ensure
+      no_longer: Result.length <= bs.length
+    end
+
+  -- Parse a non-negative integer token at the start of `bs`.
+  read_nat(bs: LIST[U64], acc: NAT, has_digit: BOOL): OPTION[NAT]
+    variant
+      bs.length
+    do
+      if bs.length = 0 or CONTABLE_PARSER.is_space(bs.head) then
+        if has_digit then Some(acc) else None end
+      else if bs.head >= 48 and bs.head <= 57 then
+        let d = bs.head - 48
+        if acc <= 100000000 then
+          CONTABLE_PARSER.read_nat(bs.tail, acc * 10 + d, True)
+        else
+          None
+        end
+      else
+        None
+      end end
+    end
+
+  -- Parse a dollar amount (`75` or `75.50`) at the start of `bs` into positive cents (`<= 10000000000`).
+  read_cents(bs: LIST[U64], dollars: NAT, has_digit: BOOL): OPTION[NAT]
+    variant
+      bs.length
+    do
+      if bs.length = 0 or CONTABLE_PARSER.is_space(bs.head) then
+        if has_digit and dollars <= 100000000 then
+          let cents = dollars * 100
+          if cents > 0 and cents <= 10000000000 then Some(cents) else None end
+        else
+          None
+        end
+      else if bs.head = 46 then
+        if not has_digit or dollars > 100000000 then
+          None
+        else
+          CONTABLE_PARSER.read_frac_cents(bs.tail, dollars)
+        end
+      else if bs.head >= 48 and bs.head <= 57 then
+        let d = bs.head - 48
+        if dollars <= 100000000 then
+          CONTABLE_PARSER.read_cents(bs.tail, dollars * 10 + d, True)
+        else
+          None
+        end
+      else
+        None
+      end end end
+    end
+
+  read_frac_cents(bs: LIST[U64], dollars: NAT): OPTION[NAT]
+    require
+      bounded_dollars: dollars <= 100000000
+    do
+      if bs.length = 0 then
+        None
+      else if bs.head >= 48 and bs.head <= 57 then
+        let d1 = bs.head - 48
+        let r1 = bs.tail
+        if r1.length = 0 or CONTABLE_PARSER.is_space(r1.head) then
+          let c = dollars * 100 + d1 * 10
+          if c > 0 and c <= 10000000000 then Some(c) else None end
+        else if r1.head >= 48 and r1.head <= 57 then
+          let d2 = r1.head - 48
+          let r2 = r1.tail
+          if r2.length = 0 or CONTABLE_PARSER.is_space(r2.head) then
+            let c = dollars * 100 + d1 * 10 + d2
+            if c > 0 and c <= 10000000000 then Some(c) else None end
+          else
+            None
+          end
+        else
+          None
+        end end
+      else
+        None
+      end end
+    end
+
+  bytes_to_memo(bs: LIST[U64]): STRING
+    do
+      let trimmed = CONTABLE_PARSER.skip_spaces(bs)
+      if trimmed.length = 0 or trimmed.length > 1024 or not BYTES.all_octets(trimmed) then
+        "Manual Transfer"
+      else
+        match STRING.from_utf8(BYTES.from_list(trimmed))
+          case Ok(s) then if s.is_empty then "Manual Transfer" else s end
+          case Error(_) then "Manual Transfer"
+        end
+      end
+    end
+
+  -- Parse `<debit_acct> <credit_acct> <amount> [memo]` into a verified `JOURNAL_ENTRY`.
+  parse_transfer(text: STRING, next_id: NAT, date: STRING, n_accts: NAT): OPTION[JOURNAL_ENTRY]
+    do
+      let b0 = CONTABLE_PARSER.skip_spaces(text.to_utf8.to_list)
+      match CONTABLE_PARSER.read_nat(b0, 0, False)
+        case None then None
+        case Some(dr_acct) then
+          let b1 = CONTABLE_PARSER.skip_spaces(CONTABLE_PARSER.drop_token(b0))
+          match CONTABLE_PARSER.read_nat(b1, 0, False)
+            case None then None
+            case Some(cr_acct) then
+              let b2 = CONTABLE_PARSER.skip_spaces(CONTABLE_PARSER.drop_token(b1))
+              match CONTABLE_PARSER.read_cents(b2, 0, False)
+                case None then None
+                case Some(cents) then
+                  if dr_acct < n_accts and cr_acct < n_accts and (dr_acct < cr_acct or cr_acct < dr_acct)
+                     and cents > 0 and cents <= 10000000000 then
+                    let b3 = CONTABLE_PARSER.drop_token(b2)
+                    let memo = CONTABLE_PARSER.bytes_to_memo(b3)
+                    Some(JOURNAL_ENTRY.make_transfer(next_id, date, memo, dr_acct, cr_acct, cents))
+                  else
+                    None
+                  end
+              end
+          end
+      end
+    end
+
+end

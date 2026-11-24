@@ -15,6 +15,10 @@ representation {NONE}
   wrap_idx: NAT
   align_idx: NAT
   detail_para: PARAGRAPH
+  auto_check: CHECKBOX
+  finished_check: CHECKBOX
+  rate_sld: SLIDER
+  toast_queue: TOAST
   help_modal: POPUP
   help_shown: BOOL
 
@@ -71,6 +75,10 @@ create {ANY}
         history = hist, tick_count = 0,
         theme_idx = 0, border_idx = 0, wrap_idx = 0, align_idx = 0,
         detail_para = para,
+        auto_check = CHECKBOX.checked("Auto-refresh"),
+        finished_check = CHECKBOX.checked("Show finished"),
+        rate_sld = SLIDER.make(1, 10, 1, 5),
+        toast_queue = TOAST.empty,
         help_modal = DASH_STATE.make_help(BORDER_KIND.rounded),
         help_shown = False }
     end
@@ -247,6 +255,26 @@ feature {ANY}
       Current.detail_para
     end
 
+  auto_checkbox: CHECKBOX
+    do
+      Current.auto_check
+    end
+
+  finished_checkbox: CHECKBOX
+    do
+      Current.finished_check
+    end
+
+  rate_slider: SLIDER
+    do
+      Current.rate_sld
+    end
+
+  toasts: TOAST
+    do
+      Current.toast_queue
+    end
+
   help_popup: POPUP
     do
       Current.help_modal
@@ -270,7 +298,22 @@ feature {ANY}
       let sample = 1 + (next_tick * 3 + (Current.mod_table.selected % 8)) % 8
       let base_hist = if Current.history.length > 0 then Current.history.tail else Current.history end
       let next_hist = LIST_CUT.take(base_hist.append(LIST.empty.prepend(sample)), 16)
-      { Current with history = next_hist, tick_count = next_tick }
+      { Current with history = next_hist, tick_count = next_tick, toast_queue = Current.toast_queue.tick(next_tick) }
+    end
+
+  notify_status: DASH_STATE
+    do
+      let next_tick = if Current.tick_count < 1000000 then Current.tick_count + 1 else 0 end
+      let kind = next_tick % 3
+      let pushed =
+        if kind = 0 then
+          Current.toast_queue.push_success("Verified module", 3)
+        else if kind = 1 then
+          Current.toast_queue.push_info("Queued task", 3)
+        else
+          Current.toast_queue.push_warning("Cache recheck", 3)
+        end end
+      { Current with tick_count = next_tick, toast_queue = pushed.tick(next_tick) }
     end
 
   on_key(k: KEY): TUI_NEXT[DASH_STATE]
@@ -291,6 +334,7 @@ feature {ANY}
         match k
           case KeysEnded then TUI_NEXT.quit(0)
           case Tab then TUI_NEXT.next({ Current with keys_at = Current.keys_at.next })
+          case Enter then TUI_NEXT.next(Current.notify_status)
           case Char(c) then
             if c = 'q' then TUI_NEXT.quit(0)
             else if c = '?' then TUI_NEXT.next({ Current with help_shown = True, help_modal = DASH_STATE.make_help(Current.border_kind) })
@@ -310,11 +354,27 @@ feature {ANY}
             else if c = 'a' then
               let next_a = if Current.align_idx < 2 then Current.align_idx + 1 else 0 end
               TUI_NEXT.next({ Current with align_idx = next_a }.refresh_inspector)
+            else if c = 'r' then
+              let next_tick = if Current.tick_count < 1000000 then Current.tick_count + 1 else 0 end
+              let next_cb = Current.auto_check.toggle
+              let q = Current.toast_queue.push_info("Auto-refresh toggled", 3).tick(next_tick)
+              TUI_NEXT.next({ Current with auto_check = next_cb, tick_count = next_tick, toast_queue = q })
+            else if c = 'f' then
+              let next_tick = if Current.tick_count < 1000000 then Current.tick_count + 1 else 0 end
+              let next_cb = Current.finished_check.toggle
+              let q = Current.toast_queue.push_warning("Filter updated", 3).tick(next_tick)
+              TUI_NEXT.next({ Current with finished_check = next_cb, tick_count = next_tick, toast_queue = q })
+            else if c = '+' or c = '=' then
+              TUI_NEXT.next({ Current with rate_sld = Current.rate_sld.increase })
+            else if c = '-' then
+              TUI_NEXT.next({ Current with rate_sld = Current.rate_sld.decrease })
+            else if c = 's' then
+              TUI_NEXT.next(Current.notify_status)
             else if c = ' ' then TUI_NEXT.next(Current.stepped_sample)
             else if Current.view_tabs.takes(k) then
               TUI_NEXT.next({ Current with view_tabs = Current.view_tabs.on_key(k) }.refresh_inspector)
             else TUI_NEXT.next(Current)
-            end end end end end end end end
+            end end end end end end end end end end end end end
           case _ then
             let vis = DASH_LAYOUT.table_rows(Current.area)
             let next_tbl = Current.mod_table.on_key(k, vis)
@@ -335,11 +395,16 @@ feature {ANY}
         else
           TUI_NEXT.next(Current)
         end end
+      else if m.is_left_down and Current.toast_queue.toast_id_at(area, m.x, m.y).is_some then
+        TUI_NEXT.next({ Current with toast_queue = Current.toast_queue.on_mouse(m, area) })
       else
         let tabs_r = DASH_LAYOUT.tabs_bar(area)
         let sb_r = DASH_LAYOUT.scrollbar_area(area)
         let tbl_r = DASH_LAYOUT.table_area(area)
-        let insp_r = DASH_LAYOUT.inspector_area(area)
+        let notes_r = DASH_LAYOUT.inspector_notes_area(area)
+        let auto_r = DASH_LAYOUT.auto_checkbox_area(area)
+        let fin_r = DASH_LAYOUT.finished_checkbox_area(area)
+        let rate_r = DASH_LAYOUT.rate_slider_area(area)
         let left_r = DASH_LAYOUT.left(area)
         let right_r = DASH_LAYOUT.right(area)
         if tabs_r.has(m.x, m.y) then
@@ -366,18 +431,24 @@ feature {ANY}
                 let next_focus = if m.is_left_down then Current.keys_at.moved_to(0) else Current.keys_at end
                 let updated: DASH_STATE = { Current with mod_table = next_tbl, keys_at = next_focus }
                 TUI_NEXT.next(if next_tbl.selected != Current.mod_table.selected then updated.refresh_inspector else updated end)
-              else if insp_r.has(m.x, m.y) then
-                TUI_NEXT.next({ Current with detail_para = Current.detail_para.on_mouse(m, insp_r) })
+              else if auto_r.has(m.x, m.y) and m.is_left_down then
+                TUI_NEXT.next({ Current with auto_check = Current.auto_check.on_mouse(m, auto_r) })
+              else if fin_r.has(m.x, m.y) and m.is_left_down then
+                TUI_NEXT.next({ Current with finished_check = Current.finished_check.on_mouse(m, fin_r) })
+              else if rate_r.has(m.x, m.y) then
+                TUI_NEXT.next({ Current with rate_sld = Current.rate_sld.on_mouse(m, rate_r) })
+              else if notes_r.has(m.x, m.y) then
+                TUI_NEXT.next({ Current with detail_para = Current.detail_para.on_mouse(m, notes_r) })
               else if m.is_left_down and left_r.has(m.x, m.y) then
                 TUI_NEXT.next({ Current with keys_at = Current.keys_at.moved_to(0) })
               else if m.is_left_down and right_r.has(m.x, m.y) then
                 TUI_NEXT.next({ Current with keys_at = Current.keys_at.moved_to(1) })
               else
                 TUI_NEXT.next(Current)
-              end end end end
+              end end end end end end end
           end
         end
-      end
+      end end
     end
 
 end

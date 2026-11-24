@@ -1,0 +1,95 @@
+-- Semantic kind of a `DIALOG`, determining its default border style.
+module DIALOG_KIND
+
+representation {NONE}
+  | DialogInfo
+  | DialogWarning
+  | DialogError
+  | DialogQuestion
+
+create {ANY}
+
+  info: DIALOG_KIND
+    do
+      DialogInfo
+    ensure
+      is_info: Result.is_info
+    end
+
+  warning: DIALOG_KIND
+    do
+      DialogWarning
+    ensure
+      is_warning: Result.is_warning
+    end
+
+  error: DIALOG_KIND
+    do
+      DialogError
+    ensure
+      is_error: Result.is_error
+    end
+
+  question: DIALOG_KIND
+    do
+      DialogQuestion
+    ensure
+      is_question: Result.is_question
+    end
+
+feature {ANY}
+
+  is_info: BOOL
+    do
+      match Current
+        case DialogInfo then True
+        case _ then False
+      end
+    end
+
+  is_warning: BOOL
+    do
+      match Current
+        case DialogWarning then True
+        case _ then False
+      end
+    end
+
+  is_error: BOOL
+    do
+      match Current
+        case DialogError then True
+        case _ then False
+      end
+    end
+
+  is_question: BOOL
+    do
+      match Current
+        case DialogQuestion then True
+        case _ then False
+      end
+    end
+
+  same(other: DIALOG_KIND): BOOL
+    do
+      match Current
+        case DialogInfo then other.is_info
+        case DialogWarning then other.is_warning
+        case DialogError then other.is_error
+        case DialogQuestion then other.is_question
+      end
+    end
+
+  -- Default border style for this dialog kind.
+  default_style: STYLE
+    do
+      match Current
+        case DialogInfo then STYLE.plain.fg(COLOR.cyan)
+        case DialogWarning then STYLE.plain.fg(COLOR.yellow)
+        case DialogError then STYLE.plain.fg(COLOR.red)
+        case DialogQuestion then STYLE.plain.fg(COLOR.blue)
+      end
+    end
+
+end

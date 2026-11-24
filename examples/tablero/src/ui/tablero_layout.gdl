@@ -1,0 +1,151 @@
+-- Shared pure layout geometry for `tablero`.
+-- Used identically by `view` and mouse hit-testing so rendering and clicks always agree.
+functions TABLERO_LAYOUT
+
+feature {ANY}
+
+  vertical_parts(area: RECT): LIST[RECT]
+    do
+      let sizes: LIST[SIZE] = LIST.empty
+        .prepend(SIZE.fixed(1))
+        .prepend(SIZE.fixed(3))
+        .prepend(SIZE.min(10))
+        .prepend(SIZE.fixed(1))
+        .prepend(SIZE.fixed(1))
+      LAYOUT.rows(area, sizes)
+    ensure
+      five: Result.length = 5
+    end
+
+  menu_bar(area: RECT): RECT
+    do
+      LIST_OPS.at(TABLERO_LAYOUT.vertical_parts(area), 0)
+    end
+
+  crumb_bar(area: RECT): RECT
+    do
+      LIST_OPS.at(TABLERO_LAYOUT.vertical_parts(area), 1)
+    end
+
+  crumb_left(area: RECT): RECT
+    do
+      let r = TABLERO_LAYOUT.crumb_bar(area)
+      let bw = if r.width > 36 then 36 else 0 end
+      r.drop_right(bw)
+    end
+
+  proof_badge_area(area: RECT): RECT
+    do
+      let r = TABLERO_LAYOUT.crumb_bar(area)
+      let bw = if r.width > 36 then 36 else 0 end
+      r.take_right(bw)
+    end
+
+  main_area(area: RECT): RECT
+    do
+      LIST_OPS.at(TABLERO_LAYOUT.vertical_parts(area), 2)
+    end
+
+  controls_bar(area: RECT): RECT
+    do
+      LIST_OPS.at(TABLERO_LAYOUT.vertical_parts(area), 3)
+    end
+
+  status_bar(area: RECT): RECT
+    do
+      LIST_OPS.at(TABLERO_LAYOUT.vertical_parts(area), 4)
+    end
+
+  board_pane(area: RECT): RECT
+    do
+      let m = TABLERO_LAYOUT.main_area(area)
+      let lw = m.width * 56 / 100
+      m.take_left(lw)
+    end
+
+  right_pane(area: RECT): RECT
+    do
+      let m = TABLERO_LAYOUT.main_area(area)
+      let lw = m.width * 56 / 100
+      m.drop_left(if lw > 0 then lw - 1 else 0 end)
+    end
+
+  board_inner(area: RECT): RECT
+    do
+      FRAME.inner_padded(TABLERO_LAYOUT.board_pane(area), PADDING.symmetric(0, 1))
+    end
+
+  grid_area(area: RECT): RECT
+    do
+      let inn = TABLERO_LAYOUT.board_inner(area)
+      if inn.height > 4 then inn.drop_bottom(2) else inn end
+    end
+
+  chk_rays_area(area: RECT): RECT
+    do
+      let inn = TABLERO_LAYOUT.board_inner(area)
+      if inn.height > 4 then inn.take_bottom(2).take_top(1) else inn.take_bottom(0) end
+    end
+
+  chk_count_area(area: RECT): RECT
+    do
+      let inn = TABLERO_LAYOUT.board_inner(area)
+      if inn.height > 4 then inn.take_bottom(1) else inn.take_bottom(0) end
+    end
+
+  right_tabs_area(area: RECT): RECT
+    do
+      FRAME.title_area(TABLERO_LAYOUT.right_pane(area))
+    end
+
+  right_inner(area: RECT): RECT
+    do
+      FRAME.inner_padded(TABLERO_LAYOUT.right_pane(area), PADDING.symmetric(0, 1))
+    end
+
+  controls_parts(area: RECT): LIST[RECT]
+    do
+      let inn = FRAME.inner_padded(TABLERO_LAYOUT.controls_bar(area), PADDING.symmetric(0, 1))
+      let sizes: LIST[SIZE] = LIST.empty
+        .prepend(SIZE.flex(1))
+        .prepend(SIZE.fixed(9))
+        .prepend(SIZE.fixed(13))
+        .prepend(SIZE.fixed(9))
+        .prepend(SIZE.fixed(9))
+        .prepend(SIZE.fixed(11))
+      LAYOUT.columns_with_gap(inn, sizes, 1)
+    ensure
+      six: Result.length = 6
+    end
+
+  btn_solve_area(area: RECT): RECT
+    do
+      LIST_OPS.at(TABLERO_LAYOUT.controls_parts(area), 0)
+    end
+
+  btn_prev_area(area: RECT): RECT
+    do
+      LIST_OPS.at(TABLERO_LAYOUT.controls_parts(area), 1)
+    end
+
+  btn_next_area(area: RECT): RECT
+    do
+      LIST_OPS.at(TABLERO_LAYOUT.controls_parts(area), 2)
+    end
+
+  btn_clear_area(area: RECT): RECT
+    do
+      LIST_OPS.at(TABLERO_LAYOUT.controls_parts(area), 3)
+    end
+
+  btn_reset_area(area: RECT): RECT
+    do
+      LIST_OPS.at(TABLERO_LAYOUT.controls_parts(area), 4)
+    end
+
+  size_slider_area(area: RECT): RECT
+    do
+      LIST_OPS.at(TABLERO_LAYOUT.controls_parts(area), 5)
+    end
+
+end

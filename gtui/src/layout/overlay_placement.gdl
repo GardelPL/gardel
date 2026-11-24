@@ -1,0 +1,135 @@
+-- Pure placement of an overlay box (`w` by `h`) next to an `anchor` rectangle inside `bounds`.
+-- Flips to the opposite side when it fits whole there, shifts back along the edge, and cuts
+-- to the available room when it fits whole on neither side.
+functions OVERLAY_PLACEMENT
+
+feature {ANY}
+
+  clamp(v: NAT, lo: NAT, hi: NAT): NAT
+    require
+      ordered: lo <= hi
+    do
+      if v < lo then lo
+      else if v > hi then hi
+      else v
+      end end
+    ensure
+      in_bounds: lo <= Result and Result <= hi
+    end
+
+  shift_along(start: NAT, span: NAT, lo: NAT, hi: NAT): NAT
+    require
+      ordered: lo <= hi
+    do
+      let avail = hi - lo
+      let cspan = if span <= avail then span else avail end
+      let max_start = hi - cspan
+      if start > max_start then
+        max_start
+      else if start < lo then
+        lo
+      else
+        start
+      end end
+    ensure
+      in_lo: lo <= Result
+      fits_hi: Result + (if span <= hi - lo then span else hi - lo end) <= hi
+    end
+
+  -- Rows (below/above) or columns (right/left) between `anchor` and the edge of `bounds` on `side`.
+  room(anchor: RECT, side: OVERLAY_SIDE, bounds: RECT): NAT
+    do
+      if bounds.is_empty then
+        0
+      else if side.is_below then
+        bounds.bottom - OVERLAY_PLACEMENT.clamp(anchor.bottom, bounds.y, bounds.bottom)
+      else if side.is_above then
+        OVERLAY_PLACEMENT.clamp(anchor.y, bounds.y, bounds.bottom) - bounds.y
+      else if side.is_right_of then
+        bounds.right - OVERLAY_PLACEMENT.clamp(anchor.right, bounds.x, bounds.right)
+      else
+        OVERLAY_PLACEMENT.clamp(anchor.x, bounds.x, bounds.right) - bounds.x
+      end end end end
+    ensure
+      vert_bound: side.is_vertical implies Result <= bounds.height
+      horiz_bound: not side.is_vertical implies Result <= bounds.width
+    end
+
+  -- Whether a `w` by `h` box fits whole on `side` of `anchor` inside `bounds`.
+  fits(anchor: RECT, w: NAT, h: NAT, side: OVERLAY_SIDE, bounds: RECT): BOOL
+    do
+      if side.is_vertical then
+        OVERLAY_PLACEMENT.room(anchor, side, bounds) >= h and w <= bounds.width
+      else
+        OVERLAY_PLACEMENT.room(anchor, side, bounds) >= w and h <= bounds.height
+      end
+    end
+
+  -- Side of `anchor` chosen for placement: `preferred` when the cross-axis fits, else opposite
+  -- when it fits or has strictly more room, else `preferred`.
+  placed_side(anchor: RECT, w: NAT, h: NAT, preferred: OVERLAY_SIDE, bounds: RECT): OVERLAY_SIDE
+    do
+      let needed = if preferred.is_vertical then h else w end
+      let pref_room = OVERLAY_PLACEMENT.room(anchor, preferred, bounds)
+      let opp = preferred.opposite
+      let opp_room = OVERLAY_PLACEMENT.room(anchor, opp, bounds)
+      if pref_room >= needed then
+        preferred
+      else if opp_room >= needed or opp_room > pref_room then
+        opp
+      else
+        preferred
+      end end
+    ensure
+      pref_or_opp: Result.same(preferred) or Result.same(preferred.opposite)
+      axis_same: Result.is_vertical = preferred.is_vertical
+      pref_when_fits: OVERLAY_PLACEMENT.fits(anchor, w, h, preferred, bounds) implies Result.same(preferred)
+    end
+
+  -- Placed rectangle of size at most `w` by `h`, inside `bounds` and disjoint from `anchor`
+  -- whenever `anchor` lies inside `bounds`.
+  -- TODO(proof-GW.2): prove cut box preserves start edge alignment with anchor
+  place(anchor: RECT, w: NAT, h: NAT, preferred: OVERLAY_SIDE, bounds: RECT): RECT
+    do
+      let side = OVERLAY_PLACEMENT.placed_side(anchor, w, h, preferred, bounds)
+      if side.is_below then
+        let y0 = OVERLAY_PLACEMENT.clamp(anchor.bottom, bounds.y, bounds.bottom)
+        let rem_h = bounds.bottom - y0
+        let ch = if h <= rem_h then h else rem_h end
+        let cw = if w <= bounds.width then w else bounds.width end
+        let x0 = OVERLAY_PLACEMENT.shift_along(anchor.x, w, bounds.x, bounds.right)
+        RECT.make(x0, y0, cw, ch)
+      else if side.is_above then
+        let y_end = OVERLAY_PLACEMENT.clamp(anchor.y, bounds.y, bounds.bottom)
+        let rem_h = y_end - bounds.y
+        let ch = if h <= rem_h then h else rem_h end
+        let y0 = y_end - ch
+        let cw = if w <= bounds.width then w else bounds.width end
+        let x0 = OVERLAY_PLACEMENT.shift_along(anchor.x, w, bounds.x, bounds.right)
+        RECT.make(x0, y0, cw, ch)
+      else if side.is_right_of then
+        let x0 = OVERLAY_PLACEMENT.clamp(anchor.right, bounds.x, bounds.right)
+        let rem_w = bounds.right - x0
+        let cw = if w <= rem_w then w else rem_w end
+        let ch = if h <= bounds.height then h else bounds.height end
+        let y0 = OVERLAY_PLACEMENT.shift_along(anchor.y, h, bounds.y, bounds.bottom)
+        RECT.make(x0, y0, cw, ch)
+      else
+        let x_end = OVERLAY_PLACEMENT.clamp(anchor.x, bounds.x, bounds.right)
+        let rem_w = x_end - bounds.x
+        let cw = if w <= rem_w then w else rem_w end
+        let x0 = x_end - cw
+        let ch = if h <= bounds.height then h else bounds.height end
+        let y0 = OVERLAY_PLACEMENT.shift_along(anchor.y, h, bounds.y, bounds.bottom)
+        RECT.make(x0, y0, cw, ch)
+      end end end
+    ensure
+      within_bounds: Result.inside(bounds)
+      width_bounded: Result.width <= w
+      height_bounded: Result.height <= h
+      clear_of_anchor: anchor.inside(bounds) implies Result.disjoint(anchor)
+      whole_when_fits: OVERLAY_PLACEMENT.fits(anchor, w, h, preferred, bounds) implies (Result.width = w and Result.height = h)
+      whole_when_flipped: (not OVERLAY_PLACEMENT.fits(anchor, w, h, preferred, bounds) and OVERLAY_PLACEMENT.fits(anchor, w, h, preferred.opposite, bounds)) implies (Result.width = w and Result.height = h)
+    end
+
+end

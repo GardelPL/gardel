@@ -20,10 +20,46 @@ representation {NONE}
   commands_open: BOOL
   help_modal: POPUP
   help_shown: BOOL
+  bar_menu: MENU
+  quit_dialog: DIALOG
+  modified: BOOL
   child: STRING
   look: THEME
 
 create {ANY}
+
+  make_menu: MENU
+    do
+      let empty_items: LIST[MENU_ITEM] = LIST.empty
+      let themes = empty_items
+        .prepend(MENU_ITEM.item("Dracula", 23))
+        .prepend(MENU_ITEM.item("Nord", 22))
+        .prepend(MENU_ITEM.item("Light", 21))
+        .prepend(MENU_ITEM.item("Dark", 20))
+      let file_items = empty_items
+        .prepend(MENU_ITEM.item("Quit", 12).with_shortcut("q"))
+        .prepend(MENU_ITEM.separator)
+        .prepend(MENU_ITEM.item("Open...", 11).with_shortcut("/"))
+        .prepend(MENU_ITEM.item("New", 10).with_shortcut("Ctrl+N"))
+      let view_items = empty_items
+        .prepend(MENU_ITEM.item("Help", 24).with_shortcut("?"))
+        .prepend(MENU_ITEM.separator)
+        .prepend(MENU_ITEM.submenu("Theme", themes))
+      let help_items = empty_items
+        .prepend(MENU_ITEM.item("About", 31))
+        .prepend(MENU_ITEM.item("Shortcuts", 30).with_shortcut("?"))
+      let entries = empty_items
+        .prepend(MENU_ITEM.submenu("Help", help_items))
+        .prepend(MENU_ITEM.submenu("View", view_items))
+        .prepend(MENU_ITEM.submenu("File", file_items))
+      MENU.make(entries).with_border(BORDER_KIND.rounded)
+    end
+
+  make_quit_dialog: DIALOG
+    do
+      DIALOG.confirm("Unsaved Changes", "Discard modified buffer and quit?")
+        .with_border(BORDER_KIND.rounded)
+    end
 
   make_help: POPUP
     do
@@ -57,6 +93,9 @@ create {ANY}
         commands_open = False,
         help_modal = TOUR_STATE.make_help,
         help_shown = False,
+        bar_menu = TOUR_STATE.make_menu,
+        quit_dialog = TOUR_STATE.make_quit_dialog,
+        modified = False,
         child = program,
         look = THEME.dark }
     end
@@ -210,6 +249,33 @@ feature {ANY}
       Current.help_modal
     end
 
+  top_menu: MENU
+    do
+      Current.bar_menu
+    end
+
+  dialog: DIALOG
+    do
+      Current.quit_dialog
+    end
+
+  dialog_open: BOOL
+    do
+      Current.quit_dialog.is_open
+    end
+
+  path_nodes: LIST[NAT]
+    do
+      let empty_ns: LIST[NAT] = LIST.empty
+      let t = Current.tree
+      if t.count = 0 then empty_ns else TOUR_STATE.ancestor_nodes(t, t.selected_row, empty_ns) end
+    end
+
+  breadcrumb: BREADCRUMB
+    do
+      BREADCRUMB.make(TOUR_STATE.labels_of(Current.tree, Current.path_nodes))
+    end
+
   theme: THEME
     do
       Current.look
@@ -241,16 +307,75 @@ feature {ANY}
       { Current with log = LIST_CUT.take(Current.log.append(LIST.empty.prepend(line)), 200) }
     end
 
+  request_quit: TUI_NEXT[TOUR_STATE]
+    do
+      if Current.modified then
+        TUI_NEXT.next({ Current with quit_dialog = Current.quit_dialog.open })
+      else
+        TUI_NEXT.quit(0)
+      end
+    end
+
+  apply_menu_choice(id: NAT): TUI_NEXT[TOUR_STATE]
+    do
+      if id = 10 then
+        TUI_NEXT.next({ Current with modified = True }.logged("New buffer (modified)"))
+      else if id = 11 then
+        TUI_NEXT.next({ Current with commands = PALETTE.make(TOUR_STATE.palette_entries), commands_open = True })
+      else if id = 12 then
+        Current.request_quit
+      else if id = 20 then
+        TUI_NEXT.next({ Current with look = THEME.dark }.logged("Theme dark"))
+      else if id = 21 then
+        TUI_NEXT.next({ Current with look = THEME.light }.logged("Theme light"))
+      else if id = 22 then
+        TUI_NEXT.next({ Current with look = THEME.nord }.logged("Theme nord"))
+      else if id = 23 then
+        TUI_NEXT.next({ Current with look = THEME.dracula }.logged("Theme dracula"))
+      else if id = 24 or id = 30 then
+        TUI_NEXT.next({ Current with help_shown = True, help_modal = TOUR_STATE.make_help })
+      else if id = 31 then
+        TUI_NEXT.next(Current.logged("gtui 0.6.0 workbench tour"))
+      else
+        TUI_NEXT.next(Current)
+      end end end end end end end end end
+    end
+
   -- A key, when the palette is closed.
   browse(k: KEY): TUI_NEXT[TOUR_STATE]
     do
-      if Current.help_shown then
+      if Current.quit_dialog.is_open then
+        match k
+          case KeysEnded then TUI_NEXT.quit(0)
+          case _ then
+            let next_dlg = Current.quit_dialog.on_key(k)
+            match next_dlg.answer
+              case Some(ans) then
+                if ans = 0 then
+                  TUI_NEXT.quit(0)
+                else
+                  TUI_NEXT.next({ Current with quit_dialog = next_dlg.clear_answer })
+                end
+              case None then TUI_NEXT.next({ Current with quit_dialog = next_dlg })
+            end
+        end
+      else if Current.bar_menu.is_open then
+        match k
+          case KeysEnded then TUI_NEXT.quit(0)
+          case _ then
+            let next_m = Current.bar_menu.on_key(k)
+            match next_m.chosen
+              case Some(id) then { Current with bar_menu = next_m.clear_chosen }.apply_menu_choice(id)
+              case None then TUI_NEXT.next({ Current with bar_menu = next_m })
+            end
+        end
+      else if Current.help_shown then
         match k
           case Escape then TUI_NEXT.next({ Current with help_shown = False })
           case Enter then TUI_NEXT.next({ Current with help_shown = False })
           case KeysEnded then TUI_NEXT.quit(0)
           case Char(c) then
-            if c = 'q' then TUI_NEXT.quit(0)
+            if c = 'q' then Current.request_quit
             else if c = '?' then TUI_NEXT.next({ Current with help_shown = False })
             else TUI_NEXT.next(Current)
             end end
@@ -258,8 +383,26 @@ feature {ANY}
         end
       else
         match k
+          case Function(n) then
+            if n = 10 then
+              TUI_NEXT.next({ Current with bar_menu = Current.bar_menu.open })
+            else
+              TUI_NEXT.next(Current.in_pane(k))
+            end
+          case Mod(inner, _, alt, ctrl) then
+            if alt and not ctrl then
+              TUI_NEXT.next({ Current with bar_menu = Current.bar_menu.on_key(k) })
+            else
+              TUI_NEXT.next(Current.in_pane(k))
+            end
+          case Ctrl(c) then
+            if c = 'n' then
+              TUI_NEXT.next({ Current with modified = True }.logged("New buffer (modified)"))
+            else
+              TUI_NEXT.next(Current.in_pane(k))
+            end
           case Char(c) then
-            if c = 'q' then TUI_NEXT.quit(0)
+            if c = 'q' then Current.request_quit
             else if c = '/' then TUI_NEXT.next({ Current with commands = PALETTE.make(TOUR_STATE.palette_entries), commands_open = True })
             else if c = '?' then TUI_NEXT.next({ Current with help_shown = True, help_modal = TOUR_STATE.make_help })
             else TUI_NEXT.next(Current.in_pane(k))
@@ -268,7 +411,7 @@ feature {ANY}
           case KeysEnded then TUI_NEXT.quit(0)
           case _ then TUI_NEXT.next(Current.in_pane(k))
         end
-      end
+      end end end
     end
 
   -- A key given to the pane that has the keys.
@@ -291,7 +434,7 @@ feature {ANY}
           end
         end end
       else if Current.keys_at.current = 1 then
-        { Current with source = Current.source.on_key(k, TOUR_LAYOUT.rows_in(TOUR_LAYOUT.right(a))) }
+        { Current with source = Current.source.on_key(k, TOUR_LAYOUT.source_rows(a)) }
       else
         let rows = TOUR_LAYOUT.rows_in(TOUR_LAYOUT.bottom(a))
         if Current.low_tabs.takes(k) then
@@ -300,7 +443,7 @@ feature {ANY}
           match k
             case Enter then
               let line = TOUR_STATE.nth(Current.issue_lines, Current.issues.selected)
-              let text_rows = TOUR_LAYOUT.rows_in(TOUR_LAYOUT.right(a))
+              let text_rows = TOUR_LAYOUT.source_rows(a)
               { Current with mark_line = Some(line), source = Current.source.showing(line, text_rows),
                 keys_at = Current.keys_at.moved_to(1) }
             case _ then { Current with issues = Current.issues.on_key(k, rows) }
@@ -360,7 +503,25 @@ feature {ANY}
   handle_mouse(m: MOUSE): TUI_NEXT[TOUR_STATE]
     do
       let area = Current.area
-      if Current.help_shown then
+      let menu_r = TOUR_LAYOUT.menu_bar(area)
+      if Current.quit_dialog.is_open then
+        let next_dlg = Current.quit_dialog.on_mouse(m, area)
+        match next_dlg.answer
+          case Some(ans) then
+            if ans = 0 then
+              TUI_NEXT.quit(0)
+            else
+              TUI_NEXT.next({ Current with quit_dialog = next_dlg.clear_answer })
+            end
+          case None then TUI_NEXT.next({ Current with quit_dialog = next_dlg })
+        end
+      else if Current.bar_menu.is_open or (not Current.help_shown and not Current.commands_open and Current.bar_menu.contains(menu_r, area, m.x, m.y) and m.is_left_down) then
+        let next_m = Current.bar_menu.on_mouse(m, menu_r, area)
+        match next_m.chosen
+          case Some(id) then { Current with bar_menu = next_m.clear_chosen }.apply_menu_choice(id)
+          case None then TUI_NEXT.next({ Current with bar_menu = next_m })
+        end
+      else if Current.help_shown then
         if Current.help_modal.contains(area, m.x, m.y) then
           TUI_NEXT.next({ Current with help_modal = Current.help_modal.on_mouse(m, area) })
         else if m.is_left_down then
@@ -396,12 +557,25 @@ feature {ANY}
           end end
         else if right.has(m.x, m.y) then
           let focused: TOUR_STATE = if m.is_left_down then { Current with keys_at = Current.keys_at.moved_to(1) } else Current end
-          let inner = FRAME.inner(right)
-          if inner.has(m.x, m.y) then
-            TUI_NEXT.next({ focused with source = focused.source.on_mouse(m, inner) })
+          let bc_r = TOUR_LAYOUT.breadcrumb_bar(area)
+          let src_r = TOUR_LAYOUT.source_area(area)
+          if bc_r.has(m.x, m.y) and m.is_left_down then
+            match focused.breadcrumb.crumb_at(bc_r, m.x, m.y)
+              case Some(ci) then
+                let node_idx = TOUR_STATE.nth(focused.path_nodes, ci)
+                let left_rows = TOUR_LAYOUT.rows_in(left)
+                if focused.left_tabs.selected = 0 then
+                  TUI_NEXT.next({ focused with module_tree = focused.module_tree.select_node(node_idx, left_rows) })
+                else
+                  TUI_NEXT.next({ focused with file_tree = focused.file_tree.select_node(node_idx, left_rows) })
+                end
+              case None then TUI_NEXT.next(focused)
+            end
+          else if src_r.has(m.x, m.y) then
+            TUI_NEXT.next({ focused with source = focused.source.on_mouse(m, src_r) })
           else
             TUI_NEXT.next(focused)
-          end
+          end end
         else if bottom.has(m.x, m.y) then
           let focused: TOUR_STATE = if m.is_left_down then { Current with keys_at = Current.keys_at.moved_to(2) } else Current end
           let title_r = FRAME.title_area(bottom)
@@ -415,7 +589,7 @@ feature {ANY}
               let idx = if focused.issues.top <= 18446744073709551615 - dy then focused.issues.top + dy else 18446744073709551615 end
               if idx < focused.issues.count then
                 let line = TOUR_STATE.nth(focused.issue_lines, next_issues.selected)
-                let text_rows = TOUR_LAYOUT.rows_in(right)
+                let text_rows = TOUR_LAYOUT.source_rows(area)
                 TUI_NEXT.next({ focused with issues = next_issues, mark_line = Some(line), source = focused.source.showing(line, text_rows) })
               else
                 TUI_NEXT.next({ focused with issues = next_issues })
@@ -429,7 +603,7 @@ feature {ANY}
         else
           TUI_NEXT.next(Current)
         end end end
-      end end
+      end end end end
     end
 
 create {ANY}
@@ -438,6 +612,39 @@ create {ANY}
   label_of(t: TREE_VIEW, i: NAT): STRING
     do
       if i < t.nodes.length then LIST_OPS.at(t.nodes, i).label else "" end
+    end
+
+  -- Labels of nodes `ns` in tree `t`.
+  labels_of(t: TREE_VIEW, ns: LIST[NAT]): LIST[STRING]
+    variant
+      ns.length
+    do
+      if ns.length = 0 then
+        let empty_s: LIST[STRING] = LIST.empty
+        empty_s
+      else
+        TOUR_STATE.labels_of(t, ns.tail).prepend(TOUR_STATE.label_of(t, ns.head))
+      end
+    end
+
+  -- Node indices from root down to `row_idx` in `t`, accumulated into `acc`.
+  ancestor_nodes(t: TREE_VIEW, row_idx: NAT, acc: LIST[NAT]): LIST[NAT]
+    variant
+      row_idx
+    do
+      let rows = t.shown_rows
+      if row_idx >= rows.length then
+        acc
+      else
+        let r = LIST_OPS.at(rows, row_idx)
+        let next_acc = acc.prepend(r.node)
+        let p = TREE_VIEW.parent_of(rows, 0, row_idx, r.depth, row_idx)
+        if p < row_idx then
+          TOUR_STATE.ancestor_nodes(t, p, next_acc)
+        else
+          next_acc
+        end
+      end
     end
 
 end

@@ -1,0 +1,439 @@
+-- Verified list predicates, element updates, `MATH_INT` multiset counts (inspired by Firulete),
+-- and inductive lemmas for CLRS Insertion Sort.
+-- All proofs use erased `check` blocks and are discharged statically by Boogie/Z3 under `--strict`.
+functions SORT_FACTS
+
+feature {ANY}
+
+  -- Replace element at index `idx` with `val`.
+  set_at(xs: LIST[NAT], idx: NAT, val: NAT): LIST[NAT]
+    require
+      in_bounds: idx < xs.length
+    variant
+      idx
+    do
+      if idx = 0 then
+        xs.tail.prepend(val)
+      else
+        SORT_FACTS.set_at(xs.tail, idx - 1, val).prepend(xs.head)
+      end
+    ensure
+      same_length: Result.length = xs.length
+      at_head_same: idx > 0 implies Result.head = xs.head
+      at_head_new: idx = 0 implies Result.head = val
+    end
+
+  -- Element lookup after `set_at`.
+  lemma_at_set_at(xs: LIST[NAT], idx: NAT, val: NAT, k: NAT): BOOL
+    require
+      idx_in: idx < xs.length
+      k_in: k < xs.length
+    variant
+      k
+    do
+      if k = 0 then
+        True
+      else if idx = 0 then
+        True
+      else
+        SORT_FACTS.lemma_at_set_at(xs.tail, idx - 1, val, k - 1)
+      end end
+    ensure
+      holds: Result
+      same_idx: k = idx implies LIST_OPS.at(SORT_FACTS.set_at(xs, idx, val), k) = val
+      other_idx: k != idx implies LIST_OPS.at(SORT_FACTS.set_at(xs, idx, val), k) = LIST_OPS.at(xs, k)
+    end
+
+  -- Exact occurrence count of `y` in `xs` (in unbounded `MATH_INT`, cf. Firulete's `count_of`).
+  count_of(y: NAT, xs: LIST[NAT]): MATH_INT
+    variant
+      xs.length
+    do
+      if xs.length = 0 then
+        0
+      else
+        let rest = SORT_FACTS.count_of(y, xs.tail)
+        if y = xs.head then rest + 1 else rest end
+      end
+    ensure
+      empty_case: xs.length = 0 implies Result = 0
+      cons_case: xs.length > 0 implies
+        (Result = (if y = xs.head then SORT_FACTS.count_of(y, xs.tail) + 1
+                   else SORT_FACTS.count_of(y, xs.tail) end))
+    end
+
+  -- Exact multiset count update under `set_at` (proves true permutation preservation).
+  lemma_count_set_at(y: NAT, xs: LIST[NAT], idx: NAT, val: NAT): BOOL
+    require
+      idx_in: idx < xs.length
+    variant
+      idx
+    do
+      if idx = 0 then
+        True
+      else
+        check rec: SORT_FACTS.lemma_count_set_at(y, xs.tail, idx - 1, val) end
+        True
+      end
+    ensure
+      holds: Result
+      count_eq: SORT_FACTS.count_of(y, SORT_FACTS.set_at(xs, idx, val))
+                + (if y = LIST_OPS.at(xs, idx) then 1 else 0 end)
+                = SORT_FACTS.count_of(y, xs)
+                + (if y = val then 1 else 0 end)
+    end
+
+  -- Logical occurrence count of `y` while `key` is lifted out of `hole`.
+  count_with_hole(y: NAT, xs: LIST[NAT], hole: NAT, key: NAT): MATH_INT
+    require
+      hole_in: hole < xs.length
+    do
+      SORT_FACTS.count_of(y, xs)
+        + (if y = key then 1 else 0 end)
+        - (if y = LIST_OPS.at(xs, hole) then 1 else 0 end)
+    end
+
+  -- True permutation theorem for `CompareShift`: shifting `left_val = xs[hole - 1]` into `hole`
+  -- preserves the exact multiset count of EVERY value `y: NAT`.
+  lemma_shift_preserves_count(y: NAT, xs: LIST[NAT], hole: NAT, left_val: NAT, key: NAT): BOOL
+    require
+      hole_pos: hole > 0
+      hole_in: hole < xs.length
+      left_eq: left_val = LIST_OPS.at(xs, hole - 1)
+    do
+      check
+        cnt: SORT_FACTS.lemma_count_set_at(y, xs, hole, left_val)
+        at_l: SORT_FACTS.lemma_at_set_at(xs, hole, left_val, hole - 1)
+      end
+      True
+    ensure
+      holds: Result
+      same_count: SORT_FACTS.count_with_hole(y, SORT_FACTS.set_at(xs, hole, left_val), hole - 1, key)
+                  = SORT_FACTS.count_with_hole(y, xs, hole, key)
+    end
+
+  -- True permutation theorem for `InsertKey`: placing `key` into `hole` yields
+  -- `count_of(y, next_xs) = count_with_hole(y, xs, hole, key)` for EVERY value `y: NAT`.
+  lemma_insert_preserves_count(y: NAT, xs: LIST[NAT], hole: NAT, key: NAT): BOOL
+    require
+      hole_in: hole < xs.length
+    do
+      check cnt: SORT_FACTS.lemma_count_set_at(y, xs, hole, key) end
+      True
+    ensure
+      holds: Result
+      same_count: SORT_FACTS.count_of(y, SORT_FACTS.set_at(xs, hole, key))
+                  = SORT_FACTS.count_with_hole(y, xs, hole, key)
+    end
+
+  -- Every element in `xs` is at most `cap`.
+  all_at_most(xs: LIST[NAT], cap: NAT): BOOL
+    variant
+      xs.length
+    do
+      if xs.length = 0 then
+        True
+      else
+        xs.head >= 0 and xs.head <= cap and SORT_FACTS.all_at_most(xs.tail, cap)
+      end
+    ensure
+      head_ok: (Result and xs.length > 0) implies (xs.head >= 0 and xs.head <= cap)
+      tail_ok: (Result and xs.length > 0) implies SORT_FACTS.all_at_most(xs.tail, cap)
+    end
+
+  -- Lookup in a bounded list is bounded.
+  lemma_at_bounded(xs: LIST[NAT], cap: NAT, k: NAT): BOOL
+    require
+      bounded: SORT_FACTS.all_at_most(xs, cap)
+      k_in: k < xs.length
+    variant
+      k
+    do
+      if k = 0 then
+        True
+      else
+        SORT_FACTS.lemma_at_bounded(xs.tail, cap, k - 1)
+      end
+    ensure
+      holds: Result
+      val_bounded: LIST_OPS.at(xs, k) <= cap
+    end
+
+  -- `set_at` preserves `all_at_most` when the new value is within `cap`.
+  lemma_set_at_bounded(xs: LIST[NAT], idx: NAT, val: NAT, cap: NAT): BOOL
+    require
+      bounded: SORT_FACTS.all_at_most(xs, cap)
+      idx_in: idx < xs.length
+      val_in: val <= cap
+    variant
+      idx
+    do
+      if idx = 0 then
+        True
+      else
+        SORT_FACTS.lemma_set_at_bounded(xs.tail, idx - 1, val, cap)
+      end
+    ensure
+      holds: Result
+      still_bounded: SORT_FACTS.all_at_most(SORT_FACTS.set_at(xs, idx, val), cap)
+    end
+
+  -- Sum of all elements in a list (capped at 64000 so addition is unconditionally overflow-free).
+  sum(xs: LIST[NAT]): NAT
+    variant
+      xs.length
+    do
+      if xs.length = 0 then
+        0
+      else
+        let h = xs.head
+        let rest = SORT_FACTS.sum(xs.tail)
+        if h >= 0 and h <= 999 and rest >= 0 and rest <= 64000 then
+          h + rest
+        else
+          64000
+        end
+      end
+    end
+
+  -- For any bounded list of length <= 64, `sum` never saturates and equals the exact sum.
+  lemma_sum_bound(xs: LIST[NAT]): BOOL
+    require
+      small_len: xs.length <= 64
+      bounded: SORT_FACTS.all_at_most(xs, 999)
+    variant
+      xs.length
+    do
+      if xs.length = 0 then
+        True
+      else
+        SORT_FACTS.lemma_sum_bound(xs.tail)
+      end
+    ensure
+      holds: Result
+      within_bound: SORT_FACTS.sum(xs) <= xs.length * 999
+      cons_sum: xs.length > 0 implies SORT_FACTS.sum(xs) = xs.head + SORT_FACTS.sum(xs.tail)
+    end
+
+  -- Every element is at most the total sum.
+  lemma_at_le_sum(xs: LIST[NAT], k: NAT): BOOL
+    require
+      small_len: xs.length <= 64
+      bounded: SORT_FACTS.all_at_most(xs, 999)
+      k_in: k < xs.length
+    variant
+      k
+    do
+      check sb: SORT_FACTS.lemma_sum_bound(xs) end
+      let v = LIST_OPS.at(xs, k)
+      if k = 0 then
+        True
+      else
+        SORT_FACTS.lemma_at_le_sum(xs.tail, k - 1)
+      end
+    ensure
+      holds: Result
+      le_sum: LIST_OPS.at(xs, k) <= SORT_FACTS.sum(xs)
+    end
+
+  -- How `sum` changes under `set_at`.
+  lemma_sum_set_at(xs: LIST[NAT], idx: NAT, val: NAT): BOOL
+    require
+      small_len: xs.length <= 64
+      bounded: SORT_FACTS.all_at_most(xs, 999)
+      idx_in: idx < xs.length
+      val_in: val <= 999
+    variant
+      idx
+    do
+      check
+        b: SORT_FACTS.lemma_set_at_bounded(xs, idx, val, 999)
+        s1: SORT_FACTS.lemma_sum_bound(xs)
+        s2: SORT_FACTS.lemma_sum_bound(SORT_FACTS.set_at(xs, idx, val))
+      end
+      if idx = 0 then
+        True
+      else
+        check le: SORT_FACTS.lemma_at_le_sum(xs.tail, idx - 1) end
+        SORT_FACTS.lemma_sum_set_at(xs.tail, idx - 1, val)
+      end
+    ensure
+      holds: Result
+      still_bounded: SORT_FACTS.all_at_most(SORT_FACTS.set_at(xs, idx, val), 999)
+      sum_eq: SORT_FACTS.sum(SORT_FACTS.set_at(xs, idx, val)) + LIST_OPS.at(xs, idx) = SORT_FACTS.sum(xs) + val
+    end
+
+  -- True when `xs[lo .. hi - 1]` is sorted in non-decreasing order.
+  sorted_range(xs: LIST[NAT], lo: NAT, hi: NAT): BOOL
+    require
+      hi_in: hi <= xs.length
+    variant
+      if hi > lo then hi - lo else 0 end
+    do
+      if lo >= hi or hi - lo <= 1 then
+        True
+      else
+        LIST_OPS.at(xs, lo) <= LIST_OPS.at(xs, lo + 1) and
+          SORT_FACTS.sorted_range(xs, lo + 1, hi)
+      end
+    ensure
+      trivial: (lo >= hi or hi - lo <= 1) implies Result
+      step_def: (lo < hi and hi - lo > 1) implies (Result = (LIST_OPS.at(xs, lo) <= LIST_OPS.at(xs, lo + 1) and SORT_FACTS.sorted_range(xs, lo + 1, hi)))
+    end
+
+  -- True when the entire list is sorted in non-decreasing order.
+  is_sorted(xs: LIST[NAT]): BOOL
+    do
+      SORT_FACTS.sorted_range(xs, 0, xs.length)
+    end
+
+  -- True when every element in `xs[lo .. hi - 1]` is strictly greater than `key`.
+  all_greater(xs: LIST[NAT], lo: NAT, hi: NAT, key: NAT): BOOL
+    require
+      hi_in: hi <= xs.length
+    variant
+      if hi > lo then hi - lo else 0 end
+    do
+      if lo >= hi then
+        True
+      else
+        LIST_OPS.at(xs, lo) > key and
+          SORT_FACTS.all_greater(xs, lo + 1, hi, key)
+      end
+    end
+
+  -- Any adjacent pair inside a `sorted_range` satisfies `xs[k] <= xs[k + 1]`.
+  lemma_sorted_adj(xs: LIST[NAT], lo: NAT, hi: NAT, k: NAT): BOOL
+    require
+      hi_in: hi <= xs.length
+      is_s: SORT_FACTS.sorted_range(xs, lo, hi)
+      k_lo: lo <= k
+      k_hi: k + 1 < hi
+    variant
+      k - lo
+    do
+      if k = lo then
+        True
+      else
+        SORT_FACTS.lemma_sorted_adj(xs, lo + 1, hi, k)
+      end
+    ensure
+      holds: Result
+      ordered: LIST_OPS.at(xs, k) <= LIST_OPS.at(xs, k + 1)
+    end
+
+  -- Shrinking the right endpoint of a `sorted_range` preserves sortedness.
+  lemma_sorted_shrink_hi(xs: LIST[NAT], lo: NAT, hi1: NAT, hi2: NAT): BOOL
+    require
+      hi_in: hi2 <= xs.length
+      order: hi1 <= hi2
+      is_s: SORT_FACTS.sorted_range(xs, lo, hi2)
+    variant
+      if hi1 > lo then hi1 - lo else 0 end
+    do
+      if lo >= hi1 or hi1 - lo <= 1 then
+        True
+      else
+        SORT_FACTS.lemma_sorted_shrink_hi(xs, lo + 1, hi1, hi2)
+      end
+    ensure
+      holds: Result
+      shrunk: SORT_FACTS.sorted_range(xs, lo, hi1)
+    end
+
+  -- `set_at` at an index outside `[lo, hi)` preserves `sorted_range(lo, hi)`.
+  lemma_sorted_set_outside(xs: LIST[NAT], idx: NAT, val: NAT, lo: NAT, hi: NAT): BOOL
+    require
+      idx_in: idx < xs.length
+      hi_in: hi <= xs.length
+      outside: idx < lo or idx >= hi
+      is_s: SORT_FACTS.sorted_range(xs, lo, hi)
+    variant
+      if hi > lo then hi - lo else 0 end
+    do
+      if lo >= hi or hi - lo <= 1 then
+        True
+      else
+        check
+          a: SORT_FACTS.lemma_at_set_at(xs, idx, val, lo)
+          b: SORT_FACTS.lemma_at_set_at(xs, idx, val, lo + 1)
+        end
+        SORT_FACTS.lemma_sorted_set_outside(xs, idx, val, lo + 1, hi)
+      end
+    ensure
+      holds: Result
+      preserved: SORT_FACTS.sorted_range(SORT_FACTS.set_at(xs, idx, val), lo, hi)
+    end
+
+  -- `set_at` at an index outside `[lo, hi)` preserves `all_greater(lo, hi, key)`.
+  lemma_greater_set_outside(xs: LIST[NAT], idx: NAT, val: NAT, lo: NAT, hi: NAT, key: NAT): BOOL
+    require
+      idx_in: idx < xs.length
+      hi_in: hi <= xs.length
+      outside: idx < lo or idx >= hi
+      is_g: SORT_FACTS.all_greater(xs, lo, hi, key)
+    variant
+      if hi > lo then hi - lo else 0 end
+    do
+      if lo >= hi then
+        True
+      else
+        check a: SORT_FACTS.lemma_at_set_at(xs, idx, val, lo) end
+        SORT_FACTS.lemma_greater_set_outside(xs, idx, val, lo + 1, hi, key)
+      end
+    ensure
+      holds: Result
+      preserved: SORT_FACTS.all_greater(SORT_FACTS.set_at(xs, idx, val), lo, hi, key)
+    end
+
+  -- Joining two sorted ranges `[lo, mid)` and `[mid, hi)` when the boundary pair is ordered.
+  lemma_sorted_join(xs: LIST[NAT], lo: NAT, mid: NAT, hi: NAT): BOOL
+    require
+      hi_in: hi <= xs.length
+      lo_le_mid: lo <= mid
+      mid_le_hi: mid <= hi
+      left_s: SORT_FACTS.sorted_range(xs, lo, mid)
+      right_s: SORT_FACTS.sorted_range(xs, mid, hi)
+      bridge: (lo < mid and mid < hi) implies LIST_OPS.at(xs, mid - 1) <= LIST_OPS.at(xs, mid)
+    variant
+      mid - lo
+    do
+      if lo = mid then
+        True
+      else if lo + 1 = mid then
+        True
+      else
+        SORT_FACTS.lemma_sorted_join(xs, lo + 1, mid, hi)
+      end end
+    ensure
+      holds: Result
+      joined: SORT_FACTS.sorted_range(xs, lo, hi)
+    end
+
+  -- Placing `key` into `hole` yields a sorted prefix `0..j+1`.
+  lemma_insert_key_sorted(xs: LIST[NAT], j: NAT, hole: NAT, key: NAT): BOOL
+    require
+      small_len: xs.length <= 64
+      j_in: j < xs.length
+      hole_le: hole <= j
+      left_s: SORT_FACTS.sorted_range(xs, 0, hole)
+      right_s: SORT_FACTS.sorted_range(xs, hole + 1, j + 1)
+      right_gt: SORT_FACTS.all_greater(xs, hole + 1, j + 1, key)
+      left_le: hole > 0 implies LIST_OPS.at(xs, hole - 1) <= key
+    do
+      let next_xs = SORT_FACTS.set_at(xs, hole, key)
+      check
+        ah: SORT_FACTS.lemma_at_set_at(xs, hole, key, hole)
+        sl: SORT_FACTS.lemma_sorted_set_outside(xs, hole, key, 0, hole)
+        sr: SORT_FACTS.lemma_sorted_set_outside(xs, hole, key, hole + 1, j + 1)
+        bl: if hole > 0 then SORT_FACTS.lemma_at_set_at(xs, hole, key, hole - 1) else True end
+        br: if hole < j then SORT_FACTS.lemma_at_set_at(xs, hole, key, hole + 1) else True end
+        j1: SORT_FACTS.lemma_sorted_join(next_xs, 0, hole, hole + 1)
+      end
+      SORT_FACTS.lemma_sorted_join(next_xs, 0, hole + 1, j + 1)
+    ensure
+      holds: Result
+      sorted_after: SORT_FACTS.sorted_range(SORT_FACTS.set_at(xs, hole, key), 0, j + 1)
+    end
+
+end

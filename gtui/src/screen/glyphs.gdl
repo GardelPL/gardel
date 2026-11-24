@@ -204,6 +204,42 @@ feature {ANY}
       if cs.length = 0 then out else GLYPHS.encode(cs.tail, GLYPHS.add_char(out, cs.head)) end
     end
 
+  -- Display width of the longest character prefix of `cs` that fits in `max_w` columns.
+  fitting_width_into(cs: LIST[CHAR], max_w: NAT, acc: NAT): NAT
+    require
+      bound: acc <= max_w and max_w <= 65535
+    variant
+      cs.length
+    do
+      if cs.length = 0 then
+        acc
+      else
+        let w = CHAR_WIDTH.of(cs.head)
+        if w = 0 then
+          GLYPHS.fitting_width_into(cs.tail, max_w, acc)
+        else if w = 1 and acc + 1 <= max_w then
+          GLYPHS.fitting_width_into(cs.tail, max_w, acc + 1)
+        else if w = 2 and acc + 2 <= max_w then
+          GLYPHS.fitting_width_into(cs.tail, max_w, acc + 2)
+        else
+          acc
+        end end end
+      end
+    ensure
+      fits: Result <= 65535
+    end
+
+  -- Display width of the longest character prefix of `s` that fits in `max_w` columns.
+  fitting_width(s: STRING, max_w: NAT): NAT
+    require
+      small: max_w <= 65535
+    do
+      let r = GLYPHS.fitting_width_into(GLYPHS.of_text(s), max_w, 0)
+      if r <= max_w then r else max_w end
+    ensure
+      bounded: Result <= max_w
+    end
+
   -- `a` followed by `b`, or `a` alone when together they would not fit a `STRING`.
   join(a: STRING, b: STRING): STRING
     do

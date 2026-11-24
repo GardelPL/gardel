@@ -1,7 +1,7 @@
 # Full Terminal Mouse Support Plan (SGR 1006)
 
 **Date:** November 16, 2026
-**Status:** Planned (Follow-up to [`gtui` 0.4.0](gtui_improvements.md))
+**Status:** Completed (all tasks `GM.1`–`GM.5` implemented and verified in `gtui` `0.5.0`, `stdlib/core`, `gardelc`, `examples/gtui_dashboard`, `examples/gtui_tour`, and 22 integration tests in `gardelc/tests/gtui.rs`; follow-up to [`gtui` 0.4.0](gtui_improvements.md))
 **Context:** End-to-end terminal mouse capture and pure functional hit-testing across [stdlib/core](../../stdlib/core), the [gardelc](../../gardelc) C11 reactive host, and [gtui](../../gtui) (`0.5.0`).
 **Follows:** [`gtui` 0.4.0 Improvements](gtui_improvements.md) and [Phase F](verified_libraries.md).
 
@@ -42,19 +42,19 @@ flowchart TD
     GM4 --> GM5
 ```
 
-| Task | Layer | Delivers | Primary Files |
-| :--- | :--- | :--- | :--- |
-| `GM.1` | Standard Library | `MOUSE` sum type + `EVENT.Mouse` + prelude registration | [mouse.gdl](../../stdlib/core/mouse.gdl), [event.gdl](../../stdlib/core/event.gdl), [main.rs](../../gardelc/src/main.rs) |
-| `GM.2` | Runtime Host (`gardelc`) | SGR 1006 decoder, Windows console mouse mode & fallback, log/replay/script syntax | [c11_typed.rs](../../gardelc/src/c11_typed.rs) |
-| `GM.3` | Terminal & App Loop (`gtui`) | `?1000h`/`?1002h`/`?1006h` in `VT_TEXT`, `ReadKey` continuation in `TUI_COMMANDS`, mock VT mode tracking | [vt_text.gdl](../../gtui/src/screen/vt_text.gdl), [tui_commands.gdl](../../gtui/src/app/tui_commands.gdl), [gtui.rs](../../gardelc/tests/gtui.rs) |
-| `GM.4` | Geometry & Widgets (`gtui`) | `RECT` hit-test laws and pure `on_mouse` / hit-test handlers across interactive widgets | [rect.gdl](../../gtui/src/layout/rect.gdl), [widget/](../../gtui/src/widget), [text_area.gdl](../../gtui/src/edit/text_area.gdl) |
-| `GM.5` | Examples & Tests | Interactive mouse support in `gtui_dashboard` and `gtui_tour`, host decoder tests, and `gtui.rs` proofs/sessions | [examples/gtui_dashboard](../../examples/gtui_dashboard), [examples/gtui_tour](../../examples/gtui_tour), [main.rs](../../gardelc/src/main.rs), [gtui.rs](../../gardelc/tests/gtui.rs) |
+| Task | Status | Layer | Delivers | Primary Files |
+| :--- | :--- | :--- | :--- | :--- |
+| `GM.1` | Completed | Standard Library | `MOUSE` sum type + `EVENT.Mouse` + prelude registration | [mouse.gdl](../../stdlib/core/mouse.gdl), [event.gdl](../../stdlib/core/event.gdl), [main.rs](../../gardelc/src/main.rs) |
+| `GM.2` | Completed | Runtime Host (`gardelc`) | SGR 1006 decoder, Windows console mouse mode & fallback, log/replay/script syntax | [c11_typed.rs](../../gardelc/src/c11_typed.rs) |
+| `GM.3` | Completed | Terminal & App Loop (`gtui`) | `?1000h`/`?1002h`/`?1006h` in `VT_TEXT`, `ReadKey` continuation in `TUI_COMMANDS`, mock VT mode tracking | [vt_text.gdl](../../gtui/src/screen/vt_text.gdl), [tui_commands.gdl](../../gtui/src/app/tui_commands.gdl), [gtui.rs](../../gardelc/tests/gtui.rs) |
+| `GM.4` | Completed | Geometry & Widgets (`gtui`) | `RECT` hit-test laws and pure `on_mouse` / hit-test handlers across interactive widgets | [rect.gdl](../../gtui/src/layout/rect.gdl), [widget/](../../gtui/src/widget), [text_area.gdl](../../gtui/src/edit/text_area.gdl) |
+| `GM.5` | Completed | Examples & Tests | Interactive mouse support in `gtui_dashboard` and `gtui_tour`, host decoder tests, and `gtui.rs` proofs/sessions | [examples/gtui_dashboard](../../examples/gtui_dashboard), [examples/gtui_tour](../../examples/gtui_tour), [main.rs](../../gardelc/src/main.rs), [gtui.rs](../../gardelc/tests/gtui.rs) |
 
 ---
 
 ## 3. Tasks
 
-### `GM.1` — Prelude `MOUSE` & `EVENT.Mouse` (`stdlib/core`)
+### `GM.1` — Prelude `MOUSE` & `EVENT.Mouse` (`stdlib/core`) [Completed]
 
 * **Design:**
   * Follow the same modifier-wrapper pattern established by [key.gdl](../../stdlib/core/key.gdl) (`KEY.Mod`) so existing clients that match without modifiers continue to compose cleanly.
@@ -84,7 +84,7 @@ flowchart TD
 
 ---
 
-### `GM.2` — `gardelc` Host SGR 1006 Decoder, Console Mode, & Deterministic Replay ([c11_typed.rs](../../gardelc/src/c11_typed.rs))
+### `GM.2` — `gardelc` Host SGR 1006 Decoder, Console Mode, & Deterministic Replay ([c11_typed.rs](../../gardelc/src/c11_typed.rs)) [Completed]
 
 * **Host event & command representation:**
   * Mouse events are asynchronous terminal input sequences that answer `ReadKey` (in the same reader stream as `Key` and `Pasted`, avoiding stdin races and preserving strict `GARDEL_RECORD`/`GARDEL_REPLAY` ordering).
@@ -122,7 +122,7 @@ flowchart TD
 
 ---
 
-### `GM.3` — `VT_TEXT` Mode Sequences & `TUI` Event Loop (`gtui/src/screen`, `gtui/src/app`)
+### `GM.3` — `VT_TEXT` Mode Sequences & `TUI` Event Loop (`gtui/src/screen`, `gtui/src/app`) [Completed]
 
 * **`VT_TEXT.enter` and `VT_TEXT.leave` ([vt_text.gdl](../../gtui/src/screen/vt_text.gdl)):**
   * Update `VT_TEXT.enter`:
@@ -139,7 +139,7 @@ flowchart TD
 
 ---
 
-### `GM.4` — Verified Hit-Testing & Widget `on_mouse` Routines (`gtui/src/layout`, `gtui/src/widget`, `gtui/src/edit`)
+### `GM.4` — Verified Hit-Testing & Widget `on_mouse` Routines (`gtui/src/layout`, `gtui/src/widget`, `gtui/src/edit`) [Completed]
 
 * **Verified geometry hit-test laws ([rect.gdl](../../gtui/src/layout/rect.gdl)):**
   * Add `specify {ANY}` laws building on existing `RECT.has`, `RECT.inside`, and `RECT.disjoint`:
@@ -180,7 +180,7 @@ flowchart TD
 
 ---
 
-### `GM.5` — Examples & End-to-End Verification (`examples/`, `gardelc/src/main.rs`, `gardelc/tests/gtui.rs`)
+### `GM.5` — Examples & End-to-End Verification (`examples/`, `gardelc/src/main.rs`, `gardelc/tests/gtui.rs`) [Completed]
 
 * **Update examples:**
   * [examples/gtui_dashboard](../../examples/gtui_dashboard): Refactor layout splitting into a shared pure helper (so both `update`—which needs `last_size: RECT` or stores `size: RECT` updated on `Resized(w, h)`—and `view` derive identical geometry):
@@ -208,10 +208,10 @@ flowchart TD
 
 ## 4. Execution Order & Verification Gates
 
-1. **Step 1 (`GM.1` + `GM.2`):** Implement [mouse.gdl](../../stdlib/core/mouse.gdl), update [event.gdl](../../stdlib/core/event.gdl) and [main.rs](../../gardelc/src/main.rs), and implement SGR 1006 decoding, Windows console mouse mode/fallback, and log/replay/script support in [c11_typed.rs](../../gardelc/src/c11_typed.rs).
+1. **Step 1 (`GM.1` + `GM.2`):** [Completed] Implement [mouse.gdl](../../stdlib/core/mouse.gdl), update [event.gdl](../../stdlib/core/event.gdl) and [main.rs](../../gardelc/src/main.rs), and implement SGR 1006 decoding, Windows console mouse mode/fallback, and log/replay/script support in [c11_typed.rs](../../gardelc/src/c11_typed.rs).
    * *Gate:* `gardelc --stdlib --strict` passes; host F.9 & new SGR mouse tests pass (`cargo test --manifest-path gardelc/Cargo.toml test_f9` and mouse host tests).
-2. **Step 2 (`GM.3`):** Update `VT_TEXT.enter`/`leave`, `TUI_COMMANDS.reads_after`, and the test `Terminal` in [gardelc/tests/gtui.rs](../../gardelc/tests/gtui.rs).
+2. **Step 2 (`GM.3`):** [Completed] Update `VT_TEXT.enter`/`leave`, `TUI_COMMANDS.reads_after`, and the test `Terminal` in [gardelc/tests/gtui.rs](../../gardelc/tests/gtui.rs).
    * *Gate:* Existing `gtui` suite passes under `--strict` with updated enter/leave sequence checks.
-3. **Step 3 (`GM.4`):** Add `RECT` hit-test laws and `on_mouse` / hit-test handlers across `gtui` widgets and `TEXT_AREA`, maintaining zero `--strict` errors/warnings (and documenting any non-local relational lemmas clearly rather than introducing unsound assumes).
+3. **Step 3 (`GM.4`):** [Completed] Add `RECT` hit-test laws and `on_mouse` / hit-test handlers across `gtui` widgets and `TEXT_AREA`, maintaining zero `--strict` errors/warnings (and documenting any non-local relational lemmas clearly rather than introducing unsound assumes).
    * *Gate:* All `gtui` modules verify under `gardelc --strict`.
-4. **Step 4 (`GM.5`):** Wire mouse interactions into [examples/gtui_dashboard](../../examples/gtui_dashboard) and [examples/gtui_tour](../../examples/gtui_tour), add contract & scripted-session mouse tests in [gardelc/tests/gtui.rs](../../gardelc/tests/gtui.rs), and run the complete test suite (`cargo test --manifest-path gardelc/Cargo.toml --test gtui -- --test-threads=4`).
+4. **Step 4 (`GM.5`):** [Completed] Wire mouse interactions into [examples/gtui_dashboard](../../examples/gtui_dashboard) and [examples/gtui_tour](../../examples/gtui_tour), add contract & scripted-session mouse tests in [gardelc/tests/gtui.rs](../../gardelc/tests/gtui.rs), and run the complete test suite (`cargo test --manifest-path gardelc/Cargo.toml --test gtui -- --test-threads=4`).

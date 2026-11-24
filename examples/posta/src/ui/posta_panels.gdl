@@ -1,0 +1,132 @@
+-- Rendering helpers for `posta` request headers, response body/headers/timeout gauge,
+-- and verified contract/short-form display.
+functions POSTA_PANELS
+
+feature {ANY}
+
+  row2(a: STRING, b: STRING): LIST[STRING]
+    do
+      let empty: LIST[STRING] = LIST.empty
+      empty.prepend(b).prepend(a)
+    end
+
+  -- Embedded verified contract interface (Short Form of `IN_FLIGHT` and `HTTP_CLIENT`).
+  short_form_lines: LIST[STRING]
+    do
+      let empty: LIST[STRING] = LIST.empty
+      empty
+        .prepend("end")
+        .prepend("      ensure  now_idle: not Result.state.is_active")
+        .prepend("      ensure  no_conn: Result.state.connection.is_none")
+        .prepend("    {ANY} cancel: FLIGHT_STEP")
+        .prepend("      ensure  freed: not Result.state.is_on(c)")
+        .prepend("    {ANY} on_closed(c: CONN_ID): FLIGHT_STEP")
+        .prepend("      ensure  bounded_active: Result.state.active_count <= 1")
+        .prepend("    {ANY} on_received(c: CONN_ID, data: BYTES): FLIGHT_STEP")
+        .prepend("      ensure  now_active: Result.state.is_active")
+        .prepend("      require sendable: HTTP_REQUEST_WRITER.sendable(req)")
+        .prepend("      require currently_idle: not Current.is_active")
+        .prepend("    {ANY} start(host: STRING, port: NAT, req: HTTP_REQUEST): FLIGHT_STEP")
+        .prepend("  invariant")
+        .prepend("    active_waiting: active implies not client.is_free")
+        .prepend("    idle_clean: not active implies (link.is_none and client.is_none)")
+        .prepend("    bounded_ticks: ticks_used <= 20")
+        .prepend("module IN_FLIGHT")
+        .prepend("")
+        .prepend("  -- ghttp::HTTP_CLIENT.receive requires `not conn.is_free`")
+        .prepend("  -- gjson::JSON.parse_text proves RFC 8259 validity & bounded offset")
+    end
+
+  -- Request Headers tab (shows the exact RFC 9110 headers emitted by `ENDPOINT.to_http_request`).
+  draw_req_headers(s: SCREEN, r: RECT, ep: ENDPOINT, body_text: STRING, t: THEME): SCREEN
+    do
+      let widths: LIST[SIZE] = LIST.empty
+        .prepend(SIZE.flex(1))
+        .prepend(SIZE.fixed(16))
+      let hdr = POSTA_PANELS.row2("Header", "Value")
+      let host_val = GLYPHS.join(ep.host, GLYPHS.join(":", NUMBER_TEXT.nat_to_text(ep.port)))
+      let base_rows: LIST[LIST[STRING]] = LIST.empty
+        .prepend(POSTA_PANELS.row2("Connection", "close"))
+        .prepend(POSTA_PANELS.row2("Accept", "application/json"))
+        .prepend(POSTA_PANELS.row2("Host", host_val))
+      let rows =
+        if not ep.method.is_safe and not body_text.is_empty then
+          base_rows.prepend(POSTA_PANELS.row2("Content-Type", "application/json"))
+        else
+          base_rows
+        end
+      TABLE.with_headers(widths, hdr, rows).draw(s, r, t.base, t.active_tab, t.base)
+    ensure
+      same_width: Result.width = s.width
+      same_height: Result.height = s.height
+    end
+
+  -- Contracts tab inside the Request pane.
+  draw_contracts(s: SCREEN, r: RECT, cv: TEXT_VIEW, t: THEME): SCREEN
+    do
+      let ok_st = STYLE.plain.fg(COLOR.green).bold
+      let s0 = s.text(r, r.x, r.y, "✓ bounded_in_flight (<= 1) & idle_clean  [PROVEN]", ok_st)
+      let r1 = r.drop_top(1)
+      let s1 = s0.text(r1, r1.x, r1.y, "✓ HTTP/1.1 framing & RFC 8259 JSON       [PROVEN]", ok_st)
+      let view_r = r.drop_top(2).drop_right(1)
+      let s2 = cv.draw(s1, view_r, t.base)
+      SCROLLBAR.vertical(cv.line_count, view_r.height, cv.top)
+        .draw(s2, r.drop_top(2), t.gutter, t.focused_border)
+    ensure
+      same_width: Result.width = s.width
+      same_height: Result.height = s.height
+    end
+
+  -- Split a multi-line response string into lines for `TEXT_VIEW`.
+  split_lines(text: STRING): LIST[STRING]
+    do
+      let empty: LIST[STRING] = LIST.empty
+      let cs = GLYPHS.of_text(text)
+      let raw = LINE_SPLIT.lines_of(cs)
+      LIST_OPS.map(raw, fn(line: LIST[CHAR]): STRING do GLYPHS.text_of(line) end)
+    end
+
+  -- Response pane content (live timeout gauge while in-flight, or response body / headers).
+  draw_response(s: SCREEN, r: RECT, flight: IN_FLIGHT, resp: RESPONSE_RECORD, tab_idx: NAT, resp_view: TEXT_VIEW, t: THEME): SCREEN
+    do
+      if flight.is_active then
+        let s0 = s.text(r, r.x, r.y, "Waiting for HTTP response (non-blocking TCP I/O)...", t.active_tab)
+        let g_r = r.drop_top(2).take_top(1)
+        let s1 = SCREEN.fitted(GAUGE.percent(flight.timeout_percent).draw(s0, g_r, t.gutter, STYLE.plain.fg(COLOR.yellow).bold), s0)
+        let info = GLYPHS.join("Elapsed: ", GLYPHS.join(NUMBER_TEXT.nat_to_text(flight.elapsed_ms), "ms / 5000ms timeout · Press Esc to cancel"))
+        s1.text(r, r.x, r.y + 4, info, t.gutter)
+      else
+        let st_style =
+          if resp.has_error then STYLE.plain.fg(COLOR.red).bold
+          else if resp.has_response and resp.status_code < 300 then STYLE.plain.fg(COLOR.green).bold
+          else if resp.has_response and resp.status_code < 500 then STYLE.plain.fg(COLOR.yellow).bold
+          else if resp.has_response then STYLE.plain.fg(COLOR.red).bold
+          else t.gutter
+          end end end end
+        let banner =
+          if resp.has_response and not resp.json_label.is_empty then
+            GLYPHS.join(resp.status_banner, GLYPHS.join("  ·  ", resp.json_label))
+          else
+            resp.status_banner
+          end
+        let s0 = s.text(r, r.x, r.y, banner, st_style)
+        let body_r = r.drop_top(1)
+        if tab_idx = 0 then
+          let vr = body_r.drop_right(1)
+          let s1 = resp_view.draw(s0, vr, t.base)
+          SCROLLBAR.vertical(resp_view.line_count, vr.height, resp_view.top)
+            .draw(s1, body_r, t.gutter, t.focused_border)
+        else
+          let widths: LIST[SIZE] = LIST.empty
+            .prepend(SIZE.flex(1))
+            .prepend(SIZE.fixed(20))
+          let hdr = POSTA_PANELS.row2("Response Header", "Value")
+          TABLE.with_headers(widths, hdr, resp.header_rows).draw(s0, body_r, t.base, t.active_tab, t.base)
+        end
+      end
+    ensure
+      same_width: Result.width = s.width
+      same_height: Result.height = s.height
+    end
+
+end

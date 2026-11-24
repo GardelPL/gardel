@@ -1,0 +1,110 @@
+-- Pure time-travel execution trace for `DIJKSTRA`.
+-- Materializes the entire shortest-path run using `DIJKSTRA.work_left` as its proven variant.
+module DIJKSTRA_HISTORY
+
+representation {NONE}
+  steps: LIST[DIJKSTRA]
+  cursor: NAT
+  init_work: NAT
+
+create {ANY}
+
+  from_initial(start: DIJKSTRA): DIJKSTRA_HISTORY
+    do
+      let trace = DIJKSTRA_HISTORY.build_trace(start)
+      let w0 = start.work_left
+      { steps = trace, cursor = 0, init_work = w0 }
+    ensure
+      at_start: Result.step_index = 0
+      non_empty: Result.step_count >= 1
+    end
+
+  build_trace(s: DIJKSTRA): LIST[DIJKSTRA]
+    variant
+      s.work_left
+    do
+      if s.is_done then
+        LIST.empty.prepend(s)
+      else
+        DIJKSTRA_HISTORY.build_trace(s.step).prepend(s)
+      end
+    ensure
+      non_empty: Result.length >= 1
+    end
+
+feature {ANY}
+
+  current: DIJKSTRA
+    do
+      LIST_OPS.at(Current.steps, Current.cursor)
+    end
+
+  step_index: NAT
+    do
+      Current.cursor
+    end
+
+  step_count: NAT
+    do
+      Current.steps.length
+    end
+
+  last_step: NAT
+    do
+      Current.steps.length - 1
+    end
+
+  initial_work: NAT
+    do
+      Current.init_work
+    end
+
+  at_end: BOOL
+    do
+      Current.cursor >= Current.steps.length - 1
+    end
+
+  step_forward: DIJKSTRA_HISTORY
+    do
+      if Current.cursor < Current.steps.length - 1 and Current.cursor < 18446744073709551615 then
+        { steps = Current.steps, cursor = Current.cursor + 1, init_work = Current.init_work }
+      else
+        Current
+      end
+    ensure
+      same_trace: Result.step_count = Current.step_count
+    end
+
+  step_back: DIJKSTRA_HISTORY
+    do
+      if Current.cursor > 0 then
+        { steps = Current.steps, cursor = Current.cursor - 1, init_work = Current.init_work }
+      else
+        Current
+      end
+    ensure
+      same_trace: Result.step_count = Current.step_count
+    end
+
+  jump_to(idx: NAT): DIJKSTRA_HISTORY
+    do
+      let clamped = if idx < Current.steps.length then idx else Current.steps.length - 1 end
+      { steps = Current.steps, cursor = clamped, init_work = Current.init_work }
+    ensure
+      same_trace: Result.step_count = Current.step_count
+      bounded: Result.step_index < Result.step_count
+    end
+
+  reset: DIJKSTRA_HISTORY
+    do
+      { steps = Current.steps, cursor = 0, init_work = Current.init_work }
+    ensure
+      at_zero: Result.step_index = 0
+      same_trace: Result.step_count = Current.step_count
+    end
+
+invariant
+  non_empty: steps.length >= 1
+  cursor_in_bounds: cursor < steps.length
+
+end

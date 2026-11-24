@@ -1,0 +1,721 @@
+-- Application state and event routing for `clrs_studio`.
+-- Coordinates `SORT_HISTORY` with `gtui` 0.6.0 widgets (`MENU`, `TABS`, `BUTTON`,
+-- `SLIDER`, `CHECKBOX`, `DIALOG`, `POPUP`, `TOAST`, `TEXT_VIEW`) and deterministic `Tick` auto-play.
+module STUDIO_STATE
+
+representation {NONE}
+  wide: NAT
+  high: NAT
+  keys_at: FOCUS
+  bar_menu: MENU
+  spec_tabs: TABS
+  code_view: TEXT_VIEW
+  short_view: TEXT_VIEW
+  algo_idx: NAT
+  hist: SORT_HISTORY
+  dj_hist: DIJKSTRA_HISTORY
+  preset_idx: NAT
+  preset_label: STRING
+  playing: BOOL
+  chk_highlight: CHECKBOX
+  chk_values: CHECKBOX
+  timeline: SLIDER
+  speed: SLIDER
+  toast_queue: TOAST
+  tick_seq: NAT
+  help_modal: POPUP
+  help_shown: BOOL
+  quit_dialog: DIALOG
+  custom_open: BOOL
+  custom_input: INPUT_LINE
+  custom_err: STRING
+  theme_idx: NAT
+
+create {ANY}
+
+  make_menu_for(algo: NAT): MENU
+    do
+      let none: LIST[MENU_ITEM] = LIST.empty
+      let file_items = none
+        .prepend(MENU_ITEM.item("Quit", 12).with_shortcut("q"))
+        .prepend(MENU_ITEM.separator)
+        .prepend(MENU_ITEM.item("Reset Trace", 10).with_shortcut("r"))
+      let algo_items = none
+        .prepend(MENU_ITEM.item("Red-Black Tree (Ch. 13)", 23).with_enabled(False))
+        .prepend(MENU_ITEM.item("LCS Dynamic Prog (Ch. 15)", 22).with_enabled(False))
+        .prepend(MENU_ITEM.separator)
+        .prepend(MENU_ITEM.item("Dijkstra Shortest Path (Ch. 22.3)", 21).with_shortcut("a"))
+        .prepend(MENU_ITEM.item("Insertion Sort (Ch. 2.1)", 20).with_shortcut("a"))
+      let input_items = if algo = 0 then
+        none
+          .prepend(MENU_ITEM.item("Custom Numbers...", 35).with_shortcut("u"))
+          .prepend(MENU_ITEM.separator)
+          .prepend(MENU_ITEM.item("Wave (10 items)", 34).with_shortcut("5"))
+          .prepend(MENU_ITEM.item("Duplicates", 33).with_shortcut("4"))
+          .prepend(MENU_ITEM.item("Nearly Sorted", 32).with_shortcut("3"))
+          .prepend(MENU_ITEM.item("Reversed (Worst)", 31).with_shortcut("2"))
+          .prepend(MENU_ITEM.item("CLRS [5,2,4,6,1,3]", 30).with_shortcut("1"))
+      else
+        none
+          .prepend(MENU_ITEM.item("Custom Edges...", 35).with_shortcut("u"))
+          .prepend(MENU_ITEM.separator)
+          .prepend(MENU_ITEM.item("Multi-Hop Network (5v)", 33).with_shortcut("4"))
+          .prepend(MENU_ITEM.item("Diamond Shortcut (5v)", 32).with_shortcut("3"))
+          .prepend(MENU_ITEM.item("CLRS Fig. 22.2 (4th ed.)", 31).with_shortcut("2"))
+          .prepend(MENU_ITEM.item("CLRS Fig. 22.6 (s,t,x,y,z)", 30).with_shortcut("1"))
+      end
+      let theme_items = none
+        .prepend(MENU_ITEM.item("Dracula", 43))
+        .prepend(MENU_ITEM.item("Nord", 42))
+        .prepend(MENU_ITEM.item("Light", 41))
+        .prepend(MENU_ITEM.item("Dark", 40))
+      let help_items = none
+        .prepend(MENU_ITEM.item("About Gardel Proofs", 51))
+        .prepend(MENU_ITEM.item("Controls & Keys", 50).with_shortcut("?"))
+      let entries = none
+        .prepend(MENU_ITEM.submenu("Help", help_items))
+        .prepend(MENU_ITEM.submenu("Theme", theme_items))
+        .prepend(MENU_ITEM.submenu("Input", input_items))
+        .prepend(MENU_ITEM.submenu("Algorithm", algo_items))
+        .prepend(MENU_ITEM.submenu("File", file_items))
+      MENU.make(entries).with_border(BORDER_KIND.rounded)
+    end
+
+  make_help: POPUP
+    do
+      let l1 = "Space: Play / Pause | Left / Right: Step Back / Forward\n"
+      let l2 = "a: Switch Algorithm (Sort / Dijkstra) | r: Reset\n"
+      let l3 = "1-5: Switch Presets | u: Custom Sort Input | i/c/s: Tabs\n"
+      let l4 = "t: Cycle Theme | +/-: Speed | F10: Menu | ?: Help | q: Quit\n"
+      let l5 = "Mouse: Click transport buttons, drag Timeline/Speed sliders,\n"
+      let l6 = "toggle checkboxes, click tabs & menu bar."
+      let p1 = GLYPHS.join(GLYPHS.join(l1, l2), GLYPHS.join(l3, l4))
+      let p2 = GLYPHS.join(l5, l6)
+      POPUP.of_text("CLRS Studio Controls", GLYPHS.join(p1, p2), 62, 7)
+        .with_border(BORDER_KIND.rounded)
+        .with_padding(PADDING.symmetric(0, 1))
+        .with_footer("Esc / ? to close")
+    end
+
+  make_quit_dialog: DIALOG
+    do
+      DIALOG.confirm("Leave CLRS Studio?", "Exit the verified algorithm visualizer?")
+        .with_border(BORDER_KIND.rounded)
+    end
+
+  make: STUDIO_STATE
+    do
+      let data = PRESETS.preset_data(0)
+      let h = SORT_HISTORY.from_initial(INSERTION_SORT.make(data))
+      let dh = DIJKSTRA_HISTORY.from_initial(DIJKSTRA_PRESETS.make_preset(0))
+      let max_s = if h.last_step > 0 then h.last_step else 1 end
+      let tl = SLIDER.make(0, max_s, 1, 0).with_label
+      let sp = SLIDER.make(1, 10, 1, 5).with_label
+      { wide = 100,
+        high = 28,
+        keys_at = FOCUS.make(2),
+        bar_menu = STUDIO_STATE.make_menu_for(0),
+        spec_tabs = TABS.empty.with("Invariants", 'i').with("Code", 'c').with("Short Form", 's'),
+        code_view = TEXT_VIEW.make(CONTRACT_PANEL.code_lines),
+        short_view = TEXT_VIEW.make(CONTRACT_PANEL.short_form_lines),
+        algo_idx = 0,
+        hist = h,
+        dj_hist = dh,
+        preset_idx = 0,
+        preset_label = PRESETS.preset_name(0),
+        playing = False,
+        chk_highlight = CHECKBOX.checked("Highlight proven region"),
+        chk_values = CHECKBOX.checked("Show bar values"),
+        timeline = tl,
+        speed = sp,
+        toast_queue = TOAST.empty.with_max_visible(1),
+        tick_seq = 0,
+        help_modal = STUDIO_STATE.make_help,
+        help_shown = False,
+        quit_dialog = STUDIO_STATE.make_quit_dialog,
+        custom_open = False,
+        custom_input = INPUT_LINE.of_text("5, 2, 4, 6, 1, 3"),
+        custom_err = "",
+        theme_idx = 0 }
+    end
+
+feature {ANY}
+
+  area: RECT
+    do
+      RECT.sized(Current.wide, Current.high)
+    end
+
+  focus: FOCUS
+    do
+      Current.keys_at
+    end
+
+  top_menu: MENU
+    do
+      Current.bar_menu
+    end
+
+  tabs: TABS
+    do
+      Current.spec_tabs
+    end
+
+  code: TEXT_VIEW
+    do
+      Current.code_view
+    end
+
+  short_form: TEXT_VIEW
+    do
+      Current.short_view
+    end
+
+  active_algo: NAT
+    do
+      Current.algo_idx
+    end
+
+  algo_title: STRING
+    do
+      if Current.algo_idx = 0 then "Insertion Sort — CLRS Ch. 2.1"
+      else "Dijkstra Shortest Path — CLRS Ch. 22.3"
+      end
+    end
+
+  history: SORT_HISTORY
+    do
+      Current.hist
+    end
+
+  sort_state: INSERTION_SORT
+    do
+      Current.hist.current
+    end
+
+  dijkstra_history: DIJKSTRA_HISTORY
+    do
+      Current.dj_hist
+    end
+
+  dijkstra_state: DIJKSTRA
+    do
+      Current.dj_hist.current
+    end
+
+  current_step_index: NAT
+    do
+      if Current.algo_idx = 0 then Current.hist.step_index else Current.dj_hist.step_index end
+    end
+
+  current_last_step: NAT
+    do
+      if Current.algo_idx = 0 then Current.hist.last_step else Current.dj_hist.last_step end
+    end
+
+  current_code_line: NAT
+    do
+      if Current.algo_idx = 0 then Current.hist.current.active_code_line else Current.dj_hist.current.active_code_line end
+    end
+
+  current_at_end: BOOL
+    do
+      if Current.algo_idx = 0 then Current.hist.at_end else Current.dj_hist.at_end end
+    end
+
+  preset_name: STRING
+    do
+      Current.preset_label
+    end
+
+  is_playing: BOOL
+    do
+      Current.playing
+    end
+
+  highlight_checkbox: CHECKBOX
+    do
+      Current.chk_highlight
+    end
+
+  values_checkbox: CHECKBOX
+    do
+      Current.chk_values
+    end
+
+  timeline_slider: SLIDER
+    do
+      Current.timeline
+    end
+
+  speed_slider: SLIDER
+    do
+      Current.speed
+    end
+
+  toasts: TOAST
+    do
+      Current.toast_queue
+    end
+
+  help_open: BOOL
+    do
+      Current.help_shown
+    end
+
+  help_popup: POPUP
+    do
+      Current.help_modal
+    end
+
+  dialog: DIALOG
+    do
+      Current.quit_dialog
+    end
+
+  dialog_open: BOOL
+    do
+      Current.quit_dialog.is_open
+    end
+
+  custom_modal_open: BOOL
+    do
+      Current.custom_open
+    end
+
+  custom_line: INPUT_LINE
+    do
+      Current.custom_input
+    end
+
+  custom_error: STRING
+    do
+      Current.custom_err
+    end
+
+  theme: THEME
+    do
+      if Current.theme_idx = 0 then THEME.dark
+      else if Current.theme_idx = 1 then THEME.light
+      else if Current.theme_idx = 2 then THEME.nord
+      else THEME.dracula
+      end end end
+    end
+
+  -- Milliseconds between auto-play steps derived from Speed slider (1..10 -> 700ms..160ms).
+  step_millis: U64
+    do
+      let v = Current.speed.value
+      let clamped = if v >= 1 and v <= 10 then v else 5 end
+      let ms = 760 - clamped * 60
+      ms
+    end
+
+  sized(w: NAT, h: NAT): STUDIO_STATE
+    do
+      { Current with wide = w, high = h }
+    end
+
+  -- Sync timeline slider and code_view scroll with `h`.
+  with_history(h: SORT_HISTORY, lbl: STRING, p_idx: NAT): STUDIO_STATE
+    do
+      let max_s = if h.last_step > 0 then h.last_step else 1 end
+      let tl = SLIDER.make(0, max_s, 1, h.step_index).with_label
+      let vis = STUDIO_LAYOUT.code_area(Current.area).height
+      let cv = Current.code_view.showing(h.current.active_code_line, vis)
+      { Current with hist = h, preset_label = lbl, preset_idx = p_idx, timeline = tl, code_view = cv, playing = False }
+    end
+
+  with_cursor_synced(h: SORT_HISTORY): STUDIO_STATE
+    do
+      let max_s = if h.last_step > 0 then h.last_step else 1 end
+      let tl = SLIDER.make(0, max_s, 1, h.step_index).with_label
+      let vis = STUDIO_LAYOUT.code_area(Current.area).height
+      let cv = Current.code_view.showing(h.current.active_code_line, vis)
+      { Current with hist = h, timeline = tl, code_view = cv }
+    end
+
+  with_dj_cursor_synced(dh: DIJKSTRA_HISTORY): STUDIO_STATE
+    do
+      let max_s = if dh.last_step > 0 then dh.last_step else 1 end
+      let tl = SLIDER.make(0, max_s, 1, dh.step_index).with_label
+      let vis = STUDIO_LAYOUT.code_area(Current.area).height
+      let cv = Current.code_view.showing(dh.current.active_code_line, vis)
+      { Current with dj_hist = dh, timeline = tl, code_view = cv }
+    end
+
+  switch_algo(idx: NAT): STUDIO_STATE
+    do
+      if idx = 0 then
+        let max_s = if Current.hist.last_step > 0 then Current.hist.last_step else 1 end
+        let tl = SLIDER.make(0, max_s, 1, Current.hist.step_index).with_label
+        let cv = TEXT_VIEW.make(CONTRACT_PANEL.code_lines)
+        let sv = TEXT_VIEW.make(CONTRACT_PANEL.short_form_lines)
+        { Current with algo_idx = 0, bar_menu = STUDIO_STATE.make_menu_for(0),
+          code_view = cv, short_view = sv, timeline = tl,
+          custom_input = INPUT_LINE.of_text("5, 2, 4, 6, 1, 3"),
+          preset_label = PRESETS.preset_name(if Current.preset_idx < 5 then Current.preset_idx else 0 end),
+          playing = False }.notify_info("Switched to Insertion Sort (CLRS Ch. 2.1)")
+      else
+        let max_s = if Current.dj_hist.last_step > 0 then Current.dj_hist.last_step else 1 end
+        let tl = SLIDER.make(0, max_s, 1, Current.dj_hist.step_index).with_label
+        let cv = TEXT_VIEW.make(CONTRACT_PANEL.dijkstra_code_lines)
+        let sv = TEXT_VIEW.make(CONTRACT_PANEL.dijkstra_short_form_lines)
+        { Current with algo_idx = 1, bar_menu = STUDIO_STATE.make_menu_for(1),
+          code_view = cv, short_view = sv, timeline = tl,
+          custom_input = INPUT_LINE.of_text("s-t:10, s-y:5, t-x:1, t-y:2, y-t:3, y-z:2, x-z:4"),
+          preset_label = DIJKSTRA_PRESETS.preset_name(0),
+          playing = False }.notify_info("Switched to Dijkstra Shortest Path (CLRS Ch. 22.3)")
+      end
+    end
+
+  notify_info(msg: STRING): STUDIO_STATE
+    do
+      let nt = if Current.tick_seq < 1000000 then Current.tick_seq + 1 else 0 end
+      let q = TOAST.empty.with_max_visible(1).push_info(msg, 2).tick(nt)
+      { Current with tick_seq = nt, toast_queue = q }
+    end
+
+  notify_success(msg: STRING): STUDIO_STATE
+    do
+      let nt = if Current.tick_seq < 1000000 then Current.tick_seq + 1 else 0 end
+      let q = TOAST.empty.with_max_visible(1).push_success(msg, 3).tick(nt)
+      { Current with tick_seq = nt, toast_queue = q }
+    end
+
+  load_preset(idx: NAT): STUDIO_STATE
+    do
+      if Current.algo_idx = 0 then
+        let data = PRESETS.preset_data(idx)
+        let h = SORT_HISTORY.from_initial(INSERTION_SORT.make(data))
+        let name = PRESETS.preset_name(idx)
+        Current.with_history(h, name, idx).notify_info(GLYPHS.join("Loaded preset: ", name))
+      else
+        let g_idx = if idx < 4 then idx else 3 end
+        let dh = DIJKSTRA_HISTORY.from_initial(DIJKSTRA_PRESETS.make_preset(g_idx))
+        let name = DIJKSTRA_PRESETS.preset_name(g_idx)
+        let max_s = if dh.last_step > 0 then dh.last_step else 1 end
+        let tl = SLIDER.make(0, max_s, 1, 0).with_label
+        { Current with dj_hist = dh, preset_label = name, preset_idx = g_idx, timeline = tl, playing = False }
+          .notify_info(GLYPHS.join("Loaded graph: ", name))
+      end
+    end
+
+  advance_one: STUDIO_STATE
+    do
+      if Current.algo_idx = 0 then
+        if Current.hist.at_end then
+          { Current with playing = False }
+        else
+          let h2 = Current.hist.step_forward
+          let s2 = Current.with_cursor_synced(h2)
+          if h2.at_end then
+            let msg = GLYPHS.join("✓ ensure: is_sorted(A) proved in ", GLYPHS.join(NUMBER_TEXT.nat_to_text(h2.last_step), " steps"))
+            { s2 with playing = False }.notify_success(msg)
+          else
+            s2
+          end
+        end
+      else
+        if Current.dj_hist.at_end then
+          { Current with playing = False }
+        else
+          let dh2 = Current.dj_hist.step_forward
+          let s2 = Current.with_dj_cursor_synced(dh2)
+          if dh2.at_end then
+            let msg = GLYPHS.join("✓ Shortest paths settled in ", GLYPHS.join(NUMBER_TEXT.nat_to_text(dh2.current.tick_count), " ticks (AutoCLRS O(n²))"))
+            { s2 with playing = False }.notify_success(msg)
+          else
+            s2
+          end
+        end
+      end
+    end
+
+  step_back_one: STUDIO_STATE
+    do
+      if Current.algo_idx = 0 then
+        { Current.with_cursor_synced(Current.hist.step_back) with playing = False }
+      else
+        { Current.with_dj_cursor_synced(Current.dj_hist.step_back) with playing = False }
+      end
+    end
+
+  reset_trace: STUDIO_STATE
+    do
+      if Current.algo_idx = 0 then
+        { Current.with_cursor_synced(Current.hist.reset) with playing = False }
+      else
+        { Current.with_dj_cursor_synced(Current.dj_hist.reset) with playing = False }
+      end
+    end
+
+  jump_trace(target: NAT): STUDIO_STATE
+    do
+      if Current.algo_idx = 0 then
+        { Current.with_cursor_synced(Current.hist.jump_to(target)) with playing = False }
+      else
+        { Current.with_dj_cursor_synced(Current.dj_hist.jump_to(target)) with playing = False }
+      end
+    end
+
+  toggle_play: TUI_NEXT[STUDIO_STATE]
+    do
+      if Current.playing then
+        TUI_NEXT.next({ Current with playing = False })
+      else
+        let base = if Current.current_at_end then Current.reset_trace else Current end
+        let started: STUDIO_STATE = { base with playing = True }
+        let cmds: LIST[COMMAND] = LIST.empty.prepend(SetTimer(1, started.step_millis))
+        Next(started, cmds)
+      end
+    end
+
+  handle_tick(id: NAT): TUI_NEXT[STUDIO_STATE]
+    do
+      if id = 1 and Current.playing then
+        let s2 = Current.advance_one
+        if s2.is_playing then
+          let cmds: LIST[COMMAND] = LIST.empty.prepend(SetTimer(1, s2.step_millis))
+          Next(s2, cmds)
+        else
+          TUI_NEXT.next(s2)
+        end
+      else
+        TUI_NEXT.next(Current)
+      end
+    end
+
+  apply_menu_choice(id: NAT): TUI_NEXT[STUDIO_STATE]
+    do
+      if id = 10 then
+        TUI_NEXT.next(Current.reset_trace.notify_info("Trace reset to step 0"))
+      else if id = 12 then
+        TUI_NEXT.next({ Current with quit_dialog = Current.quit_dialog.open, playing = False })
+      else if id = 20 then
+        TUI_NEXT.next(Current.switch_algo(0))
+      else if id = 21 then
+        TUI_NEXT.next(Current.switch_algo(1))
+      else if id >= 30 and id <= 34 then
+        TUI_NEXT.next(Current.load_preset(id - 30))
+      else if id = 35 then
+        TUI_NEXT.next({ Current with custom_open = True, custom_err = "", playing = False })
+      else if id >= 40 and id <= 43 then
+        let next_t = id - 40
+        TUI_NEXT.next({ Current with theme_idx = next_t }.notify_info("Theme updated"))
+      else if id = 50 then
+        TUI_NEXT.next({ Current with help_shown = True })
+      else if id = 51 then
+        TUI_NEXT.next(Current.notify_info("All invariants statically proved by Boogie/Z3"))
+      else
+        TUI_NEXT.next(Current)
+      end end end end end end end end end
+    end
+
+  submit_custom_input: STUDIO_STATE
+    do
+      if Current.algo_idx = 0 then
+        match PRESETS.parse_custom(Current.custom_input.text)
+          case None then
+            { Current with custom_err = "Enter 1..32 integers (0..999), comma or space separated." }
+          case Some(xs) then
+            if xs.length >= 1 and xs.length <= 32 and SORT_FACTS.all_at_most(xs, 999) then
+              let h = SORT_HISTORY.from_initial(INSERTION_SORT.make(xs))
+              { Current.with_history(h, "Custom Input", 5) with custom_open = False, custom_err = "" }
+                .notify_info("Loaded custom array")
+            else
+              { Current with custom_err = "Values must be 0..999 (max 32 items)." }
+            end
+        end
+      else
+        match DIJKSTRA_PRESETS.parse_custom_edges(Current.custom_input.text)
+          case None then
+            { Current with custom_err = "Format: s-t:10, s-y:5, t-x:1 (nodes s,t,x,y,z; weight 0..999)" }
+          case Some(dj) then
+            let dh = DIJKSTRA_HISTORY.from_initial(dj)
+            let max_s = if dh.last_step > 0 then dh.last_step else 1 end
+            let tl = SLIDER.make(0, max_s, 1, 0).with_label
+            { Current with dj_hist = dh, preset_label = "Custom Graph", preset_idx = 4,
+              timeline = tl, playing = False, custom_open = False, custom_err = "" }
+              .notify_info("Loaded custom graph")
+        end
+      end
+    end
+
+  handle_key(k: KEY): TUI_NEXT[STUDIO_STATE]
+    do
+      if Current.quit_dialog.is_open then
+        match k
+          case KeysEnded then TUI_NEXT.quit(0)
+          case _ then
+            let next_dlg = Current.quit_dialog.on_key(k)
+            match next_dlg.answer
+              case Some(ans) then
+                if ans = 0 then TUI_NEXT.quit(0)
+                else TUI_NEXT.next({ Current with quit_dialog = next_dlg.clear_answer })
+                end
+              case None then TUI_NEXT.next({ Current with quit_dialog = next_dlg })
+            end
+        end
+      else if Current.custom_open then
+        match k
+          case KeysEnded then TUI_NEXT.quit(0)
+          case Escape then TUI_NEXT.next({ Current with custom_open = False, custom_err = "" })
+          case Enter then TUI_NEXT.next(Current.submit_custom_input)
+          case _ then TUI_NEXT.next({ Current with custom_input = Current.custom_input.on_key(k), custom_err = "" })
+        end
+      else if Current.bar_menu.is_open then
+        match k
+          case KeysEnded then TUI_NEXT.quit(0)
+          case _ then
+            let next_m = Current.bar_menu.on_key(k)
+            match next_m.chosen
+              case Some(id) then { Current with bar_menu = next_m.clear_chosen }.apply_menu_choice(id)
+              case None then TUI_NEXT.next({ Current with bar_menu = next_m })
+            end
+        end
+      else if Current.help_shown then
+        match k
+          case KeysEnded then TUI_NEXT.quit(0)
+          case Escape then TUI_NEXT.next({ Current with help_shown = False })
+          case Enter then TUI_NEXT.next({ Current with help_shown = False })
+          case Char(c) then
+            if c = '?' then TUI_NEXT.next({ Current with help_shown = False })
+            else if c = 'q' then TUI_NEXT.quit(0)
+            else TUI_NEXT.next(Current)
+            end end
+          case _ then TUI_NEXT.next({ Current with help_modal = Current.help_modal.on_key(k, Current.area) })
+        end
+      else
+        match k
+          case KeysEnded then TUI_NEXT.quit(0)
+          case Function(n) then
+            if n = 10 then TUI_NEXT.next({ Current with bar_menu = Current.bar_menu.open, playing = False })
+            else TUI_NEXT.next(Current)
+            end
+          case Tab then TUI_NEXT.next({ Current with keys_at = Current.keys_at.next })
+          case Right then TUI_NEXT.next({ Current.advance_one with playing = False })
+          case Left then TUI_NEXT.next(Current.step_back_one)
+          case Home then TUI_NEXT.next(Current.reset_trace)
+          case End then TUI_NEXT.next(Current.jump_trace(Current.current_last_step))
+          case Up then
+            let vis = STUDIO_LAYOUT.code_area(Current.area).height
+            if Current.spec_tabs.selected = 1 then
+              TUI_NEXT.next({ Current with code_view = Current.code_view.on_key(k, vis) })
+            else if Current.spec_tabs.selected = 2 then
+              TUI_NEXT.next({ Current with short_view = Current.short_view.on_key(k, vis) })
+            else
+              TUI_NEXT.next(Current)
+            end end
+          case Down then
+            let vis = STUDIO_LAYOUT.code_area(Current.area).height
+            if Current.spec_tabs.selected = 1 then
+              TUI_NEXT.next({ Current with code_view = Current.code_view.on_key(k, vis) })
+            else if Current.spec_tabs.selected = 2 then
+              TUI_NEXT.next({ Current with short_view = Current.short_view.on_key(k, vis) })
+            else
+              TUI_NEXT.next(Current)
+            end end
+          case Char(c) then
+            if c = 'q' then TUI_NEXT.quit(0)
+            else if c = ' ' then Current.toggle_play
+            else if c = 'a' then TUI_NEXT.next(Current.switch_algo(if Current.algo_idx = 0 then 1 else 0 end))
+            else if c = 'r' then TUI_NEXT.next(Current.reset_trace)
+            else if c = 'n' or c = 'l' then TUI_NEXT.next({ Current.advance_one with playing = False })
+            else if c = 'p' or c = 'h' then TUI_NEXT.next(Current.step_back_one)
+            else if c = '?' then TUI_NEXT.next({ Current with help_shown = True, playing = False })
+            else if c = 'u' then TUI_NEXT.next({ Current with custom_open = True, custom_err = "", playing = False })
+            else if c = 't' then
+              let nt = if Current.theme_idx < 3 then Current.theme_idx + 1 else 0 end
+              TUI_NEXT.next({ Current with theme_idx = nt })
+            else if c = '+' or c = '=' then
+              TUI_NEXT.next({ Current with speed = Current.speed.increase })
+            else if c = '-' then
+              TUI_NEXT.next({ Current with speed = Current.speed.decrease })
+            else if c = '1' then TUI_NEXT.next(Current.load_preset(0))
+            else if c = '2' then TUI_NEXT.next(Current.load_preset(1))
+            else if c = '3' then TUI_NEXT.next(Current.load_preset(2))
+            else if c = '4' then TUI_NEXT.next(Current.load_preset(3))
+            else if c = '5' then TUI_NEXT.next(Current.load_preset(4))
+            else if Current.spec_tabs.takes(k) then
+              TUI_NEXT.next({ Current with spec_tabs = Current.spec_tabs.on_key(k) })
+            else
+              TUI_NEXT.next(Current)
+            end end end end end end end end end end end end end end end end end
+          case _ then TUI_NEXT.next(Current)
+        end
+      end end end end
+    end
+
+  handle_mouse(m: MOUSE): TUI_NEXT[STUDIO_STATE]
+    do
+      let area = Current.area
+      let menu_r = STUDIO_LAYOUT.menu_bar(area)
+      if Current.quit_dialog.is_open then
+        let next_dlg = Current.quit_dialog.on_mouse(m, area)
+        match next_dlg.answer
+          case Some(ans) then
+            if ans = 0 then TUI_NEXT.quit(0)
+            else TUI_NEXT.next({ Current with quit_dialog = next_dlg.clear_answer })
+            end
+          case None then TUI_NEXT.next({ Current with quit_dialog = next_dlg })
+        end
+      else if Current.custom_open then
+        TUI_NEXT.next(Current)
+      else if Current.help_shown then
+        if Current.help_modal.contains(area, m.x, m.y) then
+          TUI_NEXT.next({ Current with help_modal = Current.help_modal.on_mouse(m, area) })
+        else if m.is_left_down then
+          TUI_NEXT.next({ Current with help_shown = False })
+        else
+          TUI_NEXT.next(Current)
+        end end
+      else if Current.bar_menu.is_open or Current.bar_menu.contains(menu_r, area, m.x, m.y) then
+        let next_m = Current.bar_menu.on_mouse(m, menu_r, area)
+        match next_m.chosen
+          case Some(id) then { Current with bar_menu = next_m.clear_chosen }.apply_menu_choice(id)
+          case None then TUI_NEXT.next({ Current with bar_menu = next_m })
+        end
+      else if m.is_left_down and Current.toast_queue.toast_id_at(area, m.x, m.y).is_some then
+        TUI_NEXT.next({ Current with toast_queue = Current.toast_queue.on_mouse(m, area) })
+      else
+        let tabs_r = STUDIO_LAYOUT.spec_tabs_area(area)
+        let b_back = STUDIO_LAYOUT.btn_back_area(area)
+        let b_play = STUDIO_LAYOUT.btn_play_area(area)
+        let b_step = STUDIO_LAYOUT.btn_step_area(area)
+        let b_rst = STUDIO_LAYOUT.btn_reset_area(area)
+        let tl_r = STUDIO_LAYOUT.timeline_slider_area(area)
+        let sp_r = STUDIO_LAYOUT.speed_slider_area(area)
+        let c_hi = STUDIO_LAYOUT.chk_highlight_area(area)
+        let c_val = STUDIO_LAYOUT.chk_values_area(area)
+        if tabs_r.has(m.x, m.y) then
+          TUI_NEXT.next({ Current with spec_tabs = Current.spec_tabs.on_mouse(m, tabs_r) })
+        else if m.is_left_down and b_back.has(m.x, m.y) then
+          TUI_NEXT.next(Current.step_back_one)
+        else if m.is_left_down and b_play.has(m.x, m.y) then
+          Current.toggle_play
+        else if m.is_left_down and b_step.has(m.x, m.y) then
+          TUI_NEXT.next({ Current.advance_one with playing = False })
+        else if m.is_left_down and b_rst.has(m.x, m.y) then
+          TUI_NEXT.next(Current.reset_trace)
+        else if tl_r.has(m.x, m.y) then
+          let next_tl = Current.timeline.on_mouse(m, tl_r)
+          let target = next_tl.value
+          TUI_NEXT.next({ Current.jump_trace(target) with timeline = next_tl })
+        else if sp_r.has(m.x, m.y) then
+          TUI_NEXT.next({ Current with speed = Current.speed.on_mouse(m, sp_r) })
+        else if m.is_left_down and c_hi.has(m.x, m.y) then
+          TUI_NEXT.next({ Current with chk_highlight = Current.chk_highlight.on_mouse(m, c_hi) })
+        else if m.is_left_down and c_val.has(m.x, m.y) then
+          TUI_NEXT.next({ Current with chk_values = Current.chk_values.on_mouse(m, c_val) })
+        else if m.is_left_down and STUDIO_LAYOUT.viz_pane(area).has(m.x, m.y) then
+          TUI_NEXT.next({ Current with keys_at = Current.keys_at.moved_to(0) })
+        else if m.is_left_down and STUDIO_LAYOUT.spec_pane(area).has(m.x, m.y) then
+          TUI_NEXT.next({ Current with keys_at = Current.keys_at.moved_to(1) })
+        else
+          TUI_NEXT.next(Current)
+        end end end end end end end end end end end
+      end end end end end
+    end
+
+end

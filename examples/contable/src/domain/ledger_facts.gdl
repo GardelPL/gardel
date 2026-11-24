@@ -1,0 +1,261 @@
+-- Pure specification functions, overflow-free `MATH_INT` conservation lemmas,
+-- account-list updates, and currency formatting for `contable`.
+-- All proofs are discharged statically by Boogie/Z3 under `--strict`.
+functions LEDGER_FACTS
+
+feature {ANY}
+
+  -- Exact sum of signed postings in unbounded `MATH_INT` (`sum(debits) - sum(credits)`).
+  sum_postings_math(ps: LIST[POSTING]): MATH_INT
+    variant
+      ps.length
+    do
+      if ps.length = 0 then
+        0
+      else
+        ps.head.signed_math + LEDGER_FACTS.sum_postings_math(ps.tail)
+      end
+    ensure
+      empty_zero: ps.length = 0 implies Result = 0
+    end
+
+  -- Exact sum of debit legs in unbounded `MATH_INT`.
+  sum_debits_math(ps: LIST[POSTING]): MATH_INT
+    variant
+      ps.length
+    do
+      if ps.length = 0 then
+        0
+      else
+        ps.head.debit_math + LEDGER_FACTS.sum_debits_math(ps.tail)
+      end
+    ensure
+      non_negative: Result >= 0
+    end
+
+  -- Exact sum of credit legs in unbounded `MATH_INT`.
+  sum_credits_math(ps: LIST[POSTING]): MATH_INT
+    variant
+      ps.length
+    do
+      if ps.length = 0 then
+        0
+      else
+        ps.head.credit_math + LEDGER_FACTS.sum_credits_math(ps.tail)
+      end
+    ensure
+      non_negative: Result >= 0
+    end
+
+  -- Inductive lemma: `sum_postings_math(ps) = sum_debits_math(ps) - sum_credits_math(ps)`.
+  lemma_postings_diff(ps: LIST[POSTING]): BOOL
+    variant
+      ps.length
+    do
+      if ps.length = 0 then
+        True
+      else
+        check rec: LEDGER_FACTS.lemma_postings_diff(ps.tail) end
+        True
+      end
+    ensure
+      holds: Result
+      diff_eq: LEDGER_FACTS.sum_postings_math(ps) = LEDGER_FACTS.sum_debits_math(ps) - LEDGER_FACTS.sum_credits_math(ps)
+    end
+
+  -- Exact sum of all account balances in `MATH_INT` (must remain 0 for trial balance).
+  sum_balances_math(accts: LIST[ACCOUNT]): MATH_INT
+    variant
+      accts.length
+    do
+      if accts.length = 0 then
+        0
+      else
+        accts.head.balance_math + LEDGER_FACTS.sum_balances_math(accts.tail)
+      end
+    ensure
+      empty_zero: accts.length = 0 implies Result = 0
+    end
+
+  -- True when every account in `accts` has zero balance.
+  all_zero_balances(accts: LIST[ACCOUNT]): BOOL
+    variant
+      accts.length
+    do
+      if accts.length = 0 then
+        True
+      else
+        accts.head.balance_cents = 0 and LEDGER_FACTS.all_zero_balances(accts.tail)
+      end
+    ensure
+      implies_sum_zero: Result implies LEDGER_FACTS.sum_balances_math(accts) = 0
+    end
+
+  -- True when every posting targets a valid account index `< n_accts`.
+  all_postings_in_bounds(ps: LIST[POSTING], n_accts: NAT): BOOL
+    variant
+      ps.length
+    do
+      if ps.length = 0 then
+        True
+      else
+        ps.head.account_index < n_accts and LEDGER_FACTS.all_postings_in_bounds(ps.tail, n_accts)
+      end
+    end
+
+  -- Replace account at `idx` by applying `delta`, proving `sum_balances_math` shifts by exactly `delta`.
+  apply_delta_at(accts: LIST[ACCOUNT], idx: NAT, delta: I64): LIST[ACCOUNT]
+    require
+      in_bounds: idx < accts.length
+      delta_bounded: delta >= -10000000000 and delta <= 10000000000
+      target_fits: LIST_OPS.at(accts, idx).can_apply(delta)
+    variant
+      idx
+    do
+      if idx = 0 then
+        accts.tail.prepend(accts.head.apply_delta(delta))
+      else
+        LEDGER_FACTS.apply_delta_at(accts.tail, idx - 1, delta).prepend(accts.head)
+      end
+    ensure
+      same_length: Result.length = accts.length
+      sum_shifted: LEDGER_FACTS.sum_balances_math(Result) = LEDGER_FACTS.sum_balances_math(accts) + delta
+    end
+
+  -- True when sequentially applying `ps` to `accts` stays within account index and overflow bounds.
+  can_apply_postings(accts: LIST[ACCOUNT], ps: LIST[POSTING]): BOOL
+    variant
+      ps.length
+    do
+      if ps.length = 0 then
+        True
+      else
+        let p = ps.head
+        if p.account_index < accts.length then
+          let target = LIST_OPS.at(accts, p.account_index)
+          if target.can_apply(p.signed_delta) then
+            let next_accts = LEDGER_FACTS.apply_delta_at(accts, p.account_index, p.signed_delta)
+            LEDGER_FACTS.can_apply_postings(next_accts, ps.tail)
+          else
+            False
+          end
+        else
+          False
+        end
+      end
+    end
+
+  -- Sequentially apply every posting in `ps` to `accts`.
+  -- Statically proves exact conservation: `sum_balances_math(Result) = sum_balances_math(accts) + sum_postings_math(ps)`.
+  apply_postings(accts: LIST[ACCOUNT], ps: LIST[POSTING]): LIST[ACCOUNT]
+    require
+      applicable: LEDGER_FACTS.can_apply_postings(accts, ps)
+    variant
+      ps.length
+    do
+      if ps.length = 0 then
+        accts
+      else
+        let p = ps.head
+        let next_accts = LEDGER_FACTS.apply_delta_at(accts, p.account_index, p.signed_delta)
+        LEDGER_FACTS.apply_postings(next_accts, ps.tail)
+      end
+    ensure
+      same_length: Result.length = accts.length
+      sum_shifted: LEDGER_FACTS.sum_balances_math(Result) = LEDGER_FACTS.sum_balances_math(accts) + LEDGER_FACTS.sum_postings_math(ps)
+    end
+
+  -- Negate every posting in `ps` for an immutable compensating reversal entry.
+  -- Proves that reversing a balanced posting list yields a balanced posting list.
+  reverse_postings(ps: LIST[POSTING]): LIST[POSTING]
+    variant
+      ps.length
+    do
+      if ps.length = 0 then
+        LIST.empty
+      else
+        LEDGER_FACTS.reverse_postings(ps.tail).prepend(ps.head.reversed)
+      end
+    ensure
+      same_length: Result.length = ps.length
+      negated_sum: LEDGER_FACTS.sum_postings_math(Result) = 0 - LEDGER_FACTS.sum_postings_math(ps)
+      swapped_dr: LEDGER_FACTS.sum_debits_math(Result) = LEDGER_FACTS.sum_credits_math(ps)
+      swapped_cr: LEDGER_FACTS.sum_credits_math(Result) = LEDGER_FACTS.sum_debits_math(ps)
+    end
+
+  -- Total debit volume of a posting list in `NAT` (for display in the journal table).
+  total_debits_nat(ps: LIST[POSTING]): NAT
+    variant
+      ps.length
+    do
+      if ps.length = 0 then
+        0
+      else
+        let rest = LEDGER_FACTS.total_debits_nat(ps.tail)
+        let add = if ps.head.is_debit then ps.head.amount_cents else 0 end
+        if rest <= 18446744073709551615 - add then rest + add else rest end
+      end
+    end
+
+  -- Sum of normal balances for accounts matching `kind` (e.g. Assets, Liabilities, Income, Expense).
+  sum_kind_normal(accts: LIST[ACCOUNT], kind: NAT): I64
+    variant
+      accts.length
+    do
+      if accts.length = 0 then
+        0
+      else
+        let rest = LEDGER_FACTS.sum_kind_normal(accts.tail, kind)
+        if accts.head.kind = kind then
+          let b = accts.head.normal_balance_cents
+          if rest >= -10000000000000 and rest <= 10000000000000 then rest + b else rest end
+        else
+          rest
+        end
+      end
+    end
+
+  -- Format a non-negative integer dollar amount with thousands commas (e.g. 12345 -> "12,345").
+  format_thousands(n: NAT): STRING
+    variant
+      n
+    do
+      if n < 1000 then
+        NUMBER_TEXT.nat_to_text(n)
+      else
+        let hi = LEDGER_FACTS.format_thousands(n / 1000)
+        let rem = n % 1000
+        let pad =
+          if rem < 10 then "00"
+          else if rem < 100 then "0"
+          else ""
+          end end
+        GLYPHS.join(GLYPHS.join(hi, ","), GLYPHS.join(pad, NUMBER_TEXT.nat_to_text(rem)))
+      end
+    end
+
+  -- Format unsigned cents as `$1,234.56`.
+  format_nat_cents(cents: NAT): STRING
+    do
+      let dollars = cents / 100
+      let rem = cents % 100
+      let cent_str =
+        if rem < 10 then GLYPHS.join("0", NUMBER_TEXT.nat_to_text(rem))
+        else NUMBER_TEXT.nat_to_text(rem)
+        end
+      GLYPHS.join("$", GLYPHS.join(LEDGER_FACTS.format_thousands(dollars), GLYPHS.join(".", cent_str)))
+    end
+
+  -- Format signed cents as `$1,234.56` or `-$45.00`.
+  format_cents(cents: I64): STRING
+    do
+      if cents >= 0 then
+        LEDGER_FACTS.format_nat_cents(NAT.from_i64(cents))
+      else if cents >= -10000000000000 then
+        GLYPHS.join("-", LEDGER_FACTS.format_nat_cents(NAT.from_i64(0 - cents)))
+      else
+        "-$MAX"
+      end end
+    end
+
+end

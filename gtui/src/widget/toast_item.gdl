@@ -1,0 +1,148 @@
+-- A single toast notification item with id, text, severity level, duration, and deterministic start time.
+module TOAST_ITEM
+
+representation {NONE}
+  toast_id: NAT
+  msg_text: STRING
+  lvl: NAT
+  dur_ms: NAT
+  started_flag: BOOL
+  start_ms: NAT
+
+invariant
+  pos_id: toast_id >= 1
+  valid_lvl: 1 <= lvl and lvl <= 4
+  pos_dur: dur_ms >= 1
+  unstarted_zero: not started_flag implies start_ms = 0
+
+create {ANY}
+
+  info_level: NAT
+    do
+      1
+    end
+
+  success_level: NAT
+    do
+      2
+    end
+
+  warning_level: NAT
+    do
+      3
+    end
+
+  error_level: NAT
+    do
+      4
+    end
+
+  clamp_level(l: NAT): NAT
+    do
+      if l < 1 then 1 else if l > 4 then 4 else l end end
+    ensure
+      valid: 1 <= Result and Result <= 4
+    end
+
+  -- A new unstarted toast item (`id >= 1`, `level` in `1..4`, `duration >= 1`).
+  make(id: NAT, text: STRING, level: NAT, duration: NAT): TOAST_ITEM
+    do
+      let cid = if id >= 1 then id else 1 end
+      let clvl = TOAST_ITEM.clamp_level(level)
+      let cdur = if duration >= 1 then duration else 1 end
+      { toast_id = cid, msg_text = text, lvl = clvl, dur_ms = cdur,
+        started_flag = False, start_ms = 0 }
+    ensure
+      not_started: not Result.is_started
+      id_set: id >= 1 implies Result.id = id
+      dur_set: duration >= 1 implies Result.duration = duration
+    end
+
+feature {ANY}
+
+  id: NAT
+    do
+      Current.toast_id
+    ensure
+      pos: Result >= 1
+    end
+
+  text: STRING
+    do
+      Current.msg_text
+    end
+
+  level: NAT
+    do
+      Current.lvl
+    ensure
+      valid: 1 <= Result and Result <= 4
+    end
+
+  duration: NAT
+    do
+      Current.dur_ms
+    ensure
+      pos: Result >= 1
+    end
+
+  is_started: BOOL
+    do
+      Current.started_flag
+    end
+
+  started_at: NAT
+    do
+      Current.start_ms
+    end
+
+  is_info: BOOL
+    do
+      Current.lvl = 1
+    end
+
+  is_success: BOOL
+    do
+      Current.lvl = 2
+    end
+
+  is_warning: BOOL
+    do
+      Current.lvl = 3
+    end
+
+  is_error: BOOL
+    do
+      Current.lvl = 4
+    end
+
+  -- Whether a started toast has been visible for at least `duration` milliseconds at `now`.
+  is_expired_at(now: NAT): BOOL
+    do
+      Current.started_flag and now >= Current.start_ms and now - Current.start_ms >= Current.dur_ms
+    ensure
+      unstarted_kept: not Current.is_started implies not Result
+      boundary_kept: (Current.is_started and now >= Current.started_at and now - Current.started_at < Current.duration) implies not Result
+      boundary_expired: (Current.is_started and now >= Current.started_at and now - Current.started_at >= Current.duration) implies Result
+    end
+
+  -- Start this toast's clock at `now`.
+  start(now: NAT): TOAST_ITEM
+    do
+      { Current with started_flag = True, start_ms = now }
+    ensure
+      started: Result.is_started
+      time_set: Result.started_at = now
+      same_id: Result.id = Current.id
+    end
+
+  -- Stop this toast's clock (used when pushed back into waiting).
+  stop: TOAST_ITEM
+    do
+      { Current with started_flag = False, start_ms = 0 }
+    ensure
+      stopped: not Result.is_started
+      same_id: Result.id = Current.id
+    end
+
+end

@@ -1,0 +1,81 @@
+-- Lightweight single-line Gardel syntax highlighter for the `Code` and `Short Form` tabs.
+functions GDL_LEXER
+
+feature {ANY}
+
+  spans_with(t: THEME, i: NAT, line: STRING): LIST[SPAN]
+    do
+      GDL_LEXER.scan(t, GLYPHS.of_text(line), 0, LIST.empty)
+    end
+
+  scan(t: THEME, cs: LIST[CHAR], at: NAT, acc: LIST[SPAN]): LIST[SPAN]
+    variant
+      cs.length
+    do
+      if cs.length = 0 or cs.length > 65535 or at > 65535 then
+        acc
+      else
+        let c = cs.head
+        if c = '-' and cs.tail.length > 0 and cs.tail.head = '-' then
+          acc.prepend(SPAN.make(at, cs.length, t.comment))
+        else if c = '"' then
+          let n = GDL_LEXER.quoted(cs.tail)
+          let k = if n < cs.tail.length then n + 2 else cs.length end
+          GDL_LEXER.scan(t, LIST_CUT.drop(cs, k), at + k, acc.prepend(SPAN.make(at, k, t.string)))
+        else if GDL_LEXER.is_letter(c) then
+          let n = GDL_LEXER.word_length(cs)
+          let w = GLYPHS.text_of(LIST_CUT.take(cs, n))
+          let more = if GDL_LEXER.is_keyword(w) then acc.prepend(SPAN.make(at, n, t.keyword)) else acc end
+          GDL_LEXER.scan(t, LIST_CUT.drop(cs, n), at + n, more)
+        else
+          GDL_LEXER.scan(t, cs.tail, at + 1, acc)
+        end end end
+      end
+    end
+
+  quoted(cs: LIST[CHAR]): NAT
+    variant
+      cs.length
+    do
+      if cs.length = 0 or cs.head = '"' then
+        0
+      else
+        let n = GDL_LEXER.quoted(cs.tail)
+        if n < 18446744073709551615 then n + 1 else n end
+      end
+    ensure
+      within: Result <= cs.length
+    end
+
+  word_length(cs: LIST[CHAR]): NAT
+    variant
+      cs.length
+    do
+      if cs.length = 0 then
+        0
+      else if GDL_LEXER.is_letter(cs.head) or (cs.head.code >= 48 and cs.head.code <= 57) then
+        let n = GDL_LEXER.word_length(cs.tail)
+        if n < 18446744073709551615 then n + 1 else n end
+      else
+        0
+      end end
+    ensure
+      within: Result <= cs.length
+      some: (cs.length > 0 and GDL_LEXER.is_letter(cs.head)) implies Result >= 1
+    end
+
+  is_letter(c: CHAR): BOOL
+    do
+      (c.code >= 97 and c.code <= 122) or (c.code >= 65 and c.code <= 90) or c = '_'
+    end
+
+  is_keyword(w: STRING): BOOL
+    do
+      w.equals("module") or w.equals("functions") or w.equals("feature") or w.equals("create") or
+        w.equals("representation") or w.equals("invariant") or w.equals("require") or
+        w.equals("ensure") or w.equals("do") or w.equals("end") or w.equals("if") or
+        w.equals("then") or w.equals("else") or w.equals("let") or w.equals("variant") or
+        w.equals("implies") or w.equals("and") or w.equals("or") or w.equals("not")
+    end
+
+end

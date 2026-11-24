@@ -1,0 +1,195 @@
+-- An immutable, statically balanced double-entry journal entry.
+-- Every `JOURNAL_ENTRY` carries a compile-time proof that `sum(debits) = sum(credits)`
+-- in unbounded `MATH_INT` (`LEDGER_FACTS.sum_postings_math(legs) = 0`).
+module JOURNAL_ENTRY
+
+representation {NONE}
+  entry_id: NAT
+  entry_date: STRING
+  entry_memo: STRING
+  reverses_ref: OPTION[NAT]
+  legs: LIST[POSTING]
+
+invariant
+  at_least_two: legs.length >= 2
+  bounded_legs: legs.length <= 16
+  balanced: LEDGER_FACTS.sum_postings_math(legs) = 0
+  debits_eq_credits: LEDGER_FACTS.sum_debits_math(legs) = LEDGER_FACTS.sum_credits_math(legs)
+
+create {ANY}
+
+  -- Construct a general balanced journal entry from a verified posting list.
+  make(id: NAT, date: STRING, memo: STRING, postings: LIST[POSTING]): JOURNAL_ENTRY
+    require
+      at_least_two: postings.length >= 2
+      bounded_legs: postings.length <= 16
+      balanced: LEDGER_FACTS.sum_postings_math(postings) = 0
+    do
+      check
+        diff: LEDGER_FACTS.lemma_postings_diff(postings)
+      end
+      { entry_id = id, entry_date = date, entry_memo = memo, reverses_ref = None, legs = postings }
+    ensure
+      id_set: Result.id = id
+      same_legs: Result.postings = postings
+      not_reversal: not Result.is_reversal
+    end
+
+  -- Construct a 2-leg transfer (Debit `debit_acct`, Credit `credit_acct` by `amount_cents`).
+  make_transfer(id: NAT, date: STRING, memo: STRING, debit_acct: NAT, credit_acct: NAT, amount_cents: NAT): JOURNAL_ENTRY
+    require
+      positive: amount_cents > 0
+      bounded: amount_cents <= 10000000000
+    do
+      let p_dr = POSTING.debit(debit_acct, amount_cents)
+      let p_cr = POSTING.credit(credit_acct, amount_cents)
+      let empty: LIST[POSTING] = LIST.empty
+      let ps = empty.prepend(p_cr).prepend(p_dr)
+      check
+        diff: LEDGER_FACTS.lemma_postings_diff(ps)
+      end
+      { entry_id = id, entry_date = date, entry_memo = memo, reverses_ref = None, legs = ps }
+    ensure
+      two_legs: Result.leg_count = 2
+      id_set: Result.id = id
+      not_reversal: not Result.is_reversal
+    end
+
+  -- Construct a 3-leg split entry: two Debits (`dr1_amt`, `dr2_amt`) balanced by one Credit (`total_amt`).
+  -- Great for paychecks or client invoices split into Checking + Tax/Savings Reserve.
+  make_split_debit2_credit1(
+    id: NAT,
+    date: STRING,
+    memo: STRING,
+    dr1_acct: NAT,
+    dr1_amt: NAT,
+    dr2_acct: NAT,
+    dr2_amt: NAT,
+    cr_acct: NAT,
+    cr_amt: NAT
+  ): JOURNAL_ENTRY
+    require
+      pos1: dr1_amt > 0 and dr1_amt <= 10000000000
+      pos2: dr2_amt > 0 and dr2_amt <= 10000000000
+      pos_cr: cr_amt > 0 and cr_amt <= 10000000000
+      exact_split: dr1_amt + dr2_amt = cr_amt
+    do
+      let p1 = POSTING.debit(dr1_acct, dr1_amt)
+      let p2 = POSTING.debit(dr2_acct, dr2_amt)
+      let p3 = POSTING.credit(cr_acct, cr_amt)
+      let empty: LIST[POSTING] = LIST.empty
+      let ps1 = empty.prepend(p3)
+      let ps2 = ps1.prepend(p2)
+      let ps = ps2.prepend(p1)
+      check
+        s1: LEDGER_FACTS.sum_postings_math(ps1) = p3.signed_math
+        s2: LEDGER_FACTS.sum_postings_math(ps2) = p2.signed_math + p3.signed_math
+        diff: LEDGER_FACTS.lemma_postings_diff(ps)
+      end
+      { entry_id = id, entry_date = date, entry_memo = memo, reverses_ref = None, legs = ps }
+    ensure
+      three_legs: Result.leg_count = 3
+      id_set: Result.id = id
+    end
+
+  -- Construct a 3-leg split entry: one Debit (`dr_amt`) balanced by two Credits (`cr1_amt`, `cr2_amt`).
+  -- Useful for split payments (e.g. Paying a vendor from Checking + Credit Card).
+  make_split_debit1_credit2(
+    id: NAT,
+    date: STRING,
+    memo: STRING,
+    dr_acct: NAT,
+    dr_amt: NAT,
+    cr1_acct: NAT,
+    cr1_amt: NAT,
+    cr2_acct: NAT,
+    cr2_amt: NAT
+  ): JOURNAL_ENTRY
+    require
+      pos_dr: dr_amt > 0 and dr_amt <= 10000000000
+      pos1: cr1_amt > 0 and cr1_amt <= 10000000000
+      pos2: cr2_amt > 0 and cr2_amt <= 10000000000
+      exact_split: dr_amt = cr1_amt + cr2_amt
+    do
+      let p1 = POSTING.debit(dr_acct, dr_amt)
+      let p2 = POSTING.credit(cr1_acct, cr1_amt)
+      let p3 = POSTING.credit(cr2_acct, cr2_amt)
+      let empty: LIST[POSTING] = LIST.empty
+      let ps1 = empty.prepend(p3)
+      let ps2 = ps1.prepend(p2)
+      let ps = ps2.prepend(p1)
+      check
+        s1: LEDGER_FACTS.sum_postings_math(ps1) = p3.signed_math
+        s2: LEDGER_FACTS.sum_postings_math(ps2) = p2.signed_math + p3.signed_math
+        diff: LEDGER_FACTS.lemma_postings_diff(ps)
+      end
+      { entry_id = id, entry_date = date, entry_memo = memo, reverses_ref = None, legs = ps }
+    ensure
+      three_legs: Result.leg_count = 3
+      id_set: Result.id = id
+    end
+
+  -- Construct a compensating reversal entry for `orig`, flipping every debit/credit leg.
+  -- Statically proves the reversed postings remain balanced.
+  make_reversal(id: NAT, date: STRING, orig: JOURNAL_ENTRY): JOURNAL_ENTRY
+    do
+      let rev_legs = LEDGER_FACTS.reverse_postings(orig.postings)
+      let memo_txt = GLYPHS.join(
+        GLYPHS.join("REV #", NUMBER_TEXT.nat_to_text(orig.id)),
+        GLYPHS.join(" ", orig.memo)
+      )
+      { entry_id = id, entry_date = date, entry_memo = memo_txt, reverses_ref = Some(orig.id), legs = rev_legs }
+    ensure
+      is_rev: Result.is_reversal
+      same_leg_count: Result.leg_count = orig.leg_count
+      id_set: Result.id = id
+    end
+
+feature {ANY}
+
+  id: NAT
+    do
+      Current.entry_id
+    end
+
+  date: STRING
+    do
+      Current.entry_date
+    end
+
+  memo: STRING
+    do
+      Current.entry_memo
+    end
+
+  reverses: OPTION[NAT]
+    do
+      Current.reverses_ref
+    end
+
+  is_reversal: BOOL
+    do
+      Current.reverses_ref.is_some
+    end
+
+  postings: LIST[POSTING]
+    do
+      Current.legs
+    ensure
+      at_least_two: Result.length >= 2
+      balanced: LEDGER_FACTS.sum_postings_math(Result) = 0
+    end
+
+  leg_count: NAT
+    do
+      Current.legs.length
+    ensure
+      at_least_two: Result >= 2
+    end
+
+  volume_cents: NAT
+    do
+      LEDGER_FACTS.total_debits_nat(Current.legs)
+    end
+
+end

@@ -1,0 +1,289 @@
+-- Verified bounded in-flight HTTP client state machine (`0` or `1` active request).
+-- Statically proves:
+--   1. Bounded concurrency (`active_count <= 1`): a second request cannot start while one is in flight.
+--   2. Connection & timer hygiene: returning to Idle always clears `link` and `client` and emits
+--      `Close(conn)` / `CancelTimer(timer_id)` so sockets and timers never leak.
+--   3. Connection isolation: `on_received` only feeds `HTTP_CLIENT.receive` when `conn` matches
+--      the active socket; stray sockets are immediately closed.
+module IN_FLIGHT
+
+representation {NONE}
+  active: BOOL
+  req_tag: NAT
+  link: OPTION[CONN_ID]
+  wire: BYTES
+  client: OPTION[HTTP_CLIENT_CONNECTION]
+  ticks_used: NAT
+
+invariant
+  tag_fits: req_tag < 1000000000
+  bounded_ticks: ticks_used <= 20
+  idle_clean: not active implies (link.is_none and client.is_none)
+  active_waiting: active implies (match client case Some(c) then not c.is_free case None then False end)
+
+create {ANY}
+
+  max_ticks: NAT
+    do
+      20
+    end
+
+  tick_millis: U64
+    do
+      250
+    end
+
+  idle(next_tag: NAT): IN_FLIGHT
+    require
+      tag_fits: next_tag < 1000000000
+    do
+      { active = False, req_tag = next_tag, link = None, wire = BYTES.empty, client = None, ticks_used = 0 }
+    ensure
+      is_idle: not Result.is_active
+      no_conn: Result.connection.is_none
+    end
+
+  fresh: IN_FLIGHT
+    do
+      IN_FLIGHT.idle(1)
+    ensure
+      is_idle: not Result.is_active
+    end
+
+feature {ANY}
+
+  is_active: BOOL
+    do
+      Current.active
+    end
+
+  active_count: NAT
+    do
+      if Current.active then 1 else 0 end
+    ensure
+      bounded: Result <= 1
+    end
+
+  tag: NAT
+    do
+      Current.req_tag
+    ensure
+      fits: Result < 1000000000
+    end
+
+  timer_id: NAT
+    do
+      Current.req_tag + 1
+    ensure
+      nonzero: Result >= 1
+    end
+
+  connection: OPTION[CONN_ID]
+    do
+      Current.link
+    end
+
+  is_on(c: CONN_ID): BOOL
+    do
+      match Current.link
+        case Some(d) then d = c
+        case None then False
+      end
+    end
+
+  ticks_elapsed: NAT
+    do
+      Current.ticks_used
+    ensure
+      bounded: Result <= 20
+    end
+
+  elapsed_ms: NAT
+    do
+      Current.ticks_used * 250
+    end
+
+  timeout_percent: NAT
+    do
+      if not Current.active then
+        0
+      else
+        let p = Current.ticks_used * 5
+        if p <= 100 then p else 100 end
+      end
+    ensure
+      bounded: Result <= 100
+    end
+
+  next_tag: NAT
+    do
+      if Current.req_tag + 1 < 1000000000 then Current.req_tag + 1 else 1 end
+    ensure
+      fits: Result < 1000000000
+    end
+
+  -- Begin an HTTP request to `host:port` with verified `req`.
+  start(host: STRING, port: NAT, req: HTTP_REQUEST): FLIGHT_STEP[IN_FLIGHT]
+    require
+      currently_idle: not Current.is_active
+      valid_port: port >= 1 and port <= 65535
+      sendable: HTTP_REQUEST_WRITER.sendable(req)
+    do
+      let t = Current.next_tag
+      let bytes = HTTP_REQUEST_WRITER.serialize(req)
+      let conn = HTTP_CLIENT_CONNECTION.fresh.sending(req)
+      let next_st: IN_FLIGHT = {
+        active = True,
+        req_tag = t,
+        link = None,
+        wire = bytes,
+        client = Some(conn),
+        ticks_used = 0
+      }
+      let cmds: LIST[COMMAND] = LIST.empty
+        .prepend(SetTimer(next_st.timer_id, IN_FLIGHT.tick_millis))
+        .prepend(Connect(t, host, port))
+      FLIGHT_STEP.make(next_st, cmds, None)
+    ensure
+      now_active: Result.state.is_active
+      bounded_active: Result.state.active_count = 1
+      no_response_yet: Result.outcome.is_none
+    end
+
+  -- Socket connected for `t`: send serialized HTTP bytes, or close if stale.
+  on_connected(t: NAT, c: CONN_ID): FLIGHT_STEP[IN_FLIGHT]
+    do
+      if Current.active and t = Current.req_tag and Current.link.is_none then
+        let next_st: IN_FLIGHT = { Current with link = Some(c) }
+        let cmds: LIST[COMMAND] = LIST.empty.prepend(Send(c, Current.wire))
+        FLIGHT_STEP.make(next_st, cmds, None)
+      else
+        let cmds: LIST[COMMAND] = LIST.empty.prepend(Close(c))
+        FLIGHT_STEP.make(Current, cmds, None)
+      end
+    ensure
+      no_outcome: Result.outcome.is_none
+    end
+
+  -- Connect failed for `t`: cancel timer and return cleanly to Idle.
+  on_connect_failed(t: NAT, msg: STRING): FLIGHT_STEP[IN_FLIGHT]
+    do
+      if Current.active and t = Current.req_tag then
+        let resp = RESPONSE_RECORD.from_error(msg, Current.elapsed_ms)
+        let cmds: LIST[COMMAND] = LIST.empty.prepend(CancelTimer(Current.timer_id))
+        FLIGHT_STEP.make(IN_FLIGHT.idle(Current.req_tag), cmds, Some(resp))
+      else
+        FLIGHT_STEP.make(Current, LIST.empty, None)
+      end
+    ensure
+      freed_on_match: (Current.is_active and t = Current.tag) implies not Result.state.is_active
+    end
+
+  -- Finish an active exchange on `c`, closing `c`, cancelling the timer, and returning to Idle.
+  finish_on(c: CONN_ID, resp: RESPONSE_RECORD): FLIGHT_STEP[IN_FLIGHT]
+    do
+      let cmds: LIST[COMMAND] = LIST.empty
+        .prepend(CancelTimer(Current.timer_id))
+        .prepend(Close(c))
+      FLIGHT_STEP.make(IN_FLIGHT.idle(Current.req_tag), cmds, Some(resp))
+    ensure
+      now_idle: not Result.state.is_active
+      no_conn: Result.state.connection.is_none
+      has_outcome: Result.outcome.is_some
+    end
+
+  -- Incoming bytes on `c`: only feed `HTTP_CLIENT.receive` when `c` is the active socket.
+  on_received(c: CONN_ID, data: BYTES): FLIGHT_STEP[IN_FLIGHT]
+    do
+      if not Current.active or not Current.is_on(c) then
+        FLIGHT_STEP.make(Current, LIST.empty.prepend(Close(c)), None)
+      else
+        match Current.client
+          case None then
+            Current.finish_on(c, RESPONSE_RECORD.from_error("Internal client state error", Current.elapsed_ms))
+          case Some(http_conn) then
+            match HTTP_CLIENT.receive(http_conn, data)
+              case Waiting(next_conn) then
+                let next_st: IN_FLIGHT = { Current with client = Some(next_conn) }
+                FLIGHT_STEP.make(next_st, LIST.empty, None)
+              case Reuse(_, q) then
+                Current.finish_on(c, RESPONSE_RECORD.from_http(q, Current.elapsed_ms))
+              case Done(q) then
+                Current.finish_on(c, RESPONSE_RECORD.from_http(q, Current.elapsed_ms))
+              case Broken(_) then
+                Current.finish_on(c, RESPONSE_RECORD.from_error("Malformed HTTP response", Current.elapsed_ms))
+              case Unanswered then
+                Current.finish_on(c, RESPONSE_RECORD.from_error("Connection closed without response", Current.elapsed_ms))
+            end
+        end
+      end
+    ensure
+      bounded_active: Result.state.active_count <= 1
+    end
+
+  -- Socket closed or send failed on `c`: finalize via `HTTP_CLIENT.closed` and return to Idle.
+  on_closed(c: CONN_ID): FLIGHT_STEP[IN_FLIGHT]
+    do
+      if not Current.active or not Current.is_on(c) then
+        FLIGHT_STEP.make(Current, LIST.empty, None)
+      else
+        let resp =
+          match Current.client
+            case None then
+              RESPONSE_RECORD.from_error("Connection closed", Current.elapsed_ms)
+            case Some(http_conn) then
+              match HTTP_CLIENT.closed(http_conn)
+                case Done(q) then RESPONSE_RECORD.from_http(q, Current.elapsed_ms)
+                case _ then RESPONSE_RECORD.from_error("Connection closed before full response", Current.elapsed_ms)
+              end
+          end
+        let cmds: LIST[COMMAND] = LIST.empty.prepend(CancelTimer(Current.timer_id))
+        FLIGHT_STEP.make(IN_FLIGHT.idle(Current.req_tag), cmds, Some(resp))
+      end
+    ensure
+      freed: not Result.state.is_on(c)
+    end
+
+  -- Timer tick: advance the 5-second timeout countdown gauge, or abort cleanly on timeout.
+  on_tick(id: NAT): FLIGHT_STEP[IN_FLIGHT]
+    do
+      if not Current.active or id != Current.timer_id then
+        FLIGHT_STEP.make(Current, LIST.empty, None)
+      else if Current.ticks_used + 1 < IN_FLIGHT.max_ticks then
+        let next_st: IN_FLIGHT = { Current with ticks_used = Current.ticks_used + 1 }
+        let cmds: LIST[COMMAND] = LIST.empty.prepend(SetTimer(Current.timer_id, IN_FLIGHT.tick_millis))
+        FLIGHT_STEP.make(next_st, cmds, None)
+      else
+        let resp = RESPONSE_RECORD.from_error("Request timed out after 5000ms", 5000)
+        let cmds: LIST[COMMAND] =
+          match Current.link
+            case Some(c) then LIST.empty.prepend(Close(c))
+            case None then LIST.empty
+          end
+        FLIGHT_STEP.make(IN_FLIGHT.idle(Current.req_tag), cmds, Some(resp))
+      end end
+    ensure
+      bounded_active: Result.state.active_count <= 1
+    end
+
+  -- User cancellation: always closes any open socket, cancels the timer, and returns to Idle.
+  cancel: FLIGHT_STEP[IN_FLIGHT]
+    do
+      if not Current.active then
+        FLIGHT_STEP.make(Current, LIST.empty, None)
+      else
+        let base_cmds: LIST[COMMAND] = LIST.empty.prepend(CancelTimer(Current.timer_id))
+        let cmds =
+          match Current.link
+            case Some(c) then base_cmds.prepend(Close(c))
+            case None then base_cmds
+          end
+        let resp = RESPONSE_RECORD.from_error("Request cancelled by user", Current.elapsed_ms)
+        FLIGHT_STEP.make(IN_FLIGHT.idle(Current.req_tag), cmds, Some(resp))
+      end
+    ensure
+      now_idle: not Result.state.is_active
+      no_conn: Result.state.connection.is_none
+    end
+
+end

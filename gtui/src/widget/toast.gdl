@@ -1,0 +1,592 @@
+-- A deterministic queue of stacked toast notifications (`TOAST_ITEM`) with corner/edge
+-- positioning, click-to-dismiss, and caller-driven `tick(now)`.
+-- TODO(proof-GW.5): prove TOAST.boxes(area) are pairwise disjoint and no expired item remains
+-- visible after tick.
+module TOAST
+
+representation {NONE}
+  queue: LIST[TOAST_ITEM]
+  max_vis: NAT
+  seq_id: NAT
+  cur_time: NAT
+  time_set: BOOL
+  corner: NAT
+  max_w: NAT
+  border: BORDER_KIND
+
+invariant
+  pos_max_vis: 1 <= max_vis and max_vis <= 65535
+  valid_corner: 1 <= corner and corner <= 6
+  valid_max_w: 3 <= max_w and max_w <= 65535
+
+create {ANY}
+
+  top_left: NAT do 1 end
+  top_center: NAT do 2 end
+  top_right: NAT do 3 end
+  bottom_left: NAT do 4 end
+  bottom_center: NAT do 5 end
+  bottom_right: NAT do 6 end
+
+  -- An empty toast queue (`max_visible = 3`, `top_right`, `max_width = 40`, plain border).
+  empty: TOAST
+    do
+      let q: LIST[TOAST_ITEM] = LIST.empty
+      { queue = q, max_vis = 3, seq_id = 0, cur_time = 0, time_set = False,
+        corner = 3, max_w = 40, border = BORDER_KIND.plain }
+    ensure
+      is_empty: Result.is_empty
+      default_max: Result.max_visible = 3
+      id_zero: Result.last_id = 0
+    end
+
+  -- An empty toast queue initialized with clock `now`.
+  make_at(now: NAT): TOAST
+    do
+      { TOAST.empty with cur_time = now, time_set = True }
+    ensure
+      is_empty: Result.is_empty
+      has_time_set: Result.has_time and Result.now = now
+    end
+
+  append_item(xs: LIST[TOAST_ITEM], it: TOAST_ITEM): LIST[TOAST_ITEM]
+    variant
+      xs.length
+    do
+      if xs.length = 0 then
+        let single: LIST[TOAST_ITEM] = LIST.empty.prepend(it)
+        single
+      else
+        TOAST.append_item(xs.tail, it).prepend(xs.head)
+      end
+    ensure
+      one_more: Result.length = xs.length + 1
+    end
+
+  find_id_index(xs: LIST[TOAST_ITEM], target: NAT, idx: NAT): OPTION[NAT]
+    require
+      bound: idx <= xs.length
+    variant
+      xs.length - idx
+    do
+      if idx >= xs.length or idx >= 18446744073709551615 then
+        None
+      else if LIST_OPS.at(xs, idx).id = target then
+        Some(idx)
+      else
+        TOAST.find_id_index(xs, target, idx + 1)
+      end end
+    ensure
+      valid: match Result case Some(i) then 0 <= i and i < xs.length and i < 18446744073709551615 case None then True end
+    end
+
+  drop_expired(xs: LIST[TOAST_ITEM], now: NAT): LIST[TOAST_ITEM]
+    variant
+      xs.length
+    do
+      if xs.length = 0 then
+        let empty_q: LIST[TOAST_ITEM] = LIST.empty
+        empty_q
+      else
+        let rest = TOAST.drop_expired(xs.tail, now)
+        if xs.head.is_expired_at(now) then
+          rest
+        else
+          rest.prepend(xs.head)
+        end
+      end
+    ensure
+      not_longer: Result.length <= xs.length
+    end
+
+  start_first_n(xs: LIST[TOAST_ITEM], rem: NAT, now: NAT): LIST[TOAST_ITEM]
+    variant
+      xs.length
+    do
+      if xs.length = 0 then
+        let empty_q: LIST[TOAST_ITEM] = LIST.empty
+        empty_q
+      else if rem = 0 then
+        xs
+      else
+        let h = if xs.head.is_started then xs.head else xs.head.start(now) end
+        TOAST.start_first_n(xs.tail, rem - 1, now).prepend(h)
+      end end
+    ensure
+      same_len: Result.length = xs.length
+    end
+
+  stop_beyond_n(xs: LIST[TOAST_ITEM], keep: NAT): LIST[TOAST_ITEM]
+    variant
+      xs.length
+    do
+      if xs.length = 0 then
+        let empty_q: LIST[TOAST_ITEM] = LIST.empty
+        empty_q
+      else if keep > 0 then
+        TOAST.stop_beyond_n(xs.tail, keep - 1).prepend(xs.head)
+      else
+        let h = if xs.head.is_started then xs.head.stop else xs.head end
+        TOAST.stop_beyond_n(xs.tail, 0).prepend(h)
+      end end
+    ensure
+      same_len: Result.length = xs.length
+    end
+
+  remove_at_idx(xs: LIST[TOAST_ITEM], idx: NAT): LIST[TOAST_ITEM]
+    variant
+      xs.length
+    do
+      if xs.length = 0 then
+        let empty_q: LIST[TOAST_ITEM] = LIST.empty
+        empty_q
+      else if idx = 0 then
+        xs.tail
+      else
+        TOAST.remove_at_idx(xs.tail, idx - 1).prepend(xs.head)
+      end end
+    ensure
+      not_longer: Result.length <= xs.length
+      one_less: idx < xs.length implies Result.length = xs.length - 1
+    end
+
+  remove_by_id(xs: LIST[TOAST_ITEM], target: NAT): LIST[TOAST_ITEM]
+    variant
+      xs.length
+    do
+      if xs.length = 0 then
+        let empty_q: LIST[TOAST_ITEM] = LIST.empty
+        empty_q
+      else if xs.head.id = target then
+        xs.tail
+      else
+        TOAST.remove_by_id(xs.tail, target).prepend(xs.head)
+      end end
+    ensure
+      not_longer: Result.length <= xs.length
+    end
+
+  max_line_w(lines: LIST[STRING]): NAT
+    variant
+      lines.length
+    do
+      if lines.length = 0 then
+        0
+      else
+        let w = GLYPHS.width(lines.head)
+        let rest = TOAST.max_line_w(lines.tail)
+        if w >= rest then w else rest end
+      end
+    ensure
+      fits: Result <= 65535
+    end
+
+  box_for_item(area: RECT, text: STRING, max_w: NAT, corner: NAT, used: NAT): RECT
+    require
+      valid_max_w: 3 <= max_w and max_w <= 65535
+    do
+      let lim = if max_w <= area.width then max_w else area.width end
+      if lim < 3 or area.height < 3 or used >= area.height or area.height - used < 3 then
+        let empty_r = area.take_top(0)
+        check c0: RECT.cut_top(area, 0) end
+        empty_r
+      else
+        let inside_w = lim - 2
+        let lines = PARAGRAPH.of_text(text).wrapped_lines(inside_w)
+        let raw_w = TOAST.max_line_w(lines)
+        let content_w = if raw_w >= 1 then raw_w else 1 end
+        let bw = if content_w + 2 <= lim then content_w + 2 else lim end
+        let raw_h = if lines.length >= 1 and lines.length <= 65533 then lines.length + 2 else if lines.length = 0 then 3 else 65535 end end
+        let rows_left = area.height - used
+        let bh = if raw_h <= rows_left then raw_h else rows_left end
+        let dx =
+          if corner = 1 or corner = 4 then 0
+          else if corner = 3 or corner = 6 then area.width - bw
+          else (area.width - bw) / 2
+          end end
+        let cdx = if dx <= area.width - bw then dx else area.width - bw end
+        let dy = if corner <= 3 then used else area.height - used - bh end
+        let cdy = if dy <= area.height - bh then dy else area.height - bh end
+        let s1 = area.drop_left(cdx)
+        let s2 = s1.take_left(bw)
+        let s3 = s2.drop_top(cdy)
+        let res = s3.take_top(bh)
+        check c1: RECT.cut_left(area, cdx) end
+        check c2: RECT.cut_left(s1, bw) end
+        check c3: RECT.cut_top(s2, cdy) end
+        check c4: RECT.cut_top(s3, bh) end
+        check t1: RECT.inside_trans(s2, s1, area) end
+        check t2: RECT.inside_trans(s3, s2, area) end
+        check t3: RECT.inside_trans(res, s3, area) end
+        res
+      end
+    ensure
+      within: Result.inside(area)
+    end
+
+  collect_boxes(area: RECT, xs: LIST[TOAST_ITEM], idx: NAT, vis: NAT, max_w: NAT, corner: NAT, used: NAT): LIST[RECT]
+    require
+      valid_max_w: 3 <= max_w and max_w <= 65535
+      vis_bound: vis <= xs.length
+      idx_bound: idx <= vis
+    variant
+      vis - idx
+    do
+      if idx >= vis or used >= area.height or area.height - used < 3 then
+        let empty_r: LIST[RECT] = LIST.empty
+        empty_r
+      else
+        let b = TOAST.box_for_item(area, LIST_OPS.at(xs, idx).text, max_w, corner, used)
+        if b.is_empty then
+          let empty_r: LIST[RECT] = LIST.empty
+          empty_r
+        else
+          let next_used = used + b.height
+          if next_used >= area.height then
+            let single: LIST[RECT] = LIST.empty.prepend(b)
+            single
+          else
+            TOAST.collect_boxes(area, xs, idx + 1, vis, max_w, corner, next_used).prepend(b)
+          end
+        end
+      end
+    ensure
+      bounded: Result.length <= vis - idx
+    end
+
+  box_at_step(area: RECT, xs: LIST[TOAST_ITEM], idx: NAT, target: NAT, vis: NAT, max_w: NAT, corner: NAT, used: NAT): RECT
+    require
+      valid_max_w: 3 <= max_w and max_w <= 65535
+      vis_bound: vis <= xs.length
+      idx_bound: idx <= vis
+    variant
+      vis - idx
+    do
+      if idx >= vis or used >= area.height or area.height - used < 3 then
+        let empty_r = area.take_top(0)
+        check c0: RECT.cut_top(area, 0) end
+        empty_r
+      else
+        let b = TOAST.box_for_item(area, LIST_OPS.at(xs, idx).text, max_w, corner, used)
+        if b.is_empty or idx = target then
+          b
+        else
+          let next_used = used + b.height
+          if next_used >= area.height then
+            let empty_r = area.take_top(0)
+            check c0: RECT.cut_top(area, 0) end
+            empty_r
+          else
+            TOAST.box_at_step(area, xs, idx + 1, target, vis, max_w, corner, next_used)
+          end
+        end
+      end
+    ensure
+      within: Result.inside(area)
+    end
+
+  find_hit_box(area: RECT, xs: LIST[TOAST_ITEM], idx: NAT, vis: NAT, max_w: NAT, corner: NAT, used: NAT, cx: NAT, cy: NAT): OPTION[NAT]
+    require
+      valid_max_w: 3 <= max_w and max_w <= 65535
+      vis_bound: vis <= xs.length
+      idx_bound: idx <= vis
+    variant
+      vis - idx
+    do
+      if idx >= vis or used >= area.height or area.height - used < 3 then
+        None
+      else
+        let it = LIST_OPS.at(xs, idx)
+        let b = TOAST.box_for_item(area, it.text, max_w, corner, used)
+        if b.is_empty then
+          None
+        else if b.has(cx, cy) then
+          Some(it.id)
+        else
+          let next_used = used + b.height
+          if next_used >= area.height then
+            None
+          else
+            TOAST.find_hit_box(area, xs, idx + 1, vis, max_w, corner, next_used, cx, cy)
+          end
+        end end
+      end
+    end
+
+  draw_toasts(s: SCREEN, area: RECT, xs: LIST[TOAST_ITEM], idx: NAT, vis: NAT, max_w: NAT, corner: NAT, used: NAT,
+              border: BORDER_KIND, bg_st: STYLE, info_st: STYLE, success_st: STYLE, warning_st: STYLE, error_st: STYLE): SCREEN
+    require
+      valid_max_w: 3 <= max_w and max_w <= 65535
+      vis_bound: vis <= xs.length
+      idx_bound: idx <= vis
+    variant
+      vis - idx
+    do
+      if idx >= vis or used >= area.height or area.height - used < 3 then
+        s
+      else
+        let it = LIST_OPS.at(xs, idx)
+        let b = TOAST.box_for_item(area, it.text, max_w, corner, used)
+        if b.is_empty then
+          s
+        else
+          let lvl_st =
+            if it.is_success then success_st
+            else if it.is_warning then warning_st
+            else if it.is_error then error_st
+            else info_st
+            end end end
+          let cleared = CLEAR.styled(s, b, bg_st)
+          let framed = FRAME.draw_styled(cleared, b, border, "", lvl_st, lvl_st)
+          let inner = FRAME.inner(b)
+          let with_text =
+            if inner.is_empty then
+              framed
+            else
+              let lines = PARAGRAPH.of_text(it.text).wrapped_lines(inner.width)
+              PARAGRAPH.draw_lines(framed, inner, lines, inner.y, ALIGN.left, 0, bg_st)
+            end
+          let next_used = used + b.height
+          if next_used >= area.height then
+            with_text
+          else
+            TOAST.draw_toasts(with_text, area, xs, idx + 1, vis, max_w, corner, next_used, border, bg_st, info_st, success_st, warning_st, error_st)
+          end
+        end
+      end
+    ensure
+      same_width: Result.width = s.width
+      same_height: Result.height = s.height
+    end
+
+feature {ANY}
+
+  count: NAT
+    do
+      Current.queue.length
+    end
+
+  is_empty: BOOL
+    do
+      Current.queue.length = 0
+    end
+
+  max_visible: NAT
+    do
+      Current.max_vis
+    ensure
+      pos: Result >= 1
+    end
+
+  visible_count: NAT
+    do
+      if Current.queue.length <= Current.max_vis then Current.queue.length else Current.max_vis end
+    ensure
+      def: Result = (if Current.count <= Current.max_visible then Current.count else Current.max_visible end)
+      bounded: Result <= Current.count and Result <= Current.max_visible
+    end
+
+  waiting_count: NAT
+    do
+      Current.queue.length - Current.visible_count
+    end
+
+  last_id: NAT
+    do
+      Current.seq_id
+    end
+
+  now: NAT
+    do
+      Current.cur_time
+    end
+
+  has_time: BOOL
+    do
+      Current.time_set
+    end
+
+  position: NAT
+    do
+      Current.corner
+    end
+
+  max_width: NAT
+    do
+      Current.max_w
+    end
+
+  border_kind: BORDER_KIND
+    do
+      Current.border
+    end
+
+  item(i: NAT): TOAST_ITEM
+    require
+      valid_idx: i < Current.count
+    do
+      LIST_OPS.at(Current.queue, i)
+    end
+
+  index_of_id(id: NAT): OPTION[NAT]
+    do
+      TOAST.find_id_index(Current.queue, id, 0)
+    ensure
+      valid: match Result case Some(i) then i < Current.count and 0 <= i and i < 18446744073709551615 case None then True end
+    end
+
+  has_id(id: NAT): BOOL
+    do
+      match Current.index_of_id(id)
+        case Some(_) then True
+        case None then False
+      end
+    end
+
+  with_max_visible(m: NAT): TOAST
+    do
+      let cm = if m < 1 then 1 else if m > 65535 then 65535 else m end end
+      { Current with max_vis = cm, queue = TOAST.stop_beyond_n(Current.queue, cm) }
+    end
+
+  with_position(pos: NAT): TOAST
+    do
+      let cp = if pos < 1 then 1 else if pos > 6 then 6 else pos end end
+      { Current with corner = cp }
+    end
+
+  with_max_width(w: NAT): TOAST
+    do
+      let cw = if w < 3 then 3 else if w > 65535 then 65535 else w end end
+      { Current with max_w = cw }
+    end
+
+  with_border(k: BORDER_KIND): TOAST
+    do
+      { Current with border = k }
+    end
+
+  -- Push a new unstarted toast onto the end of the queue with a strictly increasing id.
+  push(text: STRING, level: NAT, duration: NAT): TOAST
+    do
+      let next_id = if Current.seq_id < 18446744073709551615 then Current.seq_id + 1 else 18446744073709551615 end
+      let it = TOAST_ITEM.make(next_id, text, level, duration)
+      { Current with queue = TOAST.append_item(Current.queue, it), seq_id = next_id }
+    ensure
+      one_more: Result.count = Current.count + 1
+      id_increased: Current.last_id < 18446744073709551615 implies Result.last_id = Current.last_id + 1
+    end
+
+  push_info(text: STRING, duration: NAT): TOAST
+    do
+      Current.push(text, TOAST_ITEM.info_level, duration)
+    ensure
+      one_more: Result.count = Current.count + 1
+    end
+
+  push_success(text: STRING, duration: NAT): TOAST
+    do
+      Current.push(text, TOAST_ITEM.success_level, duration)
+    ensure
+      one_more: Result.count = Current.count + 1
+    end
+
+  push_warning(text: STRING, duration: NAT): TOAST
+    do
+      Current.push(text, TOAST_ITEM.warning_level, duration)
+    ensure
+      one_more: Result.count = Current.count + 1
+    end
+
+  push_error(text: STRING, duration: NAT): TOAST
+    do
+      Current.push(text, TOAST_ITEM.error_level, duration)
+    ensure
+      one_more: Result.count = Current.count + 1
+    end
+
+  -- Advance deterministic clock to `now`: expire started items whose duration elapsed, and
+  -- start newly visible items at `now`.
+  tick(now: NAT): TOAST
+    do
+      let kept = TOAST.drop_expired(Current.queue, now)
+      let started = TOAST.start_first_n(kept, Current.max_vis, now)
+      { Current with queue = started, cur_time = now, time_set = True }
+    ensure
+      time_updated: Result.has_time and Result.now = now
+      never_grows: Result.count <= Current.count
+      id_kept: Result.last_id = Current.last_id
+    end
+
+  dismiss_at(idx: NAT): TOAST
+    do
+      { Current with queue = TOAST.remove_at_idx(Current.queue, idx) }
+    ensure
+      never_grows: Result.count <= Current.count
+      id_kept: Result.last_id = Current.last_id
+    end
+
+  dismiss_id(id: NAT): TOAST
+    do
+      { Current with queue = TOAST.remove_by_id(Current.queue, id) }
+    ensure
+      never_grows: Result.count <= Current.count
+      id_kept: Result.last_id = Current.last_id
+    end
+
+  clear: TOAST
+    do
+      let empty_q: LIST[TOAST_ITEM] = LIST.empty
+      { Current with queue = empty_q }
+    ensure
+      is_empty: Result.is_empty
+    end
+
+  -- Stacked bounding boxes of the visible toasts inside `area`.
+  boxes(area: RECT): LIST[RECT]
+    do
+      TOAST.collect_boxes(area, Current.queue, 0, Current.visible_count, Current.max_w, Current.corner, 0)
+    ensure
+      at_most_visible: Result.length <= Current.visible_count
+    end
+
+  -- Bounding box of visible toast `i` inside `area` (empty if out of range or no room).
+  box_at(area: RECT, i: NAT): RECT
+    do
+      TOAST.box_at_step(area, Current.queue, 0, i, Current.visible_count, Current.max_w, Current.corner, 0)
+    ensure
+      within: Result.inside(area)
+    end
+
+  -- Id of the visible toast at `(cx, cy)` inside `area`, if any.
+  toast_id_at(area: RECT, cx: NAT, cy: NAT): OPTION[NAT]
+    do
+      TOAST.find_hit_box(area, Current.queue, 0, Current.visible_count, Current.max_w, Current.corner, 0, cx, cy)
+    end
+
+  -- Dismiss the clicked toast on left mouse down.
+  on_mouse(m: MOUSE, area: RECT): TOAST
+    do
+      if not m.is_left_down then
+        Current
+      else
+        match Current.toast_id_at(area, m.x, m.y)
+          case Some(id) then Current.dismiss_id(id)
+          case None then Current
+        end
+      end
+    ensure
+      never_grows: Result.count <= Current.count
+    end
+
+  -- Draw the visible toast boxes stacked inside `area`.
+  draw(s: SCREEN, area: RECT, bg_st: STYLE, info_st: STYLE, success_st: STYLE, warning_st: STYLE, error_st: STYLE): SCREEN
+    do
+      TOAST.draw_toasts(s, area, Current.queue, 0, Current.visible_count, Current.max_w, Current.corner, 0,
+        Current.border, bg_st, info_st, success_st, warning_st, error_st)
+    ensure
+      same_width: Result.width = s.width
+      same_height: Result.height = s.height
+    end
+
+end

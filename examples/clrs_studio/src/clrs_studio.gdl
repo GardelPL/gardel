@@ -1,0 +1,155 @@
+-- Verified CLRS Algorithm Visualizer showcasing Gardel's compile-time Boogie/Z3 proofs
+-- alongside `gtui` 0.6.0 widgets, mouse interaction, themes, and pure time-travel stepping.
+--
+--   gardelc --project examples/clrs_studio --strict
+--   ./build/clrs_studio_bin
+reactive program CLRS_STUDIO
+
+feature {ANY}
+
+  update(s: STUDIO_STATE, e: EVENT): TUI_NEXT[STUDIO_STATE]
+    do
+      match e
+        case Resized(w, h) then TUI_NEXT.next(s.sized(w, h))
+        case Key(k) then s.handle_key(k)
+        case Mouse(m) then s.handle_mouse(m)
+        case Tick(id) then s.handle_tick(id)
+        case _ then TUI_NEXT.next(s)
+      end
+    end
+
+  edge(s: STUDIO_STATE, pane: NAT): STYLE
+    do
+      if s.focus.has(pane) then s.theme.focused_border else s.theme.border end
+    end
+
+  draw_custom_modal(s: SCREEN, st: STUDIO_STATE, area: RECT, t: THEME): SCREEN
+    do
+      let box = area.centered(62, 7)
+      let s0 = CLEAR.draw(s, box, t.base)
+      let heading = if st.active_algo = 0 then "Custom Numbers (0..999)" else "Custom Directed Edges (s,t,x,y,z)" end
+      let hint = if st.active_algo = 0 then
+        "Comma or space separated integers (1..32 items):"
+      else
+        "Edges u-v:w separated by commas (e.g. s-t:10, s-y:5, t-x:1):"
+      end
+      let s1 = FRAME.draw_titled(s0, box, BORDER_KIND.rounded, heading, "", "Enter:apply Esc:cancel", t.focused_border, t.active_tab)
+      let inn = FRAME.inner_padded(box, PADDING.symmetric(0, 1))
+      let s2 = s1.text(inn, inn.x, inn.y, hint, t.base)
+      let input_r = inn.drop_top(2).take_top(1)
+      let s3 = st.custom_line.draw(s2, input_r, "> ", t.base, t.selection)
+      if st.custom_error.is_empty then
+        s3
+      else
+        s3.text(inn, inn.x, inn.y + 4, st.custom_error, STYLE.plain.fg(COLOR.red).bold)
+      end
+    ensure
+      same_width: Result.width = s.width
+      same_height: Result.height = s.height
+    end
+
+  view(s: STUDIO_STATE, blank: SCREEN): SCREEN
+    do
+      let t = s.theme
+      let area = blank.area
+      let kind = BORDER_KIND.rounded
+      let st = s.sort_state
+
+      -- 1. Main split panes: Left Visualization + Right Verified Spec & State.
+      let viz_r = STUDIO_LAYOUT.viz_pane(area)
+      let spec_r = STUDIO_LAYOUT.spec_pane(area)
+      let s0 = FRAME.draw_titled(blank, viz_r, kind, s.algo_title, s.preset_name, "", edge(s, 0), t.active_tab)
+      let s1 = FRAME.draw_titled(s0, spec_r, kind, "", "", "", edge(s, 1), t.active_tab)
+      let s2 = FRAME.merge_borders(s1, STUDIO_LAYOUT.main_area(area))
+      let s3 = s.tabs.draw(s2, STUDIO_LAYOUT.spec_tabs_area(area), t.base, t.active_tab)
+
+      -- 2. Left pane content: BAR_CHART (Insertion Sort) or DIJKSTRA_VIEW (Dijkstra) + display CHECKBOXes.
+      let s4 = if s.active_algo = 0 then
+        BAR_CHART.draw(
+          s3,
+          STUDIO_LAYOUT.chart_area(area),
+          st,
+          t,
+          s.highlight_checkbox.is_checked,
+          s.values_checkbox.is_checked
+        )
+      else
+        DIJKSTRA_VIEW.draw(
+          s3,
+          STUDIO_LAYOUT.chart_area(area),
+          s.dijkstra_state,
+          t,
+          s.highlight_checkbox.is_checked,
+          s.values_checkbox.is_checked
+        )
+      end
+      let s5 = s.highlight_checkbox.draw(s4, STUDIO_LAYOUT.chk_highlight_area(area), t.base, False)
+      let s6 = s.values_checkbox.draw(s5, STUDIO_LAYOUT.chk_values_area(area), t.base, False)
+
+      -- 3. Right pane content: Invariants / Code / Short Form.
+      let s7 =
+        if s.tabs.selected = 0 then
+          if s.active_algo = 0 then
+            CONTRACT_PANEL.draw_invariants(s6, area, st, s.history.initial_work, t, kind)
+          else
+            CONTRACT_PANEL.draw_dijkstra_invariants(s6, area, s.dijkstra_state, s.dijkstra_history.initial_work, t, kind)
+          end
+        else if s.tabs.selected = 1 then
+          let mark_line: OPTION[NAT] = Some(s.current_code_line)
+          let c_r = STUDIO_LAYOUT.code_area(area)
+          let sc = s.code.draw_code(
+            s6, c_r, t.base, t.gutter, mark_line, t.marked,
+            fn(i: NAT, line: STRING): LIST[SPAN] do GDL_LEXER.spans_with(t, i, line) end
+          )
+          SCROLLBAR.vertical(s.code.line_count, c_r.height, s.code.top)
+            .draw(sc, STUDIO_LAYOUT.code_scrollbar_area(area), t.gutter, t.focused_border)
+        else
+          let c_r = STUDIO_LAYOUT.code_area(area)
+          let none_mark: OPTION[NAT] = None
+          let sc = s.short_form.draw_code(
+            s6, c_r, t.base, t.gutter, none_mark, t.marked,
+            fn(i: NAT, line: STRING): LIST[SPAN] do GDL_LEXER.spans_with(t, i, line) end
+          )
+          SCROLLBAR.vertical(s.short_form.line_count, c_r.height, s.short_form.top)
+            .draw(sc, STUDIO_LAYOUT.code_scrollbar_area(area), t.gutter, t.focused_border)
+        end end
+
+      -- 4. Transport bar: Framed BUTTONs + Timeline SLIDER + Speed SLIDER.
+      let tr_r = STUDIO_LAYOUT.transport_bar(area)
+      let step_meta = GLYPHS.join(
+        GLYPHS.join("Step ", NUMBER_TEXT.nat_to_text(s.current_step_index)),
+        GLYPHS.join("/", NUMBER_TEXT.nat_to_text(s.current_last_step))
+      )
+      let s8 = FRAME.draw_titled(s7, tr_r, kind, "Transport", step_meta, "Speed", t.border, t.active_tab)
+      let play_lbl = if s.is_playing then "Pause" else "Play " end
+      let s9 = BUTTON.make("◀ Back").draw(s8, STUDIO_LAYOUT.btn_back_area(area), t.base, False, False)
+      let s10 = BUTTON.make(play_lbl).draw(s9, STUDIO_LAYOUT.btn_play_area(area), t.active_tab, s.is_playing, False)
+      let s11 = BUTTON.make("Step ▶").draw(s10, STUDIO_LAYOUT.btn_step_area(area), t.base, False, False)
+      let s12 = BUTTON.make("Reset").draw(s11, STUDIO_LAYOUT.btn_reset_area(area), t.base, False, False)
+      let s13 = s.timeline_slider.draw(s12, STUDIO_LAYOUT.timeline_slider_area(area), t.gutter, t.string, t.active_tab)
+      let s14 = s.speed_slider.draw(s13, STUDIO_LAYOUT.speed_slider_area(area), t.gutter, t.keyword, t.active_tab)
+
+      -- 5. Bottom status bar.
+      let left_st = GLYPHS.join("CLRS Studio · ", s.preset_name)
+      let right_st = "a:algo Space:play ←/→:step r:reset 1-5:preset i/c/s:tab F10:menu ?:help q:quit"
+      let s15 = STATUS_BAR.draw(s14, STUDIO_LAYOUT.status_bar(area), left_st, right_st, t.selection)
+
+      -- 6. Overlays (rendered last): TOASTs, Help POPUP, Custom Input modal, Quit DIALOG, and top MENU.
+      let s16 = s.toasts.with_border(kind).draw(s15, area, t.base, t.focused_border, t.string, t.active_tab, t.keyword)
+      let s17 = if s.help_open then s.help_popup.draw(s16, area, t.base, t.focused_border, t.active_tab) else s16 end
+      let s18 = if s.custom_modal_open then draw_custom_modal(s17, s, area, t) else s17 end
+      let s19 = if s.dialog_open then s.dialog.draw(s18, area, t.base, t.focused_border, t.active_tab, t.base, t.selection) else s18 end
+      s.top_menu.draw(s19, STUDIO_LAYOUT.menu_bar(area), t.base, t.base, t.selection, t.gutter)
+    end
+
+  init(args: SEQ[STRING]): STEP[TUI[STUDIO_STATE]]
+    do
+      TUI.start(STUDIO_STATE.make, update, view)
+    end
+
+  step(t: TUI[STUDIO_STATE], e: EVENT): STEP[TUI[STUDIO_STATE]]
+    do
+      t.step(e)
+    end
+
+end

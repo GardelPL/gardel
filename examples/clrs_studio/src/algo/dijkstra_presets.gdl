@@ -1,0 +1,240 @@
+-- Curated weighted directed graphs for Dijkstra's algorithm (CLRS 4th ed.).
+-- Includes a safe parser for custom edge lists (`s-t:10, s-y:5, ...`).
+functions DIJKSTRA_PRESETS
+
+feature {ANY}
+
+  preset_name(idx: NAT): STRING
+    do
+      if idx = 0 then "CLRS Fig. 22.6 (s,t,x,y,z)"
+      else if idx = 1 then "CLRS Fig. 22.2 (4th ed.)"
+      else if idx = 2 then "Diamond Shortcut (5v)"
+      else "Multi-Hop Network (5v)"
+      end end end
+    end
+
+  vertex_label(v: NAT): STRING
+    do
+      if v = 0 then "s"
+      else if v = 1 then "t"
+      else if v = 2 then "x"
+      else if v = 3 then "y"
+      else if v = 4 then "z"
+      else "w"
+      end end end end end
+    end
+
+  char_to_vertex(c: CHAR): OPTION[NAT]
+    do
+      if c = 's' or c = 'S' or c = '0' then Some(0)
+      else if c = 't' or c = 'T' or c = '1' then Some(1)
+      else if c = 'x' or c = 'X' or c = '2' then Some(2)
+      else if c = 'y' or c = 'Y' or c = '3' then Some(3)
+      else if c = 'z' or c = 'Z' or c = '4' then Some(4)
+      else None
+      end end end end end
+    end
+
+  set_edge(mat: LIST[NAT], u: NAT, v: NAT, w: NAT): LIST[NAT]
+    require
+      u_in: u < 8
+      v_in: v < 8
+      mat_len: mat.length = 64
+      mat_ok: SORT_FACTS.all_at_most(mat, 999999)
+      w_ok: w <= 999999
+    do
+      let idx = u * 8 + v
+      check sb: SORT_FACTS.lemma_set_at_bounded(mat, idx, w, 999999) end
+      SORT_FACTS.set_at(mat, idx, w)
+    ensure
+      same_len: Result.length = 64
+      still_ok: SORT_FACTS.all_at_most(Result, 999999)
+    end
+
+  -- Build a verified 5-vertex initial DIJKSTRA instance for preset `idx` (0..3).
+  make_preset(idx: NAT): DIJKSTRA
+    do
+      let m_ok = DIJKSTRA_PRESETS.repeat64(999999)
+      if idx = 0 then
+        -- CLRS Figure 22.6: 0=s, 1=t, 2=x, 3=y, 4=z
+        let m1 = DIJKSTRA_PRESETS.set_edge(m_ok, 0, 1, 10)
+        let m2 = DIJKSTRA_PRESETS.set_edge(m1, 0, 3, 5)
+        let m3 = DIJKSTRA_PRESETS.set_edge(m2, 1, 2, 1)
+        let m4 = DIJKSTRA_PRESETS.set_edge(m3, 1, 3, 2)
+        let m5 = DIJKSTRA_PRESETS.set_edge(m4, 2, 4, 4)
+        let m6 = DIJKSTRA_PRESETS.set_edge(m5, 3, 1, 3)
+        let m7 = DIJKSTRA_PRESETS.set_edge(m6, 3, 2, 9)
+        let m8 = DIJKSTRA_PRESETS.set_edge(m7, 3, 4, 2)
+        let m9 = DIJKSTRA_PRESETS.set_edge(m8, 4, 0, 7)
+        let m10 = DIJKSTRA_PRESETS.set_edge(m9, 4, 2, 6)
+        DIJKSTRA.make(5, 0, m10)
+      else if idx = 1 then
+        -- CLRS Figure 22.2: 0=s, 1=t, 2=x, 3=y, 4=z
+        let m1 = DIJKSTRA_PRESETS.set_edge(m_ok, 0, 1, 3)
+        let m2 = DIJKSTRA_PRESETS.set_edge(m1, 0, 3, 5)
+        let m3 = DIJKSTRA_PRESETS.set_edge(m2, 1, 2, 6)
+        let m4 = DIJKSTRA_PRESETS.set_edge(m3, 1, 3, 2)
+        let m5 = DIJKSTRA_PRESETS.set_edge(m4, 3, 1, 1)
+        let m6 = DIJKSTRA_PRESETS.set_edge(m5, 3, 2, 4)
+        let m7 = DIJKSTRA_PRESETS.set_edge(m6, 3, 4, 6)
+        let m8 = DIJKSTRA_PRESETS.set_edge(m7, 2, 4, 2)
+        let m9 = DIJKSTRA_PRESETS.set_edge(m8, 4, 2, 7)
+        let m10 = DIJKSTRA_PRESETS.set_edge(m9, 4, 0, 3)
+        DIJKSTRA.make(5, 0, m10)
+      else if idx = 2 then
+        -- Diamond Shortcut: direct edge (s,z)=20 beaten by s->t->x->z (2+3+4=9) and s->y->z (4+6=10)
+        let m1 = DIJKSTRA_PRESETS.set_edge(m_ok, 0, 1, 2)
+        let m2 = DIJKSTRA_PRESETS.set_edge(m1, 0, 3, 4)
+        let m3 = DIJKSTRA_PRESETS.set_edge(m2, 0, 4, 20)
+        let m4 = DIJKSTRA_PRESETS.set_edge(m3, 1, 2, 3)
+        let m5 = DIJKSTRA_PRESETS.set_edge(m4, 2, 4, 4)
+        let m6 = DIJKSTRA_PRESETS.set_edge(m5, 3, 2, 1)
+        let m7 = DIJKSTRA_PRESETS.set_edge(m6, 3, 4, 6)
+        DIJKSTRA.make(5, 0, m7)
+      else
+        -- Multi-Hop Network: chain with cross-edges forcing multiple relaxations
+        let m1 = DIJKSTRA_PRESETS.set_edge(m_ok, 0, 1, 8)
+        let m2 = DIJKSTRA_PRESETS.set_edge(m1, 0, 3, 2)
+        let m3 = DIJKSTRA_PRESETS.set_edge(m2, 3, 1, 3)
+        let m4 = DIJKSTRA_PRESETS.set_edge(m3, 1, 2, 2)
+        let m5 = DIJKSTRA_PRESETS.set_edge(m4, 3, 2, 9)
+        let m6 = DIJKSTRA_PRESETS.set_edge(m5, 2, 4, 1)
+        let m7 = DIJKSTRA_PRESETS.set_edge(m6, 1, 4, 7)
+        DIJKSTRA.make(5, 0, m7)
+      end end end
+    end
+
+  -- Parse custom directed edges of the form `s-t:10, s-y:5, t-x:1` (vertices s,t,x,y,z; weights 0..999).
+  parse_custom_edges(text: STRING): OPTION[DIJKSTRA]
+    do
+      let m0 = DIJKSTRA_PRESETS.repeat64(999999)
+      match DIJKSTRA_PRESETS.parse_edge_chars(GLYPHS.of_text(text), m0, 0)
+        case None then None
+        case Some(mat) then
+          if mat.length = 64 and SORT_FACTS.all_at_most(mat, 999999) then
+            Some(DIJKSTRA.make(5, 0, mat))
+          else
+            None
+          end
+      end
+    end
+
+  -- Skip leading separators (` `, `,`, `;`).
+  skip_seps(cs: LIST[CHAR]): LIST[CHAR]
+    variant
+      cs.length
+    do
+      if cs.length = 0 then cs
+      else if cs.head = ' ' or cs.head = ',' or cs.head = ';' then
+        DIJKSTRA_PRESETS.skip_seps(cs.tail)
+      else
+        cs
+      end end
+    ensure
+      not_longer: Result.length <= cs.length
+    end
+
+  -- Read an unsigned integer `0..999` from the front of `cs`.
+  read_weight(cs: LIST[CHAR], acc: NAT, has_digit: BOOL): TUPLE[OPTION[NAT], LIST[CHAR]]
+    variant
+      cs.length
+    do
+      if cs.length = 0 then
+        (if has_digit then Some(acc) else None end, cs)
+      else
+        let code = cs.head.code
+        if code >= 48 and code <= 57 then
+          let d = code - 48
+          if acc <= 999 then
+            let next = acc * 10 + d
+            if next <= 999 then
+              DIJKSTRA_PRESETS.read_weight(cs.tail, next, True)
+            else
+              (None, cs)
+            end
+          else
+            (None, cs)
+          end
+        else
+          (if has_digit then Some(acc) else None end, cs)
+        end
+      end
+    ensure
+      not_longer: Result.second.length <= cs.length
+    end
+
+  -- Parse one or more `u-v:w` (or `u>v:w` / `uv:w`) edges into `mat`.
+  parse_edge_chars(cs: LIST[CHAR], mat: LIST[NAT], edge_count: NAT): OPTION[LIST[NAT]]
+    require
+      mat_len: mat.length = 64
+      mat_ok: SORT_FACTS.all_at_most(mat, 999999)
+    variant
+      cs.length
+    do
+      let s0 = DIJKSTRA_PRESETS.skip_seps(cs)
+      if s0.length = 0 then
+        if edge_count > 0 then Some(mat) else None end
+      else
+        match DIJKSTRA_PRESETS.char_to_vertex(s0.head)
+          case None then None
+          case Some(u) then
+            let s1 = s0.tail
+            let s2 = if s1.length > 0 and (s1.head = '-' or s1.head = '>') then s1.tail else s1 end
+            let s3 = if s2.length > 0 and s2.head = '>' then s2.tail else s2 end
+            if s3.length = 0 then
+              None
+            else
+              match DIJKSTRA_PRESETS.char_to_vertex(s3.head)
+                case None then None
+                case Some(v) then
+                  let s4 = s3.tail
+                  if s4.length = 0 or (s4.head != ':' and s4.head != '=') then
+                    None
+                  else
+                    let rw = DIJKSTRA_PRESETS.read_weight(s4.tail, 0, False)
+                    match rw.first
+                      case None then None
+                      case Some(w) then
+                        if u < 5 and v < 5 and w <= 999 then
+                          let next_mat = DIJKSTRA_PRESETS.set_edge(mat, u, v, w)
+                          let next_cnt = if edge_count < 1000 then edge_count + 1 else edge_count end
+                          DIJKSTRA_PRESETS.parse_edge_chars(rw.second, next_mat, next_cnt)
+                        else
+                          None
+                        end
+                    end
+                  end
+              end
+            end
+        end
+      end
+    end
+
+  repeat64(val: NAT): LIST[NAT]
+    require
+      val_ok: val <= 999999
+    do
+      DIJKSTRA_PRESETS.repeat_bounded(64, val)
+    ensure
+      len_eq: Result.length = 64
+      bounded: SORT_FACTS.all_at_most(Result, 999999)
+    end
+
+  repeat_bounded(k: NAT, val: NAT): LIST[NAT]
+    require
+      small: k <= 64
+      val_ok: val <= 999999
+    variant
+      k
+    do
+      if k = 0 then
+        LIST.empty
+      else
+        DIJKSTRA_PRESETS.repeat_bounded(k - 1, val).prepend(val)
+      end
+    ensure
+      len_eq: Result.length = k
+      bounded: SORT_FACTS.all_at_most(Result, 999999)
+    end
+
+end

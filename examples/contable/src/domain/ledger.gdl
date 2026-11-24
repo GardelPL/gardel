@@ -1,0 +1,166 @@
+-- Verified Double-Entry Ledger with compile-time Boogie/Z3 proofs of:
+--   1. Conservation of money (Trial Balance = 0 at every state)
+--   2. Overflow-free 64-bit integer cents across all accounts
+--   3. Immutable append-only audit trail (entries are never edited or deleted; only reversed)
+module LEDGER
+
+representation {NONE}
+  name_str: STRING
+  accts: LIST[ACCOUNT]
+  journal: LIST[JOURNAL_ENTRY]
+
+invariant
+  has_accounts: accts.length >= 2
+  trial_balance_zero: LEDGER_FACTS.sum_balances_math(accts) = 0
+
+create {ANY}
+
+  -- Create a fresh ledger with all accounts initialized to zero balance.
+  make(book_name: STRING, initial_accounts: LIST[ACCOUNT]): LEDGER
+    require
+      at_least_two: initial_accounts.length >= 2
+      all_zero: LEDGER_FACTS.all_zero_balances(initial_accounts)
+    do
+      { name_str = book_name, accts = initial_accounts, journal = LIST.empty }
+    ensure
+      empty_journal: Result.entry_count = 0
+      same_accounts: Result.account_count = initial_accounts.length
+    end
+
+feature {ANY}
+
+  book_name: STRING
+    do
+      Current.name_str
+    end
+
+  accounts: LIST[ACCOUNT]
+    do
+      Current.accts
+    ensure
+      at_least_two: Result.length >= 2
+      balanced: LEDGER_FACTS.sum_balances_math(Result) = 0
+    end
+
+  account_count: NAT
+    do
+      Current.accts.length
+    ensure
+      at_least_two: Result >= 2
+    end
+
+  -- Journal entries stored newest-first so prepending is O(1) and append-only is `Result.entries.tail = Current.entries`.
+  entries: LIST[JOURNAL_ENTRY]
+    do
+      Current.journal
+    end
+
+  entry_count: NAT
+    do
+      Current.journal.length
+    end
+
+  next_entry_id: NAT
+    do
+      if Current.journal.length < 18446744073709551615 then
+        Current.journal.length + 1
+      else
+        Current.journal.length
+      end
+    end
+
+  can_post(e: JOURNAL_ENTRY): BOOL
+    do
+      LEDGER_FACTS.can_apply_postings(Current.accts, e.postings)
+    end
+
+  -- Post a statically balanced `JOURNAL_ENTRY` onto the ledger.
+  -- Proves trial balance preservation, overflow freedom, and append-only audit trail.
+  post_entry(e: JOURNAL_ENTRY): LEDGER
+    require
+      applicable: Current.can_post(e)
+    do
+      let next_accts = LEDGER_FACTS.apply_postings(Current.accts, e.postings)
+      { Current with accts = next_accts, journal = Current.journal.prepend(e) }
+    ensure
+      same_account_count: Result.account_count = Current.account_count
+      trial_balance_zero: LEDGER_FACTS.sum_balances_math(Result.accounts) = 0
+      audit_len_inc: Result.entry_count = Current.entry_count + 1
+      audit_append_only: Result.entries.tail = Current.entries
+      head_is_posted: Result.entries.head.id = e.id
+    end
+
+  -- Check whether reversing entry at `idx` (0 = newest) fits within account overflow bounds.
+  can_reverse(idx: NAT): BOOL
+    do
+      if idx < Current.journal.length then
+        let orig = LIST_OPS.at(Current.journal, idx)
+        let rev_legs = LEDGER_FACTS.reverse_postings(orig.postings)
+        LEDGER_FACTS.can_apply_postings(Current.accts, rev_legs)
+      else
+        False
+      end
+    end
+
+  -- Reverse an existing journal entry by appending a compensating entry (never mutating history).
+  reverse_entry(idx: NAT, date: STRING): LEDGER
+    require
+      valid_idx: idx < Current.entry_count
+      applicable: Current.can_reverse(idx)
+    do
+      let orig = LIST_OPS.at(Current.journal, idx)
+      let rev = JOURNAL_ENTRY.make_reversal(Current.next_entry_id, date, orig)
+      Current.post_entry(rev)
+    ensure
+      same_account_count: Result.account_count = Current.account_count
+      trial_balance_zero: LEDGER_FACTS.sum_balances_math(Result.accounts) = 0
+      audit_len_inc: Result.entry_count = Current.entry_count + 1
+      audit_append_only: Result.entries.tail = Current.entries
+      is_reversal: Result.entries.head.is_reversal
+    end
+
+  -- Summary totals (in normal display sign) for dashboard reporting.
+  total_assets: I64
+    do
+      LEDGER_FACTS.sum_kind_normal(Current.accts, ACCOUNT.kind_asset)
+    end
+
+  total_liabilities: I64
+    do
+      LEDGER_FACTS.sum_kind_normal(Current.accts, ACCOUNT.kind_liability)
+    end
+
+  total_equity: I64
+    do
+      LEDGER_FACTS.sum_kind_normal(Current.accts, ACCOUNT.kind_equity)
+    end
+
+  total_income: I64
+    do
+      LEDGER_FACTS.sum_kind_normal(Current.accts, ACCOUNT.kind_income)
+    end
+
+  total_expenses: I64
+    do
+      LEDGER_FACTS.sum_kind_normal(Current.accts, ACCOUNT.kind_expense)
+    end
+
+  net_worth: I64
+    do
+      let a = Current.total_assets
+      let l = Current.total_liabilities
+      if a >= -10000000000000 and a <= 10000000000000 and l >= -10000000000000 and l <= 10000000000000 then
+        a - l
+      else
+        0
+      end
+    end
+
+  -- Net worth scaled to non-negative whole dollars for `SPARKLINE` rendering.
+  net_worth_spark_value: NAT
+    do
+      let nw = Current.net_worth
+      if nw <= 0 then 0 else NAT.from_i64(nw) / 100 end
+    end
+
+end

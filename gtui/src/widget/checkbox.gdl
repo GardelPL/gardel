@@ -1,0 +1,268 @@
+-- A check box with a label: `"[x] Wrap lines"`.
+--
+-- Radio-group recipe: render multiple `CHECKBOX.radio(label, i = selected)` widgets sharing a
+-- single `selected: NAT` index owned by the client; clicking or pressing Space on option `i`
+-- sets `selected := i` without clearing it.
+-- TODO(proof-GW.5): prove CHECKBOX.draw modifies only cells in content_area(r)
+module CHECKBOX
+
+representation {NONE}
+  text_label: STRING
+  checked_flag: BOOL
+  on_sym: STRING
+  off_sym: STRING
+
+create {ANY}
+
+  -- An ASCII checkbox (`[x]` / `[ ]`) with `label` and state `checked`.
+  make(label: STRING, checked: BOOL): CHECKBOX
+    do
+      { text_label = label, checked_flag = checked, on_sym = "[x]", off_sym = "[ ]" }
+    ensure
+      checked_set: Result.is_checked = checked
+      label_set: Result.label.equals(label)
+    end
+
+  -- An unchecked ASCII checkbox.
+  unchecked(label: STRING): CHECKBOX
+    do
+      CHECKBOX.make(label, False)
+    ensure
+      not_checked: not Result.is_checked
+    end
+
+  -- A checked ASCII checkbox.
+  checked(label: STRING): CHECKBOX
+    do
+      CHECKBOX.make(label, True)
+    ensure
+      is_checked: Result.is_checked
+    end
+
+  -- A Unicode checkbox (`☑` / `☐`).
+  unicode(label: STRING, checked: BOOL): CHECKBOX
+    do
+      { text_label = label, checked_flag = checked, on_sym = "☑", off_sym = "☐" }
+    ensure
+      checked_set: Result.is_checked = checked
+      label_set: Result.label.equals(label)
+    end
+
+  -- A radio button option (`(•)` / `( )`).
+  radio(label: STRING, selected: BOOL): CHECKBOX
+    do
+      { text_label = label, checked_flag = selected, on_sym = "(•)", off_sym = "( )" }
+    ensure
+      checked_set: Result.is_checked = selected
+      label_set: Result.label.equals(label)
+    end
+
+feature {ANY}
+
+  label: STRING
+    do
+      Current.text_label
+    end
+
+  is_checked: BOOL
+    do
+      Current.checked_flag
+    end
+
+  on_symbol: STRING
+    do
+      Current.on_sym
+    end
+
+  off_symbol: STRING
+    do
+      Current.off_sym
+    end
+
+  symbol: STRING
+    do
+      if Current.checked_flag then Current.on_sym else Current.off_sym end
+    end
+
+  with_label(text: STRING): CHECKBOX
+    do
+      { Current with text_label = text }
+    ensure
+      label_set: Result.label.equals(text)
+      checked_kept: Result.is_checked = Current.is_checked
+    end
+
+  with_checked(c: BOOL): CHECKBOX
+    do
+      { Current with checked_flag = c }
+    ensure
+      checked_set: Result.is_checked = c
+    end
+
+  with_symbols(on_s: STRING, off_s: STRING): CHECKBOX
+    do
+      { Current with on_sym = on_s, off_sym = off_s }
+    ensure
+      checked_kept: Result.is_checked = Current.is_checked
+    end
+
+  with_unicode_symbols: CHECKBOX
+    do
+      Current.with_symbols("☑", "☐")
+    end
+
+  with_ascii_symbols: CHECKBOX
+    do
+      Current.with_symbols("[x]", "[ ]")
+    end
+
+  with_radio_symbols: CHECKBOX
+    do
+      Current.with_symbols("(•)", "( )")
+    end
+
+  -- Wider of the two symbols so toggling never shifts the label.
+  symbol_width: NAT
+    do
+      let w1 = GLYPHS.width(Current.on_sym)
+      let w2 = GLYPHS.width(Current.off_sym)
+      if w1 >= w2 then w1 else w2 end
+    ensure
+      fits: Result <= 65535
+      at_least_on: Result >= GLYPHS.width(Current.on_symbol)
+      at_least_off: Result >= GLYPHS.width(Current.off_symbol)
+    end
+
+  -- Total columns taken by the symbol, separating space, and label (capped at 65535).
+  width: NAT
+    do
+      let sw = Current.symbol_width
+      if Current.text_label.is_empty then
+        sw
+      else
+        let lw = GLYPHS.width(Current.text_label)
+        if sw + 1 <= 65535 - lw then sw + 1 + lw else 65535 end
+      end
+    ensure
+      fits: Result <= 65535
+      at_least_symbol: Result >= Current.symbol_width
+    end
+
+  -- Top row of `r` up to `Current.width` columns wide.
+  content_area(r: RECT): RECT
+    do
+      if r.is_empty then
+        let res = r.take_top(0).take_left(0)
+        check c0: RECT.cut_top(r, 0) end
+        check c1: RECT.cut_left(r.take_top(0), 0) end
+        check tr: RECT.inside_trans(res, r.take_top(0), r) end
+        res
+      else
+        let top = r.take_top(1)
+        let res = top.take_left(Current.width)
+        check c1: RECT.cut_top(r, 1) end
+        check c2: RECT.cut_left(top, Current.width) end
+        check tr: RECT.inside_trans(res, top, r) end
+        res
+      end
+    ensure
+      within: Result.inside(r)
+      one_row: Result.height <= 1
+      width_bounded: Result.width <= Current.width and Result.width <= r.width
+    end
+
+  -- Whether `(cx, cy)` hits the checkbox content area inside `r`.
+  hit(r: RECT, cx: NAT, cy: NAT): BOOL
+    do
+      Current.content_area(r).has(cx, cy)
+    ensure
+      def: Result = Current.content_area(r).has(cx, cy)
+    end
+
+  -- Toggle the checked state.
+  toggle: CHECKBOX
+    do
+      { Current with checked_flag = not Current.checked_flag }
+    ensure
+      toggled: Result.is_checked = (not Current.is_checked)
+      same_label: Result.label.equals(Current.label)
+      same_on: Result.on_symbol.equals(Current.on_symbol)
+      same_off: Result.off_symbol.equals(Current.off_symbol)
+    end
+
+  -- Space toggles the checkbox; all other keys leave it unchanged.
+  on_key(k: KEY): CHECKBOX
+    do
+      match k
+        case Char(c) then if c = ' ' then Current.toggle else Current end
+        case _ then Current
+      end
+    ensure
+      space_toggles: match k case Char(c) then c = ' ' implies Result.is_checked = (not Current.is_checked) case _ then True end
+    end
+
+  -- Left click inside `content_area(r)` toggles the checkbox.
+  on_mouse(m: MOUSE, r: RECT): CHECKBOX
+    do
+      if m.is_left_down and Current.content_area(r).has(m.x, m.y) then
+        Current.toggle
+      else
+        Current
+      end
+    ensure
+      click_toggles: (m.is_left_down and Current.content_area(r).has(m.x, m.y)) implies Result.is_checked = (not Current.is_checked)
+      outside_unchanged: not Current.content_area(r).has(m.x, m.y) implies Result.is_checked = Current.is_checked
+    end
+
+  -- Draw the checkbox inside `content_area(r)` using `focus_st` when `focused` and `st` otherwise.
+  draw_state(s: SCREEN, r: RECT, st: STYLE, focus_st: STYLE, focused: BOOL): SCREEN
+    do
+      let ca = Current.content_area(r)
+      if ca.is_empty then
+        s
+      else
+        let eff = if focused then focus_st else st end
+        let s0 = s.fill(ca, ' ', eff)
+        let sym = Current.symbol
+        let sym_fit = GLYPHS.fitting_width(sym, ca.width)
+        let s1 =
+          if sym_fit > 0 then
+            s0.text(ca.take_left(sym_fit), ca.x, ca.y, sym, eff)
+          else
+            s0
+          end
+        let sw = Current.symbol_width
+        if not Current.text_label.is_empty and sw + 1 < ca.width then
+          let lbl_rect = ca.drop_left(sw + 1)
+          let lbl_fit = GLYPHS.fitting_width(Current.text_label, lbl_rect.width)
+          if lbl_fit > 0 then
+            s1.text(lbl_rect.take_left(lbl_fit), lbl_rect.x, lbl_rect.y, Current.text_label, eff)
+          else
+            s1
+          end
+        else
+          s1
+        end
+      end
+    ensure
+      same_width: Result.width = s.width
+      same_height: Result.height = s.height
+    end
+
+  -- Draw the checkbox inside `content_area(r)`, reversing `st` when focused.
+  draw(s: SCREEN, r: RECT, st: STYLE, focused: BOOL): SCREEN
+    do
+      Current.draw_state(s, r, st, st.reversed, focused)
+    ensure
+      same_width: Result.width = s.width
+      same_height: Result.height = s.height
+    end
+
+specify {ANY}
+
+  law toggle_involution(cb: CHECKBOX)
+    ensure
+      involution: cb.toggle.toggle.is_checked = cb.is_checked
+    end
+
+end

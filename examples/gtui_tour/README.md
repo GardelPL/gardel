@@ -3,9 +3,9 @@
 A tour of every widget of the [`gtui`](../../gtui) package, laid out as a workbench, in a program that is its state and four routines. It runs in a terminal, takes the keyboard and the mouse, and draws only the cells that change.
 
 - **Left:** the project, under the tabs `Modules(m) | Files(f)`, each a `TREE_VIEW`.
-- **Right:** a source with line numbers, its keywords, strings and comments coloured by a lexer, and one line marked.
+- **Right:** a `BREADCRUMB` path bar for the selected tree node above a source with line numbers, its keywords, strings and comments coloured by a lexer, and one line marked; and a top `MENU` bar on the frame's title row.
 - **Bottom:** the tabs `Output(o) | Problems (3)(p)`: a `TEXT_VIEW` of the log, or a `LIST_VIEW` of problems.
-- **Over them:** the command `PALETTE` (`/`) and the help `POPUP` (`?`).
+- **Over them:** the `MENU` drop-downs (`F10` / `Alt+letter`), the command `PALETTE` (`/`), the help `POPUP` (`?`), and the quit confirmation `DIALOG` when modified.
 
 The pane that has the keys is framed in bold cyan.
 
@@ -28,8 +28,10 @@ The pane that has the keys is framed in bold cyan.
 | `Right`, `Left` | In a tree: open a node, or go to its first child; close it, or go to its parent |
 | `Enter` | In a tree: open or close the node. In Problems: mark the problem's line in the source |
 | `/` | Open the commands; what is typed narrows them; `Enter` runs one, `Escape` closes them |
+| `F10`, `Alt+f`/`v`/`h` | Open the `MENU` bar (`File`, `View`, `Help`); arrows/`Enter`/`Escape` navigate |
+| `Ctrl+N` | Mark the buffer as modified (confirm `DIALOG` appears on quit) |
 | `?` | Show or hide the help |
-| `q` | Quit |
+| `q` | Quit (opens a confirmation `DIALOG` if modified) |
 
 The commands:
 
@@ -53,6 +55,9 @@ The terminal needs to report the mouse with SGR 1006 (Windows Terminal, and most
 | Click a tree row | Select it; a click on the selected row, or on its `▸` or `▾`, opens or closes the node |
 | Wheel over a tree, the source or the problems | Scroll it by three rows |
 | Click a problem | Select it and mark its line in the source |
+| Click a `MENU` entry or item | Open/switch drop-downs, sub-menus, or run a menu action |
+| Click a `BREADCRUMB` crumb | Select that ancestor node in the active tree |
+| Click a `DIALOG` button | Confirm (`Yes`) or cancel (`No`) when the quit dialog is open |
 | Wheel over the help | Scroll its text |
 | Click outside the help or the commands | Close them |
 

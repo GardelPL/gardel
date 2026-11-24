@@ -1,0 +1,37 @@
+-- Outcome of a single HTTP state-machine transition: next state `S`, emitted I/O commands,
+-- and an optional completed `RESPONSE_RECORD`.
+module FLIGHT_STEP[S]
+
+representation {NONE}
+  st: S
+  io_cmds: LIST[COMMAND]
+  done_resp: OPTION[RESPONSE_RECORD]
+
+create {ANY}
+
+  make(next_state: S, cmds: LIST[COMMAND], resp: OPTION[RESPONSE_RECORD]): FLIGHT_STEP[S]
+    do
+      { st = next_state, io_cmds = cmds, done_resp = resp }
+    ensure
+      state_set: Result.state = next_state
+      cmds_set: Result.commands = cmds
+    end
+
+feature {ANY}
+
+  state: S
+    do
+      Current.st
+    end
+
+  commands: LIST[COMMAND]
+    do
+      Current.io_cmds
+    end
+
+  outcome: OPTION[RESPONSE_RECORD]
+    do
+      Current.done_resp
+    end
+
+end

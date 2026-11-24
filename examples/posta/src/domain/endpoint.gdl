@@ -1,0 +1,143 @@
+-- Verified HTTP target & request specification for `posta`.
+-- Guarantees valid port (`1..65535`), non-empty bounded host & path, and safe-method body rules
+-- before constructing a `ghttp::HTTP_REQUEST`.
+module ENDPOINT
+
+representation {NONE}
+  ep_name: STRING
+  ep_method: HTTP_METHOD
+  ep_host: STRING
+  ep_port: NAT
+  ep_path: STRING
+  ep_body: STRING
+
+invariant
+  valid_port: ep_port >= 1 and ep_port <= 65535
+  host_non_empty: ep_host.byte_length >= 1 and ep_host.byte_length <= 128
+  path_non_empty: ep_path.byte_length >= 1 and ep_path.byte_length <= 512
+
+create {ANY}
+
+  make(name: STRING, method: HTTP_METHOD, host: STRING, port: NAT, path: STRING, body: STRING): ENDPOINT
+    require
+      port_ok: port >= 1 and port <= 65535
+      host_ok: host.byte_length >= 1 and host.byte_length <= 128
+      path_ok: path.byte_length >= 1 and path.byte_length <= 512
+    do
+      { ep_name = name, ep_method = method, ep_host = host, ep_port = port, ep_path = path, ep_body = body }
+    ensure
+      port_set: Result.port = port
+      method_set: Result.method = method
+    end
+
+  method_name(m: HTTP_METHOD): STRING
+    do
+      match m
+        case Get then "GET"
+        case Post then "POST"
+        case Put then "PUT"
+        case Delete then "DELETE"
+        case Head then "HEAD"
+        case Options then "OPTIONS"
+      end
+    end
+
+  next_method(m: HTTP_METHOD): HTTP_METHOD
+    do
+      match m
+        case Get then Post
+        case Post then Put
+        case Put then Delete
+        case Delete then Get
+        case _ then Get
+      end
+    end
+
+feature {ANY}
+
+  name: STRING
+    do
+      Current.ep_name
+    end
+
+  method: HTTP_METHOD
+    do
+      Current.ep_method
+    end
+
+  host: STRING
+    do
+      Current.ep_host
+    end
+
+  port: NAT
+    do
+      Current.ep_port
+    ensure
+      in_range: Result >= 1 and Result <= 65535
+    end
+
+  path: STRING
+    do
+      Current.ep_path
+    end
+
+  body: STRING
+    do
+      Current.ep_body
+    end
+
+  url_text: STRING
+    do
+      let hp = GLYPHS.join(Current.ep_host, GLYPHS.join(":", NUMBER_TEXT.nat_to_text(Current.ep_port)))
+      GLYPHS.join("http://", GLYPHS.join(hp, Current.ep_path))
+    end
+
+  with_method(m: HTTP_METHOD): ENDPOINT
+    do
+      { Current with ep_method = m }
+    end
+
+  with_body(b: STRING): ENDPOINT
+    do
+      { Current with ep_body = b }
+    end
+
+  -- Build a verified RFC 9110/9112 `HTTP_REQUEST` ready for `HTTP_REQUEST_WRITER.serialize`.
+  to_http_request: OPTION[HTTP_REQUEST]
+    do
+      let port_txt = NUMBER_TEXT.nat_to_text(Current.ep_port)
+      let host_val = GLYPHS.join(Current.ep_host, GLYPHS.join(":", port_txt))
+      if host_val.byte_length > 200 then
+        None
+      else
+        let h0 = HTTP_HEADERS.default_empty
+          .add(HTTP_HEADER.make("Host", host_val))
+          .add(HTTP_HEADER.make("Accept", "application/json"))
+          .add(HTTP_HEADER.make("Connection", "close"))
+        let body_bytes =
+          if Current.ep_method.is_safe or Current.ep_body.is_empty then
+            BYTES.empty
+          else
+            Current.ep_body.to_utf8
+          end
+        let hs =
+          if body_bytes.length > 0 then
+            h0.add(HTTP_HEADER.make("Content-Type", "application/json"))
+          else
+            h0
+          end
+        if body_bytes.length <= 65536 and hs.num_headers <= 64 then
+          let req = HTTP_REQUEST.make(Current.ep_method, Current.ep_path, Http11, hs, body_bytes, 65536)
+          if HTTP_REQUEST_WRITER.sendable(req) then
+            Some(req)
+          else
+            None
+          end
+        else
+          None
+        end
+      end
+    end
+
+end

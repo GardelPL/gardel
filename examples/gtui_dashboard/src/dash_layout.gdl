@@ -77,6 +77,43 @@ feature {ANY}
       FRAME.inner_padded(DASH_LAYOUT.bottom(area), PADDING.symmetric(0, 1))
     end
 
+  inspector_notes_area(area: RECT): RECT
+    do
+      DASH_LAYOUT.inspector_area(area).drop_right(18)
+    end
+
+  inspector_divider_area(area: RECT): RECT
+    do
+      let nw = DASH_LAYOUT.inspector_notes_area(area).width
+      DASH_LAYOUT.inspector_area(area).drop_left(nw).take_left(1)
+    end
+
+  inspector_controls_area(area: RECT): RECT
+    do
+      let nw = DASH_LAYOUT.inspector_notes_area(area).width
+      DASH_LAYOUT.inspector_area(area).drop_left(nw + 1)
+    end
+
+  auto_checkbox_area(area: RECT): RECT
+    do
+      DASH_LAYOUT.inspector_controls_area(area).take_top(1)
+    end
+
+  finished_checkbox_area(area: RECT): RECT
+    do
+      DASH_LAYOUT.inspector_controls_area(area).drop_top(1).take_top(1)
+    end
+
+  rate_divider_area(area: RECT): RECT
+    do
+      DASH_LAYOUT.inspector_controls_area(area).drop_top(2).take_top(1)
+    end
+
+  rate_slider_area(area: RECT): RECT
+    do
+      DASH_LAYOUT.inspector_controls_area(area).drop_top(3).take_top(1)
+    end
+
   -- Visible data rows inside the left `TABLE` pane (excluding border and 1-row table header).
   table_rows(area: RECT): NAT
     do

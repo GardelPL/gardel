@@ -1,0 +1,550 @@
+-- A horizontal or vertical range slider (`lo <= value <= hi`) with step snapping, optional
+-- value label, keyboard navigation, and mouse click/drag support.
+-- TODO(proof-GW.5): prove thumb_cell monotonicity in value and
+-- set_from_position(thumb_cell(len), len) round-trip stability.
+module SLIDER
+
+representation {NONE}
+  lo_val: NAT
+  hi_val: NAT
+  step_val: NAT
+  cur_val: NAT
+  horiz: BOOL
+  show_lbl: BOOL
+  lbl_left: BOOL
+  fixed_lbl_w: NAT
+  custom_lbl: STRING
+  fill_ch: CHAR
+  thumb_ch: CHAR
+  track_ch: CHAR
+
+invariant
+  ordered: lo_val <= hi_val and hi_val <= 1000000000
+  in_range: lo_val <= cur_val and cur_val <= hi_val
+  pos_step: 1 <= step_val and step_val <= 1000000000
+  lbl_w_bounded: fixed_lbl_w <= 65535
+
+create {ANY}
+
+  -- A horizontal slider over `lo..hi` (clamped to `<= 10^9`) with `step >= 1` and initial `val`.
+  make(lo: NAT, hi: NAT, step: NAT, val: NAT): SLIDER
+    do
+      let clo = if lo <= 1000000000 then lo else 1000000000 end
+      let raw_hi = if hi <= 1000000000 then hi else 1000000000 end
+      let chi = if raw_hi >= clo then raw_hi else clo end
+      let cstep = if step < 1 then 1 else if step <= 1000000000 then step else 1000000000 end end
+      let cval = SLIDER.snap_value(clo, chi, cstep, val)
+      { lo_val = clo, hi_val = chi, step_val = cstep, cur_val = cval,
+        horiz = True, show_lbl = False, lbl_left = False, fixed_lbl_w = 0,
+        custom_lbl = "", fill_ch = '━', thumb_ch = '●', track_ch = '─' }
+    ensure
+      in_bounds: Result.lo <= Result.value and Result.value <= Result.hi
+      is_horiz: Result.is_horizontal
+    end
+
+  -- A `0..100` slider with step `1`.
+  percent(val: NAT): SLIDER
+    do
+      SLIDER.make(0, 100, 1, val)
+    ensure
+      in_bounds: Result.lo <= Result.value and Result.value <= Result.hi
+      is_horiz: Result.is_horizontal
+    end
+
+  -- A vertical slider (`lo` at the bottom, `hi` at the top).
+  vertical(lo: NAT, hi: NAT, step: NAT, val: NAT): SLIDER
+    do
+      SLIDER.make(lo, hi, step, val).with_horizontal(False)
+    ensure
+      in_bounds: Result.lo <= Result.value and Result.value <= Result.hi
+      is_vert: not Result.is_horizontal
+    end
+
+  -- Clamp `v` to `lo..hi` and snap to the nearest valid step (`lo + k * step` or `hi`; ties go up).
+  snap_value(lo: NAT, hi: NAT, step: NAT, v: NAT): NAT
+    require
+      ordered: lo <= hi and hi <= 1000000000
+      pos_step: 1 <= step and step <= 1000000000
+    do
+      if v <= lo then
+        lo
+      else if v >= hi then
+        hi
+      else
+        let d = v - lo
+        let span = hi - lo
+        let r = d % step
+        if r = 0 then
+          v
+        else
+          let d_lo = d - r
+          let d_hi = if span - d_lo <= step then span else d_lo + step end
+          if d_hi - d <= r then lo + d_hi else lo + d_lo end
+        end
+      end end
+    ensure
+      in_range: lo <= Result and Result <= hi
+      at_lo: v <= lo implies Result = lo
+      at_hi: v >= hi implies Result = hi
+    end
+
+  -- `val * factor / divisor`, rounded half away from zero, for `val <= divisor`.
+  scaled_rounded(val: NAT, factor: NAT, divisor: NAT): NAT
+    require
+      pos_div: divisor > 0 and divisor <= 1000000000
+      val_bounded: val <= divisor
+      factor_bounded: factor <= 1000000000
+    do
+      if val = divisor then
+        factor
+      else
+        let prod = val * factor
+        let q = prod / divisor
+        let r = prod % divisor
+        let res = if r > 0 and r >= divisor - r then q + 1 else q end
+        if res <= factor then res else factor end
+      end
+    ensure
+      bounded: Result <= factor
+      at_zero: val = 0 implies Result = 0
+      at_full: val = divisor implies Result = factor
+    end
+
+feature {ANY}
+
+  lo: NAT
+    do
+      Current.lo_val
+    end
+
+  hi: NAT
+    do
+      Current.hi_val
+    end
+
+  step: NAT
+    do
+      Current.step_val
+    end
+
+  value: NAT
+    do
+      Current.cur_val
+    ensure
+      in_range: Current.lo <= Result and Result <= Current.hi
+    end
+
+  span: NAT
+    do
+      Current.hi_val - Current.lo_val
+    end
+
+  is_horizontal: BOOL
+    do
+      Current.horiz
+    end
+
+  is_at_lo: BOOL
+    do
+      Current.cur_val = Current.lo_val
+    end
+
+  is_at_hi: BOOL
+    do
+      Current.cur_val = Current.hi_val
+    end
+
+  has_label: BOOL
+    do
+      Current.show_lbl
+    end
+
+  is_label_left: BOOL
+    do
+      Current.lbl_left
+    end
+
+  filled_glyph: CHAR
+    do
+      Current.fill_ch
+    end
+
+  thumb_glyph: CHAR
+    do
+      Current.thumb_ch
+    end
+
+  track_glyph: CHAR
+    do
+      Current.track_ch
+    end
+
+  with_horizontal(h: BOOL): SLIDER
+    do
+      if h then
+        { Current with horiz = True, fill_ch = '━', track_ch = '─' }
+      else
+        { Current with horiz = False, fill_ch = '┃', track_ch = '│' }
+      end
+    ensure
+      lo_kept: Result.lo = Current.lo
+      hi_kept: Result.hi = Current.hi
+      val_kept: Result.value = Current.value
+    end
+
+  with_label: SLIDER
+    do
+      { Current with show_lbl = True, lbl_left = False }
+    end
+
+  with_label_left: SLIDER
+    do
+      { Current with show_lbl = True, lbl_left = True }
+    end
+
+  without_label: SLIDER
+    do
+      { Current with show_lbl = False }
+    end
+
+  with_label_width(w: NAT): SLIDER
+    do
+      let cw = if w <= 65535 then w else 65535 end
+      { Current with fixed_lbl_w = cw }
+    end
+
+  with_custom_label(text: STRING): SLIDER
+    do
+      { Current with custom_lbl = text, show_lbl = True }
+    end
+
+  with_symbols(filled: CHAR, thumb: CHAR, track: CHAR): SLIDER
+    do
+      { Current with fill_ch = filled, thumb_ch = thumb, track_ch = track }
+    end
+
+  label_text: STRING
+    do
+      if not Current.custom_lbl.is_empty then
+        Current.custom_lbl
+      else
+        NUMBER_TEXT.nat_to_text(Current.cur_val)
+      end
+    end
+
+  -- Width reserved for the value label (0 when hidden); independent of current `value` so the
+  -- track never shifts during dragging.
+  label_width: NAT
+    do
+      if not Current.show_lbl then
+        0
+      else if Current.fixed_lbl_w > 0 then
+        Current.fixed_lbl_w
+      else if not Current.custom_lbl.is_empty then
+        GLYPHS.width(Current.custom_lbl)
+      else
+        let w_lo = GLYPHS.width(NUMBER_TEXT.nat_to_text(Current.lo_val))
+        let w_hi = GLYPHS.width(NUMBER_TEXT.nat_to_text(Current.hi_val))
+        if w_hi >= w_lo then w_hi else w_lo end
+      end end end
+    ensure
+      fits: Result <= 65535
+    end
+
+  shows_label(r: RECT): BOOL
+    do
+      let lw = Current.label_width
+      Current.show_lbl and not r.is_empty and lw > 0 and
+        (if Current.horiz then r.width >= lw + 2 else r.height >= 2 and r.width >= lw end)
+    end
+
+  -- Bounding rectangle of the value label inside `r` (empty when hidden or not enough room).
+  label_area(r: RECT): RECT
+    do
+      if not Current.shows_label(r) then
+        r.take_top(0)
+      else
+        let lw = Current.label_width
+        if Current.horiz then
+          let top = r.take_top(1)
+          let res = if Current.lbl_left then top.take_left(lw) else top.take_right(lw) end
+          check c1: RECT.cut_top(r, 1) end
+          check c2: RECT.cut_left(top, lw) end
+          check c3: RECT.cut_right(top, lw) end
+          check tr: RECT.inside_trans(res, top, r) end
+          res
+        else
+          let col = r.take_left(lw)
+          let res = if Current.lbl_left then col.take_top(1) else col.take_bottom(1) end
+          check c1: RECT.cut_left(r, lw) end
+          check c2: RECT.cut_top(col, 1) end
+          check c3: RECT.cut_bottom(col, 1) end
+          check tr: RECT.inside_trans(res, col, r) end
+          res
+        end
+      end
+    ensure
+      within: Result.inside(r)
+    end
+
+  -- Bounding rectangle of the slider track inside `r`.
+  track_area(r: RECT): RECT
+    do
+      if r.is_empty then
+        r.take_top(0)
+      else if Current.horiz then
+        let top = r.take_top(1)
+        check c1: RECT.cut_top(r, 1) end
+        if Current.shows_label(r) then
+          let sep_lw = Current.label_width + 1
+          let res = if Current.lbl_left then top.drop_left(sep_lw) else top.drop_right(sep_lw) end
+          check c2: RECT.cut_left(top, sep_lw) end
+          check c3: RECT.cut_right(top, sep_lw) end
+          check tr: RECT.inside_trans(res, top, r) end
+          res
+        else
+          top
+        end
+      else
+        let col = r.take_left(1)
+        check c1: RECT.cut_left(r, 1) end
+        if Current.shows_label(r) then
+          let res = if Current.lbl_left then col.drop_top(1) else col.drop_bottom(1) end
+          check c2: RECT.cut_top(col, 1) end
+          check c3: RECT.cut_bottom(col, 1) end
+          check tr: RECT.inside_trans(res, col, r) end
+          res
+        else
+          col
+        end
+      end end
+    ensure
+      within: Result.inside(r)
+    end
+
+  -- Number of cells in `Current.track_area(r)`.
+  track_length(r: RECT): NAT
+    do
+      let tr = Current.track_area(r)
+      if tr.is_empty then
+        0
+      else if Current.horiz then
+        tr.width
+      else
+        tr.height
+      end end
+    ensure
+      fits: Result <= 65535
+    end
+
+  -- 0-based cell index of the thumb along a track of `len` cells (`0` when `lo = hi` or `len <= 1`).
+  thumb_cell(len: NAT): NAT
+    do
+      let clen = if len <= 1000000000 then len else 1000000000 end
+      if clen <= 1 or Current.hi_val = Current.lo_val then
+        0
+      else
+        SLIDER.scaled_rounded(Current.cur_val - Current.lo_val, clen - 1, Current.hi_val - Current.lo_val)
+      end
+    ensure
+      in_len: len > 0 implies Result < len
+      empty_span_zero: Current.lo = Current.hi implies Result = 0
+      at_lo_zero: Current.value = Current.lo implies Result = 0
+      at_hi_end: (len > 0 and len <= 1000000000 and Current.value = Current.hi and Current.hi > Current.lo) implies Result = len - 1
+    end
+
+  set_value(v: NAT): SLIDER
+    do
+      let nv = SLIDER.snap_value(Current.lo_val, Current.hi_val, Current.step_val, v)
+      { Current with cur_val = nv }
+    ensure
+      lo_kept: Result.lo = Current.lo
+      hi_kept: Result.hi = Current.hi
+      in_range: Result.lo <= Result.value and Result.value <= Result.hi
+      clamped_lo: v <= Current.lo implies Result.value = Current.lo
+      clamped_hi: v >= Current.hi implies Result.value = Current.hi
+    end
+
+  home: SLIDER
+    do
+      { Current with cur_val = Current.lo_val }
+    ensure
+      lo_kept: Result.lo = Current.lo
+      hi_kept: Result.hi = Current.hi
+      at_lo: Result.value = Result.lo
+    end
+
+  end_val: SLIDER
+    do
+      { Current with cur_val = Current.hi_val }
+    ensure
+      lo_kept: Result.lo = Current.lo
+      hi_kept: Result.hi = Current.hi
+      at_hi: Result.value = Result.hi
+    end
+
+  increase: SLIDER
+    do
+      let d = Current.cur_val - Current.lo_val
+      let sp = Current.hi_val - Current.lo_val
+      if d >= sp then
+        Current
+      else
+        let d_lo = d - (d % Current.step_val)
+        let nd = if sp - d_lo <= Current.step_val then sp else d_lo + Current.step_val end
+        { Current with cur_val = Current.lo_val + nd }
+      end
+    ensure
+      lo_kept: Result.lo = Current.lo
+      hi_kept: Result.hi = Current.hi
+      non_decreasing: Result.value >= Current.value
+    end
+
+  decrease: SLIDER
+    do
+      let d = Current.cur_val - Current.lo_val
+      if d = 0 then
+        Current
+      else
+        let r = d % Current.step_val
+        let nd = if not (r = 0) then d - r else d - Current.step_val end
+        { Current with cur_val = Current.lo_val + nd }
+      end
+    ensure
+      lo_kept: Result.lo = Current.lo
+      hi_kept: Result.hi = Current.hi
+      non_increasing: Result.value <= Current.value
+    end
+
+  page_up: SLIDER
+    do
+      let sp = Current.hi_val - Current.lo_val
+      let delta = Current.step_val * 10
+      let d = Current.cur_val - Current.lo_val
+      let target = if sp - d <= delta then Current.hi_val else Current.cur_val + delta end
+      Current.set_value(target)
+    ensure
+      lo_kept: Result.lo = Current.lo
+      hi_kept: Result.hi = Current.hi
+      non_decreasing: Result.value >= Current.value
+    end
+
+  page_down: SLIDER
+    do
+      let delta = Current.step_val * 10
+      let target = if Current.cur_val <= Current.lo_val + delta then Current.lo_val else Current.cur_val - delta end
+      Current.set_value(target)
+    ensure
+      lo_kept: Result.lo = Current.lo
+      hi_kept: Result.hi = Current.hi
+      non_increasing: Result.value <= Current.value
+    end
+
+  -- Map a 0-based `cell` on a track of `len` cells to a snapped slider value.
+  set_from_position(cell: NAT, len: NAT): SLIDER
+    do
+      if len <= 1 then
+        Current
+      else
+        let clen = if len <= 1000000000 then len else 1000000000 end
+        let ccell = if cell < clen then cell else clen - 1 end
+        let off = SLIDER.scaled_rounded(ccell, Current.hi_val - Current.lo_val, clen - 1)
+        Current.set_value(Current.lo_val + off)
+      end
+    ensure
+      lo_kept: Result.lo = Current.lo
+      hi_kept: Result.hi = Current.hi
+      first_cell: (len > 1 and cell = 0) implies Result.value = Result.lo
+      last_cell: (len > 1 and len <= 1000000000 and cell >= len - 1) implies Result.value = Result.hi
+    end
+
+  on_key(k: KEY): SLIDER
+    do
+      match k
+        case Right then Current.increase
+        case Up then Current.increase
+        case Left then Current.decrease
+        case Down then Current.decrease
+        case PageUp then Current.page_up
+        case PageDown then Current.page_down
+        case Home then Current.home
+        case End then Current.end_val
+        case _ then Current
+      end
+    ensure
+      lo_kept: Result.lo = Current.lo
+      hi_kept: Result.hi = Current.hi
+      in_range: Result.lo <= Result.value and Result.value <= Result.hi
+    end
+
+  -- Handle left click on the track or left drag (including past either end).
+  on_mouse(m: MOUSE, r: RECT): SLIDER
+    do
+      let tr = Current.track_area(r)
+      let len = if Current.horiz then tr.width else tr.height end
+      if len = 0 then
+        Current
+      else
+        let is_click = match m.plain case MouseDown(b, _, _) then b = 0 and tr.has(m.x, m.y) case _ then False end
+        let is_drag = match m.plain case MouseDrag(b, _, _) then b = 0 case _ then False end
+        if not is_click and not is_drag then
+          Current
+        else
+          let cell =
+            if Current.horiz then
+              if m.x <= tr.x then 0 else if m.x >= tr.right then len - 1 else m.x - tr.x end end
+            else
+              if m.y >= tr.bottom then 0 else if m.y <= tr.y then len - 1 else tr.bottom - 1 - m.y end end
+            end
+          Current.set_from_position(cell, len)
+        end
+      end
+    ensure
+      lo_kept: Result.lo = Current.lo
+      hi_kept: Result.hi = Current.hi
+      in_range: Result.lo <= Result.value and Result.value <= Result.hi
+    end
+
+  -- Draw the track, filled segment, thumb, and optional value label inside `r`.
+  draw(s: SCREEN, r: RECT, track_st: STYLE, fill_st: STYLE, thumb_st: STYLE): SCREEN
+    do
+      let tr = Current.track_area(r)
+      if tr.is_empty then
+        s
+      else
+        let with_lbl =
+          if Current.shows_label(r) then
+            let la = Current.label_area(r)
+            let txt = Current.label_text
+            let tw = GLYPHS.width(txt)
+            if tw <= la.width and not la.is_empty then
+              let cleared = s.fill(la, ' ', track_st)
+              let off = if Current.horiz and Current.lbl_left then la.width - tw else 0 end
+              cleared.text(la, la.x + off, la.y, txt, track_st)
+            else
+              s
+            end
+          else
+            s
+          end
+        let len = if Current.horiz then tr.width else tr.height end
+        let tc = Current.thumb_cell(len)
+        let s_track = with_lbl.fill(tr, Current.track_ch, track_st)
+        if Current.horiz then
+          let filled_r = tr.take_left(tc)
+          let thumb_r = tr.drop_left(tc).take_left(1)
+          let s_fill = if filled_r.is_empty then s_track else s_track.fill(filled_r, Current.fill_ch, fill_st) end
+          if thumb_r.is_empty then s_fill else s_fill.fill(thumb_r, Current.thumb_ch, thumb_st) end
+        else
+          let filled_r = tr.take_bottom(tc)
+          let thumb_r = tr.drop_bottom(tc).take_bottom(1)
+          let s_fill = if filled_r.is_empty then s_track else s_track.fill(filled_r, Current.fill_ch, fill_st) end
+          if thumb_r.is_empty then s_fill else s_fill.fill(thumb_r, Current.thumb_ch, thumb_st) end
+        end
+      end
+    ensure
+      same_width: Result.width = s.width
+      same_height: Result.height = s.height
+    end
+
+end

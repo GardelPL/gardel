@@ -1,0 +1,137 @@
+-- Pure URL parser for `posta`: parses `http://host:port/path` or `host:port/path`
+-- into a verified `ENDPOINT` (defaults: port 80, path "/").
+functions ENDPOINT_PARSER
+
+feature {ANY}
+
+  -- Strip leading `http://` if present.
+  strip_scheme(bs: LIST[U64]): LIST[U64]
+    do
+      if bs.length >= 7
+         and LIST_OPS.at(bs, 0) = 104
+         and LIST_OPS.at(bs, 1) = 116
+         and LIST_OPS.at(bs, 2) = 116
+         and LIST_OPS.at(bs, 3) = 112
+         and LIST_OPS.at(bs, 4) = 58
+         and LIST_OPS.at(bs, 5) = 47
+         and LIST_OPS.at(bs, 6) = 47 then
+        LIST_CUT.drop(bs, 7)
+      else
+        bs
+      end
+    end
+
+  -- Index of first byte equal to `needle`, or `bs.length` if absent.
+  find_byte(bs: LIST[U64], needle: U64): NAT
+    variant
+      bs.length
+    do
+      if bs.length = 0 then
+        0
+      else if bs.head = needle then
+        0
+      else
+        let rest = ENDPOINT_PARSER.find_byte(bs.tail, needle)
+        if rest < 18446744073709551615 then rest + 1 else rest end
+      end end
+    ensure
+      bounded: Result <= bs.length
+    end
+
+  bytes_to_string(bs: LIST[U64]): OPTION[STRING]
+    do
+      if bs.length <= 1024 and BYTES.all_octets(bs) then
+        match STRING.from_utf8(BYTES.from_list(bs))
+          case Ok(s) then Some(s)
+          case Error(_) then None
+        end
+      else
+        None
+      end
+    end
+
+  parse_port_bytes(bs: LIST[U64], acc: NAT, has_digit: BOOL): OPTION[NAT]
+    variant
+      bs.length
+    do
+      if bs.length = 0 then
+        if has_digit and acc >= 1 and acc <= 65535 then Some(acc) else None end
+      else if bs.head >= 48 and bs.head <= 57 then
+        let d = bs.head - 48
+        if acc <= 65535 then
+          ENDPOINT_PARSER.parse_port_bytes(bs.tail, acc * 10 + d, True)
+        else
+          None
+        end
+      else
+        None
+      end end
+    end
+
+  -- Parse `url` with `method` and `body` into a verified `ENDPOINT`.
+  parse(url: STRING, name: STRING, method: HTTP_METHOD, body: STRING): OPTION[ENDPOINT]
+    do
+      let raw = ENDPOINT_PARSER.strip_scheme(url.to_utf8.to_list)
+      if raw.length = 0 then
+        None
+      else
+        let slash_idx = ENDPOINT_PARSER.find_byte(raw, 47)
+        let authority = LIST_CUT.take(raw, slash_idx)
+        let path_bytes = LIST_CUT.drop(raw, slash_idx)
+        let colon_idx = ENDPOINT_PARSER.find_byte(authority, 58)
+        let host_bytes = LIST_CUT.take(authority, colon_idx)
+        let port_opt =
+          if colon_idx < authority.length then
+            ENDPOINT_PARSER.parse_port_bytes(LIST_CUT.drop(authority, colon_idx + 1), 0, False)
+          else
+            Some(80)
+          end
+        let path_opt =
+          if path_bytes.length = 0 then
+            Some("/")
+          else
+            ENDPOINT_PARSER.bytes_to_string(path_bytes)
+          end
+        match ENDPOINT_PARSER.bytes_to_string(host_bytes)
+          case None then None
+          case Some(h) then
+            match port_opt
+              case None then None
+              case Some(p) then
+                match path_opt
+                  case None then None
+                  case Some(path_str) then
+                    if p >= 1 and p <= 65535
+                       and h.byte_length >= 1 and h.byte_length <= 128
+                       and path_str.byte_length >= 1 and path_str.byte_length <= 512 then
+                      Some(ENDPOINT.make(name, method, h, p, path_str, body))
+                    else
+                      None
+                    end
+                end
+            end
+        end
+      end
+    end
+
+  -- Parse a CLI or modal target (`8091`, `127.0.0.1:9000`, or `http://127.0.0.1:9000/todos`)
+  -- into an `ENDPOINT` carrying the resolved `(host, port, path)`.
+  parse_target_override(raw: STRING, fallback_host: STRING, fallback_path: STRING, method: HTTP_METHOD, body: STRING): OPTION[ENDPOINT]
+    require
+      host_ok: fallback_host.byte_length >= 1 and fallback_host.byte_length <= 128
+      path_ok: fallback_path.byte_length >= 1 and fallback_path.byte_length <= 512
+    do
+      let bs = raw.to_utf8.to_list
+      match ENDPOINT_PARSER.parse_port_bytes(bs, 0, False)
+        case Some(p) then
+          if p >= 1 and p <= 65535 then
+            Some(ENDPOINT.make("Target", method, fallback_host, p, fallback_path, body))
+          else
+            None
+          end
+        case None then
+          ENDPOINT_PARSER.parse(raw, "Target", method, body)
+      end
+    end
+
+end

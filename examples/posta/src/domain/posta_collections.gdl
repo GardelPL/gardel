@@ -1,0 +1,100 @@
+-- Built-in starter API collections targeting Gardel's verified HTTP servers
+-- (`todo_api`, `api_gateway`, `hello_api`) plus user-added Custom endpoints,
+-- parameterized by the active base `host` and `port`.
+functions POSTA_COLLECTIONS
+
+feature {ANY}
+
+  folder_label(name: STRING, port: NAT): STRING
+    do
+      GLYPHS.join(name, GLYPHS.join(" (:", GLYPHS.join(NUMBER_TEXT.nat_to_text(port), ")")))
+    end
+
+  custom_node_label(ep: ENDPOINT): STRING
+    do
+      let m = ENDPOINT.method_name(ep.method)
+      let pad = if m.byte_length = 3 then "  " else " " end
+      GLYPHS.join(m, GLYPHS.join(pad, ep.path))
+    end
+
+  custom_nodes_of(xs: LIST[ENDPOINT]): LIST[TREE_NODE]
+    variant
+      xs.length
+    do
+      if xs.length = 0 then
+        LIST.empty
+      else
+        POSTA_COLLECTIONS.custom_nodes_of(xs.tail)
+          .prepend(TREE_NODE.make(POSTA_COLLECTIONS.custom_node_label(xs.head), 1))
+      end
+    end
+
+  -- Tree nodes for the left Collections `TREE_VIEW`:
+  --   0..10: Built-in Todo API, API Gateway, Hello API (all showing active `port`)
+  --   11:    Custom folder header (when `custom` is non-empty)
+  --   12+:   User-added custom endpoints
+  tree_nodes(port: NAT, custom: LIST[ENDPOINT]): LIST[TREE_NODE]
+    do
+      let empty: LIST[TREE_NODE] = LIST.empty
+      let builtin = empty
+        .prepend(TREE_NODE.make("GET  /health", 1))
+        .prepend(TREE_NODE.make("GET  /hello", 1))
+        .prepend(TREE_NODE.make(POSTA_COLLECTIONS.folder_label("Hello API", port), 0).set_open(True))
+        .prepend(TREE_NODE.make("GET  /todos/1", 1))
+        .prepend(TREE_NODE.make("GET  /health", 1))
+        .prepend(TREE_NODE.make(POSTA_COLLECTIONS.folder_label("API Gateway", port), 0).set_open(True))
+        .prepend(TREE_NODE.make("DEL  /todos/1", 1))
+        .prepend(TREE_NODE.make("GET  /todos/1", 1))
+        .prepend(TREE_NODE.make("POST /todos", 1))
+        .prepend(TREE_NODE.make("GET  /todos", 1))
+        .prepend(TREE_NODE.make(POSTA_COLLECTIONS.folder_label("Todo API", port), 0).set_open(True))
+      if custom.length = 0 then
+        builtin
+      else
+        let hdr = GLYPHS.join("Custom (", GLYPHS.join(NUMBER_TEXT.nat_to_text(custom.length), ")"))
+        let custom_section = POSTA_COLLECTIONS.custom_nodes_of(custom)
+          .prepend(TREE_NODE.make(hdr, 0).set_open(True))
+        builtin.append(custom_section)
+      end
+    end
+
+  -- Return the `ENDPOINT` corresponding to tree node `idx` using active `host` and `port`,
+  -- or `None` for folder headers.
+  endpoint_for_node(idx: NAT, host: STRING, port: NAT, custom: LIST[ENDPOINT]): OPTION[ENDPOINT]
+    require
+      port_ok: port >= 1 and port <= 65535
+      host_ok: host.byte_length >= 1 and host.byte_length <= 128
+    do
+      if idx = 1 then
+        Some(ENDPOINT.make("List Todos", Get, host, port, "/todos", ""))
+      else if idx = 2 then
+        Some(ENDPOINT.make("Create Todo", Post, host, port, "/todos", "{\"title\":\"Verify Posta\",\"done\":false}"))
+      else if idx = 3 then
+        Some(ENDPOINT.make("Get Todo #1", Get, host, port, "/todos/1", ""))
+      else if idx = 4 then
+        Some(ENDPOINT.make("Delete Todo #1", Delete, host, port, "/todos/1", ""))
+      else if idx = 6 then
+        Some(ENDPOINT.make("Gateway Health", Get, host, port, "/health", ""))
+      else if idx = 7 then
+        Some(ENDPOINT.make("Gateway Todo #1", Get, host, port, "/todos/1", ""))
+      else if idx = 9 then
+        Some(ENDPOINT.make("Hello World", Get, host, port, "/hello", ""))
+      else if idx = 10 then
+        Some(ENDPOINT.make("Hello Health", Get, host, port, "/health", ""))
+      else if idx >= 12 and idx - 12 < custom.length then
+        let saved = LIST_OPS.at(custom, idx - 12)
+        Some(ENDPOINT.make(saved.name, saved.method, host, port, saved.path, saved.body))
+      else
+        None
+      end end end end end end end end end
+    end
+
+  default_endpoint(host: STRING, port: NAT): ENDPOINT
+    require
+      port_ok: port >= 1 and port <= 65535
+      host_ok: host.byte_length >= 1 and host.byte_length <= 128
+    do
+      ENDPOINT.make("Create Todo", Post, host, port, "/todos", "{\"title\":\"Verify Posta\",\"done\":false}")
+    end
+
+end

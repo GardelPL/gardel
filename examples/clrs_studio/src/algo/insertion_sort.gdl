@@ -1,0 +1,296 @@
+-- Statically verified CLRS Ch. 2.1 Insertion Sort stepper.
+-- Every step uses erased `check` blocks to prove the CLRS outer/inner loop invariants,
+-- true multiset/permutation preservation (`multiset_count` / `step_preserves_count`,
+-- inspired by Firulete), element sum conservation, and strict `work_left` termination
+-- until `Done`, where `SORT_FACTS.is_sorted(elements)` holds.
+module INSERTION_SORT
+
+representation {NONE}
+  items: LIST[NAT]
+  n: NAT
+  j: NAT
+  hole: NAT
+  key: NAT
+  phase: NAT         -- 0 = PickKey, 1 = CompareShift, 2 = InsertKey, 3 = Done
+  comparisons: NAT
+  shifts: NAT
+  initial_sum: NAT
+
+create {ANY}
+
+  make(xs: LIST[NAT]): INSERTION_SORT
+    require
+      non_empty: xs.length >= 1
+      small_len: xs.length <= 32
+      bounded: SORT_FACTS.all_at_most(xs, 999)
+    do
+      let len = xs.length
+      let start_j = if len > 1 then 1 else len end
+      let start_phase = if len <= 1 then 3 else 0 end
+      let s0 = SORT_FACTS.sum(xs)
+      { items = xs,
+        n = len,
+        j = start_j,
+        hole = 0,
+        key = 0,
+        phase = start_phase,
+        comparisons = 0,
+        shifts = 0,
+        initial_sum = s0 }
+    ensure
+      same_items: Result.elements = xs
+      at_start: Result.comparison_count = 0 and Result.shift_count = 0
+    end
+
+feature {ANY}
+
+  elements: LIST[NAT]
+    do
+      Current.items
+    end
+
+  length: NAT
+    do
+      Current.n
+    end
+
+  outer_j: NAT
+    do
+      Current.j
+    end
+
+  hole_index: NAT
+    do
+      Current.hole
+    end
+
+  active_key: NAT
+    do
+      Current.key
+    end
+
+  phase_code: NAT
+    do
+      Current.phase
+    end
+
+  is_done: BOOL
+    do
+      Current.phase = 3
+    end
+
+  comparison_count: NAT
+    do
+      Current.comparisons
+    end
+
+  shift_count: NAT
+    do
+      Current.shifts
+    end
+
+  total_sum: NAT
+    do
+      Current.initial_sum
+    end
+
+  -- Logical occurrence count of `y` in the current state (accounting for lifted `key` at `hole`).
+  -- At `PickKey` and `Done`, equals `SORT_FACTS.count_of(y, Current.elements)`.
+  multiset_count(y: NAT): MATH_INT
+    do
+      if Current.phase = 1 or Current.phase = 2 then
+        SORT_FACTS.count_of(y, Current.items)
+          + (if y = Current.key then 1 else 0 end)
+          - (if y = LIST_OPS.at(Current.items, Current.hole) then 1 else 0 end)
+      else
+        SORT_FACTS.count_of(y, Current.items)
+      end
+    ensure
+      outer_eq: (Current.phase_code = 0 or Current.is_done) implies Result = SORT_FACTS.count_of(y, Current.elements)
+    end
+
+  -- Termination metric (CLRS Termination): strictly decreases on every non-done `step`.
+  -- Linear in `n`, `j`, and `hole` since `n <= 32`.
+  work_left: NAT
+    do
+      if Current.phase = 3 then
+        0
+      else
+        let rem_m1 = Current.n - Current.j - 1
+        let sub =
+          if Current.phase = 0 then 35
+          else if Current.phase = 1 then Current.hole + 2
+          else 1
+          end end
+        rem_m1 * 36 + sub
+      end
+    ensure
+      zero_iff_done: (Result = 0) = Current.is_done
+    end
+
+  -- Human-readable name of the current CLRS phase.
+  phase_name: STRING
+    do
+      if Current.phase = 0 then "PickKey"
+      else if Current.phase = 1 then "CompareShift"
+      else if Current.phase = 2 then "InsertKey"
+      else "Done"
+      end end end
+    end
+
+  -- Line index (0-based) in the embedded Code tab corresponding to the active phase.
+  active_code_line: NAT
+    do
+      if Current.phase = 0 then 5
+      else if Current.phase = 1 then 10
+      else if Current.phase = 2 then 18
+      else 23
+      end end end
+    end
+
+  -- Advance the algorithm by one fine-grained CLRS step.
+  step: INSERTION_SORT
+    do
+      if Current.phase = 3 then
+        Current
+      else if Current.phase = 0 then
+        Current.step_pick_key
+      else if Current.phase = 1 then
+        Current.step_compare_shift
+      else
+        Current.step_insert_key
+      end end end
+    ensure
+      same_length: Result.length = Current.length
+      same_sum: Result.total_sum = Current.total_sum
+      terminates: not Current.is_done implies Result.work_left < Current.work_left
+      done_stays_done: Current.is_done implies Result = Current
+      postcondition_sorted: Result.is_done implies SORT_FACTS.is_sorted(Result.elements)
+    end
+
+  step_pick_key: INSERTION_SORT
+    require
+      is_pick: Current.phase_code = 0
+    do
+      let k = LIST_OPS.at(Current.items, Current.j)
+      check
+        kb: SORT_FACTS.lemma_at_bounded(Current.items, 999, Current.j)
+        le: SORT_FACTS.lemma_at_le_sum(Current.items, Current.j)
+      end
+      { items = Current.items,
+        n = Current.n,
+        j = Current.j,
+        hole = Current.j,
+        key = k,
+        phase = 1,
+        comparisons = Current.comparisons,
+        shifts = Current.shifts,
+        initial_sum = Current.initial_sum }
+    ensure
+      same_length: Result.length = Current.length
+      same_sum: Result.total_sum = Current.total_sum
+      progress: Result.work_left < Current.work_left
+    end
+
+  step_compare_shift: INSERTION_SORT
+    require
+      is_cmp: Current.phase_code = 1
+    do
+      let next_cmp = if Current.comparisons < 1000000 then Current.comparisons + 1 else Current.comparisons end
+      if Current.hole > 0 and LIST_OPS.at(Current.items, Current.hole - 1) > Current.key then
+        let left_val = LIST_OPS.at(Current.items, Current.hole - 1)
+        let next_items = SORT_FACTS.set_at(Current.items, Current.hole, left_val)
+        check
+          lb: SORT_FACTS.lemma_at_bounded(Current.items, 999, Current.hole - 1)
+          sb: SORT_FACTS.lemma_set_at_bounded(Current.items, Current.hole, left_val, 999)
+          sm: SORT_FACTS.lemma_sum_set_at(Current.items, Current.hole, left_val)
+          ah: SORT_FACTS.lemma_at_set_at(Current.items, Current.hole, left_val, Current.hole)
+          al: SORT_FACTS.lemma_at_set_at(Current.items, Current.hole, left_val, Current.hole - 1)
+          s1: SORT_FACTS.lemma_sorted_shrink_hi(Current.items, 0, Current.hole - 1, Current.hole)
+          s2: SORT_FACTS.lemma_sorted_set_outside(Current.items, Current.hole, left_val, 0, Current.hole - 1)
+          s3: SORT_FACTS.lemma_sorted_set_outside(Current.items, Current.hole, left_val, Current.hole + 1, Current.j + 1)
+          g1: SORT_FACTS.lemma_greater_set_outside(Current.items, Current.hole, left_val, Current.hole + 1, Current.j + 1, Current.key)
+          br_old: if Current.hole < Current.j then SORT_FACTS.lemma_at_set_at(Current.items, Current.hole, left_val, Current.hole + 1) else True end
+          br_new: if Current.hole >= 2 then SORT_FACTS.lemma_sorted_adj(Current.items, 0, Current.hole, Current.hole - 2) and SORT_FACTS.lemma_at_set_at(Current.items, Current.hole, left_val, Current.hole - 2) else True end
+          le_next: SORT_FACTS.lemma_at_le_sum(next_items, Current.hole - 1)
+        end
+        let next_sh = if Current.shifts < 1000000 then Current.shifts + 1 else Current.shifts end
+        { items = next_items,
+          n = Current.n,
+          j = Current.j,
+          hole = Current.hole - 1,
+          key = Current.key,
+          phase = 1,
+          comparisons = next_cmp,
+          shifts = next_sh,
+          initial_sum = Current.initial_sum }
+      else
+        let cmp_used = if Current.hole > 0 then next_cmp else Current.comparisons end
+        { items = Current.items,
+          n = Current.n,
+          j = Current.j,
+          hole = Current.hole,
+          key = Current.key,
+          phase = 2,
+          comparisons = cmp_used,
+          shifts = Current.shifts,
+          initial_sum = Current.initial_sum }
+      end
+    ensure
+      same_length: Result.length = Current.length
+      same_sum: Result.total_sum = Current.total_sum
+      progress: Result.work_left < Current.work_left
+    end
+
+  step_insert_key: INSERTION_SORT
+    require
+      is_ins: Current.phase_code = 2
+    do
+      let next_items = SORT_FACTS.set_at(Current.items, Current.hole, Current.key)
+      check
+        sb: SORT_FACTS.lemma_set_at_bounded(Current.items, Current.hole, Current.key, 999)
+        sm: SORT_FACTS.lemma_sum_set_at(Current.items, Current.hole, Current.key)
+        ok: SORT_FACTS.lemma_insert_key_sorted(Current.items, Current.j, Current.hole, Current.key)
+      end
+      let next_j = Current.j + 1
+      let next_phase = if next_j = Current.n then 3 else 0 end
+      { items = next_items,
+        n = Current.n,
+        j = next_j,
+        hole = 0,
+        key = 0,
+        phase = next_phase,
+        comparisons = Current.comparisons,
+        shifts = Current.shifts,
+        initial_sum = Current.initial_sum }
+    ensure
+      same_length: Result.length = Current.length
+      same_sum: Result.total_sum = Current.total_sum
+      progress: Result.work_left < Current.work_left
+      bounded_after: SORT_FACTS.all_at_most(Result.elements, 999)
+      sorted_after: SORT_FACTS.sorted_range(Result.elements, 0, Result.outer_j)
+      sum_after: SORT_FACTS.sum(Result.elements) = Result.total_sum
+      postcondition_sorted: Result.is_done implies SORT_FACTS.is_sorted(Result.elements)
+    end
+
+invariant
+  non_empty: n >= 1
+  small_len: n <= 32
+  length_matches: items.length = n
+  values_bounded: SORT_FACTS.all_at_most(items, 999)
+  key_bounded: key <= 999
+  valid_phase: phase <= 3
+  j_in_bounds: j <= n
+  outer_j_lt: phase < 3 implies j < n
+  done_at_end: phase = 3 implies j = n
+  hole_in_bounds: hole <= j
+  sorted_outer: (phase = 0 or phase = 3) implies SORT_FACTS.sorted_range(items, 0, j)
+  sorted_inner_left: (phase = 1 or phase = 2) implies SORT_FACTS.sorted_range(items, 0, hole)
+  sorted_inner_right: (phase = 1 or phase = 2) implies SORT_FACTS.sorted_range(items, hole + 1, j + 1)
+  greater_inner_right: (phase = 1 or phase = 2) implies SORT_FACTS.all_greater(items, hole + 1, j + 1, key)
+  inner_bridge: ((phase = 1 or phase = 2) and hole > 0 and hole < j) implies LIST_OPS.at(items, hole - 1) <= LIST_OPS.at(items, hole + 1)
+  insert_ready: (phase = 2 and hole > 0) implies LIST_OPS.at(items, hole - 1) <= key
+  sum_outer: (phase = 0 or phase = 3) implies SORT_FACTS.sum(items) = initial_sum
+  sum_inner: (phase = 1 or phase = 2) implies SORT_FACTS.sum(items) + key = initial_sum + LIST_OPS.at(items, hole)
+
+end

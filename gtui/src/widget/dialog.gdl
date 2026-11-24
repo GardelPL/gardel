@@ -1,0 +1,838 @@
+-- A modal message dialog with a title, word-wrapped message, and 1 to 4 buttons.
+-- TODO(proof-GW.4): prove button_areas are pairwise disjoint (LAYOUT_APART), body_area and
+-- button_row_area are disjoint, and modal on_mouse swallows all outside clicks.
+module DIALOG
+
+representation {NONE}
+  heading: STRING
+  content: PARAGRAPH
+  btn_labels: LIST[STRING]
+  default_idx: NAT
+  cancel_idx: OPTION[NAT]
+  focused_idx: NAT
+  dlg_kind: DIALOG_KIND
+  border: BORDER_KIND
+  max_w: NAT
+  btn_gap: NAT
+  picked_answer: OPTION[NAT]
+  open_flag: BOOL
+
+invariant
+  button_count_valid: 1 <= btn_labels.length and btn_labels.length <= 4
+  default_valid: default_idx < btn_labels.length
+  cancel_valid: match cancel_idx case Some(c) then c < btn_labels.length case None then True end
+  focused_valid: focused_idx < btn_labels.length
+  answer_valid: match picked_answer case Some(a) then a < btn_labels.length case None then True end
+  min_max_w: 5 <= max_w and max_w <= 65535
+  gap_bounded: btn_gap <= 65535
+  no_answer_while_open: open_flag implies match picked_answer case Some(_) then False case None then True end
+
+create {ANY}
+
+  -- An alert dialog with a single `"OK"` button (default and cancel).
+  alert(title: STRING, text: STRING): DIALOG
+    do
+      let btns: LIST[STRING] = LIST.empty.prepend("OK")
+      { heading = title, content = PARAGRAPH.of_text(text).align_center,
+        btn_labels = btns, default_idx = 0, cancel_idx = Some(0), focused_idx = 0,
+        dlg_kind = DIALOG_KIND.info, border = BORDER_KIND.plain,
+        max_w = 60, btn_gap = 2, picked_answer = None, open_flag = False }
+    ensure
+      count_one: Result.button_count = 1
+      closed: not Result.is_open
+      focused_zero: Result.focused = 0
+    end
+
+  -- A confirmation dialog with `"Yes"` / `"No"` (`"No"` is default and cancel).
+  confirm(title: STRING, text: STRING): DIALOG
+    do
+      let btns: LIST[STRING] = LIST.empty.prepend("No").prepend("Yes")
+      { heading = title, content = PARAGRAPH.of_text(text).align_center,
+        btn_labels = btns, default_idx = 1, cancel_idx = Some(1), focused_idx = 1,
+        dlg_kind = DIALOG_KIND.question, border = BORDER_KIND.plain,
+        max_w = 60, btn_gap = 2, picked_answer = None, open_flag = False }
+    ensure
+      count_two: Result.button_count = 2
+      closed: not Result.is_open
+      focused_no: Result.focused = 1
+    end
+
+  -- An `"OK"` / `"Cancel"` dialog (`"OK"` is default, `"Cancel"` is cancel).
+  ok_cancel(title: STRING, text: STRING): DIALOG
+    do
+      let btns: LIST[STRING] = LIST.empty.prepend("Cancel").prepend("OK")
+      { heading = title, content = PARAGRAPH.of_text(text).align_center,
+        btn_labels = btns, default_idx = 0, cancel_idx = Some(1), focused_idx = 0,
+        dlg_kind = DIALOG_KIND.info, border = BORDER_KIND.plain,
+        max_w = 60, btn_gap = 2, picked_answer = None, open_flag = False }
+    ensure
+      count_two: Result.button_count = 2
+      closed: not Result.is_open
+      focused_ok: Result.focused = 0
+    end
+
+  -- A custom dialog with 1..4 buttons (normalized if empty or > 4), `default_btn`, and `cancel_btn`.
+  make(title: STRING, body: PARAGRAPH, buttons: LIST[STRING], default_btn: NAT, cancel_btn: OPTION[NAT]): DIALOG
+    do
+      let norm = DIALOG.normalize_buttons(buttons)
+      let def_i = if default_btn < norm.length then default_btn else 0 end
+      let can_i: OPTION[NAT] =
+        match cancel_btn
+          case Some(c) then if c < norm.length then Some(c) else None end
+          case None then None
+        end
+      { heading = title, content = body,
+        btn_labels = norm, default_idx = def_i, cancel_idx = can_i, focused_idx = def_i,
+        dlg_kind = DIALOG_KIND.info, border = BORDER_KIND.plain,
+        max_w = 60, btn_gap = 2, picked_answer = None, open_flag = False }
+    ensure
+      valid_count: 1 <= Result.button_count and Result.button_count <= 4
+      closed: not Result.is_open
+    end
+
+  -- Take at most 4 buttons, or `["OK"]` when `buttons` is empty.
+  normalize_buttons(buttons: LIST[STRING]): LIST[STRING]
+    do
+      if buttons.length = 0 then
+        let single: LIST[STRING] = LIST.empty.prepend("OK")
+        single
+      else
+        DIALOG.take_up_to(buttons, 4)
+      end
+    ensure
+      valid: 1 <= Result.length and Result.length <= 4
+    end
+
+  take_up_to(xs: LIST[STRING], limit: NAT): LIST[STRING]
+    variant
+      limit
+    do
+      if limit = 0 or xs.length = 0 then
+        let empty_l: LIST[STRING] = LIST.empty
+        empty_l
+      else
+        DIALOG.take_up_to(xs.tail, limit - 1).prepend(xs.head)
+      end
+    ensure
+      bounded: Result.length <= limit
+      non_empty_if_pos: (limit > 0 and xs.length > 0) implies Result.length >= 1
+    end
+
+  lower_ascii(c: CHAR): NAT
+    do
+      let code = c.code
+      if code >= 65 and code <= 90 then code + 32 else code end
+    end
+
+  first_non_space(cs: LIST[CHAR]): OPTION[CHAR]
+    variant
+      cs.length
+    do
+      if cs.length = 0 then
+        None
+      else if cs.head = ' ' then
+        DIALOG.first_non_space(cs.tail)
+      else
+        Some(cs.head)
+      end end
+    end
+
+  scan_initial(labels: LIST[STRING], target: NAT, idx: NAT, found_count: NAT, found_idx: NAT): OPTION[NAT]
+    require
+      idx_bound: idx <= labels.length
+      found_valid: found_count = 0 or (0 <= found_idx and found_idx < labels.length and found_idx < 18446744073709551615)
+    variant
+      labels.length - idx
+    do
+      if idx >= labels.length or idx >= 18446744073709551615 then
+        if found_count = 1 then Some(found_idx) else None end
+      else
+        let lbl = LIST_OPS.at(labels, idx)
+        let matches =
+          match DIALOG.first_non_space(GLYPHS.of_text(lbl))
+            case Some(ch) then DIALOG.lower_ascii(ch) = target
+            case None then False
+          end
+        if matches then
+          let next_cnt = if found_count < 18446744073709551615 then found_count + 1 else 18446744073709551615 end
+          DIALOG.scan_initial(labels, target, idx + 1, next_cnt, idx)
+        else
+          DIALOG.scan_initial(labels, target, idx + 1, found_count, found_idx)
+        end
+      end
+    ensure
+      valid: match Result case Some(i) then 0 <= i and i < labels.length and i < 18446744073709551615 case None then True end
+    end
+
+  max_line_width(lines: LIST[STRING]): NAT
+    variant
+      lines.length
+    do
+      if lines.length = 0 then
+        0
+      else
+        let w = GLYPHS.width(lines.head)
+        let rest = DIALOG.max_line_width(lines.tail)
+        if w >= rest then w else rest end
+      end
+    ensure
+      fits: Result <= 65535
+    end
+
+  raw_row_width(labels: LIST[STRING], gap: NAT): NAT
+    variant
+      labels.length
+    do
+      if labels.length = 0 then
+        0
+      else
+        let bw = GLYPHS.width(labels.head) + 4
+        let rest = DIALOG.raw_row_width(labels.tail, gap)
+        let cgap = if gap <= 65535 then gap else 65535 end
+        let sep = if labels.tail.length > 0 then cgap else 0 end
+        let s1 = if bw <= 65535 - rest then bw + rest else 65535 end
+        if s1 <= 65535 - sep then s1 + sep else 65535 end
+      end
+    ensure
+      fits: Result <= 65535
+    end
+
+  cap_labels(labels: LIST[STRING], cap: NAT): LIST[STRING]
+    require
+      small_cap: cap <= 65535
+    variant
+      labels.length
+    do
+      if labels.length = 0 then
+        let empty_l: LIST[STRING] = LIST.empty
+        empty_l
+      else
+        let lbl = labels.head
+        let w = GLYPHS.width(lbl)
+        let cut_lbl =
+          if w <= cap then
+            lbl
+          else
+            let fw = GLYPHS.fitting_width(lbl, cap)
+            let cs = GLYPHS.of_text(lbl)
+            if fw = 0 and cs.length > 0 then
+              GLYPHS.text_of(LIST.empty.prepend(cs.head))
+            else
+              DIALOG.prefix_for_width(cs, fw, 0)
+            end
+          end
+        DIALOG.cap_labels(labels.tail, cap).prepend(cut_lbl)
+      end
+    ensure
+      same_len: Result.length = labels.length
+    end
+
+  prefix_for_width(cs: LIST[CHAR], max_w: NAT, acc: NAT): STRING
+    require
+      bound: acc <= max_w and max_w <= 65535
+    variant
+      cs.length
+    do
+      let empty_cs: LIST[CHAR] = LIST.empty
+      GLYPHS.text_of(DIALOG.prefix_chars(cs, max_w, acc, empty_cs))
+    end
+
+  prefix_chars(cs: LIST[CHAR], max_w: NAT, acc: NAT, rev: LIST[CHAR]): LIST[CHAR]
+    require
+      bound: acc <= max_w and max_w <= 65535
+    variant
+      cs.length
+    do
+      if cs.length = 0 then
+        LIST_CUT.reverse(rev, LIST.empty)
+      else
+        let w = CHAR_WIDTH.of(cs.head)
+        let cw = if w = 0 then 0 else if w = 2 then 2 else 1 end end
+        if acc + cw <= max_w then
+          DIALOG.prefix_chars(cs.tail, max_w, acc + cw, rev.prepend(cs.head))
+        else
+          LIST_CUT.reverse(rev, LIST.empty)
+        end
+      end
+    end
+
+  fit_labels_step(orig: LIST[STRING], cap: NAT, gap: NAT, avail: NAT): LIST[STRING]
+    require
+      small_cap: cap <= 65535
+    variant
+      cap
+    do
+      let cut = DIALOG.cap_labels(orig, cap)
+      if cap <= 1 or DIALOG.raw_row_width(cut, gap) <= avail then
+        cut
+      else
+        DIALOG.fit_labels_step(orig, cap - 1, gap, avail)
+      end
+    ensure
+      same_len: Result.length = orig.length
+    end
+
+  sizes_for_labels(labels: LIST[STRING]): LIST[SIZE]
+    variant
+      labels.length
+    do
+      if labels.length = 0 then
+        let empty_s: LIST[SIZE] = LIST.empty
+        empty_s
+      else
+        let w = GLYPHS.width(labels.head) + 4
+        DIALOG.sizes_for_labels(labels.tail).prepend(SIZE.fixed(w))
+      end
+    ensure
+      same_len: Result.length = labels.length
+    end
+
+  empty_rects_for(count: NAT, x: NAT, y: NAT): LIST[RECT]
+    require
+      small_x: x <= 65535
+      small_y: y <= 65535
+    variant
+      count
+    do
+      if count = 0 then
+        let empty_r: LIST[RECT] = LIST.empty
+        empty_r
+      else
+        DIALOG.empty_rects_for(count - 1, x, y).prepend(RECT.make(x, y, 0, 0))
+      end
+    ensure
+      same_len: Result.length = count
+    end
+
+  find_button_hit(areas: LIST[RECT], idx: NAT, cx: NAT, cy: NAT): OPTION[NAT]
+    require
+      bound: idx <= areas.length
+    variant
+      areas.length - idx
+    do
+      if idx >= areas.length or idx >= 18446744073709551615 then
+        None
+      else if LIST_OPS.at(areas, idx).has(cx, cy) then
+        Some(idx)
+      else
+        DIALOG.find_button_hit(areas, idx + 1, cx, cy)
+      end end
+    ensure
+      valid: match Result case Some(i) then 0 <= i and i < areas.length and i < 18446744073709551615 case None then True end
+    end
+
+  draw_buttons(s: SCREEN, areas: LIST[RECT], labels: LIST[STRING], focused_idx: NAT, idx: NAT, btn_st: STYLE, focus_btn_st: STYLE): SCREEN
+    require
+      same_len: areas.length = labels.length
+      bound: idx <= areas.length
+    variant
+      areas.length - idx
+    do
+      if idx >= areas.length or idx >= 18446744073709551615 then
+        s
+      else
+        let r = LIST_OPS.at(areas, idx)
+        let lbl = LIST_OPS.at(labels, idx)
+        let st = if idx = focused_idx then focus_btn_st else btn_st end
+        let next = BUTTON.render_in(s, r, lbl, "[ ", " ]", ALIGN.center, True, st)
+        DIALOG.draw_buttons(next, areas, labels, focused_idx, idx + 1, btn_st, focus_btn_st)
+      end
+    ensure
+      same_width: Result.width = s.width
+      same_height: Result.height = s.height
+    end
+
+feature {ANY}
+
+  title: STRING
+    do
+      Current.heading
+    end
+
+  message: PARAGRAPH
+    do
+      Current.content
+    end
+
+  buttons: LIST[STRING]
+    do
+      Current.btn_labels
+    end
+
+  button_count: NAT
+    do
+      Current.btn_labels.length
+    ensure
+      valid: 1 <= Result and Result <= 4
+    end
+
+  button_label(i: NAT): STRING
+    require
+      valid_idx: i < Current.button_count
+    do
+      LIST_OPS.at(Current.btn_labels, i)
+    end
+
+  default_button: NAT
+    do
+      Current.default_idx
+    ensure
+      valid: Result < Current.button_count
+    end
+
+  cancel_button: OPTION[NAT]
+    do
+      Current.cancel_idx
+    end
+
+  focused: NAT
+    do
+      Current.focused_idx
+    ensure
+      valid: Result < Current.button_count
+    end
+
+  kind: DIALOG_KIND
+    do
+      Current.dlg_kind
+    end
+
+  border_kind: BORDER_KIND
+    do
+      Current.border
+    end
+
+  max_width: NAT
+    do
+      Current.max_w
+    end
+
+  button_spacing: NAT
+    do
+      Current.btn_gap
+    end
+
+  is_open: BOOL
+    do
+      Current.open_flag
+    end
+
+  is_answered: BOOL
+    do
+      match Current.picked_answer
+        case Some(_) then True
+        case None then False
+      end
+    end
+
+  answer: OPTION[NAT]
+    do
+      Current.picked_answer
+    ensure
+      valid: match Result case Some(a) then a < Current.button_count case None then True end
+    end
+
+  with_title(t: STRING): DIALOG
+    do
+      { Current with heading = t }
+    ensure
+      same_buttons: Result.button_count = Current.button_count
+      valid_focus: Result.focused < Result.button_count
+    end
+
+  with_message(p: PARAGRAPH): DIALOG
+    do
+      { Current with content = p }
+    ensure
+      same_buttons: Result.button_count = Current.button_count
+      valid_focus: Result.focused < Result.button_count
+    end
+
+  with_text(text: STRING): DIALOG
+    do
+      { Current with content = PARAGRAPH.of_text(text).align_center }
+    ensure
+      same_buttons: Result.button_count = Current.button_count
+      valid_focus: Result.focused < Result.button_count
+    end
+
+  with_kind(k: DIALOG_KIND): DIALOG
+    do
+      { Current with dlg_kind = k }
+    ensure
+      same_buttons: Result.button_count = Current.button_count
+      valid_focus: Result.focused < Result.button_count
+    end
+
+  with_border(b: BORDER_KIND): DIALOG
+    do
+      { Current with border = b }
+    ensure
+      same_buttons: Result.button_count = Current.button_count
+      valid_focus: Result.focused < Result.button_count
+    end
+
+  with_max_width(w: NAT): DIALOG
+    do
+      let cw = if w < 5 then 5 else if w > 65535 then 65535 else w end end
+      { Current with max_w = cw }
+    ensure
+      same_buttons: Result.button_count = Current.button_count
+      valid_focus: Result.focused < Result.button_count
+    end
+
+  with_button_spacing(g: NAT): DIALOG
+    do
+      let cg = if g <= 65535 then g else 65535 end
+      { Current with btn_gap = cg }
+    ensure
+      same_buttons: Result.button_count = Current.button_count
+      valid_focus: Result.focused < Result.button_count
+    end
+
+  with_default_button(i: NAT): DIALOG
+    do
+      if i < Current.btn_labels.length then
+        { Current with default_idx = i }
+      else
+        Current
+      end
+    ensure
+      same_buttons: Result.button_count = Current.button_count
+      valid_focus: Result.focused < Result.button_count
+    end
+
+  with_cancel_button(c: OPTION[NAT]): DIALOG
+    do
+      let valid_c: OPTION[NAT] =
+        match c
+          case Some(i) then if i < Current.btn_labels.length then Some(i) else None end
+          case None then None
+        end
+      { Current with cancel_idx = valid_c }
+    ensure
+      same_buttons: Result.button_count = Current.button_count
+      valid_focus: Result.focused < Result.button_count
+    end
+
+  -- Open the dialog with `default_button` focused and no answer.
+  open: DIALOG
+    do
+      { Current with open_flag = True, focused_idx = Current.default_idx, picked_answer = None }
+    ensure
+      opened: Result.is_open
+      focused_default: Result.focused = Current.default_button
+      no_answer: not Result.is_answered
+      same_buttons: Result.button_count = Current.button_count
+    end
+
+  -- Close the dialog without recording an answer.
+  close: DIALOG
+    do
+      { Current with open_flag = False }
+    ensure
+      closed: not Result.is_open
+      same_buttons: Result.button_count = Current.button_count
+    end
+
+  -- Answer the dialog with button index `i` and close it.
+  answer_with(i: NAT): DIALOG
+    do
+      if i < Current.btn_labels.length then
+        { Current with open_flag = False, focused_idx = i, picked_answer = Some(i) }
+      else
+        Current
+      end
+    ensure
+      same_buttons: Result.button_count = Current.button_count
+      valid_focus: Result.focused < Result.button_count
+      answered: i < Current.button_count implies (not Result.is_open and Result.is_answered)
+    end
+
+  -- Answer with `cancel_button` if set; otherwise leave the dialog unchanged.
+  cancel: DIALOG
+    do
+      match Current.cancel_idx
+        case Some(c) then Current.answer_with(c)
+        case None then Current
+      end
+    ensure
+      same_buttons: Result.button_count = Current.button_count
+      valid_focus: Result.focused < Result.button_count
+    end
+
+  -- Clear any stored answer.
+  clear_answer: DIALOG
+    do
+      { Current with picked_answer = None }
+    ensure
+      no_answer: not Result.is_answered
+      same_buttons: Result.button_count = Current.button_count
+    end
+
+  focus_button(i: NAT): DIALOG
+    do
+      if i < Current.btn_labels.length then
+        { Current with focused_idx = i }
+      else
+        Current
+      end
+    ensure
+      same_buttons: Result.button_count = Current.button_count
+      valid_focus: Result.focused < Result.button_count
+    end
+
+  focus_next: DIALOG
+    do
+      let next = (Current.focused_idx + 1) % Current.btn_labels.length
+      { Current with focused_idx = next }
+    ensure
+      same_buttons: Result.button_count = Current.button_count
+      valid_focus: Result.focused < Result.button_count
+    end
+
+  focus_previous: DIALOG
+    do
+      let prev = if Current.focused_idx = 0 then Current.btn_labels.length - 1 else Current.focused_idx - 1 end
+      { Current with focused_idx = prev }
+    ensure
+      same_buttons: Result.button_count = Current.button_count
+      valid_focus: Result.focused < Result.button_count
+    end
+
+  -- Index of the unique button whose label starts with `ch` (case-insensitive, leading spaces
+  -- skipped); `None` if zero or more than one label matches.
+  button_with_initial(ch: CHAR): OPTION[NAT]
+    do
+      DIALOG.scan_initial(Current.btn_labels, DIALOG.lower_ascii(ch), 0, 0, 0)
+    ensure
+      valid: match Result case Some(i) then i < Current.button_count case None then True end
+    end
+
+  -- Centered bounding rectangle of the dialog inside `area`.
+  box(area: RECT): RECT
+    do
+      let limit = if Current.max_w <= area.width then Current.max_w else area.width end
+      let wrap_w = if limit > 4 then limit - 4 else 1 end
+      let lines = Current.content.wrapped_lines(wrap_w)
+      let msg_w = DIALOG.max_line_width(lines)
+      let msg_h = if lines.length <= 65531 then lines.length else 65531 end
+      let row_w = DIALOG.raw_row_width(Current.btn_labels, Current.btn_gap)
+      let title_w_raw = GLYPHS.width(Current.heading) + 2
+      let title_w = if Current.heading.is_empty then 0 else if title_w_raw <= Current.max_w then title_w_raw else Current.max_w end end
+      let inner_w = if msg_w >= row_w then msg_w else row_w end
+      let body_box_w = if inner_w + 4 <= 65535 then inner_w + 4 else 65535 end
+      let want_w = if body_box_w >= title_w then body_box_w else title_w end
+      let want_h = msg_h + 4
+      area.centered(want_w, want_h)
+    ensure
+      within: Result.inside(area)
+    end
+
+  -- Message body rectangle inside `Current.box(area)`.
+  body_area(area: RECT): RECT
+    do
+      let b = Current.box(area)
+      let vert = b.drop_top(1).drop_bottom(1)
+      let inner = vert.drop_left(2).drop_right(2)
+      let shown = if inner.height >= 2 then inner.height - 2 else 0 end
+      let res = inner.take_top(shown)
+      check c1: RECT.cut_top(b, 1) end
+      check c2: RECT.cut_bottom(b.drop_top(1), 1) end
+      check c3: RECT.cut_left(vert, 2) end
+      check c4: RECT.cut_right(vert.drop_left(2), 2) end
+      check c5: RECT.cut_top(inner, shown) end
+      check t1: RECT.inside_trans(b.drop_top(1), b, b) end
+      check t2: RECT.inside_trans(vert, b.drop_top(1), b) end
+      check t3: RECT.inside_trans(vert.drop_left(2), vert, b) end
+      check t4: RECT.inside_trans(inner, vert.drop_left(2), b) end
+      check t5: RECT.inside_trans(res, inner, b) end
+      check t6: RECT.inside_trans(res, b, area) end
+      res
+    ensure
+      within_box: Result.inside(Current.box(area))
+      within_area: Result.inside(area)
+    end
+
+  -- Button row rectangle inside `Current.box(area)`.
+  button_row_area(area: RECT): RECT
+    do
+      let b = Current.box(area)
+      let vert = b.drop_top(1).drop_bottom(1)
+      let inner = vert.drop_left(2).drop_right(2)
+      let res = inner.take_bottom(1)
+      check c1: RECT.cut_top(b, 1) end
+      check c2: RECT.cut_bottom(b.drop_top(1), 1) end
+      check c3: RECT.cut_left(vert, 2) end
+      check c4: RECT.cut_right(vert.drop_left(2), 2) end
+      check c5: RECT.cut_bottom(inner, 1) end
+      check t2: RECT.inside_trans(vert, b.drop_top(1), b) end
+      check t3: RECT.inside_trans(vert.drop_left(2), vert, b) end
+      check t4: RECT.inside_trans(inner, vert.drop_left(2), b) end
+      check t5: RECT.inside_trans(res, inner, b) end
+      check t6: RECT.inside_trans(res, b, area) end
+      res
+    ensure
+      within_box: Result.inside(Current.box(area))
+      within_area: Result.inside(area)
+    end
+
+  -- Labels shown on buttons inside `area`, clipped uniformly when the row is narrower than needed.
+  shown_labels(area: RECT): LIST[STRING]
+    do
+      let row = Current.button_row_area(area)
+      let raw_w = DIALOG.raw_row_width(Current.btn_labels, Current.btn_gap)
+      if row.is_empty or raw_w <= row.width then
+        Current.btn_labels
+      else
+        let cap = DIALOG.max_line_width(Current.btn_labels)
+        DIALOG.fit_labels_step(Current.btn_labels, cap, Current.btn_gap, row.width)
+      end
+    ensure
+      one_each: Result.length = Current.button_count
+    end
+
+  -- Bounding rectangle of each button in order inside `area`.
+  button_areas(area: RECT): LIST[RECT]
+    do
+      let row = Current.button_row_area(area)
+      if row.is_empty then
+        DIALOG.empty_rects_for(Current.btn_labels.length, row.x, row.y)
+      else
+        let shown = Current.shown_labels(area)
+        let sizes = DIALOG.sizes_for_labels(shown)
+        LAYOUT.columns_justified(row, sizes, Current.btn_gap, JUSTIFY.center)
+      end
+    ensure
+      one_each: Result.length = Current.button_count
+    end
+
+  -- Bounding rectangle of button `i` inside `area`.
+  button_area(area: RECT, i: NAT): RECT
+    do
+      let row = Current.button_row_area(area)
+      let b = Current.box(area)
+      if row.is_empty or i >= Current.btn_labels.length then
+        let res = b.take_top(0)
+        check c0: RECT.cut_top(b, 0) end
+        check tr0: RECT.inside_trans(res, b, area) end
+        res
+      else
+        let shown = Current.shown_labels(area)
+        let sizes = DIALOG.sizes_for_labels(shown)
+        let areas = LAYOUT.columns_justified(row, sizes, Current.btn_gap, JUSTIFY.center)
+        let res = LIST_OPS.at(areas, i)
+        check ai: LAYOUT.across_inside(areas, row.x, row, i) end
+        check t1: RECT.inside_trans(res, row, b) end
+        check t2: RECT.inside_trans(res, b, area) end
+        res
+      end
+    ensure
+      within_box: Result.inside(Current.box(area))
+      within_area: Result.inside(area)
+    end
+
+  -- Index of the button at `(cx, cy)` inside `area`, if any.
+  button_at(area: RECT, cx: NAT, cy: NAT): OPTION[NAT]
+    do
+      let areas = Current.button_areas(area)
+      DIALOG.find_button_hit(areas, 0, cx, cy)
+    ensure
+      valid: match Result case Some(i) then i < Current.button_count case None then True end
+    end
+
+  -- Whether `(cx, cy)` lies inside the dialog box centered in `area`.
+  contains(area: RECT, cx: NAT, cy: NAT): BOOL
+    do
+      Current.box(area).has(cx, cy)
+    ensure
+      def: Result = Current.box(area).has(cx, cy)
+    end
+
+  -- Handle keyboard input while the dialog is open.
+  on_key(k: KEY): DIALOG
+    do
+      if not Current.open_flag then
+        Current
+      else
+        match k
+          case Tab then Current.focus_next
+          case Right then Current.focus_next
+          case Left then Current.focus_previous
+          case Mod(inner, shift, alt, ctrl) then
+            if shift and not alt and not ctrl then
+              match inner
+                case Tab then Current.focus_previous
+                case _ then Current
+              end
+            else
+              Current
+            end
+          case Enter then Current.answer_with(Current.focused_idx)
+          case Escape then Current.cancel
+          case Char(ch) then
+            if ch = ' ' then
+              Current.answer_with(Current.focused_idx)
+            else
+              match Current.button_with_initial(ch)
+                case Some(i) then Current.answer_with(i)
+                case None then Current
+              end
+            end
+          case _ then Current
+        end
+      end
+    ensure
+      same_buttons: Result.button_count = Current.button_count
+      valid_focus: Result.focused < Result.button_count
+    end
+
+  -- Handle a mouse event while the dialog is open: clicking a button answers with it;
+  -- clicking anywhere else while open is swallowed (modal).
+  on_mouse(m: MOUSE, area: RECT): DIALOG
+    do
+      if not Current.open_flag or not m.is_left_down then
+        Current
+      else
+        match Current.button_at(area, m.x, m.y)
+          case Some(i) then Current.answer_with(i)
+          case None then Current
+        end
+      end
+    ensure
+      same_buttons: Result.button_count = Current.button_count
+      valid_focus: Result.focused < Result.button_count
+      modal_swallow: (Current.is_open and m.is_left_down and match Current.button_at(area, m.x, m.y) case Some(_) then False case None then True end) implies Result.is_open
+    end
+
+  -- Draw the dialog centered in `area` when open.
+  draw(s: SCREEN, area: RECT, bg_st: STYLE, edge_st: STYLE, title_st: STYLE, btn_st: STYLE, focus_btn_st: STYLE): SCREEN
+    do
+      if not Current.open_flag then
+        s
+      else
+        let b = Current.box(area)
+        if b.is_empty then
+          s
+        else
+          let cleared = CLEAR.styled(s, b, bg_st)
+          let framed = FRAME.draw_styled(cleared, b, Current.border, Current.heading, edge_st, title_st)
+          let body_r = Current.body_area(area)
+          let with_body =
+            if body_r.is_empty then
+              framed
+            else
+              let lines = Current.content.wrapped_lines(body_r.width)
+              PARAGRAPH.draw_lines(framed, body_r, lines, body_r.y, Current.content.align, 0, bg_st)
+            end
+          let areas = Current.button_areas(area)
+          let labels = Current.shown_labels(area)
+          DIALOG.draw_buttons(with_body, areas, labels, Current.focused_idx, 0, btn_st, focus_btn_st)
+        end
+      end
+    ensure
+      same_width: Result.width = s.width
+      same_height: Result.height = s.height
+    end
+
+end

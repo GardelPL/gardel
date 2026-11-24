@@ -1,0 +1,114 @@
+-- Preferred side for placing an overlay rectangle (`OVERLAY_PLACEMENT`) relative to an anchor.
+module OVERLAY_SIDE
+
+representation {NONE}
+  | SideBelow
+  | SideAbove
+  | SideRightOf
+  | SideLeftOf
+
+create {ANY}
+
+  below: OVERLAY_SIDE
+    do
+      SideBelow
+    ensure
+      is_below: Result.is_below
+      vertical: Result.is_vertical
+    end
+
+  above: OVERLAY_SIDE
+    do
+      SideAbove
+    ensure
+      is_above: Result.is_above
+      vertical: Result.is_vertical
+    end
+
+  right_of: OVERLAY_SIDE
+    do
+      SideRightOf
+    ensure
+      is_right_of: Result.is_right_of
+      horizontal: not Result.is_vertical
+    end
+
+  left_of: OVERLAY_SIDE
+    do
+      SideLeftOf
+    ensure
+      is_left_of: Result.is_left_of
+      horizontal: not Result.is_vertical
+    end
+
+feature {ANY}
+
+  is_below: BOOL
+    do
+      match Current
+        case SideBelow then True
+        case _ then False
+      end
+    end
+
+  is_above: BOOL
+    do
+      match Current
+        case SideAbove then True
+        case _ then False
+      end
+    end
+
+  is_right_of: BOOL
+    do
+      match Current
+        case SideRightOf then True
+        case _ then False
+      end
+    end
+
+  is_left_of: BOOL
+    do
+      match Current
+        case SideLeftOf then True
+        case _ then False
+      end
+    end
+
+  is_vertical: BOOL
+    do
+      match Current
+        case SideBelow then True
+        case SideAbove then True
+        case _ then False
+      end
+    ensure
+      def: Result = (Current.is_below or Current.is_above)
+    end
+
+  same(other: OVERLAY_SIDE): BOOL
+    do
+      match Current
+        case SideBelow then other.is_below
+        case SideAbove then other.is_above
+        case SideRightOf then other.is_right_of
+        case SideLeftOf then other.is_left_of
+      end
+    ensure
+      sym: Result = other.same(Current)
+    end
+
+  opposite: OVERLAY_SIDE
+    do
+      match Current
+        case SideBelow then SideAbove
+        case SideAbove then SideBelow
+        case SideRightOf then SideLeftOf
+        case SideLeftOf then SideRightOf
+      end
+    ensure
+      involution: Result.opposite.same(Current)
+      axis_kept: Result.is_vertical = Current.is_vertical
+    end
+
+end

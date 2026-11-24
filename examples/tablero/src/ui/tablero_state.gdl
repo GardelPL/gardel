@@ -1,0 +1,558 @@
+-- Application state and event routing for `tablero`.
+module TABLERO_STATE
+
+representation {NONE}
+  wide: NAT
+  high: NAT
+  keys_at: FOCUS
+  bar_menu: MENU
+  right_tabs: TABS
+  contracts_view: TEXT_VIEW
+  board: BOARD
+  preset_idx: NAT
+  preset_label: STRING
+  cur_row: NAT
+  cur_col: NAT
+  outcome: SOLVE_OUTCOME
+  sol_idx: NAT
+  solved_once: BOOL
+  chk_rays: CHECKBOX
+  chk_count: CHECKBOX
+  size_slider: SLIDER
+  toast_queue: TOAST
+  tick_seq: NAT
+  help_modal: POPUP
+  help_shown: BOOL
+  quit_dialog: DIALOG
+  theme_idx: NAT
+
+invariant
+  cur_row_ok: cur_row < board.size
+  cur_col_ok: cur_col < board.size
+
+create {ANY}
+
+  make_menu: MENU
+    do
+      let none: LIST[MENU_ITEM] = LIST.empty
+      let file_items = none
+        .prepend(MENU_ITEM.item("Quit", 12).with_shortcut("q"))
+      let board_items = none
+        .prepend(MENU_ITEM.item("Reset Preset", 22).with_shortcut("r"))
+        .prepend(MENU_ITEM.item("Clear All Constraints", 21).with_shortcut("c"))
+        .prepend(MENU_ITEM.separator)
+        .prepend(MENU_ITEM.item("Solve (Parallel OpenMP)", 20).with_shortcut("Space"))
+      let preset_items = none
+        .prepend(MENU_ITEM.item("Diagonal Conflict 6x6 (UNSAT)", 33).with_shortcut("4"))
+        .prepend(MENU_ITEM.item("Blocked Center 8x8", 32).with_shortcut("3"))
+        .prepend(MENU_ITEM.item("Pinned Corner 8x8", 31).with_shortcut("2"))
+        .prepend(MENU_ITEM.item("Classic 8x8 (92 solutions)", 30).with_shortcut("1"))
+      let theme_items = none
+        .prepend(MENU_ITEM.item("Dracula", 43))
+        .prepend(MENU_ITEM.item("Nord", 42))
+        .prepend(MENU_ITEM.item("Light", 41))
+        .prepend(MENU_ITEM.item("Dark", 40))
+      let help_items = none
+        .prepend(MENU_ITEM.item("About OpenMP + Z3 Proofs", 51))
+        .prepend(MENU_ITEM.item("Controls & Keys", 50).with_shortcut("?"))
+      let entries = none
+        .prepend(MENU_ITEM.submenu("Help", help_items))
+        .prepend(MENU_ITEM.submenu("Theme", theme_items))
+        .prepend(MENU_ITEM.submenu("Presets", preset_items))
+        .prepend(MENU_ITEM.submenu("Board", board_items))
+        .prepend(MENU_ITEM.submenu("File", file_items))
+      MENU.make(entries).with_border(BORDER_KIND.rounded)
+    end
+
+  make_help: POPUP
+    do
+      let l1 = "Space: Run Parallel OpenMP Solver | Arrows: Move Board Cursor\n"
+      let l2 = "Enter: Toggle Pinned Queen | x: Toggle Blocked Cell\n"
+      let l3 = "1-4: Switch Presets | c: Clear Constraints | r: Reset Preset\n"
+      let l4 = "p / s / v: Proofs / Solution / Contracts tabs | t: Theme\n"
+      let l5 = "Mouse: Left-click square to pin, Right-click to block,\n"
+      let l6 = "drag Size N slider (4..12), click Solve / Checkboxes / Menu."
+      let p1 = GLYPHS.join(GLYPHS.join(l1, l2), GLYPHS.join(l3, l4))
+      let p2 = GLYPHS.join(l5, l6)
+      POPUP.of_text("Tablero — Parallel Verified Solver", GLYPHS.join(p1, p2), 66, 8)
+        .with_border(BORDER_KIND.rounded)
+        .with_padding(PADDING.symmetric(0, 1))
+        .with_footer("Esc / ? to close")
+    end
+
+  make_quit_dialog: DIALOG
+    do
+      DIALOG.confirm("Leave Tablero?", "Exit the parallel verified N-Queens solver?")
+        .with_border(BORDER_KIND.rounded)
+    end
+
+  make: TABLERO_STATE
+    do
+      let b = TABLERO_PRESETS.make_preset(0)
+      { wide = 104,
+        high = 28,
+        keys_at = FOCUS.make(2),
+        bar_menu = TABLERO_STATE.make_menu,
+        right_tabs = TABS.empty.with("Proofs", 'p').with("Solution", 's').with("Contracts", 'v'),
+        contracts_view = TEXT_VIEW.make(TABLERO_PANELS.short_form_lines),
+        board = b,
+        preset_idx = 0,
+        preset_label = TABLERO_PRESETS.preset_name(0),
+        cur_row = 0,
+        cur_col = 0,
+        outcome = SOLVE_OUTCOME.empty,
+        sol_idx = 0,
+        solved_once = False,
+        chk_rays = CHECKBOX.checked("Show pinned queen attack rays"),
+        chk_count = CHECKBOX.checked("Count all solutions (OpenMP)"),
+        size_slider = SLIDER.make(4, 10, 1, b.size).with_label,
+        toast_queue = TOAST.empty.with_max_visible(1),
+        tick_seq = 0,
+        help_modal = TABLERO_STATE.make_help,
+        help_shown = False,
+        quit_dialog = TABLERO_STATE.make_quit_dialog,
+        theme_idx = 0 }
+    end
+
+feature {ANY}
+
+  area: RECT
+    do
+      RECT.sized(Current.wide, Current.high)
+    end
+
+  focus: FOCUS
+    do
+      Current.keys_at
+    end
+
+  top_menu: MENU
+    do
+      Current.bar_menu
+    end
+
+  tabs: TABS
+    do
+      Current.right_tabs
+    end
+
+  contracts: TEXT_VIEW
+    do
+      Current.contracts_view
+    end
+
+  current_board: BOARD
+    do
+      Current.board
+    end
+
+  preset_name: STRING
+    do
+      Current.preset_label
+    end
+
+  cursor_row: NAT
+    do
+      Current.cur_row
+    end
+
+  cursor_col: NAT
+    do
+      Current.cur_col
+    end
+
+  solve_result: SOLVE_OUTCOME
+    do
+      Current.outcome
+    end
+
+  solution_index: NAT
+    do
+      Current.sol_idx
+    end
+
+  active_solution: OPTION[LIST[NAT]]
+    do
+      Current.outcome.solution_at(Current.sol_idx)
+    end
+
+  prev_solution: TABLERO_STATE
+    do
+      let n = Current.outcome.stored_count
+      if n <= 1 then
+        Current
+      else
+        let next_i = if Current.sol_idx > 0 then Current.sol_idx - 1 else n - 1 end
+        { Current with sol_idx = next_i }
+      end
+    end
+
+  next_solution: TABLERO_STATE
+    do
+      let n = Current.outcome.stored_count
+      if n <= 1 then
+        Current
+      else
+        let next_i = if Current.sol_idx < n - 1 then Current.sol_idx + 1 else 0 end
+        { Current with sol_idx = next_i }
+      end
+    end
+
+  has_run: BOOL
+    do
+      Current.solved_once
+    end
+
+  rays_checkbox: CHECKBOX
+    do
+      Current.chk_rays
+    end
+
+  count_checkbox: CHECKBOX
+    do
+      Current.chk_count
+    end
+
+  n_slider: SLIDER
+    do
+      Current.size_slider
+    end
+
+  toasts: TOAST
+    do
+      Current.toast_queue
+    end
+
+  help_open: BOOL
+    do
+      Current.help_shown
+    end
+
+  help_popup: POPUP
+    do
+      Current.help_modal
+    end
+
+  quit_dlg: DIALOG
+    do
+      Current.quit_dialog
+    end
+
+  breadcrumb: BREADCRUMB
+    do
+      let st_lbl =
+        if not Current.solved_once then "Editing"
+        else if Current.outcome.has_solution then "Solved"
+        else "UNSAT"
+        end end
+      let empty: LIST[STRING] = LIST.empty
+      let crumbs = empty
+        .prepend(st_lbl)
+        .prepend(Current.preset_label)
+        .prepend("Tablero")
+      BREADCRUMB.make(crumbs)
+    end
+
+  theme: THEME
+    do
+      if Current.theme_idx = 0 then THEME.dark
+      else if Current.theme_idx = 1 then THEME.light
+      else if Current.theme_idx = 2 then THEME.nord
+      else THEME.dracula
+      end end end
+    end
+
+  sized(w: NAT, h: NAT): TABLERO_STATE
+    do
+      { Current with wide = w, high = h }
+    end
+
+  notify_info(msg: STRING): TABLERO_STATE
+    do
+      let nt = if Current.tick_seq < 1000000 then Current.tick_seq + 1 else 0 end
+      let q = TOAST.make_at(nt).with_max_visible(1).push_info(msg, 3)
+      { Current with tick_seq = nt, toast_queue = q }
+    end
+
+  notify_success(msg: STRING): TABLERO_STATE
+    do
+      let nt = if Current.tick_seq < 1000000 then Current.tick_seq + 1 else 0 end
+      let q = TOAST.make_at(nt).with_max_visible(1).push_success(msg, 3)
+      { Current with tick_seq = nt, toast_queue = q }
+    end
+
+  run_solver: TABLERO_STATE
+    do
+      let res = QUEENS_SOLVER.solve(Current.board, Current.chk_count.is_checked)
+      let base: TABLERO_STATE = { Current with outcome = res, sol_idx = 0, solved_once = True }
+      if res.has_solution then
+        let msg =
+          if Current.chk_count.is_checked then
+            GLYPHS.join("✓ Solved & verified (", GLYPHS.join(NUMBER_TEXT.nat_to_text(res.solution_count), " solutions)"))
+          else
+            "✓ Solved — ensure: is_valid_solution(board, sol) [PROVEN]"
+          end
+        base.notify_success(msg)
+      else
+        base.notify_info("UNSAT: no valid placement satisfies current pins/blocks.")
+      end
+    end
+
+  set_board(b: BOARD, lbl: STRING, pidx: NAT): TABLERO_STATE
+    do
+      let sl = SLIDER.make(4, 10, 1, if b.size <= 10 then b.size else 10 end).with_label
+      { Current with
+        board = b,
+        preset_label = lbl,
+        preset_idx = pidx,
+        cur_row = 0,
+        cur_col = 0,
+        outcome = SOLVE_OUTCOME.empty,
+        sol_idx = 0,
+        solved_once = False,
+        size_slider = sl }
+    end
+
+  load_preset(idx: NAT): TABLERO_STATE
+    do
+      let p = if idx < 4 then idx else 0 end
+      let b = TABLERO_PRESETS.make_preset(p)
+      Current.set_board(b, TABLERO_PRESETS.preset_name(p), p).run_solver
+    end
+
+  resize_board(n: NAT): TABLERO_STATE
+    do
+      let cn = if n < 4 then 4 else if n > 10 then 10 else n end end
+      let b = BOARD.make(cn)
+      let lbl = GLYPHS.join("Custom ", GLYPHS.join(NUMBER_TEXT.nat_to_text(cn), GLYPHS.join("x", NUMBER_TEXT.nat_to_text(cn))))
+      Current.set_board(b, lbl, 4).notify_info(GLYPHS.join("Resized board to ", lbl))
+    end
+
+  toggle_pin_at(r: NAT, c: NAT): TABLERO_STATE
+    do
+      if r < Current.board.size and c < Current.board.size then
+        { Current with board = Current.board.toggle_pin(r, c), cur_row = r, cur_col = c, outcome = SOLVE_OUTCOME.empty, solved_once = False }
+      else
+        Current
+      end
+    end
+
+  toggle_block_at(r: NAT, c: NAT): TABLERO_STATE
+    do
+      if r < Current.board.size and c < Current.board.size then
+        { Current with board = Current.board.toggle_block(r, c), cur_row = r, cur_col = c, outcome = SOLVE_OUTCOME.empty, solved_once = False }
+      else
+        Current
+      end
+    end
+
+  apply_menu_choice(id: NAT): TUI_NEXT[TABLERO_STATE]
+    do
+      if id = 12 then
+        TUI_NEXT.next({ Current with quit_dialog = Current.quit_dialog.open })
+      else if id = 20 then
+        TUI_NEXT.next(Current.run_solver)
+      else if id = 21 then
+        TUI_NEXT.next({ Current with board = Current.board.clear_constraints, outcome = SOLVE_OUTCOME.empty, solved_once = False }.notify_info("Cleared all pins and blocks"))
+      else if id = 22 then
+        TUI_NEXT.next(Current.load_preset(Current.preset_idx))
+      else if id >= 30 and id <= 33 then
+        TUI_NEXT.next(Current.load_preset(id - 30))
+      else if id >= 40 and id <= 43 then
+        TUI_NEXT.next({ Current with theme_idx = id - 40 }.notify_info("Theme updated"))
+      else if id = 50 then
+        TUI_NEXT.next({ Current with help_shown = True })
+      else if id = 51 then
+        TUI_NEXT.next(Current.notify_info("Soundness, termination & lock-free OpenMP proved by Z3"))
+      else
+        TUI_NEXT.next(Current)
+      end end end end end end end end
+    end
+
+  handle_key(k: KEY): TUI_NEXT[TABLERO_STATE]
+    do
+      if Current.quit_dialog.is_open then
+        match k
+          case KeysEnded then TUI_NEXT.quit(0)
+          case _ then
+            let next_dlg = Current.quit_dialog.on_key(k)
+            match next_dlg.answer
+              case Some(ans) then
+                if ans = 0 then TUI_NEXT.quit(0)
+                else TUI_NEXT.next({ Current with quit_dialog = next_dlg.clear_answer })
+                end
+              case None then TUI_NEXT.next({ Current with quit_dialog = next_dlg })
+            end
+        end
+      else if Current.bar_menu.is_open then
+        match k
+          case KeysEnded then TUI_NEXT.quit(0)
+          case _ then
+            let next_m = Current.bar_menu.on_key(k)
+            match next_m.chosen
+              case Some(id) then { Current with bar_menu = next_m.clear_chosen }.apply_menu_choice(id)
+              case None then TUI_NEXT.next({ Current with bar_menu = next_m })
+            end
+        end
+      else if Current.help_shown then
+        match k
+          case KeysEnded then TUI_NEXT.quit(0)
+          case Escape then TUI_NEXT.next({ Current with help_shown = False })
+          case Enter then TUI_NEXT.next({ Current with help_shown = False })
+          case Char(c) then
+            if c = '?' then TUI_NEXT.next({ Current with help_shown = False })
+            else if c = 'q' then TUI_NEXT.quit(0)
+            else TUI_NEXT.next(Current)
+            end end
+          case _ then TUI_NEXT.next({ Current with help_modal = Current.help_modal.on_key(k, Current.area) })
+        end
+      else
+        match k
+          case KeysEnded then TUI_NEXT.quit(0)
+          case Function(n) then
+            if n = 10 then TUI_NEXT.next({ Current with bar_menu = Current.bar_menu.open })
+            else TUI_NEXT.next(Current)
+            end
+          case Tab then TUI_NEXT.next({ Current with keys_at = Current.keys_at.next })
+          case Up then
+            if Current.keys_at.has(1) and Current.right_tabs.selected = 2 then
+              let vis = TABLERO_LAYOUT.right_inner(Current.area).height
+              TUI_NEXT.next({ Current with contracts_view = Current.contracts_view.on_key(k, vis) })
+            else
+              let nr = if Current.cur_row > 0 then Current.cur_row - 1 else 0 end
+              TUI_NEXT.next({ Current with cur_row = nr })
+            end
+          case Down then
+            if Current.keys_at.has(1) and Current.right_tabs.selected = 2 then
+              let vis = TABLERO_LAYOUT.right_inner(Current.area).height
+              TUI_NEXT.next({ Current with contracts_view = Current.contracts_view.on_key(k, vis) })
+            else
+              let nr = if Current.cur_row + 1 < Current.board.size then Current.cur_row + 1 else Current.cur_row end
+              TUI_NEXT.next({ Current with cur_row = nr })
+            end
+          case Left then
+            let nc = if Current.cur_col > 0 then Current.cur_col - 1 else 0 end
+            TUI_NEXT.next({ Current with cur_col = nc })
+          case Right then
+            let nc = if Current.cur_col + 1 < Current.board.size then Current.cur_col + 1 else Current.cur_col end
+            TUI_NEXT.next({ Current with cur_col = nc })
+          case Enter then
+            TUI_NEXT.next(Current.toggle_pin_at(Current.cur_row, Current.cur_col))
+          case Char(c) then
+            if c = 'q' then TUI_NEXT.quit(0)
+            else if c = ' ' then TUI_NEXT.next(Current.run_solver)
+            else if c = 'x' then TUI_NEXT.next(Current.toggle_block_at(Current.cur_row, Current.cur_col))
+            else if c = 'c' then TUI_NEXT.next({ Current with board = Current.board.clear_constraints, outcome = SOLVE_OUTCOME.empty, solved_once = False }.notify_info("Cleared all pins and blocks"))
+            else if c = 'r' then TUI_NEXT.next(Current.load_preset(Current.preset_idx))
+            else if c = '?' then TUI_NEXT.next({ Current with help_shown = True })
+            else if c = 't' then
+              let nt = if Current.theme_idx < 3 then Current.theme_idx + 1 else 0 end
+              TUI_NEXT.next({ Current with theme_idx = nt })
+            else if c = '1' then TUI_NEXT.next(Current.load_preset(0))
+            else if c = '2' then TUI_NEXT.next(Current.load_preset(1))
+            else if c = '3' then TUI_NEXT.next(Current.load_preset(2))
+            else if c = '4' then TUI_NEXT.next(Current.load_preset(3))
+            else if c = '[' or c = ',' then TUI_NEXT.next(Current.prev_solution)
+            else if c = ']' or c = '.' then TUI_NEXT.next(Current.next_solution)
+            else if Current.right_tabs.takes(k) then
+              TUI_NEXT.next({ Current with right_tabs = Current.right_tabs.on_key(k) })
+            else
+              TUI_NEXT.next(Current)
+            end end end end end end end end end end end end end end
+          case _ then TUI_NEXT.next(Current)
+        end
+      end end end
+    end
+
+  handle_mouse(m: MOUSE): TUI_NEXT[TABLERO_STATE]
+    do
+      let area = Current.area
+      let menu_r = TABLERO_LAYOUT.menu_bar(area)
+      if Current.quit_dialog.is_open then
+        let next_dlg = Current.quit_dialog.on_mouse(m, area)
+        match next_dlg.answer
+          case Some(ans) then
+            if ans = 0 then TUI_NEXT.quit(0)
+            else TUI_NEXT.next({ Current with quit_dialog = next_dlg.clear_answer })
+            end
+          case None then TUI_NEXT.next({ Current with quit_dialog = next_dlg })
+        end
+      else if Current.help_shown then
+        if Current.help_modal.contains(area, m.x, m.y) then
+          TUI_NEXT.next({ Current with help_modal = Current.help_modal.on_mouse(m, area) })
+        else if m.is_left_down then
+          TUI_NEXT.next({ Current with help_shown = False })
+        else
+          TUI_NEXT.next(Current)
+        end end
+      else if Current.bar_menu.is_open or Current.bar_menu.contains(menu_r, area, m.x, m.y) then
+        let next_m = Current.bar_menu.on_mouse(m, menu_r, area)
+        match next_m.chosen
+          case Some(id) then { Current with bar_menu = next_m.clear_chosen }.apply_menu_choice(id)
+          case None then TUI_NEXT.next({ Current with bar_menu = next_m })
+        end
+      else if m.is_left_down and Current.toast_queue.toast_id_at(area, m.x, m.y).is_some then
+        TUI_NEXT.next({ Current with toast_queue = Current.toast_queue.on_mouse(m, area) })
+      else
+        let tabs_r = TABLERO_LAYOUT.right_tabs_area(area)
+        let b_solve = TABLERO_LAYOUT.btn_solve_area(area)
+        let b_prev = TABLERO_LAYOUT.btn_prev_area(area)
+        let b_next = TABLERO_LAYOUT.btn_next_area(area)
+        let b_clear = TABLERO_LAYOUT.btn_clear_area(area)
+        let b_reset = TABLERO_LAYOUT.btn_reset_area(area)
+        let sl_r = TABLERO_LAYOUT.size_slider_area(area)
+        let c_rays = TABLERO_LAYOUT.chk_rays_area(area)
+        let c_cnt = TABLERO_LAYOUT.chk_count_area(area)
+        let grid_r = TABLERO_LAYOUT.grid_area(area)
+        let ctl_r = TABLERO_LAYOUT.controls_bar(area)
+        let in_ctl_y = m.y >= ctl_r.y and m.y < ctl_r.bottom
+        let hit_solve = in_ctl_y and m.x >= b_solve.x and m.x < b_solve.right
+        let hit_prev = in_ctl_y and m.x >= b_prev.x and m.x < b_prev.right
+        let hit_next = in_ctl_y and m.x >= b_next.x and m.x < b_next.right
+        let hit_clear = in_ctl_y and m.x >= b_clear.x and m.x < b_clear.right
+        let hit_reset = in_ctl_y and m.x >= b_reset.x and m.x < b_reset.right
+        if tabs_r.has(m.x, m.y) then
+          TUI_NEXT.next({ Current with right_tabs = Current.right_tabs.on_mouse(m, tabs_r), keys_at = Current.keys_at.moved_to(1) })
+        else if m.is_left_down and hit_solve then
+          TUI_NEXT.next(Current.run_solver)
+        else if m.is_left_down and hit_prev then
+          TUI_NEXT.next(Current.prev_solution)
+        else if m.is_left_down and hit_next then
+          TUI_NEXT.next(Current.next_solution)
+        else if m.is_left_down and hit_clear then
+          TUI_NEXT.next({ Current with board = Current.board.clear_constraints, outcome = SOLVE_OUTCOME.empty, sol_idx = 0, solved_once = False }.notify_info("Cleared all pins and blocks"))
+        else if m.is_left_down and hit_reset then
+          TUI_NEXT.next(Current.load_preset(Current.preset_idx))
+        else if sl_r.has(m.x, m.y) then
+          let next_sl = Current.size_slider.on_mouse(m, sl_r)
+          if next_sl.value != Current.board.size then
+            TUI_NEXT.next({ Current.resize_board(next_sl.value) with size_slider = next_sl })
+          else
+            TUI_NEXT.next({ Current with size_slider = next_sl })
+          end
+        else if m.is_left_down and c_rays.has(m.x, m.y) then
+          TUI_NEXT.next({ Current with chk_rays = Current.chk_rays.on_mouse(m, c_rays) })
+        else if m.is_left_down and c_cnt.has(m.x, m.y) then
+          TUI_NEXT.next({ Current with chk_count = Current.chk_count.on_mouse(m, c_cnt) })
+        else if grid_r.has(m.x, m.y) then
+          let rr = BOARD_VIEW.row_at(grid_r, m.x, m.y, Current.board.size)
+          let cc = BOARD_VIEW.col_at(grid_r, m.x, m.y, Current.board.size)
+          if rr < Current.board.size and cc < Current.board.size then
+            match m.plain
+              case MouseDown(b, _, _) then
+                if b = 0 then TUI_NEXT.next(Current.toggle_pin_at(rr, cc))
+                else if b = 2 then TUI_NEXT.next(Current.toggle_block_at(rr, cc))
+                else TUI_NEXT.next(Current)
+                end end
+              case _ then TUI_NEXT.next(Current)
+            end
+          else
+            TUI_NEXT.next(Current)
+          end
+        else
+          TUI_NEXT.next(Current)
+        end end end end end end end end end end
+      end end end end
+    end
+
+end

@@ -1,0 +1,681 @@
+-- Application state and event routing for `posta`.
+-- Coordinates `IN_FLIGHT` (real non-blocking TCP/HTTP via `ghttp`) and `gjson`
+-- with `gtui` 0.6.0 (`TREE_VIEW`, `TEXT_AREA`, `INPUT_LINE`, `TABLE`, `TABS`,
+-- `BREADCRUMB`, `MENU`, `GAUGE`, `SPARKLINE`, `BUTTON`, `POPUP`, `DIALOG`, `TOAST`).
+module POSTA_STATE
+
+representation {NONE}
+  wide: NAT
+  high: NAT
+  -- Focus panes: 0=Collections tree, 1=URL input, 2=Request body editor, 3=Response view.
+  keys_at: FOCUS
+  bar_menu: MENU
+  base_host: STRING
+  base_port: NAT
+  custom_eps: LIST[ENDPOINT]
+  tree: TREE_VIEW
+  cur_ep: ENDPOINT
+  url_line: INPUT_LINE
+  body_editor: TEXT_AREA
+  req_tabs: TABS
+  resp_tabs: TABS
+  contracts_view: TEXT_VIEW
+  resp_view: TEXT_VIEW
+  flight: IN_FLIGHT
+  last_resp: RESPONSE_RECORD
+  latencies: LIST[NAT]
+  toast_queue: TOAST
+  tick_seq: NAT
+  help_modal: POPUP
+  help_shown: BOOL
+  quit_dialog: DIALOG
+  host_open: BOOL
+  host_input: INPUT_LINE
+  host_err: STRING
+  theme_idx: NAT
+
+invariant
+  valid_base_port: base_port >= 1 and base_port <= 65535
+  valid_base_host: base_host.byte_length >= 1 and base_host.byte_length <= 128
+  bounded_custom: custom_eps.length <= 32
+
+create {ANY}
+
+  make_menu: MENU
+    do
+      let none: LIST[MENU_ITEM] = LIST.empty
+      let file_items = none
+        .prepend(MENU_ITEM.item("Quit", 12).with_shortcut("q"))
+      let req_items = none
+        .prepend(MENU_ITEM.item("View Contracts", 23).with_shortcut("c"))
+        .prepend(MENU_ITEM.item("Save Request to Custom", 25).with_shortcut("a"))
+        .prepend(MENU_ITEM.item("Set Base Host:Port...", 24).with_shortcut("p"))
+        .prepend(MENU_ITEM.item("Cycle HTTP Method", 22).with_shortcut("m"))
+        .prepend(MENU_ITEM.separator)
+        .prepend(MENU_ITEM.item("Cancel Request", 21).with_shortcut("Esc"))
+        .prepend(MENU_ITEM.item("Send HTTP Request", 20).with_shortcut("F5"))
+      let theme_items = none
+        .prepend(MENU_ITEM.item("Dracula", 43))
+        .prepend(MENU_ITEM.item("Nord", 42))
+        .prepend(MENU_ITEM.item("Light", 41))
+        .prepend(MENU_ITEM.item("Dark", 40))
+      let help_items = none
+        .prepend(MENU_ITEM.item("About ghttp/gjson Proofs", 51))
+        .prepend(MENU_ITEM.item("Controls & Keys", 50).with_shortcut("?"))
+      let entries = none
+        .prepend(MENU_ITEM.submenu("Help", help_items))
+        .prepend(MENU_ITEM.submenu("Theme", theme_items))
+        .prepend(MENU_ITEM.submenu("Request", req_items))
+        .prepend(MENU_ITEM.submenu("File", file_items))
+      MENU.make(entries).with_border(BORDER_KIND.rounded)
+    end
+
+  make_help: POPUP
+    do
+      let l1 = "F5 / Ctrl+S: Send HTTP Request | Esc: Cancel In-Flight\n"
+      let l2 = "p: Set Base Host:Port (applies to all endpoints) | u: URL\n"
+      let l3 = "Tab: Cycle Focus (Collections / URL / Body / Response)\n"
+      let l4 = "m: Cycle Method (GET/POST/PUT/DELETE) | b/h/c: Req Tabs\n"
+      let l5 = "1 / 2: Response Body / Headers tabs | t: Cycle Theme | q: Quit\n"
+      let l6 = "Mouse: Click collections, buttons, tabs, URL bar, or JSON editor."
+      let p1 = GLYPHS.join(GLYPHS.join(l1, l2), GLYPHS.join(l3, l4))
+      let p2 = GLYPHS.join(l5, l6)
+      POPUP.of_text("Posta — Verified HTTP Workbench", GLYPHS.join(p1, p2), 66, 8)
+        .with_border(BORDER_KIND.rounded)
+        .with_padding(PADDING.symmetric(0, 1))
+        .with_footer("Esc / ? to close")
+    end
+
+  make_quit_dialog: DIALOG
+    do
+      DIALOG.confirm("Leave Posta?", "Exit the verified HTTP/REST workbench?")
+        .with_border(BORDER_KIND.rounded)
+    end
+
+  append_latency(xs: LIST[NAT], v: NAT): LIST[NAT]
+    do
+      let trimmed = if xs.length >= 24 then LIST_CUT.drop(xs, 1) else xs end
+      trimmed.append(LIST.empty.prepend(v))
+    end
+
+  make: POSTA_STATE
+    do
+      let h = "127.0.0.1"
+      let p: NAT = 8091
+      let empty_custom: LIST[ENDPOINT] = LIST.empty
+      let ep = POSTA_COLLECTIONS.default_endpoint(h, p)
+      let tv = TREE_VIEW.make(POSTA_COLLECTIONS.tree_nodes(p, empty_custom)).select_node(2, 16)
+      let resp0 = RESPONSE_RECORD.empty
+      { wide = 108,
+        high = 30,
+        keys_at = FOCUS.make(4),
+        bar_menu = POSTA_STATE.make_menu,
+        base_host = h,
+        base_port = p,
+        custom_eps = empty_custom,
+        tree = tv,
+        cur_ep = ep,
+        url_line = INPUT_LINE.of_text(ep.url_text),
+        body_editor = TEXT_AREA.of_text(ep.body),
+        req_tabs = TABS.empty.with("Body", 'b').with("Headers", 'h').with("Contracts", 'c'),
+        resp_tabs = TABS.empty.with("Response", '1').with("Resp Headers", '2'),
+        contracts_view = TEXT_VIEW.make(POSTA_PANELS.short_form_lines),
+        resp_view = TEXT_VIEW.make(POSTA_PANELS.split_lines(resp0.body_text)),
+        flight = IN_FLIGHT.fresh,
+        last_resp = resp0,
+        latencies = LIST.empty,
+        toast_queue = TOAST.empty.with_max_visible(1),
+        tick_seq = 0,
+        help_modal = POSTA_STATE.make_help,
+        help_shown = False,
+        quit_dialog = POSTA_STATE.make_quit_dialog,
+        host_open = False,
+        host_input = INPUT_LINE.of_text("127.0.0.1:8091"),
+        host_err = "",
+        theme_idx = 0 }
+    end
+
+  make_with_args(args: SEQ[STRING]): POSTA_STATE
+    do
+      let st = POSTA_STATE.make
+      let xs = args.to_list
+      if xs.length >= 2 then
+        let arg1 = LIST_OPS.at(xs, 1)
+        st.apply_base_target(arg1)
+      else
+        st
+      end
+    end
+
+feature {ANY}
+
+  area: RECT
+    do
+      RECT.sized(Current.wide, Current.high)
+    end
+
+  focus: FOCUS
+    do
+      Current.keys_at
+    end
+
+  top_menu: MENU
+    do
+      Current.bar_menu
+    end
+
+  collections_tree: TREE_VIEW
+    do
+      Current.tree
+    end
+
+  endpoint: ENDPOINT
+    do
+      Current.cur_ep
+    end
+
+  url: INPUT_LINE
+    do
+      Current.url_line
+    end
+
+  editor: TEXT_AREA
+    do
+      Current.body_editor
+    end
+
+  request_tabs: TABS
+    do
+      Current.req_tabs
+    end
+
+  response_tabs: TABS
+    do
+      Current.resp_tabs
+    end
+
+  contracts: TEXT_VIEW
+    do
+      Current.contracts_view
+    end
+
+  response_view: TEXT_VIEW
+    do
+      Current.resp_view
+    end
+
+  in_flight: IN_FLIGHT
+    do
+      Current.flight
+    end
+
+  response: RESPONSE_RECORD
+    do
+      Current.last_resp
+    end
+
+  latency_samples: LIST[NAT]
+    do
+      Current.latencies
+    end
+
+  toasts: TOAST
+    do
+      Current.toast_queue
+    end
+
+  help_open: BOOL
+    do
+      Current.help_shown
+    end
+
+  help_popup: POPUP
+    do
+      Current.help_modal
+    end
+
+  quit_dlg: DIALOG
+    do
+      Current.quit_dialog
+    end
+
+  host_modal_open: BOOL
+    do
+      Current.host_open
+    end
+
+  host_line: INPUT_LINE
+    do
+      Current.host_input
+    end
+
+  host_error: STRING
+    do
+      Current.host_err
+    end
+
+  base_authority: STRING
+    do
+      GLYPHS.join(Current.base_host, GLYPHS.join(":", NUMBER_TEXT.nat_to_text(Current.base_port)))
+    end
+
+  open_host_modal: POSTA_STATE
+    do
+      { Current with host_open = True, host_input = INPUT_LINE.of_text(Current.base_authority), host_err = "" }
+    end
+
+  -- Apply a new base `port`, `host:port`, or `http://host:port/path` to ALL collection endpoints and URL bar.
+  apply_base_target(raw: STRING): POSTA_STATE
+    do
+      match ENDPOINT_PARSER.parse_target_override(raw, Current.base_host, Current.cur_ep.path, Current.cur_ep.method, Current.body_editor.text)
+        case None then
+          { Current with host_err = "Use <port> (e.g. 8091) or <ipv4>:<port> (e.g. 127.0.0.1:9000)" }
+        case Some(parsed) then
+          let nh = parsed.host
+          let np = parsed.port
+          let updated_ep = ENDPOINT.make(Current.cur_ep.name, Current.cur_ep.method, nh, np, parsed.path, Current.body_editor.text)
+          let rows = POSTA_LAYOUT.tree_area(Current.area).height
+          let next_tv = Current.tree.with_nodes(POSTA_COLLECTIONS.tree_nodes(np, Current.custom_eps), if rows > 0 then rows else 16 end)
+          let auth = GLYPHS.join(nh, GLYPHS.join(":", NUMBER_TEXT.nat_to_text(np)))
+          { Current with
+            base_host = nh,
+            base_port = np,
+            tree = next_tv,
+            cur_ep = updated_ep,
+            url_line = INPUT_LINE.of_text(updated_ep.url_text),
+            host_open = False,
+            host_err = "" }.notify_success(GLYPHS.join("Base target set to ", auth))
+      end
+    end
+
+  -- Save the current URL bar + Method + Body as a new Custom endpoint in the Collections tree.
+  add_current_to_custom: POSTA_STATE
+    do
+      if Current.custom_eps.length >= 32 then
+        Current.notify_info("Custom collection full (max 32 endpoints).")
+      else
+        let body_s = Current.body_editor.text
+        match ENDPOINT_PARSER.parse(Current.url_line.text, "Custom", Current.cur_ep.method, body_s)
+          case None then
+            Current.notify_info("Cannot save: invalid URL (use http://host:port/path).")
+          case Some(ep) then
+            let label = POSTA_COLLECTIONS.custom_node_label(ep)
+            let saved = ENDPOINT.make(label, ep.method, Current.base_host, Current.base_port, ep.path, ep.body)
+            let next_custom = Current.custom_eps.append(LIST.empty.prepend(saved))
+            let rows = POSTA_LAYOUT.tree_area(Current.area).height
+            let vis = if rows > 0 then rows else 16 end
+            let next_tv = Current.tree.with_nodes(POSTA_COLLECTIONS.tree_nodes(Current.base_port, next_custom), vis)
+              .select_node(11 + next_custom.length, vis)
+            { Current with custom_eps = next_custom, tree = next_tv, cur_ep = saved }
+              .notify_success(GLYPHS.join("✓ Added to Custom: ", label))
+        end
+      end
+    end
+
+  theme: THEME
+    do
+      if Current.theme_idx = 0 then THEME.dark
+      else if Current.theme_idx = 1 then THEME.light
+      else if Current.theme_idx = 2 then THEME.nord
+      else THEME.dracula
+      end end end
+    end
+
+  breadcrumb: BREADCRUMB
+    do
+      let empty: LIST[STRING] = LIST.empty
+      let crumbs = empty
+        .prepend(ENDPOINT.method_name(Current.cur_ep.method))
+        .prepend(Current.cur_ep.name)
+        .prepend("Posta")
+      BREADCRUMB.make(crumbs)
+    end
+
+  sized(w: NAT, h: NAT): POSTA_STATE
+    do
+      { Current with wide = w, high = h }
+    end
+
+  notify_info(msg: STRING): POSTA_STATE
+    do
+      let nt = if Current.tick_seq < 1000000 then Current.tick_seq + 1 else 0 end
+      let q = TOAST.empty.with_max_visible(1).push_info(msg, 2).tick(nt)
+      { Current with tick_seq = nt, toast_queue = q }
+    end
+
+  notify_success(msg: STRING): POSTA_STATE
+    do
+      let nt = if Current.tick_seq < 1000000 then Current.tick_seq + 1 else 0 end
+      let q = TOAST.empty.with_max_visible(1).push_success(msg, 3).tick(nt)
+      { Current with tick_seq = nt, toast_queue = q }
+    end
+
+  load_endpoint(ep: ENDPOINT): POSTA_STATE
+    do
+      { Current with cur_ep = ep, url_line = INPUT_LINE.of_text(ep.url_text), body_editor = TEXT_AREA.of_text(ep.body) }
+    end
+
+  cycle_method: POSTA_STATE
+    do
+      let nm = ENDPOINT.next_method(Current.cur_ep.method)
+      { Current with cur_ep = Current.cur_ep.with_method(nm) }
+    end
+
+  -- Apply a `FLIGHT_STEP` transition from `IN_FLIGHT`, updating response & latency sparkline if finished.
+  apply_flight(step: FLIGHT_STEP[IN_FLIGHT]): TUI_NEXT[POSTA_STATE]
+    do
+      match step.outcome
+        case None then
+          Next({ Current with flight = step.state }, step.commands)
+        case Some(resp) then
+          let rv = TEXT_VIEW.make(POSTA_PANELS.split_lines(resp.body_text))
+          let lats =
+            if resp.has_response then
+              POSTA_STATE.append_latency(Current.latencies, if resp.elapsed > 0 then resp.elapsed else 1 end)
+            else
+              Current.latencies
+            end
+          let base: POSTA_STATE = { Current with flight = step.state, last_resp = resp, resp_view = rv, latencies = lats }
+          let noted =
+            if resp.has_response then
+              base.notify_success(resp.status_banner)
+            else
+              base.notify_info(resp.status_banner)
+            end
+          Next(noted, step.commands)
+      end
+    end
+
+  -- Parse the current URL bar + body editor, build a verified `HTTP_REQUEST`, and launch it.
+  send_request: TUI_NEXT[POSTA_STATE]
+    do
+      if Current.flight.is_active then
+        TUI_NEXT.next(Current.notify_info("Request already in flight (bounded <= 1). Press Esc to cancel."))
+      else
+        let body_s = Current.body_editor.text
+        match ENDPOINT_PARSER.parse(Current.url_line.text, Current.cur_ep.name, Current.cur_ep.method, body_s)
+          case None then
+            TUI_NEXT.next(Current.notify_info("Invalid URL — use http://host:port/path"))
+          case Some(ep) then
+            match ep.to_http_request
+              case None then
+                TUI_NEXT.next(Current.notify_info("Request rejected by ghttp bounds/framing check."))
+              case Some(req) then
+                if HTTP_REQUEST_WRITER.sendable(req) then
+                  let st = { Current with cur_ep = ep }
+                  st.apply_flight(st.flight.start(ep.host, ep.port, req))
+                else
+                  TUI_NEXT.next(Current.notify_info("Request not sendable."))
+                end
+            end
+        end
+      end
+    end
+
+  cancel_request: TUI_NEXT[POSTA_STATE]
+    do
+      if Current.flight.is_active then
+        Current.apply_flight(Current.flight.cancel)
+      else
+        TUI_NEXT.next(Current)
+      end
+    end
+
+  -- Handle async socket & timer events from the Gardel runtime.
+  handle_connected(t: NAT, c: CONN_ID): TUI_NEXT[POSTA_STATE]
+    do
+      Current.apply_flight(Current.flight.on_connected(t, c))
+    end
+
+  handle_connect_failed(t: NAT): TUI_NEXT[POSTA_STATE]
+    do
+      Current.apply_flight(Current.flight.on_connect_failed(t, "Connection refused or unreachable"))
+    end
+
+  handle_received(c: CONN_ID, data: BYTES): TUI_NEXT[POSTA_STATE]
+    do
+      Current.apply_flight(Current.flight.on_received(c, data))
+    end
+
+  handle_closed(c: CONN_ID): TUI_NEXT[POSTA_STATE]
+    do
+      Current.apply_flight(Current.flight.on_closed(c))
+    end
+
+  handle_tick(id: NAT): TUI_NEXT[POSTA_STATE]
+    do
+      Current.apply_flight(Current.flight.on_tick(id))
+    end
+
+  apply_menu_choice(id: NAT): TUI_NEXT[POSTA_STATE]
+    do
+      if id = 12 then
+        TUI_NEXT.next({ Current with quit_dialog = Current.quit_dialog.open })
+      else if id = 20 then
+        Current.send_request
+      else if id = 21 then
+        Current.cancel_request
+      else if id = 22 then
+        TUI_NEXT.next(Current.cycle_method)
+      else if id = 23 then
+        TUI_NEXT.next({ Current with req_tabs = Current.req_tabs.choose(2) })
+      else if id = 24 then
+        TUI_NEXT.next(Current.open_host_modal)
+      else if id = 25 then
+        TUI_NEXT.next(Current.add_current_to_custom)
+      else if id >= 40 and id <= 43 then
+        TUI_NEXT.next({ Current with theme_idx = id - 40 }.notify_info("Theme updated"))
+      else if id = 50 then
+        TUI_NEXT.next({ Current with help_shown = True })
+      else if id = 51 then
+        TUI_NEXT.next(Current.notify_info("HTTP framing, JSON & bounded in-flight proved by Z3"))
+      else
+        TUI_NEXT.next(Current)
+      end end end end end end end end end end
+    end
+
+  sync_tree_selection(tv: TREE_VIEW): POSTA_STATE
+    do
+      let base: POSTA_STATE = { Current with tree = tv }
+      match tv.selected_node
+        case Some(idx) then
+          match POSTA_COLLECTIONS.endpoint_for_node(idx, Current.base_host, Current.base_port, Current.custom_eps)
+            case Some(ep) then base.load_endpoint(ep)
+            case None then base
+          end
+        case None then base
+      end
+    end
+
+  handle_key(k: KEY): TUI_NEXT[POSTA_STATE]
+    do
+      if Current.quit_dialog.is_open then
+        match k
+          case KeysEnded then TUI_NEXT.quit(0)
+          case _ then
+            let next_dlg = Current.quit_dialog.on_key(k)
+            match next_dlg.answer
+              case Some(ans) then
+                if ans = 0 then TUI_NEXT.quit(0)
+                else TUI_NEXT.next({ Current with quit_dialog = next_dlg.clear_answer })
+                end
+              case None then TUI_NEXT.next({ Current with quit_dialog = next_dlg })
+            end
+        end
+      else if Current.host_open then
+        match k
+          case KeysEnded then TUI_NEXT.quit(0)
+          case Escape then TUI_NEXT.next({ Current with host_open = False, host_err = "" })
+          case Enter then TUI_NEXT.next(Current.apply_base_target(Current.host_input.text))
+          case _ then TUI_NEXT.next({ Current with host_input = Current.host_input.on_key(k), host_err = "" })
+        end
+      else if Current.bar_menu.is_open then
+        match k
+          case KeysEnded then TUI_NEXT.quit(0)
+          case _ then
+            let next_m = Current.bar_menu.on_key(k)
+            match next_m.chosen
+              case Some(id) then { Current with bar_menu = next_m.clear_chosen }.apply_menu_choice(id)
+              case None then TUI_NEXT.next({ Current with bar_menu = next_m })
+            end
+        end
+      else if Current.help_shown then
+        match k
+          case KeysEnded then TUI_NEXT.quit(0)
+          case Escape then TUI_NEXT.next({ Current with help_shown = False })
+          case Enter then TUI_NEXT.next({ Current with help_shown = False })
+          case Char(c) then
+            if c = '?' then TUI_NEXT.next({ Current with help_shown = False })
+            else if c = 'q' then TUI_NEXT.quit(0)
+            else TUI_NEXT.next(Current)
+            end end
+          case _ then TUI_NEXT.next({ Current with help_modal = Current.help_modal.on_key(k, Current.area) })
+        end
+      else
+        -- Global hotkeys that work regardless of focused pane:
+        match k
+          case KeysEnded then TUI_NEXT.quit(0)
+          case Function(n) then
+            if n = 5 then Current.send_request
+            else if n = 10 then TUI_NEXT.next({ Current with bar_menu = Current.bar_menu.open })
+            else TUI_NEXT.next(Current)
+            end end
+          case Ctrl(c) then
+            if c = 's' then Current.send_request
+            else if Current.keys_at.has(2) and Current.req_tabs.selected = 0 then
+              TUI_NEXT.next({ Current with body_editor = Current.body_editor.on_key(k, POSTA_LAYOUT.req_editor_area(Current.area)) })
+            else
+              TUI_NEXT.next(Current)
+            end end
+          case Escape then
+            if Current.flight.is_active then Current.cancel_request
+            else TUI_NEXT.next({ Current with keys_at = Current.keys_at.moved_to(0) })
+            end
+          case Tab then
+            TUI_NEXT.next({ Current with keys_at = Current.keys_at.next })
+          case _ then
+            -- Route to URL input (pane 1) or JSON Body editor (pane 2) when focused.
+            if Current.keys_at.has(1) then
+              match k
+                case Enter then Current.send_request
+                case _ then TUI_NEXT.next({ Current with url_line = Current.url_line.on_key(k) })
+              end
+            else if Current.keys_at.has(2) and Current.req_tabs.selected = 0 then
+              TUI_NEXT.next({ Current with body_editor = Current.body_editor.on_key(k, POSTA_LAYOUT.req_editor_area(Current.area)) })
+            else if Current.keys_at.has(0) then
+              match k
+                case Up then TUI_NEXT.next(Current.sync_tree_selection(Current.tree.on_key(k, POSTA_LAYOUT.tree_area(Current.area).height)))
+                case Down then TUI_NEXT.next(Current.sync_tree_selection(Current.tree.on_key(k, POSTA_LAYOUT.tree_area(Current.area).height)))
+                case Left then TUI_NEXT.next(Current.sync_tree_selection(Current.tree.on_key(k, POSTA_LAYOUT.tree_area(Current.area).height)))
+                case Right then TUI_NEXT.next(Current.sync_tree_selection(Current.tree.on_key(k, POSTA_LAYOUT.tree_area(Current.area).height)))
+                case Enter then Current.send_request
+                case Char(c) then Current.handle_global_char(c, k)
+                case _ then TUI_NEXT.next(Current)
+              end
+            else
+              match k
+                case Up then
+                  if Current.keys_at.has(2) and Current.req_tabs.selected = 2 then
+                    let vis = POSTA_LAYOUT.req_inner(Current.area).drop_top(2).height
+                    TUI_NEXT.next({ Current with contracts_view = Current.contracts_view.on_key(k, vis) })
+                  else
+                    let vis = POSTA_LAYOUT.resp_inner(Current.area).drop_top(1).height
+                    TUI_NEXT.next({ Current with resp_view = Current.resp_view.on_key(k, vis) })
+                  end
+                case Down then
+                  if Current.keys_at.has(2) and Current.req_tabs.selected = 2 then
+                    let vis = POSTA_LAYOUT.req_inner(Current.area).drop_top(2).height
+                    TUI_NEXT.next({ Current with contracts_view = Current.contracts_view.on_key(k, vis) })
+                  else
+                    let vis = POSTA_LAYOUT.resp_inner(Current.area).drop_top(1).height
+                    TUI_NEXT.next({ Current with resp_view = Current.resp_view.on_key(k, vis) })
+                  end
+                case Char(c) then Current.handle_global_char(c, k)
+                case _ then TUI_NEXT.next(Current)
+              end
+            end end end
+        end
+      end end end end
+    end
+
+  handle_global_char(c: CHAR, k: KEY): TUI_NEXT[POSTA_STATE]
+    do
+      if c = 'q' then TUI_NEXT.quit(0)
+      else if c = 'm' then TUI_NEXT.next(Current.cycle_method)
+      else if c = 'p' then TUI_NEXT.next(Current.open_host_modal)
+      else if c = 'a' then TUI_NEXT.next(Current.add_current_to_custom)
+      else if c = 'u' then TUI_NEXT.next({ Current with keys_at = Current.keys_at.moved_to(1) })
+      else if c = '?' then TUI_NEXT.next({ Current with help_shown = True })
+      else if c = 't' then
+        let nt = if Current.theme_idx < 3 then Current.theme_idx + 1 else 0 end
+        TUI_NEXT.next({ Current with theme_idx = nt })
+      else if Current.req_tabs.takes(k) then
+        TUI_NEXT.next({ Current with req_tabs = Current.req_tabs.on_key(k) })
+      else if Current.resp_tabs.takes(k) then
+        TUI_NEXT.next({ Current with resp_tabs = Current.resp_tabs.on_key(k) })
+      else
+        TUI_NEXT.next(Current)
+      end end end end end end end end end
+    end
+
+  handle_mouse(m: MOUSE): TUI_NEXT[POSTA_STATE]
+    do
+      let area = Current.area
+      let menu_r = POSTA_LAYOUT.menu_bar(area)
+      if Current.quit_dialog.is_open then
+        let next_dlg = Current.quit_dialog.on_mouse(m, area)
+        match next_dlg.answer
+          case Some(ans) then
+            if ans = 0 then TUI_NEXT.quit(0)
+            else TUI_NEXT.next({ Current with quit_dialog = next_dlg.clear_answer })
+            end
+          case None then TUI_NEXT.next({ Current with quit_dialog = next_dlg })
+        end
+      else if Current.host_open then
+        TUI_NEXT.next(Current)
+      else if Current.help_shown then
+        if Current.help_modal.contains(area, m.x, m.y) then
+          TUI_NEXT.next({ Current with help_modal = Current.help_modal.on_mouse(m, area) })
+        else if m.is_left_down then
+          TUI_NEXT.next({ Current with help_shown = False })
+        else
+          TUI_NEXT.next(Current)
+        end end
+      else if Current.bar_menu.is_open or Current.bar_menu.contains(menu_r, area, m.x, m.y) then
+        let next_m = Current.bar_menu.on_mouse(m, menu_r, area)
+        match next_m.chosen
+          case Some(id) then { Current with bar_menu = next_m.clear_chosen }.apply_menu_choice(id)
+          case None then TUI_NEXT.next({ Current with bar_menu = next_m })
+        end
+      else if m.is_left_down and Current.toast_queue.toast_id_at(area, m.x, m.y).is_some then
+        TUI_NEXT.next({ Current with toast_queue = Current.toast_queue.on_mouse(m, area) })
+      else
+        let b_method = POSTA_LAYOUT.btn_method_area(area)
+        let b_send = POSTA_LAYOUT.btn_send_area(area)
+        let url_r = POSTA_LAYOUT.url_input_area(area)
+        let tree_r = POSTA_LAYOUT.tree_area(area)
+        let req_tr = POSTA_LAYOUT.req_tabs_area(area)
+        let resp_tr = POSTA_LAYOUT.resp_tabs_area(area)
+        let ed_r = POSTA_LAYOUT.req_editor_area(area)
+        if m.is_left_down and b_method.has(m.x, m.y) then
+          TUI_NEXT.next(Current.cycle_method)
+        else if m.is_left_down and b_send.has(m.x, m.y) then
+          if Current.flight.is_active then Current.cancel_request else Current.send_request end
+        else if m.is_left_down and url_r.has(m.x, m.y) then
+          TUI_NEXT.next({ Current with keys_at = Current.keys_at.moved_to(1) })
+        else if req_tr.has(m.x, m.y) then
+          TUI_NEXT.next({ Current with req_tabs = Current.req_tabs.on_mouse(m, req_tr), keys_at = Current.keys_at.moved_to(2) })
+        else if resp_tr.has(m.x, m.y) then
+          TUI_NEXT.next({ Current with resp_tabs = Current.resp_tabs.on_mouse(m, resp_tr), keys_at = Current.keys_at.moved_to(3) })
+        else if tree_r.has(m.x, m.y) then
+          let tv = Current.tree.on_mouse(m, tree_r)
+          TUI_NEXT.next({ Current.sync_tree_selection(tv) with keys_at = Current.keys_at.moved_to(0) })
+        else if ed_r.has(m.x, m.y) and Current.req_tabs.selected = 0 then
+          TUI_NEXT.next({ Current with body_editor = Current.body_editor.on_mouse(m, ed_r), keys_at = Current.keys_at.moved_to(2) })
+        else
+          TUI_NEXT.next(Current)
+        end end end end end end end
+      end end end end end
+    end
+
+end

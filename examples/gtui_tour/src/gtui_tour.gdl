@@ -48,7 +48,8 @@ feature {ANY}
       let b = s.project_tabs.draw(a, FRAME.title_area(left), t.base, chosen)
       let c = s.tree.draw(b, FRAME.inner(left), t.base, mark)
       let d = FRAME.draw(c, right, s.title, edge(s, 1), edge(s, 1).patch(STYLE.plain.reversed))
-      let e = s.text.draw_code(d, FRAME.inner(right), t.base, t.gutter, s.marked,
+      let bc_drawn = s.breadcrumb.draw(d, TOUR_LAYOUT.breadcrumb_bar(area), t.base, t.active_tab, t.selection, t.gutter)
+      let e = s.text.draw_code(bc_drawn, TOUR_LAYOUT.source_area(area), t.base, t.gutter, s.marked,
         t.marked, fn(i: NAT, line: STRING): LIST[SPAN] do TOUR_LEXER.spans_with(t, i, line) end)
       let f = FRAME.draw(e, bottom, "", edge(s, 2), edge(s, 2))
       let g = s.output_tabs.draw(f, FRAME.title_area(bottom), t.base, chosen)
@@ -59,16 +60,23 @@ feature {ANY}
         else
           s.problems.draw(g, inner, t.base, mark)
         end
+      let with_menu = s.top_menu.draw(h, TOUR_LAYOUT.menu_bar(area), t.base, t.base, t.selection, t.gutter)
       let with_palette =
         if s.palette_open then
-          s.palette.draw(h, TOUR_LAYOUT.palette(area, s.palette), t.base, t.marked, t.focused_border)
+          s.palette.draw(with_menu, TOUR_LAYOUT.palette(area, s.palette), t.base, t.marked, t.focused_border)
         else
-          h
+          with_menu
         end
-      if s.help_open then
-        s.help_popup.draw(with_palette, area, t.base, t.focused_border, t.active_tab)
+      let with_help =
+        if s.help_open then
+          s.help_popup.draw(with_palette, area, t.base, t.focused_border, t.active_tab)
+        else
+          with_palette
+        end
+      if s.dialog_open then
+        s.dialog.draw(with_help, area, t.base, t.focused_border, t.active_tab, t.base, t.selection)
       else
-        with_palette
+        with_help
       end
     end
 

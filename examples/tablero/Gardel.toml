@@ -1,0 +1,6 @@
+[project]
+name = "tablero"
+version = "0.1.0"
+
+[dependencies]
+gtui = { path = "../../gtui" }

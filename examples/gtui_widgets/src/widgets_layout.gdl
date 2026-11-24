@@ -1,0 +1,191 @@
+-- Layout for the `gtui_widgets` 0.6.0 showcase:
+--   Row 0:        MENU bar
+--   Row 1:        BREADCRUMB path bar
+--   Middle rows:  Left controls pane (DIVIDERs, CHECKBOXes, SLIDERs, BUTTONs) | vertical DIVIDER | Right live preview pane
+--   Bottom row:   STATUS_BAR
+functions WIDGETS_LAYOUT
+
+feature {ANY}
+
+  menu_bar(area: RECT): RECT
+    do
+      let res = area.take_top(1)
+      check c: RECT.cut_top(area, 1) end
+      res
+    ensure
+      within: Result.inside(area)
+    end
+
+  breadcrumb_bar(area: RECT): RECT
+    do
+      let below = area.drop_top(1)
+      let res = below.take_top(1)
+      check c1: RECT.cut_top(area, 1) end
+      check c2: RECT.cut_top(below, 1) end
+      check tr: RECT.inside_trans(res, below, area) end
+      res
+    ensure
+      within: Result.inside(area)
+    end
+
+  status_bar(area: RECT): RECT
+    do
+      let res = area.take_bottom(1)
+      check c: RECT.cut_bottom(area, 1) end
+      res
+    ensure
+      within: Result.inside(area)
+    end
+
+  body(area: RECT): RECT
+    do
+      let below = area.drop_top(2)
+      let res = below.drop_bottom(1)
+      check c1: RECT.cut_top(area, 2) end
+      check c2: RECT.cut_bottom(below, 1) end
+      check tr: RECT.inside_trans(res, below, area) end
+      res
+    ensure
+      within: Result.inside(area)
+    end
+
+  left_pane(area: RECT): RECT
+    do
+      let b = WIDGETS_LAYOUT.body(area)
+      let w = if b.width >= 40 then 36 else b.width / 2 end
+      let res = b.take_left(w)
+      check c: RECT.cut_left(b, w) end
+      check tr: RECT.inside_trans(res, b, area) end
+      res
+    ensure
+      within: Result.inside(area)
+    end
+
+  vdiv_area(area: RECT): RECT
+    do
+      let b = WIDGETS_LAYOUT.body(area)
+      let w = if b.width >= 40 then 36 else b.width / 2 end
+      let rest = b.drop_left(w)
+      let res = rest.take_left(1)
+      check c1: RECT.cut_left(b, w) end
+      check c2: RECT.cut_left(rest, 1) end
+      check t1: RECT.inside_trans(res, rest, b) end
+      check t2: RECT.inside_trans(res, b, area) end
+      res
+    ensure
+      within: Result.inside(area)
+    end
+
+  right_pane(area: RECT): RECT
+    do
+      let b = WIDGETS_LAYOUT.body(area)
+      let w = if b.width >= 40 then 36 else b.width / 2 end
+      let rest = b.drop_left(w)
+      let res = rest.drop_left(1)
+      check c1: RECT.cut_left(b, w) end
+      check c2: RECT.cut_left(rest, 1) end
+      check t1: RECT.inside_trans(res, rest, b) end
+      check t2: RECT.inside_trans(res, b, area) end
+      res
+    ensure
+      within: Result.inside(area)
+    end
+
+  controls_inner(area: RECT): RECT
+    do
+      let lp = WIDGETS_LAYOUT.left_pane(area)
+      let inner = FRAME.inner(lp)
+      let res = FRAME.inner_padded(lp, PADDING.symmetric(0, 1))
+      check t1: RECT.inside_trans(res, inner, lp) end
+      check t2: RECT.inside_trans(res, lp, area) end
+      res
+    ensure
+      within: Result.inside(area)
+    end
+
+  control_row(area: RECT, row_idx: NAT): RECT
+    do
+      let ci = WIDGETS_LAYOUT.controls_inner(area)
+      let d = ci.drop_top(row_idx)
+      let res = d.take_top(1)
+      check c1: RECT.cut_top(ci, row_idx) end
+      check c2: RECT.cut_top(d, 1) end
+      check t1: RECT.inside_trans(res, d, ci) end
+      check t2: RECT.inside_trans(res, ci, area) end
+      res
+    ensure
+      within: Result.inside(area)
+    end
+
+  div_options_area(area: RECT): RECT do WIDGETS_LAYOUT.control_row(area, 0) ensure within: Result.inside(area) end
+  chk_wrap_area(area: RECT): RECT do WIDGETS_LAYOUT.control_row(area, 1) ensure within: Result.inside(area) end
+  chk_nums_area(area: RECT): RECT do WIDGETS_LAYOUT.control_row(area, 2) ensure within: Result.inside(area) end
+  chk_bold_area(area: RECT): RECT do WIDGETS_LAYOUT.control_row(area, 3) ensure within: Result.inside(area) end
+
+  div_tuning_area(area: RECT): RECT do WIDGETS_LAYOUT.control_row(area, 5) ensure within: Result.inside(area) end
+  sld_width_label_area(area: RECT): RECT do WIDGETS_LAYOUT.control_row(area, 6) ensure within: Result.inside(area) end
+  sld_width_area(area: RECT): RECT do WIDGETS_LAYOUT.control_row(area, 7) ensure within: Result.inside(area) end
+  sld_indent_label_area(area: RECT): RECT do WIDGETS_LAYOUT.control_row(area, 8) ensure within: Result.inside(area) end
+  sld_indent_area(area: RECT): RECT do WIDGETS_LAYOUT.control_row(area, 9) ensure within: Result.inside(area) end
+
+  div_actions_area(area: RECT): RECT do WIDGETS_LAYOUT.control_row(area, 11) ensure within: Result.inside(area) end
+
+  buttons_row(area: RECT): RECT
+    do
+      WIDGETS_LAYOUT.control_row(area, 12)
+    ensure
+      within: Result.inside(area)
+    end
+
+  btn_apply_area(area: RECT): RECT
+    do
+      let row = WIDGETS_LAYOUT.buttons_row(area)
+      let res = row.take_left(9)
+      check c: RECT.cut_left(row, 9) end
+      check tr: RECT.inside_trans(res, row, area) end
+      res
+    ensure
+      within: Result.inside(area)
+    end
+
+  btn_toast_area(area: RECT): RECT
+    do
+      let row = WIDGETS_LAYOUT.buttons_row(area)
+      let rest = row.drop_left(10)
+      let res = rest.take_left(9)
+      check c1: RECT.cut_left(row, 10) end
+      check c2: RECT.cut_left(rest, 9) end
+      check t1: RECT.inside_trans(res, rest, row) end
+      check t2: RECT.inside_trans(res, row, area) end
+      res
+    ensure
+      within: Result.inside(area)
+    end
+
+  btn_reset_area(area: RECT): RECT
+    do
+      let row = WIDGETS_LAYOUT.buttons_row(area)
+      let rest = row.drop_left(20)
+      let res = rest.take_left(9)
+      check c1: RECT.cut_left(row, 20) end
+      check c2: RECT.cut_left(rest, 9) end
+      check t1: RECT.inside_trans(res, rest, row) end
+      check t2: RECT.inside_trans(res, row, area) end
+      res
+    ensure
+      within: Result.inside(area)
+    end
+
+  preview_inner(area: RECT): RECT
+    do
+      let rp = WIDGETS_LAYOUT.right_pane(area)
+      let inner = FRAME.inner(rp)
+      let res = FRAME.inner_padded(rp, PADDING.symmetric(0, 1))
+      check t1: RECT.inside_trans(res, inner, rp) end
+      check t2: RECT.inside_trans(res, rp, area) end
+      res
+    ensure
+      within: Result.inside(area)
+    end
+
+end

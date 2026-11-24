@@ -1,0 +1,174 @@
+-- Shared pure layout geometry for `clrs_studio`.
+-- Used identically by `view` and mouse hit-testing so rendering and clicks always agree.
+functions STUDIO_LAYOUT
+
+feature {ANY}
+
+  -- Top-to-bottom split: 1-row menu bar, main split panes, 3-row transport bar, 1-row status bar.
+  vertical_parts(area: RECT): LIST[RECT]
+    do
+      let sizes: LIST[SIZE] = LIST.empty
+        .prepend(SIZE.fixed(1))
+        .prepend(SIZE.fixed(3))
+        .prepend(SIZE.min(8))
+        .prepend(SIZE.fixed(1))
+      LAYOUT.rows(area, sizes)
+    ensure
+      four: Result.length = 4
+    end
+
+  menu_bar(area: RECT): RECT
+    do
+      LIST_OPS.at(STUDIO_LAYOUT.vertical_parts(area), 0)
+    end
+
+  main_area(area: RECT): RECT
+    do
+      LIST_OPS.at(STUDIO_LAYOUT.vertical_parts(area), 1)
+    end
+
+  transport_bar(area: RECT): RECT
+    do
+      LIST_OPS.at(STUDIO_LAYOUT.vertical_parts(area), 2)
+    end
+
+  status_bar(area: RECT): RECT
+    do
+      LIST_OPS.at(STUDIO_LAYOUT.vertical_parts(area), 3)
+    end
+
+  -- Left visualization pane (58%) and right verified spec pane (42%), sharing 1 border column
+  -- so `FRAME.merge_borders` joins their corners cleanly into `┬` and `┴`.
+  viz_pane(area: RECT): RECT
+    do
+      let m = STUDIO_LAYOUT.main_area(area)
+      let lw = m.width * 58 / 100
+      m.take_left(lw)
+    end
+
+  spec_pane(area: RECT): RECT
+    do
+      let m = STUDIO_LAYOUT.main_area(area)
+      let lw = m.width * 58 / 100
+      m.drop_left(if lw > 0 then lw - 1 else 0 end)
+    end
+
+  viz_inner(area: RECT): RECT
+    do
+      FRAME.inner_padded(STUDIO_LAYOUT.viz_pane(area), PADDING.symmetric(0, 1))
+    end
+
+  chart_area(area: RECT): RECT
+    do
+      let inn = STUDIO_LAYOUT.viz_inner(area)
+      if inn.height > 3 then inn.drop_bottom(2) else inn end
+    end
+
+  chk_highlight_area(area: RECT): RECT
+    do
+      let inn = STUDIO_LAYOUT.viz_inner(area)
+      if inn.height > 3 then inn.take_bottom(2).take_top(1) else inn.take_bottom(0) end
+    end
+
+  chk_values_area(area: RECT): RECT
+    do
+      let inn = STUDIO_LAYOUT.viz_inner(area)
+      if inn.height > 3 then inn.take_bottom(1) else inn.take_bottom(0) end
+    end
+
+  spec_tabs_area(area: RECT): RECT
+    do
+      FRAME.title_area(STUDIO_LAYOUT.spec_pane(area))
+    end
+
+  spec_inner(area: RECT): RECT
+    do
+      FRAME.inner_padded(STUDIO_LAYOUT.spec_pane(area), PADDING.symmetric(0, 1))
+    end
+
+  invariants_list_area(area: RECT): RECT
+    do
+      STUDIO_LAYOUT.spec_inner(area).take_top(5)
+    end
+
+  variant_divider_area(area: RECT): RECT
+    do
+      STUDIO_LAYOUT.spec_inner(area).drop_top(5).take_top(1)
+    end
+
+  variant_gauge_area(area: RECT): RECT
+    do
+      STUDIO_LAYOUT.spec_inner(area).drop_top(6).take_top(1)
+    end
+
+  vars_divider_area(area: RECT): RECT
+    do
+      STUDIO_LAYOUT.spec_inner(area).drop_top(7).take_top(1)
+    end
+
+  vars_table_area(area: RECT): RECT
+    do
+      STUDIO_LAYOUT.spec_inner(area).drop_top(8)
+    end
+
+  code_area(area: RECT): RECT
+    do
+      STUDIO_LAYOUT.spec_inner(area).drop_right(1)
+    end
+
+  code_scrollbar_area(area: RECT): RECT
+    do
+      STUDIO_LAYOUT.spec_inner(area)
+    end
+
+  -- Transport controls laid out horizontally inside `FRAME.inner(transport_bar(area))`.
+  transport_inner(area: RECT): RECT
+    do
+      FRAME.inner_padded(STUDIO_LAYOUT.transport_bar(area), PADDING.symmetric(0, 1))
+    end
+
+  transport_parts(area: RECT): LIST[RECT]
+    do
+      let sizes: LIST[SIZE] = LIST.empty
+        .prepend(SIZE.fixed(14))
+        .prepend(SIZE.flex(1))
+        .prepend(SIZE.fixed(10))
+        .prepend(SIZE.fixed(10))
+        .prepend(SIZE.fixed(10))
+        .prepend(SIZE.fixed(10))
+      LAYOUT.columns_with_gap(STUDIO_LAYOUT.transport_inner(area), sizes, 1)
+    ensure
+      six: Result.length = 6
+    end
+
+  btn_back_area(area: RECT): RECT
+    do
+      LIST_OPS.at(STUDIO_LAYOUT.transport_parts(area), 0)
+    end
+
+  btn_play_area(area: RECT): RECT
+    do
+      LIST_OPS.at(STUDIO_LAYOUT.transport_parts(area), 1)
+    end
+
+  btn_step_area(area: RECT): RECT
+    do
+      LIST_OPS.at(STUDIO_LAYOUT.transport_parts(area), 2)
+    end
+
+  btn_reset_area(area: RECT): RECT
+    do
+      LIST_OPS.at(STUDIO_LAYOUT.transport_parts(area), 3)
+    end
+
+  timeline_slider_area(area: RECT): RECT
+    do
+      LIST_OPS.at(STUDIO_LAYOUT.transport_parts(area), 4)
+    end
+
+  speed_slider_area(area: RECT): RECT
+    do
+      LIST_OPS.at(STUDIO_LAYOUT.transport_parts(area), 5)
+    end
+
+end

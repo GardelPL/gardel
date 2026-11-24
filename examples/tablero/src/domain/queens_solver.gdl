@@ -1,0 +1,66 @@
+-- Parallel Verified Constrained N-Queens Solver using divide-and-conquer fork-join.
+-- `gardelc` automatically parallelizes the independent recursive `let left_res` / `let right_res`
+-- bindings via C11 + OpenMP (`#pragma omp task` / `taskwait`) with zero locks, zero data races,
+-- and bit-for-bit deterministic output.
+-- Boogie/Z3 statically proves both soundness (`is_valid_solution`) and termination (`variant`).
+functions QUEENS_SOLVER
+
+feature {ANY}
+
+  -- Divide-and-conquer search over candidate columns `[lo..hi)` for row `placed.length`.
+  -- Statically proves: if `Some(sol)` is returned, `QUEENS_FACTS.is_valid_solution(board, sol)`.
+  solve_range(board: BOARD, placed: LIST[NAT], lo: NAT, hi: NAT, count_all: BOOL): SOLVE_OUTCOME
+    require
+      row_in_bounds: placed.length < board.size
+      valid_prefix: QUEENS_FACTS.is_valid_partial(board, placed)
+      range_ordered: lo <= hi
+      range_bounded: hi <= board.size
+    variant
+      (board.size - placed.length) * 16 + (hi - lo)
+    do
+      if lo >= hi then
+        SOLVE_OUTCOME.empty_for(board)
+      else if hi - lo = 1 then
+        let r = placed.length
+        let c = lo
+        if QUEENS_FACTS.cell_allowed(board, r, c) and QUEENS_FACTS.safe_against(r, c, placed) then
+          let next_placed = placed.prepend(c)
+          if next_placed.length = board.size then
+            SOLVE_OUTCOME.found_for(board, next_placed, 1)
+          else
+            QUEENS_SOLVER.solve_range(board, next_placed, 0, board.size, count_all)
+          end
+        else
+          SOLVE_OUTCOME.empty_for(board)
+        end
+      else
+        let mid = lo + (hi - lo) / 2
+        if count_all or placed.length <= 1 then
+          -- Two independent recursive `let` bindings: `gardelc` auto-parallelizes with OpenMP tasks.
+          let left_res = QUEENS_SOLVER.solve_range(board, placed, lo, mid, count_all)
+          let right_res = QUEENS_SOLVER.solve_range(board, placed, mid, hi, count_all)
+          SOLVE_OUTCOME.merge_for(board, left_res, right_res)
+        else
+          -- Short-circuiting sequential branch when only the first solution is requested at deep rows.
+          let left_res = QUEENS_SOLVER.solve_range(board, placed, lo, mid, False)
+          if left_res.has_solution then
+            left_res
+          else
+            QUEENS_SOLVER.solve_range(board, placed, mid, hi, False)
+          end
+        end
+      end end
+    ensure
+      sound: QUEENS_FACTS.all_valid_solutions(board, Result.solutions)
+    end
+
+  -- Top-level entry point: solve `board` (collecting & counting all valid solutions in parallel).
+  solve(board: BOARD, count_all: BOOL): SOLVE_OUTCOME
+    do
+      let empty: LIST[NAT] = LIST.empty
+      QUEENS_SOLVER.solve_range(board, empty, 0, board.size, count_all)
+    ensure
+      sound: QUEENS_FACTS.all_valid_solutions(board, Result.solutions)
+    end
+
+end

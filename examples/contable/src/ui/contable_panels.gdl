@@ -1,0 +1,259 @@
+-- Rendering helpers for `contable` tables, monthly budget gauges, net-worth sparkline,
+-- journal entry leg breakdown, and verified contract/short-form view.
+functions CONTABLE_PANELS
+
+feature {ANY}
+
+  row2(a: STRING, b: STRING): LIST[STRING]
+    do
+      let empty: LIST[STRING] = LIST.empty
+      empty.prepend(b).prepend(a)
+    end
+
+  row3(a: STRING, b: STRING, c: STRING): LIST[STRING]
+    do
+      let empty: LIST[STRING] = LIST.empty
+      empty.prepend(c).prepend(b).prepend(a)
+    end
+
+  row4(a: STRING, b: STRING, c: STRING, d: STRING): LIST[STRING]
+    do
+      let empty: LIST[STRING] = LIST.empty
+      empty.prepend(d).prepend(c).prepend(b).prepend(a)
+    end
+
+  account_rows_of(accts: LIST[ACCOUNT]): LIST[LIST[STRING]]
+    variant
+      accts.length
+    do
+      if accts.length = 0 then
+        LIST.empty
+      else
+        let a = accts.head
+        let id_txt = NUMBER_TEXT.nat_to_text(a.id)
+        let bal_txt = LEDGER_FACTS.format_cents(a.normal_balance_cents)
+        let row = CONTABLE_PANELS.row4(id_txt, a.name, a.kind_label, bal_txt)
+        CONTABLE_PANELS.account_rows_of(accts.tail).prepend(row)
+      end
+    end
+
+  accounts_table(ledger: LEDGER, selected: NAT, visible_rows: NAT): TABLE
+    do
+      let widths: LIST[SIZE] = LIST.empty
+        .prepend(SIZE.fixed(12))
+        .prepend(SIZE.fixed(10))
+        .prepend(SIZE.flex(1))
+        .prepend(SIZE.fixed(3))
+      let hdr = CONTABLE_PANELS.row4("#", "Account", "Type", "Balance")
+      let rows = CONTABLE_PANELS.account_rows_of(ledger.accounts)
+      TABLE.with_headers(widths, hdr, rows).select(selected, visible_rows)
+    end
+
+  journal_rows_of(es: LIST[JOURNAL_ENTRY]): LIST[LIST[STRING]]
+    variant
+      es.length
+    do
+      if es.length = 0 then
+        LIST.empty
+      else
+        let e = es.head
+        let id_txt = GLYPHS.join("#", NUMBER_TEXT.nat_to_text(e.id))
+        let amt_txt = LEDGER_FACTS.format_nat_cents(e.volume_cents)
+        let row = CONTABLE_PANELS.row4(id_txt, e.date, e.memo, amt_txt)
+        CONTABLE_PANELS.journal_rows_of(es.tail).prepend(row)
+      end
+    end
+
+  journal_table(ledger: LEDGER, selected: NAT, visible_rows: NAT): TABLE
+    do
+      let widths: LIST[SIZE] = LIST.empty
+        .prepend(SIZE.fixed(11))
+        .prepend(SIZE.flex(1))
+        .prepend(SIZE.fixed(10))
+        .prepend(SIZE.fixed(4))
+      let hdr = CONTABLE_PANELS.row4("ID", "Date", "Memo", "Volume")
+      let rows = CONTABLE_PANELS.journal_rows_of(ledger.entries)
+      TABLE.with_headers(widths, hdr, rows).select(selected, visible_rows)
+    end
+
+  account_name_at(accts: LIST[ACCOUNT], idx: NAT): STRING
+    do
+      if idx < accts.length then
+        LIST_OPS.at(accts, idx).name
+      else
+        GLYPHS.join("Acct #", NUMBER_TEXT.nat_to_text(idx))
+      end
+    end
+
+  posting_rows_of(ps: LIST[POSTING], accts: LIST[ACCOUNT]): LIST[LIST[STRING]]
+    variant
+      ps.length
+    do
+      if ps.length = 0 then
+        LIST.empty
+      else
+        let p = ps.head
+        let aname = CONTABLE_PANELS.account_name_at(accts, p.account_index)
+        let amt = LEDGER_FACTS.format_nat_cents(p.amount_cents)
+        let row = CONTABLE_PANELS.row3(p.side_label, aname, amt)
+        CONTABLE_PANELS.posting_rows_of(ps.tail, accts).prepend(row)
+      end
+    end
+
+  -- Draw budgeted expense gauges sequentially inside `r` starting at `row_y`.
+  draw_budget_gauges(s: SCREEN, r: RECT, accts: LIST[ACCOUNT], row_y: NAT, t: THEME): SCREEN
+    variant
+      accts.length
+    do
+      if accts.length = 0 or row_y >= 18446744073709551613 or row_y + 1 >= r.bottom then
+        s
+      else
+        let a = accts.head
+        if a.has_budget then
+          let pct = a.budget_percent
+          let spent_txt = LEDGER_FACTS.format_cents(a.normal_balance_cents)
+          let cap_txt = LEDGER_FACTS.format_nat_cents(a.budget_cap)
+          let hdr = GLYPHS.join(
+            GLYPHS.join(a.name, "  "),
+            GLYPHS.join(spent_txt, GLYPHS.join(" / ", cap_txt))
+          )
+          let s1 = s.text(r, r.x, row_y, hdr, t.base)
+          let fill_st =
+            if pct >= 90 then STYLE.plain.fg(COLOR.red).bold
+            else if pct >= 70 then STYLE.plain.fg(COLOR.yellow).bold
+            else STYLE.plain.fg(COLOR.green).bold
+            end end
+          let g_rect = RECT.make(r.x, row_y + 1, r.width, 1)
+          let s2 = SCREEN.fitted(GAUGE.percent(pct).draw(s1, g_rect, t.gutter, fill_st), s1)
+          CONTABLE_PANELS.draw_budget_gauges(s2, r, accts.tail, row_y + 2, t)
+        else
+          CONTABLE_PANELS.draw_budget_gauges(s, r, accts.tail, row_y, t)
+        end
+      end
+    ensure
+      same_width: Result.width = s.width
+      same_height: Result.height = s.height
+    end
+
+  -- Tab 0: Monthly Budgets (GAUGE) + Net Worth Trend (SPARKLINE) + Accounting Equation.
+  draw_budgets_tab(s: SCREEN, area: RECT, hist: LEDGER_HISTORY, t: THEME): SCREEN
+    do
+      let r = CONTABLE_LAYOUT.right_inner(area)
+      let ledger = hist.current
+      let s0 = SCREEN.fitted(DIVIDER.horizontal.with_label("Monthly Expense Budgets").draw(s, r.take_top(1), t.border), s)
+      let budget_r = r.drop_top(1).take_top(6)
+      let s1 = CONTABLE_PANELS.draw_budget_gauges(s0, budget_r, ledger.accounts, budget_r.y, t)
+
+      let sp_div_r = r.drop_top(7).take_top(1)
+      let nw_txt = GLYPHS.join("Net Worth Trend (", GLYPHS.join(LEDGER_FACTS.format_cents(ledger.net_worth), ")"))
+      let s2 = SCREEN.fitted(DIVIDER.horizontal.with_label(nw_txt).draw(s1, sp_div_r, t.border), s1)
+      let sp_r = r.drop_top(8).take_top(3)
+      let spark = SPARKLINE.make(hist.sparkline_samples)
+      let s3 = SCREEN.fitted(spark.draw(s2, sp_r, STYLE.plain.fg(COLOR.cyan).bold), s2)
+
+      let eq_div_r = r.drop_top(11).take_top(1)
+      let s4 = SCREEN.fitted(DIVIDER.horizontal.with_label("Accounting Equation [PROVEN]").draw(s3, eq_div_r, t.border), s3)
+      let eq_r = r.drop_top(12)
+      let widths: LIST[SIZE] = LIST.empty
+        .prepend(SIZE.fixed(13))
+        .prepend(SIZE.flex(1))
+      let hdr = CONTABLE_PANELS.row2("Category", "Normal Total")
+      let rows: LIST[LIST[STRING]] = LIST.empty
+        .prepend(CONTABLE_PANELS.row2("Expenses (DR)", LEDGER_FACTS.format_cents(ledger.total_expenses)))
+        .prepend(CONTABLE_PANELS.row2("Income (CR)", LEDGER_FACTS.format_cents(ledger.total_income)))
+        .prepend(CONTABLE_PANELS.row2("Equity (CR)", LEDGER_FACTS.format_cents(ledger.total_equity)))
+        .prepend(CONTABLE_PANELS.row2("Liabilities (CR)", LEDGER_FACTS.format_cents(ledger.total_liabilities)))
+        .prepend(CONTABLE_PANELS.row2("Assets (DR)", LEDGER_FACTS.format_cents(ledger.total_assets)))
+      TABLE.with_headers(widths, hdr, rows).draw(s4, eq_r, t.base, t.active_tab, t.base)
+    ensure
+      same_width: Result.width = s.width
+      same_height: Result.height = s.height
+    end
+
+  -- Tab 1: Selected Journal Entry Breakdown (all Debit/Credit legs).
+  draw_entry_tab(s: SCREEN, area: RECT, ledger: LEDGER, selected_idx: NAT, t: THEME): SCREEN
+    do
+      let r = CONTABLE_LAYOUT.right_inner(area)
+      let ok_st = STYLE.plain.fg(COLOR.green).bold
+      if ledger.entry_count = 0 then
+        s.text(r, r.x, r.y + 1, "No journal entries at this snapshot.", t.gutter)
+      else
+        let idx = if selected_idx < ledger.entry_count then selected_idx else 0 end
+        let e = LIST_OPS.at(ledger.entries, idx)
+        let title = GLYPHS.join("Entry #", GLYPHS.join(NUMBER_TEXT.nat_to_text(e.id), GLYPHS.join(" · ", e.date)))
+        let s0 = s.text(r, r.x, r.y, title, t.active_tab)
+        let s1 = s0.text(r, r.x, r.y + 1, e.memo, t.base)
+        let kind_txt =
+          match e.reverses
+            case Some(orig_id) then
+              GLYPHS.join("Compensating reversal of Entry #", NUMBER_TEXT.nat_to_text(orig_id))
+            case None then
+              GLYPHS.join("Immutable entry · ", GLYPHS.join(NUMBER_TEXT.nat_to_text(e.leg_count), " posting legs"))
+          end
+        let s2 = s1.text(r, r.x, r.y + 2, kind_txt, t.gutter)
+        let s3 = s2.text(r, r.x, r.y + 3, "✓ sum(Debits) = sum(Credits)  [PROVEN]", ok_st)
+        let div_r = r.drop_top(4).take_top(1)
+        let s4 = DIVIDER.horizontal.with_label("Posting Legs").draw(s3, div_r, t.border)
+        let tbl_r = r.drop_top(5)
+        let widths: LIST[SIZE] = LIST.empty
+          .prepend(SIZE.fixed(12))
+          .prepend(SIZE.flex(1))
+          .prepend(SIZE.fixed(4))
+        let hdr = CONTABLE_PANELS.row3("Side", "Account", "Amount")
+        let rows = CONTABLE_PANELS.posting_rows_of(e.postings, ledger.accounts)
+        TABLE.with_headers(widths, hdr, rows).draw(s4, tbl_r, t.base, t.active_tab, t.base)
+      end
+    ensure
+      same_width: Result.width = s.width
+      same_height: Result.height = s.height
+    end
+
+  -- Embedded verified contract interface (Short Form of `LEDGER` and `JOURNAL_ENTRY`).
+  short_form_lines: LIST[STRING]
+    do
+      let empty: LIST[STRING] = LIST.empty
+      empty
+        .prepend("end")
+        .prepend("      ensure  is_reversal: Result.entries.head.is_reversal")
+        .prepend("      ensure  audit_append_only: Result.entries.tail = Current.entries")
+        .prepend("      ensure  trial_balance_zero: sum_balances_math(Result.accounts) = 0")
+        .prepend("    {ANY} reverse_entry(idx: NAT, date: STRING): LEDGER")
+        .prepend("      ensure  audit_append_only: Result.entries.tail = Current.entries")
+        .prepend("      ensure  audit_len_inc: Result.entry_count = Current.entry_count + 1")
+        .prepend("      ensure  trial_balance_zero: sum_balances_math(Result.accounts) = 0")
+        .prepend("      require applicable: Current.can_post(e)")
+        .prepend("    {ANY} post_entry(e: JOURNAL_ENTRY): LEDGER")
+        .prepend("  invariant")
+        .prepend("    trial_balance_zero: LEDGER_FACTS.sum_balances_math(accts) = 0")
+        .prepend("    has_accounts: accts.length >= 2")
+        .prepend("module LEDGER")
+        .prepend("")
+        .prepend("end")
+        .prepend("    balanced: LEDGER_FACTS.sum_postings_math(legs) = 0")
+        .prepend("    debits_eq_credits: sum_debits_math(legs) = sum_credits_math(legs)")
+        .prepend("    at_least_two: legs.length >= 2")
+        .prepend("  invariant")
+        .prepend("module JOURNAL_ENTRY")
+    end
+
+  -- Tab 2: Proven Invariants + Short Form contract viewer.
+  draw_contracts_tab(s: SCREEN, area: RECT, contracts_view: TEXT_VIEW, t: THEME): SCREEN
+    do
+      let r = CONTABLE_LAYOUT.right_inner(area)
+      let ok_st = STYLE.plain.fg(COLOR.green).bold
+      let s0 = s.text(r, r.x, r.y, "✓ trial_balance_zero (MATH_INT)  [PROVEN]", ok_st)
+      let s1 = s0.text(r, r.x, r.y + 1, "✓ sum(Debits) = sum(Credits)     [PROVEN]", ok_st)
+      let s2 = s1.text(r, r.x, r.y + 2, "✓ bounded_bal (overflow-free I64)[PROVEN]", ok_st)
+      let s3 = s2.text(r, r.x, r.y + 3, "✓ audit_append_only (immutable)  [PROVEN]", ok_st)
+      let div_r = r.drop_top(4).take_top(1)
+      let s4 = DIVIDER.horizontal.with_label("Verified Contract Interface").draw(s3, div_r, t.border)
+      let view_r = r.drop_top(5).drop_right(1)
+      let s5 = contracts_view.draw(s4, view_r, t.base)
+      SCROLLBAR.vertical(contracts_view.line_count, view_r.height, contracts_view.top)
+        .draw(s5, r.drop_top(5), t.gutter, t.focused_border)
+    ensure
+      same_width: Result.width = s.width
+      same_height: Result.height = s.height
+    end
+
+end

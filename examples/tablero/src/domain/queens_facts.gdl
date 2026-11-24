@@ -1,0 +1,137 @@
+-- Pure formal specification of constrained N-Queens validity.
+-- A placement `placed: LIST[NAT]` stores queen columns newest-row-first:
+-- when `placed.length = r`, `placed.head` is row `r - 1`, and the last element is row `0`.
+functions QUEENS_FACTS
+
+feature {ANY}
+
+  abs_diff(a: NAT, b: NAT): NAT
+    do
+      if a >= b then a - b else b - a end
+    end
+
+  -- True when queens at `(r1, c1)` and `(r2, c2)` do not share a row, column, or diagonal.
+  no_attack(r1: NAT, c1: NAT, r2: NAT, c2: NAT): BOOL
+    do
+      r1 != r2 and c1 != c2 and QUEENS_FACTS.abs_diff(r1, r2) != QUEENS_FACTS.abs_diff(c1, c2)
+    end
+
+  -- True when `(r, c)` is in bounds, not blocked, and respects any pin on row `r`.
+  cell_allowed(board: BOARD, r: NAT, c: NAT): BOOL
+    do
+      if r < board.size and c < board.size then
+        not board.is_blocked(r, c)
+          and (board.pin_col(r) >= board.size or board.pin_col(r) = c)
+      else
+        False
+      end
+    end
+
+  -- True when placing a queen at `(r, c)` does not attack any queen in `placed`
+  -- (where `placed.head` sits on row `placed.length - 1`).
+  safe_against(r: NAT, c: NAT, placed: LIST[NAT]): BOOL
+    variant
+      placed.length
+    do
+      if placed.length = 0 then
+        True
+      else
+        let pr = placed.length - 1
+        let pc = placed.head
+        QUEENS_FACTS.no_attack(r, c, pr, pc) and QUEENS_FACTS.safe_against(r, c, placed.tail)
+      end
+    end
+
+  -- True when every queen in partial placement `placed` is allowed by `board` and
+  -- pairwise non-attacking with all earlier rows.
+  is_valid_partial(board: BOARD, placed: LIST[NAT]): BOOL
+    variant
+      placed.length
+    do
+      if placed.length = 0 then
+        True
+      else
+        let r = placed.length - 1
+        let c = placed.head
+        QUEENS_FACTS.cell_allowed(board, r, c)
+          and QUEENS_FACTS.safe_against(r, c, placed.tail)
+          and QUEENS_FACTS.is_valid_partial(board, placed.tail)
+      end
+    end
+
+  -- Complete soundness specification: `sol` has `board.size` queens and satisfies all constraints.
+  is_valid_solution(board: BOARD, sol: LIST[NAT]): BOOL
+    do
+      sol.length = board.size and QUEENS_FACTS.is_valid_partial(board, sol)
+    end
+
+  -- True when EVERY placement in `sols` is a valid complete solution for `board`.
+  all_valid_solutions(board: BOARD, sols: LIST[LIST[NAT]]): BOOL
+    variant
+      sols.length
+    do
+      if sols.length = 0 then
+        True
+      else
+        QUEENS_FACTS.is_valid_solution(board, sols.head)
+          and QUEENS_FACTS.all_valid_solutions(board, sols.tail)
+      end
+    end
+
+  -- Deterministically concatenate two verified solution lists up to `cap`,
+  -- preserving `all_valid_solutions` in order (`a` before `b`).
+  merge_valid(board: BOARD, a: LIST[LIST[NAT]], b: LIST[LIST[NAT]], cap: NAT): LIST[LIST[NAT]]
+    require
+      va: QUEENS_FACTS.all_valid_solutions(board, a)
+      vb: QUEENS_FACTS.all_valid_solutions(board, b)
+      fits: a.length <= 1000 and b.length <= 1000
+    variant
+      a.length + b.length
+    do
+      if cap = 0 then
+        LIST.empty
+      else if a.length > 0 then
+        QUEENS_FACTS.merge_valid(board, a.tail, b, cap - 1).prepend(a.head)
+      else if b.length > 0 then
+        QUEENS_FACTS.merge_valid(board, a, b.tail, cap - 1).prepend(b.head)
+      else
+        LIST.empty
+      end end end
+    ensure
+      all_valid: QUEENS_FACTS.all_valid_solutions(board, Result)
+      bounded: Result.length <= cap
+      non_empty_if_any: (cap > 0 and (a.length > 0 or b.length > 0)) implies Result.length > 0
+    end
+
+  -- Column of the queen on `row` inside a newest-row-first solution `sol`.
+  col_at_row(sol: LIST[NAT], row: NAT): NAT
+    require
+      in_bounds: row < sol.length
+    do
+      LIST_OPS.at(sol, sol.length - 1 - row)
+    end
+
+  -- True if square `(r, c)` is attacked by any pinned queen on `board` (for live ray highlighting).
+  attacked_by_pin_from(board: BOARD, r: NAT, c: NAT, scan_r: NAT): BOOL
+    require
+      in_bounds: r < board.size and c < board.size and scan_r <= board.size
+    variant
+      board.size - scan_r
+    do
+      if scan_r >= board.size then
+        False
+      else
+        let pc = board.pin_col(scan_r)
+        let hit = pc < board.size and not (scan_r = r and pc = c) and not QUEENS_FACTS.no_attack(r, c, scan_r, pc)
+        if hit then True else QUEENS_FACTS.attacked_by_pin_from(board, r, c, scan_r + 1) end
+      end
+    end
+
+  attacked_by_any_pin(board: BOARD, r: NAT, c: NAT): BOOL
+    require
+      in_bounds: r < board.size and c < board.size
+    do
+      QUEENS_FACTS.attacked_by_pin_from(board, r, c, 0)
+    end
+
+end

@@ -1,0 +1,183 @@
+-- Shared pure layout geometry for `posta`.
+-- Used identically by `view` and mouse hit-testing so rendering and clicks always agree.
+functions POSTA_LAYOUT
+
+feature {ANY}
+
+  -- Top-to-bottom split:
+  -- 0: 1-row menu bar
+  -- 1: 1-row breadcrumb + live in-flight proof badge
+  -- 2: main workbench area
+  -- 3: 1-row status bar
+  vertical_parts(area: RECT): LIST[RECT]
+    do
+      let sizes: LIST[SIZE] = LIST.empty
+        .prepend(SIZE.fixed(1))
+        .prepend(SIZE.min(12))
+        .prepend(SIZE.fixed(1))
+        .prepend(SIZE.fixed(1))
+      LAYOUT.rows(area, sizes)
+    ensure
+      four: Result.length = 4
+    end
+
+  menu_bar(area: RECT): RECT
+    do
+      LIST_OPS.at(POSTA_LAYOUT.vertical_parts(area), 0)
+    end
+
+  crumb_bar(area: RECT): RECT
+    do
+      LIST_OPS.at(POSTA_LAYOUT.vertical_parts(area), 1)
+    end
+
+  crumb_left(area: RECT): RECT
+    do
+      let r = POSTA_LAYOUT.crumb_bar(area)
+      let bw = if r.width > 34 then 34 else 0 end
+      r.drop_right(bw)
+    end
+
+  proof_badge_area(area: RECT): RECT
+    do
+      let r = POSTA_LAYOUT.crumb_bar(area)
+      let bw = if r.width > 34 then 34 else 0 end
+      r.take_right(bw)
+    end
+
+  main_area(area: RECT): RECT
+    do
+      LIST_OPS.at(POSTA_LAYOUT.vertical_parts(area), 2)
+    end
+
+  status_bar(area: RECT): RECT
+    do
+      LIST_OPS.at(POSTA_LAYOUT.vertical_parts(area), 3)
+    end
+
+  -- Left sidebar (27%) + Right workbench (73%).
+  sidebar_pane(area: RECT): RECT
+    do
+      let m = POSTA_LAYOUT.main_area(area)
+      let sw = m.width * 27 / 100
+      m.take_left(if sw >= 20 then sw else m.width end)
+    end
+
+  right_col(area: RECT): RECT
+    do
+      let m = POSTA_LAYOUT.main_area(area)
+      let sw = m.width * 27 / 100
+      let w = if sw >= 20 then sw else m.width end
+      m.drop_left(if w > 0 then w - 1 else 0 end)
+    end
+
+  sidebar_inner(area: RECT): RECT
+    do
+      FRAME.inner_padded(POSTA_LAYOUT.sidebar_pane(area), PADDING.symmetric(0, 1))
+    end
+
+  tree_area(area: RECT): RECT
+    do
+      let inn = POSTA_LAYOUT.sidebar_inner(area)
+      if inn.height > 6 then inn.drop_bottom(5) else inn end
+    end
+
+  spark_divider_area(area: RECT): RECT
+    do
+      let inn = POSTA_LAYOUT.sidebar_inner(area)
+      if inn.height > 6 then inn.take_bottom(5).take_top(1) else inn.take_bottom(0) end
+    end
+
+  spark_area(area: RECT): RECT
+    do
+      let inn = POSTA_LAYOUT.sidebar_inner(area)
+      if inn.height > 6 then inn.take_bottom(4) else inn.take_bottom(0) end
+    end
+
+  -- Right column split: 3-row URL bar, Request pane (top half), Response pane (bottom half).
+  url_bar_pane(area: RECT): RECT
+    do
+      POSTA_LAYOUT.right_col(area).take_top(3)
+    end
+
+  right_body(area: RECT): RECT
+    do
+      let r = POSTA_LAYOUT.right_col(area)
+      r.drop_top(if r.height > 2 then 2 else 0 end)
+    end
+
+  request_pane(area: RECT): RECT
+    do
+      let b = POSTA_LAYOUT.right_body(area)
+      let rh = b.height * 50 / 100
+      b.take_top(if rh >= 5 then rh else b.height end)
+    end
+
+  response_pane(area: RECT): RECT
+    do
+      let b = POSTA_LAYOUT.right_body(area)
+      let rh = b.height * 50 / 100
+      let h = if rh >= 5 then rh else b.height end
+      b.drop_top(if h > 0 then h - 1 else 0 end)
+    end
+
+  url_bar_parts(area: RECT): LIST[RECT]
+    do
+      let inn = FRAME.inner_padded(POSTA_LAYOUT.url_bar_pane(area), PADDING.symmetric(0, 1))
+      let sizes: LIST[SIZE] = LIST.empty
+        .prepend(SIZE.fixed(11))
+        .prepend(SIZE.flex(1))
+        .prepend(SIZE.fixed(10))
+      LAYOUT.columns_with_gap(inn, sizes, 1)
+    ensure
+      three: Result.length = 3
+    end
+
+  btn_method_area(area: RECT): RECT
+    do
+      LIST_OPS.at(POSTA_LAYOUT.url_bar_parts(area), 0)
+    end
+
+  url_input_area(area: RECT): RECT
+    do
+      LIST_OPS.at(POSTA_LAYOUT.url_bar_parts(area), 1)
+    end
+
+  btn_send_area(area: RECT): RECT
+    do
+      LIST_OPS.at(POSTA_LAYOUT.url_bar_parts(area), 2)
+    end
+
+  req_tabs_area(area: RECT): RECT
+    do
+      FRAME.title_area(POSTA_LAYOUT.request_pane(area))
+    end
+
+  req_inner(area: RECT): RECT
+    do
+      FRAME.inner_padded(POSTA_LAYOUT.request_pane(area), PADDING.symmetric(0, 1))
+    end
+
+  req_editor_area(area: RECT): RECT
+    do
+      let inn = POSTA_LAYOUT.req_inner(area)
+      if inn.height > 2 then inn.drop_bottom(1) else inn end
+    end
+
+  req_json_bar(area: RECT): RECT
+    do
+      let inn = POSTA_LAYOUT.req_inner(area)
+      if inn.height > 2 then inn.take_bottom(1) else inn.take_bottom(0) end
+    end
+
+  resp_tabs_area(area: RECT): RECT
+    do
+      FRAME.title_area(POSTA_LAYOUT.response_pane(area))
+    end
+
+  resp_inner(area: RECT): RECT
+    do
+      FRAME.inner_padded(POSTA_LAYOUT.response_pane(area), PADDING.symmetric(0, 1))
+    end
+
+end

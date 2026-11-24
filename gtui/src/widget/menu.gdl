@@ -1,0 +1,1156 @@
+-- A menu bar with overlay drop-down and sub-menu panels (`MENU_ITEM` tree).
+-- `open_path` encodes the active trail as 1-based slots (`0` at the last level means the
+-- drop-down is open with no item highlighted).
+-- TODO(proof-GW.3): prove drop-downs at different levels are disjoint from their anchor rows,
+-- `item_area` lies inside its box with disjoint rows, `chosen` implies closed, and mouse routing is deterministic.
+module MENU
+
+representation {NONE}
+  bar_items: LIST[MENU_ITEM]
+  open_path: LIST[NAT]
+  picked_item: OPTION[MENU_ITEM]
+  border: BORDER_KIND
+  sep_border: BORDER_KIND
+
+invariant
+  path_valid: MENU.valid_path(bar_items, open_path)
+  choice_valid: match picked_item
+    case Some(it) then it.is_selectable and not it.has_submenu
+    case None then True
+  end
+
+create {ANY}
+
+  -- An empty, closed menu.
+  empty: MENU
+    do
+      { bar_items = LIST.empty, open_path = LIST.empty, picked_item = None,
+        border = BORDER_KIND.plain, sep_border = BORDER_KIND.plain }
+    ensure
+      closed: not Result.is_open
+      empty_bar: Result.count = 0
+    end
+
+  -- A closed menu with bar entries `entries`.
+  make(entries: LIST[MENU_ITEM]): MENU
+    do
+      { bar_items = entries, open_path = LIST.empty, picked_item = None,
+        border = BORDER_KIND.plain, sep_border = BORDER_KIND.plain }
+    ensure
+      closed: not Result.is_open
+      count_set: Result.count = entries.length
+    end
+
+  -- Whether `p` is a valid open path for `items`. Every slot before the last must name a
+  -- selectable item with a sub-menu; the last slot may be `0` (nothing highlighted) or a
+  -- valid selectable item index + 1.
+  valid_path(items: LIST[MENU_ITEM], p: LIST[NAT]): BOOL
+    variant
+      p.length
+    do
+      if p.length = 0 then
+        True
+      else
+        let slot = p.head
+        if slot = 0 then
+          p.tail.length = 0
+        else if slot >= 1 and slot <= items.length and slot <= 18446744073709551615 then
+          let it = LIST_OPS.at(items, slot - 1)
+          if p.tail.length = 0 then
+            it.is_selectable
+          else
+            it.is_selectable and it.has_submenu and MENU.valid_path(it.children, p.tail)
+          end
+        else
+          False
+        end end
+      end
+    end
+
+  -- Drop the innermost slot from `p`.
+  pop_path(items: LIST[MENU_ITEM], p: LIST[NAT]): LIST[NAT]
+    require
+      valid: MENU.valid_path(items, p)
+    variant
+      p.length
+    do
+      if p.length <= 1 then
+        LIST.empty
+      else
+        let slot = p.head
+        if slot < 1 or slot > items.length or slot > 18446744073709551615 then
+          LIST.empty
+        else
+          let it = LIST_OPS.at(items, slot - 1)
+          MENU.pop_path(it.children, p.tail).prepend(slot)
+        end
+      end
+    ensure
+      valid_res: MENU.valid_path(items, Result)
+      shorter: Result.length <= p.length
+      one_less: p.length > 0 implies Result.length = p.length - 1
+    end
+
+  -- Move the highlight in the innermost level of `p` to the next (`down = True`) or previous
+  -- (`down = False`) selectable item, wrapping around.
+  move_within_last(items: LIST[MENU_ITEM], p: LIST[NAT], down: BOOL): LIST[NAT]
+    require
+      valid: MENU.valid_path(items, p)
+    variant
+      p.length
+    do
+      if p.length = 0 then
+        LIST.empty
+      else if p.length = 1 then
+        let slot = p.head
+        let next_opt =
+          if slot < 1 or slot > 18446744073709551615 then
+            if down then MENU_ITEM.first_selectable_in(items) else MENU_ITEM.last_selectable_in(items) end
+          else
+            if down then MENU_ITEM.next_selectable_in(items, slot - 1) else MENU_ITEM.previous_selectable_in(items, slot - 1) end
+          end
+        match next_opt
+          case Some(k) then
+            if 0 <= k and k < 18446744073709551615 then
+              let single: LIST[NAT] = LIST.empty.prepend(k + 1)
+              single
+            else
+              p
+            end
+          case None then p
+        end
+      else
+        let slot = p.head
+        if slot < 1 or slot > items.length or slot > 18446744073709551615 then
+          p
+        else
+          let it = LIST_OPS.at(items, slot - 1)
+          MENU.move_within_last(it.children, p.tail, down).prepend(slot)
+        end
+      end end
+    ensure
+      valid_res: MENU.valid_path(items, Result)
+      same_len: Result.length = p.length
+    end
+
+  -- Open the sub-menu of the item highlighted at the end of `p`, highlighting its first item
+  -- (`pick_first`), last item (`pick_last`), or nothing (`0`).
+  open_highlighted_submenu(items: LIST[MENU_ITEM], p: LIST[NAT], pick_first: BOOL, pick_last: BOOL): LIST[NAT]
+    require
+      valid: MENU.valid_path(items, p)
+    variant
+      p.length
+    do
+      if p.length = 0 then
+        LIST.empty
+      else if p.length = 1 then
+        let slot = p.head
+        if slot < 1 or slot > items.length or slot > 18446744073709551615 then
+          p
+        else
+          let it = LIST_OPS.at(items, slot - 1)
+          if it.has_submenu then
+            let child_slot =
+              if pick_first then
+                match it.first_selectable
+                  case Some(k) then if 0 <= k and k < 18446744073709551615 then k + 1 else 0 end
+                  case None then 0
+                end
+              else if pick_last then
+                match it.last_selectable
+                  case Some(k) then if 0 <= k and k < 18446744073709551615 then k + 1 else 0 end
+                  case None then 0
+                end
+              else
+                0
+              end end
+            let res: LIST[NAT] = LIST.empty.prepend(child_slot).prepend(slot)
+            res
+          else
+            p
+          end
+        end
+      else
+        let slot = p.head
+        if slot < 1 or slot > items.length or slot > 18446744073709551615 then
+          p
+        else
+          let it = LIST_OPS.at(items, slot - 1)
+          MENU.open_highlighted_submenu(it.children, p.tail, pick_first, pick_last).prepend(slot)
+        end
+      end end
+    ensure
+      valid_res: MENU.valid_path(items, Result)
+    end
+
+  -- The item highlighted at the end of `p`, if any.
+  highlighted_item_at(items: LIST[MENU_ITEM], p: LIST[NAT]): OPTION[MENU_ITEM]
+    require
+      valid: MENU.valid_path(items, p)
+    variant
+      p.length
+    do
+      if p.length = 0 then
+        None
+      else
+        let slot = p.head
+        if slot < 1 or slot > items.length or slot > 18446744073709551615 then
+          None
+        else
+          let it = LIST_OPS.at(items, slot - 1)
+          if p.tail.length = 0 then
+            Some(it)
+          else
+            MENU.highlighted_item_at(it.children, p.tail)
+          end
+        end
+      end
+    ensure
+      selectable_when_some: match Result
+        case Some(it) then it.is_selectable
+        case None then True
+      end
+    end
+
+  -- Open path selecting bar entry `i` (`0`-based), optionally opening its drop-down.
+  entry_path(items: LIST[MENU_ITEM], i: NAT, drop_down: BOOL, highlight_first: BOOL): LIST[NAT]
+    require
+      valid_idx: i < items.length
+      selectable: LIST_OPS.at(items, i).is_selectable
+      small_idx: i < 18446744073709551615
+    do
+      let it = LIST_OPS.at(items, i)
+      let base: LIST[NAT] = LIST.empty.prepend(i + 1)
+      if drop_down and it.has_submenu then
+        let child_slot =
+          if highlight_first then
+            match it.first_selectable
+              case Some(k) then if k < 18446744073709551615 then k + 1 else 0 end
+              case None then 0
+            end
+          else
+            0
+          end
+        LIST.empty.prepend(child_slot).prepend(i + 1)
+      else
+        base
+      end
+    ensure
+      valid_res: MENU.valid_path(items, Result)
+      non_empty: Result.length >= 1
+    end
+
+  -- Update `p` after clicking item `j` (`0`-based) at 1-based `level` (`level >= 2`),
+  -- truncating deeper levels and opening a sub-menu with no item highlighted (`0`) if `j`
+  -- has a sub-menu.
+  click_submenu_at(items: LIST[MENU_ITEM], p: LIST[NAT], level: NAT, j: NAT): LIST[NAT]
+    require
+      valid: MENU.valid_path(items, p)
+    variant
+      p.length
+    do
+      if level = 0 or p.length = 0 then
+        p
+      else if level = 1 then
+        if j < items.length and j < 18446744073709551615 then
+          let it = LIST_OPS.at(items, j)
+          if it.is_selectable then
+            if it.has_submenu then
+              LIST.empty.prepend(0).prepend(j + 1)
+            else
+              LIST.empty.prepend(j + 1)
+            end
+          else
+            p
+          end
+        else
+          p
+        end
+      else
+        let slot = p.head
+        if slot < 1 or slot > items.length or slot > 18446744073709551615 then
+          p
+        else
+          let it = LIST_OPS.at(items, slot - 1)
+          MENU.click_submenu_at(it.children, p.tail, level - 1, j).prepend(slot)
+        end
+      end end
+    ensure
+      valid_res: MENU.valid_path(items, Result)
+    end
+
+  -- ASCII lowercase code for initial-letter shortcut matching.
+  lower_code(c: CHAR): NAT
+    do
+      let code = c.code
+      if code >= 65 and code <= 90 then code + 32 else code end
+    end
+
+  -- First non-space character in `cs`.
+  first_non_space(cs: LIST[CHAR]): OPTION[CHAR]
+    variant
+      cs.length
+    do
+      if cs.length = 0 then
+        None
+      else if cs.head = ' ' then
+        MENU.first_non_space(cs.tail)
+      else
+        Some(cs.head)
+      end end
+    end
+
+  -- First selectable entry in `items` whose label starts with `ch`
+  -- (case-insensitive for ASCII letters, skipping leading spaces).
+  find_entry_initial(items: LIST[MENU_ITEM], ch: CHAR, idx: NAT, steps: NAT): OPTION[NAT]
+    variant
+      steps
+    do
+      let n = if items.length <= 18446744073709551615 then items.length else 18446744073709551615 end
+      if steps = 0 or idx >= n then
+        None
+      else
+        let it = LIST_OPS.at(items, idx)
+        let matches_ch =
+          if MENU_ITEM.selectable_at(items, idx) then
+            match MENU.first_non_space(GLYPHS.of_text(it.label))
+              case Some(c0) then MENU.lower_code(c0) = MENU.lower_code(ch)
+              case None then False
+            end
+          else
+            False
+          end
+        if matches_ch then
+          Some(idx)
+        else
+          MENU.find_entry_initial(items, ch, idx + 1, steps - 1)
+        end
+      end
+    ensure
+      valid: match Result
+        case Some(k) then 0 <= k and k < 18446744073709551615 and k < items.length and LIST_OPS.at(items, k).is_selectable
+        case None then True
+      end
+    end
+
+  -- Columns of one bar entry: label plus one blank on each side.
+  entry_width(e: MENU_ITEM): NAT
+    do
+      BREADCRUMB.add_sat(e.label_width, 2)
+    ensure
+      bounded: Result <= 65535
+    end
+
+  -- Total columns of the first `count` entries in `es`.
+  entries_prefix_width(es: LIST[MENU_ITEM], count: NAT): NAT
+    variant
+      es.length
+    do
+      if count = 0 or es.length = 0 then
+        0
+      else
+        BREADCRUMB.add_sat(MENU.entry_width(es.head), MENU.entries_prefix_width(es.tail, count - 1))
+      end
+    ensure
+      bounded: Result <= 65535
+    end
+
+  -- Rectangle of bar entry `i` (`0`-based) inside `r.take_top(1)`.
+  entry_area_in(r: RECT, es: LIST[MENU_ITEM], i: NAT): RECT
+    do
+      let bar = r.take_top(1)
+      if i >= es.length then
+        bar.take_left(0)
+      else
+        let off = MENU.entries_prefix_width(es, i)
+        let w = MENU.entry_width(LIST_OPS.at(es, i))
+        let res = bar.drop_left(off).take_left(w)
+        check t1: RECT.inside_trans(res, bar, r) end
+        res
+      end
+    ensure
+      within_bar: Result.inside(r.take_top(1))
+      within: Result.inside(r)
+    end
+
+  -- Items displayed at 1-based `level` (`1` = bar entries, `2+` = sub-menu items).
+  items_at_level(items: LIST[MENU_ITEM], p: LIST[NAT], level: NAT): LIST[MENU_ITEM]
+    require
+      valid: MENU.valid_path(items, p)
+    variant
+      level
+    do
+      if level <= 1 or p.length = 0 then
+        items
+      else
+        let slot = p.head
+        if slot < 1 or slot > items.length or slot > 18446744073709551615 then
+          LIST.empty
+        else
+          MENU.items_at_level(LIST_OPS.at(items, slot - 1).children, p.tail, level - 1)
+        end
+      end
+    end
+
+  -- 1-based slot at `level` (`1`-based) in `p`, or `0` if out of range.
+  slot_at_level(p: LIST[NAT], level: NAT): NAT
+    variant
+      level
+    do
+      if level = 0 or p.length = 0 then
+        0
+      else if level = 1 then
+        let s = p.head
+        if s >= 1 and s <= 18446744073709551615 then s else 0 end
+      else
+        MENU.slot_at_level(p.tail, level - 1)
+      end end
+    end
+
+  label_column_width(items: LIST[MENU_ITEM]): NAT
+    variant
+      items.length
+    do
+      if items.length = 0 then
+        0
+      else
+        let w = items.head.label_width
+        let rest = MENU.label_column_width(items.tail)
+        let m = if w >= rest then w else rest end
+        if m <= 65535 then m else 65535 end
+      end
+    ensure
+      bounded: Result <= 65535
+    end
+
+  shortcut_column_width(items: LIST[MENU_ITEM]): NAT
+    variant
+      items.length
+    do
+      if items.length = 0 then
+        0
+      else
+        let w = items.head.shortcut_width
+        let rest = MENU.shortcut_column_width(items.tail)
+        let m = if w >= rest then w else rest end
+        if m <= 65535 then m else 65535 end
+      end
+    ensure
+      bounded: Result <= 65535
+    end
+
+  has_submenu_column(items: LIST[MENU_ITEM]): BOOL
+    variant
+      items.length
+    do
+      if items.length = 0 then
+        False
+      else
+        items.head.has_submenu or MENU.has_submenu_column(items.tail)
+      end
+    end
+
+  -- Preferred width of a drop-down displaying `items` (borders + blanks + label + optional
+  -- shortcut column + optional `▸` sub-menu column).
+  drop_down_width(items: LIST[MENU_ITEM]): NAT
+    do
+      let lw = MENU.label_column_width(items)
+      let sw = MENU.shortcut_column_width(items)
+      let sub_w = if MENU.has_submenu_column(items) then 2 else 0 end
+      let sc_w = if sw > 0 then BREADCRUMB.add_sat(2, sw) else 0 end
+      BREADCRUMB.add_sat(4, BREADCRUMB.add_sat(lw, BREADCRUMB.add_sat(sc_w, sub_w)))
+    ensure
+      at_least_four: Result >= 4
+      bounded: Result <= 65535
+    end
+
+  -- Preferred height of a drop-down displaying `items`: `items.length + 2` borders.
+  drop_down_height(items: LIST[MENU_ITEM]): NAT
+    do
+      let n = if items.length <= 65535 then items.length else 65535 end
+      BREADCRUMB.add_sat(n, 2)
+    ensure
+      bounded: Result <= 65535
+    end
+
+  -- Bounding box of open drop-down `level` (`level >= 2`) placed inside `screen`.
+  drop_down_area_at(r: RECT, screen: RECT, entries: LIST[MENU_ITEM], p: LIST[NAT], level: NAT): RECT
+    require
+      valid: MENU.valid_path(entries, p)
+    variant
+      level
+    do
+      if level < 2 or level > p.length then
+        screen.take_left(0).take_top(0)
+      else
+        let items = MENU.items_at_level(entries, p, level)
+        let w = MENU.drop_down_width(items)
+        let h = MENU.drop_down_height(items)
+        if level = 2 then
+          let s1 = MENU.slot_at_level(p, 1)
+          if s1 < 1 or s1 > entries.length or s1 > 18446744073709551615 then
+            screen.take_left(0).take_top(0)
+          else
+            let anchor = MENU.entry_area_in(r, entries, s1 - 1)
+            OVERLAY_PLACEMENT.place(anchor, w, h, OVERLAY_SIDE.below, screen)
+          end
+        else
+          let prev_box = MENU.drop_down_area_at(r, screen, entries, p, level - 1)
+          let prev_slot = MENU.slot_at_level(p, level - 1)
+          if prev_box.is_empty or prev_slot = 0 then
+            screen.take_left(0).take_top(0)
+          else
+            let anchor = prev_box.drop_top(prev_slot).take_top(1)
+            OVERLAY_PLACEMENT.place(anchor, w, h, OVERLAY_SIDE.right_of, screen)
+          end
+        end
+      end
+    ensure
+      within_screen: Result.inside(screen)
+    end
+
+  -- Row rectangle of item `j` (`0`-based) inside drop-down `level` (`level >= 2`).
+  item_area_at(r: RECT, screen: RECT, entries: LIST[MENU_ITEM], p: LIST[NAT], level: NAT, j: NAT): RECT
+    require
+      valid: MENU.valid_path(entries, p)
+    do
+      let box = MENU.drop_down_area_at(r, screen, entries, p, level)
+      let inner = FRAME.inner(box)
+      let row = inner.drop_top(j).take_top(1)
+      check t1: RECT.inside_trans(row, inner, box) end
+      check t2: RECT.inside_trans(row, box, screen) end
+      row
+    ensure
+      within_box: Result.inside(MENU.drop_down_area_at(r, screen, entries, p, level))
+      within_screen: Result.inside(screen)
+    end
+
+  -- Index of the bar entry covering `(cx, cy)` on `r`, or `None`.
+  find_bar_entry_at(r: RECT, entries: LIST[MENU_ITEM], idx: NAT, cx: NAT, cy: NAT): OPTION[NAT]
+    variant
+      if idx <= entries.length then entries.length - idx else 0 end
+    do
+      if idx >= entries.length or idx = 18446744073709551615 then
+        None
+      else if MENU.entry_area_in(r, entries, idx).has(cx, cy) then
+        Some(idx)
+      else
+        MENU.find_bar_entry_at(r, entries, idx + 1, cx, cy)
+      end end
+    ensure
+      valid: match Result
+        case Some(i) then i < entries.length
+        case None then True
+      end
+    end
+
+  -- Index of the item in drop-down `level` covering `(cx, cy)`, or `None`.
+  find_item_at(r: RECT, screen: RECT, entries: LIST[MENU_ITEM], p: LIST[NAT], level: NAT, items: LIST[MENU_ITEM], idx: NAT, cx: NAT, cy: NAT): OPTION[NAT]
+    require
+      valid: MENU.valid_path(entries, p)
+    variant
+      if idx <= items.length then items.length - idx else 0 end
+    do
+      if idx >= items.length or idx = 18446744073709551615 then
+        None
+      else if MENU.item_area_at(r, screen, entries, p, level, idx).has(cx, cy) then
+        Some(idx)
+      else
+        MENU.find_item_at(r, screen, entries, p, level, items, idx + 1, cx, cy)
+      end end
+    ensure
+      valid: match Result
+        case Some(j) then j < items.length
+        case None then True
+      end
+    end
+
+  -- Innermost drop-down level (`>= 2`) whose box contains `(cx, cy)`, or `0` if none does.
+  find_dropdown_hit(r: RECT, screen: RECT, entries: LIST[MENU_ITEM], p: LIST[NAT], level: NAT, cx: NAT, cy: NAT): NAT
+    require
+      valid: MENU.valid_path(entries, p)
+    variant
+      level
+    do
+      if level < 2 then
+        0
+      else if level <= p.length and MENU.drop_down_area_at(r, screen, entries, p, level).has(cx, cy) then
+        level
+      else
+        MENU.find_dropdown_hit(r, screen, entries, p, level - 1, cx, cy)
+      end end
+    end
+
+  -- Draw bar entries from `idx` onward on `r`.
+  draw_bar_entries(s: SCREEN, r: RECT, entries: LIST[MENU_ITEM], idx: NAT, active_slot: NAT,
+                   bar_st: STYLE, highlight_st: STYLE, disabled_st: STYLE): SCREEN
+    variant
+      if idx <= entries.length then entries.length - idx else 0 end
+    do
+      if idx >= entries.length or idx = 18446744073709551615 then
+        s
+      else
+        let it = LIST_OPS.at(entries, idx)
+        let er = MENU.entry_area_in(r, entries, idx)
+        let st =
+          if not it.is_selectable then
+            disabled_st
+          else if active_slot > 0 and active_slot - 1 = idx then
+            highlight_st
+          else
+            bar_st
+          end end
+        let filled = s.fill(er, ' ', st)
+        let drawn =
+          if er.width > 1 then
+            filled.text(er, er.x + 1, er.y, it.label, st)
+          else
+            filled
+          end
+        MENU.draw_bar_entries(drawn, r, entries, idx + 1, active_slot, bar_st, highlight_st, disabled_st)
+      end
+    ensure
+      same_width: Result.width = s.width
+      same_height: Result.height = s.height
+    end
+
+  -- Draw items `idx .. items.length - 1` of drop-down `level`.
+  draw_drop_down_items(s: SCREEN, r: RECT, screen: RECT, entries: LIST[MENU_ITEM], p: LIST[NAT], level: NAT,
+                       items: LIST[MENU_ITEM], idx: NAT, label_w: NAT, shortcut_w: NAT,
+                       sep_border: BORDER_KIND, menu_st: STYLE, highlight_st: STYLE, disabled_st: STYLE): SCREEN
+    require
+      valid: MENU.valid_path(entries, p)
+    variant
+      if idx <= items.length then items.length - idx else 0 end
+    do
+      if idx >= items.length or idx = 18446744073709551615 then
+        s
+      else
+        let it = LIST_OPS.at(items, idx)
+        let row = MENU.item_area_at(r, screen, entries, p, level, idx)
+        let next_s =
+          if row.is_empty then
+            s
+          else if it.is_separator then
+            DIVIDER.horizontal.with_border(sep_border).draw_labeled(s, row, menu_st, menu_st)
+          else
+            let active_slot = MENU.slot_at_level(p, level)
+            let st =
+              if not it.is_selectable then
+                disabled_st
+              else if active_slot > 0 and active_slot - 1 = idx then
+                highlight_st
+              else
+                menu_st
+              end end
+            let filled = s.fill(row, ' ', st)
+            let lbl_x = BREADCRUMB.add_sat(row.x, 1)
+            let with_lbl = filled.text(row, lbl_x, row.y, it.label, st)
+            let sc_base = BREADCRUMB.add_sat(lbl_x, BREADCRUMB.add_sat(label_w, 2))
+            let with_sc =
+              if not it.shortcut.is_empty and shortcut_w >= it.shortcut_width then
+                let sc_x = BREADCRUMB.add_sat(sc_base, shortcut_w - it.shortcut_width)
+                with_lbl.text(row, sc_x, row.y, it.shortcut, st)
+              else
+                with_lbl
+              end
+            let sub_base = if shortcut_w > 0 then BREADCRUMB.add_sat(sc_base, shortcut_w) else BREADCRUMB.add_sat(lbl_x, label_w) end
+            if it.has_submenu then
+              with_sc.text(row, BREADCRUMB.add_sat(sub_base, 1), row.y, "▸", st)
+            else
+              with_sc
+            end
+          end end
+        MENU.draw_drop_down_items(next_s, r, screen, entries, p, level, items, idx + 1, label_w, shortcut_w, sep_border, menu_st, highlight_st, disabled_st)
+      end
+    ensure
+      same_width: Result.width = s.width
+      same_height: Result.height = s.height
+    end
+
+  -- Draw open drop-downs from `level = 2` up to `p.length`.
+  draw_drop_downs(s: SCREEN, r: RECT, screen: RECT, entries: LIST[MENU_ITEM], p: LIST[NAT], level: NAT,
+                  border: BORDER_KIND, sep_border: BORDER_KIND, menu_st: STYLE, highlight_st: STYLE, disabled_st: STYLE): SCREEN
+    require
+      valid: MENU.valid_path(entries, p)
+    variant
+      if level <= p.length then p.length - level + 1 else 0 end
+    do
+      if level < 2 or level > p.length or level = 18446744073709551615 then
+        s
+      else
+        let box = MENU.drop_down_area_at(r, screen, entries, p, level)
+        let next_s =
+          if box.is_empty then
+            s
+          else
+            let cleared = CLEAR.styled(s, box, menu_st)
+            let framed = FRAME.draw_styled(cleared, box, border, "", menu_st, menu_st)
+            let items = MENU.items_at_level(entries, p, level)
+            let lw = MENU.label_column_width(items)
+            let sw = MENU.shortcut_column_width(items)
+            MENU.draw_drop_down_items(framed, r, screen, entries, p, level, items, 0, lw, sw, sep_border, menu_st, highlight_st, disabled_st)
+          end
+        MENU.draw_drop_downs(next_s, r, screen, entries, p, level + 1, border, sep_border, menu_st, highlight_st, disabled_st)
+      end
+    ensure
+      same_width: Result.width = s.width
+      same_height: Result.height = s.height
+    end
+
+feature {ANY}
+
+  entries: LIST[MENU_ITEM]
+    do
+      Current.bar_items
+    end
+
+  count: NAT
+    do
+      Current.bar_items.length
+    end
+
+  entry(i: NAT): MENU_ITEM
+    require
+      valid: i < Current.count
+    do
+      LIST_OPS.at(Current.bar_items, i)
+    end
+
+  path: LIST[NAT]
+    do
+      Current.open_path
+    end
+
+  depth: NAT
+    do
+      Current.open_path.length
+    end
+
+  is_open: BOOL
+    do
+      Current.open_path.length > 0
+    end
+
+  is_dropped_down: BOOL
+    do
+      Current.open_path.length > 1
+    end
+
+  slot_at(level: NAT): NAT
+    do
+      MENU.slot_at_level(Current.open_path, level)
+    end
+
+  selected_at(level: NAT): OPTION[NAT]
+    do
+      let s = Current.slot_at(level)
+      if s > 0 then Some(s - 1) else None end
+    end
+
+  highlighted_item: OPTION[MENU_ITEM]
+    do
+      MENU.highlighted_item_at(Current.bar_items, Current.open_path)
+    ensure
+      selectable_when_some: match Result
+        case Some(it) then it.is_selectable
+        case None then True
+      end
+    end
+
+  chosen_item: OPTION[MENU_ITEM]
+    do
+      Current.picked_item
+    ensure
+      valid_leaf: match Result
+        case Some(it) then it.is_selectable and not it.has_submenu
+        case None then True
+      end
+    end
+
+  chosen: OPTION[NAT]
+    do
+      match Current.picked_item
+        case Some(it) then Some(it.id)
+        case None then None
+      end
+    end
+
+  clear_chosen: MENU
+    do
+      { Current with picked_item = None }
+    ensure
+      cleared: Current.count = Result.count and Result.chosen.is_none
+    end
+
+  with_border(b: BORDER_KIND): MENU
+    do
+      { Current with border = b }
+    end
+
+  with_separator_border(b: BORDER_KIND): MENU
+    do
+      { Current with sep_border = b }
+    end
+
+  with_entries(entries: LIST[MENU_ITEM]): MENU
+    do
+      { Current with bar_items = entries, open_path = LIST.empty }
+    ensure
+      closed: not Result.is_open
+      count_set: Result.count = entries.length
+    end
+
+  -- Top row of `r` occupied by the menu bar.
+  bar_area(r: RECT): RECT
+    do
+      r.take_top(1)
+    ensure
+      within: Result.inside(r)
+    end
+
+  -- Rectangle of bar entry `i` (`0`-based) inside `bar_area(r)`.
+  entry_area(r: RECT, i: NAT): RECT
+    do
+      MENU.entry_area_in(r, Current.bar_items, i)
+    ensure
+      within_bar: Result.inside(Current.bar_area(r))
+      within: Result.inside(r)
+    end
+
+  -- Bounding box of open drop-down `level` (`level >= 2`) placed inside `screen`.
+  drop_down_area(r: RECT, screen: RECT, level: NAT): RECT
+    do
+      MENU.drop_down_area_at(r, screen, Current.bar_items, Current.open_path, level)
+    ensure
+      within_screen: Result.inside(screen)
+    end
+
+  -- Row rectangle of item `j` (`0`-based) inside drop-down `level` (`level >= 2`).
+  item_area(r: RECT, screen: RECT, level: NAT, j: NAT): RECT
+    do
+      MENU.item_area_at(r, screen, Current.bar_items, Current.open_path, level, j)
+    ensure
+      within_box: Result.inside(Current.drop_down_area(r, screen, level))
+      within_screen: Result.inside(screen)
+    end
+
+  -- Whether `(cx, cy)` lies on the bar or inside any open drop-down box.
+  contains(r: RECT, screen: RECT, cx: NAT, cy: NAT): BOOL
+    do
+      if Current.bar_area(r).has(cx, cy) then
+        True
+      else if Current.open_path.length > 1 then
+        let max_lvl = if Current.open_path.length <= 18446744073709551615 then Current.open_path.length else 18446744073709551615 end
+        MENU.find_dropdown_hit(r, screen, Current.bar_items, Current.open_path, max_lvl, cx, cy) > 0
+      else
+        False
+      end end
+    end
+
+  -- Open the first selectable bar entry and its drop-down (F10).
+  open: MENU
+    do
+      match MENU_ITEM.first_selectable_in(Current.bar_items)
+        case Some(i) then
+          if i < 18446744073709551615 then
+            { Current with open_path = MENU.entry_path(Current.bar_items, i, True, True) }
+          else
+            Current
+          end
+        case None then Current
+      end
+    ensure
+      entries_kept: Result.count = Current.count
+    end
+
+  -- Open bar entry `i` (`0`-based) and its drop-down with its first selectable item highlighted.
+  open_entry(i: NAT): MENU
+    do
+      if i < Current.bar_items.length and i < 18446744073709551615 then
+        if LIST_OPS.at(Current.bar_items, i).is_selectable then
+          { Current with open_path = MENU.entry_path(Current.bar_items, i, True, True) }
+        else
+          Current
+        end
+      else
+        Current
+      end
+    ensure
+      entries_kept: Result.count = Current.count
+    end
+
+  entry_with_initial(ch: CHAR): OPTION[NAT]
+    do
+      let n = if Current.bar_items.length <= 18446744073709551615 then Current.bar_items.length else 18446744073709551615 end
+      MENU.find_entry_initial(Current.bar_items, ch, 0, n)
+    ensure
+      valid: match Result
+        case Some(i) then 0 <= i and i < 18446744073709551615 and i < Current.count and Current.entry(i).is_selectable
+        case None then True
+      end
+    end
+
+  open_initial(ch: CHAR): MENU
+    do
+      match Current.entry_with_initial(ch)
+        case Some(i) then Current.open_entry(i)
+        case None then Current
+      end
+    ensure
+      entries_kept: Result.count = Current.count
+    end
+
+  -- Close all open levels.
+  close: MENU
+    do
+      { Current with open_path = LIST.empty }
+    ensure
+      closed: not Result.is_open
+      entries_kept: Result.count = Current.count
+    end
+
+  -- Close the innermost open level (or close the menu if only the bar is active).
+  close_level: MENU
+    do
+      if Current.open_path.length <= 1 then
+        Current.close
+      else
+        { Current with open_path = MENU.pop_path(Current.bar_items, Current.open_path) }
+      end
+    ensure
+      entries_kept: Result.count = Current.count
+      not_deeper: Result.depth <= Current.depth
+      one_less: Current.depth > 0 implies Result.depth = Current.depth - 1
+    end
+
+  move_down: MENU
+    do
+      if Current.open_path.length = 0 then
+        Current
+      else if Current.open_path.length = 1 then
+        { Current with open_path = MENU.open_highlighted_submenu(Current.bar_items, Current.open_path, True, False) }
+      else
+        { Current with open_path = MENU.move_within_last(Current.bar_items, Current.open_path, True) }
+      end end
+    ensure
+      entries_kept: Result.count = Current.count
+    end
+
+  move_up: MENU
+    do
+      if Current.open_path.length = 0 then
+        Current
+      else if Current.open_path.length = 1 then
+        { Current with open_path = MENU.open_highlighted_submenu(Current.bar_items, Current.open_path, False, True) }
+      else
+        { Current with open_path = MENU.move_within_last(Current.bar_items, Current.open_path, False) }
+      end end
+    ensure
+      entries_kept: Result.count = Current.count
+    end
+
+  move_right: MENU
+    do
+      if Current.open_path.length = 0 then
+        Current
+      else
+        let opened_sub =
+          if Current.open_path.length > 1 then
+            match Current.highlighted_item
+              case Some(it) then it.has_submenu
+              case None then False
+            end
+          else
+            False
+          end
+        if opened_sub then
+          { Current with open_path = MENU.open_highlighted_submenu(Current.bar_items, Current.open_path, True, False) }
+        else
+          let s1 = Current.open_path.head
+          let next_opt = if s1 > 0 and s1 <= 18446744073709551615 then MENU_ITEM.next_selectable_in(Current.bar_items, s1 - 1) else MENU_ITEM.first_selectable_in(Current.bar_items) end
+          match next_opt
+            case Some(i) then
+              if 0 <= i and i < 18446744073709551615 then
+                { Current with open_path = MENU.entry_path(Current.bar_items, i, Current.open_path.length > 1, True) }
+              else
+                Current
+              end
+            case None then Current
+          end
+        end
+      end
+    ensure
+      entries_kept: Result.count = Current.count
+    end
+
+  move_left: MENU
+    do
+      if Current.open_path.length = 0 then
+        Current
+      else if Current.open_path.length > 2 then
+        Current.close_level
+      else
+        let s1 = Current.open_path.head
+        let prev_opt = if s1 > 0 and s1 <= 18446744073709551615 then MENU_ITEM.previous_selectable_in(Current.bar_items, s1 - 1) else MENU_ITEM.last_selectable_in(Current.bar_items) end
+        match prev_opt
+          case Some(i) then
+            if 0 <= i and i < 18446744073709551615 then
+              { Current with open_path = MENU.entry_path(Current.bar_items, i, Current.open_path.length > 1, True) }
+            else
+              Current
+            end
+          case None then Current
+        end
+      end end
+    ensure
+      entries_kept: Result.count = Current.count
+    end
+
+  -- Activate the highlighted item: open its sub-menu, or choose the leaf and close the menu.
+  activate: MENU
+    do
+      match Current.highlighted_item
+        case Some(it) then
+          if it.has_submenu then
+            { Current with open_path = MENU.open_highlighted_submenu(Current.bar_items, Current.open_path, True, False) }
+          else
+            { Current with open_path = LIST.empty, picked_item = Some(it) }
+          end
+        case None then Current
+      end
+    ensure
+      entries_kept: Result.count = Current.count
+    end
+
+  -- Handle keyboard input. `F10` toggles open/closed; `Alt+letter` opens the matching bar
+  -- entry; while open, arrow keys, `Enter`, and `Escape` navigate.
+  on_key(k: KEY): MENU
+    do
+      match k
+        case Function(n) then
+          if n = 10 then
+            if Current.is_open then Current.close else Current.open end
+          else
+            Current
+          end
+        case Mod(inner, _, alt, ctrl) then
+          if alt and not ctrl then
+            match inner
+              case Char(ch) then Current.open_initial(ch)
+              case _ then Current
+            end
+          else
+            Current
+          end
+        case _ then
+          if not Current.is_open then
+            Current
+          else
+            match k
+              case Down then Current.move_down
+              case Up then Current.move_up
+              case Right then Current.move_right
+              case Left then Current.move_left
+              case Enter then Current.activate
+              case Escape then Current.close_level
+              case _ then Current
+            end
+          end
+      end
+    ensure
+      entries_kept: Result.count = Current.count
+      esc_not_deeper: match k
+        case Escape then Result.depth <= Current.depth
+        case _ then True
+      end
+    end
+
+  -- Handle a mouse click in `r` / `screen`: click on a bar entry toggles/switches its
+  -- drop-down, click on a drop-down item opens a sub-menu or chooses a leaf, click on a
+  -- disabled item or separator does nothing, and clicking outside while open closes the menu.
+  on_mouse(m: MOUSE, r: RECT, screen: RECT): MENU
+    do
+      if not m.is_left_down then
+        Current
+      else
+        let cx = m.x
+        let cy = m.y
+        if Current.bar_area(r).has(cx, cy) then
+          match MENU.find_bar_entry_at(r, Current.bar_items, 0, cx, cy)
+            case Some(i) then
+              if i < Current.bar_items.length and i < 18446744073709551615 then
+                let it = LIST_OPS.at(Current.bar_items, i)
+                if not it.is_selectable then
+                  Current
+                else if Current.is_dropped_down and Current.slot_at(1) = i + 1 then
+                  Current.close
+                else if it.has_submenu then
+                  { Current with open_path = MENU.entry_path(Current.bar_items, i, True, False) }
+                else
+                  { Current with open_path = LIST.empty, picked_item = Some(it) }
+                end end end
+              else
+                Current
+              end
+            case None then Current
+          end
+        else
+          let hit_lvl =
+            if Current.open_path.length > 1 then
+              let max_lvl = if Current.open_path.length <= 18446744073709551615 then Current.open_path.length else 18446744073709551615 end
+              MENU.find_dropdown_hit(r, screen, Current.bar_items, Current.open_path, max_lvl, cx, cy)
+            else
+              0
+            end
+          if hit_lvl >= 2 then
+            let items = MENU.items_at_level(Current.bar_items, Current.open_path, hit_lvl)
+            match MENU.find_item_at(r, screen, Current.bar_items, Current.open_path, hit_lvl, items, 0, cx, cy)
+              case Some(j) then
+                if j < items.length and j < 18446744073709551615 then
+                  let it = LIST_OPS.at(items, j)
+                  if not it.is_selectable then
+                    Current
+                  else if it.has_submenu then
+                    { Current with open_path = MENU.click_submenu_at(Current.bar_items, Current.open_path, hit_lvl, j) }
+                  else
+                    { Current with open_path = LIST.empty, picked_item = Some(it) }
+                  end end
+                else
+                  Current
+                end
+              case None then Current
+            end
+          else if Current.is_open then
+            Current.close
+          else
+            Current
+          end end
+        end
+      end
+    ensure
+      entries_kept: Result.count = Current.count
+    end
+
+  -- Draw the menu bar on the top row of `r`, followed by any open drop-down overlays.
+  draw(s: SCREEN, r: RECT, bar_st: STYLE, menu_st: STYLE, highlight_st: STYLE, disabled_st: STYLE): SCREEN
+    do
+      let bar = Current.bar_area(r)
+      let filled_bar = if bar.is_empty then s else s.fill(bar, ' ', bar_st) end
+      let active_slot = if Current.is_open then Current.slot_at(1) else 0 end
+      let with_bar = MENU.draw_bar_entries(filled_bar, r, Current.bar_items, 0, active_slot, bar_st, highlight_st, disabled_st)
+      let screen_area = RECT.make(0, 0, s.width, s.height)
+      let res =
+        if Current.open_path.length > 1 then
+          MENU.draw_drop_downs(with_bar, r, screen_area, Current.bar_items, Current.open_path, 2,
+            Current.border, Current.sep_border, menu_st, highlight_st, disabled_st)
+        else
+          with_bar
+        end
+      SCREEN.fitted(res, s)
+    ensure
+      same_width: Result.width = s.width
+      same_height: Result.height = s.height
+    end
+
+end

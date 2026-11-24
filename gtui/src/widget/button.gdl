@@ -1,0 +1,199 @@
+-- A push button: `"[ OK ]"`, centered on the middle row of its bounding rectangle.
+-- TODO(proof-GW.4): prove BUTTON.draw modifies only cells inside r
+module BUTTON
+
+representation {NONE}
+  text_label: STRING
+  left_brk: STRING
+  right_brk: STRING
+  alignment: ALIGN
+  fills_box: BOOL
+
+create {ANY}
+
+  -- A button labelled `label` with `"[ "` / `" ]"` brackets, centered and filled.
+  make(label: STRING): BUTTON
+    do
+      { text_label = label, left_brk = "[ ", right_brk = " ]",
+        alignment = ALIGN.center, fills_box = True }
+    ensure
+      label_set: Result.label.equals(label)
+      centered: Result.align.is_center
+      filled: Result.fills_area
+    end
+
+  -- A bare button with no brackets.
+  bare(label: STRING): BUTTON
+    do
+      { text_label = label, left_brk = "", right_brk = "",
+        alignment = ALIGN.center, fills_box = True }
+    ensure
+      label_set: Result.label.equals(label)
+      centered: Result.align.is_center
+      filled: Result.fills_area
+    end
+
+  -- Middle row of `r` (the upper of the two middle rows for an even height).
+  row_in(r: RECT): RECT
+    do
+      if r.is_empty then
+        r.take_top(0)
+      else
+        let dy = if r.height > 1 then (r.height - 1) / 2 else 0 end
+        let cdy = if dy < r.height then dy else 0 end
+        let sub = r.drop_top(cdy)
+        let res = sub.take_top(1)
+        check c1: RECT.cut_top(r, cdy) end
+        check c2: RECT.cut_top(sub, 1) end
+        check tr: RECT.inside_trans(res, sub, r) end
+        res
+      end
+    ensure
+      within: Result.inside(r)
+      one_row: Result.height <= 1
+    end
+
+  -- Render a button into `r` on `s` with style `st` (static helper usable from `DIALOG.draw`).
+  render_in(s: SCREEN, r: RECT, label: STRING, left_brk: STRING, right_brk: STRING, align: ALIGN, fills: BOOL, st: STYLE): SCREEN
+    do
+      if r.is_empty then
+        s
+      else
+        let row = BUTTON.row_in(r)
+        let full_text = GLYPHS.join(GLYPHS.join(left_brk, label), right_brk)
+        let w = GLYPHS.width(full_text)
+        let off = align.offset(w, r.width)
+        let avail = if off < r.width then r.width - off else 0 end
+        let shown_w = GLYPHS.fitting_width(full_text, avail)
+        let text_rect = RECT.make(row.x + off, row.y, shown_w, row.height)
+        let s0 =
+          if fills then
+            s.fill(r, ' ', st)
+          else
+            s.fill(text_rect, ' ', st)
+          end
+        if shown_w > 0 then
+          s0.text(text_rect, text_rect.x, text_rect.y, full_text, st)
+        else
+          s0
+        end
+      end
+    ensure
+      same_width: Result.width = s.width
+      same_height: Result.height = s.height
+    end
+
+feature {ANY}
+
+  label: STRING
+    do
+      Current.text_label
+    end
+
+  left_bracket: STRING
+    do
+      Current.left_brk
+    end
+
+  right_bracket: STRING
+    do
+      Current.right_brk
+    end
+
+  align: ALIGN
+    do
+      Current.alignment
+    end
+
+  fills_area: BOOL
+    do
+      Current.fills_box
+    end
+
+  with_label(text: STRING): BUTTON
+    do
+      { Current with text_label = text }
+    ensure
+      label_set: Result.label.equals(text)
+    end
+
+  with_brackets(left: STRING, right: STRING): BUTTON
+    do
+      { Current with left_brk = left, right_brk = right }
+    end
+
+  without_brackets: BUTTON
+    do
+      { Current with left_brk = "", right_brk = "" }
+    end
+
+  with_align(a: ALIGN): BUTTON
+    do
+      { Current with alignment = a }
+    end
+
+  with_fill(fills: BOOL): BUTTON
+    do
+      { Current with fills_box = fills }
+    end
+
+  -- Columns taken by brackets and label when unclipped, capped at 65535.
+  width: NAT
+    do
+      let lw = GLYPHS.width(Current.left_brk)
+      let tw = GLYPHS.width(Current.text_label)
+      let rw = GLYPHS.width(Current.right_brk)
+      let s1 = if lw <= 65535 - tw then lw + tw else 65535 end
+      if s1 <= 65535 - rw then s1 + rw else 65535 end
+    ensure
+      fits: Result <= 65535
+      at_least_label: Result >= GLYPHS.width(Current.label)
+    end
+
+  -- Row of `r` on which the button content is drawn.
+  content_row(r: RECT): RECT
+    do
+      BUTTON.row_in(r)
+    ensure
+      within: Result.inside(r)
+      one_row: Result.height <= 1
+    end
+
+  -- Horizontal offset of the content inside an area of `area_width` columns.
+  content_offset(area_width: NAT): NAT
+    do
+      Current.alignment.offset(Current.width, area_width)
+    ensure
+      bounded: Result <= area_width
+      left_zero: Current.align.is_left implies Result = 0
+      too_wide: Current.width >= area_width implies Result = 0
+    end
+
+  -- Whether `(cx, cy)` hits the button area `r`.
+  hit(r: RECT, cx: NAT, cy: NAT): BOOL
+    do
+      r.has(cx, cy)
+    ensure
+      def: Result = r.has(cx, cy)
+    end
+
+  -- Draw the button inside `r` with explicit base, focused, and pressed styles.
+  draw_state(s: SCREEN, r: RECT, base_st: STYLE, focused_st: STYLE, pressed_st: STYLE, focused: BOOL, pressed: BOOL): SCREEN
+    do
+      let st = if pressed then pressed_st else if focused then focused_st else base_st end end
+      BUTTON.render_in(s, r, Current.text_label, Current.left_brk, Current.right_brk, Current.alignment, Current.fills_box, st)
+    ensure
+      same_width: Result.width = s.width
+      same_height: Result.height = s.height
+    end
+
+  -- Draw the button inside `r`, reversing `st` when focused and bolding when pressed.
+  draw(s: SCREEN, r: RECT, st: STYLE, focused: BOOL, pressed: BOOL): SCREEN
+    do
+      Current.draw_state(s, r, st, st.reversed, st.reversed.bold, focused, pressed)
+    ensure
+      same_width: Result.width = s.width
+      same_height: Result.height = s.height
+    end
+
+end

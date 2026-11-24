@@ -2809,3 +2809,941 @@ end
     let t6 = screen_text(&tour_term.before_clear[7]);
     assert!(!t6.contains("Esc/? to close"), "click outside dismisses tour help popup:\n{t6}");
 }
+
+#[test]
+fn gw2_overlay_placement_and_divider_work() {
+    // 1. Formal client contract proofs for OVERLAY_SIDE, OVERLAY_PLACEMENT, and DIVIDER.
+    let contracts = r#"functions CLIENT
+
+feature {ANY}
+
+  check_gw2(anchor: RECT, bounds: RECT, w: NAT, h: NAT, side: OVERLAY_SIDE,
+            s: SCREEN, r: RECT, div: DIVIDER, st: STYLE): BOOL
+    require
+      anchor_in: anchor.inside(bounds)
+    do
+      let placed = OVERLAY_PLACEMENT.place(anchor, w, h, side, bounds)
+      let rule = div.rule_area(r)
+      let drawn = div.draw(s, r, st)
+      check
+        in_b: placed.inside(bounds)
+        apart: placed.disjoint(anchor)
+        opp_inv: side.opposite.opposite.same(side)
+        rule_in: rule.inside(r)
+        dim_w: drawn.width = s.width
+        dim_h: drawn.height = s.height
+      end
+      True
+    ensure
+      placed_inside: OVERLAY_PLACEMENT.place(anchor, w, h, side, bounds).inside(bounds)
+      placed_disjoint: OVERLAY_PLACEMENT.place(anchor, w, h, side, bounds).disjoint(anchor)
+      rule_inside: div.rule_area(r).inside(r)
+      drawn_dim: div.draw(s, r, st).width = s.width and div.draw(s, r, st).height = s.height
+    end
+
+end
+"#;
+    let contract_proj = Project::new("gtui_gw2_contracts", contracts);
+    assert_ok(&contract_proj.check());
+
+    let bad_contracts = r#"functions CLIENT
+
+feature {ANY}
+
+  bad_overlap(anchor: RECT, bounds: RECT, w: NAT, h: NAT, side: OVERLAY_SIDE): BOOL
+    require
+      anchor_in: anchor.inside(bounds)
+      non_empty_a: not anchor.is_empty
+    do
+      True
+    ensure
+      must_overlap: not OVERLAY_PLACEMENT.place(anchor, w, h, side, bounds).disjoint(anchor)
+    end
+
+end
+"#;
+    let bad_proj = Project::new("gtui_gw2_bad_overlap", bad_contracts);
+    let bad_out = bad_proj.check();
+    assert!(!bad_out.status.success(), "overlapping placement claim must be refused: {}", all(&bad_out));
+    assert!(all(&bad_out).contains("`must_overlap`"), "{}", all(&bad_out));
+
+    // 2. Runtime & VT snapshot checks for OVERLAY_PLACEMENT and DIVIDER.
+    let prog = r#"reactive program GW2_WIDGETS
+
+feature {ANY}
+
+  update(n: NAT, e: EVENT): TUI_NEXT[NAT]
+    do
+      match e
+        case Key(k) then
+          match k
+            case Char(c) then if c = 'q' then TUI_NEXT.quit(0) else TUI_NEXT.next(n) end
+            case _ then TUI_NEXT.next(n)
+          end
+        case _ then TUI_NEXT.next(n)
+      end
+    end
+
+  rect_eq(a: RECT, x: NAT, y: NAT, w: NAT, h: NAT): BOOL
+    do
+      a.x = x and a.y = y and a.width = w and a.height = h
+    end
+
+  view(n: NAT, blank: SCREEN): SCREEN
+    do
+      let bounds = RECT.make(0, 0, 20, 10)
+      -- Below fits whole
+      let p1 = OVERLAY_PLACEMENT.place(RECT.make(2, 1, 4, 1), 6, 3, OVERLAY_SIDE.below, bounds)
+      -- Below does not fit -> flips above
+      let p2 = OVERLAY_PLACEMENT.place(RECT.make(2, 8, 4, 1), 6, 3, OVERLAY_SIDE.below, bounds)
+      -- Shifts left along bottom edge
+      let p3 = OVERLAY_PLACEMENT.place(RECT.make(17, 1, 3, 1), 6, 3, OVERLAY_SIDE.below, bounds)
+      -- RightOf does not fit -> flips LeftOf
+      let p4 = OVERLAY_PLACEMENT.place(RECT.make(16, 2, 3, 1), 5, 2, OVERLAY_SIDE.right_of, bounds)
+      -- Fits neither side -> cuts to larger room (below has 5 rows vs 3 above)
+      let p5 = OVERLAY_PLACEMENT.place(RECT.make(2, 3, 4, 2), 6, 8, OVERLAY_SIDE.below, bounds)
+
+      let ok =
+        rect_eq(p1, 2, 2, 6, 3)
+          and rect_eq(p2, 2, 5, 6, 3)
+          and rect_eq(p3, 14, 2, 6, 3)
+          and rect_eq(p4, 11, 2, 5, 2)
+          and rect_eq(p5, 2, 5, 6, 5)
+
+      let base = STYLE.plain
+      let lbl_st = STYLE.plain.bold
+      let s0 = blank.text(blank.area, 0, 0, if ok then "OK" else "BAD" end, base)
+      let s1 = DIVIDER.horizontal.with_label("Settings").with_align(ALIGN.center).draw_labeled(s0, RECT.make(0, 1, 16, 1), base, lbl_st)
+      let s2 = DIVIDER.horizontal.with_border(BORDER_KIND.double).with_label("Top").draw_labeled(s1, RECT.make(0, 2, 14, 1), base, lbl_st)
+      let s3 = DIVIDER.horizontal.with_label("TooLongLabel").draw(s2, RECT.make(0, 3, 6, 1), base)
+      DIVIDER.vertical.with_border(BORDER_KIND.thick).draw(s3, RECT.make(18, 1, 1, 4), base)
+    end
+
+  init(args: SEQ[STRING]): STEP[TUI[NAT]]
+    do
+      TUI.start(0, update, view)
+    end
+
+  step(t: TUI[NAT], e: EVENT): STEP[TUI[NAT]]
+    do
+      t.step(e)
+    end
+
+end
+"#;
+    let runtime_proj = Project::new("gtui_gw2_runtime", prog);
+    let src = runtime_proj.0 .0.join("p/src");
+    fs::rename(src.join("client.gdl"), src.join("gw2_widgets.gdl")).expect("named after its module");
+    assert_ok(&runtime_proj.check());
+
+    let script = "Resized:24:8 Key:113";
+    let ran = run(&runtime_proj.0.bin("gw2_widgets"), script, &[]);
+    assert_eq!(ran.status.code(), Some(0), "{}", all(&ran));
+    let mut term = Terminal::new(sizes(script));
+    term.feed(&ran.stdout);
+
+    let slice = |row: usize, x0: usize, x1: usize| -> String {
+        term.grid[row][x0..x1].iter().map(|c| c.0).filter(|ch| *ch != '\0').collect()
+    };
+    assert_eq!(slice(0, 0, 2), "OK");
+    assert_eq!(slice(1, 0, 16), "─── Settings ───");
+    assert_eq!(pen_at(&term.grid, "Settings"), vec![1]);
+    assert_eq!(slice(2, 0, 14), "═ Top ════════");
+    assert_eq!(slice(3, 0, 6), "─ To ─");
+    let vert: String = (1..5).map(|r| term.grid[r][18].0).collect();
+    assert_eq!(vert, "┃┃┃┃");
+}
+
+#[test]
+fn gw1_breadcrumb_collapse_keys_and_mouse_work() {
+    // 1. Formal client contract proofs for BREADCRUMB.
+    let contracts = r#"functions CLIENT
+
+feature {ANY}
+
+  check_gw1(bc: BREADCRUMB, r: RECT, k: KEY, m: MOUSE, cx: NAT, cy: NAT,
+            s: SCREEN, st: STYLE): BOOL
+    do
+      let k_next = bc.on_key(k)
+      let m_next = bc.on_mouse(m, r)
+      let hit = bc.crumb_at(r, cx, cy)
+      let drawn = bc.draw(s, r, st, st, st, st)
+      check
+        k_cnt: k_next.count = bc.count
+        m_cnt: m_next.count = bc.count
+        sel_ok: bc.selected < bc.count or (bc.count = 0 and bc.selected = 0)
+        dim_w: drawn.width = s.width
+        dim_h: drawn.height = s.height
+      end
+      match hit
+        case Some(i) then i < bc.count
+        case None then True
+      end
+    ensure
+      valid_hit: match bc.crumb_at(r, cx, cy) case Some(i) then i < bc.count case None then True end
+      drawn_dim: bc.draw(s, r, st, st, st, st).width = s.width and bc.draw(s, r, st, st, st, st).height = s.height
+    end
+
+end
+"#;
+    let contract_proj = Project::new("gtui_gw1_contracts", contracts);
+    assert_ok(&contract_proj.check());
+
+    // 2. Runtime & VT checks for BREADCRUMB collapse, keyboard, and mouse hit-testing.
+    let prog = r#"reactive program GW1_BREADCRUMB
+
+feature {ANY}
+
+  update(bc: BREADCRUMB, e: EVENT): TUI_NEXT[BREADCRUMB]
+    do
+      match e
+        case Key(k) then
+          match k
+            case Char(c) then if c = 'q' then TUI_NEXT.quit(0) else TUI_NEXT.next(bc) end
+            case _ then TUI_NEXT.next(bc.on_key(k))
+          end
+        case Mouse(m) then TUI_NEXT.next(bc.on_mouse(m, RECT.make(0, 1, 26, 1)))
+        case _ then TUI_NEXT.next(bc)
+      end
+    end
+
+  opt_eq(o: OPTION[NAT], expected: NAT): BOOL
+    do
+      match o
+        case Some(v) then v = expected
+        case None then False
+      end
+    end
+
+  opt_none(o: OPTION[NAT]): BOOL
+    do
+      match o
+        case Some(_) then False
+        case None then True
+      end
+    end
+
+  view(bc: BREADCRUMB, blank: SCREEN): SCREEN
+    do
+      let base = STYLE.plain
+      let cur_st = STYLE.plain.bold
+      let sel_st = STYLE.plain.reversed
+      let sep_st = STYLE.plain.fg(COLOR.gray)
+
+      let r0 = RECT.make(0, 0, 35, 1)
+      let r1 = RECT.make(0, 1, 26, 1)
+      let r2 = RECT.make(0, 2, 16, 1)
+      let r3 = RECT.make(0, 3, 8, 1)
+
+      let hits_ok =
+        opt_eq(bc.crumb_at(r0, 0, 0), 0)
+          and opt_none(bc.crumb_at(r0, 4, 0))
+          and opt_eq(bc.crumb_at(r0, 6, 0), 1)
+          and opt_eq(bc.crumb_at(r1, 0, 1), 0)
+          and opt_none(bc.crumb_at(r1, 6, 1))
+          and opt_eq(bc.crumb_at(r1, 10, 1), 2)
+          and opt_eq(bc.crumb_at(r1, 17, 1), 3)
+          and opt_eq(bc.crumb_at(r2, 10, 2), 3)
+          and opt_eq(bc.crumb_at(r3, 2, 3), 3)
+
+      let s0 = bc.draw(blank, r0, base, cur_st, sel_st, sep_st)
+      let s1 = bc.draw(s0, r1, base, cur_st, sel_st, sep_st)
+      let s2 = bc.draw(s1, r2, base, cur_st, sel_st, sep_st)
+      let s3 = bc.draw(s2, r3, base, cur_st, sel_st, sep_st)
+      s3.text(blank.area, 0, 4, if hits_ok then "HITS_OK" else "HITS_BAD" end, base)
+    end
+
+  init(args: SEQ[STRING]): STEP[TUI[BREADCRUMB]]
+    do
+      let none: LIST[STRING] = LIST.empty
+      let path = none.prepend("node.gdl").prepend("tree").prepend("widget").prepend("src")
+      TUI.start(BREADCRUMB.make(path), update, view)
+    end
+
+  step(t: TUI[BREADCRUMB], e: EVENT): STEP[TUI[BREADCRUMB]]
+    do
+      t.step(e)
+    end
+
+end
+"#;
+    let runtime_proj = Project::new("gtui_gw1_runtime", prog);
+    let src = runtime_proj.0 .0.join("p/src");
+    fs::rename(src.join("client.gdl"), src.join("gw1_breadcrumb.gdl")).expect("named after its module");
+    assert_ok(&runtime_proj.check());
+
+    // Initial -> Left (selects node.gdl) -> Left (selects tree) -> Left (selects hidden widget -> highlights '…' on row 1) -> Mouse click on 'src' -> quit.
+    let script = "Resized:40:6 Resized:40:6 Key:Left Key:Left Key:Left Resized:40:6 Mouse:Down:0:1:1 Resized:40:6 Key:113";
+    let ran = run(&runtime_proj.0.bin("gw1_breadcrumb"), script, &[]);
+    assert_eq!(ran.status.code(), Some(0), "{}", all(&ran));
+    let mut term = Terminal::new(sizes(script));
+    term.feed(&ran.stdout);
+
+    let slice = |grid: &[Vec<Cell>], row: usize, x0: usize, x1: usize| -> String {
+        grid[row][x0..x1].iter().map(|c| c.0).filter(|ch| *ch != '\0').collect()
+    };
+
+    let shot0 = &term.before_clear[2];
+    assert_eq!(slice(shot0, 0, 0, 29), "src › widget › tree › node.gd");
+    assert_eq!(slice(shot0, 1, 0, 25), "src › … › tree › node.gdl");
+    assert_eq!(slice(shot0, 2, 0, 16), "src › … › node.g");
+    assert_eq!(slice(shot0, 3, 0, 8), "node.gdl");
+    assert_eq!(slice(shot0, 4, 0, 7), "HITS_OK");
+    assert_eq!(pen_at(shot0, "node.gdl"), vec![1], "last crumb is bold by default");
+
+    // After 3x Left: picked = 1 ("widget"), hidden on row 1 so '…' gets selected_st (reversed [7])!
+    let shot1 = &term.before_clear[3];
+    assert_eq!(pen_at(shot1, "widget"), vec![7], "row 0 highlights widget");
+    assert_eq!(shot1[1][6].1, vec![7], "row 1 highlights ellipsis for hidden selection");
+
+    // After Mouse:Down:0:1:1 -> selects crumb 0 ("src")!
+    assert_eq!(pen_at(&term.grid, "src"), vec![7], "mouse click on crumb 0 selects src");
+}
+
+#[test]
+fn gw3_menu_navigation_overlay_and_mouse_work() {
+    let model = r#"
+module GW3_MODEL
+
+feature {ANY}
+
+  check_menu: BOOL
+    do
+      let sep = MENU_ITEM.separator
+      let it_new = MENU_ITEM.item("New", 1).with_shortcut("Ctrl+N")
+      let it_redo = MENU_ITEM.item("Redo", 2).with_enabled(False)
+      let it_quit = MENU_ITEM.item("Quit", 3).with_shortcut("Ctrl+Q")
+      let file_items: LIST[MENU_ITEM] = LIST.empty.prepend(it_quit).prepend(sep).prepend(it_redo).prepend(it_new)
+      let file_entry = MENU_ITEM.submenu("File", file_items)
+
+      let edit_entry = MENU_ITEM.submenu("Edit", LIST.empty.prepend(MENU_ITEM.item("Copy", 4)))
+
+      let dark = MENU_ITEM.item("Dark", 10)
+      let light = MENU_ITEM.item("Light", 11)
+      let nord = MENU_ITEM.item("Nord", 12)
+      let theme_items: LIST[MENU_ITEM] = LIST.empty.prepend(nord).prepend(light).prepend(dark)
+      let theme_sub = MENU_ITEM.submenu("Theme", theme_items)
+      let view_entry = MENU_ITEM.submenu("View", LIST.empty.prepend(theme_sub))
+      let help_entry = MENU_ITEM.item("Help", 20)
+
+      let entries: LIST[MENU_ITEM] = LIST.empty.prepend(help_entry).prepend(view_entry).prepend(edit_entry).prepend(file_entry)
+      let m = MENU.make(entries)
+
+      -- MENU_ITEM selectable navigation contracts
+      let f_sel = file_entry.first_selectable
+      let l_sel = file_entry.last_selectable
+      let n_sel = file_entry.next_selectable(0)
+      let p_sel = file_entry.previous_selectable(0)
+      let item_nav_ok =
+        match f_sel case Some(a) then a < file_entry.count and file_entry.child(a).is_selectable case None then True end
+        and match l_sel case Some(b) then b < file_entry.count and file_entry.child(b).is_selectable case None then True end
+        and match n_sel case Some(c) then c < file_entry.count and file_entry.child(c).is_selectable case None then True end
+        and match p_sel case Some(d) then d < file_entry.count and file_entry.child(d).is_selectable case None then True end
+
+      -- MENU contracts: closed initially, count preserved, Escape does not deepen, overlay inside screen
+      let m1 = m.on_key(Function(10))
+      let m2 = m1.on_key(Down)
+      let m3 = m2.on_key(Right)
+      let m4 = m.on_key(Mod(Char('v'), False, True, False))
+      let m5 = m4.on_key(Right)
+      let m6 = m5.on_key(Enter)
+      let e1 = m5.on_key(Escape)
+      let c1 = m5.close
+      let scr = RECT.make(0, 0, 80, 24)
+      let bar_r = RECT.make(0, 0, 80, 1)
+      let mc1 = m.on_mouse(MOUSE.MouseDown(0, 1, 0), bar_r, scr)
+      let flip_box = m1.drop_down_area(RECT.make(0, 23, 80, 1), scr, 2)
+      let row_box = m1.item_area(bar_r, scr, 2, 0)
+
+      let ok =
+        not m.is_open and m.count = 4
+        and item_nav_ok
+        and m1.count = 4 and m2.count = 4 and m3.count = 4 and m4.count = 4 and m5.count = 4 and m6.count = 4
+        and e1.depth <= m5.depth
+        and not c1.is_open
+        and mc1.count = 4
+        and flip_box.inside(scr)
+        and row_box.inside(m1.drop_down_area(bar_r, scr, 2))
+        and row_box.inside(scr)
+
+      check ok: ok end
+      ok
+    ensure
+      verified: Result
+    end
+
+end
+"#;
+    let model_proj = Project::new("gtui_gw3_model", model);
+    let msrc = model_proj.0 .0.join("p/src");
+    fs::rename(msrc.join("client.gdl"), msrc.join("gw3_model.gdl")).expect("named after its module");
+    assert_ok(&model_proj.check());
+
+    let prog = r#"
+reactive program GW3_MENU
+
+feature {NONE}
+
+  build_menu: MENU
+    do
+      let sep = MENU_ITEM.separator
+      let it_new = MENU_ITEM.item("New", 1).with_shortcut("Ctrl+N")
+      let it_redo = MENU_ITEM.item("Redo", 2).with_enabled(False)
+      let it_quit = MENU_ITEM.item("Quit", 3).with_shortcut("Ctrl+Q")
+      let file_items: LIST[MENU_ITEM] = LIST.empty.prepend(it_quit).prepend(sep).prepend(it_redo).prepend(it_new)
+      let file_entry = MENU_ITEM.submenu("File", file_items)
+
+      let edit_entry = MENU_ITEM.submenu("Edit", LIST.empty.prepend(MENU_ITEM.item("Copy", 4)))
+
+      let dark = MENU_ITEM.item("Dark", 10)
+      let light = MENU_ITEM.item("Light", 11)
+      let nord = MENU_ITEM.item("Nord", 12)
+      let theme_items: LIST[MENU_ITEM] = LIST.empty.prepend(nord).prepend(light).prepend(dark)
+      let theme_sub = MENU_ITEM.submenu("Theme", theme_items)
+      let view_entry = MENU_ITEM.submenu("View", LIST.empty.prepend(theme_sub))
+      let help_entry = MENU_ITEM.item("Help", 20)
+
+      let entries: LIST[MENU_ITEM] = LIST.empty.prepend(help_entry).prepend(view_entry).prepend(edit_entry).prepend(file_entry)
+      MENU.make(entries)
+    end
+
+  update(m: MENU, e: EVENT): TUI_NEXT[MENU]
+    do
+      match e
+        case Key(Char('q')) then Quit(0, LIST.empty)
+        case Key(k) then Next(m.on_key(k), LIST.empty)
+        case Mouse(ev) then
+          let scr = RECT.make(0, 0, 50, 12)
+          let bar = RECT.make(0, 0, 50, 1)
+          Next(m.on_mouse(ev, bar, scr), LIST.empty)
+        case _ then Next(m, LIST.empty)
+      end
+    end
+
+  view(m: MENU, blank: SCREEN): SCREEN
+    do
+      let r = RECT.make(0, 0, blank.width, 1)
+      let bar_st = STYLE.plain
+      let menu_st = STYLE.plain
+      let hi_st = STYLE.plain.reversed
+      let dim_st = STYLE.plain.fg(COLOR.gray)
+      let drawn = m.draw(blank, r, bar_st, menu_st, hi_st, dim_st)
+      let status =
+        match m.chosen
+          case Some(id) then if id = 10 then "CHOSEN:10" else "CHOSEN:OTHER" end
+          case None then "CHOSEN:NONE"
+        end
+      drawn.text(RECT.make(0, 10, blank.width, 1), 0, 10, status, STYLE.plain)
+    end
+
+  init(args: SEQ[STRING]): STEP[TUI[MENU]]
+    do
+      TUI.start(build_menu, update, view)
+    end
+
+  step(t: TUI[MENU], e: EVENT): STEP[TUI[MENU]]
+    do
+      t.step(e)
+    end
+
+end
+"#;
+    let runtime_proj = Project::new("gtui_gw3_runtime", prog);
+    let src = runtime_proj.0 .0.join("p/src");
+    fs::rename(src.join("client.gdl"), src.join("gw3_menu.gdl")).expect("named after its module");
+    assert_ok(&runtime_proj.check());
+
+    // Open File via click (x=1, y=0) -> Resized snapshot -> Click View (x=13, y=0) -> Click Theme (x=14, y=2) -> Resized snapshot -> Down + Enter to pick Dark (id 10) -> quit.
+    let script = "Resized:50:12 Mouse:Down:0:1:0 Resized:50:12 Mouse:Down:0:13:0 Mouse:Down:0:14:2 Resized:50:12 Key:Down Key:Enter Key:113";
+    let ran = run(&runtime_proj.0.bin("gw3_menu"), script, &[]);
+    assert_eq!(ran.status.code(), Some(0), "{}", all(&ran));
+    let mut term = Terminal::new(sizes(script));
+    term.feed(&ran.stdout);
+
+    let slice = |grid: &[Vec<Cell>], row: usize, x0: usize, x1: usize| -> String {
+        grid[row][x0..x1].iter().map(|c| c.0).filter(|ch| *ch != '\0').collect()
+    };
+
+    // Snapshot 2: File drop-down open
+    let shot_file = &term.before_clear[2];
+    assert_eq!(slice(shot_file, 0, 0, 24), " File  Edit  View  Help ");
+    assert!(slice(shot_file, 2, 0, 20).contains("New"));
+    assert!(slice(shot_file, 2, 0, 20).contains("Ctrl+N"));
+    assert!(slice(shot_file, 3, 0, 20).contains("Redo"));
+    assert!(slice(shot_file, 4, 0, 20).contains("─"));
+    assert!(slice(shot_file, 5, 0, 20).contains("Quit"));
+
+    // Snapshot 3: View -> Theme sub-menu open
+    let shot_sub = &term.before_clear[3];
+    assert!(slice(shot_sub, 2, 12, 30).contains("Theme"));
+    assert!(slice(shot_sub, 2, 12, 30).contains("▸"));
+    assert!(slice(shot_sub, 3, 20, 35).contains("Dark"));
+    assert!(slice(shot_sub, 5, 20, 35).contains("Nord"));
+
+    // Final grid: Dark chosen (id = 10)
+    assert_eq!(slice(&term.grid, 10, 0, 9), "CHOSEN:10");
+}
+
+#[test]
+fn gw4_button_and_dialog_work() {
+    let model = r#"
+module GW4_MODEL
+
+feature {ANY}
+
+  check_button_and_dialog: BOOL
+    do
+      let btn = BUTTON.make("OK")
+      let br = RECT.make(2, 4, 12, 4)
+      let brow = btn.content_row(br)
+      let btn_ok =
+        btn.width >= GLYPHS.width(btn.label)
+        and brow.inside(br)
+        and brow.height <= 1
+        and btn.content_offset(12) <= 12
+        and (btn.hit(br, 3, 5) = br.has(3, 5))
+
+      let area = RECT.make(0, 0, 50, 14)
+      let tiny = RECT.make(0, 0, 6, 3)
+
+      let a0 = DIALOG.alert("Notice", "Saved")
+      let c0 = DIALOG.confirm("Confirm", "Delete report.txt?").open
+      let okc = DIALOG.ok_cancel("Exit", "Leave now?").open
+
+      let c1 = c0.on_key(Tab)
+      let c2 = c1.on_key(Char('y'))
+      let c_outside = c0.on_mouse(MOUSE.MouseDown(0, 0, 0), area)
+
+      let okc_esc = okc.on_key(Escape)
+      let tiny_box = c0.box(tiny)
+      let tiny_body = c0.body_area(tiny)
+      let tiny_btn0 = c0.button_area(tiny, 0)
+
+      let d_box = c0.box(area)
+      let d_body = c0.body_area(area)
+      let d_btn0 = c0.button_area(area, 0)
+      let d_btn1 = c0.button_area(area, 1)
+
+      let ok =
+        btn_ok
+        and a0.button_count = 1 and not a0.is_open
+        and c0.button_count = 2 and c0.is_open and c0.focused < c0.button_count
+        and c1.button_count = 2 and c1.focused < c1.button_count
+        and c2.button_count = 2 and c2.focused < c2.button_count
+        and c_outside.button_count = 2 and c_outside.focused < c_outside.button_count
+        and okc_esc.button_count = 2 and okc_esc.focused < okc_esc.button_count
+        and tiny_box.inside(tiny) and tiny_body.inside(tiny_box) and tiny_btn0.inside(tiny_box)
+        and d_box.inside(area) and d_body.inside(d_box)
+        and d_btn0.inside(d_box) and d_btn1.inside(d_box)
+
+      check ok: ok end
+      ok
+    ensure
+      verified: Result
+    end
+
+end
+"#;
+    let model_proj = Project::new("gtui_gw4_model", model);
+    let msrc = model_proj.0 .0.join("p/src");
+    fs::rename(msrc.join("client.gdl"), msrc.join("gw4_model.gdl")).expect("named after its module");
+    assert_ok(&model_proj.check());
+
+    let prog = r#"
+reactive program GW4_DIALOG
+
+feature {NONE}
+
+  make_ambiguous: DIALOG
+    do
+      let btns: LIST[STRING] = LIST.empty.prepend("Cancel").prepend("Skip").prepend("Save")
+      DIALOG.make("Choice", PARAGRAPH.of_text("Pick one").align_center, btns, 0, Some(2)).open
+    end
+
+  update(d: DIALOG, e: EVENT): TUI_NEXT[DIALOG]
+    do
+      let area = RECT.make(0, 0, 50, 14)
+      match e
+        case Key(Char('q')) then Quit(0, LIST.empty)
+        case Key(Char('n')) then Next(make_ambiguous, LIST.empty)
+        case Key(k) then Next(d.on_key(k), LIST.empty)
+        case Mouse(m) then Next(d.on_mouse(m, area), LIST.empty)
+        case _ then Next(d, LIST.empty)
+      end
+    end
+
+  view(d: DIALOG, blank: SCREEN): SCREEN
+    do
+      let area = RECT.make(0, 0, 50, 14)
+      let bg = STYLE.plain
+      let edge = d.kind.default_style
+      let title_st = STYLE.plain.bold
+      let btn_st = STYLE.plain
+      let focus_st = STYLE.plain.reversed
+      let with_dlg = d.draw(blank, area, bg, edge, title_st, btn_st, focus_st)
+      let ans_str =
+        match d.answer
+          case Some(0) then "ANS:0"
+          case Some(1) then "ANS:1"
+          case Some(2) then "ANS:2"
+          case Some(_) then "ANS:OTHER"
+          case None then "ANS:NONE"
+        end
+      let open_str = if d.is_open then "OPEN" else "CLOSED" end
+      with_dlg.text(RECT.make(0, 12, blank.width, 1), 0, 12, ans_str.concat(" ").concat(open_str), STYLE.plain)
+    end
+
+  init(args: SEQ[STRING]): STEP[TUI[DIALOG]]
+    do
+      TUI.start(DIALOG.confirm("Confirm", "Delete report.txt?").open, update, view)
+    end
+
+  step(t: TUI[DIALOG], e: EVENT): STEP[TUI[DIALOG]]
+    do
+      t.step(e)
+    end
+
+end
+"#;
+    let runtime_proj = Project::new("gtui_gw4_runtime", prog);
+    let src = runtime_proj.0 .0.join("p/src");
+    fs::rename(src.join("client.gdl"), src.join("gw4_dialog.gdl")).expect("named after its module");
+    assert_ok(&runtime_proj.check());
+
+    // Initial confirm -> Tab (focus Yes) -> snapshot -> 'y' (answer 0, closed) -> snapshot -> 'n' (open Save/Skip/Cancel) -> 's' (ambiguous, stays open) -> Mouse outside (modal, stays open) -> Mouse on [ Skip ] (x=22, y=7, answers 1) -> quit.
+    let script = "Resized:50:14 Key:Tab Resized:50:14 Key:121 Resized:50:14 Key:110 Key:115 Mouse:Down:0:1:1 Mouse:Down:0:22:7 Key:113";
+    let ran = run(&runtime_proj.0.bin("gw4_dialog"), script, &[]);
+    assert_eq!(ran.status.code(), Some(0), "{}", all(&ran));
+    let mut term = Terminal::new(sizes(script));
+    term.feed(&ran.stdout);
+
+    let slice = |grid: &[Vec<Cell>], row: usize, x0: usize, x1: usize| -> String {
+        grid[row][x0..x1].iter().map(|c| c.0).filter(|ch| *ch != '\0').collect()
+    };
+
+    // Snapshot 2 (after Tab): Yes focused (reversed [7])
+    let shot_tab = &term.before_clear[2];
+    assert!(slice(shot_tab, 4, 14, 36).contains("Confirm"));
+    assert!(slice(shot_tab, 5, 14, 36).contains("Delete report.txt?"));
+    assert!(slice(shot_tab, 7, 14, 36).contains("[ Yes ]"));
+    assert!(slice(shot_tab, 7, 14, 36).contains("[ No ]"));
+    assert_eq!(pen_at(shot_tab, "[ Yes ]"), vec![7]);
+
+    // Snapshot 3 (after 'y'): ANS:0 CLOSED
+    let shot_y = &term.before_clear[3];
+    assert_eq!(slice(shot_y, 12, 0, 12), "ANS:0 CLOSED");
+
+    // Final grid (after 'n', 's' ambiguous, outside click swallowed, click on [ Skip ]): ANS:1 CLOSED
+    assert_eq!(slice(&term.grid, 12, 0, 12), "ANS:1 CLOSED");
+}
+
+#[test]
+fn gw5_checkbox_slider_and_toast_work() {
+    let model = r#"
+module GW5_MODEL
+
+feature {ANY}
+
+  check_controls: BOOL
+    do
+      let cb = CHECKBOX.unchecked("Wrap lines")
+      let cr = RECT.make(0, 0, 25, 3)
+      let ca = cb.content_area(cr)
+      let cb1 = cb.on_key(Char(' '))
+      let rad = CHECKBOX.radio("Option A", True)
+      check inv: CHECKBOX.toggle_involution(cb) end
+      let cb_ok =
+        ca.inside(cr)
+        and ca.height <= 1
+        and ca.width <= cb.width and ca.width <= cr.width
+        and not cb.is_checked
+        and cb1.is_checked
+        and rad.is_checked
+
+      let sl = SLIDER.make(0, 100, 10, 20).with_label
+      let sr = RECT.make(0, 4, 24, 1)
+      let tr = sl.track_area(sr)
+      let sl_up = sl.increase.page_up
+      let sl_dn = sl.decrease.page_down
+      let sl_end = sl.end_val
+      let sl_home = sl.home
+      let sl_drag = sl.on_mouse(MOUSE.MouseDrag(0, 99, 4), sr)
+      let sl_ok =
+        tr.inside(sr)
+        and sl.lo <= sl.value and sl.value <= sl.hi
+        and sl_up.lo = sl.lo and sl_up.hi = sl.hi and sl_up.value >= sl.value
+        and sl_dn.lo = sl.lo and sl_dn.hi = sl.hi and sl_dn.value <= sl.value
+        and sl_end.value = sl_end.hi
+        and sl_home.value = sl_home.lo
+        and sl.thumb_cell(10) < 10
+        and sl_drag.lo <= sl_drag.value and sl_drag.value <= sl_drag.hi
+
+      let q0 = TOAST.empty.with_max_visible(2)
+      let q1 = q0.push_info("A", 3000).push_success("B", 3000).push_warning("C", 3000)
+      let q2 = q1.tick(1000)
+      let q3 = q2.tick(3999)
+      let q4 = q3.tick(4000)
+      let tarea = RECT.make(0, 6, 40, 10)
+      let b0 = q2.box_at(tarea, 0)
+      let q_click = q2.on_mouse(MOUSE.MouseDown(0, b0.x, b0.y), tarea)
+      let toast_ok =
+        q1.visible_count <= q1.count and q1.visible_count <= q1.max_visible
+        and q2.has_time and q2.now = 1000 and q2.count <= q1.count
+        and q3.has_time and q3.now = 3999 and q3.count <= q2.count
+        and q4.has_time and q4.now = 4000 and q4.count <= q3.count
+        and b0.inside(tarea)
+        and q_click.count <= q2.count
+
+      let ok = cb_ok and sl_ok and toast_ok
+      check ok: ok end
+      ok
+    ensure
+      verified: Result
+    end
+
+end
+"#;
+    let model_proj = Project::new("gtui_gw5_model", model);
+    let msrc = model_proj.0 .0.join("p/src");
+    fs::rename(msrc.join("client.gdl"), msrc.join("gw5_model.gdl")).expect("named after its module");
+    assert_ok(&model_proj.check());
+
+    let state_mod = r#"
+module GW5_STATE
+
+representation {NONE}
+  f_cb: CHECKBOX
+  f_sl: SLIDER
+  f_toasts: TOAST
+
+create {ANY}
+
+  init: GW5_STATE
+    do
+      let q = TOAST.empty.with_max_visible(2).push_info("First", 3000).push_success("Second", 3000).push_warning("Third", 3000).tick(1000)
+      { f_cb = CHECKBOX.unchecked("Wrap"), f_sl = SLIDER.make(0, 100, 10, 20).with_label, f_toasts = q }
+    end
+
+feature {ANY}
+  cb: CHECKBOX do Current.f_cb end
+  sl: SLIDER do Current.f_sl end
+  toasts: TOAST do Current.f_toasts end
+
+  with_cb(c: CHECKBOX): GW5_STATE do { Current with f_cb = c } end
+  with_sl(s: SLIDER): GW5_STATE do { Current with f_sl = s } end
+  with_toasts(t: TOAST): GW5_STATE do { Current with f_toasts = t } end
+
+end
+"#;
+
+    let prog = r#"
+reactive program GW5_CONTROLS
+
+feature {NONE}
+
+  update(st: GW5_STATE, e: EVENT): TUI_NEXT[GW5_STATE]
+    do
+      let cb_r = RECT.make(0, 0, 20, 1)
+      let sl_r = RECT.make(0, 2, 24, 1)
+      let t_r = RECT.make(0, 4, 40, 10)
+      match e
+        case Key(Char('q')) then Quit(0, LIST.empty)
+        case Key(Char('t')) then Next(st.with_toasts(st.toasts.tick(4000)), LIST.empty)
+        case Key(k) then Next(st.with_cb(st.cb.on_key(k)).with_sl(st.sl.on_key(k)), LIST.empty)
+        case Mouse(m) then
+          Next(st.with_cb(st.cb.on_mouse(m, cb_r)).with_sl(st.sl.on_mouse(m, sl_r)).with_toasts(st.toasts.on_mouse(m, t_r)), LIST.empty)
+        case _ then Next(st, LIST.empty)
+      end
+    end
+
+  view(st: GW5_STATE, blank: SCREEN): SCREEN
+    do
+      let plain = STYLE.plain
+      let s1 = st.cb.draw(blank, RECT.make(0, 0, 20, 1), plain, False)
+      let s2 = st.sl.draw(s1, RECT.make(0, 2, 24, 1), plain, plain.bold, plain.reversed)
+      let s3 = st.toasts.draw(s2, RECT.make(0, 4, 40, 10), plain, plain, plain, plain, plain)
+      let cnt = if st.toasts.count <= 1000 then st.toasts.count else 1000 end
+      let cnt_str = NUMBER_TEXT.nat_to_text(cnt)
+      s3.text(RECT.make(0, 14, 40, 1), 0, 14, "TOASTS:".concat(cnt_str), plain)
+    end
+
+  init(args: SEQ[STRING]): STEP[TUI[GW5_STATE]]
+    do
+      TUI.start(GW5_STATE.init, update, view)
+    end
+
+  step(t: TUI[GW5_STATE], e: EVENT): STEP[TUI[GW5_STATE]]
+    do
+      t.step(e)
+    end
+
+end
+"#;
+    let runtime_proj = Project::new("gtui_gw5_runtime", prog);
+    let src = runtime_proj.0 .0.join("p/src");
+    fs::rename(src.join("client.gdl"), src.join("gw5_controls.gdl")).expect("named after its module");
+    fs::write(src.join("gw5_state.gdl"), state_mod).expect("write gw5_state.gdl");
+    assert_ok(&runtime_proj.check());
+
+    // Initial (3 toasts, 2 visible: First + Second) -> click checkbox (x=2, y=0) -> drag slider past right (x=30, y=2) -> 't' (tick 4000 expires First & Second, shows Third) -> snapshot -> click Third toast (x=35, y=5) -> quit.
+    let script = "Resized:42:16 Mouse:Down:0:2:0 Mouse:Drag:0:30:2 Key:116 Resized:42:16 Mouse:Down:0:35:5 Key:113";
+    let ran = run(&runtime_proj.0.bin("gw5_controls"), script, &[]);
+    assert_eq!(ran.status.code(), Some(0), "{}", all(&ran));
+    let mut term = Terminal::new(sizes(script));
+    term.feed(&ran.stdout);
+
+    let slice = |grid: &[Vec<Cell>], row: usize, x0: usize, x1: usize| -> String {
+        grid[row][x0..x1].iter().map(|c| c.0).filter(|ch| *ch != '\0').collect()
+    };
+
+    // Snapshot 2 (after tick 4000): checkbox checked, slider at 100, Third toast visible
+    let shot_t = &term.before_clear[2];
+    assert_eq!(slice(shot_t, 0, 0, 8), "[x] Wrap");
+    assert!(slice(shot_t, 2, 0, 24).contains("100"));
+    assert!(slice(shot_t, 5, 30, 40).contains("Third"));
+    assert_eq!(slice(shot_t, 14, 0, 8), "TOASTS:1");
+
+    // Final grid (after click on Third toast): TOASTS:0
+    assert_eq!(slice(&term.grid, 14, 0, 8), "TOASTS:0");
+}
+
+#[test]
+fn gw6_examples_menu_breadcrumb_dialog_dashboard_work() {
+    // 1. Negative contract proof for MENU click routing (cannot return out-of-range entry index).
+    let bad_menu = r#"functions CLIENT
+
+feature {ANY}
+
+  bad_entry(m: MENU, ch: CHAR): BOOL
+    do
+      True
+    ensure
+      out_of_range: match m.entry_with_initial(ch) case Some(i) then i = m.count case None then True end
+    end
+
+end
+"#;
+    let bad_proj = Project::new("gtui_gw6_bad_menu", bad_menu);
+    let bad_out = bad_proj.check();
+    assert!(!bad_out.status.success(), "out-of-range menu entry claim must be refused: {}", all(&bad_out));
+    assert!(all(&bad_out).contains("`out_of_range`"), "{}", all(&bad_out));
+
+    // 2. Scripted VT session for `examples/gtui_tour` (BREADCRUMB, MENU, DIALOG).
+    let tour_dir = Dir::new("gw6_tour");
+    assert_ok(&tour_dir.check(&root().join("examples/gtui_tour")));
+    let tour_script = concat!(
+        "Resized:90:24 ",
+        // Expand `screen` and select `CELL` -> breadcrumb shows `gtui › screen › CELL`.
+        "Key:Down Key:Right Key:Down Resized:90:24 ",
+        // Click `screen` in breadcrumb (`x=38, y=1`) -> selects `screen` node.
+        "Mouse:Down:0:38:1 Resized:90:24 ",
+        // Open MENU via F10, navigate View -> Theme -> Nord, activate, then Ctrl+n (modified).
+        "Key:F10 Key:Right Key:Right Key:Down Key:Down Key:Enter Key:Ctrl:n Resized:90:24 ",
+        // Press 'q' while modified -> opens Unsaved Changes DIALOG.
+        "Key:113 Resized:90:24 ",
+        // Escape cancels dialog -> tour stays open; press 'q' again then 'y' to confirm quit.
+        "Key:Escape Resized:90:24 Key:113 Key:121"
+    );
+    let tour_ran = run(&tour_dir.bin("gtui_tour"), tour_script, &[]);
+    assert_eq!(tour_ran.status.code(), Some(0), "{}", all(&tour_ran));
+    let mut tour_term = Terminal::new(sizes(tour_script));
+    tour_term.feed(&tour_ran.stdout);
+
+    let bc_shot = screen_text(&tour_term.before_clear[2]);
+    assert!(bc_shot.contains("gtui › screen › CELL"), "breadcrumb shows full tree path:\n{bc_shot}");
+
+    let clicked_crumb = screen_text(&tour_term.before_clear[3]);
+    assert!(clicked_crumb.contains("╭─ screen Text"), "breadcrumb click selected ancestor `screen`:\n{clicked_crumb}");
+    assert!(clicked_crumb.contains("File  View  Help"), "top menu bar rendered:\n{clicked_crumb}");
+
+    let themed_shot = &tour_term.before_clear[4];
+    let themed_text = screen_text(themed_shot);
+    assert!(themed_text.contains("Theme nord"), "menu View->Theme->Nord switched theme:\n{themed_text}");
+    assert!(themed_text.contains("New buffer (modified)"), "Ctrl+N marked buffer modified:\n{themed_text}");
+    assert_eq!(pen_at(themed_shot, "╭─Modules"), vec![38, 2, 76, 86, 106], "Nord RGB border applied");
+
+    let dlg_shot = screen_text(&tour_term.before_clear[5]);
+    assert!(dlg_shot.contains("Unsaved Changes") && dlg_shot.contains("Discard modified buffer and quit?"), "quit dialog shown:\n{dlg_shot}");
+    assert!(dlg_shot.contains("[ Yes ]") && dlg_shot.contains("[ No ]"), "dialog buttons shown:\n{dlg_shot}");
+
+    let resumed_shot = screen_text(&tour_term.before_clear[6]);
+    assert!(!resumed_shot.contains("Unsaved Changes"), "Escape cancelled quit dialog:\n{resumed_shot}");
+
+    // 3. Scripted VT session for `examples/gtui_dashboard` (DIVIDER, CHECKBOX, SLIDER, TOAST).
+    let dash_dir = Dir::new("gw6_dash");
+    assert_ok(&dash_dir.check(&root().join("examples/gtui_dashboard")));
+    let dash_script = concat!(
+        "Resized:80:24 Resized:80:24 ",
+        // Click Auto-refresh checkbox (62, 18), click slider right (73, 21), press 's' to push toast.
+        "Mouse:Down:0:62:18 Mouse:Down:0:73:21 Key:115 Resized:80:24 ",
+        // Click top-right toast (75, 1) to dismiss it.
+        "Mouse:Down:0:75:1 Resized:80:24 Key:113"
+    );
+    let dash_ran = run(&dash_dir.bin("gtui_dashboard"), dash_script, &[]);
+    assert_eq!(dash_ran.status.code(), Some(0), "{}", all(&dash_ran));
+    let mut dash_term = Terminal::new(sizes(dash_script));
+    dash_term.feed(&dash_ran.stdout);
+
+    let d_init = screen_text(&dash_term.before_clear[2]);
+    assert!(d_init.contains("[x] Auto-refresh"), "checkbox drawn:\n{d_init}");
+    assert!(d_init.contains("[x] Show finished"), "second checkbox drawn:\n{d_init}");
+    assert!(d_init.contains("Rate"), "labeled divider drawn:\n{d_init}");
+
+    let d_after = screen_text(&dash_term.before_clear[3]);
+    assert!(d_after.contains("[ ] Auto-refresh"), "checkbox toggled on click:\n{d_after}");
+    assert!(d_after.contains("━━━━━━━━━━━━●"), "slider updated on click:\n{d_after}");
+    assert!(d_after.contains("Queued task"), "toast notification visible:\n{d_after}");
+
+    let d_dismissed = screen_text(&dash_term.before_clear[4]);
+    assert!(!d_dismissed.contains("Queued task"), "toast dismissed on click:\n{d_dismissed}");
+}
+
+#[test]
+fn gtui_widgets_example_verifies_and_exercises_all_06_widgets() {
+    let dir = Dir::new("gtui_widgets_demo");
+    assert_ok(&dir.check(&root().join("examples/gtui_widgets")));
+    let script = concat!(
+        "Resized:90:22 Resized:90:22 ",
+        // Dismiss initial welcome toast at top-right of body (80, 3), click breadcrumb "Appearance" (11, 1),
+        // toggle Wrap checkbox (4, 4), click Apply button (5, 15).
+        "Mouse:Down:0:80:3 Mouse:Down:0:11:1 Mouse:Down:0:4:4 Mouse:Down:0:5:15 Resized:90:22 ",
+        // Click Reset button (25, 15) -> opens modal Reset confirmation DIALOG.
+        "Mouse:Down:0:25:15 Resized:90:22 ",
+        // Press 'y' to confirm Reset -> restores Wrap checkbox & pushes Defaults restored toast.
+        "Key:121 Resized:90:22 ",
+        // Open MENU via F10 -> File drop-down visible.
+        "Key:F10 Resized:90:22 ",
+        // Two Escapes close drop-down and menu bar, 'q' opens Quit confirmation dialog, 'y' confirms quit.
+        "Key:Escape Key:Escape Key:113 Key:121"
+    );
+    let ran = run(&dir.bin("gtui_widgets"), script, &[]);
+    assert_eq!(ran.status.code(), Some(0), "{}", all(&ran));
+    let mut term = Terminal::new(sizes(script));
+    term.feed(&ran.stdout);
+
+    let init = screen_text(&term.before_clear[2]);
+    assert!(init.contains("File  Controls  Toast  Help"), "menu bar rendered:\n{init}");
+    assert!(init.contains("Studio › Appearance › Preview"), "breadcrumb rendered:\n{init}");
+    assert!(init.contains("Options") && init.contains("Tuning") && init.contains("Actions"), "labeled dividers rendered:\n{init}");
+    assert!(init.contains("[x] Wrap preview") && init.contains("[x] Line numbers"), "checkboxes rendered:\n{init}");
+    assert!(init.contains("[ Apply ]") && init.contains("[ Toast ]") && init.contains("[ Reset ]"), "buttons rendered:\n{init}");
+    assert!(init.contains("Welcome to gtui 0.6.0 Studio!"), "initial toast rendered:\n{init}");
+
+    let after_interact = screen_text(&term.before_clear[3]);
+    assert!(!after_interact.contains("Welcome to gtui 0.6.0 Studio!"), "welcome toast dismissed on click:\n{after_interact}");
+    assert!(after_interact.contains("Appearance Controls"), "breadcrumb click switched section:\n{after_interact}");
+    assert!(after_interact.contains("[ ] Wrap preview"), "checkbox toggled on click:\n{after_interact}");
+    assert!(after_interact.contains("Applied (w=60, i=2)"), "Apply button pushed success toast:\n{after_interact}");
+
+    let reset_dlg = screen_text(&term.before_clear[4]);
+    assert!(reset_dlg.contains("Reset Defaults?"), "Reset button opened modal dialog:\n{reset_dlg}");
+    assert!(reset_dlg.contains("[ Yes ]") && reset_dlg.contains("[ No ]"), "dialog buttons rendered:\n{reset_dlg}");
+
+    let after_reset = screen_text(&term.before_clear[5]);
+    assert!(!after_reset.contains("Reset Defaults?"), "dialog closed after Yes:\n{after_reset}");
+    assert!(after_reset.contains("[x] Wrap preview"), "Reset restored Wrap checkbox:\n{after_reset}");
+    assert!(after_reset.contains("Defaults restored."), "Reset pushed info toast:\n{after_reset}");
+
+    let menu_open = screen_text(&term.before_clear[6]);
+    assert!(menu_open.contains("Apply Settings") && menu_open.contains("Export..."), "F10 opened File drop-down:\n{menu_open}");
+}

@@ -1,0 +1,187 @@
+-- Interactive TrueColor N-Queens checkerboard renderer and mouse hit-tester.
+-- Each cell is 3 columns wide (` ♛ `, ` ✕ `, ` · `) for crisp aspect ratio and easy clicking.
+functions BOARD_VIEW
+
+feature {ANY}
+
+  -- Top-left origin `(ox, oy)` of the `N x N` grid inside `r`.
+  grid_origin_x(r: RECT, n: NAT): NAT
+    require
+      bounded_n: n <= 12
+    do
+      let grid_w = 3 + n * 3
+      let rx = if r.x <= 65500 then r.x else 65500 end
+      let rw = if r.width <= 65500 then r.width else 65500 end
+      if rw > grid_w then rx + (rw - grid_w) / 2 + 3 else rx + 3 end
+    ensure
+      bounded: Result <= 65535
+    end
+
+  grid_origin_y(r: RECT, n: NAT): NAT
+    require
+      bounded_n: n <= 12
+    do
+      let grid_h = 1 + n
+      let ry = if r.y <= 65500 then r.y else 65500 end
+      let rh = if r.height <= 65500 then r.height else 65500 end
+      if rh > grid_h then ry + (rh - grid_h) / 2 + 1 else ry + 1 end
+    ensure
+      bounded: Result <= 65535
+    end
+
+  -- Map mouse coordinates `(mx, my)` to board row `r < n` (or `n` if outside).
+  row_at(r: RECT, mx: NAT, my: NAT, n: NAT): NAT
+    require
+      bounded_n: n <= 12
+    do
+      let ox = BOARD_VIEW.grid_origin_x(r, n)
+      let oy = BOARD_VIEW.grid_origin_y(r, n)
+      if my >= oy and my < oy + n and mx >= ox and mx < ox + n * 3 then
+        my - oy
+      else
+        n
+      end
+    end
+
+  -- Map mouse coordinates `(mx, my)` to board col `c < n` (or `n` if outside).
+  col_at(r: RECT, mx: NAT, my: NAT, n: NAT): NAT
+    require
+      bounded_n: n <= 12
+    do
+      let ox = BOARD_VIEW.grid_origin_x(r, n)
+      let oy = BOARD_VIEW.grid_origin_y(r, n)
+      if my >= oy and my < oy + n and mx >= ox and mx < ox + n * 3 then
+        (mx - ox) / 3
+      else
+        n
+      end
+    end
+
+  col_label(c: NAT): STRING
+    do
+      if c < 10 then
+        GLYPHS.join(" ", GLYPHS.join(NUMBER_TEXT.nat_to_text(c), " "))
+      else
+        GLYPHS.join(NUMBER_TEXT.nat_to_text(c), " ")
+      end
+    end
+
+  row_label(row: NAT): STRING
+    do
+      if row < 10 then
+        GLYPHS.join(" ", NUMBER_TEXT.nat_to_text(row))
+      else
+        NUMBER_TEXT.nat_to_text(row)
+      end
+    end
+
+  draw_col_headers(s: SCREEN, r: RECT, ox: NAT, oy: NAT, c: NAT, n: NAT, st: STYLE): SCREEN
+    require
+      in_bounds: c <= n and n <= 12
+    variant
+      n - c
+    do
+      if c >= n or oy = 0 or ox >= 65500 then
+        s
+      else
+        let next = s.text(r, ox + c * 3, oy - 1, BOARD_VIEW.col_label(c), st)
+        BOARD_VIEW.draw_col_headers(next, r, ox, oy, c + 1, n, st)
+      end
+    ensure
+      same_width: Result.width = s.width
+      same_height: Result.height = s.height
+    end
+
+  cell_style(light: BOOL, is_cursor: BOOL, is_pinned: BOOL, is_solved_q: BOOL, is_blocked: BOOL, is_ray: BOOL, t: THEME): STYLE
+    do
+      let bg =
+        if is_cursor then COLOR.rgb(68, 92, 148)
+        else if is_ray then COLOR.rgb(72, 52, 62)
+        else if light then COLOR.rgb(46, 52, 64)
+        else COLOR.rgb(30, 34, 42)
+        end end end
+      let fg =
+        if is_pinned then COLOR.yellow
+        else if is_solved_q then COLOR.green
+        else if is_blocked then COLOR.red
+        else COLOR.rgb(120, 130, 148)
+        end end end
+      let base = STYLE.plain.bg(bg).fg(fg)
+      if is_pinned or is_solved_q or is_blocked then base.bold else base end
+    end
+
+  draw_row_cells(
+    s: SCREEN, r: RECT, ox: NAT, y: NAT,
+    board: BOARD, sol: OPTION[LIST[NAT]],
+    row: NAT, col: NAT, cur_r: NAT, cur_c: NAT, show_rays: BOOL, t: THEME
+  ): SCREEN
+    require
+      in_bounds: row < board.size and col <= board.size
+    variant
+      board.size - col
+    do
+      if col >= board.size or ox >= 65500 then
+        s
+      else
+        let pinned = board.is_pinned(row, col)
+        let blocked = board.is_blocked(row, col)
+        let solved_q =
+          match sol
+            case Some(qs) then row < qs.length and QUEENS_FACTS.col_at_row(qs, row) = col
+            case None then False
+          end
+        let light = (row + col) % 2 = 0
+        let is_cur = row = cur_r and col = cur_c
+        let is_ray = show_rays and not pinned and not solved_q and not blocked and QUEENS_FACTS.attacked_by_any_pin(board, row, col)
+        let glyph =
+          if pinned or solved_q then " ♛ "
+          else if blocked then " ✕ "
+          else " · "
+          end end
+        let st = BOARD_VIEW.cell_style(light, is_cur, pinned, solved_q, blocked, is_ray, t)
+        let next = s.text(r, ox + col * 3, y, glyph, st)
+        BOARD_VIEW.draw_row_cells(next, r, ox, y, board, sol, row, col + 1, cur_r, cur_c, show_rays, t)
+      end
+    ensure
+      same_width: Result.width = s.width
+      same_height: Result.height = s.height
+    end
+
+  draw_rows(
+    s: SCREEN, r: RECT, ox: NAT, oy: NAT,
+    board: BOARD, sol: OPTION[LIST[NAT]],
+    row: NAT, cur_r: NAT, cur_c: NAT, show_rays: BOOL, t: THEME
+  ): SCREEN
+    require
+      in_bounds: row <= board.size
+    variant
+      board.size - row
+    do
+      if row >= board.size or ox < 3 or oy >= 65500 then
+        s
+      else
+        let y = oy + row
+        let s0 = s.text(r, ox - 3, y, BOARD_VIEW.row_label(row), t.gutter)
+        let s1 = BOARD_VIEW.draw_row_cells(s0, r, ox, y, board, sol, row, 0, cur_r, cur_c, show_rays, t)
+        BOARD_VIEW.draw_rows(s1, r, ox, oy, board, sol, row + 1, cur_r, cur_c, show_rays, t)
+      end
+    ensure
+      same_width: Result.width = s.width
+      same_height: Result.height = s.height
+    end
+
+  draw(s: SCREEN, r: RECT, board: BOARD, sol: OPTION[LIST[NAT]], cur_r: NAT, cur_c: NAT, show_rays: BOOL, t: THEME): SCREEN
+    do
+      let n = board.size
+      let ox = BOARD_VIEW.grid_origin_x(r, n)
+      let oy = BOARD_VIEW.grid_origin_y(r, n)
+      let s0 = BOARD_VIEW.draw_col_headers(s, r, ox, oy, 0, n, t.gutter)
+      let s1 = BOARD_VIEW.draw_rows(s0, r, ox, oy, board, sol, 0, cur_r, cur_c, show_rays, t)
+      let legend_y = if r.bottom > 1 then r.bottom - 1 else r.y end
+      s1.text(r, r.x, legend_y, "♛ yellow:pinned  ♛ green:solved  ✕ red:blocked", t.gutter)
+    ensure
+      same_width: Result.width = s.width
+      same_height: Result.height = s.height
+    end
+
+end

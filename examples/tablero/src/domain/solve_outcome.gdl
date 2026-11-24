@@ -1,0 +1,111 @@
+-- Deterministic result of a parallel divide-and-conquer solver branch:
+-- collects up to 1,000 valid solutions in deterministic lexicographical order
+-- alongside the exact total solution count.
+module SOLVE_OUTCOME
+
+representation {NONE}
+  sols: LIST[LIST[NAT]]
+  total: NAT
+
+invariant
+  bounded_sols: sols.length <= 1000
+
+create {ANY}
+
+  max_stored: NAT
+    do
+      1000
+    end
+
+  empty: SOLVE_OUTCOME
+    do
+      { sols = LIST.empty, total = 0 }
+    ensure
+      none: Result.stored_count = 0
+      empty_sols: Result.solutions.length = 0
+      zero: Result.solution_count = 0
+    end
+
+  empty_for(board: BOARD): SOLVE_OUTCOME
+    do
+      { sols = LIST.empty, total = 0 }
+    ensure
+      none: Result.stored_count = 0
+      all_valid: QUEENS_FACTS.all_valid_solutions(board, Result.solutions)
+      zero: Result.solution_count = 0
+    end
+
+  found_for(board: BOARD, placement: LIST[NAT], count: NAT): SOLVE_OUTCOME
+    require
+      valid: QUEENS_FACTS.is_valid_solution(board, placement)
+    do
+      let empty: LIST[LIST[NAT]] = LIST.empty
+      { sols = empty.prepend(placement), total = count }
+    ensure
+      one_stored: Result.stored_count = 1
+      all_valid: QUEENS_FACTS.all_valid_solutions(board, Result.solutions)
+      count_set: Result.solution_count = count
+    end
+
+  -- Deterministic associative merge: preserves all valid solutions from `left` followed by `right`
+  -- (up to `max_stored = 1000`) regardless of OpenMP task completion order.
+  merge_for(board: BOARD, left: SOLVE_OUTCOME, right: SOLVE_OUTCOME): SOLVE_OUTCOME
+    require
+      vl: QUEENS_FACTS.all_valid_solutions(board, left.solutions)
+      vr: QUEENS_FACTS.all_valid_solutions(board, right.solutions)
+    do
+      let merged = QUEENS_FACTS.merge_valid(board, left.sols, right.sols, 1000)
+      let sum =
+        if left.total <= 1000000000 and right.total <= 1000000000 then
+          left.total + right.total
+        else
+          1000000000
+        end
+      { sols = merged, total = sum }
+    ensure
+      all_valid: QUEENS_FACTS.all_valid_solutions(board, Result.solutions)
+    end
+
+feature {ANY}
+
+  solutions: LIST[LIST[NAT]]
+    do
+      Current.sols
+    ensure
+      bounded: Result.length <= 1000
+    end
+
+  stored_count: NAT
+    do
+      Current.sols.length
+    ensure
+      bounded: Result <= 1000
+    end
+
+  has_solution: BOOL
+    do
+      Current.sols.length > 0
+    end
+
+  solution_at(idx: NAT): OPTION[LIST[NAT]]
+    do
+      if idx < Current.sols.length then
+        Some(LIST_OPS.at(Current.sols, idx))
+      else if Current.sols.length > 0 then
+        Some(Current.sols.head)
+      else
+        None
+      end end
+    end
+
+  first_solution: OPTION[LIST[NAT]]
+    do
+      Current.solution_at(0)
+    end
+
+  solution_count: NAT
+    do
+      Current.total
+    end
+
+end

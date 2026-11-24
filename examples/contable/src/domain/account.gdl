@@ -1,0 +1,180 @@
+-- Verified chart-of-accounts record with bounded 64-bit integer cents.
+-- Balances are stored as signed net debit-minus-credit so the global accounting equation
+-- (`Assets + Expenses = Liabilities + Equity + Income`) reduces cleanly to `sum(balances) = 0`.
+module ACCOUNT
+
+representation {NONE}
+  acct_id: NAT
+  acct_name: STRING
+  acct_kind: NAT
+  bal_cents: I64
+  budget_cents: NAT
+
+invariant
+  valid_kind: acct_kind <= 4
+  bounded_bal: bal_cents >= -1000000000000 and bal_cents <= 1000000000000
+  bounded_budget: budget_cents <= 1000000000000
+
+create {ANY}
+
+  -- Account kinds: 0=Asset, 1=Liability, 2=Equity, 3=Income, 4=Expense.
+  kind_asset: NAT
+    do
+      0
+    end
+
+  kind_liability: NAT
+    do
+      1
+    end
+
+  kind_equity: NAT
+    do
+      2
+    end
+
+  kind_income: NAT
+    do
+      3
+    end
+
+  kind_expense: NAT
+    do
+      4
+    end
+
+  max_cents: I64
+    do
+      1000000000000
+    end
+
+  make(id: NAT, name: STRING, kind: NAT, budget: NAT): ACCOUNT
+    require
+      valid_kind: kind <= 4
+      bounded_budget: budget <= 1000000000000
+    do
+      { acct_id = id, acct_name = name, acct_kind = kind, bal_cents = 0, budget_cents = budget }
+    ensure
+      zero_balance: Result.balance_cents = 0
+      kind_set: Result.kind = kind
+      budget_set: Result.budget_cap = budget
+    end
+
+feature {ANY}
+
+  id: NAT
+    do
+      Current.acct_id
+    end
+
+  name: STRING
+    do
+      Current.acct_name
+    end
+
+  kind: NAT
+    do
+      Current.acct_kind
+    ensure
+      valid: Result <= 4
+    end
+
+  kind_label: STRING
+    do
+      if Current.acct_kind = 0 then "Asset"
+      else if Current.acct_kind = 1 then "Liability"
+      else if Current.acct_kind = 2 then "Equity"
+      else if Current.acct_kind = 3 then "Income"
+      else "Expense"
+      end end end end
+    end
+
+  is_debit_normal: BOOL
+    do
+      Current.acct_kind = 0 or Current.acct_kind = 4
+    end
+
+  -- Signed net debit-minus-credit balance in cents (used for the trial-balance invariant).
+  balance_cents: I64
+    do
+      Current.bal_cents
+    ensure
+      bounded: Result >= -1000000000000 and Result <= 1000000000000
+    end
+
+  -- Exact balance in unbounded `MATH_INT` for overflow-free verification specs.
+  balance_math: MATH_INT
+    do
+      Current.bal_cents
+    end
+
+  -- Human-facing balance in the account's normal sign (positive when Asset/Expense is debited,
+  -- or when Liability/Equity/Income is credited).
+  normal_balance_cents: I64
+    do
+      if Current.is_debit_normal then Current.bal_cents else 0 - Current.bal_cents end
+    ensure
+      bounded: Result >= -1000000000000 and Result <= 1000000000000
+    end
+
+  budget_cap: NAT
+    do
+      Current.budget_cents
+    ensure
+      bounded: Result <= 1000000000000
+    end
+
+  has_budget: BOOL
+    do
+      Current.budget_cents > 0
+    end
+
+  -- Check whether applying signed `delta` keeps this account within `[-max_cents, max_cents]`.
+  can_apply(delta: I64): BOOL
+    do
+      if delta >= 0 then
+        Current.bal_cents <= 1000000000000 - delta
+      else
+        Current.bal_cents >= -1000000000000 - delta
+      end
+    end
+
+  -- Apply a signed debit (+delta) or credit (-delta) with compile-time overflow freedom.
+  apply_delta(delta: I64): ACCOUNT
+    require
+      delta_bounded: delta >= -10000000000 and delta <= 10000000000
+      fits: Current.can_apply(delta)
+    do
+      { Current with bal_cents = Current.bal_cents + delta }
+    ensure
+      same_id: Result.id = Current.id
+      same_kind: Result.kind = Current.kind
+      same_budget: Result.budget_cap = Current.budget_cap
+      shifted: Result.balance_cents = Current.balance_cents + delta
+      shifted_math: Result.balance_math = Current.balance_math + delta
+    end
+
+  -- Budget utilization percentage clamped to `0..100` for `GAUGE` rendering.
+  budget_percent: NAT
+    do
+      if Current.budget_cents = 0 then
+        0
+      else
+        let spent = Current.normal_balance_cents
+        if spent <= 0 then
+          0
+        else
+          let s_nat = NAT.from_i64(spent)
+          if s_nat >= Current.budget_cents then
+            100
+          else
+            let raw = s_nat * 100 / Current.budget_cents
+            if raw <= 100 then raw else 100 end
+          end
+        end
+      end
+    ensure
+      bounded: Result <= 100
+    end
+
+end

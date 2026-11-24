@@ -1,0 +1,93 @@
+-- Unified interactive showcase of all `gtui` 0.6.0 widgets:
+-- `MENU`, `BREADCRUMB`, `DIVIDER`, `CHECKBOX`, `SLIDER`, `BUTTON`, `DIALOG`, and `TOAST`.
+--
+--   gardelc --project examples/gtui_widgets --strict
+--   ./build/gtui_widgets_bin
+reactive program GTUI_WIDGETS
+
+feature {ANY}
+
+  update(s: WIDGETS_STATE, e: EVENT): TUI_NEXT[WIDGETS_STATE]
+    do
+      match e
+        case Resized(w, h) then TUI_NEXT.next(s.sized(w, h))
+        case Key(k) then
+          if s.dialog_open then s.on_dialog_key(k)
+          else if s.menu.is_open then s.on_menu_key(k)
+          else s.on_key_normal(k)
+          end end
+        case Mouse(m) then
+          if s.dialog_open then s.on_dialog_mouse(m)
+          else if s.menu_handles_mouse(m) then s.on_menu_mouse(m)
+          else s.on_mouse_normal(m)
+          end end
+        case _ then TUI_NEXT.next(s)
+      end
+    end
+
+  view(s: WIDGETS_STATE, blank: SCREEN): SCREEN
+    do
+      let t = s.theme
+      let area = blank.area
+      let kind = BORDER_KIND.rounded
+      let s0 = blank.fill(area, ' ', t.base)
+
+      -- 1. Breadcrumb bar (row 1).
+      let bc_r = WIDGETS_LAYOUT.breadcrumb_bar(area)
+      let s1 = s.crumbs.draw(s0, bc_r, t.base, t.active_tab, t.selection, t.gutter)
+
+      -- 2. Left pane: Controls (DIVIDERs, CHECKBOXes, SLIDERs, BUTTONs).
+      let left_r = WIDGETS_LAYOUT.left_pane(area)
+      let s2 = FRAME.draw_titled(s1, left_r, kind, "Controls", "0.6.0", "Tab: focus", t.focused_border, t.active_tab)
+      let s3 = DIVIDER.horizontal.with_border(kind).with_label("Options").draw_labeled(s2, WIDGETS_LAYOUT.div_options_area(area), t.border, t.keyword)
+      let s4 = s.wrap_checkbox.draw(s3, WIDGETS_LAYOUT.chk_wrap_area(area), t.base, s.focus = 0)
+      let s5 = s.nums_checkbox.draw(s4, WIDGETS_LAYOUT.chk_nums_area(area), t.base, s.focus = 1)
+      let s6 = s.bold_checkbox.draw(s5, WIDGETS_LAYOUT.chk_bold_area(area), t.base, s.focus = 2)
+
+      let s7 = DIVIDER.horizontal.with_border(kind).with_label("Tuning").draw_labeled(s6, WIDGETS_LAYOUT.div_tuning_area(area), t.border, t.keyword)
+      let w_lbl_r = WIDGETS_LAYOUT.sld_width_label_area(area)
+      let s8 = s7.text(w_lbl_r, w_lbl_r.x, w_lbl_r.y, "Width (20..80):", if s.focus = 3 then t.active_tab else t.base end)
+      let s9 = s.width_slider.draw(s8, WIDGETS_LAYOUT.sld_width_area(area), t.gutter, t.string, if s.focus = 3 then t.selection else t.active_tab end)
+      let i_lbl_r = WIDGETS_LAYOUT.sld_indent_label_area(area)
+      let s10 = s9.text(i_lbl_r, i_lbl_r.x, i_lbl_r.y, "Indent (0..8):", if s.focus = 4 then t.active_tab else t.base end)
+      let s11 = s.indent_slider.draw(s10, WIDGETS_LAYOUT.sld_indent_area(area), t.gutter, t.keyword, if s.focus = 4 then t.selection else t.active_tab end)
+
+      let s12 = DIVIDER.horizontal.with_border(kind).with_label("Actions").draw_labeled(s11, WIDGETS_LAYOUT.div_actions_area(area), t.border, t.keyword)
+      let s13 = s.apply_button.draw_state(s12, WIDGETS_LAYOUT.btn_apply_area(area), t.base, t.selection, t.selection.bold, s.focus = 5, False)
+      let s14 = s.toast_button.draw_state(s13, WIDGETS_LAYOUT.btn_toast_area(area), t.base, t.selection, t.selection.bold, s.focus = 6, False)
+      let s15 = s.reset_button.draw_state(s14, WIDGETS_LAYOUT.btn_reset_area(area), t.base, t.selection, t.selection.bold, s.focus = 7, False)
+
+      -- 3. Center vertical DIVIDER.
+      let s16 = DIVIDER.vertical.with_border(kind).draw(s15, WIDGETS_LAYOUT.vdiv_area(area), t.border)
+
+      -- 4. Right pane: Live Preview.
+      let right_r = WIDGETS_LAYOUT.right_pane(area)
+      let head_st = if s.bold_checkbox.is_checked then t.active_tab.bold else t.base end
+      let s17 = FRAME.draw_titled(s16, right_r, kind, s.section_title, t.name, "", t.border, head_st)
+      let s18 = s.preview_paragraph.draw(s17, WIDGETS_LAYOUT.preview_inner(area), t.base)
+
+      -- 5. Bottom STATUS_BAR.
+      let right_hint = "F10:menu Tab:focus Space:act i/s/w/e:toast p:pos t:theme r:reset q:quit"
+      let s19 = STATUS_BAR.draw(s18, WIDGETS_LAYOUT.status_bar(area), s.last_action, right_hint, t.selection)
+
+      -- 6. Overlays: TOAST queue (inside body so it never overlaps menu/status bars), then MENU, then modal DIALOG on top.
+      let s20 = s.toasts.with_border(kind).draw(s19, WIDGETS_LAYOUT.body(area), t.base, t.focused_border, t.string, t.active_tab, t.keyword)
+      let s21 = s.menu.draw(s20, WIDGETS_LAYOUT.menu_bar(area), t.base, t.base, t.selection, t.gutter)
+      if s.dialog_open then
+        s.dialog.draw(s21, area, t.base, t.focused_border, t.active_tab, t.base, t.selection)
+      else
+        s21
+      end
+    end
+
+  init(args: SEQ[STRING]): STEP[TUI[WIDGETS_STATE]]
+    do
+      TUI.start(WIDGETS_STATE.make, update, view)
+    end
+
+  step(t: TUI[WIDGETS_STATE], e: EVENT): STEP[TUI[WIDGETS_STATE]]
+    do
+      t.step(e)
+    end
+
+end

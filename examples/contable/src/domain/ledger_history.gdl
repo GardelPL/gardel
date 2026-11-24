@@ -1,0 +1,136 @@
+-- Pure timeline of verified `LEDGER` snapshots enabling instant time-travel scrubbing
+-- across every posted or reversed transaction.
+module LEDGER_HISTORY
+
+representation {NONE}
+  -- Snapshots stored oldest-first: index 0 is the empty initial book, last is latest.
+  snaps: LIST[LEDGER]
+  cursor: NAT
+
+invariant
+  non_empty: snaps.length >= 1
+  valid_cursor: cursor < snaps.length
+
+create {ANY}
+
+  from_initial(initial: LEDGER): LEDGER_HISTORY
+    do
+      let empty: LIST[LEDGER] = LIST.empty
+      { snaps = empty.prepend(initial), cursor = 0 }
+    ensure
+      one_snap: Result.count = 1
+      at_start: Result.step_index = 0
+    end
+
+  append_snap(xs: LIST[LEDGER], item: LEDGER): LIST[LEDGER]
+    variant
+      xs.length
+    do
+      if xs.length = 0 then
+        xs.prepend(item)
+      else
+        LEDGER_HISTORY.append_snap(xs.tail, item).prepend(xs.head)
+      end
+    ensure
+      len_inc: Result.length = xs.length + 1
+    end
+
+  spark_values_of(xs: LIST[LEDGER]): LIST[NAT]
+    variant
+      xs.length
+    do
+      if xs.length = 0 then
+        LIST.empty
+      else
+        LEDGER_HISTORY.spark_values_of(xs.tail).prepend(xs.head.net_worth_spark_value)
+      end
+    ensure
+      same_len: Result.length = xs.length
+    end
+
+feature {ANY}
+
+  count: NAT
+    do
+      Current.snaps.length
+    ensure
+      positive: Result >= 1
+    end
+
+  last_step: NAT
+    do
+      Current.snaps.length - 1
+    end
+
+  step_index: NAT
+    do
+      Current.cursor
+    ensure
+      in_bounds: Result < Current.count
+    end
+
+  at_latest: BOOL
+    do
+      Current.cursor = Current.snaps.length - 1
+    end
+
+  current: LEDGER
+    do
+      LIST_OPS.at(Current.snaps, Current.cursor)
+    end
+
+  latest: LEDGER
+    do
+      LIST_OPS.at(Current.snaps, Current.snaps.length - 1)
+    end
+
+  -- Scrub to snapshot `idx` (clamped to `0..last_step`).
+  scrub(idx: NAT): LEDGER_HISTORY
+    do
+      let c = if idx < Current.snaps.length then idx else Current.snaps.length - 1 end
+      { Current with cursor = c }
+    ensure
+      same_count: Result.count = Current.count
+    end
+
+  step_back: LEDGER_HISTORY
+    do
+      if Current.cursor > 0 then Current.scrub(Current.cursor - 1) else Current end
+    ensure
+      same_count: Result.count = Current.count
+    end
+
+  step_forward: LEDGER_HISTORY
+    do
+      if Current.cursor < 18446744073709551615 and Current.cursor < Current.snaps.length - 1 then
+        Current.scrub(Current.cursor + 1)
+      else
+        Current
+      end
+    ensure
+      same_count: Result.count = Current.count
+    end
+
+  -- Append a newly verified `LEDGER` snapshot (after posting or reversing on `latest`) and jump to it.
+  push(next_ledger: LEDGER): LEDGER_HISTORY
+    do
+      let next_snaps = LEDGER_HISTORY.append_snap(Current.snaps, next_ledger)
+      { snaps = next_snaps, cursor = next_snaps.length - 1 }
+    ensure
+      len_inc: Result.count = Current.count + 1
+      at_end: Result.at_latest
+    end
+
+  -- Net-worth sparkline samples up to the currently scrubbed snapshot.
+  sparkline_samples: LIST[NAT]
+    do
+      let shown =
+        if Current.cursor < 18446744073709551615 then
+          LIST_CUT.take(Current.snaps, Current.cursor + 1)
+        else
+          Current.snaps
+        end
+      LEDGER_HISTORY.spark_values_of(shown)
+    end
+
+end

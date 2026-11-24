@@ -1,0 +1,143 @@
+-- Posta: Verified HTTP / REST API Workbench on `gtui` 0.6.0 + `ghttp` + `gjson`.
+--
+--   gardelc --project examples/posta --strict
+--   ./build/posta_bin
+reactive program POSTA
+
+feature {ANY}
+
+  update(s: POSTA_STATE, e: EVENT): TUI_NEXT[POSTA_STATE]
+    do
+      match e
+        case Resized(w, h) then TUI_NEXT.next(s.sized(w, h))
+        case Key(k) then s.handle_key(k)
+        case Mouse(m) then s.handle_mouse(m)
+        case Connected(t, c) then s.handle_connected(t, c)
+        case ConnectFailed(t, _) then s.handle_connect_failed(t)
+        case Received(c, data) then s.handle_received(c, data)
+        case Closed(c) then s.handle_closed(c)
+        case SendFailed(c, _) then s.handle_closed(c)
+        case Tick(id) then s.handle_tick(id)
+        case _ then TUI_NEXT.next(s)
+      end
+    end
+
+  edge(s: POSTA_STATE, pane: NAT): STYLE
+    do
+      if s.focus.has(pane) then s.theme.focused_border else s.theme.border end
+    end
+
+  draw_host_modal(s: SCREEN, st: POSTA_STATE, area: RECT, t: THEME): SCREEN
+    do
+      let box = area.centered(64, 8)
+      let s0 = CLEAR.draw(s, box, t.base)
+      let s1 = FRAME.draw_titled(
+        s0, box, BORDER_KIND.rounded,
+        "Set Base Host:Port (All Endpoints)", "", "Enter:apply  Esc:cancel",
+        t.focused_border, t.active_tab
+      )
+      let inn = FRAME.inner_padded(box, PADDING.symmetric(0, 1))
+      let s2 = s1.text(inn, inn.x, inn.y, "Enter a port (e.g. 8091) or ipv4:port (e.g. 127.0.0.1:9000):", t.base)
+      let input_r = inn.drop_top(2).take_top(1)
+      let s3 = st.host_line.draw(s2, input_r, "> ", t.base, t.selection)
+      if st.host_error.is_empty then
+        s3.text(inn, inn.x, inn.y + 4, "Updates all sidebar collection endpoints & current URL.", t.gutter)
+      else
+        s3.text(inn, inn.x, inn.y + 4, st.host_error, STYLE.plain.fg(COLOR.red).bold)
+      end
+    ensure
+      same_width: Result.width = s.width
+      same_height: Result.height = s.height
+    end
+
+  view(s: POSTA_STATE, blank: SCREEN): SCREEN
+    do
+      let t = s.theme
+      let area = blank.area
+      let kind = BORDER_KIND.rounded
+
+      -- 1. Breadcrumb + live In-Flight boundedness badge.
+      let s0 = s.breadcrumb.draw(blank, POSTA_LAYOUT.crumb_left(area), t.gutter, t.active_tab, t.selection, t.border)
+      let badge_r = POSTA_LAYOUT.proof_badge_area(area)
+      let badge_txt =
+        if s.in_flight.is_active then
+          "● In-Flight: 1/1 [BOUNDED]"
+        else
+          "✓ In-Flight: 0/1 [PROVEN]"
+        end
+      let badge_st = if s.in_flight.is_active then STYLE.plain.fg(COLOR.yellow).bold else STYLE.plain.fg(COLOR.green).bold end
+      let s1 = s0.text(badge_r, badge_r.x, badge_r.y, badge_txt, badge_st)
+
+      -- 2. Main frames: Left Collections Sidebar, Top URL Bar, Request Pane, Response Pane.
+      let side_r = POSTA_LAYOUT.sidebar_pane(area)
+      let url_r = POSTA_LAYOUT.url_bar_pane(area)
+      let req_r = POSTA_LAYOUT.request_pane(area)
+      let resp_r = POSTA_LAYOUT.response_pane(area)
+      let s2 = FRAME.draw_titled(s1, side_r, kind, "Collections", "", "", edge(s, 0), t.active_tab)
+      let s3 = FRAME.draw_titled(s2, url_r, kind, "HTTP/1.1 Target", "ghttp", "", edge(s, 1), t.active_tab)
+      let s4 = FRAME.draw_titled(s3, req_r, kind, "", "", "", edge(s, 2), t.active_tab)
+      let s5 = FRAME.draw_titled(s4, resp_r, kind, "", "", "", edge(s, 3), t.active_tab)
+      let s6 = FRAME.merge_borders(s5, POSTA_LAYOUT.main_area(area))
+
+      -- 3. Left sidebar: Collections TREE_VIEW + Latency SPARKLINE.
+      let s7 = s.collections_tree.draw(s6, POSTA_LAYOUT.tree_area(area), t.base, t.selection)
+      let s8 = SCREEN.fitted(DIVIDER.horizontal.with_label("Latency (ms)").draw(s7, POSTA_LAYOUT.spark_divider_area(area), t.border), s7)
+      let s9 = SCREEN.fitted(SPARKLINE.make(s.latency_samples).draw(s8, POSTA_LAYOUT.spark_area(area), STYLE.plain.fg(COLOR.cyan).bold), s8)
+
+      -- 4. URL bar: Method BUTTON + URL INPUT_LINE + Send/Cancel BUTTON.
+      let m_lbl = GLYPHS.join(ENDPOINT.method_name(s.endpoint.method), " ▾")
+      let s10 = BUTTON.make(m_lbl).draw(s9, POSTA_LAYOUT.btn_method_area(area), t.active_tab, False, False)
+      let s11 = s.url.draw(s10, POSTA_LAYOUT.url_input_area(area), "", t.base, t.selection)
+      let send_lbl = if s.in_flight.is_active then "■ Cancel" else "▶ Send" end
+      let send_st = if s.in_flight.is_active then STYLE.plain.fg(COLOR.red).bold else STYLE.plain.fg(COLOR.green).bold end
+      let s12 = BUTTON.make(send_lbl).draw(s11, POSTA_LAYOUT.btn_send_area(area), send_st, s.in_flight.is_active, False)
+
+      -- 5. Request pane: TABS + Body TEXT_AREA (with live gjson status) / Headers / Contracts.
+      let s13 = s.request_tabs.draw(s12, POSTA_LAYOUT.req_tabs_area(area), t.base, t.active_tab)
+      let s14 =
+        if s.request_tabs.selected = 0 then
+          let ed_r = POSTA_LAYOUT.req_editor_area(area)
+          let drawn_ed = s.editor.draw(s13, ed_r, t.base, t.gutter, t.selection)
+          let jb_r = POSTA_LAYOUT.req_json_bar(area)
+          let body_s = s.editor.text
+          let j_txt = RESPONSE_RECORD.json_badge(body_s)
+          let j_st =
+            if body_s.is_empty then t.gutter
+            else if RESPONSE_RECORD.validate_json_text(body_s) then STYLE.plain.fg(COLOR.green).bold
+            else STYLE.plain.fg(COLOR.red).bold
+            end end
+          drawn_ed.text(jb_r, jb_r.x, jb_r.y, j_txt, j_st)
+        else if s.request_tabs.selected = 1 then
+          POSTA_PANELS.draw_req_headers(s13, POSTA_LAYOUT.req_inner(area), s.endpoint, s.editor.text, t)
+        else
+          POSTA_PANELS.draw_contracts(s13, POSTA_LAYOUT.req_inner(area), s.contracts, t)
+        end end
+
+      -- 6. Response pane: TABS + live response/timeout view.
+      let s15 = s.response_tabs.draw(s14, POSTA_LAYOUT.resp_tabs_area(area), t.base, t.active_tab)
+      let s16 = POSTA_PANELS.draw_response(s15, POSTA_LAYOUT.resp_inner(area), s.in_flight, s.response, s.response_tabs.selected, s.response_view, t)
+
+      -- 7. Bottom status bar.
+      let left_st = GLYPHS.join("Posta · ", s.base_authority)
+      let right_st = "F5:Send  p:Host:Port  u:URL  m:Method  Tab:Focus  ?:Help  q:Quit"
+      let s17 = STATUS_BAR.draw(s16, POSTA_LAYOUT.status_bar(area), left_st, right_st, t.selection)
+
+      -- 8. Overlays (rendered last): TOASTs, Help POPUP, Host:Port modal, Quit DIALOG, top MENU.
+      let s18 = s.toasts.with_border(kind).draw(s17, area, t.base, t.focused_border, t.string, t.active_tab, t.keyword)
+      let s19 = if s.help_open then s.help_popup.draw(s18, area, t.base, t.focused_border, t.active_tab) else s18 end
+      let s20 = if s.host_modal_open then draw_host_modal(s19, s, area, t) else s19 end
+      let s21 = if s.quit_dlg.is_open then s.quit_dlg.draw(s20, area, t.base, t.focused_border, t.active_tab, t.base, t.selection) else s20 end
+      s.top_menu.draw(s21, POSTA_LAYOUT.menu_bar(area), t.base, t.base, t.selection, t.gutter)
+    end
+
+  init(args: SEQ[STRING]): STEP[TUI[POSTA_STATE]]
+    do
+      TUI.start(POSTA_STATE.make_with_args(args), update, view)
+    end
+
+  step(t: TUI[POSTA_STATE], e: EVENT): STEP[TUI[POSTA_STATE]]
+    do
+      t.step(e)
+    end
+
+end

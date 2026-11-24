@@ -1,0 +1,181 @@
+-- Verified constrained N-Queens board (`4 <= N <= 12`) with user-pinned queens
+-- and blocked cells.
+module BOARD
+
+representation {NONE}
+  n_size: NAT
+  -- Length `n_size`: `pins[r] < n_size` pins row `r` to that column; `pins[r] = n_size` is unpinned.
+  pins: LIST[NAT]
+  -- Length `n_size * n_size` (row-major `r * n_size + c`): `True` blocks that square.
+  blocks: LIST[BOOL]
+
+invariant
+  valid_n: n_size >= 4 and n_size <= 12
+  pins_len: pins.length = n_size
+  blocks_len: blocks.length = n_size * n_size
+
+create {ANY}
+
+  repeat_nat(count: NAT, val: NAT): LIST[NAT]
+    variant
+      count
+    do
+      if count = 0 then LIST.empty
+      else BOARD.repeat_nat(count - 1, val).prepend(val)
+      end
+    ensure
+      len: Result.length = count
+    end
+
+  repeat_bool(count: NAT, val: BOOL): LIST[BOOL]
+    variant
+      count
+    do
+      if count = 0 then LIST.empty
+      else BOARD.repeat_bool(count - 1, val).prepend(val)
+      end
+    ensure
+      len: Result.length = count
+    end
+
+  set_nat(xs: LIST[NAT], idx: NAT, val: NAT): LIST[NAT]
+    require
+      in_bounds: idx < xs.length
+    variant
+      idx
+    do
+      if idx = 0 then xs.tail.prepend(val)
+      else BOARD.set_nat(xs.tail, idx - 1, val).prepend(xs.head)
+      end
+    ensure
+      same_len: Result.length = xs.length
+    end
+
+  set_bool(xs: LIST[BOOL], idx: NAT, val: BOOL): LIST[BOOL]
+    require
+      in_bounds: idx < xs.length
+    variant
+      idx
+    do
+      if idx = 0 then xs.tail.prepend(val)
+      else BOARD.set_bool(xs.tail, idx - 1, val).prepend(xs.head)
+      end
+    ensure
+      same_len: Result.length = xs.length
+    end
+
+  count_pins_in(xs: LIST[NAT], n: NAT): NAT
+    variant
+      xs.length
+    do
+      if xs.length = 0 then 0
+      else
+        let rest = BOARD.count_pins_in(xs.tail, n)
+        if xs.head < n and rest < 1000 then rest + 1 else rest end
+      end
+    end
+
+  count_blocks_in(xs: LIST[BOOL]): NAT
+    variant
+      xs.length
+    do
+      if xs.length = 0 then 0
+      else
+        let rest = BOARD.count_blocks_in(xs.tail)
+        if xs.head and rest < 1000 then rest + 1 else rest end
+      end
+    end
+
+  make(n: NAT): BOARD
+    require
+      valid_n: n >= 4 and n <= 12
+    do
+      { n_size = n,
+        pins = BOARD.repeat_nat(n, n),
+        blocks = BOARD.repeat_bool(n * n, False) }
+    ensure
+      size_set: Result.size = n
+    end
+
+feature {ANY}
+
+  size: NAT
+    do
+      Current.n_size
+    ensure
+      in_range: Result >= 4 and Result <= 12
+    end
+
+  -- Pinned column for `row`, or `Current.size` when unpinned.
+  pin_col(row: NAT): NAT
+    require
+      in_bounds: row < Current.size
+    do
+      LIST_OPS.at(Current.pins, row)
+    end
+
+  is_pinned(row: NAT, col: NAT): BOOL
+    require
+      in_bounds: row < Current.size and col < Current.size
+    do
+      LIST_OPS.at(Current.pins, row) = col
+    end
+
+  is_blocked(row: NAT, col: NAT): BOOL
+    require
+      in_bounds: row < Current.size and col < Current.size
+    do
+      LIST_OPS.at(Current.blocks, row * Current.n_size + col)
+    end
+
+  pin_count: NAT
+    do
+      BOARD.count_pins_in(Current.pins, Current.n_size)
+    end
+
+  block_count: NAT
+    do
+      BOARD.count_blocks_in(Current.blocks)
+    end
+
+  -- Pin a queen at `(row, col)` (or unpin if already pinned there); clears any block on that square.
+  toggle_pin(row: NAT, col: NAT): BOARD
+    require
+      in_bounds: row < Current.size and col < Current.size
+    do
+      let cur = LIST_OPS.at(Current.pins, row)
+      let next_val = if cur = col then Current.n_size else col end
+      let next_pins = BOARD.set_nat(Current.pins, row, next_val)
+      let next_blocks = BOARD.set_bool(Current.blocks, row * Current.n_size + col, False)
+      { Current with pins = next_pins, blocks = next_blocks }
+    ensure
+      same_size: Result.size = Current.size
+    end
+
+  -- Toggle a blocked square at `(row, col)`; unpins that square if it was pinned.
+  toggle_block(row: NAT, col: NAT): BOARD
+    require
+      in_bounds: row < Current.size and col < Current.size
+    do
+      let idx = row * Current.n_size + col
+      let cur_b = LIST_OPS.at(Current.blocks, idx)
+      let next_blocks = BOARD.set_bool(Current.blocks, idx, not cur_b)
+      let next_pins =
+        if not cur_b and LIST_OPS.at(Current.pins, row) = col then
+          BOARD.set_nat(Current.pins, row, Current.n_size)
+        else
+          Current.pins
+        end
+      { Current with pins = next_pins, blocks = next_blocks }
+    ensure
+      same_size: Result.size = Current.size
+    end
+
+  clear_constraints: BOARD
+    do
+      BOARD.make(Current.n_size)
+    ensure
+      same_size: Result.size = Current.size
+    end
+
+end

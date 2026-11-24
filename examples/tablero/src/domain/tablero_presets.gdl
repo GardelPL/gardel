@@ -1,0 +1,32 @@
+-- Starter N-Queens puzzle presets for `tablero`.
+functions TABLERO_PRESETS
+
+feature {ANY}
+
+  preset_name(idx: NAT): STRING
+    do
+      if idx = 0 then "Classic 8x8 (92 solutions)"
+      else if idx = 1 then "Pinned Corner 8x8"
+      else if idx = 2 then "Blocked Center 8x8"
+      else "Diagonal Conflict 6x6 (UNSAT)"
+      end end end
+    end
+
+  make_preset(idx: NAT): BOARD
+    do
+      if idx = 0 then
+        BOARD.make(8)
+      else if idx = 1 then
+        BOARD.make(8).toggle_pin(0, 0)
+      else if idx = 2 then
+        BOARD.make(8)
+          .toggle_block(3, 3)
+          .toggle_block(3, 4)
+          .toggle_block(4, 3)
+          .toggle_block(4, 4)
+      else
+        BOARD.make(6).toggle_pin(1, 1).toggle_pin(3, 3)
+      end end end
+    end
+
+end

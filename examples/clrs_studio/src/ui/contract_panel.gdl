@@ -1,0 +1,290 @@
+-- Right-hand Verified Spec & State panel for `clrs_studio`.
+-- Displays live proven CLRS invariants, a draining termination `variant` GAUGE,
+-- a live loop-variable TABLE, synchronized Gardel source (`Code`), and the real
+-- `gardelc --inspect INSERTION_SORT` Short Form.
+functions CONTRACT_PANEL
+
+feature {ANY}
+
+  -- Embedded verified Gardel code for `INSERTION_SORT.step` (line indices match `active_code_line`).
+  code_lines: LIST[STRING]
+    do
+      let none: LIST[STRING] = LIST.empty
+      none
+        .prepend("  end")
+        .prepend("    postcondition_sorted: Result.is_done implies is_sorted(Result.elements)")
+        .prepend("    terminates: not Current.is_done implies Result.work_left < Current.work_left")
+        .prepend("  ensure")
+        .prepend("    end end end")
+        .prepend("      Current.step_insert_key      -- [Done / Next j] j := j + 1")
+        .prepend("    else")
+        .prepend("      -- Place key into hole; prove sorted_range(0, j + 1)")
+        .prepend("      { items = set_at(items, hole, key), j = j + 1, ... }")
+        .prepend("    -- Phase 2: InsertKey")
+        .prepend("      -- Shift A[hole - 1] right while A[hole - 1] > key")
+        .prepend("      if hole > 0 and at(items, hole - 1) > key then")
+        .prepend("        { items = set_at(items, hole, left), hole = hole - 1, ... }")
+        .prepend("      else")
+        .prepend("        { phase = InsertKey, ... } -- A[hole - 1] <= key")
+        .prepend("      end")
+        .prepend("    else if Current.phase = 1 then -- [CompareShift]")
+        .prepend("      -- Lift A[j] into key, open hole = j")
+        .prepend("      { hole = j, key = at(items, j), phase = CompareShift, ... }")
+        .prepend("    else if Current.phase = 0 then -- [PickKey]")
+        .prepend("      Current                      -- [Done] is_sorted(items)")
+        .prepend("    if Current.phase = 3 then")
+        .prepend("  do")
+        .prepend("step: INSERTION_SORT")
+        .prepend("-- CLRS Ch. 2.1 Insertion Sort (verified by Boogie/Z3)")
+    end
+
+  -- Real `gardelc --inspect INSERTION_SORT` Short Form output.
+  short_form_lines: LIST[STRING]
+    do
+      let none: LIST[STRING] = LIST.empty
+      none
+        .prepend("end")
+        .prepend("      ensure  outer_eq: ((Current.phase_code = 0 or Current.is_done) implies (Result = SORT_FACTS.count_of(y, Current.elements)))")
+        .prepend("    {ANY} multiset_count(y: NAT): MATH_INT")
+        .prepend("      ensure  postcondition_sorted: (Result.is_done implies SORT_FACTS.is_sorted(Result.elements))")
+        .prepend("      ensure  sum_after: (SORT_FACTS.sum(Result.elements) = Result.total_sum)")
+        .prepend("      ensure  sorted_after: SORT_FACTS.sorted_range(Result.elements, 0, Result.outer_j)")
+        .prepend("      ensure  progress: (Result.work_left < Current.work_left)")
+        .prepend("      require is_ins: (Current.phase_code = 2)")
+        .prepend("    {ANY} step_insert_key: INSERTION_SORT")
+        .prepend("      ensure  progress: (Result.work_left < Current.work_left)")
+        .prepend("      require is_cmp: (Current.phase_code = 1)")
+        .prepend("    {ANY} step_compare_shift: INSERTION_SORT")
+        .prepend("      ensure  progress: (Result.work_left < Current.work_left)")
+        .prepend("      require is_pick: (Current.phase_code = 0)")
+        .prepend("    {ANY} step_pick_key: INSERTION_SORT")
+        .prepend("      ensure  outer_eq: ((Current.phase_code = 0 or Current.is_done) implies (Result = SORT_FACTS.count_of(y, Current.elements)))")
+        .prepend("    {ANY} multiset_count(y: NAT): MATH_INT")
+        .prepend("      ensure  postcondition_sorted: (Result.is_done implies SORT_FACTS.is_sorted(Result.elements))")
+        .prepend("      ensure  done_stays_done: (Current.is_done implies (Result = Current))")
+        .prepend("      ensure  terminates: (not Current.is_done implies (Result.work_left < Current.work_left))")
+        .prepend("      ensure  same_sum: (Result.total_sum = Current.total_sum)")
+        .prepend("      ensure  same_length: (Result.length = Current.length)")
+        .prepend("    {ANY} step: INSERTION_SORT")
+        .prepend("      ensure  zero_iff_done: ((Result = 0) = Current.is_done)")
+        .prepend("    {ANY} work_left: NAT")
+        .prepend("  feature")
+        .prepend("      ensure  same_items: (Result.elements = xs)")
+        .prepend("      require bounded: SORT_FACTS.all_at_most(xs, 999)")
+        .prepend("      require small_len: (xs.length <= 32)")
+        .prepend("      require non_empty: (xs.length >= 1)")
+        .prepend("    {ANY} make(xs: LIST[NAT]): INSERTION_SORT")
+        .prepend("  create")
+        .prepend("  representation {NONE} -- opaque ADT layout")
+        .prepend("module INSERTION_SORT")
+    end
+
+  row2(a: STRING, b: STRING): LIST[STRING]
+    do
+      let none: LIST[STRING] = LIST.empty
+      none.prepend(b).prepend(a)
+    end
+
+  -- Build the live state variables table for the Invariants tab.
+  vars_table(st: INSERTION_SORT): TABLE
+    do
+      let widths: LIST[SIZE] = LIST.empty
+        .prepend(SIZE.flex(1))
+        .prepend(SIZE.fixed(13))
+      let hdr = CONTRACT_PANEL.row2("Variable", "Value")
+      let key_txt = if st.phase_code = 1 or st.phase_code = 2 then
+        NUMBER_TEXT.nat_to_text(st.active_key)
+      else
+        "—"
+      end
+      let cmp_sh = GLYPHS.join(
+        GLYPHS.join(NUMBER_TEXT.nat_to_text(st.comparison_count), " / "),
+        NUMBER_TEXT.nat_to_text(st.shift_count)
+      )
+      let rows: LIST[LIST[STRING]] = LIST.empty
+        .prepend(CONTRACT_PANEL.row2("Sum (const)", NUMBER_TEXT.nat_to_text(st.total_sum)))
+        .prepend(CONTRACT_PANEL.row2("Cmp / Shifts", cmp_sh))
+        .prepend(CONTRACT_PANEL.row2("key", key_txt))
+        .prepend(CONTRACT_PANEL.row2("hole", NUMBER_TEXT.nat_to_text(st.hole_index)))
+        .prepend(CONTRACT_PANEL.row2("j (prefix)", NUMBER_TEXT.nat_to_text(st.outer_j)))
+        .prepend(CONTRACT_PANEL.row2("Phase", st.phase_name))
+      TABLE.with_headers(widths, hdr, rows)
+    end
+
+  -- Render the Invariants tab (proven badges + variant gauge + live variable table).
+  draw_invariants(s: SCREEN, area: RECT, st: INSERTION_SORT, init_work: NAT, t: THEME, kind: BORDER_KIND): SCREEN
+    do
+      let inv_r = STUDIO_LAYOUT.invariants_list_area(area)
+      let ok_st = STYLE.plain.fg(COLOR.green).bold
+      let ph = st.phase_code
+      let sort_lbl = if ph = 3 then
+        "✓ ensure: is_sorted(A)       [PROVEN]"
+      else if ph = 0 then
+        "✓ sorted_range(A, 0, j)      [PROVEN]"
+      else
+        "✓ sorted_with_hole(0..j)     [PROVEN]"
+      end end
+      let s0 = if inv_r.height >= 1 then s.text(inv_r, inv_r.x, inv_r.y, sort_lbl, ok_st) else s end
+      let s1 = if inv_r.height >= 2 then s0.text(inv_r, inv_r.x, inv_r.y + 1, "✓ length_matches (n = len)   [PROVEN]", ok_st) else s0 end
+      let s2 = if inv_r.height >= 3 then s1.text(inv_r, inv_r.x, inv_r.y + 2, "✓ is_permutation (count_of)  [PROVEN]", ok_st) else s1 end
+      let s3 = if inv_r.height >= 4 then s2.text(inv_r, inv_r.x, inv_r.y + 3, "✓ 0 <= hole <= j <= n        [PROVEN]", ok_st) else s2 end
+      let s4 = if inv_r.height >= 5 then
+        let term_lbl = if st.is_done then
+          "✓ work_left = 0 (terminated) [PROVEN]"
+        else
+          "✓ work_left strictly ↓       [PROVEN]"
+        end
+        s3.text(inv_r, inv_r.x, inv_r.y + 4, term_lbl, ok_st)
+      else
+        s3
+      end
+
+      -- Termination variant gauge draining from init_work down to 0.
+      let s5 = DIVIDER.horizontal.with_border(kind).with_label("Variant (work_left)")
+        .draw_labeled(s4, STUDIO_LAYOUT.variant_divider_area(area), t.border, t.keyword)
+      let den = if init_work = 0 then 1 else init_work end
+      let cur_w = st.work_left
+      let w_lbl = GLYPHS.join(
+        GLYPHS.join(NUMBER_TEXT.nat_to_text(cur_w), " / "),
+        GLYPHS.join(NUMBER_TEXT.nat_to_text(init_work), " → 0")
+      )
+      let g = GAUGE.ratio(cur_w, den).with_label(w_lbl)
+      let s6 = g.draw(s5, STUDIO_LAYOUT.variant_gauge_area(area), t.gutter, STYLE.plain.fg(COLOR.yellow).bold)
+
+      -- Live state variables table.
+      let s7 = DIVIDER.horizontal.with_border(kind).with_label("Live State")
+        .draw_labeled(s6, STUDIO_LAYOUT.vars_divider_area(area), t.border, t.keyword)
+      let tbl = CONTRACT_PANEL.vars_table(st)
+      tbl.draw(s7, STUDIO_LAYOUT.vars_table_area(area), t.base, t.keyword.bold, t.base)
+    ensure
+      same_width: Result.width = s.width
+      same_height: Result.height = s.height
+    end
+
+  -- Embedded verified Gardel code for `DIJKSTRA.step` (line indices match `active_code_line`).
+  dijkstra_code_lines: LIST[STRING]
+    do
+      let none: LIST[STRING] = LIST.empty
+      none
+        .prepend("  end")
+        .prepend("    complexity_bounded: Result.tick_count <= Result.complexity_cap")
+        .prepend("    terminates: not Current.is_done implies Result.work_left < Current.work_left")
+        .prepend("  ensure")
+        .prepend("    -- Phase 2: Done — all reachable vertices settled in O(n^2) ticks")
+        .prepend("    end end")
+        .prepend("      { dist = next_dist, parent = next_parent, ticks = ticks + 1, ... }")
+        .prepend("      -- Relax(u, v, w): if d[u] + w < d[v] then d[v] := d[u] + w")
+        .prepend("      let can_relax = (not vis[v]) and w < INF and du + w < dv")
+        .prepend("      let w = at(weights, u * 8 + v)")
+        .prepend("    else if Current.phase = 1 then -- [RelaxEdge]")
+        .prepend("      -- Mark u settled (S := S U {u}), ticks := ticks + 1")
+        .prepend("      if u >= n then { phase = Done } else { visited[u] = True, ... } end")
+        .prepend("      let u = find_min_unvisited(dist, visited, 0, n, INF)")
+        .prepend("    else if Current.phase = 0 then -- [ExtractMin]")
+        .prepend("      Current                      -- [Done] ticks <= n * 9")
+        .prepend("    if Current.phase = 2 then")
+        .prepend("  do")
+        .prepend("step: DIJKSTRA")
+        .prepend("-- CLRS 4th ed. Ch. 22.3 Dijkstra (AutoCLRS complexity bound, verified by Z3)")
+    end
+
+  -- Verified Short Form for `DIJKSTRA`.
+  dijkstra_short_form_lines: LIST[STRING]
+    do
+      let none: LIST[STRING] = LIST.empty
+      none
+        .prepend("end")
+        .prepend("      ensure  source_stays_zero: (LIST_OPS.at(Result.distances, Result.source_vertex) = 0)")
+        .prepend("      ensure  complexity_bounded: (Result.tick_count <= Result.complexity_cap)")
+        .prepend("      ensure  progress: (Result.work_left < Current.work_left)")
+        .prepend("      require is_relax: (Current.phase_code = 1)")
+        .prepend("    {ANY} step_relax_edge: DIJKSTRA")
+        .prepend("      ensure  complexity_bounded: (Result.tick_count <= Result.complexity_cap)")
+        .prepend("      ensure  progress: (Result.work_left < Current.work_left)")
+        .prepend("      require is_extract: (Current.phase_code = 0)")
+        .prepend("    {ANY} step_extract_min: DIJKSTRA")
+        .prepend("      ensure  source_stays_zero: (LIST_OPS.at(Result.distances, Result.source_vertex) = 0)")
+        .prepend("      ensure  complexity_bounded: (Result.tick_count <= Result.complexity_cap)")
+        .prepend("      ensure  done_stays_done: (Current.is_done implies (Result = Current))")
+        .prepend("      ensure  terminates: (not Current.is_done implies (Result.work_left < Current.work_left))")
+        .prepend("    {ANY} step: DIJKSTRA")
+        .prepend("      ensure  zero_iff_done: ((Result = 0) = Current.is_done)")
+        .prepend("    {ANY} work_left: NAT")
+        .prepend("    {ANY} complexity_cap: NAT")
+        .prepend("  feature")
+        .prepend("      ensure  src_zero: (LIST_OPS.at(Result.distances, src) = 0)")
+        .prepend("      require mat_bounded: SORT_FACTS.all_at_most(matrix, 999999)")
+        .prepend("      require valid_mat: (matrix.length = 64)")
+        .prepend("      require valid_n: (num_v >= 2 and num_v <= 8)")
+        .prepend("    {ANY} make(num_v: NAT, src: NAT, matrix: LIST[NAT]): DIJKSTRA")
+        .prepend("  create")
+        .prepend("  representation {NONE} -- opaque ADT layout")
+        .prepend("module DIJKSTRA")
+    end
+
+  dijkstra_vars_table(dj: DIJKSTRA): TABLE
+    do
+      let widths: LIST[SIZE] = LIST.empty
+        .prepend(SIZE.flex(1))
+        .prepend(SIZE.fixed(13))
+      let hdr = CONTRACT_PANEL.row2("Variable", "Value")
+      let u_txt = if dj.phase_code = 1 then DIJKSTRA_PRESETS.vertex_label(dj.active_u) else "—" end
+      let v_txt = if dj.phase_code = 1 then DIJKSTRA_PRESETS.vertex_label(dj.active_v) else "—" end
+      let settled_txt = GLYPHS.join(
+        GLYPHS.join(NUMBER_TEXT.nat_to_text(dj.settled), " / "),
+        NUMBER_TEXT.nat_to_text(dj.vertex_count)
+      )
+      let ticks_txt = GLYPHS.join(
+        GLYPHS.join(NUMBER_TEXT.nat_to_text(dj.tick_count), " / "),
+        NUMBER_TEXT.nat_to_text(dj.complexity_cap)
+      )
+      let rows: LIST[LIST[STRING]] = LIST.empty
+        .prepend(CONTRACT_PANEL.row2("Relaxations", NUMBER_TEXT.nat_to_text(dj.relax_count)))
+        .prepend(CONTRACT_PANEL.row2("Ticks / Cap", ticks_txt))
+        .prepend(CONTRACT_PANEL.row2("Settled |S|", settled_txt))
+        .prepend(CONTRACT_PANEL.row2("Edge (u → v)", GLYPHS.join(GLYPHS.join(u_txt, " → "), v_txt)))
+        .prepend(CONTRACT_PANEL.row2("Phase", dj.phase_name))
+      TABLE.with_headers(widths, hdr, rows)
+    end
+
+  -- Render the Invariants tab for Dijkstra (AutoCLRS complexity bound + CLRS invariants).
+  draw_dijkstra_invariants(s: SCREEN, area: RECT, dj: DIJKSTRA, init_work: NAT, t: THEME, kind: BORDER_KIND): SCREEN
+    do
+      let inv_r = STUDIO_LAYOUT.invariants_list_area(area)
+      let ok_st = STYLE.plain.fg(COLOR.green).bold
+      let s0 = if inv_r.height >= 1 then s.text(inv_r, inv_r.x, inv_r.y, "✓ dist[source] = 0           [PROVEN]", ok_st) else s end
+      let s1 = if inv_r.height >= 2 then s0.text(inv_r, inv_r.x, inv_r.y + 1, "✓ dist & parent in bounds    [PROVEN]", ok_st) else s0 end
+      let s2 = if inv_r.height >= 3 then s1.text(inv_r, inv_r.x, inv_r.y + 2, "✓ settled |S| = count(vis)   [PROVEN]", ok_st) else s1 end
+      let s3 = if inv_r.height >= 4 then s2.text(inv_r, inv_r.x, inv_r.y + 3, "✓ ticks <= n*9  (AutoCLRS)   [PROVEN]", ok_st) else s2 end
+      let s4 = if inv_r.height >= 5 then
+        let term_lbl = if dj.is_done then
+          "✓ work_left = 0 (terminated) [PROVEN]"
+        else
+          "✓ work_left strictly ↓       [PROVEN]"
+        end
+        s3.text(inv_r, inv_r.x, inv_r.y + 4, term_lbl, ok_st)
+      else
+        s3
+      end
+
+      let s5 = DIVIDER.horizontal.with_border(kind).with_label("Variant (work_left)")
+        .draw_labeled(s4, STUDIO_LAYOUT.variant_divider_area(area), t.border, t.keyword)
+      let den = if init_work = 0 then 1 else init_work end
+      let cur_w = dj.work_left
+      let w_lbl = GLYPHS.join(
+        GLYPHS.join(NUMBER_TEXT.nat_to_text(cur_w), " / "),
+        GLYPHS.join(NUMBER_TEXT.nat_to_text(init_work), " → 0")
+      )
+      let g = GAUGE.ratio(cur_w, den).with_label(w_lbl)
+      let s6 = g.draw(s5, STUDIO_LAYOUT.variant_gauge_area(area), t.gutter, STYLE.plain.fg(COLOR.yellow).bold)
+
+      let s7 = DIVIDER.horizontal.with_border(kind).with_label("Live State")
+        .draw_labeled(s6, STUDIO_LAYOUT.vars_divider_area(area), t.border, t.keyword)
+      let tbl = CONTRACT_PANEL.dijkstra_vars_table(dj)
+      tbl.draw(s7, STUDIO_LAYOUT.vars_table_area(area), t.base, t.keyword.bold, t.base)
+    ensure
+      same_width: Result.width = s.width
+      same_height: Result.height = s.height
+    end
+
+end

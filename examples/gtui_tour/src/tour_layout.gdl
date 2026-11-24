@@ -44,4 +44,28 @@ feature {ANY}
       p.place(area, 64, 12)
     end
 
+  -- Top menu bar on row 0 to the right of the right pane's title.
+  menu_bar(area: RECT): RECT
+    do
+      FRAME.title_area(TOUR_LAYOUT.right(area)).drop_left(18)
+    end
+
+  -- 1-row breadcrumb bar at the top of the right pane's interior.
+  breadcrumb_bar(area: RECT): RECT
+    do
+      FRAME.inner(TOUR_LAYOUT.right(area)).take_top(1)
+    end
+
+  -- Source view area below the breadcrumb bar.
+  source_area(area: RECT): RECT
+    do
+      FRAME.inner(TOUR_LAYOUT.right(area)).drop_top(1)
+    end
+
+  -- Visible rows in the source view.
+  source_rows(area: RECT): NAT
+    do
+      TOUR_LAYOUT.source_area(area).height
+    end
+
 end

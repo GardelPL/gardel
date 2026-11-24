@@ -1,0 +1,205 @@
+-- Verified list helpers, boolean-set counters, min-extraction, and inductive lemmas
+-- for Dijkstra's Shortest Path algorithm (CLRS 4th ed., Ch. 22.3).
+functions DIJKSTRA_FACTS
+
+feature {ANY}
+
+  -- Sentinel representing infinity (unreachable vertex / absent directed edge).
+  inf: NAT
+    do
+      999999
+    end
+
+  -- Replace boolean element at `idx` with `val`.
+  set_bool(xs: LIST[BOOL], idx: NAT, val: BOOL): LIST[BOOL]
+    require
+      in_bounds: idx < xs.length
+    variant
+      idx
+    do
+      if idx = 0 then
+        xs.tail.prepend(val)
+      else
+        DIJKSTRA_FACTS.set_bool(xs.tail, idx - 1, val).prepend(xs.head)
+      end
+    ensure
+      same_length: Result.length = xs.length
+    end
+
+  -- Lookup after `set_bool`.
+  lemma_at_set_bool(xs: LIST[BOOL], idx: NAT, val: BOOL, k: NAT): BOOL
+    require
+      idx_in: idx < xs.length
+      k_in: k < xs.length
+    variant
+      k
+    do
+      if k = 0 then
+        True
+      else if idx = 0 then
+        True
+      else
+        DIJKSTRA_FACTS.lemma_at_set_bool(xs.tail, idx - 1, val, k - 1)
+      end end
+    ensure
+      holds: Result
+      same_idx: k = idx implies LIST_OPS.at(DIJKSTRA_FACTS.set_bool(xs, idx, val), k) = val
+      other_idx: k != idx implies LIST_OPS.at(DIJKSTRA_FACTS.set_bool(xs, idx, val), k) = LIST_OPS.at(xs, k)
+    end
+
+  -- Number of `True` entries in `xs` (size of the settled set `S`).
+  count_true(xs: LIST[BOOL]): NAT
+    variant
+      xs.length
+    do
+      if xs.length = 0 then
+        0
+      else
+        let rest = DIJKSTRA_FACTS.count_true(xs.tail)
+        if xs.head then
+          if rest < 65535 then rest + 1 else 65535 end
+        else
+          rest
+        end
+      end
+    ensure
+      le_len: Result <= xs.length
+    end
+
+  -- Exact count_true bound for lists of length <= 32.
+  lemma_count_true_bound(xs: LIST[BOOL]): BOOL
+    require
+      small: xs.length <= 32
+    variant
+      xs.length
+    do
+      if xs.length = 0 then
+        True
+      else
+        DIJKSTRA_FACTS.lemma_count_true_bound(xs.tail)
+      end
+    ensure
+      holds: Result
+      le_len: DIJKSTRA_FACTS.count_true(xs) <= xs.length
+      cons_def: xs.length > 0 implies
+        DIJKSTRA_FACTS.count_true(xs) = (if xs.head then DIJKSTRA_FACTS.count_true(xs.tail) + 1 else DIJKSTRA_FACTS.count_true(xs.tail) end)
+    end
+
+  -- Setting a `False` entry to `True` increases `count_true` by exactly 1.
+  lemma_set_true_inc(xs: LIST[BOOL], idx: NAT): BOOL
+    require
+      small: xs.length <= 32
+      idx_in: idx < xs.length
+      was_false: not LIST_OPS.at(xs, idx)
+    variant
+      idx
+    do
+      check
+        b1: DIJKSTRA_FACTS.lemma_count_true_bound(xs)
+        b2: DIJKSTRA_FACTS.lemma_count_true_bound(DIJKSTRA_FACTS.set_bool(xs, idx, True))
+      end
+      if idx = 0 then
+        True
+      else
+        DIJKSTRA_FACTS.lemma_set_true_inc(xs.tail, idx - 1)
+      end
+    ensure
+      holds: Result
+      inc_one: DIJKSTRA_FACTS.count_true(DIJKSTRA_FACTS.set_bool(xs, idx, True)) = DIJKSTRA_FACTS.count_true(xs) + 1
+    end
+
+  -- Build a list of `n` copies of `val`.
+  repeat_nat(n: NAT, val: NAT): LIST[NAT]
+    require
+      small: n <= 32
+    variant
+      n
+    do
+      if n = 0 then
+        LIST.empty
+      else
+        DIJKSTRA_FACTS.repeat_nat(n - 1, val).prepend(val)
+      end
+    ensure
+      len_eq: Result.length = n
+    end
+
+  -- Every element of `repeat_nat(n, val)` is `<= cap` when `val <= cap`.
+  lemma_repeat_bounded(n: NAT, val: NAT, cap: NAT): BOOL
+    require
+      small: n <= 32
+      val_ok: val <= cap
+    variant
+      n
+    do
+      if n = 0 then
+        True
+      else
+        DIJKSTRA_FACTS.lemma_repeat_bounded(n - 1, val, cap)
+      end
+    ensure
+      holds: Result
+      bounded: SORT_FACTS.all_at_most(DIJKSTRA_FACTS.repeat_nat(n, val), cap)
+    end
+
+  -- Build a list of `n` `False` entries (empty settled set `S = ∅`).
+  repeat_false(n: NAT): LIST[BOOL]
+    require
+      small: n <= 32
+    variant
+      n
+    do
+      if n = 0 then
+        LIST.empty
+      else
+        DIJKSTRA_FACTS.repeat_false(n - 1).prepend(False)
+      end
+    ensure
+      len_eq: Result.length = n
+      zero_true: DIJKSTRA_FACTS.count_true(Result) = 0
+    end
+
+  -- Find the unvisited vertex with minimum distance `< INF`, starting scan from `idx`.
+  -- Returns `u < dist.length` (with `not visited[u]`), or `dist.length` when none is reachable.
+  find_min_unvisited(dist: LIST[NAT], visited: LIST[BOOL], idx: NAT, best_idx: NAT, best_d: NAT): NAT
+    require
+      same_len: dist.length = visited.length
+      small: dist.length <= 32
+      best_valid: best_idx <= dist.length and (best_idx < dist.length implies (not LIST_OPS.at(visited, best_idx)))
+    variant
+      if dist.length > idx then dist.length - idx else 0 end
+    do
+      if idx >= dist.length then
+        best_idx
+      else
+        let v_vis = LIST_OPS.at(visited, idx)
+        let d = LIST_OPS.at(dist, idx)
+        let res = if (not v_vis) and d < 999999 and (best_idx = dist.length or d < best_d) then
+          DIJKSTRA_FACTS.find_min_unvisited(dist, visited, idx + 1, idx, d)
+        else
+          DIJKSTRA_FACTS.find_min_unvisited(dist, visited, idx + 1, best_idx, best_d)
+        end
+        if res < dist.length and (not LIST_OPS.at(visited, res)) then res else dist.length end
+      end
+    ensure
+      in_range: Result <= dist.length
+      unvisited_if_found: Result < dist.length implies (not LIST_OPS.at(visited, Result))
+    end
+
+  -- Check that `xs[k] <= cap` for all `k` (reusing `SORT_FACTS.all_at_most`).
+  -- Also proves `dist[source] = 0` is preserved when updating `idx != source` or setting `0`.
+  lemma_source_zero_preserved(dist: LIST[NAT], source: NAT, idx: NAT, new_d: NAT): BOOL
+    require
+      src_in: source < dist.length
+      idx_in: idx < dist.length
+      src_zero: LIST_OPS.at(dist, source) = 0
+      better: new_d < LIST_OPS.at(dist, idx)
+    do
+      check a: SORT_FACTS.lemma_at_set_at(dist, idx, new_d, source) end
+      True
+    ensure
+      holds: Result
+      still_zero: LIST_OPS.at(SORT_FACTS.set_at(dist, idx, new_d), source) = 0
+    end
+
+end

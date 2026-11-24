@@ -1,0 +1,104 @@
+-- Tablero: Parallel Verified Constrained N-Queens Solver on `gtui` 0.6.0.
+-- Showcases automatic lock-free C11 + OpenMP parallelism alongside compile-time
+-- Boogie/Z3 soundness and termination proofs.
+--
+--   gardelc --project examples/tablero --strict
+--   ./build/tablero_bin
+reactive program TABLERO
+
+feature {ANY}
+
+  update(s: TABLERO_STATE, e: EVENT): TUI_NEXT[TABLERO_STATE]
+    do
+      match e
+        case Resized(w, h) then TUI_NEXT.next(s.sized(w, h))
+        case Key(k) then s.handle_key(k)
+        case Mouse(m) then s.handle_mouse(m)
+        case _ then TUI_NEXT.next(s)
+      end
+    end
+
+  edge(s: TABLERO_STATE, pane: NAT): STYLE
+    do
+      if s.focus.has(pane) then s.theme.focused_border else s.theme.border end
+    end
+
+  view(s: TABLERO_STATE, blank: SCREEN): SCREEN
+    do
+      let t = s.theme
+      let area = blank.area
+      let kind = BORDER_KIND.rounded
+      let b = s.current_board
+
+      -- 1. Breadcrumb + live Soundness proof badge.
+      let s0 = s.breadcrumb.draw(blank, TABLERO_LAYOUT.crumb_left(area), t.gutter, t.active_tab, t.selection, t.border)
+      let badge_r = TABLERO_LAYOUT.proof_badge_area(area)
+      let s1 = s0.text(badge_r, badge_r.x, badge_r.y, "✓ Soundness & Termination [PROVEN]", STYLE.plain.fg(COLOR.green).bold)
+
+      -- 2. Main split panes: Interactive Board (left) + Proofs/Solution/Contracts (right).
+      let brd_r = TABLERO_LAYOUT.board_pane(area)
+      let rgt_r = TABLERO_LAYOUT.right_pane(area)
+      let title = GLYPHS.join("Interactive Board (", GLYPHS.join(NUMBER_TEXT.nat_to_text(b.size), GLYPHS.join("x", GLYPHS.join(NUMBER_TEXT.nat_to_text(b.size), ")"))))
+      let s2 = FRAME.draw_titled(s1, brd_r, kind, title, s.preset_name, "", edge(s, 0), t.active_tab)
+      let s3 = FRAME.draw_titled(s2, rgt_r, kind, "", "", "", edge(s, 1), t.active_tab)
+      let s4 = FRAME.merge_borders(s3, TABLERO_LAYOUT.main_area(area))
+      let s5 = s.tabs.draw(s4, TABLERO_LAYOUT.right_tabs_area(area), t.base, t.active_tab)
+
+      -- 3. Left pane: TrueColor N-Queens checkerboard + display/mode CHECKBOXes.
+      let s6 = BOARD_VIEW.draw(s5, TABLERO_LAYOUT.grid_area(area), b, s.active_solution, s.cursor_row, s.cursor_col, s.rays_checkbox.is_checked, t)
+      let s7 = s.rays_checkbox.draw(s6, TABLERO_LAYOUT.chk_rays_area(area), t.base, False)
+      let s8 = s.count_checkbox.draw(s7, TABLERO_LAYOUT.chk_count_area(area), t.base, False)
+
+      -- 4. Right pane: Proofs (0) / Solution (1) / Contracts (2).
+      let s9 =
+        if s.tabs.selected = 0 then
+          TABLERO_PANELS.draw_proofs_tab(s8, area, b, s.solve_result, s.solution_index, s.has_run, s.count_checkbox.is_checked, t)
+        else if s.tabs.selected = 1 then
+          TABLERO_PANELS.draw_solution_tab(s8, area, b, s.solve_result, s.solution_index, t)
+        else
+          TABLERO_PANELS.draw_contracts_tab(s8, area, s.contracts, t)
+        end end
+
+      -- 5. Controls bar: Solve / Prev / Next / Clear / Reset BUTTONs + Board Size SLIDER.
+      let ctl_r = TABLERO_LAYOUT.controls_bar(area)
+      let sol_meta =
+        if s.solve_result.stored_count > 0 then
+          let shown_num = if s.solution_index < s.solve_result.stored_count then s.solution_index + 1 else 1 end
+          GLYPHS.join(
+            GLYPHS.join("Sol ", NUMBER_TEXT.nat_to_text(shown_num)),
+            GLYPHS.join("/", NUMBER_TEXT.nat_to_text(s.solve_result.stored_count))
+          )
+        else
+          GLYPHS.join("Size N = ", NUMBER_TEXT.nat_to_text(b.size))
+        end
+      let s10 = FRAME.draw_titled(s9, ctl_r, kind, "Parallel OpenMP Solver", sol_meta, "", t.border, t.active_tab)
+      let s11 = BUTTON.make("▶ Solve").draw(s10, TABLERO_LAYOUT.btn_solve_area(area), STYLE.plain.fg(COLOR.green).bold, False, False)
+      let s12 = BUTTON.make("◀ Prev").draw(s11, TABLERO_LAYOUT.btn_prev_area(area), t.base, False, False)
+      let s13 = BUTTON.make("Next ▶").draw(s12, TABLERO_LAYOUT.btn_next_area(area), t.base, False, False)
+      let s14 = BUTTON.make("Clear").draw(s13, TABLERO_LAYOUT.btn_clear_area(area), t.base, False, False)
+      let s15 = BUTTON.make("Reset").draw(s14, TABLERO_LAYOUT.btn_reset_area(area), t.base, False, False)
+      let s16 = s.n_slider.draw(s15, TABLERO_LAYOUT.size_slider_area(area), t.gutter, t.string, t.active_tab)
+
+      -- 6. Status bar.
+      let left_st = GLYPHS.join("Tablero · ", s.preset_name)
+      let right_st = "Space:Solve  [/]:Browse  Enter:Pin  x:Block  1-4:Preset  ?:Help  q:Quit"
+      let s17 = STATUS_BAR.draw(s16, TABLERO_LAYOUT.status_bar(area), left_st, right_st, t.selection)
+
+      -- 7. Overlays (rendered last): TOASTs, Help POPUP, Quit DIALOG, top MENU.
+      let s18 = s.toasts.with_border(kind).draw(s17, area, t.base, t.focused_border, t.string, t.active_tab, t.keyword)
+      let s19 = if s.help_open then s.help_popup.draw(s18, area, t.base, t.focused_border, t.active_tab) else s18 end
+      let s20 = if s.quit_dlg.is_open then s.quit_dlg.draw(s19, area, t.base, t.focused_border, t.active_tab, t.base, t.selection) else s19 end
+      s.top_menu.draw(s20, TABLERO_LAYOUT.menu_bar(area), t.base, t.base, t.selection, t.gutter)
+    end
+
+  init(args: SEQ[STRING]): STEP[TUI[TABLERO_STATE]]
+    do
+      TUI.start(TABLERO_STATE.make, update, view)
+    end
+
+  step(t: TUI[TABLERO_STATE], e: EVENT): STEP[TUI[TABLERO_STATE]]
+    do
+      t.step(e)
+    end
+
+end

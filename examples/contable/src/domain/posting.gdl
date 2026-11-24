@@ -1,0 +1,119 @@
+-- A single debit or credit leg of a double-entry journal transaction.
+-- Amounts are strictly positive integer cents bounded to prevent 64-bit overflow.
+module POSTING
+
+representation {NONE}
+  acct_idx: NAT
+  is_dr: BOOL
+  amt_cents: NAT
+
+invariant
+  positive_amount: amt_cents > 0
+  bounded_amount: amt_cents <= 10000000000
+
+create {ANY}
+
+  debit(account_index: NAT, amount_cents: NAT): POSTING
+    require
+      positive: amount_cents > 0
+      bounded: amount_cents <= 10000000000
+    do
+      { acct_idx = account_index, is_dr = True, amt_cents = amount_cents }
+    ensure
+      is_debit: Result.is_debit
+      acct_set: Result.account_index = account_index
+      amt_set: Result.amount_cents = amount_cents
+      delta_pos: Result.signed_math = amount_cents
+    end
+
+  credit(account_index: NAT, amount_cents: NAT): POSTING
+    require
+      positive: amount_cents > 0
+      bounded: amount_cents <= 10000000000
+    do
+      { acct_idx = account_index, is_dr = False, amt_cents = amount_cents }
+    ensure
+      is_credit: not Result.is_debit
+      acct_set: Result.account_index = account_index
+      amt_set: Result.amount_cents = amount_cents
+      delta_neg: Result.signed_math = 0 - amount_cents
+    end
+
+  make(account_index: NAT, is_debit_side: BOOL, amount_cents: NAT): POSTING
+    require
+      positive: amount_cents > 0
+      bounded: amount_cents <= 10000000000
+    do
+      { acct_idx = account_index, is_dr = is_debit_side, amt_cents = amount_cents }
+    ensure
+      acct_set: Result.account_index = account_index
+      side_set: Result.is_debit = is_debit_side
+      amt_set: Result.amount_cents = amount_cents
+    end
+
+feature {ANY}
+
+  account_index: NAT
+    do
+      Current.acct_idx
+    end
+
+  is_debit: BOOL
+    do
+      Current.is_dr
+    end
+
+  side_label: STRING
+    do
+      if Current.is_dr then "DR" else "CR" end
+    end
+
+  amount_cents: NAT
+    do
+      Current.amt_cents
+    ensure
+      positive: Result > 0
+      bounded: Result <= 10000000000
+    end
+
+  -- Signed `I64` delta (+amount for Debit, -amount for Credit).
+  signed_delta: I64
+    do
+      let a = I64.from_nat(Current.amt_cents)
+      if Current.is_dr then a else 0 - a end
+    ensure
+      bounded: Result >= -10000000000 and Result <= 10000000000
+    end
+
+  -- Exact signed delta in `MATH_INT` for ghost specifications and trial-balance lemmas.
+  signed_math: MATH_INT
+    do
+      if Current.is_dr then Current.amt_cents else 0 - Current.amt_cents end
+    ensure
+      matches_i64: Result = Current.signed_delta
+    end
+
+  debit_math: MATH_INT
+    do
+      if Current.is_dr then Current.amt_cents else 0 end
+    end
+
+  credit_math: MATH_INT
+    do
+      if Current.is_dr then 0 else Current.amt_cents end
+    end
+
+  -- Compensating posting with opposite side and identical account & amount.
+  reversed: POSTING
+    do
+      { acct_idx = Current.acct_idx, is_dr = not Current.is_dr, amt_cents = Current.amt_cents }
+    ensure
+      same_acct: Result.account_index = Current.account_index
+      same_amount: Result.amount_cents = Current.amount_cents
+      flipped_side: Result.is_debit = (not Current.is_debit)
+      opposite_math: Result.signed_math = 0 - Current.signed_math
+      swapped_dr: Result.debit_math = Current.credit_math
+      swapped_cr: Result.credit_math = Current.debit_math
+    end
+
+end

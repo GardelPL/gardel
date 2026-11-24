@@ -1,0 +1,160 @@
+-- Shared pure layout geometry for `contable`.
+-- Used identically by `view` and mouse hit-testing so rendering and clicks always agree.
+functions CONTABLE_LAYOUT
+
+feature {ANY}
+
+  -- Top-to-bottom split:
+  -- 0: 1-row menu bar
+  -- 1: 1-row breadcrumb + live trial-balance proof badge
+  -- 2: main split panes
+  -- 3: 3-row action & history scrubber bar
+  -- 4: 1-row status bar
+  vertical_parts(area: RECT): LIST[RECT]
+    do
+      let sizes: LIST[SIZE] = LIST.empty
+        .prepend(SIZE.fixed(1))
+        .prepend(SIZE.fixed(3))
+        .prepend(SIZE.min(10))
+        .prepend(SIZE.fixed(1))
+        .prepend(SIZE.fixed(1))
+      LAYOUT.rows(area, sizes)
+    ensure
+      five: Result.length = 5
+    end
+
+  menu_bar(area: RECT): RECT
+    do
+      LIST_OPS.at(CONTABLE_LAYOUT.vertical_parts(area), 0)
+    end
+
+  crumb_bar(area: RECT): RECT
+    do
+      LIST_OPS.at(CONTABLE_LAYOUT.vertical_parts(area), 1)
+    end
+
+  crumb_left(area: RECT): RECT
+    do
+      let r = CONTABLE_LAYOUT.crumb_bar(area)
+      let badge_w = if r.width > 36 then 36 else 0 end
+      r.drop_right(badge_w)
+    end
+
+  proof_badge_area(area: RECT): RECT
+    do
+      let r = CONTABLE_LAYOUT.crumb_bar(area)
+      let badge_w = if r.width > 36 then 36 else 0 end
+      r.take_right(badge_w)
+    end
+
+  main_area(area: RECT): RECT
+    do
+      LIST_OPS.at(CONTABLE_LAYOUT.vertical_parts(area), 2)
+    end
+
+  action_bar(area: RECT): RECT
+    do
+      LIST_OPS.at(CONTABLE_LAYOUT.vertical_parts(area), 3)
+    end
+
+  status_bar(area: RECT): RECT
+    do
+      LIST_OPS.at(CONTABLE_LAYOUT.vertical_parts(area), 4)
+    end
+
+  -- Left column (56%): Accounts (top) + Immutable Journal (bottom).
+  left_col(area: RECT): RECT
+    do
+      let m = CONTABLE_LAYOUT.main_area(area)
+      let lw = m.width * 56 / 100
+      m.take_left(lw)
+    end
+
+  -- Right column (44%): Tabbed Budgets / Entry Detail / Contracts pane.
+  right_pane(area: RECT): RECT
+    do
+      let m = CONTABLE_LAYOUT.main_area(area)
+      let lw = m.width * 56 / 100
+      m.drop_left(if lw > 0 then lw - 1 else 0 end)
+    end
+
+  accounts_pane(area: RECT): RECT
+    do
+      let l = CONTABLE_LAYOUT.left_col(area)
+      let top_h = l.height * 54 / 100
+      l.take_top(if top_h >= 5 then top_h else l.height end)
+    end
+
+  journal_pane(area: RECT): RECT
+    do
+      let l = CONTABLE_LAYOUT.left_col(area)
+      let top_h = l.height * 54 / 100
+      let h = if top_h >= 5 then top_h else l.height end
+      l.drop_top(if h > 0 then h - 1 else 0 end)
+    end
+
+  accounts_inner(area: RECT): RECT
+    do
+      FRAME.inner_padded(CONTABLE_LAYOUT.accounts_pane(area), PADDING.symmetric(0, 1))
+    end
+
+  journal_inner(area: RECT): RECT
+    do
+      FRAME.inner_padded(CONTABLE_LAYOUT.journal_pane(area), PADDING.symmetric(0, 1))
+    end
+
+  right_tabs_area(area: RECT): RECT
+    do
+      FRAME.title_area(CONTABLE_LAYOUT.right_pane(area))
+    end
+
+  right_inner(area: RECT): RECT
+    do
+      FRAME.inner_padded(CONTABLE_LAYOUT.right_pane(area), PADDING.symmetric(0, 1))
+    end
+
+  -- Bottom action & history scrubber controls.
+  action_inner(area: RECT): RECT
+    do
+      FRAME.inner_padded(CONTABLE_LAYOUT.action_bar(area), PADDING.symmetric(0, 1))
+    end
+
+  action_parts(area: RECT): LIST[RECT]
+    do
+      let sizes: LIST[SIZE] = LIST.empty
+        .prepend(SIZE.flex(1))
+        .prepend(SIZE.fixed(9))
+        .prepend(SIZE.fixed(9))
+        .prepend(SIZE.fixed(13))
+        .prepend(SIZE.fixed(14))
+      LAYOUT.columns_with_gap(CONTABLE_LAYOUT.action_inner(area), sizes, 1)
+    ensure
+      five: Result.length = 5
+    end
+
+  btn_new_area(area: RECT): RECT
+    do
+      LIST_OPS.at(CONTABLE_LAYOUT.action_parts(area), 0)
+    end
+
+  btn_rev_area(area: RECT): RECT
+    do
+      LIST_OPS.at(CONTABLE_LAYOUT.action_parts(area), 1)
+    end
+
+  btn_back_area(area: RECT): RECT
+    do
+      LIST_OPS.at(CONTABLE_LAYOUT.action_parts(area), 2)
+    end
+
+  btn_next_area(area: RECT): RECT
+    do
+      LIST_OPS.at(CONTABLE_LAYOUT.action_parts(area), 3)
+    end
+
+  history_slider_area(area: RECT): RECT
+    do
+      LIST_OPS.at(CONTABLE_LAYOUT.action_parts(area), 4)
+    end
+
+end

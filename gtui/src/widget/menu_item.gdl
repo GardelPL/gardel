@@ -1,0 +1,304 @@
+-- An entry of a `MENU`: an action item with optional shortcut and id, a separator row, or a
+-- sub-menu containing child items. Immutable; `with_*` builders return updated copies.
+module MENU_ITEM
+
+representation {NONE}
+  text: STRING
+  accel: STRING
+  code: NAT
+  active: BOOL
+  divider: BOOL
+  kids: LIST[MENU_ITEM]
+
+create {ANY}
+
+  -- An enabled action item with `label` and `id`, no shortcut, and no sub-menu.
+  item(label: STRING, id: NAT): MENU_ITEM
+    do
+      { text = label, accel = "", code = id, active = True, divider = False, kids = LIST.empty }
+    ensure
+      enabled: Result.is_enabled
+      not_sep: not Result.is_separator
+      selectable: Result.is_selectable
+      no_sub: not Result.has_submenu
+      id_set: Result.id = id
+    end
+
+  -- A non-selectable separator row.
+  separator: MENU_ITEM
+    do
+      { text = "", accel = "", code = 0, active = True, divider = True, kids = LIST.empty }
+    ensure
+      is_sep: Result.is_separator
+      not_selectable: not Result.is_selectable
+      no_sub: not Result.has_submenu
+    end
+
+  -- An enabled sub-menu entry with `label` and `children`.
+  submenu(label: STRING, children: LIST[MENU_ITEM]): MENU_ITEM
+    do
+      { text = label, accel = "", code = 0, active = True, divider = False, kids = children }
+    ensure
+      enabled: Result.is_enabled
+      not_sep: not Result.is_separator
+      selectable: Result.is_selectable
+      count_set: Result.count = children.length
+    end
+
+  -- Whether `i` is in bounds of `items` and the item at `i` is selectable.
+  selectable_at(items: LIST[MENU_ITEM], i: NAT): BOOL
+    do
+      i < items.length and LIST_OPS.at(items, i).is_selectable
+    ensure
+      valid: Result implies (i < items.length and LIST_OPS.at(items, i).is_selectable)
+    end
+
+  -- Scan forward from `idx` for up to `steps` positions, wrapping around `items`, returning
+  -- the first selectable index or `None`.
+  scan_forward(items: LIST[MENU_ITEM], idx: NAT, steps: NAT): OPTION[NAT]
+    variant
+      steps
+    do
+      let n = if items.length <= 18446744073709551615 then items.length else 18446744073709551615 end
+      if steps = 0 or n = 0 then
+        None
+      else
+        let c = if idx < n then idx else 0 end
+        if MENU_ITEM.selectable_at(items, c) then
+          Some(c)
+        else
+          let next_idx = if c + 1 < n then c + 1 else 0 end
+          MENU_ITEM.scan_forward(items, next_idx, steps - 1)
+        end
+      end
+    ensure
+      valid: match Result
+        case Some(k) then 0 <= k and k < 18446744073709551615 and k < items.length and LIST_OPS.at(items, k).is_selectable
+        case None then True
+      end
+    end
+
+  -- Scan backward from `idx` for up to `steps` positions, wrapping around `items`, returning
+  -- the first selectable index or `None`.
+  scan_backward(items: LIST[MENU_ITEM], idx: NAT, steps: NAT): OPTION[NAT]
+    variant
+      steps
+    do
+      let n = if items.length <= 18446744073709551615 then items.length else 18446744073709551615 end
+      if steps = 0 or n = 0 then
+        None
+      else
+        let c = if idx < n then idx else n - 1 end
+        if MENU_ITEM.selectable_at(items, c) then
+          Some(c)
+        else
+          let prev_idx = if c > 0 then c - 1 else n - 1 end
+          MENU_ITEM.scan_backward(items, prev_idx, steps - 1)
+        end
+      end
+    ensure
+      valid: match Result
+        case Some(k) then 0 <= k and k < 18446744073709551615 and k < items.length and LIST_OPS.at(items, k).is_selectable
+        case None then True
+      end
+    end
+
+  -- Index of the first selectable item in `items`, or `None`.
+  first_selectable_in(items: LIST[MENU_ITEM]): OPTION[NAT]
+    do
+      let n = if items.length <= 18446744073709551615 then items.length else 18446744073709551615 end
+      MENU_ITEM.scan_forward(items, 0, n)
+    ensure
+      valid: match Result
+        case Some(k) then 0 <= k and k < 18446744073709551615 and k < items.length and LIST_OPS.at(items, k).is_selectable
+        case None then True
+      end
+    end
+
+  -- Index of the last selectable item in `items`, or `None`.
+  last_selectable_in(items: LIST[MENU_ITEM]): OPTION[NAT]
+    do
+      let n = if items.length <= 18446744073709551615 then items.length else 18446744073709551615 end
+      let start = if n > 0 then n - 1 else 0 end
+      MENU_ITEM.scan_backward(items, start, n)
+    ensure
+      valid: match Result
+        case Some(k) then 0 <= k and k < 18446744073709551615 and k < items.length and LIST_OPS.at(items, k).is_selectable
+        case None then True
+      end
+    end
+
+  -- Index of the next selectable item after `i` in `items` (wrapping), or `None`.
+  next_selectable_in(items: LIST[MENU_ITEM], i: NAT): OPTION[NAT]
+    do
+      let n = if items.length <= 18446744073709551615 then items.length else 18446744073709551615 end
+      let start = if i < n and i + 1 < n then i + 1 else 0 end
+      MENU_ITEM.scan_forward(items, start, n)
+    ensure
+      valid: match Result
+        case Some(k) then 0 <= k and k < 18446744073709551615 and k < items.length and LIST_OPS.at(items, k).is_selectable
+        case None then True
+      end
+    end
+
+  -- Index of the previous selectable item before `i` in `items` (wrapping), or `None`.
+  previous_selectable_in(items: LIST[MENU_ITEM], i: NAT): OPTION[NAT]
+    do
+      let n = if items.length <= 18446744073709551615 then items.length else 18446744073709551615 end
+      let start = if i < n and i > 0 then i - 1 else if n > 0 then n - 1 else 0 end end
+      MENU_ITEM.scan_backward(items, start, n)
+    ensure
+      valid: match Result
+        case Some(k) then 0 <= k and k < 18446744073709551615 and k < items.length and LIST_OPS.at(items, k).is_selectable
+        case None then True
+      end
+    end
+
+feature {ANY}
+
+  label: STRING
+    do
+      Current.text
+    end
+
+  shortcut: STRING
+    do
+      Current.accel
+    end
+
+  id: NAT
+    do
+      Current.code
+    end
+
+  is_enabled: BOOL
+    do
+      Current.active
+    end
+
+  is_separator: BOOL
+    do
+      Current.divider
+    end
+
+  children: LIST[MENU_ITEM]
+    do
+      Current.kids
+    end
+
+  count: NAT
+    do
+      Current.kids.length
+    end
+
+  child(i: NAT): MENU_ITEM
+    require
+      valid: i < Current.count
+    do
+      LIST_OPS.at(Current.kids, i)
+    end
+
+  has_submenu: BOOL
+    do
+      Current.kids.length > 0
+    ensure
+      def: Result = (Current.count > 0)
+    end
+
+  is_selectable: BOOL
+    do
+      Current.active and not Current.divider
+    ensure
+      def: Result = (Current.is_enabled and not Current.is_separator)
+    end
+
+  label_width: NAT
+    do
+      GLYPHS.width(Current.text)
+    end
+
+  shortcut_width: NAT
+    do
+      GLYPHS.width(Current.accel)
+    end
+
+  with_label(s: STRING): MENU_ITEM
+    require
+      not_sep: not Current.is_separator
+    do
+      { Current with text = s }
+    end
+
+  with_shortcut(s: STRING): MENU_ITEM
+    require
+      not_sep: not Current.is_separator
+    do
+      { Current with accel = s }
+    end
+
+  with_id(id: NAT): MENU_ITEM
+    require
+      not_sep: not Current.is_separator
+    do
+      { Current with code = id }
+    ensure
+      id_set: Result.id = id
+    end
+
+  with_enabled(en: BOOL): MENU_ITEM
+    do
+      { Current with active = en }
+    ensure
+      enabled_set: Result.is_enabled = en
+    end
+
+  with_submenu(children: LIST[MENU_ITEM]): MENU_ITEM
+    require
+      not_sep: not Current.is_separator
+    do
+      { Current with kids = children }
+    ensure
+      count_set: Result.count = children.length
+    end
+
+  first_selectable: OPTION[NAT]
+    do
+      MENU_ITEM.first_selectable_in(Current.kids)
+    ensure
+      valid: match Result
+        case Some(k) then 0 <= k and k < 18446744073709551615 and k < Current.count and Current.child(k).is_selectable
+        case None then True
+      end
+    end
+
+  last_selectable: OPTION[NAT]
+    do
+      MENU_ITEM.last_selectable_in(Current.kids)
+    ensure
+      valid: match Result
+        case Some(k) then 0 <= k and k < 18446744073709551615 and k < Current.count and Current.child(k).is_selectable
+        case None then True
+      end
+    end
+
+  next_selectable(i: NAT): OPTION[NAT]
+    do
+      MENU_ITEM.next_selectable_in(Current.kids, i)
+    ensure
+      valid: match Result
+        case Some(k) then 0 <= k and k < 18446744073709551615 and k < Current.count and Current.child(k).is_selectable
+        case None then True
+      end
+    end
+
+  previous_selectable(i: NAT): OPTION[NAT]
+    do
+      MENU_ITEM.previous_selectable_in(Current.kids, i)
+    ensure
+      valid: match Result
+        case Some(k) then 0 <= k and k < 18446744073709551615 and k < Current.count and Current.child(k).is_selectable
+        case None then True
+      end
+    end
+
+end
