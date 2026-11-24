@@ -1,0 +1,111 @@
+-- A first-in, first-out queue (Task H.4).
+--
+-- A client sees `push`, `peek`, `pop`, `size` and `items`, the items oldest first, and each
+-- contract states what an operation does to `items`.
+--
+-- The representation is hidden: the oldest items in `front`, oldest first, and the newest in
+-- `back`, newest first. `push` puts an item on `back`. `pop` takes one from `front`, and
+-- when `front` runs out it reverses `back` into it, so each item is moved once and every
+-- operation takes amortized constant time. `items` itself takes time linear in the size.
+module QUEUE[A]
+
+representation {NONE}
+  front: LIST[A]
+  back: LIST[A]
+
+invariant
+  -- The oldest item is at the head of `front` whenever there is one.
+  balanced: front.length = 0 implies back.length = 0
+  fits: front.length + back.length <= 18446744073709551615
+
+create {ANY}
+
+  empty: QUEUE[A]
+    do
+      { front = LIST.empty, back = LIST.empty }
+    ensure
+      none: Result.size = 0
+      no_items: Result.items = LIST.empty
+    end
+
+feature {ANY}
+
+  -- The items, oldest first.
+  items: LIST[A]
+    do
+      Current.front.append(LIST_OPS.reverse(Current.back))
+    end
+
+  -- How many items wait.
+  size: NAT
+    do
+      Current.front.length + Current.back.length
+    ensure
+      counted: Result = Current.items.length
+    end
+
+  is_empty: BOOL
+    do
+      Current.front.length = 0
+    ensure
+      def: Result = (Current.size = 0)
+    end
+
+  -- The queue with `x` after every item.
+  push(x: A): QUEUE[A]
+    require
+      room: Current.size < 18446744073709551615
+    do
+      if Current.front.length = 0 then
+        { front = LIST.empty.prepend(x), back = LIST.empty }
+      else
+        check
+          reversed: LIST_OPS.reverse_cons(x, Current.back)
+        end
+        { front = Current.front, back = Current.back.prepend(x) }
+      end
+    ensure
+      last: Result.items = Current.items.append(LIST.empty.prepend(x))
+      grows: Result.size = Current.size + 1
+    end
+
+  -- The oldest item, or `None` when the queue is empty.
+  peek: OPTION[A]
+    do
+      if Current.front.length = 0 then
+        None
+      else
+        check
+          whole: Current.front = Current.front.tail.prepend(Current.front.head)
+        end
+        Some(Current.front.head)
+      end
+    ensure
+      none: Current.size = 0 implies Result = None
+      oldest: Current.size > 0 implies Result = Some(Current.items.head)
+    end
+
+  -- The queue without its oldest item. The empty queue stays empty.
+  pop: QUEUE[A]
+    do
+      if Current.front.length = 0 then
+        Current
+      else if Current.front.length = 1 then
+        check
+          whole: Current.front = Current.front.tail.prepend(Current.front.head)
+          reversed: LIST_OPS.reverse(LIST.empty) = LIST.empty
+        end
+        { front = LIST_OPS.reverse(Current.back), back = LIST.empty }
+      else
+        check
+          whole: Current.front = Current.front.tail.prepend(Current.front.head)
+        end
+        { front = Current.front.tail, back = Current.back }
+      end end
+    ensure
+      empty_case: Current.size = 0 implies Result.size = 0
+      rest: Current.size > 0 implies Result.items = Current.items.tail
+      shrinks: Current.size > 0 implies Result.size + 1 = Current.size
+    end
+
+end

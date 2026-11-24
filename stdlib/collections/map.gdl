@@ -175,6 +175,203 @@ create {NONE}
       unchanged: MAP.find(KEY_ORDER.remove_keys(xs, k), MAP.remove_values(xs, ys, k), j) = MAP.find(xs, ys, j)
     end
 
+  -- What `put` and `remove` do to the number of keys. When no key equals `k`, `put` adds
+  -- one and `remove` none, whatever the order. When one does, `put` adds none and `remove`
+  -- takes one away only if `equals` is `=`: `ORD` alone lets a key equal to `k` sit above a
+  -- key that `k` is below.
+
+  put_grows(xs: LIST[K], ys: LIST[V], k: K): BOOL
+    require
+      same: xs.length = ys.length
+      absent: MAP.find(xs, ys, k).is_none
+    variant
+      xs.length
+    do
+      if xs.length = 0 or k.less_than(xs.head) then True else MAP.put_grows(xs.tail, ys.tail, k) end
+    ensure
+      holds: Result
+      grows: KEY_ORDER.put_keys(xs, k).length = xs.length + 1
+    end
+
+  put_at_most(xs: LIST[K], k: K): BOOL
+    variant
+      xs.length
+    do
+      if xs.length = 0 or xs.head.equals(k) or k.less_than(xs.head) then True else MAP.put_at_most(xs.tail, k) end
+    ensure
+      holds: Result
+      at_most: KEY_ORDER.put_keys(xs, k).length <= xs.length + 1
+    end
+
+  -- A key found above `lo` is above it.
+  found_above(lo: K, xs: LIST[K], ys: LIST[V], k: K): BOOL
+    require
+      same: xs.length = ys.length
+      above: KEY_ORDER.above(lo, xs)
+      found: MAP.find(xs, ys, k).is_some
+      agrees: forall p: K. forall q: K. p.equals(q) = (p = q)
+    variant
+      xs.length
+    do
+      if xs.head.equals(k) then True else MAP.found_above(lo, xs.tail, ys.tail, k) end
+    ensure
+      holds: Result
+      below: lo.less_than(k)
+    end
+
+  -- No key above `lo` is `lo`.
+  above_misses(lo: K, xs: LIST[K], ys: LIST[V]): BOOL
+    require
+      same: xs.length = ys.length
+      above: KEY_ORDER.above(lo, xs)
+      agrees: forall p: K. forall q: K. p.equals(q) = (p = q)
+    variant
+      xs.length
+    do
+      if xs.length = 0 then True else MAP.above_misses(lo, xs.tail, ys.tail) end
+    ensure
+      holds: Result
+      missing: MAP.find(xs, ys, lo).is_none
+    end
+
+  put_keeps(xs: LIST[K], ys: LIST[V], k: K): BOOL
+    require
+      same: xs.length = ys.length
+      sorted: KEY_ORDER.ascending(xs)
+      found: MAP.find(xs, ys, k).is_some
+      agrees: forall p: K. forall q: K. p.equals(q) = (p = q)
+    variant
+      xs.length
+    do
+      if xs.head.equals(k) then
+        True
+      else
+        check
+          above: MAP.found_above(xs.head, xs.tail, ys.tail, k)
+        end
+        MAP.put_keeps(xs.tail, ys.tail, k)
+      end
+    ensure
+      holds: Result
+      kept: KEY_ORDER.put_keys(xs, k).length = xs.length
+    end
+
+  remove_absent(xs: LIST[K], ys: LIST[V], k: K): BOOL
+    require
+      same: xs.length = ys.length
+      absent: MAP.find(xs, ys, k).is_none
+    variant
+      xs.length
+    do
+      if xs.length = 0 then True else MAP.remove_absent(xs.tail, ys.tail, k) end
+    ensure
+      holds: Result
+      kept: KEY_ORDER.remove_keys(xs, k).length = xs.length
+    end
+
+  remove_at_most(xs: LIST[K], k: K): BOOL
+    variant
+      xs.length
+    do
+      if xs.length = 0 then True else MAP.remove_at_most(xs.tail, k) end
+    ensure
+      holds: Result
+      at_most: KEY_ORDER.remove_keys(xs, k).length <= xs.length
+    end
+
+  remove_shrinks(xs: LIST[K], ys: LIST[V], k: K): BOOL
+    require
+      same: xs.length = ys.length
+      sorted: KEY_ORDER.ascending(xs)
+      found: MAP.find(xs, ys, k).is_some
+      agrees: forall p: K. forall q: K. p.equals(q) = (p = q)
+    variant
+      xs.length
+    do
+      if xs.head.equals(k) then
+        check
+          is_k: xs.head = k
+          rest: MAP.above_misses(xs.head, xs.tail, ys.tail)
+          none: MAP.remove_absent(xs.tail, ys.tail, k)
+        end
+        True
+      else
+        MAP.remove_shrinks(xs.tail, ys.tail, k)
+      end
+    ensure
+      holds: Result
+      shrinks: KEY_ORDER.remove_keys(xs, k).length + 1 = xs.length
+    end
+
+  -- A new key above every key goes last, so a fold meets it last.
+  fold_put_last_fact[B](xs: LIST[K], ys: LIST[V], k: K, v: V, f: (acc: B, k: K, v: V) -> B, acc: B): BOOL
+    require
+      same: xs.length = ys.length
+      sorted: KEY_ORDER.ascending(xs)
+      absent: MAP.find(xs, ys, k).is_none
+      last: xs.length = 0 or LIST_OPS.at(xs, xs.length - 1).less_than(k)
+    variant
+      xs.length
+    do
+      if xs.length = 0 then
+        True
+      else if xs.length = 1 then
+        check
+          keys: KEY_ORDER.put_keys(xs, k) = KEY_ORDER.put_keys(xs.tail, k).prepend(xs.head)
+          values: MAP.put_values(xs, ys, k, v) = MAP.put_values(xs.tail, ys.tail, k, v).prepend(ys.head)
+          rest: MAP.fold_put_last_fact(xs.tail, ys.tail, k, v, f, f(acc, xs.head, ys.head))
+        end
+        True
+      else
+        check
+          head: KEY_ORDER.above_at(xs.head, xs.tail, xs.length - 2)
+          same_last: LIST_OPS.at(xs, xs.length - 1) = LIST_OPS.at(xs.tail, xs.length - 2)
+          below: xs.head.less_than(k)
+          keys: KEY_ORDER.put_keys(xs, k) = KEY_ORDER.put_keys(xs.tail, k).prepend(xs.head)
+          values: MAP.put_values(xs, ys, k, v) = MAP.put_values(xs.tail, ys.tail, k, v).prepend(ys.head)
+          rest: MAP.fold_put_last_fact(xs.tail, ys.tail, k, v, f, f(acc, xs.head, ys.head))
+        end
+        True
+      end end
+    ensure
+      holds: Result
+      last: MAP.fold_entries(KEY_ORDER.put_keys(xs, k), MAP.put_values(xs, ys, k, v), f, acc) = f(MAP.fold_entries(xs, ys, f, acc), k, v)
+    end
+
+  -- A new key above every key becomes the last key.
+  put_last_key(xs: LIST[K], ys: LIST[V], k: K): BOOL
+    require
+      same: xs.length = ys.length
+      sorted: KEY_ORDER.ascending(xs)
+      absent: MAP.find(xs, ys, k).is_none
+      last: xs.length = 0 or LIST_OPS.at(xs, xs.length - 1).less_than(k)
+    variant
+      xs.length
+    do
+      if xs.length = 0 then
+        True
+      else if xs.length = 1 then
+        check
+          keys: KEY_ORDER.put_keys(xs, k) = KEY_ORDER.put_keys(xs.tail, k).prepend(xs.head)
+          rest: MAP.put_last_key(xs.tail, ys.tail, k)
+        end
+        True
+      else
+        check
+          head: KEY_ORDER.above_at(xs.head, xs.tail, xs.length - 2)
+          same_last: LIST_OPS.at(xs, xs.length - 1) = LIST_OPS.at(xs.tail, xs.length - 2)
+          below: xs.head.less_than(k)
+          keys: KEY_ORDER.put_keys(xs, k) = KEY_ORDER.put_keys(xs.tail, k).prepend(xs.head)
+          rest: MAP.put_last_key(xs.tail, ys.tail, k)
+        end
+        True
+      end end
+    ensure
+      holds: Result
+      grows: KEY_ORDER.put_keys(xs, k).length = xs.length + 1
+      last_key: LIST_OPS.at(KEY_ORDER.put_keys(xs, k), xs.length) = k
+    end
+
 feature {ANY}
 
   -- How many keys the map holds.
@@ -307,6 +504,99 @@ specify {ANY}
       KEY_ORDER.ascending_at(m.keys, i, j)
     ensure
       below: LIST_OPS.at(m.keys, i).less_than(LIST_OPS.at(m.keys, j))
+    end
+
+  -- How many keys after each change. The exact counts when `k` is there need `equals` to be
+  -- `=`, which a client states as `agrees`, as `SORTING.first_least` does.
+
+  law size_put_new(m: MAP[K, V], k: K, v: V)
+    require
+      absent: not m.has(k)
+    trigger
+      m.put(k, v).size
+    do
+      MAP.put_grows(m.ks, m.vs, k)
+    ensure
+      grows: m.put(k, v).size = m.size + 1
+    end
+
+  law size_put_at_most(m: MAP[K, V], k: K, v: V)
+    trigger
+      m.put(k, v).size
+    do
+      MAP.put_at_most(m.ks, k)
+    ensure
+      at_most: m.put(k, v).size <= m.size + 1
+    end
+
+  law size_put_present(m: MAP[K, V], k: K, v: V)
+    require
+      present: m.has(k)
+      agrees: forall p: K. forall q: K. p.equals(q) = (p = q)
+    trigger
+      m.put(k, v).size
+    do
+      MAP.put_keeps(m.ks, m.vs, k)
+    ensure
+      same: m.put(k, v).size = m.size
+    end
+
+  law size_remove_absent(m: MAP[K, V], k: K)
+    require
+      absent: not m.has(k)
+    trigger
+      m.remove(k).size
+    do
+      MAP.remove_absent(m.ks, m.vs, k)
+    ensure
+      same: m.remove(k).size = m.size
+    end
+
+  law size_remove_at_most(m: MAP[K, V], k: K)
+    trigger
+      m.remove(k).size
+    do
+      MAP.remove_at_most(m.ks, k)
+    ensure
+      at_most: m.remove(k).size <= m.size
+    end
+
+  law size_remove_present(m: MAP[K, V], k: K)
+    require
+      present: m.has(k)
+      agrees: forall p: K. forall q: K. p.equals(q) = (p = q)
+    trigger
+      m.remove(k).size
+    do
+      MAP.remove_shrinks(m.ks, m.vs, k)
+    ensure
+      shrinks: m.remove(k).size + 1 = m.size
+    end
+
+  -- A fold meets the keys in ascending order, so a new key above every key is met last.
+  law fold_put_last[B](m: MAP[K, V], k: K, v: V, init: B, f: (acc: B, k: K, v: V) -> B)
+    require
+      absent: not m.has(k)
+      last: m.size = 0 or LIST_OPS.at(m.keys, m.size - 1).less_than(k)
+    trigger
+      m.put(k, v).fold(init, f)
+    do
+      MAP.fold_put_last_fact(m.ks, m.vs, k, v, f, init)
+    ensure
+      last: m.put(k, v).fold(init, f) = f(m.fold(init, f), k, v)
+    end
+
+  law keys_put_last(m: MAP[K, V], k: K, v: V)
+    require
+      absent: not m.has(k)
+      last: m.size = 0 or LIST_OPS.at(m.keys, m.size - 1).less_than(k)
+    trigger
+      m.put(k, v).keys
+    do
+      MAP.put_last_key(m.ks, m.vs, k)
+    ensure
+      grows: m.put(k, v).size = m.size + 1
+      last_key: LIST_OPS.at(m.put(k, v).keys, m.size) = k
     end
 
 end

@@ -512,6 +512,12 @@ facts(m: MAP[NAT, NAT], x: NAT): BOOL
 
 `keys` come out in ascending order and `fold(init, fn(acc: B, k: K, v: V): B do ... end)` visits them in that order. Each operation walks the map, so it takes time linear in its size. With `STRING` values, compare what `get` gives with `.equals`, as `=` on `OPTION[STRING]` is `E0311`.
 
+Other laws count the keys:
+- `m.put(k, v).size` is at most `m.size + 1`, and is `m.size + 1` when `not m.has(k)`. `m.remove(k).size` is at most `m.size`, and is `m.size` when `not m.has(k)`.
+- When `m.has(k)`, `m.put(k, v).size = m.size` and `m.remove(k).size + 1 = m.size`. These two need the premise `agrees` (see `binary_search` below), which a `NAT`, `I64` or `U64` client states in one `check`, and which does not prove for `STRING`.
+
+`fold_put_last` says that a new key above every key is the last a fold meets: `m.put(k, v).fold(init, f) = f(m.fold(init, f), k, v)` when `not m.has(k)` and `m.size = 0 or LIST_OPS.at(m.keys, m.size - 1) < k`. `keys_put_last` says that `k` is then the last key, so a chain of `put`s in order can be folded step by step.
+
 To change between `NAT` and `I64`, use `NAT.from_i64(i)`, which needs `i >= 0`, and `I64.from_nat(n)`, which needs `n <= 9223372036854775807`. Both are proof obligations (`in_range`), not run-time checks.
 
 ---
@@ -2016,7 +2022,7 @@ Every program automatically sees the **Standard Prelude**:
 | :--- | :--- |
 | Concepts | `EQ`, `CANONICAL_EQ`, `ORD` |
 | Core types | `OPTION[A]`, `RESULT[E, A]`, `IO_ERROR` |
-| Collections | `SEQ[A]`, `LIST[A]`, `LIST_OPS`, `ARRAY[A]`, `MAP[K, V]`, `KEY_ORDER[K]`, `SORTING[K]`, `GENERATOR[S, A]`, `UNFOLD[S, A]` |
+| Collections | `SEQ[A]`, `LIST[A]`, `LIST_OPS`, `ARRAY[A]`, `MAP[K, V]`, `SET[K]`, `QUEUE[A]`, `HEAP[K]`, `KEY_ORDER[K]`, `HEAP_ORDER[K]`, `SORTING[K]`, `GENERATOR[S, A]`, `UNFOLD[S, A]` |
 | Numbers | `BIGNAT`, `NUMBER_TEXT`, `NUMBER_ERROR` |
 | Text | `STRING`, `STRING_ERROR`, `BYTES`, `BYTES_BUILDER`, `STRING_BUILDER`, `TEXT_FORMAT` |
 | Encodings | `HEX`, `BASE64`, `PERCENT`, `CODEC_ERROR` |
@@ -2207,6 +2213,52 @@ A copy is never wrong, only slow, and nothing warns you of it. Keep the old arra
 - `let b = fill(a, 0)` followed by a read of `a` copies `a` once, at the first `set`, since `a` is still needed. That is right when you want both.
 - `a.set(i, x).set(j, a.at(k))` copies at the first `set`: the second call reads `a` after it. Read first: `let y = a.at(k)`, then `a.set(i, x).set(j, y)`.
 - In a loop, an argument that reads the array beside the one that changes it, as `loop(a.set(i, x), a.length)`, makes every step copy. Read `a.length` inside the loop instead.
+- In a `match` on something read from the array, as `match a.at(i)`, no arm changes the array in place: the names the `match` binds still point into it.
+
+A record with a field of type `ARRAY` gives up its array in the same cases. `HEAP.push` is written `{ slots = HEAP_ORDER.push(Current.slots, Current.n, x), n = Current.n + 1 }`, and a loop `fill(h.push(x), n - 1)` changes the array in place from its second iteration. The routine must return its own type, and must build the record as its result, reading the field once and `Current` only through its fields.
+
+### Sets, Queues and Heaps: `SET`, `QUEUE` and `HEAP`
+
+| Routine | Gives |
+| :--- | :--- |
+| `SET.empty`, `s.add(k)`, `s.remove(k)` | A set of `ORD` keys |
+| `s.has(k)`, `s.size`, `s.items` | Whether `k` is there, how many keys, and the keys in ascending order |
+| `s.union(t)`, `s.intersection(t)` | The keys of either, and of both |
+| `QUEUE.empty`, `q.push(x)`, `q.pop` | A queue, with `x` last, and without its oldest item |
+| `q.peek`, `q.size`, `q.items` | The oldest item or `None`, how many, and the items, oldest first |
+| `HEAP.empty`, `h.push(x)`, `h.pop_min` | A heap of `ORD` items, with `x`, and without one of its least items |
+| `h.peek`, `h.size` | The least item or `None`, and how many |
+
+A `SET` is proven through laws on `has`, as `MAP` is on `get`: `has_add_same`, `has_add_other`, `has_remove_same`, `has_remove_other`, `has_union` and `has_intersection`. `size_add_new`, `size_add_at_most`, `size_remove_absent` and `size_remove_at_most` count. `has`, `add` and `remove` take time linear in the size, and `union` and `intersection` the product of the two sizes.
+
+A `QUEUE`'s contracts say what each operation does to `items`: `push` appends, `pop` takes the tail, `peek` is the head. Every operation but `items` takes amortized constant time.
+
+A `HEAP` is proven through a ghost `count`: how many items are a given value. `count_push` adds one, `count_pop` takes away one of `h.peek.get`, and `peek_least` says that no item is below `peek`. `push` and `pop_min` need `agrees`:
+
+```eiffel
+  least(h: HEAP[NAT], x: NAT): BOOL
+    require
+      room: h.size < 1000
+    do
+      check
+        agrees: forall p: NAT. forall q: NAT. p.equals(q) = (p = q)
+      end
+      let g = h.push(x)
+      check
+        counted: g.count(x) > 0
+      end
+      not x.less_than(g.peek.get)
+    ensure
+      holds: Result
+    end
+```
+
+In C a heap is an array that `push` and `pop_min` change in place when the caller is done with the heap, in a logarithmic number of steps. A `push` on a full array makes one about twice as long.
+
+Limits:
+- `push` on a queue or a heap asks for room: `size < 18446744073709551615`.
+- `HEAP` needs `agrees`, which does not hold for `STRING`, so there is no heap of strings.
+- A proof about a fold or a count that uses `+%` can be slow: the solver reasons about wrapping addition bit by bit.
 
 ### Endless Sequences: `GENERATOR` and `UNFOLD`
 

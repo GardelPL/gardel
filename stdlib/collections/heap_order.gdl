@@ -1,0 +1,793 @@
+-- A binary heap kept in the first `n` items of an array, and the two ways `HEAP` changes it
+-- (Task H.4).
+--
+-- The parent of the item at `j > 0` is at `(j - 1) / 2`, so the children of `i` are at
+-- `2i + 1` and `2i + 2`. `ordered(a, n)` says that no item is below its parent. `push` puts an
+-- item last and moves it up while it is below its parent. `pop` puts the last item first and
+-- moves it down while a child is below it.
+--
+-- The facts need `agrees`: that `equals` is `=`. Then "not below" is transitive (`chain`). With
+-- another `equals`, a key may be equal to two keys of which one is below the other.
+--
+-- Each predicate is a recursive routine, not a `forall`: a `forall` over an item and its
+-- parent gives the solver the parent's parent, and so on.
+module HEAP_ORDER[K: ORD]
+
+specify {ANY}
+
+  -- How many of the first `n` items of `a` are `y` itself.
+  count_upto(a: ARRAY[K], n: NAT, y: K): NAT
+    require
+      inside: n <= a.length
+    variant
+      n
+    do
+      if n = 0 then
+        0
+      else if a.at(n - 1) = y then
+        HEAP_ORDER.count_upto(a, n - 1, y) + 1
+      else
+        HEAP_ORDER.count_upto(a, n - 1, y)
+      end end
+    ensure
+      at_most: Result <= n
+    end
+
+create {ANY}
+
+  -- The item at `j` is not below its parent.
+  edge(a: ARRAY[K], j: NAT): BOOL
+    require
+      inside: j < a.length
+    do
+      if j = 0 then True else not a.at(j).less_than(a.at((j - 1) / 2)) end
+    ensure
+      def: Result = (if j = 0 then True else not a.at(j).less_than(a.at((j - 1) / 2)) end)
+    end
+
+  -- None of the first `n` items is below its parent.
+  ordered(a: ARRAY[K], n: NAT): BOOL
+    require
+      inside: n <= a.length
+    variant
+      n
+    do
+      if n = 0 then True else HEAP_ORDER.edge(a, n - 1) and HEAP_ORDER.ordered(a, n - 1) end
+    end
+
+  -- The first `n` items of `a`, with room for one more.
+  grown(a: ARRAY[K], n: NAT, x: K): ARRAY[K]
+    require
+      inside: n <= a.length
+      room: n < 18446744073709551615
+    do
+      if n < a.length then
+        a
+      else
+        let extra = if n <= 9223372036854775807 then n + 1 else 18446744073709551615 - n end
+        ARRAY.from_list(a.to_list.append(ARRAY.make(extra, x).to_list))
+      end
+    ensure
+      longer: n < Result.length
+    end
+
+  -- The first `n` items of `a` and `x`, as a heap when they were one.
+  push(a: ARRAY[K], n: NAT, x: K): ARRAY[K]
+    require
+      inside: n <= a.length
+      room: n < 18446744073709551615
+    do
+      let g = HEAP_ORDER.grown(a, n, x)
+      HEAP_ORDER.sift_up(g.set(n, x), n + 1, n)
+    ensure
+      longer: n < Result.length
+    end
+
+  -- The first `n` items of `a` without the first, as a heap when they were one.
+  pop(a: ARRAY[K], n: NAT): ARRAY[K]
+    require
+      inside: n <= a.length
+      not_empty: n > 0
+    do
+      if n = 1 then
+        a
+      else
+        let last = a.at(n - 1)
+        HEAP_ORDER.sift_down(a.set(0, last), n - 1, 0)
+      end
+    ensure
+      same_length: Result.length = a.length
+    end
+
+  -- Moves the item at `i` up while it is below its parent.
+  sift_up(a: ARRAY[K], n: NAT, i: NAT): ARRAY[K]
+    require
+      inside: n <= a.length
+      among: i < n
+    variant
+      i
+    do
+      if i = 0 then
+        a
+      else
+        let p = (i - 1) / 2
+        let xi = a.at(i)
+        let xp = a.at(p)
+        if xi.less_than(xp) then
+          HEAP_ORDER.sift_up(a.set(i, xp).set(p, xi), n, p)
+        else
+          a
+        end
+      end
+    ensure
+      same_length: Result.length = a.length
+    end
+
+  -- Moves the item at `i` down while a child is below it, in the lesser child's place.
+  sift_down(a: ARRAY[K], n: NAT, i: NAT): ARRAY[K]
+    require
+      inside: n <= a.length
+      among: i < n
+    variant
+      n - i
+    do
+      if i >= n / 2 then
+        a
+      else
+        let c = HEAP_ORDER.lesser(a, n, i)
+        let xi = a.at(i)
+        let xc = a.at(c)
+        if xc.less_than(xi) then
+          HEAP_ORDER.sift_down(a.set(i, xc).set(c, xi), n, c)
+        else
+          a
+        end
+      end
+    ensure
+      same_length: Result.length = a.length
+    end
+
+  -- The child of `i` that the other is not below.
+  lesser(a: ARRAY[K], n: NAT, i: NAT): NAT
+    require
+      inside: n <= a.length
+      parent: i < n / 2
+    do
+      if 2 * i + 2 < n then
+        if a.at(2 * i + 2).less_than(a.at(2 * i + 1)) then 2 * i + 2 else 2 * i + 1 end
+      else
+        2 * i + 1
+      end
+    ensure
+      child: Result = 2 * i + 1 or Result = 2 * i + 2
+      among: i < Result and Result < n
+      left: not a.at(2 * i + 1).less_than(a.at(Result))
+      right: 2 * i + 2 < n implies not a.at(2 * i + 2).less_than(a.at(Result))
+    end
+
+  -- Lemmas.
+
+  -- "Not below" is transitive.
+  chain(x: K, y: K, z: K): BOOL
+    require
+      xy: not x.less_than(y)
+      yz: not y.less_than(z)
+      agrees: forall p: K. forall q: K. p.equals(q) = (p = q)
+    do
+      check
+        first: y.less_than(x) or y = x
+        second: z.less_than(y) or z = y
+      end
+      True
+    ensure
+      holds: Result
+      xz: not x.less_than(z)
+    end
+
+  edge_of(a: ARRAY[K], n: NAT, j: NAT): BOOL
+    require
+      inside: n <= a.length
+      among: j < n
+      heap: HEAP_ORDER.ordered(a, n)
+    variant
+      n
+    do
+      if n - 1 = j then True else HEAP_ORDER.edge_of(a, n - 1, j) end
+    ensure
+      holds: Result
+      edge: HEAP_ORDER.edge(a, j)
+    end
+
+  -- No item of a heap is below its first.
+  root_least(a: ARRAY[K], n: NAT, j: NAT): BOOL
+    require
+      inside: n <= a.length
+      among: j < n
+      heap: HEAP_ORDER.ordered(a, n)
+      agrees: forall p: K. forall q: K. p.equals(q) = (p = q)
+    variant
+      j
+    do
+      if j = 0 then
+        True
+      else
+        check
+          edge: HEAP_ORDER.edge_of(a, n, j)
+          parent: HEAP_ORDER.root_least(a, n, (j - 1) / 2)
+          chain: HEAP_ORDER.chain(a.at(j), a.at((j - 1) / 2), a.at(0))
+        end
+        True
+      end
+    ensure
+      holds: Result
+      least: not a.at(j).less_than(a.at(0))
+    end
+
+  -- No item counted among the first `m` of a heap is below its first.
+  least_counted(a: ARRAY[K], n: NAT, m: NAT, y: K): BOOL
+    require
+      inside: n <= a.length
+      within: m <= n
+      heap: HEAP_ORDER.ordered(a, n)
+      agrees: forall p: K. forall q: K. p.equals(q) = (p = q)
+    variant
+      m
+    do
+      if m = 0 then
+        True
+      else if a.at(m - 1).equals(y) then
+        HEAP_ORDER.root_least(a, n, m - 1)
+      else
+        HEAP_ORDER.least_counted(a, n, m - 1, y)
+      end end
+    ensure
+      holds: Result
+      least: HEAP_ORDER.count_upto(a, m, y) > 0 implies not y.less_than(a.at(0))
+    end
+
+  -- The item at `j` is counted.
+  count_has(a: ARRAY[K], n: NAT, j: NAT): BOOL
+    require
+      inside: n <= a.length
+      among: j < n
+    variant
+      n
+    do
+      if n - 1 = j then True else HEAP_ORDER.count_has(a, n - 1, j) end
+    ensure
+      holds: Result
+      counted: HEAP_ORDER.count_upto(a, n, a.at(j)) > 0
+    end
+
+  push_ordered(a: ARRAY[K], n: NAT, x: K): BOOL
+    require
+      inside: n <= a.length
+      room: n < 18446744073709551615
+      heap: HEAP_ORDER.ordered(a, n)
+      agrees: forall p: K. forall q: K. p.equals(q) = (p = q)
+    do
+      let g = HEAP_ORDER.grown(a, n, x)
+      check
+        grown: HEAP_ORDER.grown_ordered(a, n, x, n)
+        start: HEAP_ORDER.push_start(g, n, x, n + 1)
+      end
+      HEAP_ORDER.up_ordered(g.set(n, x), n + 1, n)
+    ensure
+      holds: Result
+      heap: HEAP_ORDER.ordered(HEAP_ORDER.push(a, n, x), n + 1)
+    end
+
+  pop_ordered(a: ARRAY[K], n: NAT): BOOL
+    require
+      inside: n <= a.length
+      not_empty: n > 0
+      heap: HEAP_ORDER.ordered(a, n)
+      agrees: forall p: K. forall q: K. p.equals(q) = (p = q)
+    do
+      if n = 1 then
+        True
+      else
+        check
+          start: HEAP_ORDER.pop_start(a, n, a.at(n - 1), n - 1)
+        end
+        HEAP_ORDER.down_ordered(a.set(0, a.at(n - 1)), n - 1, 0)
+      end
+    ensure
+      holds: Result
+      heap: HEAP_ORDER.ordered(HEAP_ORDER.pop(a, n), n - 1)
+    end
+
+  -- `push` adds `x` to the count.
+  push_count(a: ARRAY[K], n: NAT, x: K, y: K): BOOL
+    require
+      inside: n <= a.length
+      room: n < 18446744073709551615
+    do
+      let g = HEAP_ORDER.grown(a, n, x)
+      check
+        grown: HEAP_ORDER.grown_count(a, n, x, n, y)
+        below: HEAP_ORDER.count_below(g, n, n, x, y)
+        last: g.set(n, x).at(n) = x
+        moved: HEAP_ORDER.up_count(g.set(n, x), n + 1, n, y)
+      end
+      True
+    ensure
+      holds: Result
+      counts: HEAP_ORDER.count_upto(HEAP_ORDER.push(a, n, x), n + 1, y) = HEAP_ORDER.count_upto(a, n, y) + (if x = y then 1 else 0 end)
+    end
+
+  -- `pop` takes the first item from the count.
+  pop_count(a: ARRAY[K], n: NAT, y: K): BOOL
+    require
+      inside: n <= a.length
+      not_empty: n > 0
+    do
+      if n = 1 then
+        True
+      else
+        check
+          traded: HEAP_ORDER.count_set(a, n - 1, 0, a.at(n - 1), y)
+          moved: HEAP_ORDER.down_count(a.set(0, a.at(n - 1)), n - 1, 0, y)
+        end
+        True
+      end
+    ensure
+      holds: Result
+      counts: HEAP_ORDER.count_upto(a, n, y) = HEAP_ORDER.count_upto(HEAP_ORDER.pop(a, n), n - 1, y) + (if a.at(0) = y then 1 else 0 end)
+    end
+
+create {NONE}
+
+  -- The states of the two moves, at one item and for the first `m`.
+
+  -- Moving up from `i`: no item but the one at `i` is below its parent, and the children of
+  -- `i` are not below its parent either.
+  up_at(a: ARRAY[K], i: NAT, j: NAT): BOOL
+    require
+      i_inside: i < a.length
+      j_inside: j < a.length
+    do
+      (j = i or HEAP_ORDER.edge(a, j)) and
+        (if 0 < i and 0 < j then (j - 1) / 2 != i or not a.at(j).less_than(a.at((i - 1) / 2)) else True end)
+    ensure
+      def: Result = ((j = i or HEAP_ORDER.edge(a, j)) and
+        (if 0 < i and 0 < j then (j - 1) / 2 != i or not a.at(j).less_than(a.at((i - 1) / 2)) else True end))
+    end
+
+  up_to(a: ARRAY[K], m: NAT, i: NAT): BOOL
+    require
+      m_inside: m <= a.length
+      i_inside: i < a.length
+    variant
+      m
+    do
+      if m = 0 then True else HEAP_ORDER.up_at(a, i, m - 1) and HEAP_ORDER.up_to(a, m - 1, i) end
+    end
+
+  -- Moving down from `i`: no item but a child of `i` is below its parent, and the children of
+  -- `i` are not below its parent.
+  down_at(a: ARRAY[K], i: NAT, j: NAT): BOOL
+    require
+      i_inside: i < a.length
+      j_inside: j < a.length
+    do
+      if j = 0 then
+        True
+      else if (j - 1) / 2 = i then
+        if i = 0 then True else not a.at(j).less_than(a.at((i - 1) / 2)) end
+      else
+        HEAP_ORDER.edge(a, j)
+      end end
+    ensure
+      def: Result = (if j = 0 then True else if (j - 1) / 2 = i then (if i = 0 then True else not a.at(j).less_than(a.at((i - 1) / 2)) end) else HEAP_ORDER.edge(a, j) end end)
+    end
+
+  down_to(a: ARRAY[K], m: NAT, i: NAT): BOOL
+    require
+      m_inside: m <= a.length
+      i_inside: i < a.length
+    variant
+      m
+    do
+      if m = 0 then True else HEAP_ORDER.down_at(a, i, m - 1) and HEAP_ORDER.down_to(a, m - 1, i) end
+    end
+
+  up_has(a: ARRAY[K], m: NAT, i: NAT, j: NAT): BOOL
+    require
+      m_inside: m <= a.length
+      i_inside: i < a.length
+      among: j < m
+      state: HEAP_ORDER.up_to(a, m, i)
+    variant
+      m
+    do
+      if m - 1 = j then True else HEAP_ORDER.up_has(a, m - 1, i, j) end
+    ensure
+      holds: Result
+      at: HEAP_ORDER.up_at(a, i, j)
+    end
+
+  down_has(a: ARRAY[K], m: NAT, i: NAT, j: NAT): BOOL
+    require
+      m_inside: m <= a.length
+      i_inside: i < a.length
+      among: j < m
+      state: HEAP_ORDER.down_to(a, m, i)
+    variant
+      m
+    do
+      if m - 1 = j then True else HEAP_ORDER.down_has(a, m - 1, i, j) end
+    ensure
+      holds: Result
+      at: HEAP_ORDER.down_at(a, i, j)
+    end
+
+  -- A step up: the state moves to the parent.
+  up_moves(a: ARRAY[K], n: NAT, i: NAT, m: NAT): BOOL
+    require
+      inside: n <= a.length
+      among: 0 < i and i < n
+      within: m <= n
+      state: HEAP_ORDER.up_to(a, n, i)
+      below: a.at(i).less_than(a.at((i - 1) / 2))
+      agrees: forall p: K. forall q: K. p.equals(q) = (p = q)
+    variant
+      m
+    do
+      if m = 0 then
+        True
+      else
+        let j = m - 1
+        let p = (i - 1) / 2
+        check
+          here: HEAP_ORDER.up_has(a, n, i, j)
+          parent: HEAP_ORDER.up_has(a, n, i, p)
+          rest: HEAP_ORDER.up_moves(a, n, i, m - 1)
+          sibling: if j > 0 and p > 0 and j != i and (j - 1) / 2 = p then HEAP_ORDER.chain(a.at(j), a.at(p), a.at((p - 1) / 2)) else True end
+        end
+        True
+      end
+    ensure
+      holds: Result
+      moved: HEAP_ORDER.up_to(a.set(i, a.at((i - 1) / 2)).set((i - 1) / 2, a.at(i)), m, (i - 1) / 2)
+    end
+
+  -- The end of a move up.
+  up_done(a: ARRAY[K], n: NAT, i: NAT, m: NAT): BOOL
+    require
+      inside: n <= a.length
+      among: i < n
+      within: m <= n
+      state: HEAP_ORDER.up_to(a, n, i)
+      edge: HEAP_ORDER.edge(a, i)
+    variant
+      m
+    do
+      if m = 0 then
+        True
+      else
+        check
+          here: HEAP_ORDER.up_has(a, n, i, m - 1)
+          rest: HEAP_ORDER.up_done(a, n, i, m - 1)
+        end
+        True
+      end
+    ensure
+      holds: Result
+      heap: HEAP_ORDER.ordered(a, m)
+    end
+
+  up_ordered(a: ARRAY[K], n: NAT, i: NAT): BOOL
+    require
+      inside: n <= a.length
+      among: i < n
+      state: HEAP_ORDER.up_to(a, n, i)
+      agrees: forall p: K. forall q: K. p.equals(q) = (p = q)
+    variant
+      i
+    do
+      if i = 0 then
+        HEAP_ORDER.up_done(a, n, i, n)
+      else if a.at(i).less_than(a.at((i - 1) / 2)) then
+        check
+          moved: HEAP_ORDER.up_moves(a, n, i, n)
+        end
+        HEAP_ORDER.up_ordered(a.set(i, a.at((i - 1) / 2)).set((i - 1) / 2, a.at(i)), n, (i - 1) / 2)
+      else
+        HEAP_ORDER.up_done(a, n, i, n)
+      end end
+    ensure
+      holds: Result
+      heap: HEAP_ORDER.ordered(HEAP_ORDER.sift_up(a, n, i), n)
+    end
+
+  -- A step down: the state moves to the lesser child.
+  down_moves(a: ARRAY[K], n: NAT, i: NAT, m: NAT): BOOL
+    require
+      inside: n <= a.length
+      parent: i < n / 2
+      within: m <= n
+      state: HEAP_ORDER.down_to(a, n, i)
+      below: a.at(HEAP_ORDER.lesser(a, n, i)).less_than(a.at(i))
+    variant
+      m
+    do
+      if m = 0 then
+        True
+      else
+        let j = m - 1
+        let c = HEAP_ORDER.lesser(a, n, i)
+        check
+          here: HEAP_ORDER.down_has(a, n, i, j)
+          child: HEAP_ORDER.down_has(a, n, i, c)
+          rest: HEAP_ORDER.down_moves(a, n, i, m - 1)
+        end
+        True
+      end
+    ensure
+      holds: Result
+      moved: HEAP_ORDER.down_to(a.set(i, a.at(HEAP_ORDER.lesser(a, n, i))).set(HEAP_ORDER.lesser(a, n, i), a.at(i)), m, HEAP_ORDER.lesser(a, n, i))
+    end
+
+  -- The end of a move down: at a leaf, or where the lesser child is not below.
+  down_done(a: ARRAY[K], n: NAT, i: NAT, m: NAT): BOOL
+    require
+      inside: n <= a.length
+      among: i < n
+      within: m <= n
+      state: HEAP_ORDER.down_to(a, n, i)
+      stop: i >= n / 2 or not a.at(HEAP_ORDER.lesser(a, n, i)).less_than(a.at(i))
+      agrees: forall p: K. forall q: K. p.equals(q) = (p = q)
+    variant
+      m
+    do
+      if m = 0 then
+        True
+      else
+        let j = m - 1
+        check
+          here: HEAP_ORDER.down_has(a, n, i, j)
+          rest: HEAP_ORDER.down_done(a, n, i, m - 1)
+          child: if j > 0 and (j - 1) / 2 = i then HEAP_ORDER.chain(a.at(j), a.at(HEAP_ORDER.lesser(a, n, i)), a.at(i)) else True end
+        end
+        True
+      end
+    ensure
+      holds: Result
+      heap: HEAP_ORDER.ordered(a, m)
+    end
+
+  down_ordered(a: ARRAY[K], n: NAT, i: NAT): BOOL
+    require
+      inside: n <= a.length
+      among: i < n
+      state: HEAP_ORDER.down_to(a, n, i)
+      agrees: forall p: K. forall q: K. p.equals(q) = (p = q)
+    variant
+      n - i
+    do
+      if i >= n / 2 then
+        HEAP_ORDER.down_done(a, n, i, n)
+      else
+        let c = HEAP_ORDER.lesser(a, n, i)
+        if a.at(c).less_than(a.at(i)) then
+          check
+            moved: HEAP_ORDER.down_moves(a, n, i, n)
+          end
+          HEAP_ORDER.down_ordered(a.set(i, a.at(c)).set(c, a.at(i)), n, c)
+        else
+          HEAP_ORDER.down_done(a, n, i, n)
+        end
+      end
+    ensure
+      holds: Result
+      heap: HEAP_ORDER.ordered(HEAP_ORDER.sift_down(a, n, i), n)
+    end
+
+  -- The starts of the two moves.
+
+  grown_at(a: ARRAY[K], n: NAT, x: K, j: NAT): BOOL
+    require
+      inside: n <= a.length
+      room: n < 18446744073709551615
+      among: j < n
+    do
+      True
+    ensure
+      holds: Result
+      same: HEAP_ORDER.grown(a, n, x).at(j) = a.at(j)
+    end
+
+  grown_ordered(a: ARRAY[K], n: NAT, x: K, m: NAT): BOOL
+    require
+      inside: n <= a.length
+      room: n < 18446744073709551615
+      within: m <= n
+      heap: HEAP_ORDER.ordered(a, n)
+    variant
+      m
+    do
+      if m = 0 then
+        True
+      else
+        check
+          edge: HEAP_ORDER.edge_of(a, n, m - 1)
+          item: HEAP_ORDER.grown_at(a, n, x, m - 1)
+          parent: if m > 1 then HEAP_ORDER.grown_at(a, n, x, (m - 2) / 2) else True end
+          rest: HEAP_ORDER.grown_ordered(a, n, x, m - 1)
+        end
+        True
+      end
+    ensure
+      holds: Result
+      heap: HEAP_ORDER.ordered(HEAP_ORDER.grown(a, n, x), m)
+    end
+
+  push_start(a: ARRAY[K], n: NAT, x: K, m: NAT): BOOL
+    require
+      inside: n < a.length
+      within: m <= n + 1
+      heap: HEAP_ORDER.ordered(a, n)
+    variant
+      m
+    do
+      if m = 0 then
+        True
+      else
+        check
+          edge: if m - 1 < n then HEAP_ORDER.edge_of(a, n, m - 1) else True end
+          rest: HEAP_ORDER.push_start(a, n, x, m - 1)
+        end
+        True
+      end
+    ensure
+      holds: Result
+      state: HEAP_ORDER.up_to(a.set(n, x), m, n)
+    end
+
+  pop_start(a: ARRAY[K], n: NAT, x: K, m: NAT): BOOL
+    require
+      inside: n <= a.length
+      more: n > 1
+      within: m <= n - 1
+      heap: HEAP_ORDER.ordered(a, n)
+    variant
+      m
+    do
+      if m = 0 then
+        True
+      else
+        check
+          edge: HEAP_ORDER.edge_of(a, n, m - 1)
+          rest: HEAP_ORDER.pop_start(a, n, x, m - 1)
+        end
+        True
+      end
+    ensure
+      holds: Result
+      state: HEAP_ORDER.down_to(a.set(0, x), m, 0)
+    end
+
+  -- What the moves do to a count.
+
+  -- A change at `i` leaves the count of the items before `i`.
+  count_below(a: ARRAY[K], m: NAT, i: NAT, x: K, y: K): BOOL
+    require
+      before: m <= i
+      inside: i < a.length
+    variant
+      m
+    do
+      if m = 0 then True else HEAP_ORDER.count_below(a, m - 1, i, x, y) end
+    ensure
+      holds: Result
+      same: HEAP_ORDER.count_upto(a.set(i, x), m, y) = HEAP_ORDER.count_upto(a, m, y)
+    end
+
+  -- A change at `i` among the first `n` trades one item for another.
+  count_set(a: ARRAY[K], n: NAT, i: NAT, x: K, y: K): BOOL
+    require
+      among: i < n
+      inside: n <= a.length
+    variant
+      n
+    do
+      if n - 1 = i then
+        HEAP_ORDER.count_below(a, i, i, x, y)
+      else
+        HEAP_ORDER.count_set(a, n - 1, i, x, y)
+      end
+    ensure
+      holds: Result
+      traded: HEAP_ORDER.count_upto(a.set(i, x), n, y) + (if a.at(i) = y then 1 else 0 end) = HEAP_ORDER.count_upto(a, n, y) + (if x = y then 1 else 0 end)
+    end
+
+  -- Exchanging two items keeps the count.
+  count_swap(a: ARRAY[K], n: NAT, i: NAT, j: NAT, y: K): BOOL
+    require
+      i_among: i < n
+      j_among: j < n
+      other: i != j
+      inside: n <= a.length
+    do
+      check
+        first: HEAP_ORDER.count_set(a, n, i, a.at(j), y)
+        second: HEAP_ORDER.count_set(a.set(i, a.at(j)), n, j, a.at(i), y)
+        kept: a.set(i, a.at(j)).at(j) = a.at(j)
+      end
+      True
+    ensure
+      holds: Result
+      same: HEAP_ORDER.count_upto(a.set(i, a.at(j)).set(j, a.at(i)), n, y) = HEAP_ORDER.count_upto(a, n, y)
+    end
+
+  up_count(a: ARRAY[K], n: NAT, i: NAT, y: K): BOOL
+    require
+      inside: n <= a.length
+      among: i < n
+    variant
+      i
+    do
+      if i = 0 then
+        True
+      else if a.at(i).less_than(a.at((i - 1) / 2)) then
+        check
+          swap: HEAP_ORDER.count_swap(a, n, i, (i - 1) / 2, y)
+        end
+        HEAP_ORDER.up_count(a.set(i, a.at((i - 1) / 2)).set((i - 1) / 2, a.at(i)), n, (i - 1) / 2, y)
+      else
+        True
+      end end
+    ensure
+      holds: Result
+      same: HEAP_ORDER.count_upto(HEAP_ORDER.sift_up(a, n, i), n, y) = HEAP_ORDER.count_upto(a, n, y)
+    end
+
+  down_count(a: ARRAY[K], n: NAT, i: NAT, y: K): BOOL
+    require
+      inside: n <= a.length
+      among: i < n
+    variant
+      n - i
+    do
+      if i >= n / 2 then
+        True
+      else
+        let c = HEAP_ORDER.lesser(a, n, i)
+        if a.at(c).less_than(a.at(i)) then
+          check
+            swap: HEAP_ORDER.count_swap(a, n, i, c, y)
+          end
+          HEAP_ORDER.down_count(a.set(i, a.at(c)).set(c, a.at(i)), n, c, y)
+        else
+          True
+        end
+      end
+    ensure
+      holds: Result
+      same: HEAP_ORDER.count_upto(HEAP_ORDER.sift_down(a, n, i), n, y) = HEAP_ORDER.count_upto(a, n, y)
+    end
+
+  grown_count(a: ARRAY[K], n: NAT, x: K, m: NAT, y: K): BOOL
+    require
+      inside: n <= a.length
+      room: n < 18446744073709551615
+      within: m <= n
+    variant
+      m
+    do
+      if m = 0 then
+        True
+      else
+        check
+          item: HEAP_ORDER.grown_at(a, n, x, m - 1)
+          rest: HEAP_ORDER.grown_count(a, n, x, m - 1, y)
+        end
+        True
+      end
+    ensure
+      holds: Result
+      same: HEAP_ORDER.count_upto(HEAP_ORDER.grown(a, n, x), m, y) = HEAP_ORDER.count_upto(a, m, y)
+    end
+
+end

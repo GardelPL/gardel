@@ -94,6 +94,64 @@ fn array_chain(e: &Expr) -> Option<(&str, Vec<&Expr>)> {
     }
 }
 
+/// The variable a chain of method calls starts from (`h.pop_min.push(x)` starts from `h`),
+/// when no argument of any call reads it (Task H.4).
+fn call_chain(e: &Expr) -> Option<&str> {
+    let mut args = Vec::new();
+    let mut cur = e;
+    loop {
+        match cur {
+            Expr::MethodCall(recv, _, xs) => {
+                args.extend(xs.iter());
+                if let Expr::Var(v) = &**recv {
+                    return (!args.iter().any(|a| mentions(a, v))).then_some(v.as_str());
+                }
+                cur = recv;
+            }
+            _ => return None,
+        }
+    }
+}
+
+/// Adds to `out` each field of `Current` that `e` reads. False when `e` may read `Current`
+/// in another way: whole, or through a routine that takes it. Only plain calls and
+/// operators are looked into (Task H.4).
+fn field_reads(e: &Expr, fields: &[String], owner: &str, cx: &Ctx, out: &mut Vec<String>) -> bool {
+    match e {
+        Expr::Int(_) | Expr::Float(_) | Expr::Char(_) | Expr::Unit | Expr::Bool(_) | Expr::Str(_) => true,
+        Expr::Var(v) if cx.local(v).is_some() => true,
+        Expr::Var(v) if fields.contains(v) => {
+            out.push(v.clone());
+            true
+        }
+        // A constructor: routines start in lower case, and may read `Current` themselves.
+        Expr::Var(v) if v.chars().next().is_some_and(|c| c.is_ascii_uppercase()) && v != "Current" => true,
+        Expr::Call(f, args) if f.chars().next().is_some_and(|c| c.is_ascii_uppercase()) => {
+            args.iter().all(|a| field_reads(a, fields, owner, cx, out))
+        }
+        Expr::UnaryNot(x) | Expr::UnaryNeg(x) => field_reads(x, fields, owner, cx, out),
+        Expr::BinOp(_, l, r) => field_reads(l, fields, owner, cx, out) && field_reads(r, fields, owner, cx, out),
+        Expr::MethodCall(recv, m, args) => {
+            let head = match &**recv {
+                Expr::Var(v) if v == "Current" => {
+                    if !args.is_empty() || !fields.contains(m) {
+                        return false;
+                    }
+                    out.push(m.clone());
+                    true
+                }
+                // `M.routine(..)` inside `M` may pass `Current`.
+                Expr::Var(v) if cx.local(v).is_none() && !fields.contains(v) => {
+                    v != owner && v.chars().next().is_some_and(|c| c.is_ascii_uppercase())
+                }
+                x => field_reads(x, fields, owner, cx, out),
+            };
+            head && args.iter().all(|a| field_reads(a, fields, owner, cx, out))
+        }
+        _ => false,
+    }
+}
+
 /// Whether `v` occurs free in `e`.
 fn mentions(e: &Expr, v: &str) -> bool {
     let mut free = Vec::new();
@@ -294,6 +352,11 @@ struct Ctx {
     /// Like `moves`, the array parameters nothing evaluated after the next expression reads.
     /// A loop owns them from its second iteration, so a `set` may take them then.
     param_moves: Vec<String>,
+    /// The routine owns `Current`, which holds an array, so its result may take the array
+    /// out of it (Task H.4).
+    owns_current: bool,
+    /// The fields of `Current` that the record being built takes.
+    steals: Vec<String>,
 }
 
 impl Ctx {
@@ -1398,6 +1461,22 @@ static struct {inst}* {inst}__slice(struct {inst}* a, uint64_t lo, uint64_t hi) 
         cname
     }
 
+    /// Whether a value of `ty` is a record with a field that is an array, as a `HEAP` is. A
+    /// routine that owns such a value may take the array out of it (Task H.4).
+    fn holds_array(&self, ty: &str) -> bool {
+        self.variant_fields(ty, None).is_some_and(|fs| fs.iter().any(|(_, t)| type_head(t) == "ARRAY"))
+    }
+
+    /// Whether `m` on a value of `ty` gives a value of `ty` back, as `push` does: the caller
+    /// may then give up its own.
+    fn gives_back(&self, ty: &str, m: &str) -> bool {
+        let Some(md) = self.module(type_head(ty)) else { return false };
+        Self::find_routine(md, m).is_some_and(|(rd, kind)| {
+            let ret = rd.ret_type.trim();
+            Self::has_current(md, kind) && (ret == "Current" || type_head(ret) == md.name)
+        })
+    }
+
     /// A routine whose body ends by storing a parameter in a new value, as `concat` does.
     /// The usual convention makes such a routine copy that parameter and its caller
     /// release it, so a caller finished with the value gives it to a variant instead.
@@ -1433,7 +1512,10 @@ static struct {inst}* {inst}__slice(struct {inst}* a, uint64_t lo, uint64_t hi) 
         let cret = self.ctype(&ret)?;
         // A routine that owns its parameters and is a loop (Task H.5) is lowered again as a
         // loop that owns them from its first iteration.
-        let mut owns_loop = false;
+        // So is one that branches: an array may be taken in one branch and not in another,
+        // which only a parameter that is released if it still holds something allows.
+        let branches = matches!(&rd.body, Expr::If(..) | Expr::Match(..));
+        let mut owns_loop = req.sink && branches && !Self::is_sink(md, rd);
         let (cx, params, body) = loop {
             let mut cx = Ctx {
                 owner: md.name.clone(),
@@ -1451,6 +1533,8 @@ static struct {inst}* {inst}__slice(struct {inst}* a, uint64_t lo, uint64_t hi) 
                 params: Vec::new(),
                 gives: Vec::new(),
                 param_moves: Vec::new(),
+                owns_current: false,
+                steals: Vec::new(),
             };
             self.tail_used = false;
             self.nontail_self = false;
@@ -1471,8 +1555,9 @@ static struct {inst}* {inst}__slice(struct {inst}* a, uint64_t lo, uint64_t hi) 
             if req.sink && !owns_loop {
                 cx.sink_params = cx.params.clone();
             } else {
-                cx.param_moves = cx.params.iter().filter(|(c, t)| c != "Current" && type_head(t) == "ARRAY").map(|(c, _)| c.clone()).collect();
+                cx.param_moves = cx.params.iter().filter(|(c, t)| c != "Current" && (type_head(t) == "ARRAY" || self.holds_array(t))).map(|(c, _)| c.clone()).collect();
             }
+            cx.owns_current = req.sink && has_cur && self.holds_array(&self_ty);
             self.owned_flag = false;
             let body = self.lower_block(&mut cx, &rd.stmts, &rd.body, Some(&ret), has_cur)?;
             let body = self.own(body)?;
@@ -1494,6 +1579,9 @@ static struct {inst}* {inst}__slice(struct {inst}* a, uint64_t lo, uint64_t hi) 
             // owned from the first in a routine that owns its parameters.
             let drops = self.param_drops(&cx)?;
             format!("    bool _owned = {owns_loop};\n_tail:;\n    {cret} _res = {body};\n    if (_owned) {{\n{drops}}}\n    return _res;\n")
+        } else if owns_loop {
+            let drops = self.param_drops(&cx)?;
+            format!("    bool _owned = true;\n    {cret} _res = {body};\n    if (_owned) {{\n{drops}}}\n    return _res;\n")
         } else if self.owned_flag {
             // A `set` gave a parameter on the condition that the routine owns it: it does not.
             format!("    const bool _owned = false;\n    return {body};\n")
@@ -2024,6 +2112,25 @@ static struct {inst}* {inst}__slice(struct {inst}* a, uint64_t lo, uint64_t hi) 
                 cx.gives.push((l.cname.clone(), give.to_string()));
             }
         }
+        // So may a chain of calls on a record that holds an array, as `fill(h.push(x), i + 1)`
+        // (Task H.4).
+        for (k, a) in args.iter().enumerate() {
+            let Some(v) = call_chain(a) else { continue };
+            let Some(l) = cx.local(v) else { continue };
+            let give = if moves.contains(&l.cname) {
+                "true"
+            } else if param_moves.contains(&l.cname) {
+                "_owned"
+            } else {
+                continue;
+            };
+            let receiver = recv.as_ref().is_some_and(|rv| rv.code == l.cname);
+            let elsewhere = args.iter().enumerate().any(|(j, b)| j != k && mentions(b, v));
+            if plain_recv && !receiver && !elsewhere && self.holds_array(&l.ty) {
+                chain_gives.push(l.cname.clone());
+                cx.gives.push((l.cname.clone(), give.to_string()));
+            }
+        }
         let mut lowered: Vec<Option<V>> = vec![None; args.len()];
         for (i, ((_, pt), a)) in rd.params.iter().zip(args).enumerate() {
             let pt = subst(&fix_cur(pt), &map);
@@ -2119,7 +2226,9 @@ static struct {inst}* {inst}__slice(struct {inst}* a, uint64_t lo, uint64_t hi) 
         let ctor_sink = Self::is_sink(md, rd);
         let array_param = |t: &str| type_head(&cnorm(t)) == "ARRAY";
         let array_sink = rd.params.iter().any(|(_, t)| array_param(&subst(&fix_cur(t), &map)));
-        if (ctor_sink || array_sink) && (!takes_current || recv.is_some() || (hc && md.name == cx.owner)) {
+        // And one given a record that holds an array, to take the array out of it (Task H.4).
+        let holder_sink = takes_current && self.gives_back(&Self::self_type(md, &mod_targs), r) && self.holds_array(&Self::self_type(md, &mod_targs));
+        if (ctor_sink || array_sink || holder_sink) && (!takes_current || recv.is_some() || (hc && md.name == cx.owner)) {
             let self_ty = Self::self_type(md, &mod_targs);
             let mut vals = Vec::new();
             if takes_current {
@@ -2129,8 +2238,8 @@ static struct {inst}* {inst}__slice(struct {inst}* a, uint64_t lo, uint64_t hi) 
             // Worth it only when the caller has something to give: a value it would
             // otherwise release right after the call.
             let mut gives = false;
-            for v in &vals {
-                let counts = if ctor_sink { self.is_rc(&v.ty) } else { array_param(&v.ty) };
+            for (k, v) in vals.iter().enumerate() {
+                let counts = if ctor_sink { self.is_rc(&v.ty) } else { array_param(&v.ty) || (holder_sink && k == 0) };
                 gives |= counts && (v.owned || moves.contains(&v.code));
             }
             if gives {
@@ -2330,6 +2439,21 @@ static struct {inst}* {inst}__slice(struct {inst}* a, uint64_t lo, uint64_t hi) 
         }
     }
 
+    /// The array in field `f` of `Current`, which this routine owns: taken out when nothing
+    /// else holds `Current`, whose release then finds no array there (Task H.4).
+    fn steal_field(&mut self, cx: &Ctx, f: &str) -> Lowered {
+        let st = cx.self_ty.clone().ok_or("no `Current`")?;
+        let fs = self.variant_fields(&st, None).ok_or("`Current` has no fields")?;
+        let (_, ty) = fs.into_iter().find(|(n, _)| n == f).ok_or("unknown field")?;
+        let ct = self.ctype(&ty)?;
+        let d = self.dup(&ty, &format!("Current->{f}"))?;
+        let k = self.next();
+        Ok(owned(
+            format!("({{ {ct} _s{k}; if (atomic_load_explicit(&Current->_rc, memory_order_acquire) == 1) {{ _s{k} = Current->{f}; Current->{f} = NULL; }} else {{ _s{k} = {d}; }} _s{k}; }})"),
+            ty,
+        ))
+    }
+
     /// A component of `base` (`->field`, `.first`): borrowed from a borrowed base; from an
     /// owned base it is copied out (owned) before the base is released.
     fn project(&mut self, base: V, access: &str, ty: &str) -> Lowered {
@@ -2383,6 +2507,8 @@ static struct {inst}* {inst}__slice(struct {inst}* a, uint64_t lo, uint64_t hi) 
             params: Vec::new(),
             gives: Vec::new(),
             param_moves: Vec::new(),
+            owns_current: false,
+            steals: Vec::new(),
         };
         let mut prologue = String::new();
         let mut env_fields = String::new();
@@ -2486,9 +2612,18 @@ static struct {inst}* {inst}__slice(struct {inst}* a, uint64_t lo, uint64_t hi) 
 
     fn lower_match(&mut self, cx: &mut Ctx, scrut: &Expr, cases: &[MatchCase], expect: Option<&str>, hc: bool) -> Lowered {
         let tail = std::mem::take(&mut cx.tail);
-        let param_moves = std::mem::take(&mut cx.param_moves);
+        let mut param_moves = std::mem::take(&mut cx.param_moves);
         let depth = cx.tail_drops.len();
         let sv0 = self.lower(cx, scrut, None, hc)?;
+        // The binders of a borrowed scrutinee point into what it was read from, so no arm
+        // may take that: not a parameter it names, and no field of `Current` if it may
+        // read one.
+        let owns_current = cx.owns_current;
+        if !sv0.owned {
+            let held: Vec<String> = cx.locals.iter().filter(|l| mentions(scrut, &l.name)).map(|l| l.cname.clone()).collect();
+            param_moves.retain(|c| !held.contains(c));
+            cx.owns_current = false;
+        }
         let st = sv0.ty.clone();
         let md = self
             .module(type_head(&st))
@@ -2555,6 +2690,8 @@ static struct {inst}* {inst}__slice(struct {inst}* a, uint64_t lo, uint64_t hi) 
                 cx.locals.truncate(mark);
                 let t = bv.ty.clone();
                 cx.tail = tail;
+                cx.owns_current = owns_current;
+                cx.param_moves = param_moves;
                 cx.tail_drops.truncate(depth);
                 return self.lower_match(cx, scrut, cases, Some(&t), hc);
             }
@@ -2569,6 +2706,7 @@ static struct {inst}* {inst}__slice(struct {inst}* a, uint64_t lo, uint64_t hi) 
             arms.push(format!("{label} {{ {pre}{rv} = {b}; break; }}\n"));
         }
         cx.tail_drops.truncate(depth);
+        cx.owns_current = owns_current;
         let rt = result_ty.ok_or("empty `match`")?;
         let crt = self.ctype(&rt)?;
         let mut s = format!("({{\n{sct} {sv} = {sc};\n{crt} {rv};\nswitch ({sv}->tag) {{\n");
@@ -2655,6 +2793,9 @@ static struct {inst}* {inst}__slice(struct {inst}* a, uint64_t lo, uint64_t hi) 
                     return Ok(borrowed("Current".into(), cx.self_ty.clone().unwrap_or_default()));
                 }
                 if hc {
+                    if cx.steals.contains(v) {
+                        return self.steal_field(cx, v);
+                    }
                     if let Some(st) = cx.self_ty.clone() {
                         if let Some(fs) = self.variant_fields(&st, None) {
                             if let Some((_, ft)) = fs.iter().find(|(f, _)| f == v) {
@@ -2761,6 +2902,40 @@ static struct {inst}* {inst}__slice(struct {inst}* a, uint64_t lo, uint64_t hi) 
                         let r = self.lower(cx, recv, None, hc).and_then(|rv| self.lower_array_method(cx, rv, m, args, hc));
                         cx.gives.retain(|(g, _)| *g != c);
                         return r;
+                    }
+                }
+                // `Current.slots`, taken out of a `Current` this routine owns (Task H.4).
+                if args.is_empty() && matches!(&**recv, Expr::Var(v) if v == "Current") && cx.steals.contains(m) {
+                    return self.steal_field(cx, m);
+                }
+                // `h.push(x)` on a record that holds an array and that nothing after it uses:
+                // the routine owns it.
+                if let Some(v) = call_chain(e) {
+                    let direct = matches!(&**recv, Expr::Var(_));
+                    let l = cx.local(v).cloned().filter(|l| direct && self.holds_array(&l.ty) && self.gives_back(&l.ty, m));
+                    let give = l.as_ref().and_then(|l| {
+                        cx.gives
+                            .iter()
+                            .find(|(c, _)| *c == l.cname)
+                            .map(|(_, g)| g.clone())
+                            .or_else(|| param_moves.contains(&l.cname).then(|| "_owned".to_string()))
+                    });
+                    if let (Some(l), Some(g)) = (l, give) {
+                        let md = self.module(type_head(&l.ty)).ok_or("unknown module")?;
+                        let code = if g == "true" {
+                            if !cx.moved.contains(&l.cname) {
+                                cx.moved.push(l.cname.clone());
+                            }
+                            l.cname.clone()
+                        } else {
+                            // The parameter is the routine's to release only when it owns it.
+                            self.owned_flag = true;
+                            let k = self.next();
+                            let ct = self.ctype(&l.ty)?;
+                            let d = self.dup(&l.ty, &l.cname)?;
+                            format!("({{ {ct} _g{k} = _owned ? {c} : {d}; if (_owned) {c} = NULL; _g{k}; }})", c = l.cname)
+                        };
+                        return self.lower_call(cx, md, m, Some(owned(code, l.ty)), args, expect, hc);
                     }
                 }
                 let rv = match self.lower(cx, recv, None, hc) {
@@ -2892,15 +3067,34 @@ static struct {inst}* {inst}__slice(struct {inst}* a, uint64_t lo, uint64_t hi) 
                     .variant_fields(&ty, None)
                     .ok_or_else(|| format!("record literal of non-record type `{ty}`"))?;
                 self.ctype(&ty)?;
+                // The routine's result: an array of `Current` that only one of its fields
+                // reads, once, may be taken (Task H.4).
+                let mut steals = Vec::new();
+                if let (true, true, Some(st)) = (tail, cx.owns_current, cx.self_ty.clone()) {
+                    let own = self.variant_fields(&st, None).unwrap_or_default();
+                    let names: Vec<String> = own.iter().map(|(f, _)| f.clone()).collect();
+                    let mut reads = Vec::new();
+                    if fields.iter().all(|(_, x)| field_reads(x, &names, &cx.owner, cx, &mut reads)) {
+                        steals = own
+                            .into_iter()
+                            .filter(|(f, t)| type_head(t) == "ARRAY" && reads.iter().filter(|r| *r == f).count() == 1)
+                            .map(|(f, _)| f)
+                            .collect();
+                    }
+                }
+                let outer = std::mem::replace(&mut cx.steals, steals);
                 let mut a = Vec::new();
-                for (f, ft) in &fs {
+                let built = fs.iter().try_for_each(|(f, ft)| {
                     let (_, fe) = fields
                         .iter()
                         .find(|(n, _)| n == f)
                         .ok_or_else(|| format!("record literal misses field `{f}`"))?;
                     let v = self.lower(cx, fe, Some(ft), hc)?;
                     a.push(self.own(v)?);
-                }
+                    Ok::<(), String>(())
+                });
+                cx.steals = outer;
+                built?;
                 Ok(owned(format!("make_{}({})", c_instance_name(&ty), a.join(", ")), ty))
             }
             Expr::RecordUpdate(base, fields) => {

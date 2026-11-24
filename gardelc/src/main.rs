@@ -4235,6 +4235,22 @@ pub const STDLIB_SOURCES: &[(&str, &str)] = &[
         include_str!("../../stdlib/collections/map.gdl"),
     ),
     (
+        "stdlib/collections/set.gdl",
+        include_str!("../../stdlib/collections/set.gdl"),
+    ),
+    (
+        "stdlib/collections/queue.gdl",
+        include_str!("../../stdlib/collections/queue.gdl"),
+    ),
+    (
+        "stdlib/collections/heap_order.gdl",
+        include_str!("../../stdlib/collections/heap_order.gdl"),
+    ),
+    (
+        "stdlib/collections/heap.gdl",
+        include_str!("../../stdlib/collections/heap.gdl"),
+    ),
+    (
         "stdlib/functional/function_ops.gdl",
         include_str!("../../stdlib/functional/function_ops.gdl"),
     ),
@@ -4328,6 +4344,14 @@ pub fn phase4_stdlib_source() -> &'static str {
         include_str!("../../stdlib/collections/array.gdl"),
         "\n",
         include_str!("../../stdlib/collections/map.gdl"),
+        "\n",
+        include_str!("../../stdlib/collections/set.gdl"),
+        "\n",
+        include_str!("../../stdlib/collections/queue.gdl"),
+        "\n",
+        include_str!("../../stdlib/collections/heap_order.gdl"),
+        "\n",
+        include_str!("../../stdlib/collections/heap.gdl"),
         "\n",
         include_str!("../../stdlib/functional/function_ops.gdl"),
         "\n",
@@ -6332,7 +6356,7 @@ fn write_if_changed(path: &str, text: &str) -> std::io::Result<()> {
 /// `STRING` is injected for modules that mention it, contain string literals or use `IO`
 /// (Task B.3: literals denote prelude `STRING` values); `LIST_OPS` / `FUNCTION_OPS` are realized by the built-in
 /// `Seq_*` / `Fn1_*` preamble theories already present in every Boogie file.
-const BOOGIE_INJECTED_PRELUDE: [&str; 32] = [
+const BOOGIE_INJECTED_PRELUDE: [&str; 36] = [
     "LIST_OPS",
     "GENERATOR",
     "OPTION",
@@ -6364,6 +6388,10 @@ const BOOGIE_INJECTED_PRELUDE: [&str; 32] = [
     "SORTING",
     "ARRAY",
     "MAP",
+    "SET",
+    "QUEUE",
+    "HEAP_ORDER",
+    "HEAP",
     "UNFOLD",
 ];
 
@@ -6510,6 +6538,22 @@ impl BoogiePreludeCtx {
         if wanted.contains("MAP") || m.name == "MAP" {
             wanted.insert("KEY_ORDER");
             wanted.insert("OPTION");
+        }
+        // `SET` keeps its keys with `KEY_ORDER`, as `MAP` does. `QUEUE` reverses a list. `HEAP`
+        // keeps its items with `HEAP_ORDER`, in an `ARRAY` (Task H.4).
+        if wanted.contains("SET") || m.name == "SET" {
+            wanted.insert("KEY_ORDER");
+        }
+        if wanted.contains("QUEUE") || m.name == "QUEUE" {
+            wanted.insert("LIST_OPS");
+            wanted.insert("OPTION");
+        }
+        if wanted.contains("HEAP") || m.name == "HEAP" {
+            wanted.insert("HEAP_ORDER");
+            wanted.insert("OPTION");
+        }
+        if wanted.contains("HEAP_ORDER") || m.name == "HEAP_ORDER" {
+            wanted.insert("ARRAY");
         }
         // `UNFOLD`'s step gives an `OPTION`, and `GENERATOR.find_within` one (Task H.22).
         if wanted.contains("UNFOLD") || m.name == "UNFOLD" || wanted.contains("GENERATOR") || m.name == "GENERATOR" {
@@ -9661,12 +9705,12 @@ fn emit_prelude_contract_interface(p: &ModuleDecl) -> (String, HashSet<String>) 
         "// --- {}: routine preconditions (definitions) & trusted law markers ---\n",
         cp.name
     ));
-    let routines = cp.create_routines.iter().map(|(_, r)| (r, false)).chain(
-        cp.feature_routines
-            .iter()
-            .chain(cp.specify_routines.iter())
-            .map(|(_, r)| (r, cp.kind == ModuleKind::Module)),
-    );
+    let routines = cp
+        .create_routines
+        .iter()
+        .map(|(_, r)| (r, false))
+        .chain(cp.feature_routines.iter().map(|(_, r)| (r, cp.kind == ModuleKind::Module)))
+        .chain(cp.specify_routines.iter().map(|(_, r)| (r, specify_takes_current(&cp))));
     for (r, has_current) in routines {
         let mut params = Vec::new();
         let mut tys = Vec::new();
@@ -23567,7 +23611,7 @@ end
         let stdlib = parse_phase4_stdlib().expect("Phase 4 stdlib should parse");
         assert_eq!(stdlib.group, None);
         assert_eq!(stdlib.concepts.len(), 3);
-        assert_eq!(stdlib.modules.len(), 33);
+        assert_eq!(stdlib.modules.len(), 37);
         for m in &stdlib.modules {
             let mut diags = check_visibility_and_semantics(m);
             diags.extend(verify_module_phase3(
@@ -24059,7 +24103,7 @@ end
     #[test]
     fn test_plan3_multi_module_stdlib_pipeline() {
         let ast = parse_phase4_stdlib().expect("stdlib parses cleanly");
-        assert_eq!(ast.modules.len(), 33);
+        assert_eq!(ast.modules.len(), 37);
         let mut prog_env = ProgramEnv {
             modules: HashMap::new(),
             concepts: HashMap::new(),

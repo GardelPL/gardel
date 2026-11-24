@@ -9,6 +9,16 @@ All notable changes, theoretical soundess fixes, verification overhauls, front-e
 Spec draft v0.5. [plan/Roadmap.md](plan/Roadmap.md) holds the detail for each task.
 
 ### Language and runtime
+- **Sets, queues, heaps and more laws of `MAP`** (H.4, in part). Four new prelude modules, so the prelude has 37.
+  - **`MAP`**: the laws `size_put_new`, `size_put_at_most`, `size_put_present`, `size_remove_absent`, `size_remove_at_most` and `size_remove_present` count the keys after a `put` and a `remove`. `fold_put_last` says that a new key above every key is the last a fold meets, and `keys_put_last` that it is then the last key.
+  - **`SET[K: ORD]`**: `add`, `remove`, `has`, `union`, `intersection`, `size` and `items`, with laws on `has` and `size`.
+  - **`QUEUE[A]`**: `push`, `pop`, `peek`, `size` and `items`, on two lists, in amortized constant time. Its contracts are stated on `items`.
+  - **`HEAP[K: ORD]`** on `ARRAY`, kept by `HEAP_ORDER[K]`: `push`, `pop_min`, `peek`. Proven: no item is below `peek`, `push` adds one item and `pop_min` takes away one, `peek`.
+  - **A wrong or crashing program from a verified one, fixed** (since H.5). In `match a.at(0) case Some(x) then loop(a.set(0, y), x)`, the `set` changed the array in place and released the item `x` points at. The program printed the wrong text, or crashed. An arm of a `match` on a value read from an array no longer changes that array in place.
+  - **A record that holds an array can give it up.** A routine that returns its own type takes the array out of a record its caller is done with, so `HEAP.push` and `pop_min` change it in place. They copied it before: pushing and popping 100,000 items, with a queue of as many, took 37 s, and takes 0.2 s.
+  - **A `require` on a ghost routine of a module without a representation**, called from another module, could not be translated (`E0199`): its predicate took a receiver that the call does not pass.
+  - `tests/collections.rs`: clients prove the facts through the contracts and laws, fourteen false claims are refused, a heap of strings and a push without room are refused, and programs run in C, change arrays in place only where nothing still sees them, and free what they allocate.
+  - **Limits:** `push` on a queue or heap asks for room. `HEAP`, and `MAP`'s exact sizes for a key that is there, need `agrees`, which does not hold for `STRING`. `HASH_MAP` is not done, and `grest`'s waiting table stays a list.
 - **Sorting and searching arrays: `sort_array`, `lower_bound`, `binary_search`** (H.3, after H.5). This finishes H.3.
   - **`SORTING.sort_array(a)`** is a stable merge sort on an `ARRAY`, with `sort`'s contract stated on `to_list`: sorted, as long, each value as many times. The halves are copied out with `slice` and sorted as parallel tasks, and a loop merges them into a new array with `set`, in place. The proof is that the loop writes `SORTING.merged` of the two halves, so `merge`'s facts carry over.
   - **`SORTING.lower_bound(a, k)` and `SORTING.binary_search(a, k)`** search a sorted array. `lower_bound` gives the position before which every item is below `k` and from which none is. `binary_search` gives `Some` position of `k` or `None`, and `None` means no item is `k`. Both ask for `first_least`'s premise `agrees`, which a `NAT`, `I64` or `U64` client states in one `check`.

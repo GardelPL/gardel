@@ -641,15 +641,37 @@ Client: `MAP.keys` consumers, `gtui` list views, `gtime` tables. Needs decision 
 
 #### Task H.4: `SET`, `QUEUE`, `HEAP` and `MAP` Laws
 
+**Status:** 🟡 In part (2026-11-24): `MAP`'s laws, `SET`, `QUEUE` and `HEAP`. `HASH_MAP` and the balanced `MAP` are open.
+
 Client: `grest`'s waiting table, which F.8 built as a list because `MAP` had no size law; the rate limiter (H.16); timers in `gtui`.
 
-- [ ] `MAP`: laws for `size` after `put` and `remove`, and a law relating `fold` to `put`. Then move F.8's waiting table to `MAP` if the proofs allow, and record whether they do.
+- [x] `MAP`: laws for `size` after `put` and `remove`, and a law relating `fold` to `put`.
+  - `put` of a new key adds one, `remove` of an absent key none, and both have a bound that needs no premise. The exact size for a key that is there needs `agrees`: `ORD` alone allows a key equal to `k` to sit above a key that `k` is below, where `put` inserts a second one.
+  - `fold_put_last` relates `fold` to the `put` of a new key above every key, where it holds for any function. `keys_put_last` gives the premise of the next `put`. They are stated with `LIST_OPS.at`, which is built in: with `LIST_OPS.last`, a `MAP` client that names no `LIST_OPS` routine did not translate.
+- [ ] Move F.8's waiting table to `MAP`. Not tried. It drops waits by connection and by timeout, so it needs a `MAP.filter` with laws, which `MAP` does not have. The table holds at most 32 waits.
 - [ ] `MAP` as a balanced tree, only if a benchmark of `todo_api` with 10,000 todos calls for it (F decision 4). The laws are on the abstract model, so no contract changes.
-- [ ] `module SET[K: ORD]` over `MAP[K, UNIT]` or `KEY_ORDER` directly: `has`, `add`, `remove`, `union`, `intersection`, `size`, with laws on `has`.
-- [ ] `module QUEUE[A]`: two lists, amortized constant time, model `LIST[A]`.
-- [ ] `module HEAP[K: ORD]` on `ARRAY`: `push`, `pop_min`, `peek`. Proven: `peek` is at most every item, and `pop_min` removes one item.
+- [x] `module SET[K: ORD]` over `KEY_ORDER` directly: `has`, `add`, `remove`, `union`, `intersection`, `size`, with laws on `has`.
+- [x] `module QUEUE[A]`: two lists, amortized constant time, model `LIST[A]` (`items`). `push` asks for room, since `size` adds two lengths.
+- [x] `module HEAP[K: ORD]` on `ARRAY`: `push`, `pop_min`, `peek`. Proven: `peek` is at most every item, and `pop_min` removes one item.
+  - The user chose the array heap over adapting firulete's `BINARY_HEAP`, a skew heap on a tree.
+  - `HEAP_ORDER` holds the moves up and down and their proofs, as `KEY_ORDER` does for `MAP`. A first version stated heap order as a `forall` over an item and its parent, and the counts as a `forall` in each contract. It timed out: each such `forall` gives the solver the parent's parent, and so on. Now each predicate is a recursive routine and each proof a fact by induction, and the module verifies in seconds.
+  - The moves need `agrees`: without it "not below" is not transitive, and then no order of swaps keeps the heap.
+  - Non-recursive predicates state their definition as a postcondition. Unfolding three levels of routines takes more than the default fuel of 2.
 - [ ] With H.0a: `concept HASH refines EQ` (`equals` implies equal `hash`), and `HASH_MAP[K: HASH, V]` on `ARRAY`, with `MAP`'s laws.
-- Acceptance: each structure's laws are proven and used by a client that sees no body, with lies refused, as `tests/map.rs` does.
+- Acceptance: met for `MAP`, `SET`, `QUEUE` and `HEAP`. Each structure's laws are proven and used by a client that sees no body, with lies refused, as `tests/map.rs` does (`tests/collections.rs`).
+
+**Compiler changes.**
+- *An array in a record.* `HEAP` keeps its array in a field, and a call borrowed the record, so each `push` copied the array. A routine that returns its own type now has a variant that owns a record with an array field, used where the caller is done with the record. The variant takes the array out of the record when nothing else holds it. It may only do so in a record literal that is the routine's result, reads the field once, and reads `Current` only through its fields. A variant whose body branches owns its parameters through `_owned`, as a loop does.
+- *A dangling `match` binder* (since H.5). The binders of a `match` on a borrowed value point into what it was read from. An arm could give that array to a `set`, which released what the binder points at: a verified program printed the wrong text, and another crashed. What a borrowed scrutinee names is now given up in no arm, and neither is a field of `Current`.
+- *A ghost precondition.* The predicate for a `require` of a ghost routine took a receiver, also in a module with no representation, whose ghost routines have none since H.3.
+
+**Benchmark.** 100,000 pushes and pops on a heap, and as many on a queue: 37 s before the change to records, 0.2 s after.
+
+**Totals, H.4.** All 548 tests pass: the 235 unit tests and 313 in 47 suites (the `gtui` frame-time test run alone). The stdlib is 0/0 (37 modules). Run on Windows only.
+
+**Known limits.**
+- `sum_last`, a client's proof that a fold with `+%` grows by the value put last, runs out of resources. With wrapping addition left uninterpreted it verifies in a second, so the cost is the bit-vector encoding of `+%`, not the law.
+- `HEAP` has no items of type `STRING`, for which `agrees` does not prove.
 
 ### Step 3: Text and numbers
 
