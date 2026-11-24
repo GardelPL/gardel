@@ -1,0 +1,111 @@
+-- The cases-file pattern (Task H.9): a test program reads lines on standard input, each an
+-- input, ` => ` and what it must give. `gardelc test` sends `tests/cases.txt`. A program
+-- turns each input into text and `check` compares it, naming the case by its line:
+--
+--   run_cases(n: NAT, rs: LIST[TEST_RESULT]): IO[EXIT_CODE]
+--     require
+--       bounded: n <= 100000
+--     variant
+--       100000 - n
+--     do
+--       with IO
+--         line_res <- IO.read_line
+--         match line_res
+--           case Ok(line) then
+--             if n < 100000 then
+--               run_cases(n + 1, CASES.check(rs, n, line, fn(i: STRING): STRING do MY_TEXT.describe(i) end))
+--             else
+--               finish(rs)
+--             end
+--           case Error(_) then
+--             finish(rs)
+--         end
+--       end
+--     end
+--
+-- where `finish` prints `TESTS.report(LIST_OPS.reverse(rs))` and exits with its code.
+functions CASES
+
+feature {ANY}
+
+  read(line: STRING): CASE_LINE
+    do
+      if line.code_point_count = 0 or line.starts_with("#") then
+        Blank
+      else
+        match line.find(" => ", 0)
+          case None then
+            NoArrow
+          case Some(i) then
+            if i + 4 <= line.code_point_count then
+              Pair(line.slice(0, i), line.slice(i + 4, line.code_point_count))
+            else
+              NoArrow
+            end
+        end
+      end
+    end
+
+  -- The bytes of `raw` from index `i` on, each `%XX` read as the byte with hex value `XX`,
+  -- after `out`. A `%` with no two hex digits after it stays as it is.
+  unescape(raw: BYTES, i: NAT, out: BYTES_BUILDER): BYTES
+    require
+      inside: i <= raw.length
+    variant
+      raw.length - i
+    do
+      if i = raw.length or out.length >= 100000000 then
+        out.to_bytes
+      else
+        let b = raw.at(i)
+        if b = 37 and raw.length - i > 2 then
+          let x = NUMBER_TEXT.hex_value(raw.at(i + 1)) * 16 + NUMBER_TEXT.hex_value(raw.at(i + 2))
+          if x < 256 then CASES.unescape(raw, i + 3, out.add_byte(x)) else CASES.unescape(raw, i + 1, out.add_byte(b)) end
+        else
+          CASES.unescape(raw, i + 1, out.add_byte(b))
+        end
+      end
+    end
+
+  -- `s` with each `%XX` read as a byte: for an input that need not be text.
+  bytes(s: STRING): BYTES
+    do
+      CASES.unescape(s.to_utf8, 0, BYTES_BUILDER.empty)
+    end
+
+  -- `s` with each `%XX` read as a byte, or `s` itself if that is not UTF-8.
+  text(s: STRING): STRING
+    do
+      match STRING.from_utf8(CASES.bytes(s))
+        case Ok(t) then t
+        case Error(_) then s
+      end
+    end
+
+  -- `line <n>: <input>`, the input cut to its first 60 characters.
+  name(n: NAT, input: STRING): STRING
+    do
+      let b = CHECK.add(CHECK.add(CHECK.add(STRING_BUILDER.empty, "line "), NUMBER_TEXT.nat_to_text(n)), ": ")
+      if input.code_point_count <= 60 then
+        CHECK.add(b, input).to_string
+      else
+        CHECK.add(CHECK.add(b, input.slice(0, 60)), "...").to_string
+      end
+    end
+
+  -- `rs` with the result of line `n` before it: `run` of its input against what follows
+  -- ` => `, read with `text`. A blank line or a comment adds nothing, and a line with no
+  -- ` => ` fails.
+  check(rs: LIST[TEST_RESULT], n: NAT, line: STRING, run: STRING -> STRING): LIST[TEST_RESULT]
+    do
+      match CASES.read(line)
+        case Blank then
+          rs
+        case NoArrow then
+          rs.prepend(Fail(CASES.name(n, line), "no ` => ` on this line"))
+        case Pair(input, expected) then
+          rs.prepend(CHECK.equal_text(CASES.name(n, input), run(input), CASES.text(expected)))
+      end
+    end
+
+end

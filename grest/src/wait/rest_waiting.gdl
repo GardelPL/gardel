@@ -1,17 +1,19 @@
 -- The requests of a `REST_SERVER` that wait for their answers (F.8, decisions 7 and 8): at
--- most `max_waiting`, each with its connection, its tag and its timeout. A service answers a
--- request by its tag; an answer whose tag no wait holds, because the request timed out or its
--- connection closed, is dropped. Tags are given in turn, from 0 to 999999999 and then from 0
--- again, so a tag is given again only after a billion waits.
+-- most `max_waiting`, each with its connection, its tag and its timeout, in a `MAP` by tag
+-- (Task H.4). A service answers a request by its tag; an answer whose tag no wait holds,
+-- because the request timed out or its connection closed, is dropped. Tags are given in turn,
+-- from 0 to 999999999 and then from 0 again, and a tag that a request still waits under is not
+-- given, so no two requests wait under one tag.
 module REST_WAITING
 
 representation {NONE}
-  waits: LIST[REST_WAIT]
+  waits: MAP[NAT, REST_WAIT]
   next: NAT
 
 invariant
-  bounded: waits.length <= 32
+  bounded: waits.size <= 32
   tags: next < 1000000000
+  tagged: forall t: NAT. waits.has(t) implies waits.get(t).get.tag = t
 
 create {ANY}
 
@@ -26,88 +28,95 @@ create {ANY}
 
   empty: REST_WAITING
     do
-      { waits = LIST.empty, next = 0 }
+      { waits = MAP.empty, next = 0 }
     ensure
       none: Result.count = 0
       room: Result.has_room
+      first: Result.next_tag = 0
     end
 
 create {NONE}
 
-  -- Some wait of `ws` is on `c`.
-  on(ws: LIST[REST_WAIT], c: CONN_ID): BOOL
-    variant
-      ws.length
+  -- The waits of `ws` on `c`.
+  on(ws: MAP[NAT, REST_WAIT], c: CONN_ID): MAP[NAT, REST_WAIT]
     do
-      if ws.length = 0 then False else ws.head.connection = c or on(ws.tail, c) end
-    ensure
-      def: Result = (ws.length > 0 and (ws.head.connection = c or on(ws.tail, c)))
+      ws.filter(fn(t: NAT, w: REST_WAIT): BOOL do w.connection = c end)
     end
 
-  -- The first wait of `ws` tagged `t`.
-  find(ws: LIST[REST_WAIT], t: NAT): OPTION[REST_WAIT]
-    variant
-      ws.length
+  -- The waits of `ws` on other connections than `c`.
+  off(ws: MAP[NAT, REST_WAIT], c: CONN_ID): MAP[NAT, REST_WAIT]
     do
-      if ws.length = 0 then
-        None
-      else if ws.head.tag = t then
-        Some(ws.head)
-      else
-        find(ws.tail, t)
-      end end
-    ensure
-      tagged: Result.is_some implies Result.get.tag = t
-      first: (ws.length > 0 and ws.head.tag = t) implies Result.is_some
+      ws.filter(fn(t: NAT, w: REST_WAIT): BOOL do w.connection != c end)
     end
 
-  -- `ws` with no wait on `c`.
-  without_conn(ws: LIST[REST_WAIT], c: CONN_ID): LIST[REST_WAIT]
-    variant
-      ws.length
+  -- A wait on `c` is one of those on it.
+  some_on(ws: MAP[NAT, REST_WAIT], c: CONN_ID, t: NAT): BOOL
+    require
+      waits: ws.has(t)
+      on_c: ws.get(t).get.connection = c
     do
-      if ws.length = 0 then
-        LIST.empty
-      else
-        let rest = without_conn(ws.tail, c)
-        if ws.head.connection = c then rest else rest.prepend(ws.head) end
+      check
+        agrees: forall a: NAT. forall b: NAT. a.equals(b) = (a = b)
+        kept: on(ws, c).has(t)
       end
+      True
     ensure
-      not_longer: Result.length <= ws.length
-      gone: not on(Result, c)
+      holds: Result
+      some: on(ws, c).size > 0
     end
 
-  -- `ws` with no wait tagged `t`.
-  without_tag(ws: LIST[REST_WAIT], t: NAT): LIST[REST_WAIT]
-    variant
-      ws.length
+  -- A wait on another connection than `c` is one of those off it.
+  kept_off(ws: MAP[NAT, REST_WAIT], c: CONN_ID, t: NAT): BOOL
+    require
+      waits: ws.has(t)
+      elsewhere: ws.get(t).get.connection != c
     do
-      if ws.length = 0 then
-        LIST.empty
-      else
-        let rest = without_tag(ws.tail, t)
-        if ws.head.tag = t then rest else rest.prepend(ws.head) end
+      check
+        agrees: forall a: NAT. forall b: NAT. a.equals(b) = (a = b)
+        kept: off(ws, c).has(t)
       end
+      True
     ensure
-      not_longer: Result.length <= ws.length
-      gone: find(Result, t).is_none
+      holds: Result
+      kept: off(ws, c).has(t)
     end
 
-  -- Each of `ws` one sweep older, or expired if its time runs out on this sweep.
-  sweep_waits(ws: LIST[REST_WAIT]): REST_WAIT_SWEEP
-    variant
-      ws.length
+  -- A wait on `c` is not one of those off it.
+  dropped_off(ws: MAP[NAT, REST_WAIT], c: CONN_ID, t: NAT): BOOL
+    require
+      waits: ws.has(t)
+      on_c: ws.get(t).get.connection = c
     do
-      if ws.length = 0 then
-        REST_WAIT_SWEEP.make(LIST.empty, LIST.empty)
-      else
-        let rest = sweep_waits(ws.tail)
-        if ws.head.times_out then rest.expiring(ws.head) else rest.keeping(ws.head.aged) end
+      check
+        agrees: forall a: NAT. forall b: NAT. a.equals(b) = (a = b)
+        gone: off(ws, c).get(t).is_none
       end
+      True
     ensure
-      accounted: Result.kept.length + Result.expired.length = ws.length
-      -- The sweep counted itself on each wait it kept.
-      aged: REST_WAIT_SWEEP.all_aged(Result.kept)
+      holds: Result
+      gone: not off(ws, c).has(t)
+    end
+
+  -- None of the waits off `c` is on it.
+  none_on(ws: MAP[NAT, REST_WAIT], c: CONN_ID): BOOL
+    do
+      check
+        agrees: forall a: NAT. forall b: NAT. a.equals(b) = (a = b)
+        first: on(off(ws, c), c).size > 0 implies on(off(ws, c), c).has(LIST_OPS.at(on(off(ws, c), c).keys, 0))
+      end
+      True
+    ensure
+      holds: Result
+      none: on(off(ws, c), c).size = 0
+    end
+
+  -- `w` after one more sweep, or as it is when the sweep times it out.
+  older(w: REST_WAIT): REST_WAIT
+    do
+      if w.times_out then w else w.aged end
+    ensure
+      same_tag: Result.tag = w.tag
+      aged: not w.times_out implies Result.sweeps_waited = w.sweeps_waited + 1
     end
 
 feature {ANY}
@@ -115,14 +124,14 @@ feature {ANY}
   -- How many requests wait.
   count: NAT
     do
-      Current.waits.length
+      Current.waits.size
     ensure
       bounded: Result <= 32
     end
 
   has_room: BOOL
     do
-      Current.waits.length < 32
+      Current.waits.size < 32
     ensure
       def: Result = (Current.count < 32)
     end
@@ -133,24 +142,27 @@ feature {ANY}
       Current.next
     end
 
-  -- The tag a handler is given to wait with, or `None` when the table is full.
+  -- The tag a handler is given to wait with, or `None` when the table is full, or when a
+  -- request from a billion waits ago still waits under it.
   offered: OPTION[NAT]
     do
-      if Current.has_room then Some(Current.next) else None end
+      if Current.has_room and not Current.waits.has(Current.next) then Some(Current.next) else None end
     ensure
-      def: Result = (if Current.has_room then Some(Current.next_tag) else None end)
+      def: Result = (if Current.has_room and Current.get(Current.next_tag).is_none then Some(Current.next_tag) else None end)
+      -- No request waits under it.
+      fresh: Result.is_some implies Current.get(Result.get).is_none
     end
 
   -- Whether a request on `c` waits.
   waits_on(c: CONN_ID): BOOL
     do
-      on(Current.waits, c)
+      on(Current.waits, c).size > 0
     end
 
   -- The wait tagged `t`.
   get(t: NAT): OPTION[REST_WAIT]
     do
-      find(Current.waits, t)
+      Current.waits.get(t)
     ensure
       tagged: Result.is_some implies Result.get.tag = t
     end
@@ -159,22 +171,30 @@ feature {ANY}
   -- given.
   holding(w: REST_WAIT): REST_WAITING
     require
-      room: Current.has_room
-      tag_given: w.tag = Current.next_tag
+      offered: Current.offered = Some(w.tag)
     do
-      { waits = without_conn(Current.waits, w.connection).prepend(w),
+      let held = off(Current.waits, w.connection).put(w.tag, w)
+      check
+        agrees: forall a: NAT. forall b: NAT. a.equals(b) = (a = b)
+        waits: some_on(held, w.connection, w.tag)
+      end
+      { waits = held,
         next = if Current.next + 1 < 1000000000 then Current.next + 1 else 0 end }
     ensure
       waits: Result.waits_on(w.connection)
-      found: Result.get(w.tag).is_some
+      found: Result.get(w.tag).is_some and Result.get(w.tag).get.connection = w.connection
       not_more: Result.count <= Current.count + 1
-      next_given: Result.next_tag != Current.next_tag
+      -- In turn, from 0 to 999999999 and then from 0 again.
+      next_given: Result.next_tag = (if Current.next_tag = 999999999 then 0 else Current.next_tag + 1 end)
     end
 
   -- The table without the wait tagged `t`, once it is answered.
   taking(t: NAT): REST_WAITING
     do
-      { Current with waits = without_tag(Current.waits, t) }
+      check
+        agrees: forall a: NAT. forall b: NAT. a.equals(b) = (a = b)
+      end
+      { Current with waits = Current.waits.remove(t) }
     ensure
       gone: Result.get(t).is_none
       not_more: Result.count <= Current.count
@@ -184,32 +204,131 @@ feature {ANY}
   -- The table without the waits on `c`, once `c` closes.
   dropping(c: CONN_ID): REST_WAITING
     do
-      { Current with waits = without_conn(Current.waits, c) }
+      check
+        agrees: forall a: NAT. forall b: NAT. a.equals(b) = (a = b)
+        none: none_on(Current.waits, c)
+      end
+      { Current with waits = off(Current.waits, c) }
     ensure
       gone: not Result.waits_on(c)
       not_more: Result.count <= Current.count
       same_next: Result.next_tag = Current.next_tag
     end
 
-  -- One sweep of the table: the waits it keeps, each one sweep older, and the ones whose time
-  -- runs out. Every wait is one or the other.
-  sweep: REST_WAIT_SWEEP
+  -- The table after one sweep: the waits whose time does not run out, each one sweep older.
+  swept: REST_WAITING
     do
-      sweep_waits(Current.waits)
+      check
+        agrees: forall a: NAT. forall b: NAT. a.equals(b) = (a = b)
+      end
+      let kept = Current.waits.filter(fn(t: NAT, w: REST_WAIT): BOOL do not w.times_out end)
+      { Current with waits = kept.map(fn(t: NAT, w: REST_WAIT): REST_WAIT do REST_WAITING.older(w) end) }
     ensure
-      accounted: Result.kept.length + Result.expired.length = Current.count
-      aged: REST_WAIT_SWEEP.all_aged(Result.kept)
+      -- Every wait is kept or expires.
+      accounted: Result.count + Current.expired.length = Current.count
+      same_next: Result.next_tag = Current.next_tag
     end
 
-  -- The table with the waits `sw` kept.
-  with_kept(sw: REST_WAIT_SWEEP): REST_WAITING
-    require
-      fits: sw.kept.length <= 32
+  -- The waits whose time runs out on the next sweep, to be answered late, oldest first but
+  -- when the tags have started from 0 again.
+  expired: LIST[REST_WAIT]
     do
-      { Current with waits = sw.kept }
+      Current.waits.filter(fn(t: NAT, w: REST_WAIT): BOOL do w.times_out end).values
+    end
+
+specify {ANY}
+
+  -- No other wait leaves the table: one under another tag, and on another connection, stays
+  -- when a wait is held, answered or dropped.
+  law holding_keeps(q: REST_WAITING, w: REST_WAIT, t: NAT)
+    require
+      offered: q.offered = Some(w.tag)
+      waits: q.get(t).is_some
+      elsewhere: q.get(t).get.connection != w.connection
+    trigger
+      q.holding(w).get(t)
+    do
+      REST_WAITING.kept_off(q.waits, w.connection, t)
     ensure
-      kept: Result.count = sw.kept.length
-      same_next: Result.next_tag = Current.next_tag
+      stays: q.holding(w).get(t).is_some
+    end
+
+  -- A wait on the same connection, whose place is taken, leaves the table.
+  law holding_replaces(q: REST_WAITING, w: REST_WAIT, t: NAT)
+    require
+      offered: q.offered = Some(w.tag)
+      waits: q.get(t).is_some
+      same: q.get(t).get.connection = w.connection
+    trigger
+      q.holding(w).get(t)
+    do
+      REST_WAITING.dropped_off(q.waits, w.connection, t)
+    ensure
+      gone: q.holding(w).get(t).is_none
+    end
+
+  law taking_keeps(q: REST_WAITING, t: NAT, u: NAT)
+    require
+      other: u != t
+    trigger
+      q.taking(t).get(u)
+    ensure
+      stays: q.get(u).is_some implies q.taking(t).get(u).is_some
+    end
+
+  law dropping_keeps(q: REST_WAITING, c: CONN_ID, t: NAT)
+    require
+      waits: q.get(t).is_some
+      elsewhere: q.get(t).get.connection != c
+    trigger
+      q.dropping(c).get(t)
+    do
+      REST_WAITING.kept_off(q.waits, c, t)
+    ensure
+      stays: q.dropping(c).get(t).is_some
+    end
+
+  -- A sweep counts itself on each wait it keeps.
+  law swept_kept(q: REST_WAITING, t: NAT)
+    require
+      waits: q.get(t).is_some
+      in_time: not q.get(t).get.times_out
+    trigger
+      q.swept.get(t)
+    ensure
+      kept: q.swept.get(t).is_some
+      aged: q.swept.get(t).get.sweeps_waited = q.get(t).get.sweeps_waited + 1
+    end
+
+  -- A wait whose time runs out leaves the table.
+  law swept_gone(q: REST_WAITING, t: NAT)
+    require
+      waits: q.get(t).is_some
+      out_of_time: q.get(t).get.times_out
+    trigger
+      q.swept.get(t)
+    do
+      check
+        agrees: forall a: NAT. forall b: NAT. a.equals(b) = (a = b)
+      end
+      True
+    ensure
+      gone: q.swept.get(t).is_none
+    end
+
+  -- Only a wait whose time runs out is answered late.
+  law expired_out_of_time(q: REST_WAITING, i: NAT)
+    require
+      inside: i < q.expired.length
+    trigger
+      LIST_OPS.at(q.expired, i)
+    do
+      check
+        agrees: forall a: NAT. forall b: NAT. a.equals(b) = (a = b)
+      end
+      True
+    ensure
+      out_of_time: LIST_OPS.at(q.expired, i).times_out
     end
 
 end

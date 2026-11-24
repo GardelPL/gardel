@@ -84,7 +84,7 @@ A formally verified HTTP/1.1 protocol library and reactive TCP server written in
 
 ```powershell
 ./gardelc/target/release/gardelc.exe --project ghttp/tests --strict
-Get-Content ghttp/tests/cases.txt | ./build/ghttp_test_bin.exe
+Get-Content ghttp/tests/cases.txt | ./build/ghttp_test_bin
 ```
 
 ### 3. Deterministic Scripted Server Execution (`GARDEL_EVENTS`)
@@ -94,9 +94,9 @@ Test connection admission, fragmented TCP delivery (`NeedMore` followed by compl
 ```powershell
 $env:GARDEL_EVENTS = "Accepted:1 Received:1:GET%20/health%20HTTP/1.1%0D%0A%0D%0A Accepted:2 Received:2:GET%20/he Received:2:alth%20HTTP/1.1%0D%0A%0D%0A Shutdown"
 # Default port (8080):
-./build/http_server_bin.exe
+./build/http_server_bin
 # Custom port (e.g., 9090):
-./build/http_server_bin.exe 9090
+./build/http_server_bin 9090
 Remove-Item Env:\GARDEL_EVENTS
 ```
 

@@ -1,0 +1,48 @@
+-- Scripted reactive tests (Task H.9): a `step` run over a list of events, in Gardel, so a
+-- test needs neither `GARDEL_EVENTS` nor a harness that reads what the program wrote.
+functions SCRIPT
+
+feature {ANY}
+
+  -- `step` from state `s` over `events`, with the commands it gave so far in `cmds`. It
+  -- ends at the first `Stop`, or with the events.
+  run[S](step: (s: S, e: EVENT) -> STEP[S], s: S, events: LIST[EVENT], cmds: LIST[COMMAND]): SCRIPTED[S]
+    variant
+      events.length
+    do
+      if events.length = 0 then
+        Running(s, cmds)
+      else
+        match step(s, events.head)
+          case Continue(next, more) then
+            SCRIPT.run(step, next, events.tail, cmds.append(more))
+          case Stop(code, more) then
+            Stopped(code, cmds.append(more))
+        end
+      end
+    end
+
+  -- `run` from no commands.
+  play[S](step: (s: S, e: EVENT) -> STEP[S], s: S, events: LIST[EVENT]): SCRIPTED[S]
+    do
+      SCRIPT.run(step, s, events, LIST.empty)
+    end
+
+  -- The text of each `Print` and `Write` in `cmds`, in order.
+  printed(cmds: LIST[COMMAND]): LIST[STRING]
+    variant
+      cmds.length
+    do
+      if cmds.length = 0 then
+        LIST.empty
+      else
+        let rest = SCRIPT.printed(cmds.tail)
+        match cmds.head
+          case Print(t) then rest.prepend(t)
+          case Write(t) then rest.prepend(t)
+          case _ then rest
+        end
+      end
+    end
+
+end

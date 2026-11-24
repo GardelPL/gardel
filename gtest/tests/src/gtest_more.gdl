@@ -1,0 +1,110 @@
+-- `gtest`'s checks of `CASES`, `SPLIT_MIX`, the generators, `PROPERTY` and `SCRIPT`.
+program GTEST_MORE
+
+feature {ANY}
+
+  message(r: TEST_RESULT): STRING
+    do
+      match r
+        case Fail(_, m) then m
+        case Pass(_) then "passed"
+      end
+    end
+
+  read_checks: LIST[TEST_RESULT]
+    do
+      LIST.empty
+        .prepend(CHECK.that("blank", match CASES.read("") case Blank then True case _ then False end))
+        .prepend(CHECK.that("comment", match CASES.read("# a => b") case Blank then True case _ then False end))
+        .prepend(CHECK.that("no arrow", match CASES.read("a b") case NoArrow then True case _ then False end))
+        .prepend(CHECK.that("pair", match CASES.read("a => b => c") case Pair(i, e) then i.equals("a") and e.equals("b => c") case _ then False end))
+        .prepend(CHECK.equal_text("text", CASES.text("a%20b%41"), "a bA"))
+        .prepend(CHECK.equal_text("not text", CASES.text("%FF"), "%FF"))
+        .prepend(CHECK.equal_nat("bytes", CASES.bytes("%FF%zz").length, 4))
+        .prepend(CHECK.equal_text("name", CASES.name(7, "abc"), "line 7: abc"))
+        .prepend(CHECK.equal_nat("skipped", CASES.check(LIST.empty, 1, "# x", fn(i: STRING): STRING do i end).length, 0))
+        .prepend(CHECK.equal_text("case fails",
+          GTEST_MORE.message(CASES.check(LIST.empty, 3, "a => b", fn(i: STRING): STRING do i end).head),
+          "expected \"b\", got \"a\""))
+    end
+
+  -- SplitMix64's first outputs from seed 0, as its reference implementation gives them.
+  mix_checks: LIST[TEST_RESULT]
+    do
+      let a = SPLIT_MIX.step(0)
+      let b = SPLIT_MIX.step(a.second)
+      let c = SPLIT_MIX.step(b.second)
+      LIST.empty
+        .prepend(CHECK.equal_nat("first", a.first, 16294208416658607535))
+        .prepend(CHECK.equal_nat("second", b.first, 7960286522194355700))
+        .prepend(CHECK.equal_nat("third", c.first, 487617019471545679))
+        .prepend(CHECK.equal_nat("stream", SPLIT_MIX.stream(0).nth(2), 487617019471545679))
+    end
+
+  property_checks: LIST[TEST_RESULT]
+    do
+      let small = PROPERTY.for_all("small", GENS.nat_below(10), 200, 1, fn(n: NAT): BOOL do n < 5 end)
+      let seed = PROPERTY.search(GENS.nat_below(10), fn(n: NAT): BOOL do n < 5 end, 0, 200, 1)
+      LIST.empty
+        .prepend(PROPERTY.for_all("below", GENS.nat_below(10), 500, 42, fn(n: NAT): BOOL do n < 10 end))
+        .prepend(PROPERTY.for_all("in", GENS.nat_in(3, 5), 500, 42, fn(n: NAT): BOOL do 3 <= n and n <= 5 end))
+        .prepend(PROPERTY.for_all("lists", GENS.list(GENS.nat_below(5), 8), 300, 7,
+          fn(xs: LIST[NAT]): BOOL do xs.length <= 8 end))
+        .prepend(PROPERTY.for_all("texts", GENS.text(10), 300, 9, fn(t: STRING): BOOL do t.code_point_count <= 10 end))
+        .prepend(PROPERTY.for_all("both", GENS.pair(GENS.bool, GENS.u64), 100, 3,
+          fn(p: TUPLE[BOOL, U64]): BOOL do p.first or not p.first end))
+        .prepend(CHECK.that("false property fails", not small.passed))
+        .prepend(CHECK.that("found", seed.is_some))
+        .prepend(CHECK.that("same seed, case 0",
+          match seed
+            case Some(c) then
+              GTEST_MORE.message(PROPERTY.for_all("again", GENS.nat_below(10), 200, c.second, fn(n: NAT): BOOL do n < 5 end)).starts_with("case 0 of 200 fails")
+            case None then False
+          end))
+        .prepend(CHECK.that("shown",
+          GTEST_MORE.message(PROPERTY.for_all_shown("s", GENS.nat_below(10), 200, 1, fn(n: NAT): BOOL do n < 5 end,
+            fn(n: NAT): STRING do NUMBER_TEXT.nat_to_text(n) end)).starts_with("case ")))
+    end
+
+  events: LIST[EVENT]
+    do
+      LIST.empty.prepend(Shutdown).prepend(Line(Ok("b"))).prepend(Line(Ok("a")))
+    end
+
+  -- `xs`, each followed by a comma.
+  joined(xs: LIST[STRING]): STRING
+    variant
+      xs.length
+    do
+      if xs.length = 0 then "" else CHECK.add(CHECK.add(CHECK.add(STRING_BUILDER.empty, xs.head), ","), GTEST_MORE.joined(xs.tail)).to_string end
+    end
+
+  one_line: LIST[EVENT]
+    do
+      LIST.empty.prepend(Line(Ok("x")))
+    end
+
+  script_checks: LIST[TEST_RESULT]
+    do
+      let run = SCRIPT.play(fn(n: NAT, e: EVENT): STEP[NAT] do ECHO.step(n, e) end, 0, GTEST_MORE.events)
+      let early = SCRIPT.play(fn(n: NAT, e: EVENT): STEP[NAT] do ECHO.step(n, e) end, 0, GTEST_MORE.one_line)
+      LIST.empty
+        .prepend(CHECK.equal_text("printed", GTEST_MORE.joined(SCRIPT.printed(run.commands)), "a,b,"))
+        .prepend(CHECK.equal_nat("commands", run.commands.length, 4))
+        .prepend(CHECK.that("stopped with the count", match run case Stopped(code, _) then code = 2 case _ then False end))
+        .prepend(CHECK.that("still running", match early case Running(n, _) then n = 1 case _ then False end))
+    end
+
+  main(args: SEQ[STRING]): IO[EXIT_CODE]
+    do
+      let rs = GTEST_MORE.read_checks
+        .append(GTEST_MORE.mix_checks)
+        .append(GTEST_MORE.property_checks)
+        .append(GTEST_MORE.script_checks)
+      with IO
+        IO.print_line(TESTS.report(rs))
+        IO.exit(TESTS.exit_code(rs))
+      end
+    end
+
+end

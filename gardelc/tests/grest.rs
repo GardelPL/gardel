@@ -8,6 +8,9 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 
+/// The suffix gardelc gives an executable: `.exe` on Windows, none elsewhere.
+const EXE: &str = std::env::consts::EXE_SUFFIX;
+
 fn root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("..")
 }
@@ -79,7 +82,7 @@ fn grest_verifies_and_holds_every_case() {
     let tests = root().join("grest/tests");
     assert_ok(&check_at(&tests, &cache));
     let cases = fs::read(tests.join("cases.txt")).expect("cases.txt");
-    let mut run = Command::new(tests.join("build/grest_test_bin.exe"))
+    let mut run = Command::new(tests.join(format!("build/grest_test_bin{EXE}")))
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .spawn()
@@ -314,7 +317,7 @@ end
 
 /// A scripted run of `service`, with `args` and the events `events`.
 fn run_service(service: &Project, args: &[&str], events: &str) -> Output {
-    Command::new(service.dir.join("build/client_bin.exe"))
+    Command::new(service.dir.join(format!("build/client_bin{EXE}")))
         .args(args)
         .env("GARDEL_EVENTS", events)
         .output()
@@ -665,6 +668,8 @@ fn an_async_handler_waits_for_its_answer() {
         events.push(format!("Accepted:{c}"));
         events.push(format!("Received:{c}:{}", get("/up")));
     }
+    // Their time runs out on one sweep: each is answered late, the oldest first.
+    events.push(sweeps(6));
     let run = run_service(&relay, &["9005"], &events.join(" "));
     assert_eq!(run.status.code(), Some(0), "{}", all(&run));
     let mut expected: Vec<String> = [
@@ -697,6 +702,9 @@ fn an_async_handler_waits_for_its_answer() {
     .collect();
     expected.extend((6..38).map(|t| format!("Connect {t} 127%2E0%2E0%2E1 9999")));
     expected.push("Send 42 503 {\"error\":\"busy\"}".to_string());
+    // The idle connections are swept first.
+    expected.extend(["Close 42", "Close 2", "Close 1"].map(|s| s.to_string()));
+    expected.extend((10..42).map(|c| format!("Send {c} 504 {{\"error\":\"timed out\"}}")));
     let got = answers(&run);
     assert_eq!(got, expected, "{}", got.join("\n"));
 }

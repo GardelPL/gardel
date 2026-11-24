@@ -1,0 +1,452 @@
+-- Padding, joining, repeating and ASCII case (Task H.6). Each is stated on the scalars, and
+-- each builds its result with `STRING_BUILDER`, so it copies the bytes once.
+module TEXT_FORMAT
+
+create {ANY}
+
+  -- `s` with copies of `c` in front, up to `width` scalars. A longer `s` is kept as it is.
+  pad_left(s: STRING, width: NAT, c: CHAR): STRING
+    require
+      fits: s.byte_length + 4 * width <= 18446744073709551615
+    do
+      if s.code_point_count >= width then
+        s
+      else
+        TEXT_FORMAT.add_copies(STRING_BUILDER.empty, c, width - s.code_point_count).add(s).to_string
+      end
+    ensure
+      kept: s.code_point_count >= width implies Result = s
+      padded: s.code_point_count < width implies
+        Result.chars = TEXT_FORMAT.copies(c, width - s.code_point_count).append(s.chars)
+      wide: s.code_point_count < width implies Result.code_point_count = width
+      short: Result.byte_length <= s.byte_length + 4 * width
+    end
+
+  -- `s` with copies of `c` after it, up to `width` scalars.
+  pad_right(s: STRING, width: NAT, c: CHAR): STRING
+    require
+      fits: s.byte_length + 4 * width <= 18446744073709551615
+    do
+      if s.code_point_count >= width then
+        s
+      else
+        TEXT_FORMAT.add_copies(STRING_BUILDER.empty.add(s), c, width - s.code_point_count).to_string
+      end
+    ensure
+      kept: s.code_point_count >= width implies Result = s
+      padded: s.code_point_count < width implies
+        Result.chars = s.chars.append(TEXT_FORMAT.copies(c, width - s.code_point_count))
+      wide: s.code_point_count < width implies Result.code_point_count = width
+      short: Result.byte_length <= s.byte_length + 4 * width
+    end
+
+  -- `n` copies of `s`, one after another.
+  repeat(s: STRING, n: NAT): STRING
+    require
+      fits: n * s.byte_length <= 18446744073709551615
+    do
+      check
+        product: TEXT_FORMAT.repeated_bytes(s.byte_length, n) = n * s.byte_length
+      end
+      TEXT_FORMAT.add_repeats(STRING_BUILDER.empty, s, n).to_string
+    ensure
+      repeated: Result.chars = TEXT_FORMAT.repeated(s.chars, n)
+      len: Result.byte_length = n * s.byte_length
+    end
+
+  -- The parts with `sep` between each two: `join(["a", "b", "c"], ", ")` is `"a, b, c"`.
+  join(parts: LIST[STRING], sep: STRING): STRING
+    require
+      fits: TEXT_FORMAT.joined_bytes(parts, sep) <= 18446744073709551615
+    do
+      if parts.length = 0 then
+        ""
+      else
+        TEXT_FORMAT.add_rest(STRING_BUILDER.empty.add(parts.head), parts.tail, sep).to_string
+      end
+    ensure
+      joined: Result.chars = TEXT_FORMAT.joined(parts, sep)
+      len: Result.byte_length = TEXT_FORMAT.joined_bytes(parts, sep)
+    end
+
+  -- Whether `join(parts, sep)` fits, as a test a program runs: `joined_bytes` is a
+  -- `MATH_INT`, which only a proof uses.
+  join_fits(parts: LIST[STRING], sep: STRING): BOOL
+    do
+      if parts.length = 0 then True else TEXT_FORMAT.rest_fits(parts.tail, sep, parts.head.byte_length) end
+    ensure
+      def: Result = (TEXT_FORMAT.joined_bytes(parts, sep) <= 18446744073709551615)
+    end
+
+  -- ASCII `A` to `Z` as `a` to `z`; every other scalar as it is.
+  to_lower(s: STRING): STRING
+    do
+      TEXT_FORMAT.add_lowered(STRING_BUILDER.empty, s.to_chars).to_string
+    ensure
+      lowered: Result.chars = TEXT_FORMAT.lowered(s.chars)
+      count: Result.code_point_count = s.code_point_count
+      each: forall k: NAT. k < s.code_point_count implies
+        LIST_OPS.at(Result.chars, k) = TEXT_FORMAT.lower_char(LIST_OPS.at(s.chars, k))
+      len: Result.byte_length = s.byte_length
+    end
+
+  -- ASCII `a` to `z` as `A` to `Z`; every other scalar as it is.
+  to_upper(s: STRING): STRING
+    do
+      TEXT_FORMAT.add_raised(STRING_BUILDER.empty, s.to_chars).to_string
+    ensure
+      raised: Result.chars = TEXT_FORMAT.raised(s.chars)
+      count: Result.code_point_count = s.code_point_count
+      each: forall k: NAT. k < s.code_point_count implies
+        LIST_OPS.at(Result.chars, k) = TEXT_FORMAT.upper_char(LIST_OPS.at(s.chars, k))
+      len: Result.byte_length = s.byte_length
+    end
+
+  lower_char(c: CHAR): CHAR
+    do
+      if c.code >= 65 and c.code <= 90 then CHAR.from_scalar(c.code + 32) else c end
+    ensure
+      width: STRING.char_width(Result) = STRING.char_width(c)
+    end
+
+  upper_char(c: CHAR): CHAR
+    do
+      if c.code >= 97 and c.code <= 122 then CHAR.from_scalar(c.code - 32) else c end
+    ensure
+      width: STRING.char_width(Result) = STRING.char_width(c)
+    end
+
+  -- The models. They are public because the contracts above mention them.
+
+  -- `k` copies of `c`.
+  copies(c: CHAR, k: NAT): LIST[CHAR]
+    variant
+      k
+    do
+      if k = 0 then LIST.empty else TEXT_FORMAT.copies(c, k - 1).prepend(c) end
+    ensure
+      len: Result.length = k
+      each: forall i: NAT. i < k implies LIST_OPS.at(Result, i) = c
+      width: STRING.width_sum(Result) <= 4 * k
+    end
+
+  -- `n` copies of `cs`.
+  repeated(cs: LIST[CHAR], n: NAT): LIST[CHAR]
+    variant
+      n
+    do
+      if n = 0 then
+        LIST.empty
+      else
+        check
+          split: (n - 1) * cs.length + cs.length = n * cs.length
+        end
+        cs.append(TEXT_FORMAT.repeated(cs, n - 1))
+      end
+    ensure
+      len: Result.length = n * cs.length
+    end
+
+  -- `n` times `size`, as a sum: the builder adds one `size` at a time.
+  repeated_bytes(size: NAT, n: NAT): MATH_INT
+    variant
+      n
+    do
+      if n = 0 then
+        0
+      else
+        check
+          split: (n - 1) * size + size = n * size
+        end
+        TEXT_FORMAT.repeated_bytes(size, n - 1) + size
+      end
+    ensure
+      product: Result = n * size
+    end
+
+  -- The scalars of `parts` with those of `sep` between each two.
+  joined(parts: LIST[STRING], sep: STRING): LIST[CHAR]
+    do
+      if parts.length = 0 then LIST.empty else parts.head.chars.append(TEXT_FORMAT.rest_chars(parts.tail, sep)) end
+    end
+
+  -- The scalars of `sep` before each of `parts`.
+  rest_chars(parts: LIST[STRING], sep: STRING): LIST[CHAR]
+    variant
+      parts.length
+    do
+      if parts.length = 0 then
+        LIST.empty
+      else
+        sep.chars.append(parts.head.chars).append(TEXT_FORMAT.rest_chars(parts.tail, sep))
+      end
+    end
+
+  -- The byte length of `join(parts, sep)`.
+  joined_bytes(parts: LIST[STRING], sep: STRING): MATH_INT
+    do
+      if parts.length = 0 then 0 else parts.head.byte_length + TEXT_FORMAT.rest_bytes(parts.tail, sep) end
+    ensure
+      natural: Result >= 0
+    end
+
+  rest_bytes(parts: LIST[STRING], sep: STRING): MATH_INT
+    variant
+      parts.length
+    do
+      if parts.length = 0 then
+        0
+      else
+        sep.byte_length + parts.head.byte_length + TEXT_FORMAT.rest_bytes(parts.tail, sep)
+      end
+    ensure
+      natural: Result >= 0
+    end
+
+  lowered(cs: LIST[CHAR]): LIST[CHAR]
+    variant
+      cs.length
+    do
+      if cs.length = 0 then LIST.empty else TEXT_FORMAT.lowered(cs.tail).prepend(TEXT_FORMAT.lower_char(cs.head)) end
+    ensure
+      len: Result.length = cs.length
+      width: STRING.width_sum(Result) = STRING.width_sum(cs)
+      each: forall k: NAT. k < cs.length implies
+        LIST_OPS.at(Result, k) = TEXT_FORMAT.lower_char(LIST_OPS.at(cs, k))
+    end
+
+  raised(cs: LIST[CHAR]): LIST[CHAR]
+    variant
+      cs.length
+    do
+      if cs.length = 0 then LIST.empty else TEXT_FORMAT.raised(cs.tail).prepend(TEXT_FORMAT.upper_char(cs.head)) end
+    ensure
+      len: Result.length = cs.length
+      width: STRING.width_sum(Result) = STRING.width_sum(cs)
+      each: forall k: NAT. k < cs.length implies
+        LIST_OPS.at(Result, k) = TEXT_FORMAT.upper_char(LIST_OPS.at(cs, k))
+    end
+
+  -- Proof helpers for `join_split`. They are public because the law's proof uses them.
+
+  -- Lemma: from index `i` on is the item at `i`, then what follows it.
+  drop_step(xs: LIST[CHAR], i: NAT): BOOL
+    require
+      in_bounds: i < xs.length
+      small: xs.length <= 18446744073709551615
+    variant
+      i
+    do
+      if i = 0 then
+        xs.tail.prepend(xs.head) = xs
+      else
+        TEXT_FORMAT.drop_step(xs.tail, i - 1)
+      end
+    ensure
+      holds: Result
+      step: LIST_OPS.drop(xs, i) = LIST_OPS.drop(xs, i + 1).prepend(LIST_OPS.at(xs, i))
+    end
+
+  -- Lemma: dropping `a` items, then `b`, drops `a + b`.
+  drop_drop(xs: LIST[CHAR], a: NAT, b: NAT): BOOL
+    require
+      fits: a + b <= xs.length
+      small: xs.length <= 18446744073709551615
+    variant
+      a
+    do
+      if a = 0 then True else TEXT_FORMAT.drop_drop(xs.tail, a - 1, b) end
+    ensure
+      holds: Result
+      both: LIST_OPS.drop(LIST_OPS.drop(xs, a), b) = LIST_OPS.drop(xs, a + b)
+    end
+
+  -- Lemma: the parts of `s` from index `start`, scanned from `i`, join back to what follows
+  -- `start`. By induction on what is left to scan, one step of `split_from` at a time.
+  split_joins(s: STRING, c: CHAR, start: NAT, i: NAT): BOOL
+    require
+      ordered: start <= i
+      in_bounds: i <= s.code_point_count
+    variant
+      s.code_point_count - i
+    do
+      if i = s.code_point_count then
+        LIST_OPS.take(LIST_OPS.drop(s.chars, start), i - start) = LIST_OPS.drop(s.chars, start)
+      else
+        if LIST_OPS.at(s.chars, i) = c then
+          check
+            rest: TEXT_FORMAT.split_joins(s, c, i + 1, i + 1)
+            step: TEXT_FORMAT.drop_step(s.chars, i)
+            skip: TEXT_FORMAT.drop_drop(s.chars, start, i - start)
+            whole: LIST_OPS.take_drop(LIST_OPS.drop(s.chars, start), i - start)
+            parts: s.split_from(c, i + 1, i + 1).length > 0
+          end
+          True
+        else
+          TEXT_FORMAT.split_joins(s, c, start, i + 1)
+        end
+      end
+    ensure
+      holds: Result
+      joins: TEXT_FORMAT.joined(s.split_from(c, start, i), STRING.from_char(c)) = LIST_OPS.drop(s.chars, start)
+    end
+
+  -- Lemma: `rest_bytes` is the width of `rest_chars`.
+  rest_width(parts: LIST[STRING], sep: STRING): BOOL
+    variant
+      parts.length
+    do
+      if parts.length = 0 then
+        True
+      else
+        STRING.width_append(sep.chars.append(parts.head.chars), TEXT_FORMAT.rest_chars(parts.tail, sep)) and
+        STRING.width_append(sep.chars, parts.head.chars) and
+        sep.byte_length = STRING.width_sum(sep.chars) and
+        parts.head.byte_length = STRING.width_sum(parts.head.chars) and
+        TEXT_FORMAT.rest_width(parts.tail, sep)
+      end
+    ensure
+      holds: Result
+      width: TEXT_FORMAT.rest_bytes(parts, sep) = STRING.width_sum(TEXT_FORMAT.rest_chars(parts, sep))
+    end
+
+  -- Lemma: `joined_bytes` is the width of `joined`.
+  joined_width(parts: LIST[STRING], sep: STRING): BOOL
+    do
+      if parts.length = 0 then
+        True
+      else
+        STRING.width_append(parts.head.chars, TEXT_FORMAT.rest_chars(parts.tail, sep)) and
+        parts.head.byte_length = STRING.width_sum(parts.head.chars) and
+        TEXT_FORMAT.rest_width(parts.tail, sep)
+      end
+    ensure
+      holds: Result
+      width: TEXT_FORMAT.joined_bytes(parts, sep) = STRING.width_sum(TEXT_FORMAT.joined(parts, sep))
+    end
+
+create {NONE}
+
+  -- Whether `done + rest_bytes(parts, sep)` fits, adding with a `NAT` that never overflows.
+  rest_fits(parts: LIST[STRING], sep: STRING, done: NAT): BOOL
+    variant
+      parts.length
+    do
+      if parts.length = 0 then
+        True
+      else
+        if done > 18446744073709551615 - sep.byte_length then
+          False
+        else
+          if done + sep.byte_length > 18446744073709551615 - parts.head.byte_length then
+            False
+          else
+            TEXT_FORMAT.rest_fits(parts.tail, sep, done + sep.byte_length + parts.head.byte_length)
+          end
+        end
+      end
+    ensure
+      def: Result = (done + TEXT_FORMAT.rest_bytes(parts, sep) <= 18446744073709551615)
+    end
+
+  add_copies(b: STRING_BUILDER, c: CHAR, k: NAT): STRING_BUILDER
+    require
+      fits: b.byte_length + 4 * k <= 18446744073709551615
+    variant
+      k
+    do
+      if k = 0 then b else TEXT_FORMAT.add_copies(b.add_char(c), c, k - 1) end
+    ensure
+      model: Result.model = b.model.append(TEXT_FORMAT.copies(c, k))
+      len: Result.byte_length = b.byte_length + STRING.width_sum(TEXT_FORMAT.copies(c, k))
+    end
+
+  add_repeats(b: STRING_BUILDER, s: STRING, n: NAT): STRING_BUILDER
+    require
+      fits: b.byte_length + TEXT_FORMAT.repeated_bytes(s.byte_length, n) <= 18446744073709551615
+    variant
+      n
+    do
+      if n = 0 then b else TEXT_FORMAT.add_repeats(b.add(s), s, n - 1) end
+    ensure
+      model: Result.model = b.model.append(TEXT_FORMAT.repeated(s.chars, n))
+      len: Result.byte_length = b.byte_length + TEXT_FORMAT.repeated_bytes(s.byte_length, n)
+    end
+
+  add_rest(b: STRING_BUILDER, parts: LIST[STRING], sep: STRING): STRING_BUILDER
+    require
+      fits: b.byte_length + TEXT_FORMAT.rest_bytes(parts, sep) <= 18446744073709551615
+    variant
+      parts.length
+    do
+      if parts.length = 0 then
+        b
+      else
+        TEXT_FORMAT.add_rest(b.add(sep).add(parts.head), parts.tail, sep)
+      end
+    ensure
+      model: Result.model = b.model.append(TEXT_FORMAT.rest_chars(parts, sep))
+      len: Result.byte_length = b.byte_length + TEXT_FORMAT.rest_bytes(parts, sep)
+    end
+
+  add_lowered(b: STRING_BUILDER, cs: LIST[CHAR]): STRING_BUILDER
+    require
+      fits: b.byte_length + STRING.width_sum(cs) <= 18446744073709551615
+    variant
+      cs.length
+    do
+      if cs.length = 0 then
+        b
+      else
+        TEXT_FORMAT.add_lowered(b.add_char(TEXT_FORMAT.lower_char(cs.head)), cs.tail)
+      end
+    ensure
+      model: Result.model = b.model.append(TEXT_FORMAT.lowered(cs))
+      len: Result.byte_length = b.byte_length + STRING.width_sum(cs)
+    end
+
+  add_raised(b: STRING_BUILDER, cs: LIST[CHAR]): STRING_BUILDER
+    require
+      fits: b.byte_length + STRING.width_sum(cs) <= 18446744073709551615
+    variant
+      cs.length
+    do
+      if cs.length = 0 then
+        b
+      else
+        TEXT_FORMAT.add_raised(b.add_char(TEXT_FORMAT.upper_char(cs.head)), cs.tail)
+      end
+    ensure
+      model: Result.model = b.model.append(TEXT_FORMAT.raised(cs))
+      len: Result.byte_length = b.byte_length + STRING.width_sum(cs)
+    end
+
+specify {ANY}
+
+  -- The parts of a split, joined with the separator, are as long as the text. A caller
+  -- needs this before it calls `join`, for `fits`.
+  law join_split_fits(s: STRING, c: CHAR)
+    trigger
+      TEXT_FORMAT.joined_bytes(s.split(c), STRING.from_char(c))
+    do
+      TEXT_FORMAT.split_joins(s, c, 0, 0) and
+      TEXT_FORMAT.joined_width(s.split(c), STRING.from_char(c)) and
+      s.byte_length = STRING.width_sum(s.chars)
+    ensure
+      fits: TEXT_FORMAT.joined_bytes(s.split(c), STRING.from_char(c)) = s.byte_length
+    end
+
+  -- Joining the parts of a split with the separator gives the text back.
+  law join_split(s: STRING, c: CHAR)
+    trigger
+      TEXT_FORMAT.join(s.split(c), STRING.from_char(c))
+    do
+      TEXT_FORMAT.split_joins(s, c, 0, 0) and
+      TEXT_FORMAT.joined_width(s.split(c), STRING.from_char(c)) and
+      s.byte_length = STRING.width_sum(s.chars)
+    ensure
+      chars: TEXT_FORMAT.join(s.split(c), STRING.from_char(c)).chars = s.chars
+      same: TEXT_FORMAT.join(s.split(c), STRING.from_char(c)).equals(s)
+    end
+
+end

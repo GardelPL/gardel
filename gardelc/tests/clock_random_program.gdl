@@ -1,0 +1,36 @@
+-- IO.now and IO.random (Task H.1): the time is an I64, and an Ok of IO.random(n) has n bytes.
+program CLOCK_RANDOM_PROGRAM
+
+feature {ANY}
+
+  -- Needs exactly eight bytes, which the runtime promises for IO.random(8).
+  first_of_eight(bs: BYTES): U64
+    require
+      eight: bs.length = 8
+    do
+      bs.at(7)
+    end
+
+  main(args: SEQ[STRING]): IO[EXIT_CODE]
+    do
+      with IO
+        t <- IO.now
+        r <- IO.random(8)
+        big <- IO.random(1025)
+        match r
+          case Ok(bs) then
+            let last = first_of_eight(bs)
+            let refused = match big case Ok(_) then 1 case Error(_) then 0 end
+            with IO
+              IO.print_line(NUMBER_TEXT.i64_to_text(t))
+              IO.print_line(NUMBER_TEXT.nat_to_text(bs.length))
+              IO.print_line(NUMBER_TEXT.nat_to_text(last))
+              IO.exit(refused)
+            end
+          case Error(_) then
+            IO.exit(2)
+        end
+      end
+    end
+
+end

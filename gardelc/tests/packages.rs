@@ -6,6 +6,9 @@ use std::io::{Read, Write};
 use std::path::PathBuf;
 use std::process::{Command, Output};
 
+/// The suffix gardelc gives an executable: `.exe` on Windows, none elsewhere.
+const EXE: &str = std::env::consts::EXE_SUFFIX;
+
 const PROJECT: &str = "[project]\nname = \"{}\"\nversion = \"0.1.0\"\n";
 
 struct World {
@@ -173,7 +176,7 @@ fn two_packages_with_one_name_verify_link_and_run() {
     let out = world.run("app", &["--strict"]);
     assert_ok(&out);
     assert_eq!(tally(&out), (5, 0));
-    let exe = world.build_dir("app").join("main_app_bin.exe");
+    let exe = world.build_dir("app").join(format!("main_app_bin{EXE}"));
     let run = Command::new(exe).output().expect("the program runs");
     assert_eq!(String::from_utf8_lossy(&run.stdout).replace('\r', ""), "ALPHA_API 10\nBETA_API 20\n");
 }
@@ -551,16 +554,16 @@ end
 ";
     world.package("root", &[("dep", "{ path = \"../dep\" }")], &[("home.gdl", root)]);
     assert_ok(&world.run("root", &["--strict"]));
-    let run = Command::new(world.build_dir("root").join("home_bin.exe")).output().expect("runs");
+    let run = Command::new(world.build_dir("root").join(format!("home_bin{EXE}"))).output().expect("runs");
     assert_eq!(String::from_utf8_lossy(&run.stdout).replace('\r', ""), "home\n");
-    assert!(!world.build_dir("root").join("pk3_dep_tool_bin.exe").exists());
+    assert!(!world.build_dir("root").join(format!("pk3_dep_tool_bin{EXE}")).exists());
 
     // A library with no entry point of its own builds no binary, whatever its dependency has.
     fs::remove_file(world.dir.join("root/src/home.gdl")).expect("remove");
     drop(fs::remove_dir_all(world.build_dir("root")));
     world.write("root/src/client.gdl", &FIVE.replace("DEP", "CLIENT"));
     assert_ok(&world.run("root", &["--strict"]));
-    assert!(!world.build_dir("root").join("pk3_dep_tool_bin.exe").exists());
+    assert!(!world.build_dir("root").join(format!("pk3_dep_tool_bin{EXE}")).exists());
 
     let names_it = "functions CLIENT
 
@@ -825,7 +828,7 @@ end
 ";
     world.package("root", &[("dep", "{ path = \"../dep\" }")], &[("uses_stack.gdl", app)]);
     assert_ok(&world.run("root", &["--strict"]));
-    let run = Command::new(world.build_dir("root").join("uses_stack_bin.exe")).output().expect("runs");
+    let run = Command::new(world.build_dir("root").join(format!("uses_stack_bin{EXE}"))).output().expect("runs");
     assert_eq!(String::from_utf8_lossy(&run.stdout).replace('\r', ""), "top is two\n");
 }
 
@@ -1022,7 +1025,7 @@ end
 ";
     world.package("root", &[("dep", "{ path = \"../dep\" }")], &[("uses_stack.gdl", app)]);
     assert_ok(&world.run("root", &["--strict"]));
-    let run = Command::new(world.build_dir("root").join("uses_stack_bin.exe")).output().expect("runs");
+    let run = Command::new(world.build_dir("root").join(format!("uses_stack_bin{EXE}"))).output().expect("runs");
     assert_eq!(String::from_utf8_lossy(&run.stdout).replace('\r', ""), "top is two\n");
 }
 
@@ -1125,7 +1128,7 @@ fn a_service_on_grest_verifies_and_answers() {
     if std::net::TcpListener::bind(("127.0.0.1", 8090)).is_err() {
         return;
     }
-    let mut server = Command::new(world.dir.join("build/hello_api_bin.exe")).spawn().expect("the service starts");
+    let mut server = Command::new(world.dir.join(format!("build/hello_api_bin{EXE}"))).spawn().expect("the service starts");
     // Each part is its own write, with a pause, so the server sees it as its own read.
     let ask = |parts: &[&str]| -> String {
         let mut socket = std::net::TcpStream::connect(("127.0.0.1", 8090)).expect("connect");
@@ -1270,7 +1273,7 @@ fn ghttp_parses_every_case_whole_and_split() {
         .expect("gardelc runs");
     assert_ok(&out);
     let cases = std::fs::read(root.join("ghttp/tests/cases.txt")).expect("cases.txt");
-    let mut run = Command::new(world.dir.join("build/ghttp_test_bin.exe"))
+    let mut run = Command::new(world.dir.join(format!("build/ghttp_test_bin{EXE}")))
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .spawn()
@@ -1405,7 +1408,7 @@ end
 ";
     world.package("root", TWO_PARSERS.as_slice(), &[("qualified.gdl", app)]);
     assert_ok(&world.run("root", &["--strict"]));
-    assert_eq!(run_binary(&world, "root", "qualified_bin.exe"), "one\ntwo\n");
+    assert_eq!(run_binary(&world, "root", &format!("qualified_bin{EXE}")), "one\ntwo\n");
 }
 
 /// Qualification reaches type arguments at any depth, and a concept.
@@ -1533,7 +1536,7 @@ end
     let world = World::new("both_commands", &[]);
     world.package("root", &[], &[("command.gdl", command), ("uses_both.gdl", app)]);
     assert_ok(&world.run("root", &["--strict"]));
-    assert_eq!(run_binary(&world, "root", "uses_both_bin.exe"), "mine\n");
+    assert_eq!(run_binary(&world, "root", &format!("uses_both_bin{EXE}")), "mine\n");
 }
 
 /// With a user `EVENT`, `STEP` and `STRING`, a reactive program names the prelude's, and the
@@ -1580,7 +1583,7 @@ end
     let world = World::new("built_in", &[]);
     world.package("root", &[], &[("event.gdl", event), ("step.gdl", step), ("string.gdl", string), ("reacts.gdl", app)]);
     assert_ok(&world.run("root", &["--strict"]));
-    assert_eq!(run_binary(&world, "root", "reacts_bin.exe"), "hello
+    assert_eq!(run_binary(&world, "root", &format!("reacts_bin{EXE}")), "hello
 ");
 }
 
@@ -1794,7 +1797,7 @@ end
     let world = World::new("by_module", &[]);
     world.package("root", &[], &[("tok_a.gdl", tok_a), ("tok_b.gdl", tok_b), ("picks.gdl", app)]);
     assert_ok(&world.run("root", &["--strict"]));
-    assert_eq!(run_binary(&world, "root", "picks_bin.exe"), "one\ntwo\nthree\n");
+    assert_eq!(run_binary(&world, "root", &format!("picks_bin{EXE}")), "one\ntwo\nthree\n");
 
     // A failure speaks of the source: its span finds `Leaf`, and its text has no internal name.
     let wrong = tok_b.replace("then x\n", "then x + 1\n");

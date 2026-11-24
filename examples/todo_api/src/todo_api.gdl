@@ -1,7 +1,7 @@
 -- A REST service with a state: todos, created, read, replaced and deleted over JSON.
 --
 --   gardelc examples/todo_api --strict
---   build/todo_api_bin.exe [port]          (8091 when no port is given)
+--   build/todo_api_bin [port]          (else TODO_API_PORT, else 8091)
 --
 --   GET    /todos       every todo, in ascending order of id
 --   POST   /todos       {"title":"...","done":false} -> 201 and the todo, with its id
@@ -11,25 +11,11 @@
 --
 -- The state is a `TODO_STORE`, whose invariant holds after every request: each todo is kept
 -- under its own id, and a new todo never takes the id of another, even one deleted.
--- `REST_SERVER` proves that each request is answered once and its connection closed.
+-- `REST_SERVER` proves that each request is answered once and its connection closed. Each
+-- request is logged at `Info` on standard error, as `info: GET /todos`.
 reactive program TODO_API
 
 feature {ANY}
-
-  -- `ts` as items after those of the array `acc`, while they fit.
-  array_of(ts: LIST[TODO], acc: JSON): JSON
-    variant
-      ts.length
-    do
-      if ts.length = 0 then
-        acc
-      else
-        match acc.with_item(ts.head.to_json)
-          case None then acc
-          case Some(more) then array_of(ts.tail, more)
-        end
-      end
-    end
 
   -- The todo whose id the path gives, if there is one.
   named(s: TODO_STORE, r: REST_REQUEST): OPTION[TODO]
@@ -49,7 +35,10 @@ feature {ANY}
 
   list_todos(s: TODO_STORE, r: REST_REQUEST): HTTP_RESPONSE
     do
-      REST_RESPONSE.ok_json(array_of(s.all, JSON.empty_array))
+      match JSON_ARRAY.of(LIST_OPS.map(s.all, fn(t: TODO): JSON do t.to_json end))
+        case None then REST_RESPONSE.error(HTTP_STATUS.internal_server_error, "a todo nests too deep")
+        case Some(v) then REST_RESPONSE.ok_json(v)
+      end
     end
 
   get_todo(s: TODO_STORE, r: REST_REQUEST): HTTP_RESPONSE
@@ -110,14 +99,36 @@ feature {ANY}
       five: Result.route_count = 5
     end
 
-  init(args: SEQ[STRING]): STEP[REST_SERVER[TODO_STORE]]
+  -- The server's step, as the service's.
+  serving(st: STEP[REST_SERVER[TODO_STORE]]): STEP[TODO_APP]
     do
-      REST_SERVER.start(args, 8091, routes, TODO_STORE.empty)
+      match st
+        case Continue(n, cmds) then Continue(Serving(n), cmds)
+        case Stop(x, cmds) then Stop(x, cmds)
+      end
     end
 
-  step(s: REST_SERVER[TODO_STORE], e: EVENT): STEP[REST_SERVER[TODO_STORE]]
+  -- A port given as an argument is used at once; else the port is read from `TODO_API_PORT`.
+  init(args: SEQ[STRING]): STEP[TODO_APP]
     do
-      s.serve(e)
+      if args.length > 0 then
+        serving(REST_SERVER.start(args, 8091, routes, TODO_STORE.empty))
+      else
+        Continue(Starting, LIST.empty.prepend(ReadEnv(1, "TODO_API_PORT")))
+      end
+    end
+
+  step(s: TODO_APP, e: EVENT): STEP[TODO_APP]
+    do
+      match s
+        case Serving(server) then serving(server.serve(e))
+        case Starting then
+          match e
+            case EnvRead(_, port) then serving(REST_SERVER.start_from(port, 8091, routes, TODO_STORE.empty))
+            case Shutdown then Stop(0, LIST.empty)
+            case _ then Continue(s, LIST.empty)
+          end
+      end
     end
 
 end

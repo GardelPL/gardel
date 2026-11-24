@@ -260,6 +260,62 @@ feature {ANY}
         or (cmds.length >= 1 and not REST_COMMANDS.sends(cmds.head, c) and not REST_COMMANDS.closes(cmds.head, c) and REST_COMMANDS.all_foreign(cmds, cs)))
     end
 
+  -- `cmd` is a `Log` line (Task H.2): it names no connection and sets no timer.
+  logs(cmd: COMMAND): BOOL
+    do
+      match cmd
+        case Log(_, _) then True
+        case _ then False
+      end
+    ensure
+      def: Result = (match cmd case Log(_, _) then True case _ then False end)
+    end
+
+  -- The line logged at `Info` for a request: its method and its target, as `GET /todos/1`.
+  request_line(req: HTTP_REQUEST): COMMAND
+    do
+      Log(Info, req.method.to_string.concat(" ").concat(req.target))
+    ensure
+      logs: REST_COMMANDS.logs(Result)
+    end
+
+  -- What bytes from `c` may do once the requests they complete are logged: `Log` lines, and
+  -- then what `for_conn_out` allows.
+  for_conn_logged(cmds: LIST[COMMAND], c: CONN_ID, cs: HTTP_SERVER_STATE): BOOL
+    variant
+      cmds.length
+    do
+      if REST_COMMANDS.for_conn_out(cmds, c, cs) then
+        True
+      else if cmds.length = 0 then
+        False
+      else
+        REST_COMMANDS.logs(cmds.head) and REST_COMMANDS.for_conn_logged(cmds.tail, c, cs)
+      end end
+    ensure
+      def: Result = (REST_COMMANDS.for_conn_out(cmds, c, cs)
+        or (cmds.length >= 1 and REST_COMMANDS.logs(cmds.head) and REST_COMMANDS.for_conn_logged(cmds.tail, c, cs)))
+    end
+
+  -- A line for each of `reqs`, in order, then `cmds`: the shape and the answers to `c` stay
+  -- those of `cmds`.
+  logged(reqs: LIST[HTTP_REQUEST], cmds: LIST[COMMAND], c: CONN_ID, cs: HTTP_SERVER_STATE): LIST[COMMAND]
+    require
+      bounded: reqs.length + cmds.length <= 1000
+    variant
+      reqs.length
+    do
+      if reqs.length = 0 then
+        cmds
+      else
+        REST_COMMANDS.logged(reqs.tail, cmds, c, cs).prepend(REST_COMMANDS.request_line(reqs.head))
+      end
+    ensure
+      length: Result.length = reqs.length + cmds.length
+      shaped: REST_COMMANDS.for_conn_out(cmds, c, cs) implies REST_COMMANDS.for_conn_logged(Result, c, cs)
+      sent: REST_COMMANDS.sent_to(Result, c) = REST_COMMANDS.sent_to(cmds, c)
+    end
+
   -- One answer: a `Send`, perhaps followed by the close of the same connection.
   one_answer(cmds: LIST[COMMAND]): BOOL
     do
@@ -386,7 +442,7 @@ feature {ANY}
       match e
         case Accepted(c) then REST_COMMANDS.for_conn(cmds, c)
         case Received(c, _) then
-          if cs.lookup_connection(c).is_some then REST_COMMANDS.for_conn_out(cmds, c, cs) else REST_COMMANDS.for_wake(cmds, cs) end
+          if cs.lookup_connection(c).is_some then REST_COMMANDS.for_conn_logged(cmds, c, cs) else REST_COMMANDS.for_wake(cmds, cs) end
         case SendFailed(c, _) then
           if cs.lookup_connection(c).is_some then REST_COMMANDS.for_conn(cmds, c) else REST_COMMANDS.for_wake(cmds, cs) end
         case Closed(c) then
@@ -399,7 +455,7 @@ feature {ANY}
       def: Result = (match e
         case Accepted(c) then REST_COMMANDS.for_conn(cmds, c)
         case Received(c, _) then
-          (if cs.lookup_connection(c).is_some then REST_COMMANDS.for_conn_out(cmds, c, cs) else REST_COMMANDS.for_wake(cmds, cs) end)
+          (if cs.lookup_connection(c).is_some then REST_COMMANDS.for_conn_logged(cmds, c, cs) else REST_COMMANDS.for_wake(cmds, cs) end)
         case SendFailed(c, _) then
           (if cs.lookup_connection(c).is_some then REST_COMMANDS.for_conn(cmds, c) else REST_COMMANDS.for_wake(cmds, cs) end)
         case Closed(c) then

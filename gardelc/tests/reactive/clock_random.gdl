@@ -1,0 +1,65 @@
+-- ReadClock and Random (Task H.1): reads the clock, asks for eight random bytes and for more
+-- than the host gives, prints each answer, and stops when the three have come. With an
+-- argument it reads the clock alone, and stops at its answer. A Shutdown stops it with 4, so a
+-- script that ends early is told apart from one refused (2).
+reactive program CLOCK_RANDOM
+
+feature {ANY}
+
+  -- `a` and `b`, when they fit.
+  joined(a: STRING, b: STRING): STRING
+    do
+      if a.byte_length <= 100000 and b.byte_length <= 100000 then a.concat(b) else a end
+    end
+
+  -- The bytes from `i` on, each as a number after a space.
+  octets(bs: BYTES, i: NAT): STRING
+    variant
+      bs.length - i
+    do
+      if i >= bs.length or i >= 1024 then
+        ""
+      else
+        joined(joined(" ", NUMBER_TEXT.nat_to_text(bs.at(i))), octets(bs, i + 1))
+      end
+    end
+
+  -- One more answer; after the third, the program stops.
+  answered(s: NAT, line: STRING): STEP[NAT]
+    do
+      if s >= 2 then
+        Stop(0, LIST.empty.prepend(Print("done")).prepend(Print(line)))
+      else
+        Continue(s + 1, LIST.empty.prepend(Print(line)))
+      end
+    end
+
+  init(args: SEQ[STRING]): STEP[NAT]
+    do
+      if args.length > 0 then
+        Continue(2, LIST.empty.prepend(ReadClock(1)))
+      else
+        Continue(0, LIST.empty
+        .prepend(Random(3, 1025))
+        .prepend(Random(2, 8))
+        .prepend(ReadClock(1)))
+      end
+    end
+
+  step(s: NAT, e: EVENT): STEP[NAT]
+    do
+      match e
+        case Clock(tag, wall, mono) then
+          answered(s, joined(joined("clock ", NUMBER_TEXT.i64_to_text(wall)), joined(" ", NUMBER_TEXT.nat_to_text(mono))))
+        case RandomBytes(tag, r) then
+          let line = match r
+            case Ok(bs) then joined(joined("random ", NUMBER_TEXT.nat_to_text(bs.length)), octets(bs, 0))
+            case Error(_) then joined("refused ", NUMBER_TEXT.nat_to_text(tag))
+          end
+          answered(s, line)
+        case Shutdown then Stop(4, LIST.empty)
+        case _ then Continue(s, LIST.empty)
+      end
+    end
+
+end

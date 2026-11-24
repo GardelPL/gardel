@@ -1,3 +1,9 @@
+-- Operations on lists and their laws (Bird and Wadler, §3.2 to §3.5).
+--
+-- `map`, `filter`, `fold_left`, `fold_right` and `at` are realized by the verifier's built-in
+-- list theory. The rest are ordinary functions, proven here, and a client sees their
+-- contracts and their laws. A law with a function argument states what it needs of the
+-- function as a `require`, as `forall` premises a client proves of its own function.
 functions LIST_OPS
 
 feature {ANY}
@@ -34,6 +40,8 @@ feature {ANY}
     ensure
       not_longer: Result.length <= xs.length
       empty_case: xs.length = 0 implies Result = LIST.empty
+      kept_case: xs.length > 0 and keep(xs.head) implies Result = LIST_OPS.filter(xs.tail, keep).prepend(xs.head)
+      dropped_case: xs.length > 0 and not keep(xs.head) implies Result = LIST_OPS.filter(xs.tail, keep)
     end
 
   fold_left[A, B](xs: LIST[A], f: (acc: B, x: A) -> B, init: B): B
@@ -78,6 +86,431 @@ feature {ANY}
     ensure
       head_case: i = 0 implies Result = xs.head
       step_case: i > 0 implies Result = LIST_OPS.at(xs.tail, i - 1)
+    end
+
+  -- The first `n` items, or all of them when there are fewer.
+  take[A](xs: LIST[A], n: NAT): LIST[A]
+    variant
+      n
+    do
+      if n = 0 or xs.length = 0 then
+        LIST.empty
+      else
+        take(xs.tail, n - 1).prepend(xs.head)
+      end
+    ensure
+      len: n <= xs.length implies Result.length = n
+      whole: n >= xs.length implies Result = xs
+      empty_case: (n = 0 or xs.length = 0) implies Result = LIST.empty
+      cons_case: (n > 0 and xs.length > 0) implies Result = take(xs.tail, n - 1).prepend(xs.head)
+    end
+
+  -- What follows the first `n` items, or nothing when there are fewer.
+  drop[A](xs: LIST[A], n: NAT): LIST[A]
+    variant
+      n
+    do
+      if n = 0 or xs.length = 0 then
+        xs
+      else
+        drop(xs.tail, n - 1)
+      end
+    ensure
+      len: n <= xs.length implies Result.length + n = xs.length
+      none: n >= xs.length implies Result = LIST.empty
+      zero_case: (n = 0 or xs.length = 0) implies Result = xs
+      cons_case: (n > 0 and xs.length > 0) implies Result = drop(xs.tail, n - 1)
+    end
+
+  -- `xs` reversed, in front of `acc`.
+  reverse_onto[A](xs: LIST[A], acc: LIST[A]): LIST[A]
+    variant
+      xs.length
+    do
+      if xs.length = 0 then
+        acc
+      else
+        reverse_onto(xs.tail, acc.prepend(xs.head))
+      end
+    ensure
+      len: Result.length = xs.length + acc.length
+      empty_case: xs.length = 0 implies Result = acc
+      cons_case: xs.length > 0 implies Result = reverse_onto(xs.tail, acc.prepend(xs.head))
+    end
+
+  reverse[A](xs: LIST[A]): LIST[A]
+    do
+      reverse_onto(xs, LIST.empty)
+    ensure
+      same_length: Result.length = xs.length
+      empty_case: xs.length = 0 implies Result = LIST.empty
+    end
+
+  -- The lists of `xss`, one after another.
+  concat[A](xss: LIST[LIST[A]]): LIST[A]
+    variant
+      xss.length
+    do
+      if xss.length = 0 then
+        LIST.empty
+      else
+        xss.head.append(concat(xss.tail))
+      end
+    ensure
+      empty_case: xss.length = 0 implies Result = LIST.empty
+      cons_case: xss.length > 0 implies Result = xss.head.append(concat(xss.tail))
+    end
+
+  -- The longest prefix of `xs` whose items all satisfy `p`.
+  take_while[A](xs: LIST[A], p: A -> BOOL): LIST[A]
+    variant
+      xs.length
+    do
+      if xs.length = 0 then
+        LIST.empty
+      else if p(xs.head) then
+        take_while(xs.tail, p).prepend(xs.head)
+      else
+        LIST.empty
+      end end
+    ensure
+      not_longer: Result.length <= xs.length
+      empty_case: xs.length = 0 implies Result = LIST.empty
+      kept_case: xs.length > 0 and p(xs.head) implies Result = take_while(xs.tail, p).prepend(xs.head)
+      stop_case: xs.length > 0 and not p(xs.head) implies Result = LIST.empty
+    end
+
+  -- What follows `take_while(xs, p)`.
+  drop_while[A](xs: LIST[A], p: A -> BOOL): LIST[A]
+    variant
+      xs.length
+    do
+      if xs.length = 0 then
+        xs
+      else if p(xs.head) then
+        drop_while(xs.tail, p)
+      else
+        xs
+      end end
+    ensure
+      not_longer: Result.length <= xs.length
+      empty_case: xs.length = 0 implies Result = xs
+      kept_case: xs.length > 0 and p(xs.head) implies Result = drop_while(xs.tail, p)
+      stop_case: xs.length > 0 and not p(xs.head) implies Result = xs
+    end
+
+  -- Pairs of the items at the same place, as long as the shorter list.
+  zip[A, B](xs: LIST[A], ys: LIST[B]): LIST[TUPLE[A, B]]
+    variant
+      xs.length
+    do
+      if xs.length = 0 or ys.length = 0 then
+        LIST.empty
+      else
+        zip(xs.tail, ys.tail).prepend((xs.head, ys.head))
+      end
+    ensure
+      len: Result.length = (if xs.length <= ys.length then xs.length else ys.length end)
+      empty_case: (xs.length = 0 or ys.length = 0) implies Result = LIST.empty
+      cons_case: (xs.length > 0 and ys.length > 0) implies Result = zip(xs.tail, ys.tail).prepend((xs.head, ys.head))
+    end
+
+  -- `f` of the items at the same place, as long as the shorter list.
+  zip_with[A, B, C](xs: LIST[A], ys: LIST[B], f: (x: A, y: B) -> C): LIST[C]
+    variant
+      xs.length
+    do
+      if xs.length = 0 or ys.length = 0 then
+        LIST.empty
+      else
+        zip_with(xs.tail, ys.tail, f).prepend(f(xs.head, ys.head))
+      end
+    ensure
+      len: Result.length = (if xs.length <= ys.length then xs.length else ys.length end)
+      empty_case: (xs.length = 0 or ys.length = 0) implies Result = LIST.empty
+      cons_case: (xs.length > 0 and ys.length > 0) implies Result = zip_with(xs.tail, ys.tail, f).prepend(f(xs.head, ys.head))
+    end
+
+  last[A](xs: LIST[A]): A
+    require
+      not_empty: xs.length > 0
+    variant
+      xs.length
+    do
+      if xs.length = 1 then
+        xs.head
+      else
+        last(xs.tail)
+      end
+    ensure
+      single_case: xs.length = 1 implies Result = xs.head
+      cons_case: xs.length > 1 implies Result = last(xs.tail)
+    end
+
+  -- Every item but the last.
+  init[A](xs: LIST[A]): LIST[A]
+    require
+      not_empty: xs.length > 0
+    variant
+      xs.length
+    do
+      if xs.length = 1 then
+        LIST.empty
+      else
+        init(xs.tail).prepend(xs.head)
+      end
+    ensure
+      len: Result.length + 1 = xs.length
+      single_case: xs.length = 1 implies Result = LIST.empty
+      cons_case: xs.length > 1 implies Result = init(xs.tail).prepend(xs.head)
+    end
+
+  -- The lists `f` gives for each item, one after another.
+  concat_map[A, B](xs: LIST[A], f: A -> LIST[B]): LIST[B]
+    variant
+      xs.length
+    do
+      if xs.length = 0 then
+        LIST.empty
+      else
+        f(xs.head).append(concat_map(xs.tail, f))
+      end
+    ensure
+      empty_case: xs.length = 0 implies Result = LIST.empty
+      cons_case: xs.length > 0 implies Result = f(xs.head).append(concat_map(xs.tail, f))
+    end
+
+  -- `lo`, `lo + 1`, ..., `hi - 1`: empty when `lo >= hi`.
+  range(lo: NAT, hi: NAT): LIST[NAT]
+    variant
+      (if lo < hi then hi - lo else 0 end)
+    do
+      if lo < hi then
+        range(lo + 1, hi).prepend(lo)
+      else
+        LIST.empty
+      end
+    ensure
+      len: Result.length = (if lo < hi then hi - lo else 0 end)
+      empty_case: lo >= hi implies Result = LIST.empty
+      cons_case: lo < hi implies Result = range(lo + 1, hi).prepend(lo)
+    end
+
+  -- `x`, `f(x)`, `f(f(x))`, ...: `n` items.
+  iterate_n[A](f: A -> A, x: A, n: NAT): LIST[A]
+    variant
+      n
+    do
+      if n = 0 then
+        LIST.empty
+      else
+        iterate_n(f, f(x), n - 1).prepend(x)
+      end
+    ensure
+      len: Result.length = n
+      empty_case: n = 0 implies Result = LIST.empty
+      cons_case: n > 0 implies Result = iterate_n(f, f(x), n - 1).prepend(x)
+    end
+
+  -- `xs` with its item at `i` replaced by `x`, or `xs` itself when `i` is past the end (Task
+  -- H.5). `ARRAY.set` states its result with it.
+  update[A](xs: LIST[A], i: NAT, x: A): LIST[A]
+    variant
+      i
+    do
+      if xs.length = 0 then
+        xs
+      else if i = 0 then
+        xs.tail.prepend(x)
+      else
+        update(xs.tail, i - 1, x).prepend(xs.head)
+      end end
+    ensure
+      len: Result.length = xs.length
+      empty_case: xs.length = 0 implies Result = xs
+      head_case: (xs.length > 0 and i = 0) implies Result = xs.tail.prepend(x)
+      step_case: (xs.length > 0 and i > 0) implies Result = update(xs.tail, i - 1, x).prepend(xs.head)
+    end
+
+feature {NONE}
+
+  -- The item at `j` of `update(xs, i, x)`: `x` at `i`, and the item of `xs` elsewhere.
+  update_fact[A](xs: LIST[A], i: NAT, x: A, j: NAT): BOOL
+    require
+      inside: j < xs.length
+    variant
+      j
+    do
+      if j = 0 then
+        True
+      else if i = 0 then
+        check
+          put: LIST_OPS.at(xs.tail.prepend(x), j) = LIST_OPS.at(xs.tail, j - 1)
+          was: LIST_OPS.at(xs, j) = LIST_OPS.at(xs.tail, j - 1)
+        end
+        True
+      else
+        check
+          step: update_fact(xs.tail, i - 1, x, j - 1)
+          put: LIST_OPS.at(update(xs.tail, i - 1, x).prepend(xs.head), j) = LIST_OPS.at(update(xs.tail, i - 1, x), j - 1)
+          was: LIST_OPS.at(xs, j) = LIST_OPS.at(xs.tail, j - 1)
+        end
+        True
+      end end
+    ensure
+      holds: Result
+      same: i = j implies LIST_OPS.at(update(xs, i, x), j) = x
+      other: i != j implies LIST_OPS.at(update(xs, i, x), j) = LIST_OPS.at(xs, j)
+    end
+
+  take_update_fact[A](xs: LIST[A], k: NAT, x: A): BOOL
+    require
+      inside: k < xs.length
+      small: k < 18446744073709551615
+    variant
+      k
+    do
+      if k = 0 then
+        check
+          put: update(xs, 0, x) = xs.tail.prepend(x)
+          one: take(xs.tail.prepend(x), 1) = take(xs.tail, 0).prepend(x)
+          none: take(xs, 0) = LIST.empty
+        end
+        True
+      else
+        check
+          step: take_update_fact(xs.tail, k - 1, x)
+          put: update(xs, k, x) = update(xs.tail, k - 1, x).prepend(xs.head)
+          front: take(update(xs.tail, k - 1, x).prepend(xs.head), k + 1) = take(update(xs.tail, k - 1, x), k).prepend(xs.head)
+          was: take(xs, k) = take(xs.tail, k - 1).prepend(xs.head)
+          moved: take(xs.tail, k - 1).prepend(xs.head).append(LIST.empty.prepend(x)) = take(xs.tail, k - 1).append(LIST.empty.prepend(x)).prepend(xs.head)
+        end
+        True
+      end
+    ensure
+      holds: Result
+      grows: take(update(xs, k, x), k + 1) = take(xs, k).append(LIST.empty.prepend(x))
+    end
+
+  -- Inside this module a law is not an axiom, a contract is: each fact below is a routine
+  -- that states a fact for its arguments and holds, so a proof calls it where it needs it.
+
+  -- Reversing onto `acc` is reversing, then appending `acc`.
+  onto_fact[A](xs: LIST[A], acc: LIST[A]): BOOL
+    variant
+      xs.length
+    do
+      if xs.length = 0 then
+        True
+      else
+        let none: LIST[A] = LIST.empty
+        onto_fact(xs.tail, acc.prepend(xs.head)) and onto_fact(xs.tail, none.prepend(xs.head))
+      end
+    ensure
+      holds: Result
+      onto: reverse_onto(xs, acc) = reverse_onto(xs, LIST.empty).append(acc)
+    end
+
+  -- The reverse of a list is the reverse of its tail, then its head.
+  snoc_fact[A](xs: LIST[A]): BOOL
+    do
+      if xs.length = 0 then
+        True
+      else
+        let none: LIST[A] = LIST.empty
+        onto_fact(xs.tail, none.prepend(xs.head))
+      end
+    ensure
+      holds: Result
+      snoc: xs.length > 0 implies reverse(xs) = reverse(xs.tail).append(LIST.empty.prepend(xs.head))
+    end
+
+  append_fact[A](xs: LIST[A], ys: LIST[A]): BOOL
+    variant
+      xs.length
+    do
+      if xs.length = 0 then
+        True
+      else
+        check
+          cons: xs.tail.prepend(xs.head) = xs
+          split: xs.append(ys) = xs.tail.append(ys).prepend(xs.head)
+          whole_snoc: snoc_fact(xs.append(ys))
+          snoc: snoc_fact(xs)
+          step: append_fact(xs.tail, ys)
+        end
+        True
+      end
+    ensure
+      holds: Result
+      distributes: reverse(xs.append(ys)) = reverse(ys).append(reverse(xs))
+    end
+
+  -- Over a monoid, a left fold from `a` is `a` combined with the fold from the identity.
+  monoid_acc_fact[A](xs: LIST[A], f: (acc: A, x: A) -> A, e: A, a: A): BOOL
+    require
+      associative: forall p: A. forall q: A. forall r: A. f(f(p, q), r) = f(p, f(q, r))
+      left_identity: forall p: A. f(e, p) = p
+      right_identity: forall p: A. f(p, e) = p
+    variant
+      xs.length
+    do
+      if xs.length = 0 then
+        True
+      else
+        check
+          cons: xs.tail.prepend(xs.head) = xs
+          unit: f(e, xs.head) = xs.head
+          from_a: monoid_acc_fact(xs.tail, f, e, f(a, xs.head))
+          from_head: monoid_acc_fact(xs.tail, f, e, xs.head)
+          regroup: f(f(a, xs.head), LIST_OPS.fold_left(xs.tail, f, e)) = f(a, f(xs.head, LIST_OPS.fold_left(xs.tail, f, e)))
+        end
+        True
+      end
+    ensure
+      holds: Result
+      acc: LIST_OPS.fold_left(xs, f, a) = f(a, LIST_OPS.fold_left(xs, f, e))
+    end
+
+  -- A left fold with `g` from `f(x, y)` is `f(x, _)` of the fold from `y`.
+  mixed_acc_fact[A, B](xs: LIST[A], f: (x: A, acc: B) -> B, g: (acc: B, x: A) -> B, x: A, y: B): BOOL
+    require
+      mixed: forall p: A. forall q: B. forall r: A. f(p, g(q, r)) = g(f(p, q), r)
+    variant
+      xs.length
+    do
+      if xs.length = 0 then
+        True
+      else
+        check
+          cons: xs.tail.prepend(xs.head) = xs
+          regroup: f(x, g(y, xs.head)) = g(f(x, y), xs.head)
+          step: mixed_acc_fact(xs.tail, f, g, x, g(y, xs.head))
+        end
+        True
+      end
+    ensure
+      holds: Result
+      acc: LIST_OPS.fold_left(xs, g, f(x, y)) = f(x, LIST_OPS.fold_left(xs, g, y))
+    end
+
+  concat_map_append_fact[A, B](xs: LIST[A], ys: LIST[A], f: A -> LIST[B]): BOOL
+    variant
+      xs.length
+    do
+      if xs.length = 0 then
+        True
+      else
+        check
+          cons: xs.tail.prepend(xs.head) = xs
+          split: xs.append(ys) = xs.tail.append(ys).prepend(xs.head)
+          step: concat_map_append_fact(xs.tail, ys, f)
+        end
+        True
+      end
+    ensure
+      holds: Result
+      distributes: concat_map(xs.append(ys), f) = concat_map(xs, f).append(concat_map(ys, f))
     end
 
 specify {ANY}
@@ -134,6 +567,43 @@ specify {ANY}
       right: k >= xs.length implies LIST_OPS.at(xs.append(ys), k) = LIST_OPS.at(ys, k - xs.length)
     end
 
+  -- The item `update` puts, and every other item, unchanged (Task H.5). With their triggers
+  -- the solver applies them wherever an updated list is indexed.
+  law at_update_same[A](xs: LIST[A], i: NAT, x: A)
+    require
+      inside: i < xs.length
+    trigger
+      LIST_OPS.at(LIST_OPS.update(xs, i, x), i)
+    do
+      update_fact(xs, i, x, i)
+    ensure
+      same: LIST_OPS.at(LIST_OPS.update(xs, i, x), i) = x
+    end
+
+  law at_update_other[A](xs: LIST[A], i: NAT, x: A, j: NAT)
+    require
+      inside: j < xs.length
+      other: i != j
+    trigger
+      LIST_OPS.at(LIST_OPS.update(xs, i, x), j)
+    do
+      update_fact(xs, i, x, j)
+    ensure
+      unchanged: LIST_OPS.at(LIST_OPS.update(xs, i, x), j) = LIST_OPS.at(xs, j)
+    end
+
+  -- The first `k + 1` items after an `update` at `k`: the first `k` items, then the new one
+  -- (Task H.3). A loop that fills a list by index calls it at each step.
+  law take_update[A](xs: LIST[A], k: NAT, x: A)
+    require
+      inside: k < xs.length
+      small: k < 18446744073709551615
+    do
+      take_update_fact(xs, k, x)
+    ensure
+      grows: LIST_OPS.take(LIST_OPS.update(xs, k, x), k + 1) = LIST_OPS.take(xs, k).append(LIST.empty.prepend(x))
+    end
+
   -- An item of the tail is the next item of the list.
   law at_tail[A](xs: LIST[A], k: NAT)
     require
@@ -152,5 +622,256 @@ specify {ANY}
              LIST_OPS.fold_left(xs, fn(acc: C, x: A): C do f(acc, g(x)) end, init)
     end
 
-end
+  -- B&W §3.3: two maps are one map of the composition.
+  law map_fusion[A, B, C](xs: LIST[A], g: A -> B, f: B -> C)
+    variant
+      xs.length
+    do
+      if xs.length = 0 then
+        True
+      else
+        xs.tail.prepend(xs.head) = xs and map_fusion(xs.tail, g, f)
+      end
+    ensure
+      fused: LIST_OPS.map(LIST_OPS.map(xs, g), f) = LIST_OPS.map(xs, FUNCTION_OPS.compose(f, g))
+    end
 
+  -- B&W §3.5: filtering after a map is mapping after filtering by the composition.
+  law filter_map[A, B](xs: LIST[A], f: A -> B, p: B -> BOOL)
+    variant
+      xs.length
+    do
+      if xs.length = 0 then
+        True
+      else
+        xs.tail.prepend(xs.head) = xs and filter_map(xs.tail, f, p)
+      end
+    ensure
+      commutes: LIST_OPS.filter(LIST_OPS.map(xs, f), p) = LIST_OPS.map(LIST_OPS.filter(xs, FUNCTION_OPS.compose(p, f)), f)
+    end
+
+  -- What follows the first `i` items is the item at `i`, then what follows it (Task H.6). A
+  -- loop over a list by index calls it at each step, to read the list's model one item on.
+  law drop_step[A](xs: LIST[A], i: NAT)
+    require
+      in_bounds: i < xs.length
+      small: i < 18446744073709551615
+    variant
+      i
+    do
+      if i = 0 then
+        xs.tail.prepend(xs.head) = xs
+      else
+        drop_step(xs.tail, i - 1)
+      end
+    ensure
+      step: LIST_OPS.drop(xs, i) = LIST_OPS.drop(xs, i + 1).prepend(LIST_OPS.at(xs, i))
+    end
+
+  -- B&W §3.4: the first `n` items, then the rest, are the list.
+  law take_drop[A](xs: LIST[A], n: NAT)
+    variant
+      n
+    do
+      if n = 0 or xs.length = 0 then
+        True
+      else
+        xs.tail.prepend(xs.head) = xs and take_drop(xs.tail, n - 1)
+      end
+    ensure
+      whole: LIST_OPS.take(xs, n).append(LIST_OPS.drop(xs, n)) = xs
+    end
+
+  law take_while_drop_while[A](xs: LIST[A], p: A -> BOOL)
+    variant
+      xs.length
+    do
+      if xs.length = 0 then
+        True
+      else
+        xs.tail.prepend(xs.head) = xs and take_while_drop_while(xs.tail, p)
+      end
+    ensure
+      whole: LIST_OPS.take_while(xs, p).append(LIST_OPS.drop_while(xs, p)) = xs
+    end
+
+  law reverse_cons[A](x: A, xs: LIST[A])
+    do
+      snoc_fact(xs.prepend(x)) and xs.prepend(x).tail = xs and xs.prepend(x).head = x
+    ensure
+      snoc: LIST_OPS.reverse(xs.prepend(x)) = LIST_OPS.reverse(xs).append(LIST.empty.prepend(x))
+    end
+
+  law reverse_append[A](xs: LIST[A], ys: LIST[A])
+    do
+      append_fact(xs, ys)
+    ensure
+      distributes: LIST_OPS.reverse(xs.append(ys)) = LIST_OPS.reverse(ys).append(LIST_OPS.reverse(xs))
+    end
+
+  law reverse_reverse[A](xs: LIST[A])
+    variant
+      xs.length
+    do
+      if xs.length = 0 then
+        True
+      else
+        let none: LIST[A] = LIST.empty
+        xs.tail.prepend(xs.head) = xs and
+          snoc_fact(xs) and
+          append_fact(LIST_OPS.reverse(xs.tail), none.prepend(xs.head)) and
+          snoc_fact(none.prepend(xs.head)) and
+          reverse_reverse(xs.tail)
+      end
+    ensure
+      twice: LIST_OPS.reverse(LIST_OPS.reverse(xs)) = xs
+    end
+
+  law init_last[A](xs: LIST[A])
+    require
+      not_empty: xs.length > 0
+    variant
+      xs.length
+    do
+      if xs.length = 1 then
+        xs.tail.prepend(xs.head) = xs
+      else
+        xs.tail.prepend(xs.head) = xs and init_last(xs.tail)
+      end
+    ensure
+      whole: LIST_OPS.init(xs).append(LIST.empty.prepend(LIST_OPS.last(xs))) = xs
+    end
+
+  -- B&W §3.5.1, the first duality theorem: over a monoid, both folds agree.
+  law fold_duality_first[A](xs: LIST[A], f: (x: A, y: A) -> A, e: A)
+    require
+      associative: forall p: A. forall q: A. forall r: A. f(f(p, q), r) = f(p, f(q, r))
+      left_identity: forall p: A. f(e, p) = p
+      right_identity: forall p: A. f(p, e) = p
+    variant
+      xs.length
+    do
+      if xs.length = 0 then
+        True
+      else
+        xs.tail.prepend(xs.head) = xs and
+          f(e, xs.head) = xs.head and
+          monoid_acc_fact(xs.tail, f, e, xs.head) and fold_duality_first(xs.tail, f, e)
+      end
+    ensure
+      agree: LIST_OPS.fold_right(xs, f, e) = LIST_OPS.fold_left(xs, f, e)
+    end
+
+  -- The second duality theorem: `f` and `g` associate with each other, and agree on `a`.
+  law fold_duality_second[A, B](xs: LIST[A], f: (x: A, acc: B) -> B, g: (acc: B, x: A) -> B, a: B)
+    require
+      mixed: forall p: A. forall q: B. forall r: A. f(p, g(q, r)) = g(f(p, q), r)
+      swap: forall p: A. f(p, a) = g(a, p)
+    variant
+      xs.length
+    do
+      if xs.length = 0 then
+        True
+      else
+        xs.tail.prepend(xs.head) = xs and
+          f(xs.head, a) = g(a, xs.head) and
+          mixed_acc_fact(xs.tail, f, g, xs.head, a) and fold_duality_second(xs.tail, f, g, a)
+      end
+    ensure
+      agree: LIST_OPS.fold_right(xs, f, a) = LIST_OPS.fold_left(xs, g, a)
+    end
+
+  -- The third duality theorem: a right fold is a left fold of the reverse with `f` flipped.
+  law fold_duality_third[A, B](xs: LIST[A], f: (x: A, acc: B) -> B, g: (acc: B, x: A) -> B, a: B)
+    require
+      flipped: forall p: A. forall q: B. g(q, p) = f(p, q)
+    variant
+      xs.length
+    do
+      if xs.length = 0 then
+        True
+      else
+        let none: LIST[A] = LIST.empty
+        xs.tail.prepend(xs.head) = xs and
+          snoc_fact(xs) and
+          g(LIST_OPS.fold_left(LIST_OPS.reverse(xs.tail), g, a), xs.head) = f(xs.head, LIST_OPS.fold_left(LIST_OPS.reverse(xs.tail), g, a)) and
+          fold_duality_third(xs.tail, f, g, a)
+      end
+    ensure
+      agree: LIST_OPS.fold_right(xs, f, a) = LIST_OPS.fold_left(LIST_OPS.reverse(xs), g, a)
+    end
+
+  -- A monoid fold is a homomorphism from append to the monoid's operator.
+  law fold_homomorphism[A](xs: LIST[A], ys: LIST[A], f: (acc: A, x: A) -> A, e: A)
+    require
+      associative: forall p: A. forall q: A. forall r: A. f(f(p, q), r) = f(p, f(q, r))
+      left_identity: forall p: A. f(e, p) = p
+      right_identity: forall p: A. f(p, e) = p
+    do
+      monoid_acc_fact(ys, f, e, LIST_OPS.fold_left(xs, f, e))
+    ensure
+      splits: LIST_OPS.fold_left(xs.append(ys), f, e) = f(LIST_OPS.fold_left(xs, f, e), LIST_OPS.fold_left(ys, f, e))
+    end
+
+  -- B&W §3.3: `concat_map` is `concat` after `map`.
+  law concat_map_is_concat_map[A, B](xs: LIST[A], f: A -> LIST[B])
+    variant
+      xs.length
+    do
+      if xs.length = 0 then
+        True
+      else
+        xs.tail.prepend(xs.head) = xs and concat_map_is_concat_map(xs.tail, f)
+      end
+    ensure
+      same: LIST_OPS.concat_map(xs, f) = LIST_OPS.concat(LIST_OPS.map(xs, f))
+    end
+
+  law concat_map_append[A, B](xs: LIST[A], ys: LIST[A], f: A -> LIST[B])
+    do
+      concat_map_append_fact(xs, ys, f)
+    ensure
+      distributes: LIST_OPS.concat_map(xs.append(ys), f) = LIST_OPS.concat_map(xs, f).append(LIST_OPS.concat_map(ys, f))
+    end
+
+  -- The monad laws of `concat_map`, named as `OPTION.and_then`'s are.
+  law concat_map_left_unit[A, B](x: A, f: A -> LIST[B])
+    ensure
+      left_id: LIST_OPS.concat_map(LIST.empty.prepend(x), f) = f(x)
+    end
+
+  law concat_map_right_identity[A](xs: LIST[A], unit: A -> LIST[A])
+    require
+      is_unit: forall p: A. unit(p) = LIST.empty.prepend(p)
+    variant
+      xs.length
+    do
+      if xs.length = 0 then
+        True
+      else
+        xs.tail.prepend(xs.head) = xs and unit(xs.head) = LIST.empty.prepend(xs.head) and
+          concat_map_right_identity(xs.tail, unit)
+      end
+    ensure
+      right_id: LIST_OPS.concat_map(xs, unit) = xs
+    end
+
+  law concat_map_associative[A, B, C](xs: LIST[A], f: A -> LIST[B], g: B -> LIST[C], h: A -> LIST[C])
+    require
+      composed: forall p: A. h(p) = LIST_OPS.concat_map(f(p), g)
+    variant
+      xs.length
+    do
+      if xs.length = 0 then
+        True
+      else
+        xs.tail.prepend(xs.head) = xs and
+          h(xs.head) = LIST_OPS.concat_map(f(xs.head), g) and
+          concat_map_append_fact(f(xs.head), LIST_OPS.concat_map(xs.tail, f), g) and
+          concat_map_associative(xs.tail, f, g, h)
+      end
+    ensure
+      assoc: LIST_OPS.concat_map(LIST_OPS.concat_map(xs, f), g) = LIST_OPS.concat_map(xs, h)
+    end
+
+end

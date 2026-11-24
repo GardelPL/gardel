@@ -43,7 +43,7 @@ feature {ANY}
     do
       if t = LIST.empty then
         racc
-      else if t.head >= 0 and t.head < 256 then
+      else if t.head < 256 then
         push_text(t.tail, push_byte(t.head, racc))
       else
         push_text(t.tail, racc)

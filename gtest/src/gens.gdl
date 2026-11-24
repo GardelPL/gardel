@@ -1,0 +1,178 @@
+-- Generators for numbers, lists and text (Task H.9).
+functions GENS
+
+feature {ANY}
+
+  -- The pair of `a` and `b`. A tuple written on the line after a `let` would be read as a call
+  -- of the `let`'s value, so a step that binds a name gives its pair through this.
+  both[A, B](a: A, b: B): TUPLE[A, B]
+    do
+      (a, b)
+    ensure
+      left: Result.first = a
+      right: Result.second = b
+    end
+
+  -- Every `U64`.
+  u64: GEN[U64]
+    do
+      GEN.make(fn(s: U64): TUPLE[U64, U64] do SPLIT_MIX.step(s) end)
+    end
+
+  -- A `NAT` below `bound`.
+  nat_below(bound: NAT): GEN[NAT]
+    require
+      positive: bound > 0
+    do
+      GEN.make(fn(s: U64): TUPLE[NAT, U64] do GENS.below(bound, s) end)
+    end
+
+  -- The step of `nat_below`.
+  below(bound: NAT, s: U64): TUPLE[NAT, U64]
+    require
+      positive: bound > 0
+    do
+      let r = SPLIT_MIX.step(s)
+      GENS.both(r.first % bound, r.second)
+    ensure
+      under: Result.first < bound
+    end
+
+  -- A `NAT` from `lo` to `hi`, both included.
+  nat_in(lo: NAT, hi: NAT): GEN[NAT]
+    require
+      ordered: lo <= hi
+      not_all: hi - lo < 18446744073709551615
+    do
+      GEN.make(fn(s: U64): TUPLE[NAT, U64] do GENS.between(lo, hi, s) end)
+    end
+
+  -- The step of `nat_in`.
+  between(lo: NAT, hi: NAT, s: U64): TUPLE[NAT, U64]
+    require
+      ordered: lo <= hi
+      not_all: hi - lo < 18446744073709551615
+    do
+      let r = GENS.below(hi - lo + 1, s)
+      GENS.both(lo + r.first, r.second)
+    ensure
+      low: lo <= Result.first
+      high: Result.first <= hi
+    end
+
+  bool: GEN[BOOL]
+    do
+      GEN.make(fn(s: U64): TUPLE[BOOL, U64] do GENS.coin(s) end)
+    end
+
+  -- The step of `bool`.
+  coin(s: U64): TUPLE[BOOL, U64]
+    do
+      let r = SPLIT_MIX.step(s)
+      GENS.both(r.first % 2 = 1, r.second)
+    end
+
+  -- Lists of at most `max_length` values of `g`.
+  list[A](g: GEN[A], max_length: NAT): GEN[LIST[A]]
+    require
+      bounded: max_length < 18446744073709551615
+    do
+      GEN.make(fn(s: U64): TUPLE[LIST[A], U64] do GENS.list_at(g, max_length, s) end)
+    end
+
+  -- The step of `list`: a length, then that many values.
+  list_at[A](g: GEN[A], max_length: NAT, s: U64): TUPLE[LIST[A], U64]
+    require
+      bounded: max_length < 18446744073709551615
+    do
+      let n = GENS.below(max_length + 1, s)
+      GENS.values(g, n.first, n.second, LIST.empty)
+    ensure
+      short: Result.first.length <= max_length
+    end
+
+  -- `n` values of `g` from state `s`, after `acc` reversed.
+  values[A](g: GEN[A], n: NAT, s: U64, acc: LIST[A]): TUPLE[LIST[A], U64]
+    variant
+      n
+    do
+      if n = 0 then
+        (LIST_OPS.reverse(acc), s)
+      else
+        let r = g.run(s)
+        GENS.values(g, n - 1, r.second, acc.prepend(r.first))
+      end
+    ensure
+      counted: Result.first.length = acc.length + n
+    end
+
+  -- Text of at most `max_length` characters of `alphabet`.
+  text_from(alphabet: STRING, max_length: NAT): GEN[STRING]
+    require
+      some: alphabet.code_point_count > 0
+      bounded: max_length <= 1000000
+    do
+      GEN.make(fn(s: U64): TUPLE[STRING, U64] do GENS.text_at(alphabet, max_length, s) end)
+    end
+
+  -- Text of at most `max_length` printable ASCII characters, space included.
+  text(max_length: NAT): GEN[STRING]
+    require
+      bounded: max_length <= 1000000
+    do
+      GENS.text_from(" !\"#$%&'()*+,-./0123456789:;<=>?@ABCDEFGHIJKLMNOPQRSTUVWXYZ[\\]^_`abcdefghijklmnopqrstuvwxyz{|}~", max_length)
+    end
+
+  -- The step of `text_from`.
+  text_at(alphabet: STRING, max_length: NAT, s: U64): TUPLE[STRING, U64]
+    require
+      some: alphabet.code_point_count > 0
+      bounded: max_length <= 1000000
+    do
+      let n = GENS.below(max_length + 1, s)
+      GENS.chars(alphabet, n.first, n.second, STRING_BUILDER.empty)
+    end
+
+  -- `n` characters of `alphabet` from state `s`, after `out`.
+  chars(alphabet: STRING, n: NAT, s: U64, out: STRING_BUILDER): TUPLE[STRING, U64]
+    require
+      some: alphabet.code_point_count > 0
+    variant
+      n
+    do
+      if n = 0 then
+        (out.to_string, s)
+      else
+        let r = GENS.below(alphabet.code_point_count, s)
+        GENS.chars(alphabet, n - 1, r.second, CHECK.add(out, STRING.from_char(alphabet.character_at(r.first))))
+      end
+    end
+
+  -- `f` of each value of `g`.
+  map[A, B](g: GEN[A], f: A -> B): GEN[B]
+    do
+      GEN.make(fn(s: U64): TUPLE[B, U64] do GENS.mapped(g, f, s) end)
+    end
+
+  -- The step of `map`.
+  mapped[A, B](g: GEN[A], f: A -> B, s: U64): TUPLE[B, U64]
+    do
+      let r = g.run(s)
+      GENS.both(f(r.first), r.second)
+    end
+
+  -- A value of `g` and one of `h`, as a pair.
+  pair[A, B](g: GEN[A], h: GEN[B]): GEN[TUPLE[A, B]]
+    do
+      GEN.make(fn(s: U64): TUPLE[TUPLE[A, B], U64] do GENS.paired(g, h, s) end)
+    end
+
+  -- The step of `pair`.
+  paired[A, B](g: GEN[A], h: GEN[B], s: U64): TUPLE[TUPLE[A, B], U64]
+    do
+      let a = g.run(s)
+      let b = h.run(a.second)
+      GENS.both((a.first, b.first), b.second)
+    end
+
+end

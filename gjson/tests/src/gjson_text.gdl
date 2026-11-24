@@ -61,35 +61,6 @@ feature {ANY}
       end
     end
 
-  -- `raw` with each `%XX` replaced by the byte with hex value `XX`, from index `i`.
-  unescape(raw: BYTES, i: NAT, out: BYTES_BUILDER): BYTES
-    require
-      inside: i <= raw.length
-    variant
-      raw.length - i
-    do
-      if i = raw.length or out.length >= 1000000 then
-        out.to_bytes
-      else
-        let b = raw.at(i)
-        if b = 37 and raw.length - i > 2 then
-          let x = NUMBER_TEXT.hex_value(raw.at(i + 1)) * 16 + NUMBER_TEXT.hex_value(raw.at(i + 2))
-          if x < 256 then unescape(raw, i + 3, out.add_byte(x)) else out.to_bytes end
-        else
-          unescape(raw, i + 1, out.add_byte(b))
-        end
-      end
-    end
-
-  -- `s` with each `%XX` replaced by its byte, as text.
-  decoded(s: STRING): STRING
-    do
-      match STRING.from_utf8(unescape(s.to_utf8, 0, BYTES_BUILDER.empty))
-        case Ok(t) then t
-        case Error(_) then s
-      end
-    end
-
   -- `n` copies of `part`, after `out`.
   repeat(part: BYTES, n: NAT, out: BYTES_BUILDER): BYTES_BUILDER
     variant
@@ -122,6 +93,34 @@ feature {ANY}
       end
     end
 
+  -- The numbers from 0 to `n - 1`, in front of `vs`.
+  numbers(n: NAT, vs: LIST[JSON]): LIST[JSON]
+    require
+      few: n <= 1000000
+    variant
+      n
+    do
+      if n = 0 then vs else numbers(n - 1, vs.prepend(JSON.int(I64.from_nat(n - 1)))) end
+    end
+
+  -- The array `JSON_ARRAY` makes of `vs`, written, or nothing if it makes none.
+  array_of(vs: LIST[JSON]): BYTES
+    do
+      match JSON_ARRAY.of(vs)
+        case Some(v) then v.to_bytes
+        case None then BYTES.empty
+      end
+    end
+
+  -- The array of the value `b` holds, written.
+  boxed(b: BYTES): BYTES
+    do
+      match JSON.parse(b)
+        case Ok(v) then array_of(LIST.empty.prepend(v))
+        case Error(_) then BYTES.empty
+      end
+    end
+
   -- The document that `@kind n` stands for.
   generated(kind: STRING, n: NAT): BYTES
     do
@@ -138,45 +137,34 @@ feature {ANY}
         add(fields(n, add(b, "{")), "}").to_bytes
       else if kind.equals("digits") then
         repeat("9".to_utf8, n, b).to_bytes
+      else if kind.equals("array") then
+        array_of(numbers(if n <= 1000000 then n else 1000000 end, LIST.empty))
+      else if kind.equals("boxed") then
+        boxed(repeat("]".to_utf8, n, repeat("[".to_utf8, n, b)).to_bytes)
       else
         b.to_bytes
-      end end end end end end
+      end end end end end end end end
     end
 
-  -- 0 if a line of `cases.txt` holds, or is a comment, else 1.
-  check_line(line: STRING): NAT
+  -- What `JSON.parse` says of the document a case stands for: its bytes, with `%XX` read as
+  -- a byte, or `@kind n` for a generated one, summed up but for a short array.
+  got(doc: STRING): STRING
     do
-      if line.code_point_count = 0 or line.starts_with("#") then
-        0
-      else
-        match line.find(" => ", 0)
-          case None then
-            1
-          case Some(i) then
-            if i + 4 > line.code_point_count then
-              1
+      if doc.starts_with("@") then
+        match doc.find_char(' ', 0)
+          case None then "bad case"
+          case Some(sp) then
+            if sp + 1 <= doc.code_point_count then
+              match NUMBER_TEXT.parse_nat(doc.slice(sp + 1, doc.code_point_count))
+                case Ok(n) then describe(JSON.parse(generated(doc.slice(1, sp), n)), n > 20 or not doc.starts_with("@array"))
+                case Error(_) then "bad count"
+              end
             else
-              let doc = line.slice(0, i)
-              let expected = decoded(line.slice(i + 4, line.code_point_count))
-              let got = if doc.starts_with("@") then
-                  match doc.find_char(' ', 0)
-                    case None then "bad case"
-                    case Some(sp) then
-                      if sp + 1 <= doc.code_point_count then
-                        match NUMBER_TEXT.parse_nat(doc.slice(sp + 1, doc.code_point_count))
-                          case Ok(n) then describe(JSON.parse(generated(doc.slice(1, sp), n)), True)
-                          case Error(_) then "bad count"
-                        end
-                      else
-                        "bad case"
-                      end
-                  end
-                else
-                  describe(JSON.parse(unescape(doc.to_utf8, 0, BYTES_BUILDER.empty)), False)
-                end
-              if got.equals(expected) then 0 else 1 end
+              "bad case"
             end
         end
+      else
+        describe(JSON.parse(CASES.bytes(doc)), False)
       end
     end
 

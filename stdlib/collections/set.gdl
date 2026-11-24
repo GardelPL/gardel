@@ -1,0 +1,422 @@
+-- A finite set of ordered keys (Task H.4).
+--
+-- A client sees `has`, `add`, `remove`, `union`, `intersection`, `size` and `items`, and the
+-- laws below, which state what `has` says after each change. Keys are compared with `K`'s
+-- `equals` and ordered by its `less_than`.
+--
+-- The representation is hidden: the keys in ascending order, as `MAP` keeps them. `has`,
+-- `add` and `remove` take time linear in the size, `union` the product of the two sizes and
+-- `intersection` the same.
+module SET[K: ORD]
+
+representation {NONE}
+  ks: LIST[K]
+
+invariant
+  sorted: KEY_ORDER.ascending(ks)
+
+create {ANY}
+
+  empty: SET[K]
+    do
+      { ks = LIST.empty }
+    ensure
+      no_keys: Result.size = 0
+    end
+
+create {NONE}
+
+  -- Some key of `xs` is equal to `k`.
+  member(xs: LIST[K], k: K): BOOL
+    variant
+      xs.length
+    do
+      if xs.length = 0 then False else xs.head.equals(k) or SET.member(xs.tail, k) end
+    end
+
+  -- `xs` with each key of `ys` put in its place.
+  union_keys(xs: LIST[K], ys: LIST[K]): LIST[K]
+    variant
+      ys.length
+    do
+      if ys.length = 0 then xs else SET.union_keys(KEY_ORDER.put_keys(xs, ys.head), ys.tail) end
+    end
+
+  -- The keys of `xs` that `ys` has, in their order.
+  common_keys(xs: LIST[K], ys: LIST[K]): LIST[K]
+    variant
+      xs.length
+    do
+      if xs.length = 0 then
+        xs
+      else
+        let rest = SET.common_keys(xs.tail, ys)
+        if SET.member(ys, xs.head) then rest.prepend(xs.head) else rest end
+      end
+    end
+
+  -- Lemmas, each proven by induction.
+
+  -- Keys equal to each other are members together.
+  member_equal(xs: LIST[K], a: K, b: K): BOOL
+    require
+      same: a.equals(b)
+    variant
+      xs.length
+    do
+      if xs.length = 0 then True else SET.member_equal(xs.tail, a, b) end
+    ensure
+      holds: Result
+      together: SET.member(xs, a) = SET.member(xs, b)
+    end
+
+  member_put(xs: LIST[K], j: K, k: K): BOOL
+    variant
+      xs.length
+    do
+      if xs.length = 0 or xs.head.equals(j) or j.less_than(xs.head) then True else SET.member_put(xs.tail, j, k) end
+    ensure
+      holds: Result
+      put: SET.member(KEY_ORDER.put_keys(xs, j), k) = (j.equals(k) or SET.member(xs, k))
+    end
+
+  member_remove(xs: LIST[K], j: K, k: K): BOOL
+    variant
+      xs.length
+    do
+      if xs.length = 0 then True else SET.member_remove(xs.tail, j, k) end
+    ensure
+      holds: Result
+      removed: SET.member(KEY_ORDER.remove_keys(xs, j), k) = (SET.member(xs, k) and not j.equals(k))
+    end
+
+  member_union(xs: LIST[K], ys: LIST[K], k: K): BOOL
+    variant
+      ys.length
+    do
+      if ys.length = 0 then
+        True
+      else
+        check
+          put: SET.member_put(xs, ys.head, k)
+        end
+        SET.member_union(KEY_ORDER.put_keys(xs, ys.head), ys.tail, k)
+      end
+    ensure
+      holds: Result
+      either: SET.member(SET.union_keys(xs, ys), k) = (SET.member(xs, k) or SET.member(ys, k))
+    end
+
+  member_common(xs: LIST[K], ys: LIST[K], k: K): BOOL
+    variant
+      xs.length
+    do
+      if xs.length = 0 then
+        True
+      else if xs.head.equals(k) then
+        check
+          moved: SET.member_equal(ys, xs.head, k)
+        end
+        SET.member_common(xs.tail, ys, k)
+      else
+        SET.member_common(xs.tail, ys, k)
+      end end
+    ensure
+      holds: Result
+      both: SET.member(SET.common_keys(xs, ys), k) = (SET.member(xs, k) and SET.member(ys, k))
+    end
+
+  union_sorted(xs: LIST[K], ys: LIST[K]): BOOL
+    require
+      sorted: KEY_ORDER.ascending(xs)
+    variant
+      ys.length
+    do
+      if ys.length = 0 then
+        True
+      else
+        check
+          put: KEY_ORDER.ascending_put(xs, ys.head)
+        end
+        SET.union_sorted(KEY_ORDER.put_keys(xs, ys.head), ys.tail)
+      end
+    ensure
+      holds: Result
+      kept: KEY_ORDER.ascending(SET.union_keys(xs, ys))
+    end
+
+  above_common(lo: K, xs: LIST[K], ys: LIST[K]): BOOL
+    require
+      above: KEY_ORDER.above(lo, xs)
+    variant
+      xs.length
+    do
+      if xs.length = 0 then True else SET.above_common(lo, xs.tail, ys) end
+    ensure
+      holds: Result
+      kept: KEY_ORDER.above(lo, SET.common_keys(xs, ys))
+    end
+
+  common_sorted(xs: LIST[K], ys: LIST[K]): BOOL
+    require
+      sorted: KEY_ORDER.ascending(xs)
+    variant
+      xs.length
+    do
+      if xs.length = 0 then
+        True
+      else
+        check
+          head: SET.above_common(xs.head, xs.tail, ys)
+        end
+        SET.common_sorted(xs.tail, ys)
+      end
+    ensure
+      holds: Result
+      kept: KEY_ORDER.ascending(SET.common_keys(xs, ys))
+    end
+
+  add_grows(xs: LIST[K], k: K): BOOL
+    require
+      absent: not SET.member(xs, k)
+    variant
+      xs.length
+    do
+      if xs.length = 0 or k.less_than(xs.head) then True else SET.add_grows(xs.tail, k) end
+    ensure
+      holds: Result
+      grows: KEY_ORDER.put_keys(xs, k).length = xs.length + 1
+    end
+
+  add_at_most(xs: LIST[K], k: K): BOOL
+    variant
+      xs.length
+    do
+      if xs.length = 0 or xs.head.equals(k) or k.less_than(xs.head) then True else SET.add_at_most(xs.tail, k) end
+    ensure
+      holds: Result
+      at_most: KEY_ORDER.put_keys(xs, k).length <= xs.length + 1
+    end
+
+  remove_absent(xs: LIST[K], k: K): BOOL
+    require
+      absent: not SET.member(xs, k)
+    variant
+      xs.length
+    do
+      if xs.length = 0 then True else SET.remove_absent(xs.tail, k) end
+    ensure
+      holds: Result
+      kept: KEY_ORDER.remove_keys(xs, k).length = xs.length
+    end
+
+  remove_at_most(xs: LIST[K], k: K): BOOL
+    variant
+      xs.length
+    do
+      if xs.length = 0 then True else SET.remove_at_most(xs.tail, k) end
+    ensure
+      holds: Result
+      at_most: KEY_ORDER.remove_keys(xs, k).length <= xs.length
+    end
+
+  common_at_most(xs: LIST[K], ys: LIST[K]): BOOL
+    variant
+      xs.length
+    do
+      if xs.length = 0 then True else SET.common_at_most(xs.tail, ys) end
+    ensure
+      holds: Result
+      at_most: SET.common_keys(xs, ys).length <= xs.length
+    end
+
+feature {ANY}
+
+  -- How many keys the set holds.
+  size: NAT
+    do
+      Current.ks.length
+    end
+
+  -- Whether the set has a key equal to `k`.
+  has(k: K): BOOL
+    do
+      SET.member(Current.ks, k)
+    end
+
+  -- The set with `k`. A key equal to `k` already there is kept as it is.
+  add(k: K): SET[K]
+    do
+      check
+        sorted: KEY_ORDER.ascending_put(Current.ks, k)
+      end
+      { ks = KEY_ORDER.put_keys(Current.ks, k) }
+    end
+
+  -- The set with no key equal to `k`.
+  remove(k: K): SET[K]
+    do
+      check
+        sorted: KEY_ORDER.ascending_remove(Current.ks, k)
+      end
+      { ks = KEY_ORDER.remove_keys(Current.ks, k) }
+    end
+
+  -- The keys of either set.
+  union(other: SET[K]): SET[K]
+    do
+      check
+        sorted: SET.union_sorted(Current.ks, other.ks)
+      end
+      { ks = SET.union_keys(Current.ks, other.ks) }
+    end
+
+  -- The keys of both sets.
+  intersection(other: SET[K]): SET[K]
+    do
+      check
+        sorted: SET.common_sorted(Current.ks, other.ks)
+        fewer: SET.common_at_most(Current.ks, other.ks)
+      end
+      { ks = SET.common_keys(Current.ks, other.ks) }
+    ensure
+      at_most: Result.size <= Current.size
+    end
+
+  -- The keys, in ascending order.
+  items: LIST[K]
+    do
+      Current.ks
+    ensure
+      sorted: KEY_ORDER.ascending(Result)
+      counted: Result.length = Current.size
+    end
+
+specify {ANY}
+
+  -- What `has` says after each change. With these a client proves facts about a set
+  -- without seeing how it is kept.
+
+  law has_empty(s: SET[K], k: K)
+    require
+      no_keys: s.size = 0
+    trigger
+      s.has(k)
+    ensure
+      nothing: not s.has(k)
+    end
+
+  law has_add_same(s: SET[K], k: K)
+    trigger
+      s.add(k).has(k)
+    do
+      SET.member_put(s.ks, k, k)
+    ensure
+      found: s.add(k).has(k)
+    end
+
+  law has_add_other(s: SET[K], k: K, j: K)
+    require
+      other: not j.equals(k)
+    trigger
+      s.add(k).has(j)
+    do
+      SET.member_put(s.ks, k, j)
+    ensure
+      unchanged: s.add(k).has(j) = s.has(j)
+    end
+
+  law has_remove_same(s: SET[K], k: K)
+    trigger
+      s.remove(k).has(k)
+    do
+      SET.member_remove(s.ks, k, k)
+    ensure
+      gone: not s.remove(k).has(k)
+    end
+
+  law has_remove_other(s: SET[K], k: K, j: K)
+    require
+      other: not j.equals(k)
+    trigger
+      s.remove(k).has(j)
+    do
+      SET.member_remove(s.ks, k, j)
+    ensure
+      unchanged: s.remove(k).has(j) = s.has(j)
+    end
+
+  law has_union(s: SET[K], t: SET[K], k: K)
+    trigger
+      s.union(t).has(k)
+    do
+      SET.member_union(s.ks, t.ks, k)
+    ensure
+      either: s.union(t).has(k) = (s.has(k) or t.has(k))
+    end
+
+  law has_intersection(s: SET[K], t: SET[K], k: K)
+    trigger
+      s.intersection(t).has(k)
+    do
+      SET.member_common(s.ks, t.ks, k)
+    ensure
+      both: s.intersection(t).has(k) = (s.has(k) and t.has(k))
+    end
+
+  -- How many keys after each change.
+
+  law size_add_new(s: SET[K], k: K)
+    require
+      absent: not s.has(k)
+    trigger
+      s.add(k).size
+    do
+      SET.add_grows(s.ks, k)
+    ensure
+      grows: s.add(k).size = s.size + 1
+    end
+
+  law size_add_at_most(s: SET[K], k: K)
+    trigger
+      s.add(k).size
+    do
+      SET.add_at_most(s.ks, k)
+    ensure
+      at_most: s.add(k).size <= s.size + 1
+    end
+
+  law size_remove_absent(s: SET[K], k: K)
+    require
+      absent: not s.has(k)
+    trigger
+      s.remove(k).size
+    do
+      SET.remove_absent(s.ks, k)
+    ensure
+      same: s.remove(k).size = s.size
+    end
+
+  law size_remove_at_most(s: SET[K], k: K)
+    trigger
+      s.remove(k).size
+    do
+      SET.remove_at_most(s.ks, k)
+    ensure
+      at_most: s.remove(k).size <= s.size
+    end
+
+  -- The items ascend: one at a lower place is below one at a higher place.
+  law items_ascending(s: SET[K], i: NAT, j: NAT)
+    require
+      ordered: i < j
+      inside: j < s.size
+    trigger
+      LIST_OPS.at(s.items, i), LIST_OPS.at(s.items, j)
+    do
+      KEY_ORDER.ascending_at(s.items, i, j)
+    ensure
+      below: LIST_OPS.at(s.items, i).less_than(LIST_OPS.at(s.items, j))
+    end
+
+end

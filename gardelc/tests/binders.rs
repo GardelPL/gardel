@@ -8,6 +8,9 @@ use std::fs;
 use std::path::PathBuf;
 use std::process::{Command, Output};
 
+/// The suffix gardelc gives an executable: `.exe` on Windows, none elsewhere.
+const EXE: &str = std::env::consts::EXE_SUFFIX;
+
 struct Project {
     dir: PathBuf,
 }
@@ -100,7 +103,7 @@ fn binders_of_one_name_and_two_types_verify_and_run() {
     let p = Project::new("binders", &program(""));
     let out = p.check();
     assert!(out.status.success() && all(&out).contains("0 errors, 0 warnings"), "{}", all(&out));
-    let run = Command::new(p.dir.join("build").join("main_bin.exe")).output().expect("the program runs");
+    let run = Command::new(p.dir.join("build").join(format!("main_bin{EXE}"))).output().expect("the program runs");
     assert!(run.status.success(), "{run:?}");
     let printed = String::from_utf8(run.stdout).expect("UTF-8 output").replace("\r\n", "\n");
     assert_eq!(printed.lines().collect::<Vec<_>>().join(" "), "7 30 42");

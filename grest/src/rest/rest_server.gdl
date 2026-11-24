@@ -14,7 +14,8 @@
 -- last answered. Each request is answered once, and the state after it is
 -- the one its handler gave back. `serve` proves both for every event: see
 -- `REST_SERVER.within` and `moves_to`. The state is an `S`, so whatever `S`'s invariant says
--- holds of it after every request.
+-- holds of it after every request. Each request that bytes complete is logged at `Info`, as
+-- `info: GET /todos/1`, before the answers (Task H.2): `GARDEL_LOG_LEVEL=warn` silences it.
 --
 -- Async handlers (F.8). A route made with `REST_ROUTER.on_await` may wait for its answer: its
 -- handler gives `REST_OUTCOME.waiting`, with the commands that start the work, such as a
@@ -91,19 +92,51 @@ create {ANY}
     require
       valid_port: p >= 1 and p <= 65535
     do
+      REST_SERVER.start_waking_from(REST_COMMANDS.first_arg(args), p, api, wk, s)
+    ensure
+      bad_route_stops: api.invalid_route.is_some implies Result.is_stop
+      -- A server that starts listens and sets the first sweep.
+      armed: match Result
+        case Continue(_, cmds) then cmds.length = 2 and REST_COMMANDS.for_sweep(cmds.tail)
+        case Stop(_, _) then True
+      end
+    end
+
+  -- `start`, on the port the text `a` names, or on `p` when there is none: for a port read
+  -- elsewhere, as from the environment with `ReadEnv` (Task H.2). Text that is not a port from
+  -- 1 to 65535 stops the program with exit status 2 and a message, as an argument does.
+  start_from(a: OPTION[STRING], p: NAT, api: REST_ROUTER[S], s: S): STEP[REST_SERVER[S]]
+    require
+      valid_port: p >= 1 and p <= 65535
+    do
+      REST_SERVER.start_waking_from(a, p, api, fn(x: S, e: EVENT): REST_WAKE[S] do REST_WAKE.unknown(x, e) end, s)
+    ensure
+      bad_route_stops: api.invalid_route.is_some implies Result.is_stop
+      armed: match Result
+        case Continue(_, cmds) then cmds.length = 2 and REST_COMMANDS.for_sweep(cmds.tail)
+        case Stop(_, _) then True
+      end
+    end
+
+  -- `start_from`, for a service that handles the events that are not the server's own with
+  -- `wk`.
+  start_waking_from(a: OPTION[STRING], p: NAT, api: REST_ROUTER[S], wk: (s: S, e: EVENT) -> REST_WAKE[S], s: S): STEP[REST_SERVER[S]]
+    require
+      valid_port: p >= 1 and p <= 65535
+    do
       match api.invalid_route
         case Some(bad) then
           Stop(2, LIST.empty.prepend(Print(REST_COMMANDS.complaint("grest: route pattern is not valid: ", bad))))
         case None then
-          match REST_COMMANDS.first_arg(args)
+          match a
             case None then
               Continue(REST_SERVER.make_waking(p, api, wk, s), LIST.empty.prepend(REST_COMMANDS.rearm).prepend(Listen(p)))
-            case Some(a) then
-              match REST_COMMANDS.port_of(a)
+            case Some(t) then
+              match REST_COMMANDS.port_of(t)
                 case Some(q) then
                   Continue(REST_SERVER.make_waking(q, api, wk, s), LIST.empty.prepend(REST_COMMANDS.rearm).prepend(Listen(q)))
                 case None then
-                  Stop(2, LIST.empty.prepend(Print(REST_COMMANDS.complaint("grest: not a port: ", a))))
+                  Stop(2, LIST.empty.prepend(Print(REST_COMMANDS.complaint("grest: not a port: ", t))))
               end
           end
       end
@@ -384,21 +417,24 @@ feature {ANY}
       freed: not Result.waits_on(c)
     end
 
-  -- After the replies `r` to bytes from `c`: the connections `done` when no request waits;
-  -- or, when one does, `waiter`, the connection that waits, and the request held, closing its
-  -- connection after its answer too when `cut`.
-  settled(c: CONN_ID, r: REST_REPLIES[S], done: HTTP_SERVER_STATE, waiter: HTTP_CONNECTION, cut: BOOL): STEP[REST_SERVER[S]]
+  -- After the replies `r` to the requests `reqs` from `c`, each logged at `Info` before them
+  -- (Task H.2): the connections `done` when no request waits; or, when one does, `waiter`, the
+  -- connection that waits, and the request held, closing its connection after its answer too
+  -- when `cut`.
+  settled(c: CONN_ID, reqs: LIST[HTTP_REQUEST], r: REST_REPLIES[S], done: HTTP_SERVER_STATE, waiter: HTTP_CONNECTION, cut: BOOL): STEP[REST_SERVER[S]]
     require
       same_limit: done.max_connections = Current.max_connections
       tagged: r.holds_wait implies Current.offered = Some(r.wait_tag)
+      few: reqs.length + r.commands.length <= 1000
     do
+      let cmds = REST_COMMANDS.logged(reqs, r.commands, c, Current.conns)
       if r.holds_wait then
-        Continue(Current.holding(Current.conns.save_connection(waiter), r.wait_on(c, cut), r.state), r.commands)
+        Continue(Current.holding(Current.conns.save_connection(waiter), r.wait_on(c, cut), r.state), cmds)
       else
-        Continue(Current.with_conns_and_state(done, r.state), r.commands)
+        Continue(Current.with_conns_and_state(done, r.state), cmds)
       end
     ensure
-      commands_set: REST_SERVER.commands(Result) = r.commands
+      commands_set: REST_SERVER.commands(Result) = REST_COMMANDS.logged(reqs, r.commands, c, Current.connections)
       moved: match Result
         case Continue(n, _) then n.state = r.state and n.max_connections = Current.max_connections
         case Stop(_, _) then False
@@ -423,13 +459,13 @@ feature {ANY}
             let w = Current.queue.offered
             match b.ending
               case ReadOn(n) then
-                Current.settled(c, Current.replies(Current.app, b.requests, c, False, LIST.empty, w),
+                Current.settled(c, b.requests, Current.replies(Current.app, b.requests, c, False, LIST.empty, w),
                   Current.conns.save_connection(n), n.awaiting, n.parser_state.buffered_bytes > 0)
               case CloseAfter then
-                Current.settled(c, Current.replies(Current.app, b.requests, c, True, REST_COMMANDS.close_only(c), w),
+                Current.settled(c, b.requests, Current.replies(Current.app, b.requests, c, True, REST_COMMANDS.close_only(c), w),
                   Current.conns.release_connection(c), conn.awaiting, True)
               case FailAfter(err) then
-                Current.settled(c, Current.replies(Current.app, b.requests, c, False, REST_COMMANDS.answer(c, HTTP_RESPONSE.from_error(err)), w),
+                Current.settled(c, b.requests, Current.replies(Current.app, b.requests, c, False, REST_COMMANDS.answer(c, HTTP_RESPONSE.from_error(err)), w),
                   Current.conns.release_connection(c), conn.awaiting, True)
             end
           end
@@ -546,8 +582,7 @@ feature {ANY}
   on_sweep: STEP[REST_SERVER[S]]
     do
       let sw = Current.conns.sweep
-      let ws = Current.queue.sweep
-      match Current.with_conns_waits(Current.conns.with_kept(sw), Current.queue.with_kept(ws)).lates(ws.expired)
+      match Current.with_conns_waits(Current.conns.with_kept(sw), Current.queue.swept).lates(Current.queue.expired)
         case Continue(n, cs) then Continue(n, REST_COMMANDS.closing_all(sw.closed, cs))
         case Stop(x, cs) then Stop(x, cs)
       end

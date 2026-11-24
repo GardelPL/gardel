@@ -6,6 +6,7 @@
 --   pattern <pattern> => valid <segments> <parameters>   or  => invalid
 --   match <pattern> <target> => params [name]=[value] ...  or  => no match
 --   request <METHOD> <target> [H:<name>:<value>]... [<body>] => <status> [text|json <body>]
+--   await <tag> <METHOD> <target> ... => waits <tag> <sweeps>, or as for `request`
 --   wire <METHOD> <target> ... => the response as sent, each CRLF written `|`
 --   routes api|broken => valid  or  => invalid [<pattern>]
 functions GREST_TEXT
@@ -196,8 +197,8 @@ feature {ANY}
     end
 
   -- What `GREST_API.router` answers to the request the words `ws` say: a method, a target,
-  -- headers, and a body.
-  request(ws: LIST[STRING], wire: BOOL): STRING
+  -- headers, and a body. An async handler is offered the tag `w`.
+  request(ws: LIST[STRING], wire: BOOL, w: OPTION[NAT]): STRING
     do
       if ws.length < 2 then
         "bad case"
@@ -212,7 +213,12 @@ feature {ANY}
               "bad case"
             else
               let req = HTTP_REQUEST.make_simple(m, t).with_headers(hs).with_body(b, 65536)
-              shown(GREST_API.router.dispatch(0, req).response, wire)
+              let out = GREST_API.router.dispatch_as(0, req, w)
+              if out.waits then
+                join(join(join("waits ", number(out.wait_tag)), " "), number(out.wait_sweeps))
+              else
+                shown(out.response, wire)
+              end
             end
         end
       end
@@ -244,14 +250,19 @@ feature {ANY}
         else if kind.equals("match") and words.length = 3 then
           matched(first, words.tail.tail.head)
         else if kind.equals("request") then
-          request(words.tail, False)
+          request(words.tail, False, None)
         else if kind.equals("wire") then
-          request(words.tail, True)
+          request(words.tail, True, None)
+        else if kind.equals("await") then
+          match NUMBER_TEXT.parse_nat(first)
+            case Error(_) then "bad case"
+            case Ok(n) then request(words.tail.tail, False, Some(n))
+          end
         else if kind.equals("routes") and words.length = 2 then
           routes(first)
         else
           "bad case"
-        end end end end end end end
+        end end end end end end end end
       end
     end
 

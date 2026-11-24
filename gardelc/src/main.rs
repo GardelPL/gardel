@@ -19,11 +19,13 @@ mod c11_typed;
 mod host_files;
 mod compat;
 pub mod manifest;
+mod mutate_cmd;
 mod names;
 mod patterns;
 mod proof_cache;
 mod refined;
 mod resolve;
+mod test_cmd;
 pub use c11_typed::emit_c11_typed;
 
 /// In a `program` or `functions` module (no `Current`), a free name that is a routine of
@@ -409,6 +411,9 @@ pub struct ModuleDecl {
     pub name: String,
     pub type_params: Vec<String>,
     pub type_bounds: HashMap<String, String>, // e.g., [A: ORD] -> "A" -> "ORD"
+    /// The bounds written as `[A: C]`, which every use must satisfy. `type_bounds` also holds
+    /// the concept of a `where` constraint on a parameter with no written bound.
+    pub declared_bounds: HashMap<String, String>,
     pub satisfies: Option<SatisfiesClause>,
     pub repr_vis: Visibility,
     pub repr: ReprKind,
@@ -766,14 +771,27 @@ pub fn tokenize(src: &str) -> Result<Vec<Token>, LexError> {
 }
 
 pub fn tokenize_with_lines(src: &str) -> Result<(Vec<Token>, Vec<usize>), LexError> {
+    tokenize_with_spans(src).map(|t| (t.tokens, t.lines))
+}
+
+/// The tokens of a source text, each with its 1-based line and its extent in `char`s.
+pub struct SpannedTokens {
+    pub tokens: Vec<Token>,
+    pub lines: Vec<usize>,
+    pub spans: Vec<(usize, usize)>,
+}
+
+pub fn tokenize_with_spans(src: &str) -> Result<SpannedTokens, LexError> {
     let mut tokens = Vec::new();
     let mut lines = Vec::new();
+    let mut spans = Vec::new();
     let chars: Vec<char> = src.chars().collect();
     let mut i = 0;
     let mut current_line = 1;
 
     while i < chars.len() {
         let c = chars[i];
+        let (token_start, seen) = (i, tokens.len());
         if c == '\n' {
             current_line += 1;
             i += 1;
@@ -1026,10 +1044,14 @@ pub fn tokenize_with_lines(src: &str) -> Result<(Vec<Token>, Vec<usize>), LexErr
             }
             i += 1;
         }
+        if tokens.len() > seen {
+            spans.push((token_start, i));
+        }
     }
     tokens.push(Token::Eof);
     lines.push(current_line);
-    Ok((tokens, lines))
+    spans.push((i, i));
+    Ok(SpannedTokens { tokens, lines, spans })
 }
 
 /// The Boogie function that holds one clause of a module's invariant, with the ranges of its
@@ -1186,10 +1208,47 @@ impl std::fmt::Display for ParseError {
 
 impl std::error::Error for ParseError {}
 
+/// A range of tokens, from the first to past the last.
+pub type TokenRange = std::ops::Range<usize>;
+
+/// What a recording parser read at a place of the source. Nothing in the tree keeps its place,
+/// so `gardelc mutate` (H.10) works on these.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SiteKind {
+    Module(String),
+    /// A routine, and whether it states a fact: a `BOOL` with a clause that ensures `Result`.
+    Routine { name: String, fact: bool },
+    Law(String),
+    /// A `specify` routine, or an expression that only a proof reads.
+    Ghost,
+    /// The body of a routine.
+    Body,
+    Require,
+    Invariant,
+    /// An integer or Boolean literal.
+    Literal,
+    /// The operator of a comparison or connective.
+    Operator,
+    /// The condition of an `if`.
+    Condition,
+    /// The bodies of the arms of a `match`, each with the names its pattern binds.
+    Arms(Vec<(TokenRange, Vec<String>)>),
+    /// A call: its receiver, if it has one, and its arguments.
+    Call { receiver: Option<TokenRange>, args: Vec<TokenRange> },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Site {
+    pub kind: SiteKind,
+    pub range: TokenRange,
+}
+
 pub struct Parser {
     tokens: Vec<Token>,
     lines: Vec<usize>,
     pos: usize,
+    /// What is read and where, when it is recorded.
+    sites: Option<Vec<Site>>,
 }
 
 impl Parser {
@@ -1199,6 +1258,7 @@ impl Parser {
             tokens,
             lines,
             pos: 0,
+            sites: None,
         }
     }
 
@@ -1207,7 +1267,48 @@ impl Parser {
             tokens,
             lines,
             pos: 0,
+            sites: None,
         }
+    }
+
+    /// Parses a file and returns what was read where.
+    pub fn parse_sites(tokens: Vec<Token>) -> Result<Vec<Site>, ParseError> {
+        let mut parser = Self::new(tokens);
+        parser.sites = Some(Vec::new());
+        parser.parse_file()?;
+        Ok(parser.sites.unwrap_or_default())
+    }
+
+    /// Records what was read from `start` up to here.
+    fn site(&mut self, start: usize, kind: SiteKind) {
+        let range = start..self.pos;
+        if let Some(sites) = &mut self.sites {
+            sites.push(Site { kind, range });
+        }
+    }
+
+    /// `parse_expr` for what only a proof reads.
+    fn parse_ghost_expr(&mut self) -> Result<Expr, ParseError> {
+        let start = self.pos;
+        let e = self.parse_expr()?;
+        self.site(start, SiteKind::Ghost);
+        Ok(e)
+    }
+
+    /// The arguments of a call, whose `(` was read.
+    fn parse_args(&mut self) -> Result<(Vec<Expr>, Vec<TokenRange>), ParseError> {
+        let mut args = Vec::new();
+        let mut ranges = Vec::new();
+        while *self.peek() != Token::RParen {
+            let start = self.pos;
+            args.push(self.parse_expr()?);
+            ranges.push(start..self.pos);
+            if *self.peek() == Token::Comma {
+                self.next();
+            }
+        }
+        self.expect(Token::RParen)?;
+        Ok((args, ranges))
     }
 
     pub fn line_of(&self, pos: usize) -> usize {
@@ -1431,7 +1532,7 @@ impl Parser {
                 while self.is_tagged_pred_start() {
                     let tag = self.expect_lower_ident()?;
                     self.expect(Token::Colon)?;
-                    list.push((tag, self.parse_expr()?));
+                    list.push((tag, self.parse_ghost_expr()?));
                 }
             }
         }
@@ -1598,6 +1699,7 @@ impl Parser {
     }
 
     pub fn parse_module_with_kind(&mut self, kind: ModuleKind) -> Result<ModuleDecl, ParseError> {
+        let module_start = self.pos;
         match kind {
             ModuleKind::Module => self.expect_kw("module")?,
             ModuleKind::Functions => self.expect_kw("functions")?,
@@ -1725,7 +1827,9 @@ impl Parser {
                     if self.is_kw("law") {
                         specify_laws.push((vis.clone(), self.parse_law()?));
                     } else {
+                        let start = self.pos;
                         specify_routines.push((vis.clone(), self.parse_routine()?));
+                        self.site(start, SiteKind::Ghost);
                     }
                 }
             } else if self.is_kw("create") {
@@ -1761,7 +1865,9 @@ impl Parser {
                 while self.is_tagged_pred_start() {
                     let tag = self.expect_lower_ident()?;
                     self.expect(Token::Colon)?;
-                    let expr = self.parse_expr()?;
+                    let start = self.pos;
+                    let expr = self.parse_ghost_expr()?;
+                    self.site(start, SiteKind::Invariant);
                     invariants.push((tag, expr));
                 }
             } else {
@@ -1772,6 +1878,7 @@ impl Parser {
             }
         }
         self.expect_kw("end")?;
+        self.site(module_start, SiteKind::Module(name.clone()));
 
         if kind == ModuleKind::ReactiveProgram {
             if !type_params.is_empty() {
@@ -1787,6 +1894,7 @@ impl Parser {
             kind,
             name,
             type_params,
+            declared_bounds: type_bounds.clone(),
             type_bounds,
             satisfies,
             repr_vis,
@@ -1826,6 +1934,7 @@ impl Parser {
     }
 
     fn parse_law(&mut self) -> Result<LawDecl, ParseError> {
+        let law_start = self.pos;
         self.expect_kw("law")?;
         let name = self.expect_lower_ident()?;
         let mut type_params = Vec::new();
@@ -1860,7 +1969,9 @@ impl Parser {
             while self.is_tagged_pred_start() {
                 let tag = self.expect_lower_ident()?;
                 self.expect(Token::Colon)?;
-                let expr = self.parse_expr()?;
+                let start = self.pos;
+                let expr = self.parse_ghost_expr()?;
+                self.site(start, SiteKind::Require);
                 requires.push((tag, expr));
             }
         }
@@ -1868,29 +1979,29 @@ impl Parser {
         let mut triggers = Vec::new();
         if self.is_kw("trigger") {
             self.next();
-            triggers.push(self.parse_expr()?);
+            triggers.push(self.parse_ghost_expr()?);
             while *self.peek() == Token::Comma {
                 self.next();
-                triggers.push(self.parse_expr()?);
+                triggers.push(self.parse_ghost_expr()?);
             }
         }
 
         let mut variant = Vec::new();
         if self.is_kw("variant") {
             self.next();
-            variant.push(self.parse_expr()?);
+            variant.push(self.parse_ghost_expr()?);
             while *self.peek() == Token::Comma {
                 self.next();
-                variant.push(self.parse_expr()?);
+                variant.push(self.parse_ghost_expr()?);
             }
         }
 
         if self.is_kw("trigger") {
             self.next();
-            triggers.push(self.parse_expr()?);
+            triggers.push(self.parse_ghost_expr()?);
             while *self.peek() == Token::Comma {
                 self.next();
-                triggers.push(self.parse_expr()?);
+                triggers.push(self.parse_ghost_expr()?);
             }
         }
 
@@ -1898,7 +2009,9 @@ impl Parser {
         let mut body = None;
         if self.is_kw("do") {
             self.next();
+            let start = self.pos;
             let (s, b) = self.parse_block()?;
+            self.site(start, SiteKind::Ghost);
             stmts = s;
             body = Some(b);
         }
@@ -1909,12 +2022,13 @@ impl Parser {
             while self.is_tagged_pred_start() {
                 let tag = self.expect_lower_ident()?;
                 self.expect(Token::Colon)?;
-                let expr = self.parse_expr()?;
+                let expr = self.parse_ghost_expr()?;
                 ensures.push((tag, expr));
             }
         }
 
         self.expect_kw("end")?;
+        self.site(law_start, SiteKind::Law(name.clone()));
         Ok(LawDecl {
             name,
             type_params,
@@ -1929,6 +2043,7 @@ impl Parser {
     }
 
     fn parse_routine(&mut self) -> Result<RoutineDecl, ParseError> {
+        let routine_start = self.pos;
         let name = self.expect_lower_ident()?;
         let mut type_params = Vec::new();
         if *self.peek() == Token::LBracket {
@@ -1957,7 +2072,12 @@ impl Parser {
         }
         self.expect(Token::Colon)?;
         let ret_type = self.parse_type()?;
-        self.finish_routine_after_sig(name, type_params, params, ret_type)
+        let label = name.clone();
+        let routine = self.finish_routine_after_sig(name, type_params, params, ret_type)?;
+        let fact = routine.ret_type == "BOOL"
+            && routine.ensures.iter().any(|(_, e)| *e == Expr::Var("Result".to_string()));
+        self.site(routine_start, SiteKind::Routine { name: label, fact });
+        Ok(routine)
     }
 
     fn finish_routine_after_sig(
@@ -1973,7 +2093,9 @@ impl Parser {
             while self.is_tagged_pred_start() {
                 let tag = self.expect_lower_ident()?;
                 self.expect(Token::Colon)?;
-                let expr = self.parse_expr()?;
+                let start = self.pos;
+                let expr = self.parse_ghost_expr()?;
+                self.site(start, SiteKind::Require);
                 requires.push((tag, expr));
             }
         }
@@ -1981,15 +2103,17 @@ impl Parser {
         let mut variant = Vec::new();
         if self.is_kw("variant") {
             self.next();
-            variant.push(self.parse_expr()?);
+            variant.push(self.parse_ghost_expr()?);
             while *self.peek() == Token::Comma {
                 self.next();
-                variant.push(self.parse_expr()?);
+                variant.push(self.parse_ghost_expr()?);
             }
         }
 
         self.expect_kw("do")?;
+        let body_start = self.pos;
         let (stmts, body) = self.parse_block()?;
+        self.site(body_start, SiteKind::Body);
 
         let mut ensures = Vec::new();
         if self.is_kw("ensure") {
@@ -1997,7 +2121,7 @@ impl Parser {
             while self.is_tagged_pred_start() {
                 let tag = self.expect_lower_ident()?;
                 self.expect(Token::Colon)?;
-                let expr = self.parse_expr()?;
+                let expr = self.parse_ghost_expr()?;
                 ensures.push((tag, expr));
             }
         }
@@ -2039,7 +2163,7 @@ impl Parser {
                 while self.is_tagged_pred_start() {
                     let tag = self.expect_lower_ident()?;
                     self.expect(Token::Colon)?;
-                    let e = self.parse_expr()?;
+                    let e = self.parse_ghost_expr()?;
                     stmts.push(Stmt::Check(tag, e));
                 }
                 self.expect_kw("end")?;
@@ -2051,7 +2175,7 @@ impl Parser {
                 while self.is_tagged_pred_start() {
                     let tag = self.expect_lower_ident()?;
                     self.expect(Token::Colon)?;
-                    let e = self.parse_expr()?;
+                    let e = self.parse_ghost_expr()?;
                     stmts.push(Stmt::Assume(tag, e));
                 }
                 self.expect_kw("end")?;
@@ -2114,6 +2238,7 @@ impl Parser {
         let mut left = self.parse_and()?;
         while self.is_kw("or") {
             self.next();
+            self.site(self.pos - 1, SiteKind::Operator);
             let right = self.parse_and()?;
             left = Expr::BinOp("or".into(), Box::new(left), Box::new(right));
         }
@@ -2124,6 +2249,7 @@ impl Parser {
         let mut left = self.parse_not()?;
         while self.is_kw("and") {
             self.next();
+            self.site(self.pos - 1, SiteKind::Operator);
             let right = self.parse_not()?;
             left = Expr::BinOp("and".into(), Box::new(left), Box::new(right));
         }
@@ -2152,6 +2278,7 @@ impl Parser {
             };
             let op_str = op.to_string();
             self.next();
+            self.site(self.pos - 1, SiteKind::Operator);
             let right = self.parse_bitwise_or()?;
             left = if op_str == "!=" {
                 // `a != b` is `not (a = b)`, so it uses exactly the equality of `=` (§9).
@@ -2259,41 +2386,25 @@ impl Parser {
     }
 
     fn parse_postfix(&mut self) -> Result<Expr, ParseError> {
+        let start = self.pos;
         let mut expr = self.parse_primary()?;
         loop {
+            let receiver = start..self.pos;
             if *self.peek() == Token::Dot {
                 self.next();
                 let member = self.expect_ident()?;
                 let mut args = Vec::new();
+                let mut ranges = Vec::new();
                 if *self.peek() == Token::LParen {
                     self.next();
-                    if *self.peek() == Token::RParen {
-                        self.next();
-                    } else {
-                        while *self.peek() != Token::RParen {
-                            args.push(self.parse_expr()?);
-                            if *self.peek() == Token::Comma {
-                                self.next();
-                            }
-                        }
-                        self.expect(Token::RParen)?;
-                    }
+                    (args, ranges) = self.parse_args()?;
                 }
+                self.site(start, SiteKind::Call { receiver: Some(receiver), args: ranges });
                 expr = Expr::MethodCall(Box::new(expr), member, args);
             } else if *self.peek() == Token::LParen && self.same_line(self.pos - 1, self.pos) {
                 self.next();
-                let mut args = Vec::new();
-                if *self.peek() == Token::RParen {
-                    self.next();
-                } else {
-                    while *self.peek() != Token::RParen {
-                        args.push(self.parse_expr()?);
-                        if *self.peek() == Token::Comma {
-                            self.next();
-                        }
-                    }
-                    self.expect(Token::RParen)?;
-                }
+                let (args, ranges) = self.parse_args()?;
+                self.site(start, SiteKind::Call { receiver: None, args: ranges });
                 expr = Expr::MethodCall(Box::new(expr), "apply".to_string(), args);
             } else {
                 break;
@@ -2457,7 +2568,9 @@ impl Parser {
         }
         if self.is_kw("if") {
             self.next();
+            let start = self.pos;
             let cond = self.parse_expr()?;
+            self.site(start, SiteKind::Condition);
             self.expect_kw("then")?;
             let (t_stmts, t_expr) = self.parse_block()?;
             self.expect_kw("else")?;
@@ -2473,21 +2586,32 @@ impl Parser {
         }
         if self.is_kw("match") {
             self.next();
+            let match_start = self.pos - 1;
             let scrut = self.parse_expr()?;
             let mut cases = Vec::new();
+            let mut arms = Vec::new();
             while self.is_kw("case") {
                 self.next();
                 let pat = self.parse_pattern()?;
                 self.expect_kw("then")?;
+                let start = self.pos;
                 let (stmts, body) = self.parse_block()?;
+                let mut names = Vec::new();
+                pattern_binders(&pat, &mut names);
+                arms.push((start..self.pos, names));
                 cases.push(MatchCase::new(pat, stmts, body));
             }
             self.expect_kw("end")?;
+            self.site(match_start, SiteKind::Arms(arms));
             return Ok(Expr::Match(Box::new(scrut), cases));
         }
 
+        let start = self.pos;
         match self.next() {
-            Token::Int(n) => Ok(Expr::Int(n)),
+            Token::Int(n) => {
+                self.site(start, SiteKind::Literal);
+                Ok(Expr::Int(n))
+            }
             Token::Float(f) => Ok(Expr::Float(f)),
             Token::Char(c) => Ok(Expr::Char(c as u32)),
             Token::Str(s) => Ok(Expr::Str(s)),
@@ -2550,10 +2674,9 @@ impl Parser {
                 }
             }
             Token::Ident(name) => {
-                if name == "True" {
-                    return Ok(Expr::Bool(true));
-                } else if name == "False" {
-                    return Ok(Expr::Bool(false));
+                if name == "True" || name == "False" {
+                    self.site(start, SiteKind::Literal);
+                    return Ok(Expr::Bool(name == "True"));
                 }
                 let name = if *self.peek() == Token::ColonColon {
                     self.next();
@@ -2563,18 +2686,8 @@ impl Parser {
                 };
                 if *self.peek() == Token::LParen && self.same_line(self.pos - 1, self.pos) {
                     self.next();
-                    let mut args = Vec::new();
-                    if *self.peek() == Token::RParen {
-                        self.next();
-                    } else {
-                        while *self.peek() != Token::RParen {
-                            args.push(self.parse_expr()?);
-                            if *self.peek() == Token::Comma {
-                                self.next();
-                            }
-                        }
-                        self.expect(Token::RParen)?;
-                    }
+                    let (args, ranges) = self.parse_args()?;
+                    self.site(start, SiteKind::Call { receiver: None, args: ranges });
                     Ok(Expr::Call(name, args))
                 } else {
                     Ok(Expr::Var(name))
@@ -2753,7 +2866,8 @@ pub fn check_and_expand_concepts(
                 cname.clone(),
                 format!("Where constraint specifies unknown concept `{cname}`"),
             ));
-        } else {
+        } else if !m.declared_bounds.contains_key(tp) {
+            // A written bound stays: `bound_concepts` adds the `where` concept to its theory.
             m.type_bounds.insert(tp.clone(), cname.clone());
         }
     }
@@ -2781,6 +2895,9 @@ pub fn check_and_expand_concepts(
         }
     }
 
+    derive_enumeration_instance(m, &mut required_concepts, concepts);
+    let enumeration = enumeration_variants(m).is_some();
+
     let existing_features: HashSet<String> = m
         .feature_routines
         .iter()
@@ -2796,7 +2913,18 @@ pub fn check_and_expand_concepts(
 
         // 1. Check required signatures
         for sig in &cdecl.signatures {
-            if !existing_features.contains(&sig.name) {
+            if !existing_features.contains(&sig.name) && !enumeration && DERIVABLE.contains(&(cname.as_str(), sig.name.as_str())) {
+                diags.push(Diagnostic::basic(
+                    "error",
+                    "E0323: underivable_instance",
+                    sig.name.clone(),
+                    "underivable_instance".to_string(),
+                    format!(
+                        "E0323: underivable_instance: `{}` satisfies `{cname}` but writes no `{}`. The compiler gives one only to an enumeration, a sum whose variants have no fields and that has no type parameters; write it (§9)",
+                        m.name, sig.name
+                    ),
+                ));
+            } else if !existing_features.contains(&sig.name) {
                 diags.push(Diagnostic::basic(
                     "error",
                     "Phase 2 (Missing Concept Operation)",
@@ -2858,6 +2986,174 @@ pub fn check_and_expand_concepts(
 
     m.feature_routines.extend(default_routines_to_inject);
     diags
+}
+
+/// The methods the compiler writes for an enumeration (H.0c), by the concept that asks for them.
+const DERIVABLE: [(&str, &str); 2] = [("EQ", "equals"), ("ORD", "less_than")];
+
+/// The variants of an enumeration: a sum with no type parameters whose variants have no fields.
+fn enumeration_variants(m: &ModuleDecl) -> Option<Vec<String>> {
+    match &m.repr {
+        ReprKind::Sum(vs) if m.type_params.is_empty() && !vs.is_empty() && vs.iter().all(|v| v.fields.is_empty()) => {
+            Some(vs.iter().map(|v| v.name.clone()).collect())
+        }
+        _ => None,
+    }
+}
+
+/// What the compiler writes for an enumeration `name` (B&W §8.1): `equals` as structural
+/// equality, `less_than` by the order of declaration, `ordinal`, `from_ordinal` and `all`, and
+/// laws that tie them together. All of it is verified as if written by hand.
+fn enumeration_source(name: &str, variants: &[String]) -> String {
+    let n = variants.len();
+    let cases = |f: &dyn Fn(usize, &str) -> String| {
+        variants.iter().enumerate().map(|(i, v)| format!("        case {v} then {}\n", f(i, v))).collect::<String>()
+    };
+    let from_ordinal = variants.iter().enumerate().map(|(i, v)| format!("if n = {i} then Some({v}) else ")).collect::<String>();
+    let ends = " end".repeat(n);
+    let all = variants.iter().rev().map(|v| format!(".prepend({v})")).collect::<String>();
+    let has_each = variants.iter().map(|v| format!("Result.has({v})")).collect::<Vec<_>>().join(" and ");
+    let repr = variants.iter().map(|v| format!("  | {v}\n")).collect::<String>();
+    let ordinal_cases = cases(&|i, _| i.to_string());
+    let true_cases = cases(&|_, _| "True".to_string());
+    format!(
+        "module {name}
+
+representation {{ANY}}
+{repr}
+create {{ANY}}
+
+  from_ordinal(n: NAT): OPTION[{name}]
+    do
+      {from_ordinal}None{ends}
+    ensure
+      in_range: Result.is_some = (n < {n})
+    end
+
+  all: LIST[{name}]
+    do
+      LIST.empty{all}
+    ensure
+      count: Result.length = {n}
+      has_each: {has_each}
+    end
+
+feature {{ANY}}
+
+  equals(other: {name}): BOOL
+    do
+      Current = other
+    ensure
+      def: Result = (Current = other)
+    end
+
+  less_than(other: {name}): BOOL
+    do
+      Current.ordinal < other.ordinal
+    ensure
+      def: Result = (Current.ordinal < other.ordinal)
+    end
+
+  ordinal: NAT
+    do
+      match Current
+{ordinal_cases}      end
+    ensure
+      bound: Result < {n}
+    end
+
+specify {{ANY}}
+
+  law ordinal_back(t: {name})
+    ensure
+      back: {name}.from_ordinal(t.ordinal) = Some(t)
+    end
+
+  law all_listed(t: {name})
+    do
+      match t
+{true_cases}      end
+    ensure
+      listed: {name}.all.has(t)
+    end
+
+  law all_at_ordinal(t: {name})
+    ensure
+      placed: LIST_OPS.at({name}.all, t.ordinal) = t
+    end
+
+end
+"
+    )
+}
+
+/// Supplies an enumeration's instance (H.0c): when `m` is an enumeration and leaves out a
+/// method in `DERIVABLE` that a concept of `required` asks for, the compiler writes it, with
+/// `ordinal`, `from_ordinal`, `all`, their laws and every law of `required` that `m` does not
+/// state. A routine or law written by hand keeps its place. Nothing is trusted: each is
+/// verified like the module's own. A derived `equals` is structural, so it also makes `m`
+/// satisfy `CANONICAL_EQ`, whose law is then proven too.
+fn derive_enumeration_instance(m: &mut ModuleDecl, required: &mut Vec<String>, concepts: &HashMap<String, ConceptDecl>) {
+    let Some(variants) = enumeration_variants(m) else {
+        return;
+    };
+    let written = |m: &ModuleDecl, n: &str| m.feature_routines.iter().chain(&m.create_routines).any(|(_, r)| r.name == n);
+    let missing: Vec<&str> = DERIVABLE
+        .iter()
+        .filter(|(c, meth)| required.iter().any(|r| r == c) && !written(m, meth))
+        .map(|(_, meth)| *meth)
+        .collect();
+    if missing.is_empty() {
+        return;
+    }
+    if missing.contains(&"equals") && concepts.contains_key("CANONICAL_EQ") && !required.iter().any(|c| c == "CANONICAL_EQ") {
+        required.push("CANONICAL_EQ".to_string());
+        if let Some(sat) = &mut m.satisfies {
+            sat.concepts.push("CANONICAL_EQ".to_string());
+        }
+    }
+    let parsed = tokenize(&enumeration_source(&m.name, &variants))
+        .map_err(|e| e.to_string())
+        .and_then(|t| Parser::new(t).parse_file().map_err(|e| e.to_string()));
+    let Some(derived) = parsed.ok().and_then(|f| f.modules.into_iter().next()) else {
+        return; // Variant names are identifiers, so the source always parses.
+    };
+    for (vis, r) in derived.create_routines.into_iter().chain(derived.feature_routines) {
+        let asked = !DERIVABLE.iter().any(|(_, meth)| *meth == r.name) || missing.contains(&r.name.as_str());
+        if asked && !written(m, &r.name) {
+            let list = if r.name == "from_ordinal" || r.name == "all" { &mut m.create_routines } else { &mut m.feature_routines };
+            list.push((vis, r));
+        }
+    }
+    let stated = |m: &ModuleDecl, n: &str, concept: Option<&str>| {
+        m.specify_laws.iter().any(|(vis, l)| {
+            l.name == n
+                && match vis {
+                    Visibility::Any => true,
+                    Visibility::Modules(ms) => concept.is_some_and(|c| ms.iter().any(|x| x == c)),
+                    Visibility::None => false,
+                }
+        })
+    };
+    for (vis, l) in derived.specify_laws {
+        if !stated(m, &l.name, None) {
+            m.specify_laws.push((vis, l));
+        }
+    }
+    for cname in required {
+        let Some(c) = concepts.get(cname) else { continue };
+        for law in &c.laws {
+            if !stated(m, &law.name, Some(cname)) {
+                let mut l = law.clone();
+                for (_, t) in &mut l.params {
+                    if t == "Current" {
+                        *t = m.name.clone();
+                    }
+                }
+                m.specify_laws.push((Visibility::Modules(vec![cname.clone()]), l));
+            }
+        }
+    }
 }
 
 const REACTIVE_VIOLATION: &str = "Phase 4 (Reactive Violation)";
@@ -3991,6 +4287,30 @@ pub const STDLIB_SOURCES: &[(&str, &str)] = &[
         include_str!("../../stdlib/text/number_text.gdl"),
     ),
     (
+        "stdlib/text/string_builder.gdl",
+        include_str!("../../stdlib/text/string_builder.gdl"),
+    ),
+    (
+        "stdlib/text/text_format.gdl",
+        include_str!("../../stdlib/text/text_format.gdl"),
+    ),
+    (
+        "stdlib/text/codec_error.gdl",
+        include_str!("../../stdlib/text/codec_error.gdl"),
+    ),
+    (
+        "stdlib/text/hex.gdl",
+        include_str!("../../stdlib/text/hex.gdl"),
+    ),
+    (
+        "stdlib/text/base64.gdl",
+        include_str!("../../stdlib/text/base64.gdl"),
+    ),
+    (
+        "stdlib/text/percent.gdl",
+        include_str!("../../stdlib/text/percent.gdl"),
+    ),
+    (
         "stdlib/core/io_error.gdl",
         include_str!("../../stdlib/core/io_error.gdl"),
     ),
@@ -3999,12 +4319,44 @@ pub const STDLIB_SOURCES: &[(&str, &str)] = &[
         include_str!("../../stdlib/collections/list_ops.gdl"),
     ),
     (
+        "stdlib/collections/generator.gdl",
+        include_str!("../../stdlib/collections/generator.gdl"),
+    ),
+    (
+        "stdlib/collections/unfold.gdl",
+        include_str!("../../stdlib/collections/unfold.gdl"),
+    ),
+    (
         "stdlib/collections/key_order.gdl",
         include_str!("../../stdlib/collections/key_order.gdl"),
     ),
     (
+        "stdlib/collections/sorting.gdl",
+        include_str!("../../stdlib/collections/sorting.gdl"),
+    ),
+    (
+        "stdlib/collections/array.gdl",
+        include_str!("../../stdlib/collections/array.gdl"),
+    ),
+    (
         "stdlib/collections/map.gdl",
         include_str!("../../stdlib/collections/map.gdl"),
+    ),
+    (
+        "stdlib/collections/set.gdl",
+        include_str!("../../stdlib/collections/set.gdl"),
+    ),
+    (
+        "stdlib/collections/queue.gdl",
+        include_str!("../../stdlib/collections/queue.gdl"),
+    ),
+    (
+        "stdlib/collections/heap_order.gdl",
+        include_str!("../../stdlib/collections/heap_order.gdl"),
+    ),
+    (
+        "stdlib/collections/heap.gdl",
+        include_str!("../../stdlib/collections/heap.gdl"),
     ),
     (
         "stdlib/functional/function_ops.gdl",
@@ -4021,6 +4373,10 @@ pub const STDLIB_SOURCES: &[(&str, &str)] = &[
     (
         "stdlib/core/dir_entry.gdl",
         include_str!("../../stdlib/core/dir_entry.gdl"),
+    ),
+    (
+        "stdlib/core/log_level.gdl",
+        include_str!("../../stdlib/core/log_level.gdl"),
     ),
     (
         "stdlib/core/command.gdl",
@@ -4069,13 +4425,41 @@ pub fn phase4_stdlib_source() -> &'static str {
         "\n",
         include_str!("../../stdlib/text/number_text.gdl"),
         "\n",
+        include_str!("../../stdlib/text/string_builder.gdl"),
+        "\n",
+        include_str!("../../stdlib/text/text_format.gdl"),
+        "\n",
+        include_str!("../../stdlib/text/codec_error.gdl"),
+        "\n",
+        include_str!("../../stdlib/text/hex.gdl"),
+        "\n",
+        include_str!("../../stdlib/text/base64.gdl"),
+        "\n",
+        include_str!("../../stdlib/text/percent.gdl"),
+        "\n",
         include_str!("../../stdlib/core/io_error.gdl"),
         "\n",
         include_str!("../../stdlib/collections/list_ops.gdl"),
         "\n",
+        include_str!("../../stdlib/collections/generator.gdl"),
+        "\n",
+        include_str!("../../stdlib/collections/unfold.gdl"),
+        "\n",
         include_str!("../../stdlib/collections/key_order.gdl"),
         "\n",
+        include_str!("../../stdlib/collections/sorting.gdl"),
+        "\n",
+        include_str!("../../stdlib/collections/array.gdl"),
+        "\n",
         include_str!("../../stdlib/collections/map.gdl"),
+        "\n",
+        include_str!("../../stdlib/collections/set.gdl"),
+        "\n",
+        include_str!("../../stdlib/collections/queue.gdl"),
+        "\n",
+        include_str!("../../stdlib/collections/heap_order.gdl"),
+        "\n",
+        include_str!("../../stdlib/collections/heap.gdl"),
         "\n",
         include_str!("../../stdlib/functional/function_ops.gdl"),
         "\n",
@@ -4084,6 +4468,8 @@ pub fn phase4_stdlib_source() -> &'static str {
         include_str!("../../stdlib/core/proc_id.gdl"),
         "\n",
         include_str!("../../stdlib/core/dir_entry.gdl"),
+        "\n",
+        include_str!("../../stdlib/core/log_level.gdl"),
         "\n",
         include_str!("../../stdlib/core/command.gdl"),
         "\n",
@@ -4128,6 +4514,7 @@ pub fn monomorphize_module(m: &ModuleDecl, concrete_args: &[String]) -> ModuleDe
     spec.name = format!("{}_{}", m.name, concrete_args.join("_"));
     spec.type_params.clear();
     spec.type_bounds.clear();
+    spec.declared_bounds.clear();
 
     let sub_ty = |t: &str| -> String {
         if let Some(rep) = subst.get(t) {
@@ -4662,10 +5049,15 @@ fn conditional_canonical_tps(m: &ModuleDecl) -> Vec<String> {
         .map(|s| {
             s.where_constraints
                 .iter()
-                // Only parameters whose bound was resolved (so `<tp>_eq` is declared).
+                // Only parameters whose bound was resolved (so `<tp>_eq` is declared), and
+                // not one whose written bound already makes it canonical everywhere.
                 .filter(|(tp, c)| {
                     c == "CANONICAL_EQ"
-                        && m.type_bounds.get(tp).is_some_and(|b| b == "CANONICAL_EQ")
+                        && m.type_bounds.contains_key(tp)
+                        && bound_concepts(m, tp).iter().any(|x| x == "EQ")
+                        && !m.declared_bounds.get(tp).is_some_and(|b| {
+                            concept_closure(b).iter().any(|x| x == "CANONICAL_EQ")
+                        })
                 })
                 .map(|(tp, _)| tp.clone())
                 .collect()
@@ -4781,8 +5173,8 @@ fn elem_receiver_type(e: &Expr, m: &ModuleDecl) -> Option<String> {
 /// to structural `==` (§5, §9).
 fn elem_equals_fn(recv: &Expr, m: &ModuleDecl) -> Option<String> {
     let ty = elem_receiver_type(recv, m)?;
-    let bound = m.type_bounds.get(&ty)?;
-    if m.type_params.contains(&ty) && matches!(bound.as_str(), "EQ" | "ORD" | "CANONICAL_EQ") {
+    m.type_bounds.get(&ty)?;
+    if m.type_params.contains(&ty) && bound_concepts(m, &ty).iter().any(|c| c == "EQ") {
         Some(format!("{ty}_eq"))
     } else {
         None
@@ -4812,17 +5204,13 @@ fn function_field_call(recv: &Expr, f: &str, args: &[Expr], m: &ModuleDecl) -> O
 
 /// The theory function of concept method `mname` on type parameter `tp` with bound `bound`:
 /// what `emit_boogie_parts_with_options` declares for an `EQ`-family or `ORD` bound.
-fn bound_method_relation(tp: &str, bound: &str, mname: &str) -> Option<String> {
-    if !BOUND_THEORY_CONCEPTS.contains(&bound) {
-        return None;
-    }
-    let closure = concept_closure(bound);
-    let has = |c: &str| closure.iter().any(|x| x == c);
+fn bound_method_relation(tp: &str, concepts: &[String], mname: &str) -> Option<String> {
+    let has = |c: &str| concepts.iter().any(|x| x == c);
     match mname {
         "equals" if has("EQ") => Some(format!("{tp}_eq")),
         "less_than" if has("ORD") => Some(format!("{tp}_less")),
         "less_or_equal" if has("ORD") => Some(format!("{tp}_less_eq")),
-        _ => None,
+        _ => user_bound_method(concepts, mname).map(|_| user_method_relation(tp, mname)),
     }
 }
 
@@ -4842,7 +5230,8 @@ fn bound_method_fn(recv: &Expr, mname: &str, m: &ModuleDecl) -> Option<String> {
     if !m.type_params.contains(&ty) {
         return None;
     }
-    bound_method_relation(&ty, m.type_bounds.get(&ty)?, mname)
+    m.type_bounds.get(&ty)?;
+    bound_method_relation(&ty, &bound_concepts(m, &ty), mname)
 }
 
 /// The range predicate of a machine number type. `MATH_INT` has none.
@@ -4853,6 +5242,839 @@ fn machine_range(ty: &str) -> Option<&'static str> {
         "CHAR" => Some("in_char"),
         _ => None,
     }
+}
+
+/// The range predicate of a `LIST` or `SEQ` of a machine number type: every element is in the
+/// element type's range (Task H.0b), and whether the type is a `SEQ`, whose elements are those
+/// of its `model`.
+fn elements_range(ty: &str) -> Option<(String, bool)> {
+    let ty = ty.trim();
+    let (inner, seq) = match ty.strip_prefix("LIST[") {
+        Some(rest) => (rest.strip_suffix(']')?, false),
+        // A `SEQ` is read through the prelude's `model`, so not where there is none.
+        None if boogie_prelude_ctx().is_some_and(|c| c.module("SEQ").is_some()) => {
+            (ty.strip_prefix("SEQ[")?.strip_suffix(']')?, true)
+        }
+        None => return None,
+    };
+    if let Some(r) = machine_range(inner) {
+        return Some((format!("Seq_{r}"), seq));
+    }
+    // A list of lists of a machine type, such as the lines of a text, has its lists' elements
+    // in range: `Seq2_in_char` holds when `Seq_in_char` holds of each line.
+    let inner = inner.trim().strip_prefix("LIST[")?.strip_suffix(']')?;
+    Some((format!("Seq2_{}", machine_range(inner)?), seq))
+}
+
+/// That every element of `term`, of type `ty`, is in range (Task H.0b). Each value of a list
+/// of a machine type has its elements in range, as each value of a machine type is in range, so
+/// it is assumed and checked where `machine_range` is.
+fn elements_fact(ty: &str, term: &str) -> Option<String> {
+    if let Some(fact) = function_fact(ty, term) {
+        return Some(fact);
+    }
+    let Some((p, seq)) = elements_range(ty) else {
+        return container_fact(ty, term);
+    };
+    Some(if seq {
+        format!("{p}(SEQ__fn_model(DefaultFuel, {term}))")
+    } else {
+        format!("{p}({term})")
+    })
+}
+
+/// The Boogie type of a parameter of a function type, for those `function_fact` can state:
+/// numbers, truth values and lists of them.
+fn plain_boogie_type(ty: &str) -> Option<String> {
+    let ty = ty.trim();
+    if machine_range(ty).is_some() || ty == "MATH_INT" {
+        return Some("int".to_string());
+    }
+    if ty == "BOOL" {
+        return Some("bool".to_string());
+    }
+    let inner = ty.strip_prefix("LIST[")?.strip_suffix(']')?;
+    Some(format!("(Seq {})", plain_boogie_type(inner)?))
+}
+
+/// That a function `term`, of type `ty`, gives a value in its result type's range for
+/// arguments in their types' ranges (Task H.0b): a lambda's body is proven under its
+/// parameters' ranges, so a `lex: (start: NAT, line: LIST[CHAR]) -> NAT` gives a `NAT`. It is
+/// checked where a function is passed, as a list's range is.
+fn function_fact(ty: &str, term: &str) -> Option<String> {
+    let (args, ret) = split_top_level_arrow(ty)?;
+    let args = args.trim();
+    let args = args.strip_prefix('(').and_then(|a| a.strip_suffix(')')).unwrap_or(args).trim();
+    let ret = ret.split(" require ").next()?.split(" ensure ").next()?.trim();
+    if args.is_empty() {
+        return None;
+    }
+    let arg_tys: Vec<&str> = split_top_level_commas(args)
+        .into_iter()
+        .map(|p| p.split_once(':').map_or(p, |(_, t)| t).trim())
+        .collect();
+    let app = match arg_tys.len() {
+        1 => "Fn1_app",
+        2 => "Fn2_app",
+        3 => "Fn3_app",
+        _ => return None,
+    };
+    let names: Vec<String> = (0..arg_tys.len()).map(|i| format!("_fa{i}")).collect();
+    let applied = format!("{app}({term}, {})", names.join(", "));
+    let fact = value_fact(ret, &applied)?;
+    let mut decls = Vec::new();
+    let mut guards = Vec::new();
+    for (n, t) in names.iter().zip(&arg_tys) {
+        decls.push(format!("{n}: {}", plain_boogie_type(t)?));
+        guards.extend(value_fact(t, n));
+    }
+    let guard = if guards.is_empty() { String::new() } else { format!("{} ==> ", guards.join(" && ")) };
+    let all = format!("(forall {} :: {{ {applied} }} {guard}{fact})", decls.join(", "));
+    // Its range as a function as well, for a container whose range is joint (Task H.22b).
+    Some(match split_top_level_arrow(ty).and_then(|(l, r)| fn_rng_term(l, r, &machine_rng, &|_| false)) {
+        Some(rng) => format!("({all} && Rng_holds({rng}, {term}))"),
+        None => all,
+    })
+}
+
+/// Whether a value of type `ty` has a range fact beyond a machine number's own, to be checked
+/// where one is built or passed.
+fn has_elements_fact(ty: &str) -> bool {
+    elements_fact(ty, "x").is_some()
+}
+
+/// The range of `term`, of type `ty`: its own for a machine number, its elements' for a list.
+fn value_fact(ty: &str, term: &str) -> Option<String> {
+    machine_range(ty).map(|r| format!("{r}({term})")).or_else(|| elements_fact(ty, term))
+}
+
+thread_local! {
+    /// The module whose Boogie text is being emitted. Its own declaration is in no context.
+    static BOOGIE_OWN_MODULE: std::cell::RefCell<Option<Rc<ModuleDecl>>> = const { std::cell::RefCell::new(None) };
+    /// The containers whose ranges are being decided, so that a recursive one ends.
+    static RANGE_DECIDING: std::cell::RefCell<HashSet<(String, String)>> = std::cell::RefCell::new(HashSet::new());
+}
+
+/// Runs `f` with `m` as the module being emitted.
+fn with_own_boogie_module<T>(m: &ModuleDecl, f: impl FnOnce() -> T) -> T {
+    let saved = BOOGIE_OWN_MODULE.with(|o| o.replace(Some(Rc::new(m.clone()))));
+    let out = f();
+    BOOGIE_OWN_MODULE.with(|o| *o.borrow_mut() = saved);
+    out
+}
+
+/// The declaration of module `name`: the one being emitted, or one of its context.
+fn with_module_decl<T>(name: &str, f: impl FnOnce(&ModuleDecl) -> T) -> Option<T> {
+    if let Some(own) = BOOGIE_OWN_MODULE.with(|o| o.borrow().clone()).filter(|o| o.name == name) {
+        return Some(f(&own));
+    }
+    boogie_prelude_ctx()?.module(name).map(f)
+}
+
+/// The types of the fields of `d`'s representation, with `Current` spelled as `d`'s type.
+fn repr_field_types(d: &ModuleDecl) -> Vec<String> {
+    let own = module_self_type(d);
+    let fields: Vec<&String> = match &d.repr {
+        ReprKind::Sum(vs) => vs.iter().flat_map(|v| v.fields.iter().map(|(_, t)| t)).collect(),
+        ReprKind::Product(fs) => fs.iter().map(|(_, t)| t).collect(),
+    };
+    fields.into_iter().map(|t| if t == "Current" { own.clone() } else { t.clone() }).collect()
+}
+
+/// The range a value of type `ty` holds (Task H.0e): `leaf` gives it for a type, and a
+/// container holds the range of its one argument that has one, as `Rng__OPTION_A(Rng_u64)`
+/// of an `OPTION[U64]`. `None` when no single range states it: an argument that `mentions`
+/// a ranged type and has no range of its own, or two arguments with one.
+fn rng_term(ty: &str, leaf: &dyn Fn(&str) -> Option<String>, mentions: &dyn Fn(&str) -> bool) -> Option<String> {
+    let ty = ty.trim();
+    if let Some(r) = leaf(ty) {
+        return Some(r);
+    }
+    if let Some((lhs, rhs)) = split_top_level_arrow(ty) {
+        return fn_rng_term(lhs, rhs, leaf, mentions);
+    }
+    let (head, args) = split_type_app(ty);
+    // A container whose range is stated over all its arguments at once, as a `GENERATOR`'s:
+    // an argument with no range holds `Rng_any`.
+    if joint_range(head) {
+        let mut slots = Vec::new();
+        let mut any = false;
+        for a in &args {
+            match rng_term(a, leaf, mentions) {
+                Some(r) => {
+                    any = true;
+                    slots.push(r);
+                }
+                None if mentions(a) => return None,
+                None => slots.push("Rng_any".to_string()),
+            }
+        }
+        return any.then(|| format!("Rng__{head}({})", slots.join(", ")));
+    }
+    let mut parts = Vec::new();
+    for (j, a) in args.iter().enumerate() {
+        match rng_term(a, leaf, mentions) {
+            Some(r) if head == "LIST" => parts.push(format!("Rng_seq({r})")),
+            Some(r) => parts.push(format!("{}({r})", container_rng_fn(head, j)?)),
+            None if mentions(a) => return None,
+            None => {}
+        }
+    }
+    // A container with several such arguments, as a `TUPLE[U64, U64]`, holds them all.
+    parts.into_iter().reduce(|a, b| format!("Rng_and({a}, {b})"))
+}
+
+/// The range of a function of one or two arguments (Task H.22b): `Rng_fn1(p, q)` holds of a
+/// function that gives a value in `q` for an argument in `p`. An argument with no range is in
+/// `Rng_any`. `None` when the result has no range, or the function has a contract of its own,
+/// under which alone it is proven.
+fn fn_rng_term(lhs: &str, rhs: &str, leaf: &dyn Fn(&str) -> Option<String>, mentions: &dyn Fn(&str) -> bool) -> Option<String> {
+    if rhs.contains(" require ") || rhs.contains(" ensure ") {
+        return None;
+    }
+    let ret = rng_term(rhs, leaf, mentions)?;
+    let lhs = lhs.trim();
+    let lhs = lhs.strip_prefix('(').and_then(|a| a.strip_suffix(')')).unwrap_or(lhs).trim();
+    let arg_tys: Vec<&str> =
+        split_top_level_commas(lhs).into_iter().map(|p| p.split_once(':').map_or(p, |(_, t)| t).trim()).collect();
+    if lhs.is_empty() || arg_tys.len() > 2 {
+        return None;
+    }
+    let mut parts = Vec::new();
+    for a in arg_tys {
+        match rng_term(a, leaf, mentions) {
+            Some(r) => parts.push(r),
+            None if mentions(a) => return None,
+            None => parts.push("Rng_any".to_string()),
+        }
+    }
+    parts.push(ret);
+    Some(format!("Rng_fn{}({})", parts.len() - 1, parts.join(", ")))
+}
+
+/// Whether module `head` states its range over all its type parameters at once (Task H.22b):
+/// a field of a function type holds its values, as `GENERATOR`'s `next: S -> TUPLE[A, S]`,
+/// whose items are in `A`'s range only for states in `S`'s. Every field that holds a type
+/// parameter's values must have a range term, or the module has no range.
+fn joint_range(head: &str) -> bool {
+    let key = (head.to_string(), "->".to_string());
+    if RANGE_DECIDING.with(|d| d.borrow().contains(&key)) {
+        return true;
+    }
+    let Some((tps, fields)) = with_module_decl(head, |d| (d.type_params.clone(), repr_field_types(d))) else {
+        return false;
+    };
+    let mentions = |t: &str| type_tokens(t).iter().any(|x| tps.iter().any(|p| p == x));
+    if tps.is_empty() || !fields.iter().any(|f| f.contains("->") && mentions(f)) {
+        return false;
+    }
+    RANGE_DECIDING.with(|d| d.borrow_mut().insert(key.clone()));
+    let leaf = |t: &str| tps.iter().position(|p| p == t).map(|i| format!("_r{i}"));
+    let stated = fields.iter().filter(|f| mentions(f)).all(|f| rng_term(f, &leaf, &mentions).is_some());
+    RANGE_DECIDING.with(|d| d.borrow_mut().remove(&key));
+    stated
+}
+
+/// Whether a type names a module whose range is stated jointly.
+fn involves_joint(ty: &str) -> bool {
+    type_tokens(ty).iter().any(|t| joint_range(t))
+}
+
+/// The range of a machine number type, as a range term.
+fn machine_rng(ty: &str) -> Option<String> {
+    machine_range(ty).map(|r| format!("Rng_{}", &r[3..]))
+}
+
+/// The range a field of type `fty` holds when every `tp` value in it holds `p`.
+fn field_rng(fty: &str, tp: &str, p: &str) -> Option<String> {
+    rng_term(fty, &|t| (t == tp).then(|| p.to_string()), &|t| type_tokens(t).contains(&tp))
+}
+
+/// The range function of argument `j` of container `head`, as `Rng__OPTION_A`: `None` when
+/// its representation does not hold that argument's values in a way a range states.
+fn container_rng_fn(head: &str, j: usize) -> Option<String> {
+    if head == "TUPLE" {
+        return ["Rng__Tuple2_A", "Rng__Tuple2_B"].get(j).map(|s| s.to_string());
+    }
+    // A `SEQ`'s elements are its `model`'s.
+    if matches!(head, "LIST" | "SEQ") {
+        return None;
+    }
+    let tp = with_module_decl(head, |d| d.type_params.get(j).cloned()).flatten()?;
+    carries_range(head, &tp).then(|| format!("Rng__{head}_{tp}"))
+}
+
+/// Whether the representation of `g` holds its `tp` values in fields whose range a range term
+/// states, and holds some. A field of `g`'s own type is taken to, so that a tree is decided.
+fn carries_range(g: &str, tp: &str) -> bool {
+    let key = (g.to_string(), tp.to_string());
+    if !RANGE_DECIDING.with(|d| d.borrow_mut().insert(key.clone())) {
+        return true;
+    }
+    let carries = with_module_decl(g, repr_field_types).is_some_and(|fields| {
+        let holding: Vec<&String> = fields.iter().filter(|f| type_tokens(f).contains(&tp)).collect();
+        !holding.is_empty() && holding.iter().all(|f| field_rng(f, tp, "p").is_some())
+    });
+    RANGE_DECIDING.with(|d| d.borrow_mut().remove(&key));
+    carries
+}
+
+/// That every machine number in `term`, a container of type `ty` such as an `OPTION[U64]`, is
+/// in its type's range (Task H.0e): one `Rng_holds` for each argument with a range.
+fn container_fact(ty: &str, term: &str) -> Option<String> {
+    let ty = ty.trim();
+    if split_top_level_arrow(ty).is_some() {
+        return None;
+    }
+    let (head, args) = split_type_app(ty);
+    if matches!(head, "LIST" | "SEQ") {
+        return None;
+    }
+    if joint_range(head) {
+        return rng_term(ty, &machine_rng, &|_| false).map(|r| format!("Rng_holds({r}, {term})"));
+    }
+    let facts: Vec<String> = args
+        .iter()
+        .enumerate()
+        .filter_map(|(j, a)| {
+            let r = rng_term(a, &machine_rng, &|_| false)?;
+            Some(format!("Rng_holds({}({r}), {term})", container_rng_fn(head, j)?))
+        })
+        .collect();
+    (!facts.is_empty()).then(|| facts.join(" && "))
+}
+
+/// The theory of `Rng_holds` (Task H.0e): `Rng_holds(p, x)` means that every machine number
+/// in `x` is in the range `p` describes. A number's range is its type's, a list's is each
+/// element's (the same as `Seq_in_u64` and `Seq2_in_u64`), and a pair's that of a part.
+fn emit_container_range_base() -> String {
+    let mut out = String::new();
+    out.push_str("type Rng;\n");
+    out.push_str("function Rng_holds<T>(p: Rng, x: T) returns (bool);\n");
+    out.push_str("function Rng_seq(p: Rng) returns (Rng);\n");
+    out.push_str("function Rng_and(p: Rng, q: Rng) returns (Rng);\n");
+    out.push_str("axiom (forall<T> p: Rng, q: Rng, x: T :: { Rng_holds(Rng_and(p, q), x) } Rng_holds(Rng_and(p, q), x) <==> Rng_holds(p, x) && Rng_holds(q, x));\n");
+    for r in ["in_u64", "in_i64", "in_char"] {
+        let c = format!("Rng_{}", &r[3..]);
+        out.push_str(&format!("const unique {c}: Rng;\n"));
+        out.push_str(&format!("axiom (forall x: int :: {{ Rng_holds({c}, x) }} Rng_holds({c}, x) <==> {r}(x));\n"));
+        out.push_str(&format!("axiom (forall xs: Seq int :: {{ Rng_holds(Rng_seq({c}), xs) }} Rng_holds(Rng_seq({c}), xs) <==> Seq_{r}(xs));\n"));
+        out.push_str(&format!("axiom (forall xs: Seq (Seq int) :: {{ Rng_holds(Rng_seq(Rng_seq({c})), xs) }} Rng_holds(Rng_seq(Rng_seq({c})), xs) <==> Seq2_{r}(xs));\n"));
+    }
+    // A list of any ranged values, as `Seq_in_u64` is of numbers.
+    let p = "Rng_seq(p)";
+    out.push_str(&format!("axiom (forall<T> p: Rng :: {{ Rng_holds({p}, Seq_empty() : Seq T) }} Rng_holds({p}, Seq_empty() : Seq T));\n"));
+    out.push_str(&format!("axiom (forall<T> p: Rng, x: T, xs: Seq T :: {{ Rng_holds({p}, Seq_prepend(x, xs)) }} Rng_holds({p}, Seq_prepend(x, xs)) <==> Rng_holds(p, x) && Rng_holds({p}, xs));\n"));
+    out.push_str(&format!("axiom (forall<T> p: Rng, x: T :: {{ Rng_holds({p}, Seq_singleton(x)) }} Rng_holds({p}, Seq_singleton(x)) <==> Rng_holds(p, x));\n"));
+    out.push_str(&format!("axiom (forall<T> p: Rng, xs: Seq T, ys: Seq T :: {{ Rng_holds({p}, Seq_append(xs, ys)) }} Rng_holds({p}, Seq_append(xs, ys)) <==> Rng_holds({p}, xs) && Rng_holds({p}, ys));\n"));
+    out.push_str(&format!("axiom (forall<T> p: Rng, xs: Seq T :: {{ Rng_holds({p}, xs), Seq_head(xs) }} Rng_holds({p}, xs) && Seq_length(xs) > 0 ==> Rng_holds(p, Seq_head(xs)));\n"));
+    out.push_str(&format!("axiom (forall<T> p: Rng, xs: Seq T :: {{ Rng_holds({p}, xs), Seq_tail(xs) }} Rng_holds({p}, xs) ==> Rng_holds({p}, Seq_tail(xs)));\n"));
+    out.push_str(&format!("axiom (forall<T> p: Rng, xs: Seq T, i: int :: {{ Rng_holds({p}, xs), Seq_at(xs, i) }} Rng_holds({p}, xs) && 0 <= i && i < Seq_length(xs) ==> Rng_holds(p, Seq_at(xs, i)));\n"));
+    out.push_str(&format!("axiom (forall<T> p: Rng, xs: Seq T, x: T :: {{ Rng_holds({p}, xs), Seq_has(xs, x) }} Rng_holds({p}, xs) && Seq_has(xs, x) ==> Rng_holds(p, x));\n"));
+    out.push_str(&format!("axiom (forall<T> p: Rng, xs: Seq T, keep: Fn1 T bool :: {{ Rng_holds({p}, Seq_filter(xs, keep)) }} Rng_holds({p}, xs) ==> Rng_holds({p}, Seq_filter(xs, keep)));\n"));
+    // A pair holds a range in a part when that part does.
+    for (rf, part, sel) in [("Rng__Tuple2_A", "a", "Tuple2_first"), ("Rng__Tuple2_B", "b", "Tuple2_second")] {
+        out.push_str(&format!("function {rf}(p: Rng) returns (Rng);\n"));
+        out.push_str(&format!("axiom (forall<A, B> p: Rng, a: A, b: B :: {{ Rng_holds({rf}(p), Tuple2_mk(a, b)) }} Rng_holds({rf}(p), Tuple2_mk(a, b)) <==> Rng_holds(p, {part}));\n"));
+        out.push_str(&format!("axiom (forall<A, B> p: Rng, t: Tuple2 A B :: {{ Rng_holds({rf}(p), t), {sel}(t) }} Rng_holds({rf}(p), t) ==> Rng_holds(p, {sel}(t)));\n"));
+        out.push_str(&format!("axiom {rf}(Rng_any) == Rng_any;\n"));
+    }
+    // Task H.22b: `Rng_any` holds of every value: the range of a type parameter that has none,
+    // in a range stated over all of a container's parameters. A range made of it alone is it,
+    // and a conjunction with it is the other part, as equations, so that `Rng_and(Rng__Tuple2_A(
+    // Rng_any), q)`, in the step of a generator of `BOOL` items, matches a lambda's stated `q`.
+    out.push_str("const unique Rng_any: Rng;\n");
+    out.push_str("axiom (forall<T> x: T :: { Rng_holds(Rng_any, x) } Rng_holds(Rng_any, x));\n");
+    out.push_str("axiom Rng_seq(Rng_any) == Rng_any;\n");
+    out.push_str("axiom (forall p: Rng :: { Rng_and(Rng_any, p) } Rng_and(Rng_any, p) == p);\n");
+    out.push_str("axiom (forall p: Rng :: { Rng_and(p, Rng_any) } Rng_and(p, Rng_any) == p);\n");
+    // A function holds `Rng_fn1(p, q)` when it gives a value in `q` for each argument in `p`:
+    // an application to an argument known in `p` is in `q`. That a function holds it is a fact
+    // stated where it is known, of a lambda or a parameter, not derived.
+    out.push_str("function Rng_fn1(p: Rng, q: Rng) returns (Rng);\n");
+    out.push_str("axiom (forall<A, B> p: Rng, q: Rng, f: Fn1 A B, x: A :: { Rng_holds(Rng_fn1(p, q), f), Fn1_app(f, x) } Rng_holds(Rng_fn1(p, q), f) && Rng_holds(p, x) ==> Rng_holds(q, Fn1_app(f, x)));\n");
+    out.push_str("axiom (forall p: Rng :: { Rng_fn1(p, Rng_any) } Rng_fn1(p, Rng_any) == Rng_any);\n");
+    // A function whose values are in both of two ranges is in each (Task H.9). A lambda states
+    // both halves of a pair it gives, as `Rng_and(Rng__Tuple2_A(Rng_u64), Rng__Tuple2_B(
+    // Rng_u64))`, where `GEN[A].make` at `NAT` asks only for the half that is not `A`'s. Each
+    // half is triggered by the fact asked for as well: triggered by the stated fact alone, it
+    // fired on every lambda giving a pair, and `ghttp`'s `request_line_reads_back` failed.
+    out.push_str("axiom (forall<A, B> p: Rng, q: Rng, r: Rng, f: Fn1 A B :: { Rng_holds(Rng_fn1(p, q), f), Rng_holds(Rng_fn1(p, Rng_and(q, r)), f) } Rng_holds(Rng_fn1(p, Rng_and(q, r)), f) ==> Rng_holds(Rng_fn1(p, q), f));\n");
+    out.push_str("axiom (forall<A, B> p: Rng, q: Rng, r: Rng, f: Fn1 A B :: { Rng_holds(Rng_fn1(p, r), f), Rng_holds(Rng_fn1(p, Rng_and(q, r)), f) } Rng_holds(Rng_fn1(p, Rng_and(q, r)), f) ==> Rng_holds(Rng_fn1(p, r), f));\n");
+    // The lambdas written as built-in functions, not lifted: the identity keeps any range, and
+    // a composition gives what its outer function gives for what its inner one gives. Each is
+    // triggered by the fact it states, so it works only where that fact is asked for: one on
+    // every `Rng_fn1` or every composition made `tenth`, `fibs(0).nth(9)`, run out of resource.
+    out.push_str("axiom (forall<A> p: Rng :: { Rng_holds(Rng_fn1(p, p), Fn1_id() : Fn1 A A) } Rng_holds(Rng_fn1(p, p), Fn1_id() : Fn1 A A));\n");
+    out.push_str("axiom (forall<A, B, C> p: Rng, q: Rng, r: Rng, f: Fn1 B C, g: Fn1 A B :: { Rng_holds(Rng_fn1(p, r), Fn1_compose(f, g)), Rng_holds(Rng_fn1(q, r), f) } Rng_holds(Rng_fn1(q, r), f) && Rng_holds(Rng_fn1(p, q), g) ==> Rng_holds(Rng_fn1(p, r), Fn1_compose(f, g)));\n");
+    out.push_str("function Rng_fn2(p: Rng, q: Rng, r: Rng) returns (Rng);\n");
+    out.push_str("axiom (forall p: Rng, q: Rng :: { Rng_fn2(p, q, Rng_any) } Rng_fn2(p, q, Rng_any) == Rng_any);\n");
+    out.push_str("axiom (forall<A, B, C> p: Rng, q: Rng, r: Rng, f: Fn2 A B C, x: A, y: B :: { Rng_holds(Rng_fn2(p, q, r), f), Fn2_app(f, x, y) } Rng_holds(Rng_fn2(p, q, r), f) && Rng_holds(p, x) && Rng_holds(q, y) ==> Rng_holds(r, Fn2_app(f, x, y)));\n");
+    out
+}
+
+/// The ranges of a generic module's type parameters (Task H.0e): for each one its fields hold
+/// in a stated way, `Rng__<M>_<tp>(p)` holds of a value whose `tp` values all hold `p`. A
+/// value built by a constructor holds it exactly when its fields do, and a field read from a
+/// value that holds it holds its part. Each is triggered by a term already there, a
+/// constructor's or a field's, so a recursive type unfolds no further than its terms.
+fn emit_container_range_theory(m: &ModuleDecl, tp_quant: &str, mod_bpl_ty: &str, hide_repr: bool) -> String {
+    let mut out = String::new();
+    let ctors: Vec<(String, Option<String>, Vec<(String, String)>)> = match &m.repr {
+        ReprKind::Sum(vs) => vs.iter().map(|v| (v.name.clone(), Some(v.name.clone()), v.fields.clone())).collect(),
+        ReprKind::Product(fs) => vec![(format!("{}_Ctor", m.name), None, fs.clone())],
+    };
+    let own = module_self_type(m);
+    if joint_range(&m.name) {
+        return emit_joint_range_theory(m, &ctors, tp_quant, mod_bpl_ty, hide_repr);
+    }
+    for tp in &m.type_params {
+        if !carries_range(&m.name, tp) {
+            continue;
+        }
+        let rf = format!("Rng__{}_{tp}", m.name);
+        out.push_str(&format!("function {rf}(_rp: Rng) returns (Rng);\n"));
+        out.push_str(&format!("axiom {rf}(Rng_any) == Rng_any;\n"));
+        if hide_repr {
+            continue;
+        }
+        let holds = |x: &str| format!("Rng_holds({rf}(_rp), {x})");
+        let fact = |fty: &str, term: &str| -> Option<String> {
+            let fty = if fty == "Current" { own.as_str() } else { fty };
+            if !type_tokens(fty).contains(&tp.as_str()) {
+                return None;
+            }
+            Some(format!("Rng_holds({}, {term})", field_rng(fty, tp, "_rp")?))
+        };
+        for (ctor, variant, fields) in &ctors {
+            if fields.is_empty() && variant.is_none() {
+                continue;
+            }
+            let binders: Vec<String> = fields.iter().map(|(f, _)| boogie_reserved::field_binder(f)).collect();
+            let mut quant = vec!["_rp: Rng".to_string()];
+            quant.extend(fields.iter().zip(&binders).map(|((_, t), b)| format!("{b}: {}", map_boogie_type(t, m))));
+            let app = format!("({ctor}({}) : {mod_bpl_ty})", binders.join(", "));
+            let conj: Vec<String> = fields.iter().zip(&binders).filter_map(|((_, t), b)| fact(t, b)).collect();
+            let conj = if conj.is_empty() { "true".to_string() } else { conj.join(" && ") };
+            out.push_str(&format!(
+                "axiom (forall{tp_quant} {} :: {{ {} }} {} <==> {conj});\n",
+                quant.join(", "),
+                holds(&app),
+                holds(&app)
+            ));
+            for (f, t) in fields {
+                let sel = match variant {
+                    Some(v) => format!("{v}_{f}(_rx)"),
+                    None => format!("{}_{f}(_rx)", m.name),
+                };
+                let Some(ff) = fact(t, &sel) else { continue };
+                let guard = variant.as_ref().map(|v| format!(" && is_{v}(_rx)")).unwrap_or_default();
+                out.push_str(&format!(
+                    "axiom (forall{tp_quant} _rp: Rng, _rx: {mod_bpl_ty} :: {{ {}, {sel} }} {}{guard} ==> {ff});\n",
+                    holds("_rx"),
+                    holds("_rx")
+                ));
+            }
+        }
+    }
+    out
+}
+
+/// The range of a module whose fields hold its type parameters' values in functions (Task
+/// H.22b): `Rng__M(r0, r1, ...)` takes one range for each parameter and holds of a value whose
+/// fields hold theirs. For `GENERATOR[S, A]`, the state is in `r0` and the step takes a state
+/// in `r0` to an item in `r1` and a state in `r0`, so each item and state reached is in range.
+/// With every parameter at `Rng_any` it holds of every value.
+fn emit_joint_range_theory(
+    m: &ModuleDecl,
+    ctors: &[(String, Option<String>, Vec<(String, String)>)],
+    tp_quant: &str,
+    mod_bpl_ty: &str,
+    hide_repr: bool,
+) -> String {
+    let mut out = String::new();
+    let own = module_self_type(m);
+    let vars: Vec<String> = (0..m.type_params.len()).map(|i| format!("_r{i}")).collect();
+    let rf = format!("Rng__{}", m.name);
+    let decls: Vec<String> = vars.iter().map(|v| format!("{v}: Rng")).collect();
+    out.push_str(&format!("function {rf}({}) returns (Rng);\n", decls.join(", ")));
+    let anys = vec!["Rng_any"; vars.len()].join(", ");
+    out.push_str(&format!("axiom {rf}({anys}) == Rng_any;\n"));
+    if hide_repr {
+        return out;
+    }
+    let tps = &m.type_params;
+    let leaf = |t: &str| tps.iter().position(|p| p == t).map(|i| vars[i].clone());
+    let mentions = |t: &str| type_tokens(t).iter().any(|x| tps.iter().any(|p| p == x));
+    let holds = |x: &str| format!("Rng_holds({rf}({}), {x})", vars.join(", "));
+    let fact = |fty: &str, term: &str| -> Option<String> {
+        let fty = if fty == "Current" { own.as_str() } else { fty };
+        if !mentions(fty) {
+            return None;
+        }
+        Some(format!("Rng_holds({}, {term})", rng_term(fty, &leaf, &mentions)?))
+    };
+    for (ctor, variant, fields) in ctors {
+        if fields.is_empty() && variant.is_none() {
+            continue;
+        }
+        let binders: Vec<String> = fields.iter().map(|(f, _)| boogie_reserved::field_binder(f)).collect();
+        let mut quant = decls.clone();
+        quant.extend(fields.iter().zip(&binders).map(|((_, t), b)| format!("{b}: {}", map_boogie_type(t, m))));
+        let app = format!("({ctor}({}) : {mod_bpl_ty})", binders.join(", "));
+        let conj: Vec<String> = fields.iter().zip(&binders).filter_map(|((_, t), b)| fact(t, b)).collect();
+        let conj = if conj.is_empty() { "true".to_string() } else { conj.join(" && ") };
+        out.push_str(&format!(
+            "axiom (forall{tp_quant} {} :: {{ {} }} {} <==> {conj});\n",
+            quant.join(", "),
+            holds(&app),
+            holds(&app)
+        ));
+        for (f, t) in fields {
+            let sel = match variant {
+                Some(v) => format!("{v}_{f}(_rx)"),
+                None => format!("{}_{f}(_rx)", m.name),
+            };
+            let Some(ff) = fact(t, &sel) else { continue };
+            let guard = variant.as_ref().map(|v| format!(" && is_{v}(_rx)")).unwrap_or_default();
+            out.push_str(&format!(
+                "axiom (forall{tp_quant} {}, _rx: {mod_bpl_ty} :: {{ {}, {sel} }} {}{guard} ==> {ff});\n",
+                decls.join(", "),
+                holds("_rx"),
+                holds("_rx")
+            ));
+        }
+    }
+    out
+}
+
+/// The ranges a generic routine's result holds over a module whose range is joint (Task
+/// H.22b), as `GENERATOR.take`'s items: by parametricity, for any range of each type
+/// parameter, a routine given arguments in those ranges gives a result in them. Each type
+/// parameter's range is a variable `_rg_T`, a machine number type's its own. Every argument
+/// that can carry a type parameter's values is a guard, and the routine has no axiom when one
+/// has no range term. A function argument that gives back no such value, as `p: A -> BOOL`,
+/// carries none.
+///
+/// The axiom is triggered by the result's range, when it is to be proven, or by the routine's
+/// term with the ranges of its container arguments, when they are known. A variable that only
+/// a function argument fixes, as `B` of `map[B](f: A -> B)`, is then instantiated at each
+/// machine number range, as are all of them for a routine with no container argument, as
+/// `cycle(xs)`, whose axioms the call alone triggers.
+fn emit_joint_parametric_axioms(r: &RoutineDecl, has_current: bool, m: &ModuleDecl, r_all_tps: &[String], q_params: &[String], fn_f_app: &str) -> String {
+    let mut out = String::new();
+    let tps: Vec<&String> =
+        r_all_tps.iter().filter(|tp| q_params.iter().any(|qp| type_tokens(qp).contains(&tp.as_str()))).collect();
+    if r_all_tps.iter().any(|tp| !tps.contains(&tp) && type_tokens(&r.ret_type).contains(&tp.as_str())) {
+        return out;
+    }
+    let var = |tp: &str| format!("_rg_{tp}");
+    let leaf = |t: &str| tps.iter().find(|p| p.as_str() == t).map(|p| var(p)).or_else(|| machine_rng(t));
+    let mentions = |t: &str| type_tokens(t).iter().any(|x| tps.iter().any(|p| p.as_str() == *x));
+    let Some(ret_rng) = rng_term(&r.ret_type, &leaf, &mentions) else {
+        return out;
+    };
+    let mut sig: Vec<(String, String)> = Vec::new();
+    if has_current {
+        sig.push(("Current".to_string(), module_self_type(m)));
+    }
+    sig.extend(r.params.iter().cloned());
+    let mut guards = Vec::new();
+    let mut trigger_guards = Vec::new();
+    for (pn, pt) in &sig {
+        if !mentions(pt) {
+            continue;
+        }
+        if let Some((lhs, rhs)) = split_top_level_arrow(pt) {
+            if !lhs.contains("->") && !rhs.contains("->") && !mentions(rhs) {
+                continue;
+            }
+        }
+        let Some(g) = rng_term(pt, &leaf, &mentions) else {
+            return out;
+        };
+        let holds = format!("Rng_holds({g}, {pn})");
+        // A container argument's range is a fact the caller has; a number's or a function's
+        // is not stated as a `Rng_holds` term until the axiom is used.
+        let (head, _) = split_type_app(pt);
+        if split_top_level_arrow(pt).is_none() && !matches!(head, "LIST" | "SEQ") && !tps.iter().any(|p| p.as_str() == pt.trim()) {
+            trigger_guards.push(holds.clone());
+        }
+        guards.push(holds);
+    }
+    let vars_in = |s: &str| -> Vec<String> {
+        tps.iter().map(|tp| var(tp)).filter(|v| type_tokens(s).contains(&v.as_str())).collect()
+    };
+    let fact_vars = vars_in(&ret_rng);
+    if fact_vars.is_empty() {
+        return out;
+    }
+    let mut used: Vec<String> = fact_vars.clone();
+    for g in &guards {
+        for v in vars_in(g) {
+            if !used.contains(&v) {
+                used.push(v);
+            }
+        }
+    }
+    let ret_bty = map_boogie_type(&r.ret_type, m);
+    let term = format!("({fn_f_app} : {ret_bty})");
+    let tp_quant = if tps.is_empty() {
+        String::new()
+    } else {
+        format!("<{}>", tps.iter().map(|t| t.as_str()).collect::<Vec<_>>().join(", "))
+    };
+    let covered: Vec<String> = trigger_guards.iter().flat_map(|g| vars_in(g)).collect();
+    let uncovered: Vec<String> = used.iter().filter(|v| !covered.contains(v)).cloned().collect();
+    // One assignment of the uncovered variables to machine number ranges, or none to leave them
+    // all quantified.
+    let ranges = ["Rng_u64", "Rng_i64", "Rng_char"];
+    let mut assignments: Vec<HashMap<String, String>> = vec![HashMap::new()];
+    if !uncovered.is_empty() && uncovered.len() <= 2 {
+        for v in &uncovered {
+            assignments = assignments
+                .into_iter()
+                .flat_map(|a| {
+                    ranges.iter().map(move |r| {
+                        let mut a = a.clone();
+                        a.insert(v.clone(), r.to_string());
+                        a
+                    })
+                })
+                .collect();
+        }
+        // The general axiom, triggered by the result's range, stays as well.
+        assignments.insert(0, HashMap::new());
+    }
+    for a in assignments {
+        let at = |s: &str| rename_boogie_idents(s, &a);
+        let fact = at(&format!("Rng_holds({ret_rng}, {term})"));
+        let guards: Vec<String> = guards.iter().map(|g| at(g)).collect();
+        let quantified: Vec<String> = used.iter().filter(|v| !a.contains_key(*v)).cloned().collect();
+        let mut triggers = Vec::new();
+        if quantified.iter().all(|v| vars_in(&fact).contains(v)) {
+            triggers.push(format!("{{ {fact} }}"));
+        }
+        // With no container argument, as `cycle(xs)` or `make(s, f)`, the call alone, once each
+        // variable is a machine number range.
+        if quantified.iter().all(|v| covered.contains(v)) {
+            let tg: Vec<String> = std::iter::once(term.clone()).chain(trigger_guards.iter().map(|g| at(g))).collect();
+            triggers.push(format!("{{ {} }}", tg.join(", ")));
+        }
+        if triggers.is_empty() {
+            continue;
+        }
+        let mut quant: Vec<String> = quantified.iter().map(|v| format!("{v}: Rng")).collect();
+        quant.extend(q_params.iter().cloned());
+        let guard = if guards.is_empty() { String::new() } else { format!("{} ==> ", guards.join(" && ")) };
+        out.push_str(&format!("axiom (forall{tp_quant} {} :: {} {guard}{fact});\n", quant.join(", "), triggers.join(" ")));
+    }
+    out
+}
+
+/// How a parameter of type `ty` can carry values of the type parameter `tp` into a routine:
+/// not at all, as a `tp` or a `LIST[tp]` (whose range a guard can state), or some other way.
+enum TpCarrier {
+    None,
+    Value,
+    List,
+    Other,
+}
+
+fn tp_carrier(ty: &str, tp: &str) -> TpCarrier {
+    let ty = ty.trim();
+    if !type_tokens(ty).contains(&tp) {
+        return TpCarrier::None;
+    }
+    if ty == tp {
+        return TpCarrier::Value;
+    }
+    if ty.strip_prefix("LIST[").and_then(|s| s.strip_suffix(']')).is_some_and(|s| s.trim() == tp) {
+        return TpCarrier::List;
+    }
+    // A function that only takes `tp` values, such as `keep: A -> BOOL`, gives the routine
+    // none. One that gives them back, or takes a function, could.
+    if let Some((lhs, rhs)) = split_top_level_arrow(ty) {
+        if !lhs.contains("->") && !rhs.contains("->") && !type_tokens(rhs).contains(&tp) {
+            return TpCarrier::None;
+        }
+    }
+    TpCarrier::Other
+}
+
+/// Task H.0b: a generic routine has no value of a type parameter `A` but those its arguments
+/// carry, so where `A` is a machine number type and each argument that carries `A` is in a
+/// range, a result that holds `A` is too. `LIST_OPS.drop(xs, n)` on a `LIST[U64]` then gives
+/// a `LIST[U64]` with its elements in range. A carrier is an `A`, a list of them, or a
+/// container whose range states all its `A` values (H.0e), as the receiver of `get` of a
+/// `MAP[K, V]` at `V`, whose result `OPTION[V]` then holds the range. One axiom per range,
+/// with `A` at `int`; the routine's `require` is not needed, as the result is made from the
+/// same values wherever it is defined.
+fn emit_parametric_range_axioms(
+    r: &RoutineDecl,
+    has_current: bool,
+    m: &ModuleDecl,
+    r_all_tps: &[String],
+    q_params: &[String],
+    fn_f_app: &str,
+) -> String {
+    let own_joint = has_current && involves_joint(&module_self_type(m));
+    if own_joint || involves_joint(&r.ret_type) || r.params.iter().any(|(_, t)| involves_joint(t)) {
+        return emit_joint_parametric_axioms(r, has_current, m, r_all_tps, q_params, fn_f_app);
+    }
+    let mut out = String::new();
+    for tp in r_all_tps {
+        if matches!(tp_carrier(&r.ret_type, tp), TpCarrier::None) || r.ret_type.contains("->") {
+            continue;
+        }
+        let mut carriers: Vec<(String, String)> = Vec::new();
+        let mut stated = true;
+        // The receiver carries `A` as an argument does. A `SEQ`'s range is its `model`'s, which
+        // no range term states: a guard on it would unfold `model` at every call.
+        if has_current && m.type_params.contains(tp) {
+            let own = module_self_type(m);
+            if field_rng(&own, tp, "p").is_some() {
+                carriers.push(("Current".to_string(), own));
+            } else {
+                stated = false;
+            }
+        }
+        for (pn, pt) in &r.params {
+            match tp_carrier(pt, tp) {
+                TpCarrier::None => {}
+                TpCarrier::Value | TpCarrier::List => carriers.push((pn.clone(), pt.clone())),
+                // A container is a carrier when its range states each of its `A` values.
+                // A function's range is stated only over a joint container's (H.22b).
+                TpCarrier::Other if !pt.contains("->") && field_rng(pt, tp, "p").is_some() => {
+                    carriers.push((pn.clone(), pt.clone()))
+                }
+                TpCarrier::Other => stated = false,
+            }
+        }
+        // Each other type parameter must stay fixed by an argument or by the result, whose
+        // type the axiom's term states, as `K` of `empty: MAP[K, V]`.
+        let others: Vec<&String> = r_all_tps.iter().filter(|t| *t != tp).collect();
+        let fixed = others.iter().all(|o| {
+            q_params.iter().chain(std::iter::once(&r.ret_type)).any(|qp| type_tokens(qp).iter().any(|t| *t == o.as_str()))
+        });
+        if !stated || !fixed {
+            continue;
+        }
+        let quant = if others.is_empty() {
+            String::new()
+        } else {
+            format!("<{}>", others.iter().map(|t| t.as_str()).collect::<Vec<_>>().join(", "))
+        };
+        // `A` as a machine number, and as a list of them, such as a line of a text.
+        let levels = [
+            ("U64", "int"),
+            ("I64", "int"),
+            ("CHAR", "int"),
+            ("LIST[U64]", "(Seq int)"),
+            ("LIST[I64]", "(Seq int)"),
+            ("LIST[CHAR]", "(Seq int)"),
+        ];
+        for (a_ty, a_bty) in levels {
+            let at: HashMap<String, String> = [(tp.clone(), a_ty.to_string())].into_iter().collect();
+            let at_ty = |ty: &str| rename_boogie_idents(ty, &at);
+            let map: HashMap<String, String> = [(tp.clone(), a_bty.to_string())].into_iter().collect();
+            let params: Vec<String> = q_params.iter().map(|qp| rename_boogie_idents(qp, &map)).collect();
+            let ret_bty = rename_boogie_idents(&map_boogie_type(&r.ret_type, m), &map);
+            let term = format!("({fn_f_app} : {ret_bty})");
+            let guards: Option<Vec<String>> = carriers.iter().map(|(pn, pt)| value_fact(&at_ty(pt), pn)).collect();
+            let (Some(guards), Some(fact)) = (guards, value_fact(&at_ty(&r.ret_type), &term)) else {
+                continue;
+            };
+            let guard = if guards.is_empty() { String::new() } else { format!("{} ==> ", guards.join(" && ")) };
+            out.push_str(&format!(
+                "axiom (forall{quant} {} :: {{ {term} }} {guard}{fact});\n",
+                params.join(", ")
+            ));
+        }
+        // `A` at any range `p`, as an `OPTION[U64]` in a `MAP[STRING, OPTION[U64]]`. A number
+        // states its range with an inlined `in_u64`, which binds no `p`, so the axiom is
+        // triggered by a container's range: the result's, when it is to be proven, or a
+        // carrier's, when it is known.
+        let Some(ret_rng) = field_rng(&r.ret_type, tp, "_rp") else {
+            continue;
+        };
+        let Some(carrier_rngs) = carriers
+            .iter()
+            .map(|(pn, pt)| field_rng(pt, tp, "_rp").map(|g| format!("Rng_holds({g}, {pn})")))
+            .collect::<Option<Vec<String>>>()
+        else {
+            continue;
+        };
+        let all_tps = format!("<{}>", r_all_tps.join(", "));
+        let term = format!("({fn_f_app} : {})", map_boogie_type(&r.ret_type, m));
+        let fact = format!("Rng_holds({ret_rng}, {term})");
+        let mut triggers = vec![format!("{{ {fact} }}")];
+        triggers.extend(carrier_rngs.iter().filter(|g| !g.starts_with("Rng_holds(_rp,")).map(|g| format!("{{ {term}, {g} }}")));
+        let guard = if carrier_rngs.is_empty() { String::new() } else { format!("{} ==> ", carrier_rngs.join(" && ")) };
+        out.push_str(&format!(
+            "axiom (forall{all_tps} _rp: Rng, {} :: {} {guard}{fact});\n",
+            q_params.join(", "),
+            triggers.join(" ")
+        ));
+    }
+    out
+}
+
+/// The theory of `Seq_in_u64`, `Seq_in_i64` and `Seq_in_char` (Task H.0b). Each means that
+/// every item of the list is in the range, and the axioms follow from that reading: an empty
+/// list holds, `prepend` and `append` hold when their parts do, and an item read from a list
+/// that holds, by `head`, `at` or `has`, is in range, as are its `tail` and a `filter` of it.
+fn emit_elements_range_theory() -> String {
+    let mut out = String::new();
+    // `Seq_r` over a list of numbers, then `Seq2_r` over a list of lists, each of whose items
+    // holds `Seq_r`.
+    let levels = ["in_u64", "in_i64", "in_char"].into_iter().flat_map(|r| {
+        [(format!("Seq_{r}"), "int", r.to_string()), (format!("Seq2_{r}"), "Seq int", format!("Seq_{r}"))]
+    });
+    for (p, t, r) in levels {
+        let tw = if t.contains(' ') { format!("({t})") } else { t.to_string() };
+        let s = format!("Seq {tw}");
+        out.push_str(&format!("function {p}(xs: {s}) returns (bool);\n"));
+        out.push_str(&format!("axiom {p}(Seq_empty() : {s});\n"));
+        out.push_str(&format!("axiom (forall x: {t}, xs: {s} :: {{ {p}(Seq_prepend(x, xs)) }} {p}(Seq_prepend(x, xs)) <==> {r}(x) && {p}(xs));\n"));
+        out.push_str(&format!("axiom (forall x: {t} :: {{ {p}(Seq_singleton(x)) }} {p}(Seq_singleton(x)) <==> {r}(x));\n"));
+        out.push_str(&format!("axiom (forall xs: {s}, ys: {s} :: {{ {p}(Seq_append(xs, ys)) }} {p}(Seq_append(xs, ys)) <==> {p}(xs) && {p}(ys));\n"));
+        out.push_str(&format!("axiom (forall xs: {s} :: {{ {p}(xs), Seq_head(xs) }} {p}(xs) && Seq_length(xs) > 0 ==> {r}(Seq_head(xs)));\n"));
+        out.push_str(&format!("axiom (forall xs: {s} :: {{ {p}(xs), Seq_tail(xs) }} {p}(xs) ==> {p}(Seq_tail(xs)));\n"));
+        out.push_str(&format!("axiom (forall xs: {s}, i: int :: {{ {p}(xs), Seq_at(xs, i) }} {p}(xs) && 0 <= i && i < Seq_length(xs) ==> {r}(Seq_at(xs, i)));\n"));
+        out.push_str(&format!("axiom (forall xs: {s}, x: {t} :: {{ {p}(xs), Seq_has(xs, x) }} {p}(xs) && Seq_has(xs, x) ==> {r}(x));\n"));
+        out.push_str(&format!("axiom (forall xs: {s}, keep: Fn1 {tw} bool :: {{ {p}(Seq_filter(xs, keep)) }} {p}(xs) ==> {p}(Seq_filter(xs, keep)));\n"));
+    }
+    out.push_str(&emit_fold_range_theory());
+    out.push('\n');
+    out
+}
+
+/// Task H.0d: a fold whose accumulator is a machine number is in that number's range when its
+/// start is and every step keeps it there, by induction on the list. A step may assume the
+/// range of the element it takes when the list's elements have one.
+fn emit_fold_range_theory() -> String {
+    let ranges = ["in_u64", "in_i64", "in_char"];
+    let mut out = String::new();
+    for r in ranges {
+        // Each fold, with its step applied as `Fn2_app(f, <acc>, <elem>)` or the other way.
+        for (fold, fty, app) in [
+            ("Seq_fold_left", "Fn2 int {A} int", "Fn2_app(f, b, a)"),
+            ("Seq_fold_right", "Fn2 {A} int int", "Fn2_app(f, a, b)"),
+        ] {
+            let any = fty.replace("{A}", "A");
+            out.push_str(&format!(
+                "axiom (forall<A> xs: Seq A, f: {any}, init: int :: {{ {fold}(xs, f, init) }} {r}(init) && (forall b: int, a: A :: {{ {app} }} {r}(b) ==> {r}({app})) ==> {r}({fold}(xs, f, init)));\n"
+            ));
+            let ints = fty.replace("{A}", "int");
+            for ra in ranges {
+                out.push_str(&format!(
+                    "axiom (forall xs: Seq int, f: {ints}, init: int :: {{ {fold}(xs, f, init) }} {r}(init) && Seq_{ra}(xs) && (forall b: int, a: int :: {{ {app} }} {r}(b) && {ra}(a) ==> {r}({app})) ==> {r}({fold}(xs, f, init)));\n"
+                ));
+            }
+        }
+    }
+    out
 }
 
 /// A concept method on a scalar, which has no module to hold it. Every type mapped to `int` is
@@ -5216,11 +6438,35 @@ pub fn check_module_dependency_cycles(units: &[SourceUnit], table: &LinkTable) -
 /// nothing to the program.
 pub const GCC_NET_LIBS: &[&str] = if cfg!(windows) { &["-lws2_32"] } else { &[] };
 
+/// Compiles a program's C file into its executable, as every build does.
+pub fn compile_program_c(c_path: &str, exe: &str) -> std::io::Result<std::process::Output> {
+    Command::new("gcc").args(["-O3", "-fopenmp", c_path, "-o", exe]).args(GCC_NET_LIBS).output()
+}
+
+/// Whether `exe` was built from `c_path` as it stands: it exists and is no older. A C file is
+/// rewritten only when its text changes (`write_if_changed`), so an unchanged program is not
+/// compiled again. The C file holds its whole runtime, so nothing else goes into the build.
+pub fn executable_is_current(c_path: &str, exe: &str) -> bool {
+    let modified = |p: &str| fs::metadata(p).and_then(|m| m.modified()).ok();
+    matches!((modified(c_path), modified(exe)), (Some(c), Some(e)) if e >= c)
+}
+
+/// Writes `text` to `path` unless it already holds exactly that, so its time stays that of
+/// its last change.
+fn write_if_changed(path: &str, text: &str) -> std::io::Result<()> {
+    if fs::read(path).is_ok_and(|old| old == text.as_bytes()) {
+        return Ok(());
+    }
+    fs::write(path, text)
+}
+
 /// Prelude modules whose background theory is injected into user Boogie contexts.
 /// `STRING` is injected for modules that mention it, contain string literals or use `IO`
 /// (Task B.3: literals denote prelude `STRING` values); `LIST_OPS` / `FUNCTION_OPS` are realized by the built-in
 /// `Seq_*` / `Fn1_*` preamble theories already present in every Boogie file.
-const BOOGIE_INJECTED_PRELUDE: [&str; 20] = [
+const BOOGIE_INJECTED_PRELUDE: [&str; 36] = [
+    "LIST_OPS",
+    "GENERATOR",
     "OPTION",
     "RESULT",
     "SEQ",
@@ -5231,16 +6477,30 @@ const BOOGIE_INJECTED_PRELUDE: [&str; 20] = [
     "BYTES_BUILDER",
     "NUMBER_ERROR",
     "NUMBER_TEXT",
+    "STRING_BUILDER",
+    "TEXT_FORMAT",
+    "CODEC_ERROR",
+    "HEX",
+    "BASE64",
+    "PERCENT",
     "IO_ERROR",
     "CONN_ID",
     "PROC_ID",
     "DIR_ENTRY",
+    "LOG_LEVEL",
     "COMMAND",
     "KEY",
     "EVENT",
     "STEP",
     "KEY_ORDER",
+    "SORTING",
+    "ARRAY",
     "MAP",
+    "SET",
+    "QUEUE",
+    "HEAP_ORDER",
+    "HEAP",
+    "UNFOLD",
 ];
 
 /// Marker on the opaque declaration of another prelude module's sort that a module's
@@ -5363,9 +6623,52 @@ impl BoogiePreludeCtx {
         if wanted.contains("BYTES_BUILDER") || m.name == "BYTES_BUILDER" {
             wanted.insert("STRING");
         }
+        // The codecs read and write text as `NUMBER_TEXT` does, build their output with a
+        // `BYTES_BUILDER`, and fail with a `CODEC_ERROR` (Task H.6).
+        if ["HEX", "BASE64", "PERCENT"].iter().any(|c| wanted.contains(c) || m.name == *c) {
+            wanted.insert("BYTES_BUILDER");
+            wanted.insert("CODEC_ERROR");
+            wanted.insert("NUMBER_TEXT");
+            wanted.insert("NUMBER_ERROR");
+            wanted.insert("STRING");
+        }
+        // `TEXT_FORMAT` builds with `STRING_BUILDER` (Task H.6).
+        if wanted.contains("TEXT_FORMAT") || m.name == "TEXT_FORMAT" {
+            wanted.insert("STRING_BUILDER");
+        }
+        // `STRING_BUILDER` adds numbers with `NUMBER_TEXT` (Task H.6).
+        if wanted.contains("STRING_BUILDER") || m.name == "STRING_BUILDER" {
+            wanted.insert("NUMBER_TEXT");
+            wanted.insert("NUMBER_ERROR");
+            wanted.insert("STRING");
+        }
         // `MAP` keeps its keys with `KEY_ORDER` and answers `get` with an `OPTION`.
         if wanted.contains("MAP") || m.name == "MAP" {
             wanted.insert("KEY_ORDER");
+            wanted.insert("OPTION");
+        }
+        // `SET` keeps its keys with `KEY_ORDER`, as `MAP` does. `QUEUE` reverses a list. `HEAP`
+        // keeps its items with `HEAP_ORDER`, in an `ARRAY` (Task H.4).
+        if wanted.contains("SET") || m.name == "SET" {
+            wanted.insert("KEY_ORDER");
+        }
+        if wanted.contains("QUEUE") || m.name == "QUEUE" {
+            wanted.insert("LIST_OPS");
+            wanted.insert("OPTION");
+        }
+        if wanted.contains("HEAP") || m.name == "HEAP" {
+            wanted.insert("HEAP_ORDER");
+            wanted.insert("OPTION");
+        }
+        if wanted.contains("HEAP_ORDER") || m.name == "HEAP_ORDER" {
+            wanted.insert("ARRAY");
+        }
+        // `UNFOLD`'s step gives an `OPTION`, and `GENERATOR.find_within` one (Task H.22).
+        if wanted.contains("UNFOLD") || m.name == "UNFOLD" || wanted.contains("GENERATOR") || m.name == "GENERATOR" {
+            wanted.insert("OPTION");
+        }
+        // `LOG_LEVEL.from_ordinal`, derived (H.0c), gives an `OPTION` (Task H.2).
+        if wanted.contains("LOG_LEVEL") || m.name == "LOG_LEVEL" {
             wanted.insert("OPTION");
         }
         // `BYTES.index_of` gives an `OPTION`.
@@ -5396,6 +6699,24 @@ impl BoogiePreludeCtx {
             if wanted.len() == before {
                 break;
             }
+        }
+        // `BYTES` states its slices with `LIST_OPS.take` and `drop` (Task H.21). After the
+        // loop, as a representation may bring `BYTES` in.
+        // `SEQ.reduce` is proven by `LIST_OPS`' fold laws.
+        if wanted.contains("BYTES") || m.name == "BYTES" || m.name == "SEQ" {
+            wanted.insert("LIST_OPS");
+        }
+        // `SORTING` splits and merges with `LIST_OPS`' `take`, `drop` and `reverse_onto`
+        // (Task H.3).
+        if wanted.contains("SORTING") || m.name == "SORTING" {
+            wanted.insert("LIST_OPS");
+            // `sort_array` and `binary_search` (Task H.3, after H.5).
+            wanted.insert("ARRAY");
+            wanted.insert("OPTION");
+        }
+        // `ARRAY.set` states its result with `LIST_OPS.update` (Task H.5).
+        if wanted.contains("ARRAY") || m.name == "ARRAY" {
+            wanted.insert("LIST_OPS");
         }
         let mut modules: Vec<ModuleDecl> = BOOGIE_INJECTED_PRELUDE
             .iter()
@@ -5470,6 +6791,15 @@ fn module_referenced_idents(m: &ModuleDecl) -> HashSet<String> {
 
 /// Standard Prelude modules referenced by `m` (empty unless prelude injection is enabled
 /// and `m` is not itself a prelude module).
+/// Whether the `Debug` text of a module calls a `LIST_OPS` routine that is not a built-in.
+fn calls_list_ops_function(debug: &str) -> bool {
+    const CALL: &str = "Var(\"LIST_OPS\"), \"";
+    debug.match_indices(CALL).any(|(i, _)| {
+        let rest = &debug[i + CALL.len()..];
+        rest.split('"').next().is_some_and(|r| !is_list_ops_builtin(r))
+    })
+}
+
 fn prelude_modules_wanted(m: &ModuleDecl) -> HashSet<&'static str> {
     let mut wanted: HashSet<&'static str> = HashSet::new();
     if !prelude_injection_enabled() || standard_prelude().declares(&m.name) {
@@ -5498,7 +6828,16 @@ fn prelude_modules_wanted(m: &ModuleDecl) -> HashSet<&'static str> {
             // `IO.read_line: IO[RESULT[IO_ERROR, STRING]]` (§11).
             let read_line_use =
                 matches!(name, "RESULT" | "IO_ERROR") && idents.contains("read_line");
-            if idents.contains(name) || ctor_used || string_use || read_line_use {
+            // `IO.random(count): IO[RESULT[IO_ERROR, BYTES]]` (Task H.1).
+            let read_line_use = read_line_use
+                || matches!(name, "RESULT" | "IO_ERROR" | "BYTES") && idents.contains("random") && idents.contains("IO");
+            // `IO.env(name): IO[OPTION[STRING]]` and `IO.log(level, text)` (Task H.2).
+            let read_line_use = read_line_use
+                || name == "OPTION" && idents.contains("env") && idents.contains("IO")
+                || name == "LOG_LEVEL" && idents.contains("log") && idents.contains("IO");
+            // `LIST_OPS`' built-in routines need no theory; its others do (Task H.21).
+            let named = if name == "LIST_OPS" { calls_list_ops_function(&debug) } else { idents.contains(name) };
+            if named || ctor_used || string_use || read_line_use {
                 wanted.insert(name);
             }
         }
@@ -5583,15 +6922,21 @@ impl LinkTable {
         let Some(&mf) = self.file_of.get(&m.name) else {
             return Vec::new();
         };
-        let idents = if self.is_external_for(root_caller, &m.name) {
+        let external = self.is_external_for(root_caller, &m.name);
+        let idents = if external {
             module_referenced_idents(&contract_only_module(m))
         } else {
             module_referenced_idents(m)
         };
+        // `LIST_OPS` is linked only for its ordinary routines; its built-ins need no theory.
+        let list_ops_used = || {
+            let view = if external { format!("{:?}", contract_only_module(m)) } else { format!("{m:?}") };
+            calls_list_ops_function(&view)
+        };
         self.modules
             .iter()
             .filter(|n| n.name != m.name && self.file_of.get(&n.name) != Some(&mf))
-            .filter(|n| n.name != "LIST_OPS" && n.name != "FUNCTION_OPS")
+            .filter(|n| n.name != "FUNCTION_OPS" && (n.name != "LIST_OPS" || list_ops_used()))
             .filter(|n| {
                 let ctors_visible =
                     !(self.is_external_for(root_caller, &n.name) && n.repr_vis == Visibility::None);
@@ -5733,9 +7078,11 @@ fn linked_user_modules_for(m: &ModuleDecl) -> Vec<ModuleDecl> {
 /// shared by every client.
 fn with_fresh_boogie_numbering<T>(f: impl FnOnce() -> T) -> T {
     let saved_lambda = BOOGIE_LAMBDA_COUNTER.with(|c| c.replace(0));
+    let saved_names = BOOGIE_LAMBDA_NAMES.with(|n| std::mem::take(&mut *n.borrow_mut()));
     let saved_obligation = BOOGIE_OBLIGATION_COUNTER.with(|c| c.replace(0));
     let out = f();
     BOOGIE_LAMBDA_COUNTER.with(|c| c.set(saved_lambda));
+    BOOGIE_LAMBDA_NAMES.with(|n| *n.borrow_mut() = saved_names);
     BOOGIE_OBLIGATION_COUNTER.with(|c| c.set(saved_obligation));
     out
 }
@@ -5749,7 +7096,7 @@ fn in_own_boogie_ctx<T>(n: &ModuleDecl, f: impl FnOnce() -> T) -> T {
     };
     let saved_ctx = BOOGIE_PRELUDE_CTX.with(|c| c.replace(own));
     let saved_env = BOOGIE_TYPE_ENV.with(|e| std::mem::take(&mut *e.borrow_mut()));
-    let out = with_fresh_boogie_numbering(f);
+    let out = with_own_boogie_module(n, || with_fresh_boogie_numbering(f));
     BOOGIE_PRELUDE_CTX.with(|c| *c.borrow_mut() = saved_ctx);
     BOOGIE_TYPE_ENV.with(|e| *e.borrow_mut() = saved_env);
     out
@@ -5804,7 +7151,7 @@ fn emit_linked_background_theory(
     text.push_str(&invariant_of_every_value(n, &text));
     let map: HashMap<String, String> = boogie_declared_names(&text)
         .into_iter()
-        .filter(|x| x != &n.name)
+        .filter(|x| x != &n.name && !x.starts_with("Rng__"))
         .map(|x| {
             let r = format!("{}__{x}", n.name);
             (x, r)
@@ -5832,6 +7179,11 @@ thread_local! {
     static BOOGIE_LIFTED_LAMBDAS: std::cell::RefCell<String> =
         const { std::cell::RefCell::new(String::new()) };
     static BOOGIE_LAMBDA_COUNTER: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// The name each lifted lambda got, by its definition: a lambda translated again, as the
+    /// obligation walker and the body both do, keeps its name, so a term holding it is the
+    /// same in both (Task H.0d).
+    static BOOGIE_LAMBDA_NAMES: std::cell::RefCell<HashMap<String, String>> =
+        std::cell::RefCell::new(HashMap::new());
     /// Procedure locals for the binders and lambda parameters of nested expressions (see
     /// `emit_boogie_expr_obligations`), drained by `emit_boogie_verify_routine`.
     static BOOGIE_OBLIGATION_LOCALS: std::cell::RefCell<Vec<(String, String)>> =
@@ -5961,7 +7313,23 @@ fn lift_boogie_lambda(
     if params.is_empty() || params.len() > 3 {
         return None;
     }
-    let mentions_tp = |t: &str| type_tokens(t).iter().any(|tok| m.type_params.iter().any(|p| p == tok));
+    // The type parameters in scope: the module's, and those of its routines and laws, as a
+    // lambda in `map[B]` has a `B` (Task H.22). Type parameters are named apart from types,
+    // so taking every routine's is safe.
+    let mut scope_tps: Vec<String> = m.type_params.clone();
+    let routine_tps = m
+        .create_routines
+        .iter()
+        .chain(&m.feature_routines)
+        .chain(&m.specify_routines)
+        .flat_map(|(_, r)| r.type_params.iter())
+        .chain(m.specify_laws.iter().flat_map(|(_, l)| l.type_params.iter()));
+    for tp in routine_tps {
+        if !scope_tps.contains(tp) {
+            scope_tps.push(tp.clone());
+        }
+    }
+    let mentions_tp = |t: &str| type_tokens(t).iter().any(|tok| scope_tps.iter().any(|p| p == tok));
     let param_names: Vec<String> = params.iter().map(|(p, _)| p.clone()).collect();
     let mut free = Vec::new();
     let mut bound = param_names.clone();
@@ -5976,10 +7344,15 @@ fn lift_boogie_lambda(
     let captures: Vec<(String, String)> = free
         .into_iter()
         .filter(|v| !implicit_fields.contains(v))
-        .filter_map(|v| boogie_env_type(&v).map(|t| (v, t)))
+        .filter_map(|v| {
+            // `Current` in a module's routine is captured as any local is (Task H.22).
+            if v == "Current" && m.kind == ModuleKind::Module {
+                return Some((v, module_self_type(m)));
+            }
+            boogie_env_type(&v).map(|t| (v, t))
+        })
         .collect();
-    let lam_tps: Vec<String> = m
-        .type_params
+    let lam_tps: Vec<String> = scope_tps
         .iter()
         .filter(|tp| {
             let here = |t: &str| type_tokens(t).iter().any(|tok| tok == *tp);
@@ -6010,12 +7383,22 @@ fn lift_boogie_lambda(
             }
         }
     });
-    let k = BOOGIE_LAMBDA_COUNTER.with(|c| {
-        let v = c.get();
-        c.set(v + 1);
-        v
+    let key = format!(
+        "{}|{:?}|{:?}|{ret_ty}|{generic}|{:?}|{body_bpl}",
+        m.name, params, captures, lam_tps
+    );
+    let known = BOOGIE_LAMBDA_NAMES.with(|n| n.borrow().get(&key).cloned());
+    let fresh = known.is_none();
+    let name = known.unwrap_or_else(|| {
+        let k = BOOGIE_LAMBDA_COUNTER.with(|c| {
+            let v = c.get();
+            c.set(v + 1);
+            v
+        });
+        let name = format!("lam_{}_{k}", m.name);
+        BOOGIE_LAMBDA_NAMES.with(|n| n.borrow_mut().insert(key, name.clone()));
+        name
     });
-    let name = format!("lam_{}_{k}", m.name);
     let cap_decls: Vec<String> = captures
         .iter()
         .map(|(v, t)| format!("{v}: {}", map_boogie_type(t, m)))
@@ -6038,6 +7421,9 @@ fn lift_boogie_lambda(
     } else {
         format!("{name}({})", cap_names.join(", "))
     };
+    if !fresh {
+        return Some(call);
+    }
     let mut quant: Vec<String> = cap_decls.clone();
     quant.extend(params.iter().map(|(p, t)| format!("{p}: {}", map_boogie_type(t, m))));
     let applied = format!("{app}({call}, {})", param_names.join(", "));
@@ -6053,6 +7439,62 @@ fn lift_boogie_lambda(
         quant.join(", ")
     );
     BOOGIE_LIFTED_LAMBDAS.with(|l| l.borrow_mut().push_str(&decl));
+    // Task H.22b: the lambda's range as a function, `Rng_fn1(p, q)`, for captures in theirs,
+    // as a container whose range is joint needs of its step. It is a fact here, from the
+    // same proof of the body as the axioms below, rather than a rule that derives it for any
+    // function, whose nested quantifier the solver searched without end.
+    // A generic one states it with its type parameters' parts at `Rng_any`, as `cycle`'s step.
+    if (1..=2).contains(&params.len()) && !(generic && cap_decls.is_empty()) {
+        let lhs = format!("({})", params.iter().map(|(p, t)| format!("{p}: {t}")).collect::<Vec<_>>().join(", "));
+        if let Some(rng) = fn_rng_term(&lhs, ret_ty, &machine_rng, &|_| false) {
+            let cap_guards: Vec<String> = captures.iter().filter_map(|(v, t)| value_fact(t, v)).collect();
+            let guard = if cap_guards.is_empty() { String::new() } else { format!("{} ==> ", cap_guards.join(" && ")) };
+            let fact = if cap_decls.is_empty() {
+                format!("axiom Rng_holds({rng}, {call});\n")
+            } else {
+                format!("axiom (forall{tp_quant} {} :: {{ {call} }} {guard}Rng_holds({rng}, {call}));\n", cap_decls.join(", "))
+            };
+            BOOGIE_LIFTED_LAMBDAS.with(|l| l.borrow_mut().push_str(&fact));
+        }
+    }
+    // Task H.0b: a lambda of a machine result type gives a value in that range for arguments
+    // and captures in theirs, as its body is proven under those. The axiom above holds for
+    // any argument, so the fact is guarded. Mapped over a list whose elements are in range, it
+    // gives a list whose elements are, as in `s.map(fn(x: U64): U64 do x *% 2 end)`.
+    if let Some(range) = machine_range(ret_ty).filter(|_| !generic) {
+        let cap_guards: Vec<String> = captures.iter().filter_map(|(v, t)| value_fact(t, v)).collect();
+        let mut guards = cap_guards.clone();
+        guards.extend(params.iter().filter_map(|(p, t)| value_fact(t, p)));
+        let guard = if guards.is_empty() { String::new() } else { format!("{} ==> ", guards.join(" && ")) };
+        let mut lam_axioms = format!("axiom (forall {} :: {{ {applied} }} {guard}{range}({applied}));\n", quant.join(", "));
+        if let [(_, pt)] = params {
+            if elements_range(pt).is_none() {
+                let mut guards = cap_guards;
+                if let Some(r) = machine_range(pt) {
+                    guards.push(format!("Seq_{r}(xs)"));
+                }
+                let guard = if guards.is_empty() { String::new() } else { format!("{} ==> ", guards.join(" && ")) };
+                let mut q = cap_decls.clone();
+                q.push(format!("xs: Seq {}", map_boogie_type(pt, m)));
+                let mapped = format!("Seq_map(xs, {call})");
+                lam_axioms.push_str(&format!(
+                    "axiom (forall {} :: {{ Seq_{range}({mapped}) }} {guard}Seq_{range}({mapped}));\n",
+                    q.join(", ")
+                ));
+            }
+        }
+        BOOGIE_LIFTED_LAMBDAS.with(|l| l.borrow_mut().push_str(&lam_axioms));
+    } else if let Some(fact) = container_fact(ret_ty, &applied) {
+        // A lambda that gives a container of machine numbers, as a step `(s, s +% 1)` of a
+        // `GENERATOR[NAT, NAT]` does: its body is proven to put only values in range there,
+        // for arguments and captures in theirs (Task H.22). A generic one states its parts of
+        // a machine number type, as the state in `cycle`'s step `(T, NAT)` (H.22b).
+        let mut guards: Vec<String> = captures.iter().filter_map(|(v, t)| value_fact(t, v)).collect();
+        guards.extend(params.iter().filter_map(|(p, t)| value_fact(t, p)));
+        let guard = if guards.is_empty() { String::new() } else { format!("{} ==> ", guards.join(" && ")) };
+        let axiom = format!("axiom (forall{tp_quant} {} :: {{ {applied} }} {guard}{fact});\n", quant.join(", "));
+        BOOGIE_LIFTED_LAMBDAS.with(|l| l.borrow_mut().push_str(&axiom));
+    }
     Some(call)
 }
 
@@ -6212,13 +7654,103 @@ fn with_scoped_var_types<T>(vars: &[(String, String)], f: impl FnOnce() -> T) ->
 /// The concepts whose laws a type parameter's bound can carry into Boogie.
 const BOUND_THEORY_CONCEPTS: [&str; 3] = ["EQ", "CANONICAL_EQ", "ORD"];
 
+thread_local! {
+    /// The concepts a user declared in the current run (Task H.0a). The prelude's are in
+    /// `standard_prelude`.
+    static USER_CONCEPTS: std::cell::RefCell<Rc<Vec<ConceptDecl>>> =
+        std::cell::RefCell::new(Rc::new(Vec::new()));
+}
+
+/// Installs the user concepts of the current run, for bounds and their theories.
+pub fn set_user_concepts(concepts: Vec<ConceptDecl>) {
+    USER_CONCEPTS.with(|c| *c.borrow_mut() = Rc::new(concepts));
+}
+
+/// The declaration of concept `name`, from the prelude or the user's run.
+fn find_concept(name: &str) -> Option<ConceptDecl> {
+    if let Some(c) = standard_prelude().concept(name) {
+        return Some(c.clone());
+    }
+    USER_CONCEPTS.with(|c| c.borrow().iter().find(|x| x.name == name).cloned())
+}
+
+/// Every concept whose laws reach the theory of type parameter `tp` of `m`: its bound (written,
+/// or from a `where` when none is written) and every `where` concept on it, each with what it
+/// refines. Prelude concepts come first, in the order of `BOUND_THEORY_CONCEPTS`, then a user's.
+fn bound_concepts(m: &ModuleDecl, tp: &str) -> Vec<String> {
+    let mut all: Vec<String> = Vec::new();
+    let mut add = |c: &str| {
+        for x in concept_closure(c) {
+            if !all.contains(&x) {
+                all.push(x);
+            }
+        }
+    };
+    if let Some(b) = m.type_bounds.get(tp) {
+        add(b);
+    }
+    if let Some(sat) = &m.satisfies {
+        for (t, c) in &sat.where_constraints {
+            if t == tp {
+                add(c);
+            }
+        }
+    }
+    let mut out: Vec<String> = BOUND_THEORY_CONCEPTS
+        .iter()
+        .filter(|c| all.iter().any(|x| x == *c))
+        .map(ToString::to_string)
+        .collect();
+    out.extend(all.into_iter().filter(|c| !BOUND_THEORY_CONCEPTS.contains(&c.as_str())));
+    out
+}
+
+/// The methods a user concept gives a type parameter, from it and not from what it refines.
+fn user_concept_methods(c: &str) -> Vec<SignatureDecl> {
+    if BOUND_THEORY_CONCEPTS.contains(&c) {
+        return Vec::new();
+    }
+    find_concept(c).map(|cd| cd.signatures).unwrap_or_default()
+}
+
+/// A method of a user concept on type parameter `tp`, with its signature.
+fn user_bound_method(concepts: &[String], mname: &str) -> Option<SignatureDecl> {
+    concepts.iter().flat_map(|c| user_concept_methods(c)).find(|s| s.name == mname)
+}
+
+/// The theory function of a user concept's method `mname` on type parameter `tp`.
+fn user_method_relation(tp: &str, mname: &str) -> String {
+    format!("{tp}_m_{mname}")
+}
+
+/// Why concept `c` cannot be a bound, or `None` when it can: the prelude's three, and a user
+/// concept with no type parameters, whose methods all have a receiver, and whose refined
+/// concepts can be bounds too.
+fn bound_unsupported_reason(c: &str) -> Option<String> {
+    if BOUND_THEORY_CONCEPTS.contains(&c) {
+        return None;
+    }
+    let Some(cd) = find_concept(c) else {
+        return Some(format!("there is no concept `{c}`"));
+    };
+    if !cd.type_params.is_empty() {
+        return Some(format!("`{c}` has type parameters, and a bound's theory has none"));
+    }
+    if let Some(r) = cd.default_routines.first() {
+        return Some(format!(
+            "`{c}.{}` has a body, and a bound gives only methods without one",
+            r.name
+        ));
+    }
+    cd.refines.iter().find_map(|r| bound_unsupported_reason(r))
+}
+
 /// Concept `c` together with every concept it (transitively) refines.
 fn concept_closure(c: &str) -> Vec<String> {
-    let prelude = standard_prelude();
     let mut out = vec![c.to_string()];
     let mut i = 0;
     while i < out.len() {
-        if let Some(cd) = prelude.concepts.iter().find(|x| x.name == out[i]) {
+        if let Some(cd) = find_concept(&out[i]) {
             for r in &cd.refines {
                 if !out.contains(r) {
                     out.push(r.clone());
@@ -6236,6 +7768,10 @@ fn concept_closure(c: &str) -> Vec<String> {
 /// constraints hold for the type arguments.
 fn type_satisfies(ty: &str, concept: &str, m: &ModuleDecl, ctx: &BoogiePreludeCtx) -> bool {
     let module = |head: &str| if head == m.name { Some(m) } else { ctx.module(head) };
+    // Inside `m`, a parameter has its written bound and its `where` concepts.
+    if m.type_params.iter().any(|p| p == ty.trim()) && m.type_bounds.contains_key(ty.trim()) {
+        return bound_concepts(m, ty.trim()).iter().any(|c| c == concept);
+    }
     let param_bound = |tp: &str| {
         m.type_params.iter().any(|p| p == tp).then(|| m.type_bounds.get(tp).cloned())
     };
@@ -6370,17 +7906,10 @@ struct BoundUse {
 }
 
 /// The bound written as `[tp: C]`. A `where` constraint is conditional: it limits what the
-/// module's conformance claims, not which types the module can be used at.
+/// module's conformance claims, not which types the module can be used at. A parameter can
+/// have both, and then every use is checked against the written bound.
 fn declared_bound<'a>(owner: &'a ModuleDecl, tp: &str) -> Option<&'a String> {
-    let conditional = owner
-        .satisfies
-        .as_ref()
-        .is_some_and(|s| s.where_constraints.iter().any(|(t, _)| t == tp));
-    if conditional {
-        None
-    } else {
-        owner.type_bounds.get(tp)
-    }
+    owner.declared_bounds.get(tp)
 }
 
 /// Every application `H[a, b]` in a written type, nested ones included.
@@ -6528,11 +8057,8 @@ impl<'a> ConceptWalk<'a> {
             return;
         };
         if m.type_params.contains(&t) || self.routine_tps.contains(&t) {
-            let known = m
-                .type_bounds
-                .get(&t)
-                .and_then(|b| bound_method_relation(&t, b, rname))
-                .is_some();
+            let known = m.type_bounds.contains_key(&t)
+                && bound_method_relation(&t, &bound_concepts(m, &t), rname).is_some();
             if !known {
                 let bound = m.type_bounds.get(&t).map_or("no bound".to_string(), |b| format!("bound {b}"));
                 self.report(
@@ -6553,12 +8079,8 @@ impl<'a> ConceptWalk<'a> {
             return;
         };
         // The concept (listed directly) that declares this routine.
-        let prelude = standard_prelude();
         let declaring = sat.concepts.iter().find(|c| {
-            prelude
-                .concepts
-                .iter()
-                .any(|cd| &cd.name == *c && cd.signatures.iter().any(|s| s.name == rname))
+            find_concept(c).is_some_and(|cd| cd.signatures.iter().any(|s| s.name == rname))
         });
         if declaring.is_none() {
             return;
@@ -6787,6 +8309,99 @@ impl<'a> ConceptWalk<'a> {
     }
 }
 
+/// `ty` with `Current` read as `tp`.
+fn current_as(ty: &str, tp: &str) -> String {
+    if ty.trim() == "Current" {
+        tp.to_string()
+    } else {
+        subst_type_idents(ty, &HashMap::from([("Current".to_string(), tp.to_string())]))
+    }
+}
+
+/// The theory that a user concept gives type parameter `tp` of `m` (Task H.0a), as `EQ` and
+/// `ORD` give theirs: one function per method, with the range of a machine number result, and
+/// each law as an axiom. `q` quantifies a module's own type parameter.
+fn emit_user_bound_theory(m: &ModuleDecl, tp: &str, q: &str, concepts: &[String]) -> String {
+    let mut out = String::new();
+    let user: Vec<ConceptDecl> = concepts
+        .iter()
+        .filter(|c| !BOUND_THEORY_CONCEPTS.contains(&c.as_str()))
+        .filter_map(|c| find_concept(c))
+        .collect();
+    if user.is_empty() {
+        return out;
+    }
+    for cd in &user {
+        for sig in &cd.signatures {
+            let f = user_method_relation(tp, &sig.name);
+            let mut formals = vec![format!("x: {tp}")];
+            let mut vars = vec!["x".to_string()];
+            for (i, (_, pt)) in sig.params.iter().enumerate() {
+                formals.push(format!("p{i}: {}", map_boogie_type(&current_as(pt, tp), m)));
+                vars.push(format!("p{i}"));
+            }
+            let ret = current_as(&sig.ret_type, tp);
+            out.push_str(&format!(
+                "function {f}{q}({}) returns ({});\n",
+                formals.join(", "),
+                map_boogie_type(&ret, m)
+            ));
+            if let Some(range) = machine_range(&ret) {
+                let app = format!("{f}({})", vars.join(", "));
+                out.push_str(&format!(
+                    "axiom (forall{q} {} :: {{ {app} }} {range}({app}));\n",
+                    formals.join(", ")
+                ));
+            }
+        }
+    }
+    let (no_fields, no_revealed) = (HashSet::new(), HashSet::new());
+    for cd in &user {
+        for law in &cd.laws {
+            let params: Vec<(String, String)> =
+                law.params.iter().map(|(n, t)| (n.clone(), current_as(t, tp))).collect();
+            if params.is_empty() || law.ensures.is_empty() {
+                continue;
+            }
+            set_boogie_type_env(m, &params, None);
+            let emit = |e: &Expr| {
+                with_scoped_var_types(&params, || {
+                    emit_boogie_expr_with_strings(e, m, &no_fields, &no_revealed, "DefaultFuel", &[])
+                })
+            };
+            let mut reqs: Vec<String> = params
+                .iter()
+                .filter_map(|(n, t)| machine_range(t).map(|r| format!("{r}({n})")))
+                .collect();
+            reqs.extend(law.requires.iter().map(|(_, e)| format!("({})", emit(e))));
+            let ens: Vec<String> = law.ensures.iter().map(|(_, e)| format!("({})", emit(e))).collect();
+            let triggers: Vec<String> = law.triggers.iter().map(&emit).collect();
+            clear_boogie_type_env();
+            let trig = if triggers.is_empty() {
+                String::new()
+            } else {
+                format!("{{ {} }} ", triggers.join(", "))
+            };
+            let body = if reqs.is_empty() {
+                ens.join(" && ")
+            } else {
+                format!("({}) ==> ({})", reqs.join(" && "), ens.join(" && "))
+            };
+            let formals: Vec<String> = params
+                .iter()
+                .map(|(n, t)| format!("{n}: {}", map_boogie_type(t, m)))
+                .collect();
+            out.push_str(&format!(
+                "// {}.{} on {tp}\naxiom (forall{q} {} :: {trig}{body});\n",
+                cd.name,
+                law.name,
+                formals.join(", ")
+            ));
+        }
+    }
+    out
+}
+
 /// Whether the proofs behind `arg` can depend on `m`: it names `m`, or a module that needs `m`.
 /// `m` must then not assume that `arg` keeps its concept's laws. Those laws are what `m` may be
 /// proving, or what a module that `m` is under depends on.
@@ -6826,9 +8441,10 @@ fn emit_bound_instance_links(m: &ModuleDecl, ctx: &BoogiePreludeCtx) -> String {
             })
             .collect();
         let quant = if tps.is_empty() { String::new() } else { format!("<{}>", tps.join(", ")) };
+        let concepts = concept_closure(&u.bound);
         // `less_or_equal` follows from these two, on both sides.
         for mname in ["equals", "less_than"] {
-            let Some(rel) = bound_method_relation(&u.tp, &u.bound, mname) else {
+            let Some(rel) = bound_method_relation(&u.tp, &concepts, mname) else {
                 continue;
             };
             let (x, y) = ("_bx".to_string(), "_by".to_string());
@@ -6852,6 +8468,39 @@ fn emit_bound_instance_links(m: &ModuleDecl, ctx: &BoogiePreludeCtx) -> String {
                 "axiom (forall{quant} {x}: {bty}, {y}: {bty} :: {triggers} {rel_app} <==> {inst});\n"
             ));
         }
+        // A user concept's methods: the receiver is `_bx`, and the arguments `_b0`, `_b1`, ...
+        for sig in concepts.iter().flat_map(|c| user_concept_methods(c)) {
+            let rel = user_method_relation(&u.tp, &sig.name);
+            let mut vars = vec![("_bx".to_string(), u.arg.clone())];
+            for (i, (_, pt)) in sig.params.iter().enumerate() {
+                vars.push((format!("_b{i}"), current_as(pt, &u.arg)));
+            }
+            let args: Vec<Expr> = vars[1..].iter().map(|(v, _)| Expr::Var(v.clone())).collect();
+            let call = Expr::MethodCall(Box::new(Expr::Var("_bx".to_string())), sig.name.clone(), args);
+            let (inst, formals) = with_scoped_var_types(&vars, || {
+                let inst = emit_boogie_expr_with_strings(&call, m, &empty, &empty, "DefaultFuel", &[]);
+                let formals: Vec<String> =
+                    vars.iter().map(|(v, t)| format!("{v}: {}", map_boogie_type(t, m))).collect();
+                (inst, formals)
+            });
+            let names: Vec<&str> = vars.iter().map(|(v, _)| v.as_str()).collect();
+            let rel_app = format!("{}__{rel}({})", u.owner, names.join(", "));
+            let ret = current_as(&sig.ret_type, &u.arg);
+            let eq = if map_boogie_type(&ret, m) == "bool" { "<==>" } else { "==" };
+            // Only an application can be a trigger.
+            let is_app = inst.split_once('(').is_some_and(|(h, _)| {
+                !h.is_empty() && h.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+            });
+            let triggers = if is_app {
+                format!("{{ {rel_app} }} {{ {inst} }}")
+            } else {
+                format!("{{ {rel_app} }}")
+            };
+            out.push_str(&format!(
+                "axiom (forall{quant} {} :: {triggers} {rel_app} {eq} {inst});\n",
+                formals.join(", ")
+            ));
+        }
     }
     clear_boogie_type_env();
     out
@@ -6867,12 +8516,12 @@ pub fn check_where_constraints(m: &ModuleDecl, src: &str, input_path: &str) -> V
     BOOGIE_PRELUDE_CTX.with(|c| *c.borrow_mut() = prev);
     for tp in &m.type_params {
         if let Some(bound) = declared_bound(m, tp) {
-            if !BOUND_THEORY_CONCEPTS.contains(&bound.as_str()) {
+            if let Some(why) = bound_unsupported_reason(bound) {
                 found.push((
                     m.name.clone(),
                     "E0320: unsupported_bound",
                     format!(
-                        "E0320: unsupported_bound: `[{tp}: {bound}]`: a bound must be EQ, CANONICAL_EQ or ORD, the concepts with a theory for a type parameter (§9)"
+                        "E0320: unsupported_bound: `[{tp}: {bound}]`: {why}. A bound is a concept with no type parameters whose methods have no body (§9)"
                     ),
                 ));
             }
@@ -7179,8 +8828,240 @@ pub fn check_string_semantics(m: &ModuleDecl, src: &str, input_path: &str) -> Ve
         .collect()
 }
 
+/// The fields of the constructor `name`: of a variant of `m`, or of an injected module's.
+fn ctor_fields(m: &ModuleDecl, name: &str) -> Option<Vec<(String, String)>> {
+    if let ReprKind::Sum(vs) = &m.repr {
+        if let Some(v) = vs.iter().find(|v| v.name == name) {
+            return Some(v.fields.clone());
+        }
+    }
+    let ctx = boogie_prelude_ctx()?;
+    let owner = ctx.module(ctx.ctor_owner.get(name)?)?;
+    let ReprKind::Sum(vs) = &owner.repr else {
+        return None;
+    };
+    vs.iter().find(|v| v.name == name).map(|v| v.fields.clone())
+}
+
+/// Task H.0b: a field that is a list of a machine type has its elements in range, which every
+/// reader of the field assumes, so a value built into it must have them.
+#[allow(clippy::too_many_arguments)]
+fn emit_field_elements_obligation(
+    field: &str,
+    ty: &str,
+    value: &Expr,
+    m: &ModuleDecl,
+    revealed: &HashSet<String>,
+    pad: &str,
+    strings: &[String],
+    routine: &str,
+) -> String {
+    if !has_elements_fact(ty) {
+        return String::new();
+    }
+    let v = emit_boogie_expr_with_strings(value, m, &HashSet::new(), revealed, "DefaultFuel", strings);
+    let fact = elements_fact(ty, &v).expect("a range, as checked above");
+    elements_obligation(pad, &format!("{routine}::range::{field}_elements"), &fact)
+}
+
+/// Task H.0d: a value given to a parameter or field `name` of a machine number type `ty` is in
+/// that type's range, which the callee or every reader of the field assumes. A value whose own
+/// type has the range already is not checked again.
+#[allow(clippy::too_many_arguments)]
+fn machine_range_obligation(
+    name: &str,
+    ty: &str,
+    value: &Expr,
+    r: &RoutineDecl,
+    m: &ModuleDecl,
+    revealed: &HashSet<String>,
+    pad: &str,
+    strings: &[String],
+) -> String {
+    let Some(range) = machine_range(ty) else {
+        return String::new();
+    };
+    if known_in_range(value, range, r, m) {
+        return String::new();
+    }
+    let v = emit_boogie_expr_with_strings(value, m, &HashSet::new(), revealed, "DefaultFuel", strings);
+    elements_obligation(pad, &format!("{}::range::{name}", r.name), &format!("{range}({v})"))
+}
+
+/// Task H.0d: the length of a `LIST` that a program reads is a `NAT`, a trusted fact: no list
+/// that exists in memory holds 2^64 elements. It is assumed where the length is read, not as
+/// an axiom over every list, which `prepend` would contradict.
+#[allow(clippy::too_many_arguments)]
+fn emit_list_length_trust(
+    e: &Expr,
+    mname: &str,
+    args: &[Expr],
+    m: &ModuleDecl,
+    revealed: &HashSet<String>,
+    pad: &str,
+    strings: &[String],
+) -> String {
+    if mname != "length" || !args.is_empty() {
+        return String::new();
+    }
+    // Keyed on the translation, the built-in `Seq_length`: the receiver's Gardel type is not
+    // always known, as of `LIST_OPS.filter(ps, keep)`. A `SEQ` or a module's own `length` is
+    // a routine with a result checked in its body, and is not trusted.
+    let v = emit_boogie_expr_with_strings(e, m, &HashSet::new(), revealed, "DefaultFuel", strings);
+    if !v.starts_with("Seq_length(") {
+        return String::new();
+    }
+    // A lambda in the term keeps its name in the body (`BOOGIE_LAMBDA_NAMES`), so the
+    // length of `LIST_OPS.filter(ps, keep)` here is the body's.
+    format!("{pad}assume in_u64({v});\n")
+}
+
+/// Task H.0d: `m.fold(init, f)` of a `MAP[K, V]` is in a machine range when `init` is and each
+/// step keeps it there, as `emit_fold_range_theory` states of a list. A step may assume its
+/// value in range when the map's values are (H.0e); the axiom is stated here, where `V` is
+/// known, since a `MAP[K, MATH_INT]` holds ints too.
+#[allow(clippy::too_many_arguments)]
+fn emit_map_fold_range(
+    e: &Expr,
+    recv: &Expr,
+    mname: &str,
+    args: &[Expr],
+    m: &ModuleDecl,
+    revealed: &HashSet<String>,
+    pad: &str,
+    strings: &[String],
+) -> String {
+    let [init, f] = args else {
+        return String::new();
+    };
+    let Some(ctx) = boogie_prelude_ctx() else {
+        return String::new();
+    };
+    if mname != "fold" {
+        return String::new();
+    }
+    let Some(rt) = infer_gardel_type(recv, m, &ctx) else {
+        return String::new();
+    };
+    let Some(inner) = rt.trim().strip_prefix("MAP[").and_then(|x| x.strip_suffix(']')) else {
+        return String::new();
+    };
+    let parts = split_top_level_commas(inner);
+    let [k_ty, v_ty] = parts.as_slice() else {
+        return String::new();
+    };
+    let (k_ty, v_ty) = (k_ty.trim(), v_ty.trim());
+    let Some(range) = infer_gardel_type(e, m, &ctx).and_then(|t| machine_range(&t)) else {
+        return String::new();
+    };
+    let tr = |x: &Expr| emit_boogie_expr_with_strings(x, m, &HashSet::new(), revealed, "DefaultFuel", strings);
+    let (term, init_v, f_v) = (tr(e), tr(init), tr(f));
+    let app = format!("Fn3_app({f_v}, b, k, v)");
+    let v_guard = machine_range(v_ty).map(|rv| format!(" && {rv}(v)")).unwrap_or_default();
+    let values = match machine_rng(v_ty) {
+        Some(r) => format!("Rng_holds(Rng__MAP_V({r}), {}) && ", tr(recv)),
+        None => String::new(),
+    };
+    format!(
+        "{pad}assume {values}{range}({init_v}) && (forall b: int, k: {}, v: {} :: {{ {app} }} {range}(b){v_guard} ==> {range}({app})) ==> {range}({term});\n",
+        map_boogie_type(k_ty, m),
+        map_boogie_type(v_ty, m),
+    )
+}
+
+/// Whether the call `e` is of a routine, of `m` or of a module in `ctx`, for which `test`
+/// holds. A built-in, as `fold_left` of a `SEQ`, is no such routine.
+fn callee_declares(
+    e: &Expr,
+    m: &ModuleDecl,
+    ctx: &BoogiePreludeCtx,
+    test: impl Fn(&ModuleDecl, &RoutineDecl) -> bool,
+) -> bool {
+    let holds = |owner: &ModuleDecl, name: &str| find_module_routine(owner, name).is_some_and(|(rd, _)| test(owner, rd));
+    match e {
+        Expr::Call(f, _) => holds(m, f),
+        Expr::MethodCall(recv, name, _) => {
+            if let Expr::Var(v) = &**recv {
+                if v != "Current" && boogie_env_type(v).is_none() {
+                    if v == &m.name {
+                        return holds(m, name);
+                    }
+                    if let Some(owner) = ctx.module(v) {
+                        return holds(owner, name);
+                    }
+                }
+            }
+            let Some(rt) = infer_gardel_type(recv, m, ctx) else {
+                return false;
+            };
+            match type_head(&rt) {
+                head if head == m.name => holds(m, name),
+                head => ctx.module(head).is_some_and(|owner| holds(owner, name)),
+            }
+        }
+        _ => false,
+    }
+}
+
+/// Whether `e` is in the range `range` by its type alone: a parameter or field of a type with
+/// that range, or a call whose result has it, since every result is checked (Task H.0d). A
+/// local is not, as its type can be inferred from a literal out of range, nor is a literal.
+fn known_in_range(e: &Expr, range: &str, r: &RoutineDecl, m: &ModuleDecl) -> bool {
+    let declared = match e {
+        Expr::Var(v) => r
+            .params
+            .iter()
+            .find(|(p, _)| p == v)
+            .map(|(_, t)| t.clone())
+            .or_else(|| match &m.repr {
+                ReprKind::Product(fs) => fs.iter().find(|(f, _)| f == v).map(|(_, t)| t.clone()),
+                _ => None,
+            }),
+        // A wrapping or bit operation is in range by construction: proving it of the
+        // bit-vector term, as `in_u64(u64_wrap_add(1, x * 10))`, took Z3 minutes.
+        Expr::BinOp(op, a, b) if matches!(op.as_str(), "+%" | "-%" | "*%" | "&" | "|" | "^" | "<<" | ">>") => {
+            let wraps = matches!(op.as_str(), "+%" | "-%" | "*%");
+            return if operands_kind(a, b, m) == NumKind::Signed {
+                wraps && range == "in_i64"
+            } else {
+                range == "in_u64"
+            };
+        }
+        // Only a routine that declares the range checks its result; a built-in, as a fold,
+        // or a routine whose result is a type parameter does not.
+        Expr::Call(..) | Expr::MethodCall(..) => {
+            return boogie_prelude_ctx().is_some_and(|ctx| {
+                callee_declares(e, m, &ctx, |_, rd| machine_range(&rd.ret_type) == Some(range))
+                    && infer_gardel_type(e, m, &ctx).is_some_and(|t| machine_range(&t) == Some(range))
+            });
+        }
+        _ => None,
+    };
+    declared.is_some_and(|t| machine_range(&t) == Some(range))
+}
+
+/// Checks a range fact. A function value's fact starts a verification condition of its own:
+/// in one condition with the obligations around it, Z3 ran out of resource on the lies of
+/// `tests/refined.rs` (after 171 s and 264 s, against about 1 s split). Boogie assumes it in
+/// the conditions that follow, as it does a plain `assert`.
+fn elements_obligation(pad: &str, msg: &str, fact: &str) -> String {
+    if fact.starts_with("(forall") {
+        format!("{pad}assert {{:split_here}} {{:msg \"{msg}\"}} {fact};\n")
+    } else {
+        format!("{pad}assert {{:msg \"{msg}\"}} {fact};\n")
+    }
+}
+
 fn module_has_variant(m: &ModuleDecl, name: &str) -> bool {
     matches!(&m.repr, ReprKind::Sum(vs) if vs.iter().any(|v| v.name == name))
+}
+
+/// Whether `m`'s `specify` routines take a `Current` receiver. A module with no
+/// representation, as `SORTING` (Task H.3), has no value to pass: its ghost routines are
+/// called as `SORTING.count(xs, x)`, as its `create` routines are. Its features keep a
+/// receiver, since a client may call them on a value (`c.least(a, b)`).
+fn specify_takes_current(m: &ModuleDecl) -> bool {
+    m.kind == ModuleKind::Module && !matches!(&m.repr, ReprKind::Product(fields) if fields.is_empty())
 }
 
 /// Finds routine `name` in `m`; the flag is true when it takes a `Current` receiver.
@@ -7188,9 +9069,9 @@ fn find_module_routine<'a>(m: &'a ModuleDecl, name: &str) -> Option<(&'a Routine
     let is_adt = m.kind == ModuleKind::Module;
     m.feature_routines
         .iter()
-        .chain(m.specify_routines.iter())
         .find(|(_, r)| r.name == name)
         .map(|(_, r)| (r, is_adt))
+        .or_else(|| m.specify_routines.iter().find(|(_, r)| r.name == name).map(|(_, r)| (r, specify_takes_current(m))))
         .or_else(|| {
             m.create_routines
                 .iter()
@@ -7327,6 +9208,7 @@ fn infer_gardel_type(e: &Expr, m: &ModuleDecl, ctx: &BoogiePreludeCtx) -> Option
                 .to_string(),
             )
         }
+        Expr::MethodCall(..) if io_fresh_type(e).is_some() => io_fresh_type(e).map(str::to_string),
         Expr::MethodCall(recv, r, _) if conversion_result(recv, r).is_some() => {
             conversion_result(recv, r).map(str::to_string)
         }
@@ -7357,7 +9239,12 @@ fn infer_gardel_type(e: &Expr, m: &ModuleDecl, ctx: &BoogiePreludeCtx) -> Option
                     return Some(fty.clone());
                 }
             }
-            None
+            if module_has_variant(m, v) {
+                return Some(module_self_type(m));
+            }
+            // A variant with no fields of another module, such as `Info` in `Info.less_than(Warn)`.
+            let owner = ctx.module(ctx.ctor_owner.get(v)?)?;
+            owner.type_params.is_empty().then(|| owner.name.clone())
         }
         Expr::Call(f, args) => {
             let arg_tys: Vec<Option<String>> =
@@ -7418,6 +9305,12 @@ fn infer_gardel_type(e: &Expr, m: &ModuleDecl, ctx: &BoogiePreludeCtx) -> Option
             }
             let rt = match infer_gardel_type(recv, m, ctx) {
                 Some(t) => t,
+                // `LIST.empty.prepend(x)`, as a test's list of checks is written: the empty
+                // list has no element type, so what is put in it gives the list's (Task H.9).
+                None if r == "prepend" && is_empty_list(recv) => {
+                    return arg_tys.first().cloned().flatten().map(|t| format!("LIST[{t}]"));
+                }
+                None if r == "append" && is_empty_list(recv) => return arg_tys.first().cloned().flatten(),
                 None => {
                     // `M.make(4).push(10)`: the receiver's type arguments are fixed only
                     // by this call's arguments; infer the result from the routine of the
@@ -7429,6 +9322,12 @@ fn infer_gardel_type(e: &Expr, m: &ModuleDecl, ctx: &BoogiePreludeCtx) -> Option
             };
             if r == "apply" && split_top_level_arrow(&rt).is_some() {
                 return c11_typed::fn_parts(&c11_typed::norm_type(&rt)).map(|(_, ret)| ret);
+            }
+            // A method that a user concept gives a bounded type parameter (Task H.0a).
+            if m.type_params.contains(&rt) && m.type_bounds.contains_key(&rt) {
+                if let Some(sig) = user_bound_method(&bound_concepts(m, &rt), r) {
+                    return Some(current_as(&sig.ret_type, &rt));
+                }
             }
             let head = type_head(&rt).to_string();
             if head == "LIST" || (head == "SEQ" && ctx.module("SEQ").is_none()) {
@@ -7478,6 +9377,12 @@ fn infer_gardel_type(e: &Expr, m: &ModuleDecl, ctx: &BoogiePreludeCtx) -> Option
         // The type of the first arm whose type is known. The arms' binders are typed first,
         // by `collect_proc_locals`, so an arm that is a binder has its type.
         Expr::Match(_, cases) => cases.iter().find_map(|c| infer_gardel_type(&c.body, m, ctx)),
+        // A pair whose parts' types are known (Task H.9): `let out = (r.first % n, r.second)`.
+        Expr::TupleLit(parts) if parts.len() == 2 => {
+            let a = infer_gardel_type(&parts[0], m, ctx)?;
+            let b = infer_gardel_type(&parts[1], m, ctx)?;
+            Some(format!("TUPLE[{a}, {b}]"))
+        }
         // A lambda's parameter and result types are annotated.
         Expr::Lambda(ps, ret, _, _) => Some(c11_typed::norm_type(&format!(
             "({}) -> {ret}",
@@ -7485,6 +9390,11 @@ fn infer_gardel_type(e: &Expr, m: &ModuleDecl, ctx: &BoogiePreludeCtx) -> Option
         ))),
         _ => None,
     }
+}
+
+/// `LIST.empty`.
+fn is_empty_list(e: &Expr) -> bool {
+    matches!(e, Expr::MethodCall(recv, r, args) if r == "empty" && args.is_empty() && matches!(&**recv, Expr::Var(v) if v == "LIST"))
 }
 
 /// Decides whether `recv.mname(..)` in user module `m` targets an injected prelude
@@ -7503,6 +9413,12 @@ fn prelude_result_head<'c>(e: &Expr, ctx: &'c BoogiePreludeCtx) -> Option<&'c st
     let (rd, _) = find_module_routine(owner, r)?;
     let ret = rd.ret_type.trim();
     (ret == "Current" || type_head(ret) == owner.name).then_some(owner.name.as_str())
+}
+
+/// The `LIST_OPS` routines the verifier realizes as built-in `Seq_*` functions. Its other
+/// routines are ordinary prelude functions (Task H.21).
+fn is_list_ops_builtin(r: &str) -> bool {
+    matches!(r, "map" | "filter" | "fold_left" | "fold_right" | "at")
 }
 
 fn resolve_prelude_receiver(
@@ -7587,7 +9503,7 @@ fn prelude_call_target(
     };
     if let Expr::Var(v) = &**recv {
         if v == "LIST"
-            || v == "LIST_OPS"
+            || (v == "LIST_OPS" && is_list_ops_builtin(r))
             || v == "FUNCTION_OPS"
             || (v == "SEQ" && ctx.module("SEQ").is_none())
         {
@@ -7645,7 +9561,7 @@ fn emit_boogie_prelude_ref(
         Expr::MethodCall(recv, r, args) => {
             if let Expr::Var(v) = &**recv {
                 if v == "LIST"
-            || v == "LIST_OPS"
+            || (v == "LIST_OPS" && is_list_ops_builtin(r))
             || v == "FUNCTION_OPS"
             || (v == "SEQ" && ctx.module("SEQ").is_none())
         {
@@ -7897,12 +9813,12 @@ fn emit_prelude_contract_interface(p: &ModuleDecl) -> (String, HashSet<String>) 
         "// --- {}: routine preconditions (definitions) & trusted law markers ---\n",
         cp.name
     ));
-    let routines = cp.create_routines.iter().map(|(_, r)| (r, false)).chain(
-        cp.feature_routines
-            .iter()
-            .chain(cp.specify_routines.iter())
-            .map(|(_, r)| (r, cp.kind == ModuleKind::Module)),
-    );
+    let routines = cp
+        .create_routines
+        .iter()
+        .map(|(_, r)| (r, false))
+        .chain(cp.feature_routines.iter().map(|(_, r)| (r, cp.kind == ModuleKind::Module)))
+        .chain(cp.specify_routines.iter().map(|(_, r)| (r, specify_takes_current(&cp))));
     for (r, has_current) in routines {
         let mut params = Vec::new();
         let mut tys = Vec::new();
@@ -8064,7 +9980,7 @@ fn emit_prelude_background_theory(
     text.push_str(&invariant_of_every_value(p, &text));
     let mut map: HashMap<String, String> = boogie_declared_names(&text)
         .into_iter()
-        .filter(|n| n != &p.name && !foreign.contains(n))
+        .filter(|n| n != &p.name && !foreign.contains(n) && !n.starts_with("Rng__"))
         .map(|n| {
             let r = format!("{}__{n}", p.name);
             (n, r)
@@ -8122,8 +10038,30 @@ enum BoogieEmitScope {
 
 pub fn emit_boogie(m: &ModuleDecl, fuel_limit: usize) -> String {
     let bpl = with_fresh_boogie_numbering(|| emit_boogie_numbered(m, fuel_limit));
+    let bpl = without_unasked_fn_splits(&bpl);
     boogie_params::scalars_last(&fill_literal_lemmas_in_module(&bpl))
 }
+
+/// The axioms that split a function's range over `Rng_and` (Task H.9) serve only an
+/// assertion that a function holds a range. Elsewhere they are left out: an axiom more moved
+/// `ghttp`'s `request_line_reads_back`, already near its limit by a `decode_utf8` axiom's
+/// instances, onto seeds that fail. Leaving an axiom out is always sound.
+fn without_unasked_fn_splits(bpl: &str) -> String {
+    let asked = bpl.lines().any(|l| l.trim_start().starts_with("assert") && l.contains("Rng_holds(Rng_fn1("));
+    if asked {
+        return bpl.to_string();
+    }
+    let mut out = String::with_capacity(bpl.len());
+    for line in bpl.split_inclusive('\n') {
+        if !line.contains(FN_SPLIT_TAG) {
+            out.push_str(line);
+        }
+    }
+    out
+}
+
+/// What marks the `Rng_and` split axioms, so `without_unasked_fn_splits` finds them.
+const FN_SPLIT_TAG: &str = "Rng_holds(Rng_fn1(p, Rng_and(q, r)), f) }";
 
 fn emit_boogie_numbered(m: &ModuleDecl, fuel_limit: usize) -> String {
     let ctx = Rc::new(BoogiePreludeCtx::for_module(m));
@@ -8174,6 +10112,14 @@ fn emit_boogie_parts(m: &ModuleDecl, fuel_limit: usize) -> BoogieParts {
 }
 
 fn emit_boogie_parts_with_options(
+    m: &ModuleDecl,
+    fuel_limit: usize,
+    scope: BoogieEmitScope,
+) -> BoogieParts {
+    with_own_boogie_module(m, || emit_own_boogie_parts(m, fuel_limit, scope))
+}
+
+fn emit_own_boogie_parts(
     m: &ModuleDecl,
     fuel_limit: usize,
     scope: BoogieEmitScope,
@@ -8257,68 +10203,43 @@ fn emit_boogie_parts_with_options(
         // Module type parameters are the holes of `type M A ...;` and are quantified (`<A>`) in every
         // module function, so they must not also be declared as global types.
         let is_adt_tp = m.type_params.contains(tp);
+        let q = if is_adt_tp { format!("<{tp}>") } else { String::new() };
         if !is_adt_tp {
             out.push_str(&format!("type {tp};\n"));
-            if bound == "EQ" || bound == "ORD" || bound == "CANONICAL_EQ" {
-                out.push_str(&format!(
-                    "function {tp}_eq(x: {tp}, y: {tp}) returns (bool);\n"
-                ));
-                out.push_str(&format!(
-                    "axiom (forall x: {tp} :: {{ {tp}_eq(x, x) }} {tp}_eq(x, x));\n"
-                ));
-                out.push_str(&format!("axiom (forall x: {tp}, y: {tp} :: {{ {tp}_eq(x, y) }} {tp}_eq(x, y) ==> {tp}_eq(y, x));\n"));
-                out.push_str(&format!("axiom (forall x: {tp}, y: {tp}, z: {tp} :: {{ {tp}_eq(x, y), {tp}_eq(y, z) }} {tp}_eq(x, y) && {tp}_eq(y, z) ==> {tp}_eq(x, z));\n"));
-            }
-            if bound == "CANONICAL_EQ" && !conditional_tps.contains(tp) {
-                out.push_str(&format!(
-                    "axiom (forall x: {tp}, y: {tp} :: {{ {tp}_eq(x, y) }} {tp}_eq(x, y) <==> (x == y));\n"
-                ));
-            }
-            if bound == "ORD" {
-                out.push_str(&format!(
-                    "function {tp}_less(x: {tp}, y: {tp}) returns (bool);\n"
-                ));
-                out.push_str(&format!(
-                    "function {tp}_less_eq(x: {tp}, y: {tp}) returns (bool);\n"
-                ));
-                out.push_str(&format!(
-                    "axiom (forall x: {tp} :: {{ {tp}_less(x, x) }} !{tp}_less(x, x));\n"
-                ));
-                out.push_str(&format!("axiom (forall x: {tp}, y: {tp}, z: {tp} :: {{ {tp}_less(x, y), {tp}_less(y, z) }} {tp}_less(x, y) && {tp}_less(y, z) ==> {tp}_less(x, z));\n"));
-                out.push_str(&format!("axiom (forall x: {tp}, y: {tp} :: {{ {tp}_less_eq(x, y) }} {tp}_less_eq(x, y) <==> ({tp}_less(x, y) || {tp}_eq(x, y)));\n"));
-                out.push_str(&format!("axiom (forall x: {tp}, y: {tp} :: {{ {tp}_less(x, y), {tp}_less(y, x) }} {tp}_less(x, y) || {tp}_eq(x, y) || {tp}_less(y, x));\n"));
-            }
-        } else {
-            if bound == "EQ" || bound == "ORD" || bound == "CANONICAL_EQ" {
-                out.push_str(&format!(
-                    "function {tp}_eq<{tp}>(x: {tp}, y: {tp}) returns (bool);\n"
-                ));
-                out.push_str(&format!(
-                    "axiom (forall<{tp}> x: {tp} :: {{ {tp}_eq(x, x) }} {tp}_eq(x, x));\n"
-                ));
-                out.push_str(&format!("axiom (forall<{tp}> x: {tp}, y: {tp} :: {{ {tp}_eq(x, y) }} {tp}_eq(x, y) ==> {tp}_eq(y, x));\n"));
-                out.push_str(&format!("axiom (forall<{tp}> x: {tp}, y: {tp}, z: {tp} :: {{ {tp}_eq(x, y), {tp}_eq(y, z) }} {tp}_eq(x, y) && {tp}_eq(y, z) ==> {tp}_eq(x, z));\n"));
-            }
-            if bound == "CANONICAL_EQ" && !conditional_tps.contains(tp) {
-                out.push_str(&format!(
-                    "axiom (forall<{tp}> x: {tp}, y: {tp} :: {{ {tp}_eq(x, y) }} {tp}_eq(x, y) <==> (x == y));\n"
-                ));
-            }
-            if bound == "ORD" {
-                out.push_str(&format!(
-                    "function {tp}_less<{tp}>(x: {tp}, y: {tp}) returns (bool);\n"
-                ));
-                out.push_str(&format!(
-                    "function {tp}_less_eq<{tp}>(x: {tp}, y: {tp}) returns (bool);\n"
-                ));
-                out.push_str(&format!(
-                    "axiom (forall<{tp}> x: {tp} :: {{ {tp}_less(x, x) }} !{tp}_less(x, x));\n"
-                ));
-                out.push_str(&format!("axiom (forall<{tp}> x: {tp}, y: {tp}, z: {tp} :: {{ {tp}_less(x, y), {tp}_less(y, z) }} {tp}_less(x, y) && {tp}_less(y, z) ==> {tp}_less(x, z));\n"));
-                out.push_str(&format!("axiom (forall<{tp}> x: {tp}, y: {tp} :: {{ {tp}_less_eq(x, y) }} {tp}_less_eq(x, y) <==> ({tp}_less(x, y) || {tp}_eq(x, y)));\n"));
-                out.push_str(&format!("axiom (forall<{tp}> x: {tp}, y: {tp} :: {{ {tp}_less(x, y), {tp}_less(y, x) }} {tp}_less(x, y) || {tp}_eq(x, y) || {tp}_less(y, x));\n"));
-            }
         }
+        let concepts = bound_concepts(m, tp);
+        let has = |c: &str| concepts.iter().any(|x| x == c);
+        if has("EQ") {
+            out.push_str(&format!(
+                "function {tp}_eq{q}(x: {tp}, y: {tp}) returns (bool);\n"
+            ));
+            out.push_str(&format!(
+                "axiom (forall{q} x: {tp} :: {{ {tp}_eq(x, x) }} {tp}_eq(x, x));\n"
+            ));
+            out.push_str(&format!("axiom (forall{q} x: {tp}, y: {tp} :: {{ {tp}_eq(x, y) }} {tp}_eq(x, y) ==> {tp}_eq(y, x));\n"));
+            out.push_str(&format!("axiom (forall{q} x: {tp}, y: {tp}, z: {tp} :: {{ {tp}_eq(x, y), {tp}_eq(y, z) }} {tp}_eq(x, y) && {tp}_eq(y, z) ==> {tp}_eq(x, z));\n"));
+        }
+        let canonical = concept_closure(bound).iter().any(|c| c == "CANONICAL_EQ");
+        if canonical && !conditional_tps.contains(tp) {
+            out.push_str(&format!(
+                "axiom (forall{q} x: {tp}, y: {tp} :: {{ {tp}_eq(x, y) }} {tp}_eq(x, y) <==> (x == y));\n"
+            ));
+        }
+        if has("ORD") {
+            out.push_str(&format!(
+                "function {tp}_less{q}(x: {tp}, y: {tp}) returns (bool);\n"
+            ));
+            out.push_str(&format!(
+                "function {tp}_less_eq{q}(x: {tp}, y: {tp}) returns (bool);\n"
+            ));
+            out.push_str(&format!(
+                "axiom (forall{q} x: {tp} :: {{ {tp}_less(x, x) }} !{tp}_less(x, x));\n"
+            ));
+            out.push_str(&format!("axiom (forall{q} x: {tp}, y: {tp}, z: {tp} :: {{ {tp}_less(x, y), {tp}_less(y, z) }} {tp}_less(x, y) && {tp}_less(y, z) ==> {tp}_less(x, z));\n"));
+            out.push_str(&format!("axiom (forall{q} x: {tp}, y: {tp} :: {{ {tp}_less_eq(x, y) }} {tp}_less_eq(x, y) <==> ({tp}_less(x, y) || {tp}_eq(x, y)));\n"));
+            out.push_str(&format!("axiom (forall{q} x: {tp}, y: {tp} :: {{ {tp}_less(x, y), {tp}_less(y, x) }} {tp}_less(x, y) || {tp}_eq(x, y) || {tp}_less(y, x));\n"));
+        }
+        out.push_str(&emit_user_bound_theory(m, tp, &q, &concepts));
         out.push('\n');
     }
     // Representation fields typed by another prelude module: declare that sort opaquely
@@ -8395,6 +10316,10 @@ fn emit_boogie_parts_with_options(
     out.push_str(&format!(
         "function IO_print_line(s: {str_ty}) returns (IO int);\n"
     ));
+    if string_mode && boogie_prelude_ctx().is_some_and(|c| c.module("LOG_LEVEL").is_some()) {
+        // `IO.log(level, text)` (Task H.2), typed, so a level of another type is refused.
+        out.push_str("function IO_log(level: LOG_LEVEL, s: STRING) returns (IO int);\n");
+    }
     out.push_str("function IO_exit(code: int) returns (IO int);\n\n");
 
     out.push_str("function Seq_empty<T>() returns (Seq T);\n");
@@ -8498,6 +10423,8 @@ fn emit_boogie_parts_with_options(
     out.push_str("axiom (forall<A> keep: Fn1 A bool :: { Seq_filter(Seq_empty() : Seq A, keep) } Seq_filter(Seq_empty() : Seq A, keep) == (Seq_empty() : Seq A));\n");
     out.push_str("axiom (forall<A> x: A, xs: Seq A, keep: Fn1 A bool :: { Seq_filter(Seq_prepend(x, xs), keep) } (Fn1_app(keep, x) ==> Seq_filter(Seq_prepend(x, xs), keep) == Seq_prepend(x, Seq_filter(xs, keep))) && (!Fn1_app(keep, x) ==> Seq_filter(Seq_prepend(x, xs), keep) == Seq_filter(xs, keep)));\n");
     out.push_str("axiom (forall<A> xs: Seq A, ys: Seq A, keep: Fn1 A bool :: { Seq_filter(Seq_append(xs, ys), keep) } Seq_filter(Seq_append(xs, ys), keep) == Seq_append(Seq_filter(xs, keep), Seq_filter(ys, keep)));\n\n");
+    out.push_str(&emit_elements_range_theory());
+    out.push_str(&emit_container_range_base());
 
     out.push_str("function Seq_fold_left<A, B>(xs: Seq A, f: Fn2 B A B, init: B) returns (B);\n");
     out.push_str("axiom (forall<A, B> f: Fn2 B A B, init: B :: { Seq_fold_left(Seq_empty() : Seq A, f, init) } Seq_fold_left(Seq_empty() : Seq A, f, init) == init);\n");
@@ -8611,10 +10538,10 @@ fn emit_boogie_parts_with_options(
                     ));
                     // A field of a machine number type holds a value of that type: every
                     // value is built from one, and each such value is proven in range.
-                    if let Some(range) = machine_range(fty) {
+                    if let Some(fact) = value_fact(fty, &format!("{}_{}(x)", v.name, fnm)) {
                         out.push_str(&format!(
-                            "axiom (forall{tp_quant} x: {mod_bpl_ty} :: {{ {}_{}(x) }} {range}({}_{}(x)));\n",
-                            v.name, fnm, v.name, fnm
+                            "axiom (forall{tp_quant} x: {mod_bpl_ty} :: {{ {}_{}(x) }} {fact});\n",
+                            v.name, fnm
                         ));
                     }
                 }
@@ -8779,10 +10706,10 @@ fn emit_boogie_parts_with_options(
                     map_boogie_type(fty, m)
                 ));
                 // As for a variant's field above.
-                if let Some(range) = machine_range(fty) {
+                if let Some(fact) = value_fact(fty, &format!("{}_{}(x)", m.name, fnm)) {
                     out.push_str(&format!(
-                        "axiom (forall{tp_quant} x: {mod_bpl_ty} :: {{ {}_{}(x) }} {range}({}_{}(x)));\n",
-                        m.name, fnm, m.name, fnm
+                        "axiom (forall{tp_quant} x: {mod_bpl_ty} :: {{ {}_{}(x) }} {fact});\n",
+                        m.name, fnm
                     ));
                 }
             }
@@ -8815,11 +10742,35 @@ fn emit_boogie_parts_with_options(
         }
         }
     }
+    if !m.type_params.is_empty() {
+        out.push_str(&emit_container_range_theory(m, &tp_quant, &mod_bpl_ty, hide_repr));
+    }
     out.push('\n');
 
     if m.name == "SEQ" && !hide_repr {
         out.push_str("axiom (forall<A> Current: (SEQ A) :: { Concat_left(Current) } is_Concat(Current) ==> fn_length(DefaultFuel, Current) == fn_length(DefaultFuel, Concat_left(Current)) + fn_length(DefaultFuel, Concat_right(Current)));\n");
-        out.push_str("axiom (forall<A> s: (SEQ A), p: (Fn1 A bool), q: (Fn1 A bool) :: { fn_filter(DefaultFuel, fn_filter(DefaultFuel, s, p), q) } SEQ_Invariant(s) ==> fn_equals(DefaultFuel, fn_filter(DefaultFuel, fn_filter(DefaultFuel, s, p), q), fn_filter(DefaultFuel, s, Fn1_and(p, q))));\n\n");
+        out.push_str("axiom (forall<A> s: (SEQ A), p: (Fn1 A bool), q: (Fn1 A bool) :: { fn_filter(DefaultFuel, fn_filter(DefaultFuel, s, p), q) } SEQ_Invariant(s) ==> fn_equals(DefaultFuel, fn_filter(DefaultFuel, fn_filter(DefaultFuel, s, p), q), fn_filter(DefaultFuel, s, Fn1_and(p, q))));\n");
+        // Task H.0e: a `SEQ`'s range is its `model`'s, and by `model`'s definition a leaf's
+        // value and a concatenation's parts hold it, as a match on the sequence reads them.
+        for r in ["in_u64", "in_i64", "in_char"] {
+            for (p, a, item) in [(format!("Seq_{r}"), "int", r.to_string()), (format!("Seq2_{r}"), "(Seq int)", format!("Seq_{r}"))] {
+                let holds = |x: &str| format!("{p}(fn_model(DefaultFuel, {x}))");
+                out.push_str(&format!(
+                    "axiom (forall s: (SEQ {a}) :: {{ {}, Leaf_value(s) }} {} && is_Leaf(s) ==> {item}(Leaf_value(s)));\n",
+                    holds("s"),
+                    holds("s")
+                ));
+                for part in ["Concat_left", "Concat_right"] {
+                    out.push_str(&format!(
+                        "axiom (forall s: (SEQ {a}) :: {{ {}, {part}(s) }} {} && is_Concat(s) ==> {});\n",
+                        holds("s"),
+                        holds("s"),
+                        holds(&format!("{part}(s)"))
+                    ));
+                }
+            }
+        }
+        out.push('\n');
     }
 
     // 4. Module Refinement Invariant (§6)
@@ -8840,6 +10791,8 @@ fn emit_boogie_parts_with_options(
                     ranges.push(format!("  in_i64({}_{}(Current))", m.name, fnm));
                 } else if fty == "CHAR" {
                     ranges.push(format!("  in_char({}_{}(Current))", m.name, fnm));
+                } else if let Some(fact) = elements_fact(fty, &format!("{}_{}(Current)", m.name, fnm)) {
+                    ranges.push(format!("  {fact}"));
                 }
             }
         }
@@ -8895,7 +10848,7 @@ fn emit_boogie_parts_with_options(
     let all_routines: Vec<(&RoutineDecl, bool)> = m
         .specify_routines
         .iter()
-        .map(|(_, r)| (r, is_adt))
+        .map(|(_, r)| (r, specify_takes_current(m)))
         .chain(m.feature_routines.iter().map(|(_, r)| (r, is_adt)))
         .chain(m.create_routines.iter().map(|(_, r)| (r, false)))
         .collect();
@@ -8931,23 +10884,35 @@ fn emit_boogie_parts_with_options(
 
     for (r, has_current) in &all_routines {
         set_boogie_type_env(m, &r.params, Some(&r.ret_type));
+        let uses_curr = *has_current && !current_indep.contains(&r.name);
         let mut r_all_tps = m.type_params.clone();
         for tp in &r.type_params {
             if !r_all_tps.contains(tp) {
                 r_all_tps.push(tp.clone());
             }
         }
+        // Boogie refuses a type parameter that no argument or result mentions, as a module's
+        // own in a static creator `iterate[T](x: T, ..): GENERATOR[T, T]` (Task H.22).
+        if !uses_curr {
+            let sig: Vec<&str> = r.params.iter().map(|(_, t)| t.as_str()).chain([r.ret_type.as_str()]).collect();
+            r_all_tps.retain(|tp| {
+                !m.type_params.contains(tp)
+                    || r.ret_type == "Current"
+                    || sig.iter().any(|t| type_tokens(t).iter().any(|tok| tok == tp))
+            });
+        }
         let r_tp_quant = if r_all_tps.is_empty() {
             String::new()
         } else {
             format!("<{}>", r_all_tps.join(", "))
         };
-        let uses_curr = *has_current && !current_indep.contains(&r.name);
         let mut sig_params = vec!["fuel: Fuel".to_string()];
         let mut q_params = vec!["_fuel: Fuel".to_string()];
         let mut call_args_succ = vec!["SuccFuel(_fuel)".to_string()];
         let mut call_args_f = vec!["_fuel".to_string()];
         let mut pre_guards = Vec::new();
+        // The range guards of list arguments (see `range_defined`).
+        let mut list_guards: Vec<String> = Vec::new();
 
         if *has_current {
             sig_params.push(format!("Current: {mod_bpl_ty}"));
@@ -8970,6 +10935,11 @@ fn emit_boogie_parts_with_options(
                 pre_guards.push(format!("in_i64({pn})"));
             } else if pt == "CHAR" {
                 pre_guards.push(format!("in_char({pn})"));
+            } else if let Some(fact) = elements_fact(pt, pn) {
+                if !fact.starts_with("(forall") {
+                    list_guards.push(fact.clone());
+                }
+                pre_guards.push(fact);
             } else if !m.invariants.is_empty()
                 && (pt == &m.name || pt == "Current" || pt.starts_with(&format!("{}[", m.name)))
             {
@@ -9048,10 +11018,42 @@ fn emit_boogie_parts_with_options(
             }
             BoogieEmitScope::ContractOnly => r.ret_type.starts_with("IO[") || r.ret_type == "IO",
         };
+        // Task H.0b: a Boolean routine with no `require` is false of a list out of its type's
+        // range, such as a `LIST[U64]` with a negative element. Its definition is then whole
+        // past its number guards, and where it holds, its lists are in range: `valid_utf8(bs)`
+        // gives `Seq_in_u64(bs)` without Z3 deciding it. Guarded by the range alone, the
+        // contracts of `valid_utf8` and `decode_utf8` made `ghttp`'s test client case split 50
+        // times as often, over the lists `decode_injective` reaches, and run out of resources.
+        let number_guards: Vec<&String> = pre_guards.iter().filter(|g| !list_guards.contains(g)).collect();
+        let range_defined = r.ret_type == "BOOL"
+            && r.requires.is_empty()
+            && !list_guards.is_empty()
+            && number_guards.iter().all(|g| g.starts_with("in_"));
+        let number_guard_str = if number_guards.is_empty() {
+            String::new()
+        } else {
+            format!("{} ==> ", number_guards.iter().map(|g| g.as_str()).collect::<Vec<_>>().join(" && "))
+        };
         if !binds_io && scope == BoogieEmitScope::Full {
+            if range_defined {
+                out.push_str(&format!(
+                    "axiom (forall{r_tp_quant} {} :: {fn_succ_trigger} {number_guard_str}{fn_succ_app} == ({} && ({body_expr})));\n",
+                    q_params.join(", "),
+                    list_guards.join(" && ")
+                ));
+            } else {
+                out.push_str(&format!(
+                    "axiom (forall{r_tp_quant} {} :: {fn_succ_trigger} {guard_str}{fn_succ_app} == {body_expr});\n",
+                    q_params.join(", ")
+                ));
+            }
+        }
+        if range_defined && !binds_io {
+            let numbers = number_guards.iter().map(|g| format!("{g} && ")).collect::<String>();
             out.push_str(&format!(
-                "axiom (forall{r_tp_quant} {} :: {fn_succ_trigger} {guard_str}{fn_succ_app} == {body_expr});\n",
-                q_params.join(", ")
+                "axiom (forall{r_tp_quant} {} :: {fn_succ_trigger} {numbers}{fn_succ_app} ==> {});\n",
+                q_params.join(", "),
+                list_guards.join(" && ")
             ));
         }
         // Where the body is hidden, the axiom below makes every fuel one, so this step would
@@ -9126,6 +11128,8 @@ fn emit_boogie_parts_with_options(
             post_clauses.push(format!("in_i64({fn_f_term})"));
         } else if r.ret_type == "CHAR" {
             post_clauses.push(format!("in_char({fn_f_term})"));
+        } else if let Some(fact) = elements_fact(&r.ret_type, &fn_f_term) {
+            post_clauses.push(fact);
         } else if r.ret_type == m.name
             || r.ret_type == "Current"
             || r.ret_type.starts_with(&format!("{}[", m.name))
@@ -9188,6 +11192,9 @@ fn emit_boogie_parts_with_options(
                 q_params.join(", "),
                 post_clauses.join(" && ")
             ));
+        }
+        if trusted {
+            out.push_str(&emit_parametric_range_axioms(r, *has_current, m, &r_all_tps, &q_params, &fn_f_app));
         }
         let mentions_all_tps = r_all_tps
             .iter()
@@ -9396,6 +11403,7 @@ fn emit_boogie_parts_with_options(
     // order-independent, so they can follow their uses).
     let mut theory = theory;
     theory.push_str(&BOOGIE_LIFTED_LAMBDAS.with(|l| std::mem::take(&mut *l.borrow_mut())));
+    BOOGIE_LAMBDA_NAMES.with(|n| n.borrow_mut().clear());
 
     BoogieParts {
         preamble,
@@ -10101,6 +12109,13 @@ fn emit_boogie_verify_routine(
             all_tps.push(tp.clone());
         }
     }
+    // As for the routine's function: only the type parameters its signature mentions.
+    if !has_current && r.ret_type != "Current" {
+        let sig: Vec<&str> = r.params.iter().map(|(_, t)| t.as_str()).chain([r.ret_type.as_str()]).collect();
+        all_tps.retain(|tp| {
+            !m.type_params.contains(tp) || sig.iter().any(|t| type_tokens(t).iter().any(|tok| tok == tp))
+        });
+    }
     let tp_quant = if all_tps.is_empty() {
         String::new()
     } else {
@@ -10130,6 +12145,8 @@ fn emit_boogie_verify_routine(
             s.push_str(&format!("  requires in_i64({pn});\n"));
         } else if pt == "CHAR" {
             s.push_str(&format!("  requires in_char({pn});\n"));
+        } else if let Some(fact) = elements_fact(pt, pn) {
+            s.push_str(&format!("  requires {fact};\n"));
         } else if !m.invariants.is_empty()
             && (pt == &m.name || pt == "Current" || pt.starts_with(&format!("{}[", m.name)))
         {
@@ -10145,24 +12162,22 @@ fn emit_boogie_verify_routine(
     }
     let empty_fields = HashSet::new();
     let mut revealed = HashSet::new();
+    let mut generic_foralls = Vec::new();
     for (tag, req_e) in &r.requires {
-        s.push_str(&format!(
-            "  requires {}; // require:{tag}\n",
-            emit_boogie_expr_with_strings(
-                req_e,
-                m,
-                &empty_fields,
-                &revealed,
-                "DefaultFuel",
-                strings
-            )
-        ));
+        let req = emit_boogie_expr_with_strings(req_e, m, &empty_fields, &revealed, "DefaultFuel", strings);
+        if req.contains("forall") && !(r.type_params.is_empty() && m.type_params.is_empty()) {
+            generic_foralls.push(req.clone());
+        }
+        s.push_str(&format!("  requires {req}; // require:{tag}\n"));
     }
     s.push_str("{\n");
 
     let mut locals = Vec::new();
     collect_proc_locals(&r.stmts, &r.body, r, m, &mut locals);
-    let mut code = emit_string_literal_lemma_calls();
+    let mut code = String::new();
+    // After the locals, which Boogie wants first.
+    push_generic_forall_assumes(&mut code, &generic_foralls);
+    code.push_str(&emit_string_literal_lemma_calls());
     code.push_str("  //LITERAL_BYTE_LEMMAS_MARKER\n");
     for (_, req_e) in &r.requires {
         code.push_str(&emit_from_scalar_obligation(
@@ -10198,6 +12213,19 @@ fn emit_boogie_verify_routine(
                 r.name,
                 invariant_clause_fn(&m.name, tag)
             ));
+        }
+    }
+    // A list of a machine type that this routine gives back has its elements in range, which
+    // every caller assumes (Task H.0b). A list built from a value out of range stops here.
+    // So does a machine number out of its type's range, such as a `U64` result of
+    // `18446744073709551616` or of a `MATH_INT` (Task H.0d): its frame axiom states the range.
+    if let Some(fact) = elements_fact(&r.ret_type, "Result") {
+        s.push_str(&elements_obligation("  ", &format!("{}::range::elements", r.name), &fact));
+    } else if let Some(fact) = value_fact(&r.ret_type, "Result") {
+        let wraps = matches!(r.body, Expr::BinOp(..))
+            && machine_range(&r.ret_type).is_some_and(|range| known_in_range(&r.body, range, r, m));
+        if !wraps {
+            s.push_str(&elements_obligation("  ", &format!("{}::range::result", r.name), &fact));
         }
     }
     for (tag, ens_e) in &r.ensures {
@@ -10267,22 +12295,20 @@ fn emit_boogie_verify_law(
             s.push_str(&format!("  requires in_i64({pn});\n"));
         } else if pt == "CHAR" {
             s.push_str(&format!("  requires in_char({pn});\n"));
+        } else if let Some(fact) = elements_fact(pt, pn) {
+            s.push_str(&format!("  requires {fact};\n"));
         }
     }
+    let mut generic_foralls = Vec::new();
     for (tag, req_e) in &law.requires {
-        s.push_str(&format!(
-            "  requires {}; // require:{tag}\n",
-            emit_boogie_expr_with_strings(
-                req_e,
-                m,
-                &empty_fields,
-                &revealed,
-                "DefaultFuel",
-                strings
-            )
-        ));
+        let req = emit_boogie_expr_with_strings(req_e, m, &empty_fields, &revealed, "DefaultFuel", strings);
+        if req.contains("forall") && !(law.type_params.is_empty() && m.type_params.is_empty()) {
+            generic_foralls.push(req.clone());
+        }
+        s.push_str(&format!("  requires {req}; // require:{tag}\n"));
     }
     s.push_str("{\n");
+    push_generic_forall_assumes(&mut s, &generic_foralls);
     s.push_str(&emit_string_literal_lemma_calls());
     s.push_str("  //LITERAL_BYTE_LEMMAS_MARKER\n");
     let law_ctx = format!("{vis_prefix}{}", law.name);
@@ -11223,6 +13249,9 @@ fn infer_boogie_expr_type(e: &Expr, r: &RoutineDecl, m: &ModuleDecl) -> String {
         }
         Expr::MethodCall(recv, mname, _) => {
             if let Expr::Var(v) = &**recv {
+                if let Some(t) = io_fresh_type(e) {
+                    return map_boogie_type(t, m);
+                }
                 if v == "IO" && mname == "read_line" {
                     if boogie_prelude_ctx().is_some_and(|c| c.module("RESULT").is_some()) {
                         return map_boogie_type(READ_LINE_RESULT_TYPE, m);
@@ -11258,6 +13287,61 @@ fn infer_boogie_expr_type(e: &Expr, r: &RoutineDecl, m: &ModuleDecl) -> String {
 
 /// Gardel type of `IO.read_line`'s result (§11).
 const READ_LINE_RESULT_TYPE: &str = "RESULT[IO_ERROR, STRING]";
+
+/// Gardel type of `IO.random(count)`'s result (Task H.1).
+pub const RANDOM_RESULT_TYPE: &str = "RESULT[IO_ERROR, BYTES]";
+
+/// Gardel type of `IO.env(name)`'s result (Task H.2).
+pub const ENV_RESULT_TYPE: &str = "OPTION[STRING]";
+
+/// The most bytes one `IO.random` or `Random` gives; a larger count is an `Error`.
+pub const GARDEL_RANDOM_MAX: u64 = 1024;
+
+/// `IO.now` or `IO.random(count)`, the routines that read the clock and the system's
+/// generator (Task H.1), with the type of what they give.
+fn io_fresh_type(e: &Expr) -> Option<&'static str> {
+    match e {
+        Expr::MethodCall(recv, r, args) if matches!(&**recv, Expr::Var(v) if v == "IO") => {
+            match (r.as_str(), args.len()) {
+                ("now", 0) => Some("I64"),
+                ("random", 1) => Some(RANDOM_RESULT_TYPE),
+                ("env", 1) => Some(ENV_RESULT_TYPE),
+                _ => None,
+            }
+        }
+        _ => None,
+    }
+}
+
+/// What the runtime guarantees about `v` bound by `v <- IO.now` or `v <- IO.random(count)`,
+/// with `count` already in Boogie (Task H.1). The time is an `I64`. A result is a `RESULT`
+/// whose `Ok` payload is a valid `BYTES` of exactly `count` bytes, at most
+/// `GARDEL_RANDOM_MAX`: the C runtime fills that many or returns `Error`.
+fn io_fresh_wf(e: &Expr, v: &str, count: Option<&str>) -> Option<String> {
+    match io_fresh_type(e)? {
+        "I64" => Some(format!("in_i64({v})")),
+        // `IO.env(name)` (Task H.2): a value is a valid STRING, and nothing says which.
+        ENV_RESULT_TYPE => {
+            let ctx = boogie_prelude_ctx()?;
+            if ctx.module("OPTION").is_none() || ctx.module("STRING").is_none() {
+                return None;
+            }
+            Some(format!(
+                "OPTION__OPTION_Invariant({v}) && (OPTION__is_Some({v}) ==> STRING__STRING_Invariant(OPTION__Some_value({v})))"
+            ))
+        }
+        _ => {
+            let ctx = boogie_prelude_ctx()?;
+            if ctx.module("RESULT").is_none() || ctx.module("BYTES").is_none() {
+                return None;
+            }
+            let n = count?;
+            Some(format!(
+                "RESULT__RESULT_Invariant({v}) && (RESULT__is_Ok({v}) ==> BYTES__BYTES_Invariant(RESULT__Ok_val({v})) && BYTES__fn_length(DefaultFuel, RESULT__Ok_val({v})) == {n} && {n} <= {GARDEL_RANDOM_MAX})"
+            ))
+        }
+    }
+}
 
 fn is_io_read_line(e: &Expr) -> bool {
     matches!(e, Expr::MethodCall(recv, r, args)
@@ -11450,13 +13534,6 @@ fn emit_boogie_proc_stmts_and_ret(
                                     c.ctor(),
                                     fname
                                 ));
-                                // A binder of a machine type, such as `id` in `case Some(id)` on
-                                // an `OPTION[NAT]`, is in its range: every value of the type is.
-                                // The field's declared type is the generic `A`, so the range is
-                                // read from the binder's own type at this instance.
-                                if let Some(range) = boogie_env_type(bname).as_deref().and_then(machine_range) {
-                                    s.push_str(&format!("{pad}  assume {range}({bname});\n"));
-                                }
                                 if is_own
                                     && !m.invariants.is_empty()
                                     && (fty == &m.name
@@ -11509,6 +13586,25 @@ fn emit_boogie_proc_stmts_and_ret(
                             if let Some(wf) = read_line_result_wf(v) {
                                 s.push_str(&format!(
                                     "{pad}assume {wf}; // IO boundary: the runtime decodes and validates input (spec §11)\n"
+                                ));
+                            }
+                        } else if io_fresh_type(e).is_some() {
+                            // The clock and the generator give a fresh value at each call (H.1).
+                            let count = match e {
+                                Expr::MethodCall(_, _, args) if args.len() == 1 => Some(emit_boogie_expr_with_strings(
+                                    &args[0],
+                                    m,
+                                    &empty_fields,
+                                    revealed,
+                                    "DefaultFuel",
+                                    strings,
+                                )),
+                                _ => None,
+                            };
+                            s.push_str(&format!("{pad}havoc {v};\n"));
+                            if let Some(wf) = io_fresh_wf(e, v, count.as_deref()) {
+                                s.push_str(&format!(
+                                    "{pad}assume {wf}; // IO boundary: the runtime checks what it gives (Task H.1)\n"
                                 ));
                             }
                         } else {
@@ -11839,6 +13935,15 @@ fn wf_walk(k: WfKind<'_>, e: &Expr) -> Option<Expr> {
     }
 }
 
+/// Boogie 3.4.3 never assumes a `requires` that quantifies over a type parameter of its
+/// procedure, while the same formula assumed in the body holds (Task H.21). A generic
+/// routine's or law's quantified `require` is therefore also assumed where its body starts.
+fn push_generic_forall_assumes(s: &mut String, reqs: &[String]) {
+    for req in reqs {
+        s.push_str(&format!("  assume {req}; // generic forall premise\n"));
+    }
+}
+
 /// Emits the Boogie proof obligation for the `CHAR.from_scalar` calls in `e`
 /// (if any), tagged `<ctx>::require::valid_scalar`.
 fn emit_from_scalar_obligation(
@@ -12040,6 +14145,20 @@ fn emit_call_arg_obligations(
         }
         s.push_str(&emit_boogie_expr_obligations(a, r, m, revealed, indent, strings));
         LAMBDA_EXPECTED.with(|l| *l.borrow_mut() = None);
+        // A list of a machine type passed to a parameter of that type has its elements in
+        // range, which the callee assumes (Task H.0b).
+        if let Some((pn, pt)) = expected.as_ref().and_then(|ps| ps.get(i)).filter(|p| has_elements_fact(&p.1)) {
+            let arg = emit_boogie_expr_with_strings(a, m, &HashSet::new(), revealed, "DefaultFuel", strings);
+            if let Some(fact) = elements_fact(pt, &arg) {
+                s.push_str(&elements_obligation(&pad, &format!("{}::range::{pn}_elements", r.name), &fact));
+            }
+        }
+        // A machine number passed to a parameter of a machine type is in its range, which the
+        // callee assumes (Task H.0d): a `MATH_INT` passed as a `U64` is checked here.
+        if let Some((pn, pt)) = expected.as_ref().and_then(|ps| ps.get(i)) {
+            // Tagged apart from the name, which the source finds in the callee's header.
+            s.push_str(&machine_range_obligation(&format!("{pn}_range"), pt, a, r, m, revealed, &pad, strings));
+        }
         let Expr::Var(v) = a else {
             continue;
         };
@@ -12222,6 +14341,8 @@ fn emit_value_assumptions(v: &str, gty: &str, m: &ModuleDecl, pad: &str) -> Stri
         format!("{pad}assume in_i64({v});\n")
     } else if gty == "CHAR" {
         format!("{pad}assume in_char({v});\n")
+    } else if let Some(fact) = elements_fact(gty, v) {
+        format!("{pad}assume {fact};\n")
     } else if own {
         if m.invariants.is_empty() {
             String::new()
@@ -12472,6 +14593,14 @@ fn emit_boogie_expr_obligations(
                     value, r, m, revealed, indent, strings,
                 ));
             }
+            if let ReprKind::Product(decl) = &m.repr {
+                for (f, value) in fields {
+                    if let Some((_, t)) = decl.iter().find(|(d, _)| d == f) {
+                        s.push_str(&emit_field_elements_obligation(f, t, value, m, revealed, &pad, strings, &r.name));
+                        s.push_str(&machine_range_obligation(f, t, value, r, m, revealed, &pad, strings));
+                    }
+                }
+            }
             let val_bpl = emit_boogie_expr_with_strings(
                 e,
                 m,
@@ -12495,6 +14624,8 @@ fn emit_boogie_expr_obligations(
                 recv, r, m, revealed, indent, strings,
             ));
             s.push_str(&emit_call_arg_obligations(e, args, r, m, revealed, indent, strings));
+            s.push_str(&emit_list_length_trust(e, mname, args, m, revealed, &pad, strings));
+            s.push_str(&emit_map_fold_range(e, recv, mname, args, m, revealed, &pad, strings));
             // Applying a function, held or in a field, must establish its type's `require`.
             if mname == "apply" {
                 s.push_str(&emit_fn_application_obligations(recv, args, r, m, revealed, &pad, strings));
@@ -12603,6 +14734,12 @@ fn emit_boogie_expr_obligations(
         }
         Expr::Call(fname, args) => {
             s.push_str(&emit_call_arg_obligations(e, args, r, m, revealed, indent, strings));
+            if let Some(fields) = ctor_fields(m, fname) {
+                for ((f, t), value) in fields.iter().zip(args.iter()) {
+                    s.push_str(&emit_field_elements_obligation(f, t, value, m, revealed, &pad, strings, &r.name));
+                    s.push_str(&machine_range_obligation(f, t, value, r, m, revealed, &pad, strings));
+                }
+            }
             if find_module_routine(m, fname).is_none() {
                 s.push_str(&emit_fn_application_obligations(
                     &Expr::Var(fname.clone()),
@@ -13628,6 +15765,31 @@ fn share_subexpr(e: &Expr, target: &Expr, name: &str, found: &mut usize) -> Expr
     }
 }
 
+/// `recv.mname(args)` with other than one argument, as a method of a user concept's bound
+/// (Task H.0a). Apart from `emit_boogie_expr_with_strings`, whose frame every nested
+/// expression pays for.
+#[inline(never)]
+fn emit_user_bound_call(
+    recv: &Expr,
+    mname: &str,
+    args: &[Expr],
+    r_str: &str,
+    m: &ModuleDecl,
+    (implicit_fields, revealed, fuel_var, strings): (
+        &HashSet<String>,
+        &HashSet<String>,
+        &str,
+        &[String],
+    ),
+) -> Option<String> {
+    let f = bound_method_fn(recv, mname, m)?;
+    let mut parts = vec![r_str.to_string()];
+    parts.extend(args.iter().map(|a| {
+        emit_boogie_expr_with_strings(a, m, implicit_fields, revealed, fuel_var, strings)
+    }));
+    Some(format!("{f}({})", parts.join(", ")))
+}
+
 fn emit_boogie_expr_with_strings(
     e: &Expr,
     m: &ModuleDecl,
@@ -13857,9 +16019,8 @@ fn emit_boogie_expr_with_strings(
                     fuel_var
                 };
                 let mut full_args = vec![call_fuel.to_string()];
-                if m.kind == ModuleKind::Module
-                    && (m.feature_routines.iter().any(|(_, r)| r.name == *fname)
-                        || m.specify_routines.iter().any(|(_, r)| r.name == *fname))
+                if (m.kind == ModuleKind::Module && m.feature_routines.iter().any(|(_, r)| r.name == *fname))
+                    || (specify_takes_current(m) && m.specify_routines.iter().any(|(_, r)| r.name == *fname))
                 {
                     full_args.push("Current".to_string());
                 }
@@ -13937,7 +16098,15 @@ fn emit_boogie_expr_with_strings(
                         "at" => {
                             return format!("Seq_at({}, {})", a_str[0], a_str[1]);
                         }
-                        _ => {}
+                        // Its other routines are ordinary functions (Task H.21): its own,
+                        // or injected into a client as any prelude module's are.
+                        _ => {
+                            let call_fuel = if revealed.contains(mname.as_str()) { "RevealFuel" } else { fuel_var };
+                            let mut full_args = vec![call_fuel.to_string()];
+                            full_args.extend(a_str);
+                            let owner = if m.name == "LIST_OPS" { String::new() } else { "LIST_OPS__".to_string() };
+                            return format!("{owner}fn_{mname}({})", full_args.join(", "));
+                        }
                     }
                 } else if v == "FUNCTION_OPS" {
                     let a_str: Vec<String> = args
@@ -14134,6 +16303,19 @@ fn emit_boogie_expr_with_strings(
                             return format!("{eq_fn}({r_str}, {rhs})");
                         }
                     }
+                    // A method of a user concept's bound, of any arity (Task H.0a).
+                    if args.len() != 1 {
+                        if let Some(app) = emit_user_bound_call(
+                            recv,
+                            mname,
+                            args,
+                            &r_str,
+                            m,
+                            (implicit_fields, revealed, fuel_var, strings),
+                        ) {
+                            return app;
+                        }
+                    }
                     // A method of a concept bound, or one on a scalar, has no routine: it
                     // belongs to the instance, not to this module.
                     if args.len() == 1 {
@@ -14235,6 +16417,33 @@ fn emit_boogie_expr_with_strings(
             acc.unwrap_or(s_str)
         }
         Expr::RecordLit(fields) => {
+            // A record of another module, such as `{ state = 0, next = f }` returned as a
+            // `GENERATOR[NAT, NAT]` by a client: its fields are not this module's, and the
+            // routine's result type names its module (Task H.22).
+            let same_fields = |d: &ModuleDecl| {
+                matches!(&d.repr, ReprKind::Product(fs)
+                    if fs.len() == fields.len() && fs.iter().all(|(f, _)| fields.iter().any(|(k, _)| k == f)))
+            };
+            if !same_fields(m) {
+                let owner = boogie_result_type().map(|t| type_head(&t).to_string()).filter(|h| *h != m.name);
+                let decl_fields = owner.as_ref().and_then(|h| {
+                    with_module_decl(h, |d| match &d.repr {
+                        ReprKind::Product(fs) if same_fields(d) => Some(fs.clone()),
+                        _ => None,
+                    })
+                    .flatten()
+                });
+                if let (Some(h), Some(decl_fields)) = (owner, decl_fields) {
+                    let args: Vec<String> = decl_fields
+                        .iter()
+                        .map(|(fnm, _)| {
+                            let fe = &fields.iter().find(|(k, _)| k == fnm).expect("same fields").1;
+                            emit_boogie_expr_with_strings(fe, m, implicit_fields, revealed, fuel_var, strings)
+                        })
+                        .collect();
+                    return format!("{h}__{h}_Ctor({})", args.join(", "));
+                }
+            }
             if let ReprKind::Product(decl_fields) = &m.repr {
                 let args: Vec<String> = decl_fields
                     .iter()
@@ -14780,11 +16989,13 @@ const VERIFIER_SOURCES: &[(&str, &str)] = &[
     ("host_files.rs", include_str!("host_files.rs")),
     ("main.rs", include_str!("main.rs")),
     ("manifest.rs", include_str!("manifest.rs")),
+    ("mutate_cmd.rs", include_str!("mutate_cmd.rs")),
     ("names.rs", include_str!("names.rs")),
     ("patterns.rs", include_str!("patterns.rs")),
     ("proof_cache.rs", include_str!("proof_cache.rs")),
     ("refined.rs", include_str!("refined.rs")),
     ("resolve.rs", include_str!("resolve.rs")),
+    ("test_cmd.rs", include_str!("test_cmd.rs")),
 ];
 
 fn verifier_id() -> String {
@@ -14990,8 +17201,7 @@ fn run_boogie_verification(
     let mut untrusted: HashSet<String> = HashSet::new();
     loop {
         let prev = UNTRUSTED_CONTRACTS.with(|u| u.replace(untrusted.clone()));
-        let pass =
-            run_boogie_verification_once(m, fuel_limit, boogie_path, z3_path, src, input_path);
+        let pass = run_boogie_with_retries(m, fuel_limit, boogie_path, z3_path, src, input_path);
         UNTRUSTED_CONTRACTS.with(|u| *u.borrow_mut() = prev);
         let pass = pass?;
         // A failed postcondition clause withdraws that clause only; any other failure of a
@@ -15016,12 +17226,79 @@ fn run_boogie_verification(
                 all.push(d);
             }
         }
-        if newly_failed.is_empty() {
+        // A failure in any pass is a genuine one, so a run that only asks whether there is one
+        // needs no other pass.
+        if newly_failed.is_empty() || ONE_PASS.with(|o| o.get()) {
             break;
         }
         untrusted.extend(newly_failed);
     }
     Ok(all)
+}
+
+/// The Z3 seeds tried, in order, when a proof runs out of resources under the default one.
+const RETRY_SEEDS: [u32; 3] = [1, 2, 3];
+
+/// Seconds per procedure for the first try under the default seed, when other seeds follow.
+const FIRST_TRY_SECS: u32 = 120;
+
+/// The solver gave up: it ran out of time or of its resource budget, or `gardelc` stopped
+/// it. This says
+/// nothing about the program, unlike a failed obligation.
+fn solver_gave_up(d: &Diagnostic) -> bool {
+    d.rule == "Phase 3 Boogie (Verification Timeout)"
+        || d.rule == "Phase 3 Boogie (Verification Resource Limit)"
+        || (d.rule == "Phase 3 Boogie (Verification Incomplete)" && d.message.contains("the solver was stopped after"))
+}
+
+/// One verification pass. Whether Z3 finds a proof within its resources can turn on its
+/// random seed: a proof that takes 2 s under one seed can run out under another, after a
+/// change that adds only declarations the proof never uses (H.0c). So when the solver gives
+/// up under the default seed, the pass runs again under each of `RETRY_SEEDS`, and the first
+/// result in which it does not give up stands. A proof under any seed is a proof, so this is
+/// sound; it costs time only where a proof did not complete. A seed the user chose
+/// (`--z3-seed`, `GARDEL_Z3_SEED`) is kept, so that run can be reproduced.
+fn run_boogie_with_retries(
+    m: &ModuleDecl,
+    fuel_limit: usize,
+    boogie_path: &str,
+    z3_path: &str,
+    src: &str,
+    input_path: &str,
+) -> Result<Vec<Diagnostic>, String> {
+    let retrying = current_z3_seed().is_none();
+    // A stuck proof may never reach its resource budget, so the first try has a shorter time
+    // limit per procedure when other seeds will follow: a proof that needs longer gets the
+    // full limit under them.
+    let first_limit = if retrying { FIRST_TRY_SECS.min(solver_backstop_secs()) } else { solver_backstop_secs() };
+    let none = HashSet::new();
+    let first = run_boogie_verification_once(m, fuel_limit, boogie_path, z3_path, src, input_path, first_limit, &none)?;
+    if !retrying || !first.iter().any(solver_gave_up) {
+        return Ok(first);
+    }
+    // The routines the solver gave up on are tried again one obligation at a time: a law whose
+    // obligations each take a second can run out of resources as one condition, as ghttp's
+    // `HTTP_ROUND_TRIP.request_line_reads_back` did under seeds 1 to 3 (H.9). Each later
+    // try splits every routine given up on so far.
+    let mut split: HashSet<String> = first.iter().filter(|d| solver_gave_up(d)).map(|d| d.routine.clone()).collect();
+    let again = run_boogie_verification_once(m, fuel_limit, boogie_path, z3_path, src, input_path, solver_backstop_secs(), &split)?;
+    if !again.iter().any(solver_gave_up) {
+        eprintln!("      [seed] `{}` ran out of resources under Z3's default seed, and completed with its obligations split", m.name);
+        return Ok(again);
+    }
+    split.extend(again.iter().filter(|d| solver_gave_up(d)).map(|d| d.routine.clone()));
+    for seed in RETRY_SEEDS {
+        let again = with_z3_seed(Some(seed), || {
+            run_boogie_verification_once(m, fuel_limit, boogie_path, z3_path, src, input_path, solver_backstop_secs(), &split)
+        })?;
+        if !again.iter().any(solver_gave_up) {
+            eprintln!("      [seed] `{}` ran out of resources under Z3's default seed, and completed under seed {seed}", m.name);
+            return Ok(again);
+        }
+        split.extend(again.iter().filter(|d| solver_gave_up(d)).map(|d| d.routine.clone()));
+    }
+    eprintln!("      [seed] `{}`: the solver gave up under Z3's default seed and under seeds 1, 2 and 3", m.name);
+    Ok(first)
 }
 
 thread_local! {
@@ -15034,6 +17311,15 @@ thread_local! {
     static BOOGIE_Z3_RLIMIT: std::cell::RefCell<Option<u64>> = const { std::cell::RefCell::new(None) };
     /// `--no-verify`: Boogie resolves and type checks each module and proves nothing.
     static TYPES_ONLY: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// `--fail-fast`: a module with a failure is not verified again to find every other one.
+    static ONE_PASS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+fn with_one_pass<R>(on: bool, f: impl FnOnce() -> R) -> R {
+    let prev = ONE_PASS.with(|o| o.replace(on));
+    let res = f();
+    ONE_PASS.with(|o| o.set(prev));
+    res
 }
 
 /// Runs `f` with Boogie type checking only (`--no-verify`), proving nothing.
@@ -15156,6 +17442,35 @@ fn boogie_seed_args(seed: u32) -> [String; 2] {
     ]
 }
 
+/// Marks the procedures of `routines` for Boogie to verify one assertion at a time. A routine
+/// `r` is the procedure `Verify_r` or, for a law, `Verify_law_r`. When a name matches no
+/// procedure (a module-wide failure names the module), every procedure is split.
+fn split_procedures(bpl: &str, routines: &HashSet<String>) -> String {
+    if routines.is_empty() {
+        return bpl.to_string();
+    }
+    let proc_name = |line: &str| -> Option<String> {
+        let rest = line.strip_prefix("procedure ")?.trim_start();
+        let name = rest.strip_prefix("Verify_")?;
+        Some(name.split(|c: char| c == '(' || c == '<' || c.is_whitespace()).next()?.to_string())
+    };
+    let names: HashSet<String> = bpl.lines().filter_map(proc_name).collect();
+    let all = routines.iter().any(|r| !names.contains(r) && !names.contains(&format!("law_{r}")));
+    let chosen = |p: &str| all || routines.contains(p) || p.strip_prefix("law_").is_some_and(|r| routines.contains(r));
+    let mut out = String::with_capacity(bpl.len() + 64);
+    for line in bpl.split_inclusive('\n') {
+        match proc_name(line) {
+            Some(p) if chosen(&p) => {
+                out.push_str("procedure {:vcs_split_on_every_assert} ");
+                out.push_str(&line["procedure ".len()..]);
+            }
+            _ => out.push_str(line),
+        }
+    }
+    out
+}
+
+#[allow(clippy::too_many_arguments)]
 fn run_boogie_verification_once(
     m: &ModuleDecl,
     fuel_limit: usize,
@@ -15163,8 +17478,10 @@ fn run_boogie_verification_once(
     z3_path: &str,
     src: &str,
     input_path: &str,
+    proc_limit: u32,
+    split: &HashSet<String>,
 ) -> Result<Vec<Diagnostic>, String> {
-    let bpl_code = emit_boogie(m, fuel_limit);
+    let bpl_code = split_procedures(&emit_boogie(m, fuel_limit), split);
     // Unique per call: concurrent verifications of the same module (e.g. parallel tests)
     // must not overwrite each other's VC file.
     static VERIFY_SEQ: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
@@ -15187,7 +17504,7 @@ fn run_boogie_verification_once(
     cmd.arg(BOOGIE_TYPE_ENCODING);
     cmd.arg(format!("/rlimit:{}", current_z3_rlimit()));
     let backstop = solver_backstop_secs();
-    cmd.arg(format!("/timeLimit:{backstop}"));
+    cmd.arg(format!("/timeLimit:{proc_limit}"));
     cmd.arg("/mv:-");
     cmd.arg("/errorTrace:0");
     if TYPES_ONLY.with(|t| t.get()) {
@@ -15369,6 +17686,7 @@ pub fn parse_boogie_output(
 
             let static_rule = match rule_kind.as_str() {
                 "overflow" => "Phase 3 Boogie (Arithmetic Overflow)",
+                "range" => "Phase 3 Boogie (Range Violation)",
                 "div_by_zero" => "Phase 3 Boogie (Division by Zero)",
                 "variant" => "Phase 3 Boogie (Termination Variant Violation)",
                 "invariant" => "Phase 3 Boogie (Invariant Violation)",
@@ -15467,6 +17785,7 @@ pub fn parse_boogie_output(
                 }
                 let static_rule = match rule_kind.as_str() {
                     "overflow" => "Phase 3 Boogie (Arithmetic Overflow)",
+                    "range" => "Phase 3 Boogie (Range Violation)",
                     "div_by_zero" => "Phase 3 Boogie (Division by Zero)",
                     "variant" => "Phase 3 Boogie (Termination Variant Violation)",
                     "invariant" => "Phase 3 Boogie (Invariant Violation)",
@@ -16118,7 +18437,7 @@ fn verify_module_obligations(
         .iter()
         .map(|(_, r)| (r, false))
         .chain(m.feature_routines.iter().map(|(_, r)| (r, is_adt)))
-        .chain(m.specify_routines.iter().map(|(_, r)| (r, is_adt)))
+        .chain(m.specify_routines.iter().map(|(_, r)| (r, specify_takes_current(m))))
         .collect();
 
     // 1. Audit / Strict check on `assume` statements (§7)
@@ -18006,9 +20325,17 @@ uint64_t gardel_live_allocations(void) {
 }
 #define GARDEL_LIVE_ADD() atomic_fetch_add(&g_gardel_live_allocs, 1)
 #define GARDEL_LIVE_SUB() atomic_fetch_sub(&g_gardel_live_allocs, 1)
+/* Copies of an `ARRAY` that `set` or `swap` made because the array had another reference
+   (Task H.5), for the tests that show when an update is in place. */
+static _Atomic uint64_t g_gardel_array_copies = 0;
+uint64_t gardel_array_copies(void) {
+    return atomic_load(&g_gardel_array_copies);
+}
+#define GARDEL_ARRAY_COPY() atomic_fetch_add(&g_gardel_array_copies, 1)
 #else
 #define GARDEL_LIVE_ADD() ((void)0)
 #define GARDEL_LIVE_SUB() ((void)0)
+#define GARDEL_ARRAY_COPY() ((void)0)
 #endif
 
 static void gardel_out_of_memory(void) {
@@ -18902,6 +21229,7 @@ pub fn contract_only_module(m: &ModuleDecl) -> ModuleDecl {
         name: m.name.clone(),
         type_params: m.type_params.clone(),
         type_bounds: m.type_bounds.clone(),
+        declared_bounds: m.declared_bounds.clone(),
         satisfies: m.satisfies.clone(),
         repr_vis: m.repr_vis.clone(),
         repr: m.repr.clone(),
@@ -19793,7 +22121,8 @@ fn looks_like_input(s: &str) -> bool {
 }
 
 /// Flags followed by a value.
-const VALUE_FLAGS: &[&str] = &["--fuel", "--z3-seed", "--z3-rlimit", "--project", "--compare-with"];
+const VALUE_FLAGS: &[&str] =
+    &["--fuel", "--z3-seed", "--z3-rlimit", "--project", "--compare-with", "--fail-fast"];
 /// Flags with no value, or with an optional one (`--inspect`, `--emit-stdlib`).
 const PLAIN_FLAGS: &[&str] = &[
     "--stdlib",
@@ -19876,6 +22205,9 @@ pub struct VerifyOptions {
     pub packages: HashMap<String, String>,
     /// The local verification cache. `None` runs the solver on every module.
     pub cache: Option<Rc<ProofCache>>,
+    /// `--fail-fast M`: module `M` is checked first, and the run stops at the first module
+    /// with an error, after the solver's first pass over it.
+    pub fail_fast: Option<String>,
 }
 
 /// Outcome of checking and verifying all modules of a run.
@@ -19904,6 +22236,7 @@ pub fn check_and_verify_project(units: &mut [SourceUnit], opts: VerifyOptions) -
             concept_map.insert(c.name.clone(), c.clone());
         }
     }
+    set_user_concepts(units.iter().flat_map(|u| u.ast.concepts.iter().cloned()).collect());
 
     // Concept expansion and static checks of every module (before linking, so linked
     // modules carry their expanded routines).
@@ -19965,7 +22298,16 @@ pub fn check_and_verify_project(units: &mut [SourceUnit], opts: VerifyOptions) -
     }
 
     let mut diags: Vec<(usize, Diagnostic)> = Vec::new();
-    for (ui, u) in units.iter().enumerate() {
+    // `--fail-fast`: the file with the module named comes first.
+    let mut order: Vec<usize> = (0..units.len()).collect();
+    if let Some(first) = &opts.fail_fast {
+        order.sort_by_key(|&ui| !units[ui].ast.modules.iter().any(|m| m.name == *first));
+    }
+    for ui in order {
+        let u = &units[ui];
+        if opts.fail_fast.is_some() && diags.iter().any(|(_, d)| d.level == "error") {
+            break;
+        }
         if opts.project_mode {
             for d in check_file_module_name(u, opts.strict) {
                 diags.push((ui, d));
@@ -19983,15 +22325,17 @@ pub fn check_and_verify_project(units: &mut [SourceUnit], opts: VerifyOptions) -
                     with_proof_cache(opts.cache.clone(), || {
                         with_z3_seed(opts.z3_seed, || {
                             with_z3_rlimit(opts.z3_rlimit, || {
-                                verify_module_phase3(
-                                    m,
-                                    &u.src,
-                                    &u.path,
-                                    opts.fuel_limit,
-                                    opts.strict,
-                                    opts.audit || package.is_some(),
-                                    opts.bounded_check,
-                                )
+                                with_one_pass(opts.fail_fast.is_some(), || {
+                                    verify_module_phase3(
+                                        m,
+                                        &u.src,
+                                        &u.path,
+                                        opts.fuel_limit,
+                                        opts.strict,
+                                        opts.audit || package.is_some(),
+                                        opts.bounded_check,
+                                    )
+                                })
                             })
                         })
                     })
@@ -20050,6 +22394,7 @@ fn verify_embedded_prelude(cache: Option<Rc<ProofCache>>) -> Vec<Diagnostic> {
             z3_rlimit: None,
             packages: HashMap::new(),
             cache,
+            fail_fast: None,
         },
     );
     let mut failed = checked.fatal;
@@ -20156,10 +22501,18 @@ fn print_inspect_json(verified: bool, modules: &[String], concepts: &[String], d
 
 fn main() {
     let args: Vec<String> = env::args().collect();
+    if args.get(1).is_some_and(|a| a == "test") {
+        std::process::exit(test_cmd::run(&args[2..]));
+    }
+    if args.get(1).is_some_and(|a| a == "mutate") {
+        std::process::exit(mutate_cmd::run(&args[2..]));
+    }
     if args.len() < 2 && !std::path::Path::new("Gardel.toml").is_file() {
         eprintln!(
             "Usage: gardelc <input.gdl ... | DIR | --project <DIR> | --stdlib> [--no-prelude] [--inspect [MODULE]] [--emit-stdlib [DIR]] [--json-diagnostics] [--fuel <N>] [--z3-seed <N>] [--z3-rlimit <N>] [--audit] [--strict] [--bounded-check] [--verify-deps] [--run] [--no-verify]"
         );
+        eprintln!("       gardelc test [DIR] [--filter <NAME>]  verify, build and run each program of DIR/tests (§4.2)");
+        eprintln!("       gardelc mutate [DIR] [--only <MODULE>] [--limit <N>] [--seed <N>] [--jobs <N>] [--list]  change the package's code in small ways, and report the changes that neither its proofs nor its tests refuse (§4.2)");
         eprintln!(
             "  --no-verify  with --inspect: show the short forms after type checking, proving nothing"
         );
@@ -20175,6 +22528,7 @@ fn main() {
         eprintln!(
             "  --verify-deps  ignore the local verification cache and run the solver on every module"
         );
+        eprintln!("  --fail-fast <MODULE>  check MODULE first, and stop at the first module with an error");
         eprintln!(
             "  --compare-with <DIR>  after verifying, report what would break a client of the older version in DIR"
         );
@@ -20260,6 +22614,20 @@ fn main() {
                 "gardelc",
                 "invalid_arguments",
                 "--compare-with: expected the directory of the older version".to_string(),
+                "",
+            ),
+        },
+    };
+    let fail_fast = match args.iter().position(|a| a == "--fail-fast") {
+        None => None,
+        Some(i) => match args.get(i + 1).filter(|v| !v.starts_with("--")) {
+            Some(name) => Some(name.clone()),
+            None => exit_with_frontend_error(
+                json_mode,
+                "Command Line",
+                "gardelc",
+                "invalid_arguments",
+                "--fail-fast: expected the module to check first".to_string(),
                 "",
             ),
         },
@@ -20629,6 +22997,7 @@ fn main() {
         z3_rlimit,
         packages: packages.clone(),
         cache: proof_cache.clone(),
+        fail_fast,
     };
     let mut checked = with_types_only(no_verify, || check_and_verify_project(&mut units, opts));
     if verify_deps && prelude_mode && !bounded_check {
@@ -20999,6 +23368,7 @@ fn main() {
                 name: format!("{}_closures", m.name),
                 type_params: Vec::new(),
                 type_bounds: HashMap::new(),
+                declared_bounds: HashMap::new(),
                 satisfies: None,
                 repr_vis: Visibility::Any,
                 repr: ReprKind::Product(Vec::new()),
@@ -21024,7 +23394,7 @@ fn main() {
         if m.name == module.name {
             c_backend_errors = errs;
         }
-        if let Err(e) = fs::write(&c_path, c_code) {
+        if let Err(e) = write_if_changed(&c_path, &c_code) {
             eprintln!("[ERROR] Failed to write C11 output '{c_path}': {e}");
             std::process::exit(1);
         }
@@ -21033,18 +23403,17 @@ fn main() {
             primary_bpl = bpl_path;
             primary_bend = bend_path;
             primary_c = c_path;
-            primary_exe = format!("build/{stem}_bin.exe");
+            primary_exe = format!("build/{stem}_bin{}", std::env::consts::EXE_SUFFIX);
         }
     }
 
     // The build's own diagnostics: a C compiler that fails or is missing (Task F.11b).
     let mut build_diags: Vec<Diagnostic> = Vec::new();
-    let gcc_compiled = if module.kind.is_entry_point() {
-        let gcc = Command::new("gcc")
-            .args(["-O3", "-fopenmp", &primary_c, "-o", &primary_exe])
-            .args(GCC_NET_LIBS)
-            .output();
-        match gcc {
+    let exe_current = module.kind.is_entry_point() && executable_is_current(&primary_c, &primary_exe);
+    let gcc_compiled = if exe_current {
+        true
+    } else if module.kind.is_entry_point() {
+        match compile_program_c(&primary_c, &primary_exe) {
             Ok(out) if out.status.success() => {
                 // Its warnings, if any, are the C compiler's to show, not a result of the run.
                 std::io::Write::write_all(&mut std::io::stderr(), &out.stderr).ok();
@@ -21088,7 +23457,9 @@ fn main() {
     for e in &c_backend_errors {
         say(&format!("      [C backend] {e} (the C file starts with #error)"));
     }
-    if gcc_compiled {
+    if exe_current {
+        say(&format!("      Native executable up to date            -> {primary_exe}"));
+    } else if gcc_compiled {
         say(&format!("      Compiled native executable              -> {primary_exe}"));
     }
 
@@ -21200,6 +23571,37 @@ mod tests {
         let mut m = ast.modules.pop().expect("expected one module");
         let _ = check_and_expand_concepts(&mut m, &cmap);
         m
+    }
+
+    /// A run is retried under other seeds only where the solver gave up: a timeout, or a run
+    /// `gardelc` stopped. A failed obligation, or a Boogie run that ended without a clean
+    /// summary for another reason, is the answer, and is not retried.
+    #[test]
+    fn a_retry_splits_only_the_procedures_given_up_on() {
+        let bpl = "procedure Verify_law_slow(x: int)\n{ assert x == x; }\nprocedure Verify_fast(x: int)\n{ }\nprocedure helper();\n";
+        let set = |names: &[&str]| names.iter().map(|s| s.to_string()).collect::<HashSet<String>>();
+        assert_eq!(split_procedures(bpl, &set(&[])), bpl);
+        let laws = split_procedures(bpl, &set(&["slow"]));
+        assert!(laws.contains("procedure {:vcs_split_on_every_assert} Verify_law_slow(x: int)\n"), "{laws}");
+        assert!(laws.contains("procedure Verify_fast("), "{laws}");
+        assert!(laws.contains("procedure helper();"), "{laws}");
+        assert_eq!(split_procedures(bpl, &set(&["law_slow"])), laws);
+        let all = split_procedures(bpl, &set(&["MODULE"]));
+        assert!(all.contains("{:vcs_split_on_every_assert} Verify_law_slow") && all.contains("{:vcs_split_on_every_assert} Verify_fast"), "{all}");
+        assert!(all.contains("procedure helper();"), "{all}");
+    }
+
+    #[test]
+    fn only_a_solver_that_gave_up_is_retried() {
+        let d = |rule: &'static str, msg: &str| Diagnostic::basic("error", rule, "r".into(), "t".into(), msg.into());
+        assert!(solver_gave_up(&d("Phase 3 Boogie (Verification Timeout)", "did not complete")));
+        assert!(solver_gave_up(&d("Phase 3 Boogie (Verification Resource Limit)", "out of resource")));
+        assert!(solver_gave_up(&d(
+            "Phase 3 Boogie (Verification Incomplete)",
+            "Fatal Error: the solver was stopped after 600 s, likely in a matching loop"
+        )));
+        assert!(!solver_gave_up(&d("Phase 3 Boogie (Verification Incomplete)", "Boogie did not report a clean result: parse error")));
+        assert!(!solver_gave_up(&d("Phase 3 Boogie (Postcondition Violation)", "failed")));
     }
 
     #[test]
@@ -21365,7 +23767,7 @@ end
         let stdlib = parse_phase4_stdlib().expect("Phase 4 stdlib should parse");
         assert_eq!(stdlib.group, None);
         assert_eq!(stdlib.concepts.len(), 3);
-        assert_eq!(stdlib.modules.len(), 22);
+        assert_eq!(stdlib.modules.len(), 37);
         for m in &stdlib.modules {
             let mut diags = check_visibility_and_semantics(m);
             diags.extend(verify_module_phase3(
@@ -21475,6 +23877,7 @@ end
             z3_rlimit: None,
             packages: HashMap::new(),
             cache: None,
+            fail_fast: None,
         };
         let checked = check_and_verify_project(&mut units, opts);
         assert!(
@@ -21857,7 +24260,7 @@ end
     #[test]
     fn test_plan3_multi_module_stdlib_pipeline() {
         let ast = parse_phase4_stdlib().expect("stdlib parses cleanly");
-        assert_eq!(ast.modules.len(), 22);
+        assert_eq!(ast.modules.len(), 37);
         let mut prog_env = ProgramEnv {
             modules: HashMap::new(),
             concepts: HashMap::new(),
@@ -26653,6 +29056,7 @@ end
             z3_rlimit: Some(DEFAULT_Z3_RLIMIT),
             packages: HashMap::new(),
             cache: None,
+            fail_fast: None,
         };
 
         let dir_res = check_and_verify_project(&mut dir_units, opts.clone());
@@ -28139,6 +30543,7 @@ end
             z3_rlimit: None,
             packages: HashMap::new(),
             cache: None,
+            fail_fast: None,
         }
     }
 

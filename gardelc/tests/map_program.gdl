@@ -80,6 +80,17 @@ feature {ANY}
       m3.put(10, "TEN")
     end
 
+  shout(s: STRING): STRING
+    do
+      if s.byte_length <= 1000000 then s.concat("!") else s end
+    end
+
+  -- A map to values of another type, by a function that holds a name of this routine.
+  capped(m: MAP[STRING, NAT], most: NAT): MAP[STRING, STRING]
+    do
+      m.map(fn(k: STRING, v: NAT): STRING do NUMBER_TEXT.nat_to_text(if v > most then most else v end) end)
+    end
+
   report: STRING
     do
       let m = fruit
@@ -88,7 +99,11 @@ feature {ANY}
       let b = and_then(a, and_then(number(m.get("apple")), and_then(number(m.get("fig")), number(m.get("kiwi")))))
       let c = and_then(b, and_then(NUMBER_TEXT.nat_to_text(total(m)), longest(m)))
       let d = and_then(c, and_then(text(n.get(10)), and_then(text(n.get(20)), text(n.get(40)))))
-      and_then(d, joined(n.values))
+      let e = and_then(d, joined(n.values))
+      let small = m.filter(fn(k: STRING, v: NAT): BOOL do v < 10 end)
+      let loud = n.filter(fn(k: NAT, v: STRING): BOOL do k != 20 end).map(fn(k: NAT, v: STRING): STRING do shout(v) end)
+      let g = and_then(e, and_then(joined(small.keys), NUMBER_TEXT.nat_to_text(small.size)))
+      and_then(and_then(g, joined(loud.values)), joined(capped(m, 9).values))
     end
 
   -- A plain number from the whole report, for the leak count, which calls it 51 times.

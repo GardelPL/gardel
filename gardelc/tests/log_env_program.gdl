@@ -1,0 +1,38 @@
+-- IO.log and IO.env (Task H.2): reads a variable that is set, one that is not, one whose
+-- value may not be text, and a name no variable can have, logs at two levels, and prints the
+-- value it read. A value is a STRING, so it can be printed.
+program LOG_ENV_PROGRAM
+
+feature {ANY}
+
+  main(args: SEQ[STRING]): IO[EXIT_CODE]
+    do
+      with IO
+        v <- IO.env("GARDEL_TEST_VALUE")
+        u <- IO.env("GARDEL_TEST_UNSET")
+        odd <- IO.env("GARDEL_TEST_ODD")
+        -- Windows keeps each drive's directory as `=C:`; a name with `=` names no variable.
+        hidden <- IO.env("=C:")
+        IO.log(Debug, "program debug")
+        IO.log(Info, "program info")
+        match v
+          case Some(s) then
+            with IO
+              IO.print_line(s)
+              IO.log(Warn, "after the value")
+              IO.exit(match u
+                case Some(_) then 1
+                case None then
+                  match odd
+                    case Some(_) then 3
+                    case None then match hidden case Some(_) then 4 case None then 0 end
+                  end
+              end)
+            end
+          case None then
+            IO.exit(2)
+        end
+      end
+    end
+
+end

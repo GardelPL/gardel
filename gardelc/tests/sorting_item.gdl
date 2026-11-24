@@ -1,0 +1,70 @@
+-- A key with a tag that the order ignores: two items with one key are `equals` and differ
+-- in their tag, so a sort that keeps them in order is stable.
+module ITEM satisfies ORD
+
+representation {ANY}
+  key: NAT
+  tag: NAT
+
+create {ANY}
+
+  make(key: NAT, tag: NAT): ITEM
+    do
+      { key = key, tag = tag }
+    end
+
+feature {ANY}
+
+  equals(other: ITEM): BOOL
+    do
+      Current.key = other.key
+    end
+
+  less_than(other: ITEM): BOOL
+    do
+      Current.key < other.key
+    end
+
+specify {EQ}
+
+  law reflexive(a: ITEM)
+    ensure
+      refl: a.equals(a)
+    end
+
+  law symmetric(a: ITEM, b: ITEM)
+    require
+      ab: a.equals(b)
+    ensure
+      ba: b.equals(a)
+    end
+
+  law transitive(a: ITEM, b: ITEM, c: ITEM)
+    require
+      ab: a.equals(b)
+      bc: b.equals(c)
+    ensure
+      ac: a.equals(c)
+    end
+
+specify {ORD}
+
+  law irreflexive(a: ITEM)
+    ensure
+      not_less_than_self: not a.less_than(a)
+    end
+
+  law transitive(a: ITEM, b: ITEM, c: ITEM)
+    require
+      ab: a.less_than(b)
+      bc: b.less_than(c)
+    ensure
+      ac: a.less_than(c)
+    end
+
+  law total(a: ITEM, b: ITEM)
+    ensure
+      comparable: a.less_than(b) or a.equals(b) or b.less_than(a)
+    end
+
+end

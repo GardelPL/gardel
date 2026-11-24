@@ -186,6 +186,74 @@ create {ANY}
       bounded: Result <= 16
     end
 
+  -- The lowercase hex digits of `n`, most significant first, in front of `rest` (Task H.6).
+  hex_digits(n: NAT, rest: LIST[U64]): LIST[U64]
+    variant
+      n
+    do
+      if n < 16 then
+        rest.prepend(NUMBER_TEXT.hex_digit(n))
+      else
+        NUMBER_TEXT.hex_digits(n / 16, rest.prepend(NUMBER_TEXT.hex_digit(n % 16)))
+      end
+    ensure
+      len: Result.length = rest.length + NUMBER_TEXT.hex_count(n)
+    end
+
+  -- `n` in lowercase hex, with no leading zero and no `0x`.
+  nat_to_hex(n: NAT): STRING
+    do
+      let d = NUMBER_TEXT.hex_digits(n, LIST.empty)
+      check
+        digits_ascii: NUMBER_TEXT.hex_digits_ascii(n, LIST.empty)
+        text: NUMBER_TEXT.ascii_text(d)
+      end
+      match STRING.from_utf8(BYTES.from_list(d))
+        case Ok(s) then s
+        case Error(_) then ""
+      end
+    ensure
+      bytes: Result.byte_model = NUMBER_TEXT.hex_digits(n, LIST.empty)
+    end
+
+  -- Hex digits of either case, any number of them: no sign, no `0x`, leading zeros allowed.
+  parse_hex(s: STRING): RESULT[NUMBER_ERROR, NAT]
+    do
+      let bs = s.to_utf8.to_list
+      if bs.length = 0 then
+        Error(NoDigits)
+      else
+        NUMBER_TEXT.parse_hex_digits(bs, 0, 0)
+      end
+    ensure
+      empty: s.byte_model.length = 0 implies Result = Error(NoDigits)
+      digits: s.byte_model.length > 0 implies
+        Result = NUMBER_TEXT.parse_hex_digits(s.byte_model, 0, 0)
+    end
+
+  -- Reads hex digits `bs` onto `acc`. `offset` is where `bs` starts, for the error.
+  parse_hex_digits(bs: LIST[U64], acc: NAT, offset: NAT): RESULT[NUMBER_ERROR, NAT]
+    require
+      fits: offset <= 18446744073709551615 - bs.length
+    variant
+      bs.length
+    do
+      if bs.length = 0 then
+        Ok(acc)
+      else
+        let v = NUMBER_TEXT.hex_value(bs.head)
+        if v = 16 then
+          Error(NotADigit(offset))
+        else
+          if acc > (18446744073709551615 - v) / 16 then
+            Error(OutOfRange)
+          else
+            NUMBER_TEXT.parse_hex_digits(bs.tail, acc * 16 + v, offset + 1)
+          end
+        end
+      end
+    end
+
   -- Four lowercase hex digits, as in a JSON `\uXXXX` escape.
   hex4_text(n: NAT): BYTES
     require
@@ -251,6 +319,37 @@ create {ANY}
       eight: n < 100000000 implies Result <= 8
       nine: n < 1000000000 implies Result <= 9
       ten: n < 10000000000 implies Result <= 10
+      eleven: n < 100000000000 implies Result <= 11
+      twelve: n < 1000000000000 implies Result <= 12
+      thirteen: n < 10000000000000 implies Result <= 13
+      fourteen: n < 100000000000000 implies Result <= 14
+      fifteen: n < 1000000000000000 implies Result <= 15
+      sixteen: n < 10000000000000000 implies Result <= 16
+      seventeen: n < 100000000000000000 implies Result <= 17
+      eighteen: n < 1000000000000000000 implies Result <= 18
+      nineteen: n < 10000000000000000000 implies Result <= 19
+      twenty: Result <= 20
+    end
+
+  -- How many hex digits `n` has.
+  hex_count(n: NAT): NAT
+    variant
+      n
+    do
+      if n < 16 then 1 else NUMBER_TEXT.hex_count(n / 16) + 1 end
+    ensure
+      positive: Result >= 1
+      small: n > 0 implies Result <= n
+    end
+
+  -- The number `k` followed by the hex digits of `n`.
+  absorb16(n: NAT, k: MATH_INT): MATH_INT
+    variant
+      n
+    do
+      if n < 16 then k * 16 + n else NUMBER_TEXT.absorb16(n / 16, k) * 16 + n % 16 end
+    ensure
+      grows: k >= 0 implies Result >= k
     end
 
   -- The number `k` followed by the digits of `n`.
@@ -353,6 +452,47 @@ create {ANY}
       round_trip: NUMBER_TEXT.parse_i64(NUMBER_TEXT.i64_to_text(i)) = Ok(i)
     end
 
+  hex_digits_ascii(n: NAT, rest: LIST[U64]): BOOL
+    require
+      rest_ascii: NUMBER_TEXT.ascii(rest)
+    variant
+      n
+    do
+      if n < 16 then True else NUMBER_TEXT.hex_digits_ascii(n / 16, rest.prepend(NUMBER_TEXT.hex_digit(n % 16))) end
+    ensure
+      holds: Result
+      ascii: NUMBER_TEXT.ascii(NUMBER_TEXT.hex_digits(n, rest))
+    end
+
+  absorb16_zero(n: NAT): BOOL
+    variant
+      n
+    do
+      if n < 16 then True else NUMBER_TEXT.absorb16_zero(n / 16) end
+    ensure
+      holds: Result
+      is_n: NUMBER_TEXT.absorb16(n, 0) = n
+    end
+
+  -- Parsing the hex digits of `n` adds them to the number read so far.
+  parse_hex_step(n: NAT, rest: LIST[U64], k: NAT, offset: NAT): BOOL
+    require
+      small: NUMBER_TEXT.absorb16(n, k) <= 18446744073709551615
+      fits: offset <= 18446744073709551615 - NUMBER_TEXT.hex_digits(n, rest).length
+    variant
+      n
+    do
+      if n < 16 then
+        True
+      else
+        NUMBER_TEXT.parse_hex_step(n / 16, rest.prepend(NUMBER_TEXT.hex_digit(n % 16)), k, offset)
+      end
+    ensure
+      holds: Result
+      parsed: NUMBER_TEXT.parse_hex_digits(NUMBER_TEXT.hex_digits(n, rest), k, offset) =
+        NUMBER_TEXT.parse_hex_digits(rest, NUMBER_TEXT.absorb16(n, k), offset + NUMBER_TEXT.hex_count(n))
+    end
+
   absorb_zero(n: NAT): BOOL
     variant
       n
@@ -396,6 +536,16 @@ create {ANY}
 
 specify {ANY}
 
+  -- One step of `ascii` (Task H.6), as `BYTES.octets_prepend` is for `all_octets`.
+  law ascii_prepend(x: U64, xs: LIST[U64])
+    trigger
+      NUMBER_TEXT.ascii(xs.prepend(x))
+    do
+      xs.prepend(x).tail = xs
+    ensure
+      step: NUMBER_TEXT.ascii(xs.prepend(x)) = (x < 128 and NUMBER_TEXT.ascii(xs))
+    end
+
   -- One step of `digits`, for a client proving what the digits of a number are (`gjson`).
   -- It has no trigger, as a step names the digits of `n / 10`, and so on without end: a
   -- client states it where it needs it, as `check NUMBER_TEXT.digits_step(n, rest) end`.
@@ -430,6 +580,18 @@ specify {ANY}
       end
     ensure
       round_trip: NUMBER_TEXT.parse_i64(NUMBER_TEXT.i64_to_text(i)) = Ok(i)
+    end
+
+  -- The hex text of a number reads back as that number (Task H.6).
+  law hex_round_trip(n: NAT)
+    trigger
+      NUMBER_TEXT.parse_hex(NUMBER_TEXT.nat_to_hex(n))
+    do
+      NUMBER_TEXT.absorb16_zero(n) and
+      NUMBER_TEXT.parse_hex_step(n, LIST.empty, 0, 0) and
+      NUMBER_TEXT.nat_to_hex(n).byte_model.length > 0
+    ensure
+      round_trip: NUMBER_TEXT.parse_hex(NUMBER_TEXT.nat_to_hex(n)) = Ok(n)
     end
 
   law hex4_round_trip(n: NAT)

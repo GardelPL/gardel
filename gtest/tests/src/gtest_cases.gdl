@@ -1,0 +1,42 @@
+-- `CASES` driving a program from `tests/cases.txt`, which `gardelc test` sends on standard
+-- input: each input must come back in capitals.
+program GTEST_CASES
+
+feature {ANY}
+
+  finish(rs: LIST[TEST_RESULT]): IO[EXIT_CODE]
+    do
+      let ordered = LIST_OPS.reverse(rs)
+      with IO
+        IO.print_line(TESTS.report(ordered))
+        IO.exit(TESTS.exit_code(ordered))
+      end
+    end
+
+  run_cases(n: NAT, rs: LIST[TEST_RESULT]): IO[EXIT_CODE]
+    require
+      bounded: n <= 100000
+    variant
+      100000 - n
+    do
+      with IO
+        line_res <- IO.read_line
+        match line_res
+          case Ok(line) then
+            if n < 100000 then
+              run_cases(n + 1, CASES.check(rs, n, line, fn(i: STRING): STRING do TEXT_FORMAT.to_upper(CASES.text(i)) end))
+            else
+              finish(rs)
+            end
+          case Error(_) then
+            finish(rs)
+        end
+      end
+    end
+
+  main(args: SEQ[STRING]): IO[EXIT_CODE]
+    do
+      run_cases(1, LIST.empty)
+    end
+
+end

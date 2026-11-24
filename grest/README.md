@@ -49,7 +49,12 @@ end
 
 `REST_SERVER.start` listens on the port its first argument names, or on `8090` when there is
 none. A route whose pattern is not valid, or an argument that is not a port, stops the program
-with exit status 2 and a message, before it listens.
+with exit status 2 and a message, before it listens. `REST_SERVER.start_from(port, 8090, router,
+STORE.empty)` takes the port as an `OPTION[STRING]` instead, for one read at run time, as
+`examples/todo_api` reads `TODO_API_PORT` with `ReadEnv`.
+
+Each request is logged at `Info` on standard error when its bytes are complete, as
+`info: GET /todos/1`; `GARDEL_LOG_LEVEL=warn` turns the lines off.
 [`examples/todo_api`](../examples/todo_api) is a service with a state, and
 [`examples/hello_api`](../examples/hello_api) one of four routes whose handlers do not look at
 it, so its state is a `NAT` that stays `0`. [`examples/api_gateway`](../examples/api_gateway)
@@ -83,7 +88,7 @@ gjson = { path = "../gjson" }
 | `REST_ROUTE[S]` | A method, a pattern and a handler, `(s: S, r: REST_REQUEST) -> REST_OUTCOME[S]`. `plain`, `viewing` and `with_json` make one from a handler of another shape. |
 | `REST_OUTCOME[S]` | What a handler gives back: the next `state` and the `response`; or, from `waiting(s, tag, cmds, sweeps, late)`, a request that waits for its answer, with the commands that start the work, its tag, its timeout in sweeps (1 to 30), and the answer sent when the time runs out. |
 | `REST_WAKE[S]` | What a service gives back for an event that is not the server's own: the next state, commands, and perhaps an answer to a waiting request by its tag (`answering`). `unknown` is the handler of a service that waits for nothing. |
-| `REST_WAITING`, `REST_WAIT`, `REST_WAIT_SWEEP` | The requests that wait, at most 32, each with its connection, tag and timeout, and what a sweep keeps and times out. |
+| `REST_WAITING`, `REST_WAIT` | The requests that wait, at most 32, in a `MAP` by tag, each with its connection and timeout, and what a sweep keeps and times out. |
 | `REST_REPLIES[S]` | The answers to a batch of requests on one connection, the state after them, and the request held to wait, if one is. |
 | `REST_COMMANDS` | The commands a server step may give (`for_conn`, `for_none`, `shaped`), and what `start` reads from its arguments. They do not depend on the state, so they are apart from the generic server. |
 | `REST_REQUEST` | What a handler sees: `method`, `param` and `param_nat` (path parameters), `query`, `header` (ignoring the case of the name), `body`, `json_body`, and the `http` request itself. |
@@ -180,7 +185,10 @@ empty one, so it does not match `/users`. Patterns are written decoded.
     `Shutdown` stops the server.
 - **Waiting requests.** At most 32 wait, each with a count of sweeps below its limit, of at
   most 30; a request waits only under the tag offered to it, which is offered only when there is
-  room; each sweep counts itself on every wait it keeps and answers the others late, so no wait
+  room and no request waits under it; tags are given in turn; a request that waits takes the place
+  of an earlier wait on its connection; every other wait stays when one is held, answered or
+  dropped; each
+  sweep counts itself on every wait it keeps and answers the others late, so no wait
   outlives its limit while the sweep is armed; a connection that closes or fails frees its wait;
   and an answer under a tag that no request waits under reaches none of the server's connections.
 
@@ -227,7 +235,7 @@ answer), and what it must give:
 
 ```text
 gardelc --project grest/tests --strict
-grest/tests/build/grest_test_bin.exe < grest/tests/cases.txt
+grest/tests/build/grest_test_bin < grest/tests/cases.txt
 ```
 
 Exit code 0 means every case holds. `cargo test --test grest` does both.

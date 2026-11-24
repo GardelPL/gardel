@@ -1,11 +1,10 @@
 //! `gjson` (Task F.4): the package verifies, every case of `gjson/tests/cases.txt` holds in C,
-//! and a client proves the round trip of scalars through the law alone. Also the compiler
+//! run by `gardelc test` (Task H.9), and a client proves the round trip of scalars through the law alone. Also the compiler
 //! changes F.4 needed: a field of a machine number type is in range.
 
 use std::fs;
-use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output, Stdio};
+use std::process::{Command, Output};
 
 fn root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("..")
@@ -68,25 +67,23 @@ fn assert_refused(out: &Output, text: &str) {
     assert!(all(out).contains(text), "must say {text}:\n{}", all(out));
 }
 
-/// The package and its test package verify, and the test program accepts every case. The
-/// cases include 64 levels of nesting, 200,000 items, 300,000 bytes of text and 3,000 fields in
-/// descending order, so they also show that long arrays and strings take no stack.
+/// The package and its test package verify, and `gardelc test` runs the test program, which
+/// accepts every case. The cases include 64 levels of nesting, 200,000 items, 300,000 bytes of
+/// text and 3,000 fields in descending order, so they also show that long arrays and strings
+/// take no stack.
 #[test]
 fn gjson_verifies_and_holds_every_case() {
     let cache = std::env::temp_dir().join(format!("gardelc_gjson_{}_cache", std::process::id()));
     drop(fs::remove_dir_all(&cache));
-    assert_ok(&check_at(&root().join("gjson"), &cache));
-    let tests = root().join("gjson/tests");
-    assert_ok(&check_at(&tests, &cache));
-    let cases = fs::read(tests.join("cases.txt")).expect("cases.txt");
-    let mut run = Command::new(tests.join("build/gjson_test_bin.exe"))
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .spawn()
-        .expect("the suite starts");
-    run.stdin.take().expect("stdin").write_all(&cases).expect("cases are sent");
-    let done = run.wait_with_output().expect("the suite ends");
-    assert!(done.status.success(), "exit {:?}, failing case: {}", done.status.code(), String::from_utf8_lossy(&done.stdout));
+    let out = Command::new(env!("CARGO_BIN_EXE_gardelc"))
+        .env("GARDEL_CACHE_DIR", &cache)
+        .args(["test"])
+        .arg(root().join("gjson"))
+        .output()
+        .expect("gardelc runs");
+    assert!(out.status.success(), "{}", all(&out));
+    assert!(all(&out).contains("[test] GJSON_TEST ... ok"), "{}", all(&out));
+    assert!(all(&out).contains("1 program: 1 passed, 0 failed"), "{}", all(&out));
     drop(fs::remove_dir_all(&cache));
 }
 
@@ -134,6 +131,86 @@ fn a_lie_about_the_round_trip_does_not_verify() {
         ("refused", "f(b: BOOL): BOOL\n    do\n      True\n    ensure\n      claim: JSON.parse(JSON.bool(b).to_bytes).is_error\n    end\n"),
         // The law needs the text to fit: a string of any length is not covered.
         ("any_length", "f(s: STRING): BOOL\n    do\n      True\n    ensure\n      claim: JSON.parse(JSON.string(s).to_bytes) = Ok(JSON.string(s))\n    end\n"),
+    ];
+    for (name, routine) in lies {
+        let p = Project::new(&format!("lie_{name}"), &[("client.gdl", &client(&format!("  {routine}")))], true);
+        assert_refused(&p.check(), "claim");
+    }
+}
+
+/// `JSON_ARRAY.of` is `with_item` for each value, and `with_first`'s laws reach a client.
+#[test]
+fn a_client_proves_facts_about_arrays() {
+    let facts = client(
+        "  none: BOOL
+    do
+      True
+    ensure
+      empty: JSON_ARRAY.of(LIST.empty) = Some(JSON.empty_array)
+    end
+
+  each(vs: LIST[JSON]): BOOL
+    do
+      True
+    ensure
+      same: JSON_ARRAY.of(vs) = JSON_ARRAY.appended(JSON.empty_array, vs)
+    end
+
+  one(v: JSON): BOOL
+    require
+      fits: JSON.empty_array.with_item(v).is_some
+    do
+      True
+    ensure
+      made: JSON_ARRAY.of(LIST.empty.prepend(v)) = JSON.empty_array.with_item(v)
+      first: JSON.empty_array.with_first(v) = JSON.empty_array.with_item(v)
+    end
+
+  ends(a: JSON, v: JSON, w: JSON, b: JSON, c: JSON): BOOL
+    require
+      first: a.with_first(v) = Some(b)
+      last: a.with_item(w) = Some(c)
+    do
+      True
+    ensure
+      same: b.with_item(w) = c.with_first(v)
+    end
+",
+    );
+    assert_ok(&Project::new("arrays", &[("client.gdl", &facts)], true).check());
+}
+
+#[test]
+fn a_lie_about_arrays_does_not_verify() {
+    let lies = [
+        ("ends_agree", "f(a: JSON, v: JSON): BOOL
+    do
+      True
+    ensure
+      claim: a.with_first(v) = a.with_item(v)
+    end
+"),
+        ("first_dropped", "f(vs: LIST[JSON], v: JSON): BOOL
+    do
+      True
+    ensure
+      claim: JSON_ARRAY.of(vs.prepend(v)) = JSON_ARRAY.of(vs)
+    end
+"),
+        ("always_fits", "f(vs: LIST[JSON]): BOOL
+    do
+      True
+    ensure
+      claim: JSON_ARRAY.of(vs).is_some
+    end
+"),
+        ("either_order", "f(a: JSON, v: JSON, w: JSON): BOOL
+    do
+      True
+    ensure
+      claim: JSON_ARRAY.of(LIST.empty.prepend(v).prepend(w)) = JSON_ARRAY.of(LIST.empty.prepend(w).prepend(v))
+    end
+"),
     ];
     for (name, routine) in lies {
         let p = Project::new(&format!("lie_{name}"), &[("client.gdl", &client(&format!("  {routine}")))], true);
