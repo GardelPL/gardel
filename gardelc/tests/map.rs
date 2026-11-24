@@ -129,6 +129,122 @@ fn a_lie_about_a_map_does_not_verify() {
     }
 }
 
+/// `filter`, `map`, and what `keys` and `values` say of `get` (H.4). With `STRING` keys, for
+/// which `agrees` does not prove, the laws that do not need it still hold.
+#[test]
+fn a_client_proves_facts_about_filter_and_map() {
+    let facts = client(
+        "  big(m: MAP[NAT, NAT]): MAP[NAT, NAT]
+    do
+      m.filter(fn(k: NAT, v: NAT): BOOL do v > 10 end)
+    ensure
+      not_more: Result.size <= m.size
+    end
+
+  kept(m: MAP[NAT, NAT], k: NAT): BOOL
+    require
+      present: m.has(k)
+      large: m.get(k).get > 10
+    do
+      True
+    ensure
+      same: m.filter(fn(i: NAT, v: NAT): BOOL do v > 10 end).get(k) = m.get(k)
+    end
+
+  small(m: MAP[NAT, NAT], k: NAT): BOOL
+    require
+      present: m.has(k)
+      small: m.get(k).get <= 10
+    do
+      check
+        agrees: forall a: NAT. forall b: NAT. a.equals(b) = (a = b)
+      end
+      True
+    ensure
+      gone: m.filter(fn(i: NAT, v: NAT): BOOL do v > 10 end).get(k) = None
+    end
+
+  by_key(m: MAP[NAT, NAT], k: NAT): BOOL
+    require
+      low: k < 5
+      present: m.has(k)
+    do
+      check
+        agrees: forall a: NAT. forall b: NAT. a.equals(b) = (a = b)
+      end
+      True
+    ensure
+      gone: m.filter(fn(i: NAT, v: NAT): BOOL do i >= 5 end).get(k) = None
+    end
+
+  texts(m: MAP[STRING, NAT], k: STRING): BOOL
+    require
+      present: m.filter(fn(i: STRING, v: NAT): BOOL do v > 10 end).has(k)
+    do
+      True
+    ensure
+      large: m.filter(fn(i: STRING, v: NAT): BOOL do v > 10 end).get(k).get > 10
+    end
+
+  halves(m: MAP[NAT, NAT]): BOOL
+    do
+      True
+    ensure
+      all: m.filter(fn(i: NAT, v: NAT): BOOL do v > 10 end).size + m.filter(fn(i: NAT, v: NAT): BOOL do not (v > 10) end).size = m.size
+    end
+
+  ages(m: MAP[NAT, NAT], k: NAT): MAP[NAT, BOOL]
+    do
+      m.map(fn(i: NAT, v: NAT): BOOL do v > 10 end)
+    ensure
+      same: Result.size = m.size
+      at: m.get(k) = Some(12) implies Result.get(k) = Some(True)
+      none: m.get(k) = None implies Result.get(k) = None
+    end
+
+  keys_there(m: MAP[STRING, NAT]): BOOL
+    require
+      some: m.size > 0
+    do
+      True
+    ensure
+      present: m.has(LIST_OPS.at(m.keys, 0))
+    end
+
+  values_there(m: MAP[NAT, NAT], i: NAT): BOOL
+    require
+      inside: i < m.size
+    do
+      check
+        agrees: forall a: NAT. forall b: NAT. a.equals(b) = (a = b)
+      end
+      True
+    ensure
+      found: m.get(LIST_OPS.at(m.keys, i)) = Some(LIST_OPS.at(m.values, i))
+    end
+",
+    );
+    assert_ok(&Project::new("filter_facts", &[("client.gdl", &facts)]).check());
+}
+
+#[test]
+fn a_lie_about_filter_or_map_does_not_verify() {
+    let lies = [
+        ("kept_all", "f(m: MAP[NAT, NAT], k: NAT): BOOL\n    require\n      present: m.has(k)\n    do\n      check\n        agrees: forall a: NAT. forall b: NAT. a.equals(b) = (a = b)\n      end\n      True\n    ensure\n      claim: m.filter(fn(i: NAT, v: NAT): BOOL do v > 10 end).get(k) = m.get(k)\n    end\n"),
+        ("kept_none", "f(m: MAP[NAT, NAT], k: NAT): BOOL\n    require\n      present: m.has(k)\n    do\n      check\n        agrees: forall a: NAT. forall b: NAT. a.equals(b) = (a = b)\n      end\n      True\n    ensure\n      claim: m.filter(fn(i: NAT, v: NAT): BOOL do v > 10 end).get(k) = None\n    end\n"),
+        ("kept_small", "f(m: MAP[NAT, NAT], k: NAT): BOOL\n    require\n      present: m.filter(fn(i: NAT, v: NAT): BOOL do v > 10 end).has(k)\n    do\n      check\n        agrees: forall a: NAT. forall b: NAT. a.equals(b) = (a = b)\n      end\n      True\n    ensure\n      claim: m.filter(fn(i: NAT, v: NAT): BOOL do v > 10 end).get(k).get > 11\n    end\n"),
+        ("kept_text", "f(m: MAP[STRING, NAT], k: STRING): BOOL\n    require\n      present: m.has(k)\n      small: m.get(k).get <= 10\n    do\n      True\n    ensure\n      claim: m.filter(fn(i: STRING, v: NAT): BOOL do v > 10 end).get(k) = None\n    end\n"),
+        ("parts_overlap", "f(m: MAP[NAT, NAT]): BOOL\n    do\n      check\n        agrees: forall a: NAT. forall b: NAT. a.equals(b) = (a = b)\n      end\n      True\n    ensure\n      claim: m.filter(fn(i: NAT, v: NAT): BOOL do v > 10 end).size + m.filter(fn(i: NAT, v: NAT): BOOL do v > 5 end).size = m.size\n    end\n"),
+        ("mapped_other", "f(m: MAP[NAT, NAT]): BOOL\n    require\n      there: m.get(1) = Some(12)\n    do\n      check\n        agrees: forall a: NAT. forall b: NAT. a.equals(b) = (a = b)\n      end\n      True\n    ensure\n      claim: m.map(fn(i: NAT, v: NAT): BOOL do v > 10 end).get(1) = Some(False)\n    end\n"),
+        ("mapped_more", "f(m: MAP[NAT, NAT]): BOOL\n    do\n      check\n        agrees: forall a: NAT. forall b: NAT. a.equals(b) = (a = b)\n      end\n      True\n    ensure\n      claim: m.map(fn(i: NAT, v: NAT): BOOL do v > 10 end).size > m.size\n    end\n"),
+        ("value_elsewhere", "f(m: MAP[NAT, NAT]): BOOL\n    require\n      two: m.size >= 2\n    do\n      check\n        agrees: forall a: NAT. forall b: NAT. a.equals(b) = (a = b)\n      end\n      True\n    ensure\n      claim: m.get(LIST_OPS.at(m.keys, 0)) = Some(LIST_OPS.at(m.values, 1))\n    end\n"),
+    ];
+    for (name, routine) in lies {
+        let p = Project::new(&format!("lie_{name}"), &[("client.gdl", &client(&format!("  {routine}")))]);
+        assert_refused(&p.check(), "claim");
+    }
+}
+
 /// `K` is bounded by `ORD`, at each use: `BYTES` and a module of the client's are not ordered.
 #[test]
 fn a_key_must_be_ordered() {
@@ -150,7 +266,7 @@ fn the_map_runs_in_c_and_frees_what_it_allocates() {
     let text = String::from_utf8(out.stdout).expect("UTF-8 output").replace("\r\n", "\n");
     assert_eq!(
         text,
-        "3 | apple,kiwi,pear | 10 | none | 4 | 17 | apple | TEN | twenty | none | TEN,twenty,thirty\n"
+        "3 | apple,kiwi,pear | 10 | none | 4 | 17 | apple | TEN | twenty | none | TEN,twenty,thirty | kiwi,pear | 2 | TEN!,thirty! | 9,4,3\n"
     );
 
     let c = fs::read_to_string(p.dir.join("build").join("main.c")).expect("the C file");
@@ -171,5 +287,5 @@ fn the_map_runs_in_c_and_frees_what_it_allocates() {
     assert!(built.status.success(), "{}", String::from_utf8_lossy(&built.stderr));
     let counted = Command::new(&exe).output().expect("the harness runs");
     let counts = String::from_utf8_lossy(&counted.stdout).trim().to_string();
-    assert_eq!(counts, "0 0 4590", "live blocks after one call and after 51, then the lengths' sum");
+    assert_eq!(counts, "0 0 6579", "live blocks after one call and after 51, then the lengths' sum");
 }

@@ -518,6 +518,28 @@ Other laws count the keys:
 
 `fold_put_last` says that a new key above every key is the last a fold meets: `m.put(k, v).fold(init, f) = f(m.fold(init, f), k, v)` when `not m.has(k)` and `m.size = 0 or LIST_OPS.at(m.keys, m.size - 1) < k`. `keys_put_last` says that `k` is then the last key, so a chain of `put`s in order can be folded step by step.
 
+`m.filter(fn(k: K, v: V): BOOL do ... end)` keeps the entries the function holds for, and `m.map(fn(k: K, v: V): W do ... end)` gives a map with the same keys and the function's values:
+
+```eiffel
+large(m: MAP[NAT, NAT], k: NAT): BOOL
+  require
+    present: m.has(k)
+    small: m.get(k).get <= 10
+  do
+    check
+      agrees: forall a: NAT. forall b: NAT. a.equals(b) = (a = b)
+    end
+    True
+  ensure
+    gone: m.filter(fn(i: NAT, v: NAT): BOOL do v > 10 end).get(k) = None
+  end
+```
+
+- `get_filter_kept`, `get_filter_holds` and `get_filter_absent` need no `agrees`, so they hold for `STRING` keys too. The first two need a function that cannot tell equal keys apart (`respects`), as one that looks at the value alone. `get_filter_dropped`, as above, needs `agrees`.
+- `size_filter_parts`: the sizes of two filters add up to `m.size` when one function holds where the other does not.
+- `get_map`: `m.map(f).get(k)` is `Some(f(k, v))` when `m.get(k) = Some(v)`, and `None` when `m` has no `k`. It needs `respects`.
+- `keys_present`: the map has each of its `keys`. `values_at`: the value of the key at place `i` of `keys` is at place `i` of `values`. It needs `agrees`.
+
 To change between `NAT` and `I64`, use `NAT.from_i64(i)`, which needs `i >= 0`, and `I64.from_nat(n)`, which needs `n <= 9223372036854775807`. Both are proof obligations (`in_range`), not run-time checks.
 
 ---

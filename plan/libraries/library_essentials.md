@@ -641,15 +641,29 @@ Client: `MAP.keys` consumers, `gtui` list views, `gtime` tables. Needs decision 
 
 #### Task H.4: `SET`, `QUEUE`, `HEAP` and `MAP` Laws
 
-**Status:** 🟡 In part (2026-11-24): `MAP`'s laws, `SET`, `QUEUE` and `HEAP`. `HASH_MAP` and the balanced `MAP` are open.
+**Status:** ✅ Done (2026-11-24), but for `HASH_MAP`, which waits for a client and H.0a.
 
 Client: `grest`'s waiting table, which F.8 built as a list because `MAP` had no size law; the rate limiter (H.16); timers in `gtui`.
 
 - [x] `MAP`: laws for `size` after `put` and `remove`, and a law relating `fold` to `put`.
   - `put` of a new key adds one, `remove` of an absent key none, and both have a bound that needs no premise. The exact size for a key that is there needs `agrees`: `ORD` alone allows a key equal to `k` to sit above a key that `k` is below, where `put` inserts a second one.
   - `fold_put_last` relates `fold` to the `put` of a new key above every key, where it holds for any function. `keys_put_last` gives the premise of the next `put`. They are stated with `LIST_OPS.at`, which is built in: with `LIST_OPS.last`, a `MAP` client that names no `LIST_OPS` routine did not translate.
-- [ ] Move F.8's waiting table to `MAP`. Not tried. It drops waits by connection and by timeout, so it needs a `MAP.filter` with laws, which `MAP` does not have. The table holds at most 32 waits.
-- [ ] `MAP` as a balanced tree, only if a benchmark of `todo_api` with 10,000 todos calls for it (F decision 4). The laws are on the abstract model, so no contract changes.
+- [x] Move F.8's waiting table to `MAP` (`grest` 0.8.0). The proofs allow it.
+  - `MAP` gained `filter` and `map`, with laws. The keys are the tags. `taking` is `remove`, `dropping` is a `filter`, and a sweep is a `filter` and a `map`. `REST_WAIT_SWEEP` is gone, and `REST_SERVER` changes in two lines.
+  - The invariant `tagged` says that each wait is under its own tag. `offered` is `None` also when a request waits under the next tag, so tags are unique, which F.8 left unproven.
+  - New laws, which the list did not have: `holding_keeps`, `taking_keeps`, `dropping_keeps`, `swept_kept`, `swept_gone` and `expired_out_of_time`.
+  - The laws of `filter` and `map` see the key that the map keeps, which is `equals` to the one asked for and may not be `=` to it. `respects` asks that the function cannot tell the two apart, and a function of the value alone never can. Only "an entry the function does not hold for is gone" needs `agrees`, as an equal key could sit further on.
+  - `waits_on` is a `filter` that is not empty. That no wait is left after `dropping` needed `keys_present`: a map that is not empty has its first key.
+  - Mutations, 13, all refused: a tag offered while in use, or when the table is full; a held wait that drops the others, or is under another tag; `taking` and `dropping` that do nothing, or drop all; a sweep that keeps the late, or does not age; `expired` giving all; the same tag given again; and 33 waits.
+- [x] `MAP` as a balanced tree, only if a benchmark of `todo_api` with 10,000 todos calls for it (F decision 4). The laws are on the abstract model, so no contract changes. Measured (2026-11-24), and it does not call for it:
+
+  | Todos | `GET` of the last | `POST` of one more | `PUT` of the last | `GET` of all |
+  | :--- | :--- | :--- | :--- | :--- |
+  | 100 | 0.07 ms | 0.10 ms | 0.08 ms | 1.2 ms |
+  | 1,000 | 0.09 ms | 0.16 ms | 0.17 ms | 43 ms |
+  | 10,000 | 0.31 ms | 1.3 ms | 1.4 ms | 4.9 s, a `500` |
+
+  Means over a keep-alive socket on one machine, each from one run: 300 requests for the `GET` and the `PUT` of one todo, 90 for `POST`, 5 for all. A request on one todo costs the key walk and the copy of the lists, which is linear as expected. `GET` of all is what does not scale: it grows with the square of the number of todos, and past 64 KiB it is the `500` that the example's README documents. A balanced tree would not change that. Its cause was not looked for; the walk of `MAP` is not it, as `values` gives the list as it is.
 - [x] `module SET[K: ORD]` over `KEY_ORDER` directly: `has`, `add`, `remove`, `union`, `intersection`, `size`, with laws on `has`.
 - [x] `module QUEUE[A]`: two lists, amortized constant time, model `LIST[A]` (`items`). `push` asks for room, since `size` adds two lengths.
 - [x] `module HEAP[K: ORD]` on `ARRAY`: `push`, `pop_min`, `peek`. Proven: `peek` is at most every item, and `pop_min` removes one item.
@@ -667,7 +681,9 @@ Client: `grest`'s waiting table, which F.8 built as a list because `MAP` had no 
 
 **Benchmark.** 100,000 pushes and pops on a heap, and as many on a queue: 37 s before the change to records, 0.2 s after.
 
-**Totals, H.4.** All 548 tests pass: the 235 unit tests and 313 in 47 suites (the `gtui` frame-time test run alone). The stdlib is 0/0 (37 modules). Run on Windows only.
+**Totals, H.4, first part.** All 548 tests pass: the 235 unit tests and 313 in 47 suites (the `gtui` frame-time test run alone). The stdlib is 0/0 (37 modules). Run on Windows only.
+
+**Totals, H.4, with `MAP.filter` and the waiting table.** All 550 tests pass: the 235 unit tests and 315 in 47 suites (the `gtui` frame-time test run alone). The stdlib is 0/0 (37 modules). Run on Windows only.
 
 **Known limits.**
 - `sum_last`, a client's proof that a fold with `+%` grows by the value put last, runs out of resources. With wrapping addition left uninterpreted it verifies in a second, so the cost is the bit-vector encoding of `+%`, not the law.

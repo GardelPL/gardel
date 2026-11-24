@@ -668,6 +668,8 @@ fn an_async_handler_waits_for_its_answer() {
         events.push(format!("Accepted:{c}"));
         events.push(format!("Received:{c}:{}", get("/up")));
     }
+    // Their time runs out on one sweep: each is answered late, the oldest first.
+    events.push(sweeps(6));
     let run = run_service(&relay, &["9005"], &events.join(" "));
     assert_eq!(run.status.code(), Some(0), "{}", all(&run));
     let mut expected: Vec<String> = [
@@ -700,6 +702,9 @@ fn an_async_handler_waits_for_its_answer() {
     .collect();
     expected.extend((6..38).map(|t| format!("Connect {t} 127%2E0%2E0%2E1 9999")));
     expected.push("Send 42 503 {\"error\":\"busy\"}".to_string());
+    // The idle connections are swept first.
+    expected.extend(["Close 42", "Close 2", "Close 1"].map(|s| s.to_string()));
+    expected.extend((10..42).map(|c| format!("Send {c} 504 {{\"error\":\"timed out\"}}")));
     let got = answers(&run);
     assert_eq!(got, expected, "{}", got.join("\n"));
 }

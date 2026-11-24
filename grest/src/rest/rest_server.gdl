@@ -582,8 +582,7 @@ feature {ANY}
   on_sweep: STEP[REST_SERVER[S]]
     do
       let sw = Current.conns.sweep
-      let ws = Current.queue.sweep
-      match Current.with_conns_waits(Current.conns.with_kept(sw), Current.queue.with_kept(ws)).lates(ws.expired)
+      match Current.with_conns_waits(Current.conns.with_kept(sw), Current.queue.swept).lates(Current.queue.expired)
         case Continue(n, cs) then Continue(n, REST_COMMANDS.closing_all(sw.closed, cs))
         case Stop(x, cs) then Stop(x, cs)
       end
