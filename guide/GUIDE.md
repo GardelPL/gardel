@@ -2082,6 +2082,9 @@ Two limits:
 | `SORTING.merge(xs, ys)` | The items of both, in order when both are |
 | `SORTING.sorted(xs)` | Whether each item is at most the next, by `less_or_equal` |
 | `SORTING.count(xs, x)` | How many items are `x` itself. It is ghost: contracts only |
+| `SORTING.sort_array(a)` | The items of the `ARRAY` `a` in order, with `sort`'s contract on `a.to_list` |
+| `SORTING.lower_bound(a, k)` | In a sorted array, the first position whose item is not below `k` |
+| `SORTING.binary_search(a, k)` | In a sorted array, `Some` position of `k`, or `None` |
 
 `sort`'s contract has three parts:
 - `ordered`: `SORTING.sorted(Result)`.
@@ -2109,12 +2112,34 @@ The law `first_least(xs, j)` says that the first item of a sorted list is at mos
 
 The sort is stable: items that are `equals` but differ keep their order. A module that orders records by a key, as `less_than` on `Current.key < other.key`, gets them back in the order they came. This is tested, not proven (see the limits below).
 
-In C, every step of the sort is a loop, so a list of millions of items cannot exhaust the stack. The two halves of each split are independent `let`s, so they run as parallel tasks. Each step builds new list cells, so a million `U64`s take about 2 s, against 0.13 s for C's `qsort` on an array. A sort that changes an `ARRAY` in place, `sort_array`, is still to come.
+In C, every step of the sort is a loop, so a list of millions of items cannot exhaust the stack. The two halves of each split are independent `let`s, so they run as parallel tasks. Each step builds new list cells, so a million `U64`s take about 2.7 s.
+
+`sort_array` is the same merge sort on an `ARRAY`, and stable too. Each half is copied out with `slice` and sorted as a parallel task. The two sorted halves are then merged into a new array, which the merge loop fills with `set` in place. Its contract is `sort`'s, stated on `Result.to_list` and `a.to_list`. A program that fills and sorts a million `U64`s takes 0.68 s on one thread and 0.22 s on twenty, against 2.7 s with `sort` on a list. C's `qsort` on a plain array takes about 0.16 s in the same conditions.
+
+`lower_bound` and `binary_search` search a sorted array in about log2(n) steps. Like `first_least`, they ask for the premise `agrees`, which a client states once in a `check`:
+
+```eiffel
+  position(a: ARRAY[NAT], k: NAT): NAT
+    require
+      ordered: SORTING.sorted(a.to_list)
+    do
+      check
+        nat_agrees: forall p: NAT. forall q: NAT. p.equals(q) = (p = q)
+      end
+      match SORTING.binary_search(a, k)
+        case Some(i) then i
+        case None then a.length
+      end
+    end
+```
+
+`lower_bound`'s contract says that every item before the position it gives is below `k`, and that no item from it on is. `binary_search`'s says that what it finds is `k`, and that when it gives `None` no item of the array is `k`.
 
 Limits:
 - Stability is tested, not proven. For a key whose `equals` is not `=`, the proof needs `equals` and `less_than` to agree (`a.equals(b) and b.less_than(c) implies a.less_than(c)`). As a premise that quantifies over three values, the solver cannot use it.
 - There is no `sort` for `SEQ`: a client cannot see how a `SEQ`'s model unfolds. Sort its items as a list, such as the one `s.fold_right` builds with `prepend`.
-- `binary_search` and `sort_array` on an `ARRAY` are still to come.
+- `sort_array` is not in place. It copies each half, about n log2(n) items moved in all, and allocates about 2n arrays.
+- A search needs `agrees`, and for `STRING` it does not hold: `equals` compares the bytes, and two strings with the same bytes are not known to be `=`. A client cannot prove the premise, so an array of strings can be sorted but not searched.
 
 ### Arrays: `ARRAY`
 

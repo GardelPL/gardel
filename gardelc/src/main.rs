@@ -6558,6 +6558,9 @@ impl BoogiePreludeCtx {
         // (Task H.3).
         if wanted.contains("SORTING") || m.name == "SORTING" {
             wanted.insert("LIST_OPS");
+            // `sort_array` and `binary_search` (Task H.3, after H.5).
+            wanted.insert("ARRAY");
+            wanted.insert("OPTION");
         }
         // `ARRAY.set` states its result with `LIST_OPS.update` (Task H.5).
         if wanted.contains("ARRAY") || m.name == "ARRAY" {

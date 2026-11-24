@@ -2740,7 +2740,7 @@ static struct {inst}* {inst}__slice(struct {inst}* a, uint64_t lo, uint64_t hi) 
                         || (self.module(v).is_none() && self.ctor_owner(v, None, cx).is_some());
                     if !is_value {
                         cx.tail_site = tail;
-                        return self.lower_static(cx, v, m, args, expect, hc);
+                        return self.lower_static(cx, v, m, args, expect, hc, moves, param_moves);
                     }
                 }
                 // `a.set(i, x)` on a local nothing after it uses: the `set` may take the
@@ -3056,7 +3056,21 @@ static struct {inst}* {inst}__slice(struct {inst}* a, uint64_t lo, uint64_t hi) 
     }
 
     /// `T.r(args)` where `T` names a type or a runtime facility rather than a value.
-    fn lower_static(&mut self, cx: &mut Ctx, v: &str, m: &str, args: &[Expr], expect: Option<&str>, hc: bool) -> Lowered {
+    /// `moves` and `param_moves` are the caller's (Task H.3): a routine called by its module's
+    /// name, as `SORTING.merge_into(x, y, out, 0, 0)`, may take an array as a plain call does.
+    /// Only the calls of routines get them, not the primitives' arguments.
+    #[allow(clippy::too_many_arguments)]
+    fn lower_static(
+        &mut self,
+        cx: &mut Ctx,
+        v: &str,
+        m: &str,
+        args: &[Expr],
+        expect: Option<&str>,
+        hc: bool,
+        moves: Vec<String>,
+        param_moves: Vec<String>,
+    ) -> Lowered {
         match (v, m, args.len()) {
             ("IO", "print", 1) | ("IO", "print_line", 1) => {
                 let a = self.lower(cx, &args[0], Some("STRING"), hc)?;
@@ -3145,7 +3159,11 @@ static struct {inst}* {inst}__slice(struct {inst}* a, uint64_t lo, uint64_t hi) 
                 // Not a primitive: a routine with no `Current` compiles from its verified source.
                 let md = self.module(v).ok_or_else(|| format!("unknown name `{v}`"))?;
                 return match Self::find_routine(md, m) {
-                    Some((_, kind)) if kind == "create" => self.lower_call(cx, md, m, None, args, expect, hc),
+                    Some((_, kind)) if kind == "create" => {
+                        cx.moves = moves;
+                        cx.param_moves = param_moves;
+                        self.lower_call(cx, md, m, None, args, expect, hc)
+                    }
                     _ => Err(format!("`{v}.{m}` has no C runtime implementation")),
                 };
             }
@@ -3191,7 +3209,11 @@ static struct {inst}* {inst}__slice(struct {inst}* a, uint64_t lo, uint64_t hi) 
             ("ARRAY", _, _) => {
                 let md = self.module(v).ok_or_else(|| format!("unknown name `{v}`"))?;
                 return match Self::find_routine(md, m) {
-                    Some((_, kind)) if kind == "create" && m != "repeat" => self.lower_call(cx, md, m, None, args, expect, hc),
+                    Some((_, kind)) if kind == "create" && m != "repeat" => {
+                        cx.moves = moves;
+                        cx.param_moves = param_moves;
+                        self.lower_call(cx, md, m, None, args, expect, hc)
+                    }
                     _ => Err(format!("`ARRAY.{m}` has no C runtime implementation")),
                 };
             }
@@ -3217,6 +3239,8 @@ static struct {inst}* {inst}__slice(struct {inst}* a, uint64_t lo, uint64_t hi) 
         }
         let md = self.module(v).ok_or_else(|| format!("unknown name `{v}`"))?;
         if Self::find_routine(md, m).is_some() {
+            cx.moves = moves;
+            cx.param_moves = param_moves;
             return self.lower_call(cx, md, m, None, args, expect, hc);
         }
         Err(format!("`{v}` has no routine `{m}`"))

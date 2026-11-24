@@ -1,0 +1,198 @@
+-- `SORTING.sort_array`, `lower_bound` and `binary_search` in C (Task H.3, after H.5):
+-- numbers and text with repeats, the empty and one-item arrays, items that the order ties (a
+-- stable sort keeps their tags in order), searches that find and miss, and a million numbers.
+program MAIN
+
+feature {ANY}
+
+  -- The items joined by commas.
+  nats(a: ARRAY[NAT]): STRING
+    do
+      a.fold(fn(acc: STRING, x: NAT): STRING do
+        let t = NUMBER_TEXT.nat_to_text(x)
+        if acc.byte_length <= 1000000 then
+          (if acc.byte_length = 0 then t else acc.concat(",").concat(t) end)
+        else
+          acc
+        end
+      end, "")
+    end
+
+  texts(a: ARRAY[STRING]): STRING
+    do
+      a.fold(fn(acc: STRING, x: STRING): STRING do
+        if acc.byte_length <= 1000000 and x.byte_length <= 1000000 then
+          (if acc.byte_length = 0 then x else acc.concat(",").concat(x) end)
+        else
+          acc
+        end
+      end, "")
+    end
+
+  -- Each item as key:tag.
+  items(a: ARRAY[ITEM]): STRING
+    do
+      a.fold(fn(acc: STRING, x: ITEM): STRING do
+        let t = NUMBER_TEXT.nat_to_text(x.key).concat(":").concat(NUMBER_TEXT.nat_to_text(x.tag))
+        if acc.byte_length <= 1000000 then
+          (if acc.byte_length = 0 then t else acc.concat(",").concat(t) end)
+        else
+          acc
+        end
+      end, "")
+    end
+
+  -- Where `binary_search` found `k`, or `-`.
+  found(a: ARRAY[NAT], k: NAT): STRING
+    require
+      ordered: SORTING.sorted(a.to_list)
+    do
+      check
+        nat_agrees: forall p: NAT. forall q: NAT. p.equals(q) = (p = q)
+      end
+      match SORTING.binary_search(a, k)
+      case Some(i) then NUMBER_TEXT.nat_to_text(i)
+      case None then "-"
+      end
+    end
+
+  bound(a: ARRAY[NAT], k: NAT): STRING
+    require
+      ordered: SORTING.sorted(a.to_list)
+    do
+      check
+        nat_agrees: forall p: NAT. forall q: NAT. p.equals(q) = (p = q)
+      end
+      NUMBER_TEXT.nat_to_text(SORTING.lower_bound(a, k))
+    end
+
+  -- `a` and `b` joined by ` | `, or `a` alone if that would not fit.
+  and_then(a: STRING, b: STRING): STRING
+    do
+      if a.byte_length <= 1000000 and b.byte_length <= 1000000 then
+        a.concat(" | ").concat(b)
+      else
+        a
+      end
+    end
+
+  spaced(a: STRING, b: STRING): STRING
+    do
+      if a.byte_length <= 1000000 and b.byte_length <= 1000000 then
+        a.concat(" ").concat(b)
+      else
+        a
+      end
+    end
+
+  -- Every case but the million numbers.
+  small: STRING
+    do
+      let a = SORTING.sort_array(ARRAY.from_list(LIST.empty.prepend(7).prepend(0).prepend(3).prepend(1).prepend(9).prepend(3).prepend(5)))
+      let b = SORTING.sort_array(ARRAY.from_list(LIST.empty.prepend("apple").prepend("fig").prepend("apple").prepend("pear")))
+      let none: LIST[NAT] = LIST.empty
+      let c = SORTING.sort_array(ARRAY.from_list(none))
+      let d = SORTING.sort_array(ARRAY.from_list(LIST.empty.prepend(42)))
+      let tied = LIST.empty.prepend(ITEM.make(1, 6)).prepend(ITEM.make(2, 5)).prepend(ITEM.make(1, 4)).prepend(ITEM.make(2, 3)).prepend(ITEM.make(1, 2)).prepend(ITEM.make(0, 1))
+      let f = SORTING.sort_array(ARRAY.from_list(tied))
+      let searches = spaced(spaced(found(a, 5), found(a, 4)), spaced(found(a, 0), found(c, 1)))
+      let bounds = spaced(spaced(bound(a, 4), bound(a, 3)), spaced(bound(a, 10), bound(c, 1)))
+      and_then(and_then(and_then(and_then(and_then(and_then(nats(a), texts(b)), nats(c)), nats(d)), items(f)), searches), bounds)
+    end
+
+  -- The next number of a linear congruential sequence.
+  next(seed: U64): U64
+    do
+      seed *% 6364136223846793005 +% 1442695040888963407
+    end
+
+  -- `a` from `i` on filled from a linear congruential sequence: a loop that changes `a` in
+  -- place.
+  fill(a: ARRAY[U64], i: NAT, seed: U64): ARRAY[U64]
+    require
+      inside: i <= a.length
+    variant
+      a.length - i
+    do
+      if i = a.length then
+        a
+      else
+        fill(a.set(i, seed >> 20), i + 1, next(seed))
+      end
+    ensure
+      len: Result.length = a.length
+    end
+
+  -- Each item from `i` on at most the next.
+  in_order(a: ARRAY[U64], i: NAT): BOOL
+    require
+      inside: i < a.length
+    variant
+      a.length - i
+    do
+      if i + 1 = a.length then
+        True
+      else if a.at(i) <= a.at(i + 1) then
+        in_order(a, i + 1)
+      else
+        False
+      end end
+    end
+
+  -- How many of the items from `i` on `binary_search` finds where they are, or at an equal
+  -- item.
+  finds(a: ARRAY[U64], i: NAT, n: NAT): NAT
+    require
+      ordered: SORTING.sorted(a.to_list)
+      inside: i <= a.length
+      few: n <= i
+    variant
+      a.length - i
+    do
+      check
+        u64_agrees: forall p: U64. forall q: U64. p.equals(q) = (p = q)
+      end
+      if i = a.length then
+        n
+      else
+        let hit = match SORTING.binary_search(a, a.at(i))
+          case Some(j) then (if a.at(j) = a.at(i) then 1 else 0 end)
+          case None then 0
+          end
+        finds(a, i + 1, n + hit)
+      end
+    end
+
+  big: STRING
+    do
+      let a = SORTING.sort_array(fill(ARRAY.make(1000000, 0), 0, 42))
+      let shown = if a.length > 0 and in_order(a, 0) then " in order" else " OUT OF ORDER" end
+      check
+        u64_agrees: forall p: U64. forall q: U64. p.equals(q) = (p = q)
+      end
+      let missing = match SORTING.binary_search(a, 18446744073709551615)
+        case Some(_) then " found a number never put"
+        case None then ""
+        end
+      NUMBER_TEXT.nat_to_text(a.length).concat(shown).concat(" ").concat(NUMBER_TEXT.nat_to_text(finds(a, 0, 0))).concat(" found").concat(missing)
+    end
+
+  report: STRING
+    do
+      and_then(small, big)
+    end
+
+  small_length: NAT
+    do
+      small.byte_length
+    end
+
+  main(args: SEQ[STRING]): IO[EXIT_CODE]
+    do
+      with IO
+        IO.print_line(report)
+        IO.exit(if small_length > 0 then 0 else 1 end)
+      end
+    end
+
+end

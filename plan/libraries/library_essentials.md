@@ -578,13 +578,13 @@ Client: sorting (H.3), the heap (H.4), `gtui`'s screen grid (F.10). Needs decisi
 **Known limits.**
 - No `=` on arrays in running code: like `MAP`'s, the representation is hidden (E0311). Compare `a.to_list`.
 - A `set` whose array is read later in the same expression copies, and nothing warns of it. A warning when a loop's `set` copies at every step would need the analysis to report what it did not give.
-- `sort_array` and `binary_search` (H.3) and `HEAP` (H.4) can now be written on `ARRAY`.
+- `sort_array` and `binary_search` (H.3) are now written on `ARRAY` (2026-11-23), and `HEAP` (H.4) can be.
 
 #### Task H.3: Sort and Search
 
 Client: `MAP.keys` consumers, `gtui` list views, `gtime` tables. Needs decision 5, H.5 and P1.
 
-**Status:** ✅ Completed on `LIST` (2026-11-23). `sort_array` and `binary_search` waited for H.5, as the user chose: they need `ARRAY`, which H.5 has now added. Decision 5 taken as proposed.
+**Status:** ✅ Completed (2026-11-23). `sort_array` and `binary_search` waited for H.5, as the user chose, and followed it the same day. Decision 5 taken as proposed.
 
 - [x] `module SORTING[K: ORD]`, a module of routines as `KEY_ORDER` is: `sorted(xs)`, `sort(xs)`, `merge(xs, ys)`, and the ghost `count(xs, x)`. `sort_array` waits for H.5.
 - [x] Merge sort on `LIST`. The two halves are independent `let`s, so they run as parallel tasks under the existing depth cap.
@@ -598,12 +598,20 @@ Client: `MAP.keys` consumers, `gtui` list views, `gtime` tables. Needs decision 
   - A proof was written: `keyed(xs, k)` (the items `equals` to `k`), `keyed(sort(xs), k) = keyed(xs, k)`, through `merged` and a lemma that nothing above `y` in a sorted list is `equals` to it.
   - It needs `equals` and `less_than` to agree, `a.equals(b) and b.less_than(c) implies a.less_than(c)` and its mirror. As a `forall` premise over three values, Z3 never uses it: it is three nested quantifiers, and even flattened it has no trigger Z3 picks. With `{K_eq(a, b), K_less(b, c)}` as triggers, added by hand to the `.bpl`, the lemma's steps go through. Its result still fails, because the guard of its contract keeps the nested form.
   - Two ways on: `forall` with triggers in Gardel, or a concept that refines `ORD` with these laws, whose laws are axioms with triggers already.
-- [ ] `binary_search(a: ARRAY[K], k)`: waits for H.5.
+- [x] `sort_array(a: ARRAY[K])`, after H.5: a merge sort on arrays, stable, with `sort`'s three properties stated on `to_list`.
+  - Each half is copied out with `slice` and sorted as a parallel task. `merge_arrays` makes the result with `ARRAY.make`, and the loop `merge_into` fills it with `set`, in place.
+  - The proof: `merge_into` keeps `take(out, i + j) ++ merged(drop(x, i), drop(y, j)) = merged(x, y)`, through the new law `LIST_OPS.take_update` and `drop_step`. So the result is `merged` of the sorted halves, and `merged_fact` and `merged_sorted_fact` give the order and the counts.
+  - Not in place: a merge sort in place would need a proof that permuting a segment keeps the bounds of the items around it. This one moves about n log2(n) items and allocates about 2n arrays.
+- [x] `lower_bound(a, k)` and `binary_search(a: ARRAY[K], k): OPTION[NAT]`, after H.5, adapted from firulete's `BINARY_SEARCH` on lists.
+  - `lower_bound`: every item before the result is below `k`, and none from it on is. `binary_search`: a found position holds `k`, and `None` means no item is `k`.
+  - Both need `agrees`, as `first_least` does: chaining `less_or_equal` needs `equals` to be `=`. The facts `neighbour_fact`, `below_fact`, `not_below_fact` and `above_fact` carry a bound along a sorted list by induction.
+  - The window loop `bound_from(a, k, lo, hi)` states what it finds in `lo` to `hi` as postconditions. A first version took what holds outside the window as `forall` preconditions: they guard the routine's contract axiom, the solver did not prove the guard at the recursive calls, and every postcondition failed.
 - [x] Benchmark against C `qsort` on 1,000,000 `U64` from one linear congruential sequence, the median of five runs.
   - `SORTING.sort`: 2.19 s on one thread and 1.80 s on 20.
   - `qsort` on an array: 0.127 s.
   - Each merge level allocates new cells, about 80 million in all, so the sort is bound by allocation and gains little from threads. A sort as fast as `qsort` needs `ARRAY`.
-- Acceptance: met. All three properties of `sort` are proven. A `NAT` client proves that the first item of a sorted list is at most every other, through the contracts alone (`tests/sorting.rs`).
+  - After H.5, a program that fills and sorts a million `U64`s with `sort_array`, the median of five runs: 0.68 s on one thread, 0.22 s on twenty. `SORTING.sort` measured the same way took 2.78 s and 2.68 s, and `qsort` about 0.16 s. Another verification was running on the machine at the time, so all three are slower than above, the list sort by about a quarter.
+- Acceptance: met. All three properties of `sort` and of `sort_array` are proven. A `NAT` client proves that the first item of a sorted list is at most every other, through the contracts alone (`tests/sorting.rs`), and what `binary_search` finds and misses (`tests/sort_array.rs`).
 
 **Compiler change.** A module with no representation, as `SORTING`, has no value to pass as `Current`. Its `specify` routines took one in the verifier, while a call as `SORTING.count(xs, x)` passed none (E0199, "wrong number of arguments"). They now take none (`specify_takes_current`), as its `create` routines do, so a module of routines can have ghost helpers. Its features keep a receiver: a first version made them static too, and `tests/bounds.rs` showed a client calling one on a value (`c.least(a, a)`). `SORTING` keeps its private helpers in `create {NONE}`.
 
@@ -613,11 +621,23 @@ Client: `MAP.keys` consumers, `gtui` list views, `gtime` tables. Needs decision 
 - `BYTES` and a client's own module are refused as keys (E0317);
 - a program sorts numbers, text, ties and a million numbers in C, with the expected output, and a leak harness finds no live block after 51 calls.
 
+`tests/sort_array.rs` (4 tests), after H.5:
+- a client proves `sort_array`'s three properties, what `binary_search` finds and misses, that it finds an item of the array, and `lower_bound`'s bounds on `I64`;
+- six false claims are refused, each by a failed proof;
+- a search on an array not known to be sorted is refused (`ordered`);
+- a program sorts numbers, text, the empty and one-item arrays, ties and a million numbers in C, searches and bounds, finds each of the million, and a leak harness finds no live block after 51 calls.
+
+**Compiler change, after H.5.** A call written with its module's name, as `SORTING.merge_into(x, y, out, 0, 0)`, went through `lower_static`, which dropped the caller's `moves` and `param_moves`. Such a call gave up no array, while the same call written plainly did. `merge_into` copied `out` at every `set`, and sorting a million items did not finish in minutes. `lower_static` now passes them on to the calls of routines only, never to a primitive's arguments.
+
+**Totals, after H.5.** All 542 tests pass: the 235 unit tests and 307 in 46 suites (the `gtui` frame-time test alone). The stdlib is 0/0 (33 modules).
+
 **Totals.** All 534 tests pass: the 235 unit tests and 299 in 44 suites (the `gtui` frame-time test alone). The stdlib is 0/0 (32 modules, 194 s).
 
 **Known limits.**
 - A recursive law's call to itself in its `do` is asserted, not assumed as an induction hypothesis with its premises. Induction goes in a private `BOOL` fact routine, as `KEY_ORDER`'s are.
 - `LIST_OPS.reverse`'s contract does not say it is `reverse_onto(xs, LIST.empty)`, so `SORTING` uses `reverse_onto` throughout and proves its own double reversal (`back_fact`).
+- A search needs `agrees`, which does not hold for `STRING`: `equals` compares the bytes, and two strings with the same bytes are not known to be `=`. An array of strings can be sorted but not searched.
+- `sort_array` is not in place (see above).
 
 #### Task H.4: `SET`, `QUEUE`, `HEAP` and `MAP` Laws
 

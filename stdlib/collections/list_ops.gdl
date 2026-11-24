@@ -363,6 +363,35 @@ feature {NONE}
       other: i != j implies LIST_OPS.at(update(xs, i, x), j) = LIST_OPS.at(xs, j)
     end
 
+  take_update_fact[A](xs: LIST[A], k: NAT, x: A): BOOL
+    require
+      inside: k < xs.length
+      small: k < 18446744073709551615
+    variant
+      k
+    do
+      if k = 0 then
+        check
+          put: update(xs, 0, x) = xs.tail.prepend(x)
+          one: take(xs.tail.prepend(x), 1) = take(xs.tail, 0).prepend(x)
+          none: take(xs, 0) = LIST.empty
+        end
+        True
+      else
+        check
+          step: take_update_fact(xs.tail, k - 1, x)
+          put: update(xs, k, x) = update(xs.tail, k - 1, x).prepend(xs.head)
+          front: take(update(xs.tail, k - 1, x).prepend(xs.head), k + 1) = take(update(xs.tail, k - 1, x), k).prepend(xs.head)
+          was: take(xs, k) = take(xs.tail, k - 1).prepend(xs.head)
+          moved: take(xs.tail, k - 1).prepend(xs.head).append(LIST.empty.prepend(x)) = take(xs.tail, k - 1).append(LIST.empty.prepend(x)).prepend(xs.head)
+        end
+        True
+      end
+    ensure
+      holds: Result
+      grows: take(update(xs, k, x), k + 1) = take(xs, k).append(LIST.empty.prepend(x))
+    end
+
   -- Inside this module a law is not an axiom, a contract is: each fact below is a routine
   -- that states a fact for its arguments and holds, so a proof calls it where it needs it.
 
@@ -561,6 +590,18 @@ specify {ANY}
       update_fact(xs, i, x, j)
     ensure
       unchanged: LIST_OPS.at(LIST_OPS.update(xs, i, x), j) = LIST_OPS.at(xs, j)
+    end
+
+  -- The first `k + 1` items after an `update` at `k`: the first `k` items, then the new one
+  -- (Task H.3). A loop that fills a list by index calls it at each step.
+  law take_update[A](xs: LIST[A], k: NAT, x: A)
+    require
+      inside: k < xs.length
+      small: k < 18446744073709551615
+    do
+      take_update_fact(xs, k, x)
+    ensure
+      grows: LIST_OPS.take(LIST_OPS.update(xs, k, x), k + 1) = LIST_OPS.take(xs, k).append(LIST.empty.prepend(x))
     end
 
   -- An item of the tail is the next item of the list.
