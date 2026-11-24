@@ -32,6 +32,7 @@ create {ANY}
     ensure
       none: Result.count = 0
       room: Result.has_room
+      first: Result.next_tag = 0
     end
 
 create {NONE}
@@ -78,6 +79,22 @@ create {NONE}
     ensure
       holds: Result
       kept: off(ws, c).has(t)
+    end
+
+  -- A wait on `c` is not one of those off it.
+  dropped_off(ws: MAP[NAT, REST_WAIT], c: CONN_ID, t: NAT): BOOL
+    require
+      waits: ws.has(t)
+      on_c: ws.get(t).get.connection = c
+    do
+      check
+        agrees: forall a: NAT. forall b: NAT. a.equals(b) = (a = b)
+        gone: off(ws, c).get(t).is_none
+      end
+      True
+    ensure
+      holds: Result
+      gone: not off(ws, c).has(t)
     end
 
   -- None of the waits off `c` is on it.
@@ -167,7 +184,8 @@ feature {ANY}
       waits: Result.waits_on(w.connection)
       found: Result.get(w.tag).is_some and Result.get(w.tag).get.connection = w.connection
       not_more: Result.count <= Current.count + 1
-      next_given: Result.next_tag != Current.next_tag
+      -- In turn, from 0 to 999999999 and then from 0 again.
+      next_given: Result.next_tag = (if Current.next_tag = 999999999 then 0 else Current.next_tag + 1 end)
     end
 
   -- The table without the wait tagged `t`, once it is answered.
@@ -233,6 +251,20 @@ specify {ANY}
       REST_WAITING.kept_off(q.waits, w.connection, t)
     ensure
       stays: q.holding(w).get(t).is_some
+    end
+
+  -- A wait on the same connection, whose place is taken, leaves the table.
+  law holding_replaces(q: REST_WAITING, w: REST_WAIT, t: NAT)
+    require
+      offered: q.offered = Some(w.tag)
+      waits: q.get(t).is_some
+      same: q.get(t).get.connection = w.connection
+    trigger
+      q.holding(w).get(t)
+    do
+      REST_WAITING.dropped_off(q.waits, w.connection, t)
+    ensure
+      gone: q.holding(w).get(t).is_none
     end
 
   law taking_keeps(q: REST_WAITING, t: NAT, u: NAT)

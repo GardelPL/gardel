@@ -185,7 +185,9 @@ empty one, so it does not match `/users`. Patterns are written decoded.
     `Shutdown` stops the server.
 - **Waiting requests.** At most 32 wait, each with a count of sweeps below its limit, of at
   most 30; a request waits only under the tag offered to it, which is offered only when there is
-  room and no request waits under it; a wait stays when another is held, answered or dropped; each
+  room and no request waits under it; tags are given in turn; a request that waits takes the place
+  of an earlier wait on its connection; every other wait stays when one is held, answered or
+  dropped; each
   sweep counts itself on every wait it keeps and answers the others late, so no wait
   outlives its limit while the sweep is armed; a connection that closes or fails frees its wait;
   and an answer under a tag that no request waits under reaches none of the server's connections.

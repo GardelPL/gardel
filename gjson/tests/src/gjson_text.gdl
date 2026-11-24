@@ -93,6 +93,34 @@ feature {ANY}
       end
     end
 
+  -- The numbers from 0 to `n - 1`, in front of `vs`.
+  numbers(n: NAT, vs: LIST[JSON]): LIST[JSON]
+    require
+      few: n <= 1000000
+    variant
+      n
+    do
+      if n = 0 then vs else numbers(n - 1, vs.prepend(JSON.int(I64.from_nat(n - 1)))) end
+    end
+
+  -- The array `JSON_ARRAY` makes of `vs`, written, or nothing if it makes none.
+  array_of(vs: LIST[JSON]): BYTES
+    do
+      match JSON_ARRAY.of(vs)
+        case Some(v) then v.to_bytes
+        case None then BYTES.empty
+      end
+    end
+
+  -- The array of the value `b` holds, written.
+  boxed(b: BYTES): BYTES
+    do
+      match JSON.parse(b)
+        case Ok(v) then array_of(LIST.empty.prepend(v))
+        case Error(_) then BYTES.empty
+      end
+    end
+
   -- The document that `@kind n` stands for.
   generated(kind: STRING, n: NAT): BYTES
     do
@@ -109,13 +137,17 @@ feature {ANY}
         add(fields(n, add(b, "{")), "}").to_bytes
       else if kind.equals("digits") then
         repeat("9".to_utf8, n, b).to_bytes
+      else if kind.equals("array") then
+        array_of(numbers(if n <= 1000000 then n else 1000000 end, LIST.empty))
+      else if kind.equals("boxed") then
+        boxed(repeat("]".to_utf8, n, repeat("[".to_utf8, n, b)).to_bytes)
       else
         b.to_bytes
-      end end end end end end
+      end end end end end end end end
     end
 
   -- What `JSON.parse` says of the document a case stands for: its bytes, with `%XX` read as
-  -- a byte, or `@kind n` for a generated one, summed up.
+  -- a byte, or `@kind n` for a generated one, summed up but for a short array.
   got(doc: STRING): STRING
     do
       if doc.starts_with("@") then
@@ -124,7 +156,7 @@ feature {ANY}
           case Some(sp) then
             if sp + 1 <= doc.code_point_count then
               match NUMBER_TEXT.parse_nat(doc.slice(sp + 1, doc.code_point_count))
-                case Ok(n) then describe(JSON.parse(generated(doc.slice(1, sp), n)), True)
+                case Ok(n) then describe(JSON.parse(generated(doc.slice(1, sp), n)), n > 20 or not doc.starts_with("@array"))
                 case Error(_) then "bad count"
               end
             else

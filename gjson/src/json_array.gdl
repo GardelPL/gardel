@@ -1,0 +1,151 @@
+-- An array from a list of values.
+--
+-- It is what `with_item` gives for each value in turn, from an empty array (`of`'s `same`),
+-- and takes time linear in the list, where `with_item` for each is quadratic. The values are
+-- put on from the last to the first by `with_first`.
+functions JSON_ARRAY
+
+feature {ANY}
+
+  -- The array `a` with the values `vs` after its last item, one by one, or `None` if one of
+  -- them nests too deep.
+  appended(a: JSON, vs: LIST[JSON]): OPTION[JSON]
+    variant
+      vs.length
+    do
+      if vs.length = 0 then
+        Some(a)
+      else
+        match a.with_item(vs.head)
+          case Some(b) then appended(b, vs.tail)
+          case None then None
+        end
+      end
+    ensure
+      def: Result = (if vs.length = 0 then Some(a) else (match a.with_item(vs.head)
+        case Some(b) then appended(b, vs.tail)
+        case None then None
+      end) end)
+    end
+
+  -- The array of the values `vs`, in order, or `None` if one of them nests too deep.
+  of(vs: LIST[JSON]): OPTION[JSON]
+    do
+      check
+        onto: onto_is(LIST_OPS.reverse_onto(vs, LIST.empty), LIST.empty, JSON.empty_array)
+        twice: turned_twice(vs, LIST.empty)
+      end
+      onto(LIST_OPS.reverse_onto(vs, LIST.empty), JSON.empty_array)
+    ensure
+      same: Result = appended(JSON.empty_array, vs)
+    end
+
+feature {NONE}
+
+  -- The array `a` with each of `vs` put before its first item, in turn.
+  onto(vs: LIST[JSON], a: JSON): OPTION[JSON]
+    variant
+      vs.length
+    do
+      if vs.length = 0 then
+        Some(a)
+      else
+        match a.with_first(vs.head)
+          case Some(b) then onto(vs.tail, b)
+          case None then None
+        end
+      end
+    end
+
+  -- A list turned round twice is the list.
+  turned_twice(vs: LIST[JSON], acc: LIST[JSON]): BOOL
+    variant
+      vs.length
+    do
+      if vs.length = 0 then
+        True
+      else
+        check
+          whole: vs.tail.prepend(vs.head) = vs
+        end
+        turned_twice(vs.tail, acc.prepend(vs.head))
+      end
+    ensure
+      holds: Result
+      twice: LIST_OPS.reverse_onto(LIST_OPS.reverse_onto(vs, acc), LIST.empty) = LIST_OPS.reverse_onto(acc, vs)
+    end
+
+  -- `o` with `v` before its first item.
+  first_of(o: OPTION[JSON], v: JSON): OPTION[JSON]
+    do
+      match o
+        case Some(b) then b.with_first(v)
+        case None then None
+      end
+    end
+
+  -- A first item put on before the others are appended is one put on after.
+  first_moves(a: JSON, v: JSON, vs: LIST[JSON]): BOOL
+    variant
+      vs.length
+    do
+      if vs.length = 0 then
+        True
+      else
+        match a.with_item(vs.head)
+          case Some(c) then first_moves(c, v, vs.tail)
+          case None then True
+        end
+      end
+    ensure
+      holds: Result
+      moves: first_of(appended(a, vs), v) = (match a.with_first(v)
+        case Some(b) then appended(b, vs)
+        case None then None
+      end)
+    end
+
+  -- An array cannot get past a value that does not fit.
+  stuck(rs: LIST[JSON], vs: LIST[JSON]): BOOL
+    require
+      none: appended(JSON.empty_array, vs).is_none
+    variant
+      rs.length
+    do
+      if rs.length = 0 then
+        True
+      else
+        check
+          moves: first_moves(JSON.empty_array, rs.head, vs)
+        end
+        stuck(rs.tail, vs.prepend(rs.head))
+      end
+    ensure
+      holds: Result
+      none: appended(JSON.empty_array, LIST_OPS.reverse_onto(rs, vs)).is_none
+    end
+
+  -- With `a` the array of `vs`, `onto(rs, a)` is the array of `rs` turned round and `vs`.
+  onto_is(rs: LIST[JSON], vs: LIST[JSON], a: JSON): BOOL
+    require
+      made: appended(JSON.empty_array, vs) = Some(a)
+    variant
+      rs.length
+    do
+      if rs.length = 0 then
+        True
+      else
+        check
+          moves: first_moves(JSON.empty_array, rs.head, vs)
+        end
+        match a.with_first(rs.head)
+          case Some(b) then onto_is(rs.tail, vs.prepend(rs.head), b)
+          case None then stuck(rs.tail, vs.prepend(rs.head))
+        end
+      end
+    ensure
+      holds: Result
+      same: onto(rs, a) = appended(JSON.empty_array, LIST_OPS.reverse_onto(rs, vs))
+    end
+
+end

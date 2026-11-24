@@ -98,6 +98,7 @@ This guide is written for two audiences:
   - [Dependencies](#dependencies)
   - [A Package for JSON: `gjson`](#a-package-for-json-gjson)
   - [Testing a Package: `gardelc test` and `gtest`](#testing-a-package-gardelc-test-and-gtest)
+  - [Mutating a Package: `gardelc mutate`](#mutating-a-package-gardelc-mutate)
   - [Checking a New Version](#checking-a-new-version)
   - [Name Resolution](#name-resolution)
   - [The Standard Library Sources (`stdlib/`)](#the-standard-library-sources-stdlib)
@@ -2461,7 +2462,7 @@ match JSON.parse_text("{\"b\": [1, 2.5, \"x\"], \"a\": null}")
 end
 ```
 
-- **The value.** `JSON` is opaque. Build it with `null`, `bool`, `int`, `number`, `string`, `empty_array`, `empty_object`, `with_item` and `with_field`, and read it with `is_null`, `as_bool`, `as_int`, `number_text`, `as_string`, `count`, `item`, `field` and `depth`. Its invariant keeps text valid UTF-8, the keys of an object unique and in ascending byte order, and nesting at most 64 levels, so `with_item` and `with_field` return an `OPTION`. An integer in the range of `I64` is an `I64`, and any other number keeps its text as read.
+- **The value.** `JSON` is opaque. Build it with `null`, `bool`, `int`, `number`, `string`, `empty_array`, `empty_object`, `with_item` and `with_field`, or an array from a list with `JSON_ARRAY.of`, and read it with `is_null`, `as_bool`, `as_int`, `number_text`, `as_string`, `count`, `item`, `field` and `depth`. Its invariant keeps text valid UTF-8, the keys of an object unique and in ascending byte order, and nesting at most 64 levels, so `with_item` and `with_field` return an `OPTION`. An integer in the range of `I64` is an `I64`, and any other number keeps its text as read.
 - **Parsing.** `JSON.parse(b: BYTES)` and `JSON.parse_text(s: STRING)` are total and return `RESULT[JSON_ERROR, JSON]`. Every error names a byte offset (`e.offset`). Input over 4 MiB is `TooLarge`, nesting over 64 levels is `TooDeep`, and a repeated key is `DuplicateKey`.
 - **Writing.** `to_bytes` and `to_text` add no white space and write keys in order, so equal values give equal bytes.
 - **What you can prove.** The law `JSON.scalar_round_trip` says a scalar read back from its own bytes is itself. With the builders' contracts it reaches your code with no extra work:
@@ -2540,6 +2541,33 @@ main(args: SEQ[STRING]): IO[EXIT_CODE]
 - **Reactive steps.** `SCRIPT.play(step, state, events)` runs a `step` over a list of events and gives `Running(state, commands)` or `Stopped(code, commands)`, with every command in order; `SCRIPT.printed(commands)` is the text of each `Print` and `Write`. The `step` must be a routine of a module, as a `reactive program` cannot be named. Keep the run in a `let`: a routine that returns a `SCRIPTED[NAT]` must show its state in range, and a generic routine's result has no range.
 
 `gjson`, `gtest` and its own tests (`gtest/tests`) use it. `ghttp` and `grest` still read their cases from Rust tests.
+
+### Mutating a Package: `gardelc mutate`
+
+A proof shows that the code keeps its contract, and a test that it does what the test asks. Neither shows that the contract and the tests say enough. `gardelc mutate DIR` changes the package's code in small ways, one change at a time, and says what refuses each changed package (a *mutant*):
+
+- **the verifier**, with the clause that fails: what the change breaks is proven;
+- **a test**, with its name: it is tested, and not proven;
+- **nothing**: the mutant *survives*, and no proof or test tells it from the original.
+
+```text
+$ gardelc mutate price
+[mutate] 10 mutants
+[mutate] the package as it is: verified and tested (4.1 s)
+[mutate] 1/10 src/price.gdl:7 PRICE.doubled: `require` `small` dropped ... killed by the verifier: `overflow_add` of `doubled` (Arithmetic Overflow) (2.4 s)
+[mutate] 2/10 src/price.gdl:16 PRICE.fee: `>` -> `>=` ... killed by a test: PRICE_TEST: FAIL paid: expected 50, got 0 (6.6 s)
+[mutate] 3/10 src/price.gdl:21 PRICE.label: `5` -> `6` ... SURVIVED (4.8 s)
+    - 5
+    + 6
+```
+
+The changes are: an integer one more or one less; `True` for `False`; `<` for `<=`, `>` for `>=`, `=` for `!=` and `and` for `or`, each both ways; a condition negated; one branch of an `if` always taken; an arm of a `match` with the next arm's body; a `require` or `invariant` clause dropped; two arguments next to each other swapped; and a call replaced by its receiver or an argument. Only code is changed. A `check`, an `ensure`, a law's proof, a `specify` routine and a routine that states a fact (a `BOOL` with a clause that ensures `Result`) are left alone. Many changes are of the wrong type; they are refused before any proof and counted as "not a program".
+
+Each mutant is made in a private copy, verified with `--strict`, its own module first, and then tested with `gardelc test` if the package has a `tests/` package. The exit status is 0 when none survived, 1 when one did or the package itself does not pass, and 2 for a wrong command line.
+
+- `--only MODULE` changes only that module, and may be repeated. `--limit N` tries `N` of the mutants, chosen by `--seed` (0 when it is not given). `--list` lists them and tries none.
+- `--jobs N` tries `N` at a time. A mutant can keep the solver busy for long: `--time-limit SECS` stops the verifier on one after that time (1800 when it is not given). A mutant the solver gives up on is refused, as any module it gives up on is, but it was not shown to be wrong, so it is counted apart, as "not proven".
+- A survivor is an invitation to state or to test more. One that means the same as the original goes in `Gardel.mutants`, beside the manifest: one a line, as the report writes it, with the reason above it as a `--` comment. It is not tried again. A line that fits no mutant any more is reported.
 
 ### Checking a New Version
 
@@ -2743,6 +2771,13 @@ gardelc --compare-with <old-dir>
 # Verify and build DIR/tests (default ./tests), run each program in it with tests/cases.txt
 # on its standard input, and report each by its exit status
 gardelc test [DIR] [--filter <NAME>]
+
+# Change the package's code in small ways, and report the changes that neither its proofs
+# nor its tests refuse
+gardelc mutate [DIR] [--only <MODULE>] [--limit <N>] [--seed <N>] [--jobs <N>] [--time-limit <SECS>] [--list]
+
+# Check MODULE first, and stop at the first module with an error
+gardelc <file.gdl> --fail-fast <MODULE>
 ```
 
 `gardelc` remembers what this machine has proven, in `GARDEL_CACHE_DIR` or your user cache directory. A module whose verification condition has not changed is not given to the solver again, and the run says how many came from the cache. Changing `gardelc`, Boogie, Z3 or a limit verifies everything again. If Boogie or Z3 cannot give its version, the run uses no cache, and a `[cache] off` line names the tool and the reason. All other checks run every time, so `--strict` cannot be answered by an earlier run. The cache only saves time: deleting it is always safe.

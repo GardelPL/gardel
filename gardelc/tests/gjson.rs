@@ -138,6 +138,86 @@ fn a_lie_about_the_round_trip_does_not_verify() {
     }
 }
 
+/// `JSON_ARRAY.of` is `with_item` for each value, and `with_first`'s laws reach a client.
+#[test]
+fn a_client_proves_facts_about_arrays() {
+    let facts = client(
+        "  none: BOOL
+    do
+      True
+    ensure
+      empty: JSON_ARRAY.of(LIST.empty) = Some(JSON.empty_array)
+    end
+
+  each(vs: LIST[JSON]): BOOL
+    do
+      True
+    ensure
+      same: JSON_ARRAY.of(vs) = JSON_ARRAY.appended(JSON.empty_array, vs)
+    end
+
+  one(v: JSON): BOOL
+    require
+      fits: JSON.empty_array.with_item(v).is_some
+    do
+      True
+    ensure
+      made: JSON_ARRAY.of(LIST.empty.prepend(v)) = JSON.empty_array.with_item(v)
+      first: JSON.empty_array.with_first(v) = JSON.empty_array.with_item(v)
+    end
+
+  ends(a: JSON, v: JSON, w: JSON, b: JSON, c: JSON): BOOL
+    require
+      first: a.with_first(v) = Some(b)
+      last: a.with_item(w) = Some(c)
+    do
+      True
+    ensure
+      same: b.with_item(w) = c.with_first(v)
+    end
+",
+    );
+    assert_ok(&Project::new("arrays", &[("client.gdl", &facts)], true).check());
+}
+
+#[test]
+fn a_lie_about_arrays_does_not_verify() {
+    let lies = [
+        ("ends_agree", "f(a: JSON, v: JSON): BOOL
+    do
+      True
+    ensure
+      claim: a.with_first(v) = a.with_item(v)
+    end
+"),
+        ("first_dropped", "f(vs: LIST[JSON], v: JSON): BOOL
+    do
+      True
+    ensure
+      claim: JSON_ARRAY.of(vs.prepend(v)) = JSON_ARRAY.of(vs)
+    end
+"),
+        ("always_fits", "f(vs: LIST[JSON]): BOOL
+    do
+      True
+    ensure
+      claim: JSON_ARRAY.of(vs).is_some
+    end
+"),
+        ("either_order", "f(a: JSON, v: JSON, w: JSON): BOOL
+    do
+      True
+    ensure
+      claim: JSON_ARRAY.of(LIST.empty.prepend(v).prepend(w)) = JSON_ARRAY.of(LIST.empty.prepend(w).prepend(v))
+    end
+"),
+    ];
+    for (name, routine) in lies {
+        let p = Project::new(&format!("lie_{name}"), &[("client.gdl", &client(&format!("  {routine}")))], true);
+        assert_refused(&p.check(), "claim");
+    }
+}
+
 /// A field of a machine number type is in the range of its type, as every value stored there
 /// was. Without that, `same(n)`'s contract, which needs `n` in range, says nothing here.
 #[test]

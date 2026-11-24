@@ -1,0 +1,20 @@
+-- The mutants of grest that mean the same as the original: `gardelc mutate grest` does not try
+-- them.
+
+-- `out_of_time`, the next clause, reads the wait, so the law asks first that there is one.
+REST_WAITING.swept_gone: waits: q.get(t).is_some => waits: True
+
+-- The tag of an outcome that does not wait is never read: `held_by` asks first if it waits.
+REST_OUTCOME.make: { next = s, reply = resp, sweeps = 0, id = 0, cmds = LIST.empty } => { next = s, reply = resp, sweeps = 0, id = 1, cmds = LIST.empty }
+
+-- `body` is `raw.body`.
+REST_REQUEST.json_body: JSON.parse(Current.raw.body) => JSON.parse(Current.body)
+
+-- The first character is `/`, so a search from 0 and one from 1 find the same.
+PATH_PATTERN.parse: else if p.character_at(0) != '/' or p.find_char('?', 0).is_some or p.find_char('%', 0).is_some then => else if p.character_at(0) != '/' or p.find_char('?', 1).is_some or p.find_char('%', 0).is_some then
+PATH_PATTERN.parse: else if p.character_at(0) != '/' or p.find_char('?', 0).is_some or p.find_char('%', 0).is_some then => else if p.character_at(0) != '/' or p.find_char('?', 0).is_some or p.find_char('%', 1).is_some then
+REQUEST_TARGET.parse: let path_end = match t.find_char('?', 1) => let path_end = match t.find_char('?', 0)
+
+-- The capacity of an empty string is not part of its text.
+REQUEST_TARGET.read_field: case Ok(n) then Ok(URL_PARAM.make(n, STRING.make_empty(1))) => case Ok(n) then Ok(URL_PARAM.make(n, STRING.make_empty(2)))
+REQUEST_TARGET.query_after: if i < t.code_point_count then t.slice(i + 1, t.code_point_count) else STRING.make_empty(1) end => if i < t.code_point_count then t.slice(i + 1, t.code_point_count) else STRING.make_empty(2) end

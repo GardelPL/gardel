@@ -19,6 +19,7 @@ mod c11_typed;
 mod host_files;
 mod compat;
 pub mod manifest;
+mod mutate_cmd;
 mod names;
 mod patterns;
 mod proof_cache;
@@ -770,14 +771,27 @@ pub fn tokenize(src: &str) -> Result<Vec<Token>, LexError> {
 }
 
 pub fn tokenize_with_lines(src: &str) -> Result<(Vec<Token>, Vec<usize>), LexError> {
+    tokenize_with_spans(src).map(|t| (t.tokens, t.lines))
+}
+
+/// The tokens of a source text, each with its 1-based line and its extent in `char`s.
+pub struct SpannedTokens {
+    pub tokens: Vec<Token>,
+    pub lines: Vec<usize>,
+    pub spans: Vec<(usize, usize)>,
+}
+
+pub fn tokenize_with_spans(src: &str) -> Result<SpannedTokens, LexError> {
     let mut tokens = Vec::new();
     let mut lines = Vec::new();
+    let mut spans = Vec::new();
     let chars: Vec<char> = src.chars().collect();
     let mut i = 0;
     let mut current_line = 1;
 
     while i < chars.len() {
         let c = chars[i];
+        let (token_start, seen) = (i, tokens.len());
         if c == '\n' {
             current_line += 1;
             i += 1;
@@ -1030,10 +1044,14 @@ pub fn tokenize_with_lines(src: &str) -> Result<(Vec<Token>, Vec<usize>), LexErr
             }
             i += 1;
         }
+        if tokens.len() > seen {
+            spans.push((token_start, i));
+        }
     }
     tokens.push(Token::Eof);
     lines.push(current_line);
-    Ok((tokens, lines))
+    spans.push((i, i));
+    Ok(SpannedTokens { tokens, lines, spans })
 }
 
 /// The Boogie function that holds one clause of a module's invariant, with the ranges of its
@@ -1190,10 +1208,47 @@ impl std::fmt::Display for ParseError {
 
 impl std::error::Error for ParseError {}
 
+/// A range of tokens, from the first to past the last.
+pub type TokenRange = std::ops::Range<usize>;
+
+/// What a recording parser read at a place of the source. Nothing in the tree keeps its place,
+/// so `gardelc mutate` (H.10) works on these.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SiteKind {
+    Module(String),
+    /// A routine, and whether it states a fact: a `BOOL` with a clause that ensures `Result`.
+    Routine { name: String, fact: bool },
+    Law(String),
+    /// A `specify` routine, or an expression that only a proof reads.
+    Ghost,
+    /// The body of a routine.
+    Body,
+    Require,
+    Invariant,
+    /// An integer or Boolean literal.
+    Literal,
+    /// The operator of a comparison or connective.
+    Operator,
+    /// The condition of an `if`.
+    Condition,
+    /// The bodies of the arms of a `match`, each with the names its pattern binds.
+    Arms(Vec<(TokenRange, Vec<String>)>),
+    /// A call: its receiver, if it has one, and its arguments.
+    Call { receiver: Option<TokenRange>, args: Vec<TokenRange> },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Site {
+    pub kind: SiteKind,
+    pub range: TokenRange,
+}
+
 pub struct Parser {
     tokens: Vec<Token>,
     lines: Vec<usize>,
     pos: usize,
+    /// What is read and where, when it is recorded.
+    sites: Option<Vec<Site>>,
 }
 
 impl Parser {
@@ -1203,6 +1258,7 @@ impl Parser {
             tokens,
             lines,
             pos: 0,
+            sites: None,
         }
     }
 
@@ -1211,7 +1267,48 @@ impl Parser {
             tokens,
             lines,
             pos: 0,
+            sites: None,
         }
+    }
+
+    /// Parses a file and returns what was read where.
+    pub fn parse_sites(tokens: Vec<Token>) -> Result<Vec<Site>, ParseError> {
+        let mut parser = Self::new(tokens);
+        parser.sites = Some(Vec::new());
+        parser.parse_file()?;
+        Ok(parser.sites.unwrap_or_default())
+    }
+
+    /// Records what was read from `start` up to here.
+    fn site(&mut self, start: usize, kind: SiteKind) {
+        let range = start..self.pos;
+        if let Some(sites) = &mut self.sites {
+            sites.push(Site { kind, range });
+        }
+    }
+
+    /// `parse_expr` for what only a proof reads.
+    fn parse_ghost_expr(&mut self) -> Result<Expr, ParseError> {
+        let start = self.pos;
+        let e = self.parse_expr()?;
+        self.site(start, SiteKind::Ghost);
+        Ok(e)
+    }
+
+    /// The arguments of a call, whose `(` was read.
+    fn parse_args(&mut self) -> Result<(Vec<Expr>, Vec<TokenRange>), ParseError> {
+        let mut args = Vec::new();
+        let mut ranges = Vec::new();
+        while *self.peek() != Token::RParen {
+            let start = self.pos;
+            args.push(self.parse_expr()?);
+            ranges.push(start..self.pos);
+            if *self.peek() == Token::Comma {
+                self.next();
+            }
+        }
+        self.expect(Token::RParen)?;
+        Ok((args, ranges))
     }
 
     pub fn line_of(&self, pos: usize) -> usize {
@@ -1435,7 +1532,7 @@ impl Parser {
                 while self.is_tagged_pred_start() {
                     let tag = self.expect_lower_ident()?;
                     self.expect(Token::Colon)?;
-                    list.push((tag, self.parse_expr()?));
+                    list.push((tag, self.parse_ghost_expr()?));
                 }
             }
         }
@@ -1602,6 +1699,7 @@ impl Parser {
     }
 
     pub fn parse_module_with_kind(&mut self, kind: ModuleKind) -> Result<ModuleDecl, ParseError> {
+        let module_start = self.pos;
         match kind {
             ModuleKind::Module => self.expect_kw("module")?,
             ModuleKind::Functions => self.expect_kw("functions")?,
@@ -1729,7 +1827,9 @@ impl Parser {
                     if self.is_kw("law") {
                         specify_laws.push((vis.clone(), self.parse_law()?));
                     } else {
+                        let start = self.pos;
                         specify_routines.push((vis.clone(), self.parse_routine()?));
+                        self.site(start, SiteKind::Ghost);
                     }
                 }
             } else if self.is_kw("create") {
@@ -1765,7 +1865,9 @@ impl Parser {
                 while self.is_tagged_pred_start() {
                     let tag = self.expect_lower_ident()?;
                     self.expect(Token::Colon)?;
-                    let expr = self.parse_expr()?;
+                    let start = self.pos;
+                    let expr = self.parse_ghost_expr()?;
+                    self.site(start, SiteKind::Invariant);
                     invariants.push((tag, expr));
                 }
             } else {
@@ -1776,6 +1878,7 @@ impl Parser {
             }
         }
         self.expect_kw("end")?;
+        self.site(module_start, SiteKind::Module(name.clone()));
 
         if kind == ModuleKind::ReactiveProgram {
             if !type_params.is_empty() {
@@ -1831,6 +1934,7 @@ impl Parser {
     }
 
     fn parse_law(&mut self) -> Result<LawDecl, ParseError> {
+        let law_start = self.pos;
         self.expect_kw("law")?;
         let name = self.expect_lower_ident()?;
         let mut type_params = Vec::new();
@@ -1865,7 +1969,9 @@ impl Parser {
             while self.is_tagged_pred_start() {
                 let tag = self.expect_lower_ident()?;
                 self.expect(Token::Colon)?;
-                let expr = self.parse_expr()?;
+                let start = self.pos;
+                let expr = self.parse_ghost_expr()?;
+                self.site(start, SiteKind::Require);
                 requires.push((tag, expr));
             }
         }
@@ -1873,29 +1979,29 @@ impl Parser {
         let mut triggers = Vec::new();
         if self.is_kw("trigger") {
             self.next();
-            triggers.push(self.parse_expr()?);
+            triggers.push(self.parse_ghost_expr()?);
             while *self.peek() == Token::Comma {
                 self.next();
-                triggers.push(self.parse_expr()?);
+                triggers.push(self.parse_ghost_expr()?);
             }
         }
 
         let mut variant = Vec::new();
         if self.is_kw("variant") {
             self.next();
-            variant.push(self.parse_expr()?);
+            variant.push(self.parse_ghost_expr()?);
             while *self.peek() == Token::Comma {
                 self.next();
-                variant.push(self.parse_expr()?);
+                variant.push(self.parse_ghost_expr()?);
             }
         }
 
         if self.is_kw("trigger") {
             self.next();
-            triggers.push(self.parse_expr()?);
+            triggers.push(self.parse_ghost_expr()?);
             while *self.peek() == Token::Comma {
                 self.next();
-                triggers.push(self.parse_expr()?);
+                triggers.push(self.parse_ghost_expr()?);
             }
         }
 
@@ -1903,7 +2009,9 @@ impl Parser {
         let mut body = None;
         if self.is_kw("do") {
             self.next();
+            let start = self.pos;
             let (s, b) = self.parse_block()?;
+            self.site(start, SiteKind::Ghost);
             stmts = s;
             body = Some(b);
         }
@@ -1914,12 +2022,13 @@ impl Parser {
             while self.is_tagged_pred_start() {
                 let tag = self.expect_lower_ident()?;
                 self.expect(Token::Colon)?;
-                let expr = self.parse_expr()?;
+                let expr = self.parse_ghost_expr()?;
                 ensures.push((tag, expr));
             }
         }
 
         self.expect_kw("end")?;
+        self.site(law_start, SiteKind::Law(name.clone()));
         Ok(LawDecl {
             name,
             type_params,
@@ -1934,6 +2043,7 @@ impl Parser {
     }
 
     fn parse_routine(&mut self) -> Result<RoutineDecl, ParseError> {
+        let routine_start = self.pos;
         let name = self.expect_lower_ident()?;
         let mut type_params = Vec::new();
         if *self.peek() == Token::LBracket {
@@ -1962,7 +2072,12 @@ impl Parser {
         }
         self.expect(Token::Colon)?;
         let ret_type = self.parse_type()?;
-        self.finish_routine_after_sig(name, type_params, params, ret_type)
+        let label = name.clone();
+        let routine = self.finish_routine_after_sig(name, type_params, params, ret_type)?;
+        let fact = routine.ret_type == "BOOL"
+            && routine.ensures.iter().any(|(_, e)| *e == Expr::Var("Result".to_string()));
+        self.site(routine_start, SiteKind::Routine { name: label, fact });
+        Ok(routine)
     }
 
     fn finish_routine_after_sig(
@@ -1978,7 +2093,9 @@ impl Parser {
             while self.is_tagged_pred_start() {
                 let tag = self.expect_lower_ident()?;
                 self.expect(Token::Colon)?;
-                let expr = self.parse_expr()?;
+                let start = self.pos;
+                let expr = self.parse_ghost_expr()?;
+                self.site(start, SiteKind::Require);
                 requires.push((tag, expr));
             }
         }
@@ -1986,15 +2103,17 @@ impl Parser {
         let mut variant = Vec::new();
         if self.is_kw("variant") {
             self.next();
-            variant.push(self.parse_expr()?);
+            variant.push(self.parse_ghost_expr()?);
             while *self.peek() == Token::Comma {
                 self.next();
-                variant.push(self.parse_expr()?);
+                variant.push(self.parse_ghost_expr()?);
             }
         }
 
         self.expect_kw("do")?;
+        let body_start = self.pos;
         let (stmts, body) = self.parse_block()?;
+        self.site(body_start, SiteKind::Body);
 
         let mut ensures = Vec::new();
         if self.is_kw("ensure") {
@@ -2002,7 +2121,7 @@ impl Parser {
             while self.is_tagged_pred_start() {
                 let tag = self.expect_lower_ident()?;
                 self.expect(Token::Colon)?;
-                let expr = self.parse_expr()?;
+                let expr = self.parse_ghost_expr()?;
                 ensures.push((tag, expr));
             }
         }
@@ -2044,7 +2163,7 @@ impl Parser {
                 while self.is_tagged_pred_start() {
                     let tag = self.expect_lower_ident()?;
                     self.expect(Token::Colon)?;
-                    let e = self.parse_expr()?;
+                    let e = self.parse_ghost_expr()?;
                     stmts.push(Stmt::Check(tag, e));
                 }
                 self.expect_kw("end")?;
@@ -2056,7 +2175,7 @@ impl Parser {
                 while self.is_tagged_pred_start() {
                     let tag = self.expect_lower_ident()?;
                     self.expect(Token::Colon)?;
-                    let e = self.parse_expr()?;
+                    let e = self.parse_ghost_expr()?;
                     stmts.push(Stmt::Assume(tag, e));
                 }
                 self.expect_kw("end")?;
@@ -2119,6 +2238,7 @@ impl Parser {
         let mut left = self.parse_and()?;
         while self.is_kw("or") {
             self.next();
+            self.site(self.pos - 1, SiteKind::Operator);
             let right = self.parse_and()?;
             left = Expr::BinOp("or".into(), Box::new(left), Box::new(right));
         }
@@ -2129,6 +2249,7 @@ impl Parser {
         let mut left = self.parse_not()?;
         while self.is_kw("and") {
             self.next();
+            self.site(self.pos - 1, SiteKind::Operator);
             let right = self.parse_not()?;
             left = Expr::BinOp("and".into(), Box::new(left), Box::new(right));
         }
@@ -2157,6 +2278,7 @@ impl Parser {
             };
             let op_str = op.to_string();
             self.next();
+            self.site(self.pos - 1, SiteKind::Operator);
             let right = self.parse_bitwise_or()?;
             left = if op_str == "!=" {
                 // `a != b` is `not (a = b)`, so it uses exactly the equality of `=` (§9).
@@ -2264,41 +2386,25 @@ impl Parser {
     }
 
     fn parse_postfix(&mut self) -> Result<Expr, ParseError> {
+        let start = self.pos;
         let mut expr = self.parse_primary()?;
         loop {
+            let receiver = start..self.pos;
             if *self.peek() == Token::Dot {
                 self.next();
                 let member = self.expect_ident()?;
                 let mut args = Vec::new();
+                let mut ranges = Vec::new();
                 if *self.peek() == Token::LParen {
                     self.next();
-                    if *self.peek() == Token::RParen {
-                        self.next();
-                    } else {
-                        while *self.peek() != Token::RParen {
-                            args.push(self.parse_expr()?);
-                            if *self.peek() == Token::Comma {
-                                self.next();
-                            }
-                        }
-                        self.expect(Token::RParen)?;
-                    }
+                    (args, ranges) = self.parse_args()?;
                 }
+                self.site(start, SiteKind::Call { receiver: Some(receiver), args: ranges });
                 expr = Expr::MethodCall(Box::new(expr), member, args);
             } else if *self.peek() == Token::LParen && self.same_line(self.pos - 1, self.pos) {
                 self.next();
-                let mut args = Vec::new();
-                if *self.peek() == Token::RParen {
-                    self.next();
-                } else {
-                    while *self.peek() != Token::RParen {
-                        args.push(self.parse_expr()?);
-                        if *self.peek() == Token::Comma {
-                            self.next();
-                        }
-                    }
-                    self.expect(Token::RParen)?;
-                }
+                let (args, ranges) = self.parse_args()?;
+                self.site(start, SiteKind::Call { receiver: None, args: ranges });
                 expr = Expr::MethodCall(Box::new(expr), "apply".to_string(), args);
             } else {
                 break;
@@ -2462,7 +2568,9 @@ impl Parser {
         }
         if self.is_kw("if") {
             self.next();
+            let start = self.pos;
             let cond = self.parse_expr()?;
+            self.site(start, SiteKind::Condition);
             self.expect_kw("then")?;
             let (t_stmts, t_expr) = self.parse_block()?;
             self.expect_kw("else")?;
@@ -2478,21 +2586,32 @@ impl Parser {
         }
         if self.is_kw("match") {
             self.next();
+            let match_start = self.pos - 1;
             let scrut = self.parse_expr()?;
             let mut cases = Vec::new();
+            let mut arms = Vec::new();
             while self.is_kw("case") {
                 self.next();
                 let pat = self.parse_pattern()?;
                 self.expect_kw("then")?;
+                let start = self.pos;
                 let (stmts, body) = self.parse_block()?;
+                let mut names = Vec::new();
+                pattern_binders(&pat, &mut names);
+                arms.push((start..self.pos, names));
                 cases.push(MatchCase::new(pat, stmts, body));
             }
             self.expect_kw("end")?;
+            self.site(match_start, SiteKind::Arms(arms));
             return Ok(Expr::Match(Box::new(scrut), cases));
         }
 
+        let start = self.pos;
         match self.next() {
-            Token::Int(n) => Ok(Expr::Int(n)),
+            Token::Int(n) => {
+                self.site(start, SiteKind::Literal);
+                Ok(Expr::Int(n))
+            }
             Token::Float(f) => Ok(Expr::Float(f)),
             Token::Char(c) => Ok(Expr::Char(c as u32)),
             Token::Str(s) => Ok(Expr::Str(s)),
@@ -2555,10 +2674,9 @@ impl Parser {
                 }
             }
             Token::Ident(name) => {
-                if name == "True" {
-                    return Ok(Expr::Bool(true));
-                } else if name == "False" {
-                    return Ok(Expr::Bool(false));
+                if name == "True" || name == "False" {
+                    self.site(start, SiteKind::Literal);
+                    return Ok(Expr::Bool(name == "True"));
                 }
                 let name = if *self.peek() == Token::ColonColon {
                     self.next();
@@ -2568,18 +2686,8 @@ impl Parser {
                 };
                 if *self.peek() == Token::LParen && self.same_line(self.pos - 1, self.pos) {
                     self.next();
-                    let mut args = Vec::new();
-                    if *self.peek() == Token::RParen {
-                        self.next();
-                    } else {
-                        while *self.peek() != Token::RParen {
-                            args.push(self.parse_expr()?);
-                            if *self.peek() == Token::Comma {
-                                self.next();
-                            }
-                        }
-                        self.expect(Token::RParen)?;
-                    }
+                    let (args, ranges) = self.parse_args()?;
+                    self.site(start, SiteKind::Call { receiver: None, args: ranges });
                     Ok(Expr::Call(name, args))
                 } else {
                     Ok(Expr::Var(name))
@@ -16881,6 +16989,7 @@ const VERIFIER_SOURCES: &[(&str, &str)] = &[
     ("host_files.rs", include_str!("host_files.rs")),
     ("main.rs", include_str!("main.rs")),
     ("manifest.rs", include_str!("manifest.rs")),
+    ("mutate_cmd.rs", include_str!("mutate_cmd.rs")),
     ("names.rs", include_str!("names.rs")),
     ("patterns.rs", include_str!("patterns.rs")),
     ("proof_cache.rs", include_str!("proof_cache.rs")),
@@ -17117,7 +17226,9 @@ fn run_boogie_verification(
                 all.push(d);
             }
         }
-        if newly_failed.is_empty() {
+        // A failure in any pass is a genuine one, so a run that only asks whether there is one
+        // needs no other pass.
+        if newly_failed.is_empty() || ONE_PASS.with(|o| o.get()) {
             break;
         }
         untrusted.extend(newly_failed);
@@ -17200,6 +17311,15 @@ thread_local! {
     static BOOGIE_Z3_RLIMIT: std::cell::RefCell<Option<u64>> = const { std::cell::RefCell::new(None) };
     /// `--no-verify`: Boogie resolves and type checks each module and proves nothing.
     static TYPES_ONLY: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// `--fail-fast`: a module with a failure is not verified again to find every other one.
+    static ONE_PASS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+fn with_one_pass<R>(on: bool, f: impl FnOnce() -> R) -> R {
+    let prev = ONE_PASS.with(|o| o.replace(on));
+    let res = f();
+    ONE_PASS.with(|o| o.set(prev));
+    res
 }
 
 /// Runs `f` with Boogie type checking only (`--no-verify`), proving nothing.
@@ -22001,7 +22121,8 @@ fn looks_like_input(s: &str) -> bool {
 }
 
 /// Flags followed by a value.
-const VALUE_FLAGS: &[&str] = &["--fuel", "--z3-seed", "--z3-rlimit", "--project", "--compare-with"];
+const VALUE_FLAGS: &[&str] =
+    &["--fuel", "--z3-seed", "--z3-rlimit", "--project", "--compare-with", "--fail-fast"];
 /// Flags with no value, or with an optional one (`--inspect`, `--emit-stdlib`).
 const PLAIN_FLAGS: &[&str] = &[
     "--stdlib",
@@ -22084,6 +22205,9 @@ pub struct VerifyOptions {
     pub packages: HashMap<String, String>,
     /// The local verification cache. `None` runs the solver on every module.
     pub cache: Option<Rc<ProofCache>>,
+    /// `--fail-fast M`: module `M` is checked first, and the run stops at the first module
+    /// with an error, after the solver's first pass over it.
+    pub fail_fast: Option<String>,
 }
 
 /// Outcome of checking and verifying all modules of a run.
@@ -22174,7 +22298,16 @@ pub fn check_and_verify_project(units: &mut [SourceUnit], opts: VerifyOptions) -
     }
 
     let mut diags: Vec<(usize, Diagnostic)> = Vec::new();
-    for (ui, u) in units.iter().enumerate() {
+    // `--fail-fast`: the file with the module named comes first.
+    let mut order: Vec<usize> = (0..units.len()).collect();
+    if let Some(first) = &opts.fail_fast {
+        order.sort_by_key(|&ui| !units[ui].ast.modules.iter().any(|m| m.name == *first));
+    }
+    for ui in order {
+        let u = &units[ui];
+        if opts.fail_fast.is_some() && diags.iter().any(|(_, d)| d.level == "error") {
+            break;
+        }
         if opts.project_mode {
             for d in check_file_module_name(u, opts.strict) {
                 diags.push((ui, d));
@@ -22192,15 +22325,17 @@ pub fn check_and_verify_project(units: &mut [SourceUnit], opts: VerifyOptions) -
                     with_proof_cache(opts.cache.clone(), || {
                         with_z3_seed(opts.z3_seed, || {
                             with_z3_rlimit(opts.z3_rlimit, || {
-                                verify_module_phase3(
-                                    m,
-                                    &u.src,
-                                    &u.path,
-                                    opts.fuel_limit,
-                                    opts.strict,
-                                    opts.audit || package.is_some(),
-                                    opts.bounded_check,
-                                )
+                                with_one_pass(opts.fail_fast.is_some(), || {
+                                    verify_module_phase3(
+                                        m,
+                                        &u.src,
+                                        &u.path,
+                                        opts.fuel_limit,
+                                        opts.strict,
+                                        opts.audit || package.is_some(),
+                                        opts.bounded_check,
+                                    )
+                                })
                             })
                         })
                     })
@@ -22259,6 +22394,7 @@ fn verify_embedded_prelude(cache: Option<Rc<ProofCache>>) -> Vec<Diagnostic> {
             z3_rlimit: None,
             packages: HashMap::new(),
             cache,
+            fail_fast: None,
         },
     );
     let mut failed = checked.fatal;
@@ -22368,11 +22504,15 @@ fn main() {
     if args.get(1).is_some_and(|a| a == "test") {
         std::process::exit(test_cmd::run(&args[2..]));
     }
+    if args.get(1).is_some_and(|a| a == "mutate") {
+        std::process::exit(mutate_cmd::run(&args[2..]));
+    }
     if args.len() < 2 && !std::path::Path::new("Gardel.toml").is_file() {
         eprintln!(
             "Usage: gardelc <input.gdl ... | DIR | --project <DIR> | --stdlib> [--no-prelude] [--inspect [MODULE]] [--emit-stdlib [DIR]] [--json-diagnostics] [--fuel <N>] [--z3-seed <N>] [--z3-rlimit <N>] [--audit] [--strict] [--bounded-check] [--verify-deps] [--run] [--no-verify]"
         );
         eprintln!("       gardelc test [DIR] [--filter <NAME>]  verify, build and run each program of DIR/tests (§4.2)");
+        eprintln!("       gardelc mutate [DIR] [--only <MODULE>] [--limit <N>] [--seed <N>] [--jobs <N>] [--list]  change the package's code in small ways, and report the changes that neither its proofs nor its tests refuse (§4.2)");
         eprintln!(
             "  --no-verify  with --inspect: show the short forms after type checking, proving nothing"
         );
@@ -22388,6 +22528,7 @@ fn main() {
         eprintln!(
             "  --verify-deps  ignore the local verification cache and run the solver on every module"
         );
+        eprintln!("  --fail-fast <MODULE>  check MODULE first, and stop at the first module with an error");
         eprintln!(
             "  --compare-with <DIR>  after verifying, report what would break a client of the older version in DIR"
         );
@@ -22473,6 +22614,20 @@ fn main() {
                 "gardelc",
                 "invalid_arguments",
                 "--compare-with: expected the directory of the older version".to_string(),
+                "",
+            ),
+        },
+    };
+    let fail_fast = match args.iter().position(|a| a == "--fail-fast") {
+        None => None,
+        Some(i) => match args.get(i + 1).filter(|v| !v.starts_with("--")) {
+            Some(name) => Some(name.clone()),
+            None => exit_with_frontend_error(
+                json_mode,
+                "Command Line",
+                "gardelc",
+                "invalid_arguments",
+                "--fail-fast: expected the module to check first".to_string(),
                 "",
             ),
         },
@@ -22842,6 +22997,7 @@ fn main() {
         z3_rlimit,
         packages: packages.clone(),
         cache: proof_cache.clone(),
+        fail_fast,
     };
     let mut checked = with_types_only(no_verify, || check_and_verify_project(&mut units, opts));
     if verify_deps && prelude_mode && !bounded_check {
@@ -23721,6 +23877,7 @@ end
             z3_rlimit: None,
             packages: HashMap::new(),
             cache: None,
+            fail_fast: None,
         };
         let checked = check_and_verify_project(&mut units, opts);
         assert!(
@@ -28899,6 +29056,7 @@ end
             z3_rlimit: Some(DEFAULT_Z3_RLIMIT),
             packages: HashMap::new(),
             cache: None,
+            fail_fast: None,
         };
 
         let dir_res = check_and_verify_project(&mut dir_units, opts.clone());
@@ -30385,6 +30543,7 @@ end
             z3_rlimit: None,
             packages: HashMap::new(),
             cache: None,
+            fail_fast: None,
         }
     }
 

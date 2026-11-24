@@ -17,21 +17,6 @@ reactive program TODO_API
 
 feature {ANY}
 
-  -- `ts` as items after those of the array `acc`, while they fit.
-  array_of(ts: LIST[TODO], acc: JSON): JSON
-    variant
-      ts.length
-    do
-      if ts.length = 0 then
-        acc
-      else
-        match acc.with_item(ts.head.to_json)
-          case None then acc
-          case Some(more) then array_of(ts.tail, more)
-        end
-      end
-    end
-
   -- The todo whose id the path gives, if there is one.
   named(s: TODO_STORE, r: REST_REQUEST): OPTION[TODO]
     do
@@ -50,7 +35,10 @@ feature {ANY}
 
   list_todos(s: TODO_STORE, r: REST_REQUEST): HTTP_RESPONSE
     do
-      REST_RESPONSE.ok_json(array_of(s.all, JSON.empty_array))
+      match JSON_ARRAY.of(LIST_OPS.map(s.all, fn(t: TODO): JSON do t.to_json end))
+        case None then REST_RESPONSE.error(HTTP_STATUS.internal_server_error, "a todo nests too deep")
+        case Some(v) then REST_RESPONSE.ok_json(v)
+      end
     end
 
   get_todo(s: TODO_STORE, r: REST_REQUEST): HTTP_RESPONSE

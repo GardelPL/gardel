@@ -288,6 +288,25 @@ feature {ANY}
       end
     end
 
+  -- The array with `v` before its first item, if this is an array and the result is not
+  -- nested deeper than `max_depth`. It takes constant time in the length of the array, where
+  -- `with_item` walks it.
+  with_first(v: JSON): OPTION[JSON]
+    do
+      match Current.cell
+        case JArray(its) then
+          if v.cell.fits(63) then
+            check
+              v_fits: JSON_CELL.fits_ok(v.cell, 64, 63)
+            end
+            Some({ cell = JArray(JItem(v.cell, its)) })
+          else
+            None
+          end
+        case _ then None
+      end
+    end
+
   -- The object with `key` set to `v`, replacing any value it had, if this is an object and
   -- the result is not nested deeper than `max_depth`.
   with_field(key: STRING, v: JSON): OPTION[JSON]
@@ -452,7 +471,133 @@ specify {ANY}
       read_back: JSON.parse(v.to_bytes) = Ok(v)
     end
 
+  -- On an empty array the first item is the last.
+  law with_first_of_empty(v: JSON)
+    trigger
+      JSON.empty_array.with_first(v)
+    do
+      JSON.first_of_empty(v)
+    ensure
+      same: JSON.empty_array.with_first(v) = JSON.empty_array.with_item(v)
+    end
+
+  -- Items put at the two ends may be put in either order.
+  law with_first_then_item(a: JSON, v: JSON, w: JSON)
+    trigger
+      a.with_first(v), a.with_item(w)
+    do
+      JSON.ends_apart(a, v, w)
+    ensure
+      same: (match a.with_first(v)
+        case Some(b) then b.with_item(w)
+        case None then None
+      end) = (match a.with_item(w)
+        case Some(b) then b.with_first(v)
+        case None then None
+      end)
+    end
+
 create {NONE}
+
+  -- The proof of `with_first_of_empty`.
+  first_of_empty(v: JSON): BOOL
+    do
+      check
+        none: JSON_CELL.reverse_items(JEnd, JEnd) = JEnd
+        one: JSON_CELL.reverse_items(JItem(v.cell, JEnd), JEnd) = JSON_CELL.reverse_items(JEnd, JItem(v.cell, JEnd))
+        one_is: JSON_CELL.reverse_items(JEnd, JItem(v.cell, JEnd)) = JItem(v.cell, JEnd)
+      end
+      True
+    ensure
+      holds: Result
+      same: JSON.empty_array.with_first(v) = JSON.empty_array.with_item(v)
+    end
+
+  -- The array `with_item` gives, as a chain with `w` before its end.
+  with_item_cell(a: JSON, w: JSON): BOOL
+    do
+      match a.cell
+        case JArray(its) then
+          check
+            turned: JSON_CELL.reverse_items_twice(its, JEnd, JItem(w.cell, JEnd))
+            none: JSON_CELL.reverse_items(JEnd, JSON_CELL.ending_in(its, JItem(w.cell, JEnd))) = JSON_CELL.ending_in(its, JItem(w.cell, JEnd))
+            step: JSON_CELL.reverse_items(JItem(w.cell, JSON_CELL.reverse_items(its, JEnd)), JEnd) = JSON_CELL.reverse_items(JSON_CELL.reverse_items(its, JEnd), JItem(w.cell, JEnd))
+          end
+          True
+        case _ then True
+      end
+    ensure
+      holds: Result
+      ends: match a.cell
+        case JArray(its) then (match a.with_item(w)
+          case Some(b) then w.cell.fits(63) and b.cell = JArray(JSON_CELL.ending_in(its, JItem(w.cell, JEnd)))
+          case None then not w.cell.fits(63)
+        end)
+        case _ then a.with_item(w).is_none
+      end
+    end
+
+  -- The proof of `with_first_then_item`.
+  ends_apart(a: JSON, v: JSON, w: JSON): BOOL
+    do
+      match a.cell
+        case JArray(its) then
+          check
+            on_a: JSON.with_item_cell(a, w)
+          end
+          if v.cell.fits(63) and w.cell.fits(63) then
+            check
+              v_fits: JSON_CELL.fits_ok(v.cell, 64, 63)
+              w_fits: JSON_CELL.fits_ok(w.cell, 64, 63)
+              reversed: JSON_CELL.reverse_items_ok(its, JEnd, 63)
+              added: JSON_CELL.reverse_items_ok(JItem(w.cell, JSON_CELL.reverse_items(its, JEnd)), JEnd, 63)
+            end
+            let first: JSON = { cell = JArray(JItem(v.cell, its)) }
+            let last: JSON = { cell = JArray(JSON_CELL.reverse_items(JItem(w.cell, JSON_CELL.reverse_items(its, JEnd)), JEnd)) }
+            check
+              is_first: a.with_first(v) = Some(first)
+              is_last: a.with_item(w) = Some(last)
+              on_first: JSON.with_item_cell(first, w)
+              both: last.with_first(v) = first.with_item(w)
+            end
+            True
+          else if v.cell.fits(63) then
+            check
+              v_fits: JSON_CELL.fits_ok(v.cell, 64, 63)
+            end
+            let first: JSON = { cell = JArray(JItem(v.cell, its)) }
+            check
+              is_first: a.with_first(v) = Some(first)
+              no_w: first.with_item(w).is_none
+            end
+            True
+          else if w.cell.fits(63) then
+            check
+              w_fits: JSON_CELL.fits_ok(w.cell, 64, 63)
+              reversed: JSON_CELL.reverse_items_ok(its, JEnd, 63)
+              added: JSON_CELL.reverse_items_ok(JItem(w.cell, JSON_CELL.reverse_items(its, JEnd)), JEnd, 63)
+            end
+            let last: JSON = { cell = JArray(JSON_CELL.reverse_items(JItem(w.cell, JSON_CELL.reverse_items(its, JEnd)), JEnd)) }
+            check
+              is_last: a.with_item(w) = Some(last)
+              no_v: last.with_first(v).is_none
+            end
+            True
+          else
+            True
+          end end end
+        case _ then True
+      end
+    ensure
+      holds: Result
+      same: (match a.with_first(v)
+        case Some(b) then b.with_item(w)
+        case None then None
+      end) = (match a.with_item(w)
+        case Some(b) then b.with_first(v)
+        case None then None
+      end)
+    end
 
   -- The proof of `scalar_round_trip`.
   scalar_read_back(v: JSON): BOOL

@@ -42,6 +42,7 @@ create {ANY}
       tag_set: Result.tag = t
       fresh: Result.sweeps_waited = 0
       timed: Result.sweeps_allowed = sweeps
+      head_set: Result.is_head = head
       closing_set: Result.closes = close
     end
 
@@ -116,6 +117,8 @@ feature {ANY}
   wire(resp: HTTP_RESPONSE): BYTES
     do
       HTTP_SERIALIZER.serialize_answer(resp, Current.head_only, Current.closing)
+    ensure
+      def: Result.equals(HTTP_SERIALIZER.serialize_answer(resp, Current.is_head, Current.closes))
     end
 
 end

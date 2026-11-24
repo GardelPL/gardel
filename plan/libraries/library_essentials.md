@@ -641,7 +641,7 @@ Client: `MAP.keys` consumers, `gtui` list views, `gtime` tables. Needs decision 
 
 #### Task H.4: `SET`, `QUEUE`, `HEAP` and `MAP` Laws
 
-**Status:** ✅ Done (2026-11-24), but for `HASH_MAP`, which waits for a client and H.0a.
+**Status:** ✅ Done (2026-11-24), but for `HASH_MAP`, which waits for a client (H.0a was done on 2026-11-16).
 
 Client: `grest`'s waiting table, which F.8 built as a list because `MAP` had no size law; the rate limiter (H.16); timers in `gtui`.
 
@@ -663,7 +663,7 @@ Client: `grest`'s waiting table, which F.8 built as a list because `MAP` had no 
   | 1,000 | 0.09 ms | 0.16 ms | 0.17 ms | 43 ms |
   | 10,000 | 0.31 ms | 1.3 ms | 1.4 ms | 4.9 s, a `500` |
 
-  Means over a keep-alive socket on one machine, each from one run: 300 requests for the `GET` and the `PUT` of one todo, 90 for `POST`, 5 for all. A request on one todo costs the key walk and the copy of the lists, which is linear as expected. `GET` of all is what does not scale: it grows with the square of the number of todos, and past 64 KiB it is the `500` that the example's README documents. A balanced tree would not change that. Its cause was not looked for; the walk of `MAP` is not it, as `values` gives the list as it is.
+  Means over a keep-alive socket on one machine, each from one run: 300 requests for the `GET` and the `PUT` of one todo, 90 for `POST`, 5 for all. A request on one todo costs the key walk and the copy of the lists, which is linear as expected. `GET` of all is what does not scale: it grows with the square of the number of todos, and past 64 KiB it is the `500` that the example's README documents. A balanced tree would not change that. Its cause was `JSON.with_item`, which walks the array for each item. It was fixed with H.10: `gjson` 0.2.0's `JSON_ARRAY.of` is linear, and `GET` of all now takes 0.8 ms, 7.8 ms and 86 ms (still a `500`).
 - [x] `module SET[K: ORD]` over `KEY_ORDER` directly: `has`, `add`, `remove`, `union`, `intersection`, `size`, with laws on `has`.
 - [x] `module QUEUE[A]`: two lists, amortized constant time, model `LIST[A]` (`items`). `push` asks for room, since `size` adds two lengths.
 - [x] `module HEAP[K: ORD]` on `ARRAY`: `push`, `pop_min`, `peek`. Proven: `peek` is at most every item, and `pop_min` removes one item.
@@ -818,12 +818,42 @@ Client: every package. Today each package's tests are a `cases.txt` read on stan
 
 Client: this plan's own rule. Phases E and F made well over a hundred mutations by hand, each on a private copy.
 
-- [ ] Mutation operators on `.gdl` source: a constant off by one, a comparison swapped (`<` and `<=`), a condition negated, a branch replaced by the other, a `require` or an invariant clause dropped, an argument pair swapped, a call's result replaced by its argument.
-- [ ] Each mutant is built in a private copy and run through verification and `gardelc test`. A mutant that passes both is a survivor.
-- [ ] Report: per mutant, what killed it, the verifier (with the clause) or a test (with its name). This is the split Phase F reports by hand, and it shows what is proven against what is only tested.
-- [ ] `--only <module>`, and a limit on the number of mutants, chosen by a seed.
-- [ ] A way to mark a mutant as equivalent, in a file beside the package, so it is not reported again.
-- Acceptance: on `grest`, the tool finds no survivor among the operators that Phase F's hand-made mutations covered. On a copy of `grest` with one test case removed, it finds one.
+**Status:** ✅ The tool is done (2026-11-24). Its acceptance test is met for eleven of `grest`'s modules, and not for the other six (see the results).
+
+- [x] Mutation operators on `.gdl` source: a constant off by one, a comparison swapped (`<` and `<=`), a condition negated, a branch replaced by the other, a `require` or an invariant clause dropped, an argument pair swapped, a call's result replaced by its argument.
+- [x] Each mutant is built in a private copy and run through verification and `gardelc test`. A mutant that passes both is a survivor.
+- [x] Report: per mutant, what killed it, the verifier (with the clause) or a test (with its name). This is the split Phase F reports by hand, and it shows what is proven against what is only tested.
+- [x] `--only <module>`, and a limit on the number of mutants, chosen by a seed.
+- [x] A way to mark a mutant as equivalent, in a file beside the package (`Gardel.mutants`, one a line as the report writes it, with the reason as a comment), so it is not reported again.
+- Acceptance: on `grest`, the tool finds no survivor among the operators that Phase F's hand-made mutations covered. On a copy of `grest` with one test case removed, it finds one. The second half is met. The first is met for the modules below only.
+
+**How it works.** The AST has no spans, so the parser records where each expression, clause and literal is when it is asked to (`parse_sites`), and a mutant is a change of the source text. `--fail-fast` verifies the mutated module first and stops at the first module with an error. Only code is changed, not what is ghost.
+
+**Results, on `grest` (2026-11-24).**
+
+| Run | Mutants | Verifier | Not proven | Test | Survived | Not a program |
+| :--- | :--- | :--- | :--- | :--- | :--- | :--- |
+| `REST_WAITING`, 0.8.0 | 102 | 50 | 0 | 0 | 6 | 46 |
+| `REST_WAITING`, 0.8.1, 1 marked | 104 | 58 | 0 | 0 | 0 | 46 |
+| 100 of the whole package, seed 1 | 100 | 28 | 1 | 5 | 9 | 57 |
+| The ten modules below, before | 688 | 209 | 8 | 114 | 16 | 341 |
+| Those ten and `REST_WAITING`, after, 8 marked | 782 | 265 | 12 | 118 | 0 | 387 |
+
+- The ten modules are `URL_TEXT`, `REQUEST_TARGET`, `PATH_PATTERN`, `PATH_SEGMENT`, `URL_ERROR`, `URL_PARAM`, `REST_WAIT`, `REST_ROUTE`, `REST_OUTCOME` and `REST_REQUEST`. The last run took 4759 s with 10 jobs.
+- `REST_WAITING`'s six were a real gap. That a held wait replaces an earlier one on its connection was unproven, and that tags are given in order was only a comment. Both are now stated (`holding_replaces`, `next_given`).
+- The ten modules' 16: seven were equivalent, and are marked. Two were a `require` that no proof needs, and are gone. Three are refused by a new clause (`PATH_PATTERN.segment_count`, `URL_PARAM.find`, `REST_WAIT.wire`). Four needed a case: a `+` in the name of a query field (two of them), a target with too many fields at the router, and an async handler given a tag, for which `cases.txt` has a new kind, `await`.
+- The 12 not proven all drop or move a limit (16 segments, 32 fields) and time out, so they were refused but not shown to be wrong. `cases.txt` has each limit and one past it.
+- With a case removed: `REQUEST_TARGET.read_query`'s `32 -> 31` is killed by a test with the whole `cases.txt`, and survives without the 32-field case.
+- **Not met: `REST_SERVER`, `REST_COMMANDS`, `REST_REPLIES`, `REST_RESPONSE`, `REST_ROUTER` and `REST_WAKE`.** They hold about 1,650 of the 2,440 mutants, and were only sampled. Eight of the sample's nine survivors are in four of them: `REST_SERVER` (5), `REST_REPLIES`, `REST_COMMANDS` and `REST_WAKE`. Most change what only the scripted runs in `gardelc/tests/grest.rs` exercise, which `mutate` does not run. Whether those runs kill them has not been checked. Moving them to `grest/tests`, with `SCRIPT.play`, would let the tool see them.
+
+**Known limits.**
+- Half the mutants are of the wrong type, and are refused in 0.3 s to 2 s. A survivor costs the whole package and its tests, about 5 minutes in `grest`.
+- A default routine of a concept is not mutated.
+- A condition that is one `=` gives two mutants that mean the same, negated and `!=`.
+- A call replaced by a part in parentheses, on the line after a `let`, can be read as a call of the `let`'s value (H.9's limit), so it is refused as ill-typed instead of tried.
+- Some mutations made by hand are not among the operators: a call to another routine (`off` for `on`), a whole field set to `MAP.empty`.
+
+**Totals, with the `GET /todos` fix.** All 564 tests pass: the 242 unit tests and 322 in 48 suites (the `gtui` frame-time test run alone). The stdlib is 0/0 (37 modules). Run on Windows only.
 
 ### Step 5: Time, hashes and configuration
 
