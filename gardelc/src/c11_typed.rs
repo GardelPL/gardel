@@ -74,6 +74,91 @@ fn retype_request(e: &str) -> Option<(&str, &str)> {
     e.strip_prefix(RETYPE)?.split_once('\u{0}')
 }
 
+/// The variable a chain of `set` and `swap` calls starts from (`a.set(i, x).swap(j, k)`
+/// starts from `a`), and the arguments of every call of the chain but the first. The first
+/// call's arguments are read before it changes the array; the others' after (Task H.5).
+fn array_chain(e: &Expr) -> Option<(&str, Vec<&Expr>)> {
+    let mut later = Vec::new();
+    let mut cur = e;
+    loop {
+        match cur {
+            Expr::MethodCall(recv, m, args) if (m == "set" || m == "swap") && args.len() == 2 => {
+                if let Expr::Var(v) = &**recv {
+                    return Some((v, later));
+                }
+                later.extend(args.iter());
+                cur = recv;
+            }
+            _ => return None,
+        }
+    }
+}
+
+/// The variable a chain of method calls starts from (`h.pop_min.push(x)` starts from `h`),
+/// when no argument of any call reads it (Task H.4).
+fn call_chain(e: &Expr) -> Option<&str> {
+    let mut args = Vec::new();
+    let mut cur = e;
+    loop {
+        match cur {
+            Expr::MethodCall(recv, _, xs) => {
+                args.extend(xs.iter());
+                if let Expr::Var(v) = &**recv {
+                    return (!args.iter().any(|a| mentions(a, v))).then_some(v.as_str());
+                }
+                cur = recv;
+            }
+            _ => return None,
+        }
+    }
+}
+
+/// Adds to `out` each field of `Current` that `e` reads. False when `e` may read `Current`
+/// in another way: whole, or through a routine that takes it. Only plain calls and
+/// operators are looked into (Task H.4).
+fn field_reads(e: &Expr, fields: &[String], owner: &str, cx: &Ctx, out: &mut Vec<String>) -> bool {
+    match e {
+        Expr::Int(_) | Expr::Float(_) | Expr::Char(_) | Expr::Unit | Expr::Bool(_) | Expr::Str(_) => true,
+        Expr::Var(v) if cx.local(v).is_some() => true,
+        Expr::Var(v) if fields.contains(v) => {
+            out.push(v.clone());
+            true
+        }
+        // A constructor: routines start in lower case, and may read `Current` themselves.
+        Expr::Var(v) if v.chars().next().is_some_and(|c| c.is_ascii_uppercase()) && v != "Current" => true,
+        Expr::Call(f, args) if f.chars().next().is_some_and(|c| c.is_ascii_uppercase()) => {
+            args.iter().all(|a| field_reads(a, fields, owner, cx, out))
+        }
+        Expr::UnaryNot(x) | Expr::UnaryNeg(x) => field_reads(x, fields, owner, cx, out),
+        Expr::BinOp(_, l, r) => field_reads(l, fields, owner, cx, out) && field_reads(r, fields, owner, cx, out),
+        Expr::MethodCall(recv, m, args) => {
+            let head = match &**recv {
+                Expr::Var(v) if v == "Current" => {
+                    if !args.is_empty() || !fields.contains(m) {
+                        return false;
+                    }
+                    out.push(m.clone());
+                    true
+                }
+                // `M.routine(..)` inside `M` may pass `Current`.
+                Expr::Var(v) if cx.local(v).is_none() && !fields.contains(v) => {
+                    v != owner && v.chars().next().is_some_and(|c| c.is_ascii_uppercase())
+                }
+                x => field_reads(x, fields, owner, cx, out),
+            };
+            head && args.iter().all(|a| field_reads(a, fields, owner, cx, out))
+        }
+        _ => false,
+    }
+}
+
+/// Whether `v` occurs free in `e`.
+fn mentions(e: &Expr, v: &str) -> bool {
+    let mut free = Vec::new();
+    expr_free_vars(e, &mut Vec::new(), &mut free);
+    free.iter().any(|f| f == v)
+}
+
 /// Operators whose result has the type of their operands.
 fn is_arith_op(op: &str) -> bool {
     matches!(op, "+" | "-" | "*" | "/" | "%" | "+%" | "-%" | "*%" | "&" | "|" | "^" | "<<" | ">>")
@@ -260,6 +345,18 @@ struct Ctx {
     fn_cname: String,
     /// The routine's C parameters, `Current` first.
     params: Vec<(String, String)>,
+    /// Arrays the next `set` or `swap` on them may take (Task H.5): the C name of a local
+    /// or parameter, and the C condition under which it is given (`true`, or `_owned` for a
+    /// parameter, which a loop owns after its first iteration).
+    gives: Vec<(String, String)>,
+    /// Like `moves`, the array parameters nothing evaluated after the next expression reads.
+    /// A loop owns them from its second iteration, so a `set` may take them then.
+    param_moves: Vec<String>,
+    /// The routine owns `Current`, which holds an array, so its result may take the array
+    /// out of it (Task H.4).
+    owns_current: bool,
+    /// The fields of `Current` that the record being built takes.
+    steals: Vec<String>,
 }
 
 impl Ctx {
@@ -357,12 +454,21 @@ pub(crate) struct TypedC<'a> {
     counter: usize,
     needs_validator: bool,
     needs_read_line: bool,
+    /// `IO.now` or `IO.random` (Task H.1).
+    needs_clock_random: bool,
+    needs_random: bool,
+    /// `IO.log` or `IO.env` (Task H.2).
+    needs_log_env: bool,
+    needs_log: bool,
+    needs_env: bool,
     /// The routine being emitted jumped to its own start (spec §10: tail calls are loops).
     tail_used: bool,
     needs_from_utf8: bool,
     /// Inside the argument of `IO.exit`: the process ends right after, so scopes do not
     /// release what they own (Task C.4.1).
     exiting: bool,
+    /// The routine being emitted gave a parameter to a `set` on the condition `_owned`.
+    owned_flag: bool,
     /// The expression being lowered may do unbounded work: it reaches a recursive routine,
     /// applies a function value or does IO (Task F.14). A `let` group forks only when at
     /// least two of its `let`s set it.
@@ -407,8 +513,14 @@ impl<'a> TypedC<'a> {
             counter: 0,
             needs_validator: false,
             needs_read_line: false,
+            needs_clock_random: false,
+            needs_random: false,
+            needs_log_env: false,
+            needs_log: false,
+            needs_env: false,
             tail_used: false,
             exiting: false,
+            owned_flag: false,
             needs_from_utf8: false,
             cost_hit: false,
             cost_memo: HashMap::new(),
@@ -452,6 +564,11 @@ impl<'a> TypedC<'a> {
             t if type_head(t) == "LIST" => {
                 let elem = split_type_app(t).1.first().map(|s| cnorm(s)).unwrap_or_default();
                 self.ensure_list(&elem)?;
+                format!("struct {}*", c_instance_name(t))
+            }
+            t if type_head(t) == "ARRAY" => {
+                let elem = split_type_app(t).1.first().map(|s| cnorm(s)).unwrap_or_default();
+                self.ensure_array(&elem)?;
                 format!("struct {}*", c_instance_name(t))
             }
             t => {
@@ -830,6 +947,102 @@ static bool {inst}__has(struct {inst}* xs, {ce} x) {{\n\
         Ok(())
     }
 
+    /// The `ARRAY[elem]` runtime (Task H.5): one counted block holding the length and the
+    /// items. Every routine borrows its array and returns a new one, except the `_give`
+    /// forms of `set` and `swap`, which take the array when `give` is true: with no other
+    /// reference they change it in place, and otherwise copy it and release it.
+    fn ensure_array(&mut self, elem: &str) -> Result<(), String> {
+        let at = format!("ARRAY[{elem}]");
+        let inst = c_instance_name(&at);
+        if !self.done_types.insert(inst.clone()) {
+            return Ok(());
+        }
+        let ce = self.ctype(elem)?;
+        self.ctype(&format!("LIST[{elem}]"))?;
+        let list = c_instance_name(&format!("LIST[{elem}]"));
+        let dup_x = self.dup(elem, "x")?;
+        let dup_y = self.dup(elem, "y")?;
+        let dup_i = self.dup(elem, "a->data[k]")?;
+        let dup_h = self.dup(elem, "xs->head")?;
+        let drop_k = self.drop_stmt(elem, "p->data[k]")?;
+        let drop_i = self.drop_stmt(elem, "a->data[i]")?;
+        let drop_i_copy = self.drop_stmt(elem, "r->data[i]")?;
+        self.struct_fwd.push(format!("struct {inst};\n"));
+        self.type_defs.push(format!(
+            "struct {inst} {{ _Atomic uint64_t _rc; uint64_t len; {ce} data[]; }};\n\
+             static inline struct {inst}* dup_{inst}(struct {inst}* p) {{\n    atomic_fetch_add_explicit(&p->_rc, 1, memory_order_relaxed);\n    return p;\n}}\n\n"
+        ));
+        self.rc_protos.push(format!("static void drop_{inst}(struct {inst}* p);\n"));
+        self.protos.push(format!(
+            "static struct {inst}* {inst}__make(uint64_t n, {ce} x);\n\
+             static struct {inst}* {inst}__from_list(struct {list}* xs);\n\
+             static struct {list}* {inst}__to_list(struct {inst}* a);\n\
+             static uint64_t {inst}__length(struct {inst}* a);\n\
+             static {ce} {inst}__at(struct {inst}* a, uint64_t i);\n\
+             static struct {inst}* {inst}__set_give(struct {inst}* a, uint64_t i, {ce} x, bool give);\n\
+             static struct {inst}* {inst}__swap_give(struct {inst}* a, uint64_t i, uint64_t j, bool give);\n\
+             static struct {inst}* {inst}__slice(struct {inst}* a, uint64_t lo, uint64_t hi);\n"
+        ));
+        // A copy of a counted item takes a reference; the old item at `i` is released after
+        // the new one is referenced, since `x` may be that very item (`a.set(i, a.at(i))`).
+        self.bodies.push(format!(
+            "/* ARRAY[{elem}] runtime (Task H.5): a counted block of items */\n\
+static size_t {inst}_bytes(uint64_t n) {{\n\
+    if (n > (SIZE_MAX - sizeof(struct {inst})) / sizeof({ce})) gardel_out_of_memory();\n\
+    return sizeof(struct {inst}) + (size_t)n * sizeof({ce});\n}}\n\
+static struct {inst}* {inst}_alloc(uint64_t n) {{\n\
+    struct {inst}* a = (struct {inst}*)gardel_alloc({inst}_bytes(n));\n\
+    atomic_init(&a->_rc, 1);\n    a->len = n;\n    return a;\n}}\n\
+static void drop_{inst}(struct {inst}* p) {{\n\
+    if (p && gardel_rc_release(&p->_rc)) {{\n\
+        for (uint64_t k = 0; k < p->len; k++) {{ {drop_k} }}\n\
+        gardel_free(p, {inst}_bytes(p->len));\n    }}\n}}\n\
+static struct {inst}* {inst}_copy(struct {inst}* a) {{\n\
+    GARDEL_ARRAY_COPY();\n\
+    struct {inst}* r = {inst}_alloc(a->len);\n\
+    for (uint64_t k = 0; k < a->len; k++) r->data[k] = {dup_i};\n\
+    return r;\n}}\n\
+static struct {inst}* {inst}__make(uint64_t n, {ce} x) {{\n\
+    struct {inst}* a = {inst}_alloc(n);\n\
+    for (uint64_t k = 0; k < n; k++) a->data[k] = {dup_x};\n\
+    return a;\n}}\n\
+static struct {inst}* {inst}__from_list(struct {list}* xs) {{\n\
+    struct {inst}* a = {inst}_alloc({list}__length(xs));\n\
+    for (uint64_t k = 0; xs; xs = xs->tail, k++) a->data[k] = {dup_h};\n\
+    return a;\n}}\n\
+static struct {list}* {inst}__to_list(struct {inst}* a) {{\n\
+    struct {list}* xs = NULL;\n\
+    for (uint64_t k = a->len; k > 0; k--) {{\n\
+        struct {list}* c = {list}__prepend(xs, a->data[k - 1]);\n\
+        drop_{list}(xs);\n        xs = c;\n    }}\n\
+    return xs;\n}}\n\
+static uint64_t {inst}__length(struct {inst}* a) {{\n    return a->len;\n}}\n\
+static {ce} {inst}__at(struct {inst}* a, uint64_t i) {{\n    return a->data[i];\n}}\n\
+/* Whether the array taken has no other reference, so that it can be changed in place. */\n\
+static bool {inst}_alone(struct {inst}* a) {{\n\
+    return atomic_load_explicit(&a->_rc, memory_order_acquire) == 1;\n}}\n\
+static struct {inst}* {inst}__set_give(struct {inst}* a, uint64_t i, {ce} x, bool give) {{\n\
+    {ce} y = {dup_x};\n\
+    if (give && {inst}_alone(a)) {{\n\
+        {drop_i}        a->data[i] = y;\n        return a;\n    }}\n\
+    struct {inst}* r = {inst}_copy(a);\n\
+    {drop_i_copy}    r->data[i] = y;\n\
+    if (give) drop_{inst}(a);\n\
+    return r;\n}}\n\
+static struct {inst}* {inst}__swap_give(struct {inst}* a, uint64_t i, uint64_t j, bool give) {{\n\
+    struct {inst}* r = a;\n\
+    if (!(give && {inst}_alone(a))) {{\n\
+        r = {inst}_copy(a);\n        if (give) drop_{inst}(a);\n    }}\n\
+    {ce} t = r->data[i];\n    r->data[i] = r->data[j];\n    r->data[j] = t;\n\
+    return r;\n}}\n\
+static struct {inst}* {inst}__slice(struct {inst}* a, uint64_t lo, uint64_t hi) {{\n\
+    struct {inst}* r = {inst}_alloc(hi - lo);\n\
+    for (uint64_t k = lo; k < hi; k++) {{ {ce} y = a->data[k]; r->data[k - lo] = {dup_y}; }}\n\
+    return r;\n}}\n\n"
+        ));
+        Ok(())
+    }
+
     /// `BYTES.to_list` and `BYTES.from_list`, which need the `LIST[U64]` runtime. Both borrow
     /// their argument and return a new value.
     fn list_bytes_helper(&mut self, which: &str) -> Result<String, String> {
@@ -888,6 +1101,69 @@ static bool {inst}__has(struct {inst}* xs, {ce} x) {{\n\
     buf[n] = '\\0';\n\
     GardelBytes b = {{ (const uint8_t*)buf, n, owner }};\n\
     return b;\n}}\n\n"
+            );
+            let proto = body.lines().next().unwrap_or_default().trim_end_matches(" {").to_string();
+            self.protos.push(format!("{proto};\n"));
+            self.bodies.push(body);
+        }
+        Ok(name)
+    }
+
+    /// `STRING.to_chars` (Task H.6): decodes the bytes from the end, so that each scalar is
+    /// prepended once. The bytes are well-formed UTF-8, as every `STRING`'s are.
+    fn string_chars_helper(&mut self) -> Result<String, String> {
+        self.ctype("LIST[CHAR]")?;
+        let inst = c_instance_name("LIST[CHAR]");
+        let name = "gardel_string_to_chars".to_string();
+        if self.done_helpers.insert(name.clone()) {
+            let body = format!(
+                "static struct {inst}* {name}(GardelString s) {{\n\
+    const uint8_t* p = (const uint8_t*)s.data;\n\
+    struct {inst}* xs = NULL;\n\
+    uint64_t i = s.len;\n\
+    while (i > 0) {{\n\
+        uint64_t j = i - 1;\n\
+        while ((p[j] & 0xC0) == 0x80) j--;\n\
+        uint32_t b0 = p[j], c;\n\
+        if (b0 < 0x80) c = b0;\n\
+        else if (b0 < 0xE0) c = ((b0 & 0x1F) << 6) | (p[j + 1] & 0x3F);\n\
+        else if (b0 < 0xF0) c = ((b0 & 0x0F) << 12) | ((uint32_t)(p[j + 1] & 0x3F) << 6) | (p[j + 2] & 0x3F);\n\
+        else c = ((b0 & 0x07) << 18) | ((uint32_t)(p[j + 1] & 0x3F) << 12) | ((uint32_t)(p[j + 2] & 0x3F) << 6) | (p[j + 3] & 0x3F);\n\
+        struct {inst}* n = {inst}__prepend(xs, c);\n\
+        drop_{inst}(xs);\n\
+        xs = n;\n\
+        i = j;\n\
+    }}\n\
+    return xs;\n}}\n\n"
+            );
+            let proto = body.lines().next().unwrap_or_default().trim_end_matches(" {").to_string();
+            self.protos.push(format!("{proto};\n"));
+            self.bodies.push(body);
+        }
+        Ok(name)
+    }
+
+    /// `STRING_BUILDER.join_reversed` (Task H.6): as `BYTES_BUILDER`'s, and the scalar count
+    /// is the sum of the parts'. Borrows the list.
+    fn string_join_reversed_helper(&mut self) -> Result<String, String> {
+        self.ctype("LIST[STRING]")?;
+        let inst = c_instance_name("LIST[STRING]");
+        let name = "gardel_string_join_reversed".to_string();
+        if self.done_helpers.insert(name.clone()) {
+            let body = format!(
+                "static GardelString {name}(struct {inst}* parts) {{\n\
+    uint64_t n = 0, chars = 0;\n\
+    for (struct {inst}* p = parts; p; p = p->tail) {{ n += p->head.len; chars += p->head.chars; }}\n\
+    void* owner = NULL;\n\
+    char* buf = gardel_buf_alloc((size_t)(n + 1), &owner);\n\
+    uint64_t at = n;\n\
+    for (struct {inst}* p = parts; p; p = p->tail) {{\n\
+        at -= p->head.len;\n\
+        if (p->head.len) memcpy(buf + at, p->head.data, (size_t)p->head.len);\n\
+    }}\n\
+    buf[n] = '\\0';\n\
+    GardelString s = {{ buf, n, chars, owner }};\n\
+    return s;\n}}\n\n"
             );
             let proto = body.lines().next().unwrap_or_default().trim_end_matches(" {").to_string();
             self.protos.push(format!("{proto};\n"));
@@ -1185,6 +1461,22 @@ static bool {inst}__has(struct {inst}* xs, {ce} x) {{\n\
         cname
     }
 
+    /// Whether a value of `ty` is a record with a field that is an array, as a `HEAP` is. A
+    /// routine that owns such a value may take the array out of it (Task H.4).
+    fn holds_array(&self, ty: &str) -> bool {
+        self.variant_fields(ty, None).is_some_and(|fs| fs.iter().any(|(_, t)| type_head(t) == "ARRAY"))
+    }
+
+    /// Whether `m` on a value of `ty` gives a value of `ty` back, as `push` does: the caller
+    /// may then give up its own.
+    fn gives_back(&self, ty: &str, m: &str) -> bool {
+        let Some(md) = self.module(type_head(ty)) else { return false };
+        Self::find_routine(md, m).is_some_and(|(rd, kind)| {
+            let ret = rd.ret_type.trim();
+            Self::has_current(md, kind) && (ret == "Current" || type_head(ret) == md.name)
+        })
+    }
+
     /// A routine whose body ends by storing a parameter in a new value, as `concat` does.
     /// The usual convention makes such a routine copy that parameter and its caller
     /// release it, so a caller finished with the value gives it to a variant instead.
@@ -1216,48 +1508,66 @@ static bool {inst}__has(struct {inst}* xs, {ce} x) {{\n\
         let self_ty = Self::self_type(md, &req.mod_targs);
         tmap.insert("Current".into(), self_ty.clone());
         let has_cur = Self::has_current(md, kind);
-        let mut cx = Ctx {
-            owner: md.name.clone(),
-            self_ty: if md.kind == ModuleKind::Module { Some(self_ty.clone()) } else { None },
-            tmap: tmap.clone(),
-            locals: Vec::new(),
-            used: HashSet::new(),
-            tail: true,
-            tail_site: false,
-            tail_drops: Vec::new(),
-            moves: Vec::new(),
-            moved: Vec::new(),
-            sink_params: Vec::new(),
-            fn_cname: req.cname.clone(),
-            params: Vec::new(),
-        };
-        self.tail_used = false;
-        self.nontail_self = false;
-        self.pending_groups.clear();
-        cx.used.insert("Current".into());
-        let mut params = Vec::new();
-        if has_cur {
-            params.push(format!("{} Current", self.ctype(&self_ty)?));
-            cx.params.push(("Current".to_string(), self_ty.clone()));
-        }
-        for (p, t) in &rd.params {
-            let ty = subst(t, &tmap);
-            let ct = self.ctype(&ty)?;
-            let cn = cx.bind(p, &ty);
-            params.push(format!("{ct} {cn}"));
-            cx.params.push((cn, ty));
-        }
-        if req.sink {
-            cx.sink_params = cx.params.clone();
-        }
         let ret = subst(&rd.ret_type, &tmap);
         let cret = self.ctype(&ret)?;
-        let body = self.lower_block(&mut cx, &rd.stmts, &rd.body, Some(&ret), has_cur)?;
-        let body = self.own(body)?;
-        let body = self.settle_groups(body);
-        if req.sink && self.tail_used {
-            return Err("a routine that owns its parameters cannot be a loop".into());
-        }
+        // A routine that owns its parameters and is a loop (Task H.5) is lowered again as a
+        // loop that owns them from its first iteration.
+        // So is one that branches: an array may be taken in one branch and not in another,
+        // which only a parameter that is released if it still holds something allows.
+        let branches = matches!(&rd.body, Expr::If(..) | Expr::Match(..));
+        let mut owns_loop = req.sink && branches && !Self::is_sink(md, rd);
+        let (cx, params, body) = loop {
+            let mut cx = Ctx {
+                owner: md.name.clone(),
+                self_ty: if md.kind == ModuleKind::Module { Some(self_ty.clone()) } else { None },
+                tmap: tmap.clone(),
+                locals: Vec::new(),
+                used: HashSet::new(),
+                tail: true,
+                tail_site: false,
+                tail_drops: Vec::new(),
+                moves: Vec::new(),
+                moved: Vec::new(),
+                sink_params: Vec::new(),
+                fn_cname: req.cname.clone(),
+                params: Vec::new(),
+                gives: Vec::new(),
+                param_moves: Vec::new(),
+                owns_current: false,
+                steals: Vec::new(),
+            };
+            self.tail_used = false;
+            self.nontail_self = false;
+            self.pending_groups.clear();
+            cx.used.insert("Current".into());
+            let mut params = Vec::new();
+            if has_cur {
+                params.push(format!("{} Current", self.ctype(&self_ty)?));
+                cx.params.push(("Current".to_string(), self_ty.clone()));
+            }
+            for (p, t) in &rd.params {
+                let ty = subst(t, &tmap);
+                let ct = self.ctype(&ty)?;
+                let cn = cx.bind(p, &ty);
+                params.push(format!("{ct} {cn}"));
+                cx.params.push((cn, ty));
+            }
+            if req.sink && !owns_loop {
+                cx.sink_params = cx.params.clone();
+            } else {
+                cx.param_moves = cx.params.iter().filter(|(c, t)| c != "Current" && (type_head(t) == "ARRAY" || self.holds_array(t))).map(|(c, _)| c.clone()).collect();
+            }
+            cx.owns_current = req.sink && has_cur && self.holds_array(&self_ty);
+            self.owned_flag = false;
+            let body = self.lower_block(&mut cx, &rd.stmts, &rd.body, Some(&ret), has_cur)?;
+            let body = self.own(body)?;
+            let body = self.settle_groups(body);
+            if req.sink && self.tail_used && !owns_loop {
+                owns_loop = true;
+                continue;
+            }
+            break (cx, params, body);
+        };
         let sig = format!(
             "static {cret} {}({})",
             req.cname,
@@ -1265,9 +1575,16 @@ static bool {inst}__has(struct {inst}* xs, {ce} x) {{\n\
         );
         self.protos.push(format!("{sig};\n"));
         let code = if self.tail_used {
-            // Parameters are borrowed on the first iteration and owned after a tail call.
+            // Parameters are borrowed on the first iteration and owned after a tail call, or
+            // owned from the first in a routine that owns its parameters.
             let drops = self.param_drops(&cx)?;
-            format!("    bool _owned = false;\n_tail:;\n    {cret} _res = {body};\n    if (_owned) {{\n{drops}}}\n    return _res;\n")
+            format!("    bool _owned = {owns_loop};\n_tail:;\n    {cret} _res = {body};\n    if (_owned) {{\n{drops}}}\n    return _res;\n")
+        } else if owns_loop {
+            let drops = self.param_drops(&cx)?;
+            format!("    bool _owned = true;\n    {cret} _res = {body};\n    if (_owned) {{\n{drops}}}\n    return _res;\n")
+        } else if self.owned_flag {
+            // A `set` gave a parameter on the condition that the routine owns it: it does not.
+            format!("    const bool _owned = false;\n    return {body};\n")
         } else {
             format!("    return {body};\n")
         };
@@ -1320,6 +1637,7 @@ static bool {inst}__has(struct {inst}* xs, {ce} x) {{\n\
         for (cn, ty) in cx.tail_drops.iter().rev() {
             code.push_str(&self.drop_stmt(ty, cn)?);
         }
+        // A parameter a `set` took (Task H.5) is NULL, which releases nothing.
         let drops = self.param_drops(cx)?;
         let cret = self.ctype(ret)?;
         self.tail_used = true;
@@ -1361,9 +1679,11 @@ static bool {inst}__has(struct {inst}* xs, {ce} x) {{\n\
         let depth = cx.tail_drops.len();
         let mut retyped: HashMap<String, String> = HashMap::new();
         let sink_params = std::mem::take(&mut cx.sink_params);
+        let param_moves = std::mem::take(&mut cx.param_moves);
         loop {
             cx.tail = tail;
             cx.sink_params = sink_params.clone();
+            cx.param_moves = param_moves.clone();
             let res = self.lower_block_once(cx, stmts, body, expect, has_cur, &retyped);
             cx.tail_drops.truncate(depth);
             let Err(e) = &res else { return res };
@@ -1399,6 +1719,8 @@ static bool {inst}__has(struct {inst}* xs, {ce} x) {{\n\
         let mark = cx.locals.len();
         let mut code = String::new();
         let mut owned_locals: Vec<(String, String)> = std::mem::take(&mut cx.sink_params);
+        // Parameters nothing after this block reads (Task H.5).
+        let inherited: Vec<(String, String)> = std::mem::take(&mut cx.param_moves).into_iter().map(|c| (c, String::new())).collect();
         let groups = analyze_parallel_lets(stmts);
         // The declared type of each `let`, in the order `groups` holds them.
         let mut declared = stmts.iter().enumerate().filter(|(_, s)| matches!(s, Stmt::Let(..))).map(|(i, _)| crate::declared_let_type(stmts, i));
@@ -1408,8 +1730,10 @@ static bool {inst}__has(struct {inst}* xs, {ce} x) {{\n\
                 let want = declared.next().flatten();
                 let soft = want.is_none() && !retyped.contains_key(v) && cx.untyped_num(e);
                 cx.moves = Self::unused_after(cx, &owned_locals, &groups[at + 1..], body);
+                cx.param_moves = Self::unused_after(cx, &inherited, &groups[at + 1..], body);
                 let x = self.lower(cx, e, want.or(retyped.get(v).map(String::as_str)), has_cur);
                 cx.moves.clear();
+                cx.param_moves.clear();
                 Self::settle_moves(cx, &mut owned_locals);
                 let x = x?;
                 Self::check_declared(v, want, &x.ty)?;
@@ -1506,8 +1830,10 @@ static bool {inst}__has(struct {inst}* xs, {ce} x) {{\n\
         }
         // Nothing of this block runs after its result, so all its locals may be taken over.
         cx.moves = owned_locals.iter().map(|(cn, _)| cn.clone()).collect();
+        cx.param_moves = inherited.iter().map(|(cn, _)| cn.clone()).collect();
         let b = self.lower(cx, body, expect, has_cur);
         cx.moves.clear();
+        cx.param_moves.clear();
         Self::settle_moves(cx, &mut owned_locals);
         let b = b?;
         cx.locals.truncate(mark);
@@ -1762,6 +2088,49 @@ static bool {inst}__has(struct {inst}* xs, {ce} x) {{\n\
         if let Some(e) = expect {
             unify(&fix_cur(&rd.ret_type), e, &tps, &mut map);
         }
+        // An argument that is a chain of `set` and `swap` on an array nothing after this call
+        // reads may take it (Task H.5), as `fill(a.set(i, x), i + 1)` does in a loop. No
+        // other argument may read it, since C evaluates them in no fixed order, and the
+        // receiver must be a name, which reads nothing.
+        let param_moves = std::mem::take(&mut cx.param_moves);
+        let mut chain_gives: Vec<String> = Vec::new();
+        let plain_recv = recv.as_ref().is_none_or(|rv| rv.code.chars().all(|c| c.is_ascii_alphanumeric() || c == '_'));
+        for (k, a) in args.iter().enumerate() {
+            let Some((v, later)) = array_chain(a) else { continue };
+            let Some(l) = cx.local(v) else { continue };
+            let give = if moves.contains(&l.cname) {
+                "true"
+            } else if param_moves.contains(&l.cname) {
+                "_owned"
+            } else {
+                continue;
+            };
+            let receiver = recv.as_ref().is_some_and(|rv| rv.code == l.cname);
+            let elsewhere = args.iter().enumerate().any(|(j, b)| j != k && mentions(b, v)) || later.iter().any(|b| mentions(b, v));
+            if type_head(&l.ty) == "ARRAY" && plain_recv && !receiver && !elsewhere {
+                chain_gives.push(l.cname.clone());
+                cx.gives.push((l.cname.clone(), give.to_string()));
+            }
+        }
+        // So may a chain of calls on a record that holds an array, as `fill(h.push(x), i + 1)`
+        // (Task H.4).
+        for (k, a) in args.iter().enumerate() {
+            let Some(v) = call_chain(a) else { continue };
+            let Some(l) = cx.local(v) else { continue };
+            let give = if moves.contains(&l.cname) {
+                "true"
+            } else if param_moves.contains(&l.cname) {
+                "_owned"
+            } else {
+                continue;
+            };
+            let receiver = recv.as_ref().is_some_and(|rv| rv.code == l.cname);
+            let elsewhere = args.iter().enumerate().any(|(j, b)| j != k && mentions(b, v));
+            if plain_recv && !receiver && !elsewhere && self.holds_array(&l.ty) {
+                chain_gives.push(l.cname.clone());
+                cx.gives.push((l.cname.clone(), give.to_string()));
+            }
+        }
         let mut lowered: Vec<Option<V>> = vec![None; args.len()];
         for (i, ((_, pt), a)) in rd.params.iter().zip(args).enumerate() {
             let pt = subst(&fix_cur(pt), &map);
@@ -1806,11 +2175,27 @@ static bool {inst}__has(struct {inst}* xs, {ce} x) {{\n\
                 }
             }
         }
+        // A static routine whose signature names none of its module's type parameters, as
+        // `GENERATOR.iterate[T](x: T, ..): GENERATOR[T, T]`, is the same for every instance
+        // of them; any one will do (Task H.22).
+        if !Self::has_current(md, kind) {
+            let sig: Vec<String> = rd.params.iter().map(|(_, t)| t.clone()).chain([rd.ret_type.clone()]).collect();
+            for tp in &md.type_params {
+                if !map.contains_key(tp) && rd.ret_type.trim() != "Current" && !sig.iter().any(|t| mentions_any(t, std::slice::from_ref(tp))) {
+                    map.insert(tp.clone(), "BOOL".to_string());
+                }
+            }
+        }
         if let Some(tp) = tps.iter().find(|t| !map.contains_key(*t)) {
             return Err(format!(
                 "{NEED_TYPE}cannot infer type parameter `{tp}` of `{}.{r}`",
                 md.name
             ));
+        }
+        if !chain_gives.is_empty() {
+            cx.gives.retain(|(c, _)| !chain_gives.contains(c));
+            // What a chain took is no longer the caller's to give again.
+            moves.retain(|m| !cx.moved.contains(m));
         }
         let mod_targs: Vec<String> = md.type_params.iter().map(|t| map[t].clone()).collect();
         let rtargs: Vec<String> = rd.type_params.iter().map(|t| map[t].clone()).collect();
@@ -1819,7 +2204,8 @@ static bool {inst}__has(struct {inst}* xs, {ce} x) {{\n\
             self.cost_hit = true;
         }
         let cname = self.request_fn(&md.name, &mod_targs, r, &rtargs);
-        if tail_site && cname == cx.fn_cname {
+        // The variant that owns its parameters jumps to itself too.
+        if tail_site && (cname == cx.fn_cname || cx.fn_cname == format!("sink_{cname}")) {
             let self_ty = Self::self_type(md, &mod_targs);
             let mut vals = Vec::new();
             if Self::has_current(md, kind) {
@@ -1835,7 +2221,14 @@ static bool {inst}__has(struct {inst}* xs, {ce} x) {{\n\
             self.nontail_self = true;
         }
         let takes_current = Self::has_current(md, kind);
-        if Self::is_sink(md, rd) && (!takes_current || recv.is_some() || (hc && md.name == cx.owner)) {
+        // A routine given an array its caller is done with owns it, so that a `set` on it
+        // may change it in place (Task H.5).
+        let ctor_sink = Self::is_sink(md, rd);
+        let array_param = |t: &str| type_head(&cnorm(t)) == "ARRAY";
+        let array_sink = rd.params.iter().any(|(_, t)| array_param(&subst(&fix_cur(t), &map)));
+        // And one given a record that holds an array, to take the array out of it (Task H.4).
+        let holder_sink = takes_current && self.gives_back(&Self::self_type(md, &mod_targs), r) && self.holds_array(&Self::self_type(md, &mod_targs));
+        if (ctor_sink || array_sink || holder_sink) && (!takes_current || recv.is_some() || (hc && md.name == cx.owner)) {
             let self_ty = Self::self_type(md, &mod_targs);
             let mut vals = Vec::new();
             if takes_current {
@@ -1845,8 +2238,9 @@ static bool {inst}__has(struct {inst}* xs, {ce} x) {{\n\
             // Worth it only when the caller has something to give: a value it would
             // otherwise release right after the call.
             let mut gives = false;
-            for v in &vals {
-                gives |= self.is_rc(&v.ty) && (v.owned || moves.contains(&v.code));
+            for (k, v) in vals.iter().enumerate() {
+                let counts = if ctor_sink { self.is_rc(&v.ty) } else { array_param(&v.ty) || (holder_sink && k == 0) };
+                gives |= counts && (v.owned || moves.contains(&v.code));
             }
             if gives {
                 let sink = self.request_sink(&md.name, &mod_targs, r, &rtargs);
@@ -1913,6 +2307,10 @@ static bool {inst}__has(struct {inst}* xs, {ce} x) {{\n\
             ("BYTES", "concat", 1, "BYTES"),
             ("BYTES", "slice", 2, "BYTES"),
         ];
+        if rt == "STRING" && m == "to_chars" && args.is_empty() {
+            let f = self.string_chars_helper()?;
+            return self.runtime_call(&f, vec![rv], "LIST[CHAR]", true);
+        }
         if rt == "BYTES" && m == "to_list" && args.is_empty() {
             let f = self.list_bytes_helper("to_list")?;
             return self.runtime_call(&f, vec![rv], "LIST[U64]", true);
@@ -1936,6 +2334,74 @@ static bool {inst}__has(struct {inst}* xs, {ce} x) {{\n\
         }
         let prefix = if rt == "STRING" { "gardel_string_" } else { "gardel_bytes_" };
         self.runtime_call(&format!("{prefix}{m}"), vals, ret, true)
+    }
+
+    /// A routine of `ARRAY` (Task H.5): the primitives call the runtime, and the rest
+    /// (`fold`) compile from their verified source over them. `set` and `swap` take the
+    /// array when it is the result of another call, or when `cx.gives` holds it.
+    fn lower_array_method(&mut self, cx: &mut Ctx, rv: V, m: &str, args: &[Expr], hc: bool) -> Lowered {
+        let rt = cnorm(&rv.ty);
+        let elem = split_type_app(&rt).1.first().map(|s| cnorm(s)).unwrap_or_default();
+        self.ctype(&rt)?;
+        let inst = c_instance_name(&rt);
+        match (m, args.len()) {
+            ("length", 0) => self.runtime_call(&format!("{inst}__length"), vec![rv], "NAT", true),
+            ("to_list", 0) => self.runtime_call(&format!("{inst}__to_list"), vec![rv], &format!("LIST[{elem}]"), true),
+            ("at", 1) => {
+                let i = self.lower(cx, &args[0], Some("NAT"), hc)?;
+                self.runtime_call(&format!("{inst}__at"), vec![rv, i], &elem, false)
+            }
+            ("slice", 2) => {
+                let lo = self.lower(cx, &args[0], Some("NAT"), hc)?;
+                let hi = self.lower(cx, &args[1], Some("NAT"), hc)?;
+                self.runtime_call(&format!("{inst}__slice"), vec![rv, lo, hi], &rt, true)
+            }
+            ("set", 2) | ("swap", 2) => {
+                let given = if rv.owned {
+                    None
+                } else {
+                    cx.gives.iter().find(|(c, _)| *c == rv.code).map(|(_, g)| g.clone())
+                };
+                // The arguments are read before the array changes, and no `set` among them
+                // may take it.
+                let hidden: Vec<(String, String)> = cx.gives.iter().filter(|(c, _)| *c == rv.code).cloned().collect();
+                cx.gives.retain(|(c, _)| *c != rv.code);
+                let second = if m == "set" { elem.clone() } else { "NAT".to_string() };
+                let a = self.lower(cx, &args[0], Some("NAT"), hc);
+                let b = self.lower(cx, &args[1], Some(&second), hc);
+                cx.gives.extend(hidden);
+                let (a, b) = (a?, b?);
+                let mut t = Temps::default();
+                let (recv, give) = match &given {
+                    _ if rv.owned => (rv.code.clone(), "true".to_string()),
+                    Some(g) => {
+                        if g == "true" && !cx.moved.contains(&rv.code) {
+                            cx.moved.push(rv.code.clone());
+                        }
+                        (rv.code.clone(), g.clone())
+                    }
+                    None => (self.borrow(rv, &mut t)?, "false".to_string()),
+                };
+                let ac = self.borrow(a, &mut t)?;
+                let bc = self.borrow(b, &mut t)?;
+                let mut call = format!("{inst}__{m}_give({recv}, {ac}, {bc}, {give})");
+                if given.as_deref() == Some("_owned") {
+                    // The parameter is the loop's to release: once taken, it holds nothing.
+                    self.owned_flag = true;
+                    let k = self.next();
+                    let ct = self.ctype(&rt)?;
+                    call = format!("({{ {ct} _g{k} = {call}; if (_owned) {recv} = NULL; _g{k}; }})");
+                }
+                Ok(owned(self.with_temps(t, call, &rt)?, rt))
+            }
+            _ => {
+                let md = self.module("ARRAY").ok_or("no `ARRAY` module")?;
+                match Self::find_routine(md, m) {
+                    Some(_) => self.lower_call(cx, md, m, Some(rv), args, None, hc),
+                    None => Err(format!("`ARRAY.{m}` has no C runtime implementation")),
+                }
+            }
+        }
     }
 
     fn lower_list_method(&mut self, cx: &mut Ctx, rv: V, m: &str, args: &[Expr], hc: bool) -> Lowered {
@@ -1971,6 +2437,21 @@ static bool {inst}__has(struct {inst}* xs, {ce} x) {{\n\
             ("tail", 0) => self.project(rv, "->tail", &rt),
             _ => Err(format!("`LIST.{m}` has no C runtime implementation")),
         }
+    }
+
+    /// The array in field `f` of `Current`, which this routine owns: taken out when nothing
+    /// else holds `Current`, whose release then finds no array there (Task H.4).
+    fn steal_field(&mut self, cx: &Ctx, f: &str) -> Lowered {
+        let st = cx.self_ty.clone().ok_or("no `Current`")?;
+        let fs = self.variant_fields(&st, None).ok_or("`Current` has no fields")?;
+        let (_, ty) = fs.into_iter().find(|(n, _)| n == f).ok_or("unknown field")?;
+        let ct = self.ctype(&ty)?;
+        let d = self.dup(&ty, &format!("Current->{f}"))?;
+        let k = self.next();
+        Ok(owned(
+            format!("({{ {ct} _s{k}; if (atomic_load_explicit(&Current->_rc, memory_order_acquire) == 1) {{ _s{k} = Current->{f}; Current->{f} = NULL; }} else {{ _s{k} = {d}; }} _s{k}; }})"),
+            ty,
+        ))
     }
 
     /// A component of `base` (`->field`, `.first`): borrowed from a borrowed base; from an
@@ -2024,6 +2505,10 @@ static bool {inst}__has(struct {inst}* xs, {ce} x) {{\n\
             sink_params: Vec::new(),
             fn_cname: String::new(),
             params: Vec::new(),
+            gives: Vec::new(),
+            param_moves: Vec::new(),
+            owns_current: false,
+            steals: Vec::new(),
         };
         let mut prologue = String::new();
         let mut env_fields = String::new();
@@ -2127,8 +2612,18 @@ static bool {inst}__has(struct {inst}* xs, {ce} x) {{\n\
 
     fn lower_match(&mut self, cx: &mut Ctx, scrut: &Expr, cases: &[MatchCase], expect: Option<&str>, hc: bool) -> Lowered {
         let tail = std::mem::take(&mut cx.tail);
+        let mut param_moves = std::mem::take(&mut cx.param_moves);
         let depth = cx.tail_drops.len();
         let sv0 = self.lower(cx, scrut, None, hc)?;
+        // The binders of a borrowed scrutinee point into what it was read from, so no arm
+        // may take that: not a parameter it names, and no field of `Current` if it may
+        // read one.
+        let owns_current = cx.owns_current;
+        if !sv0.owned {
+            let held: Vec<String> = cx.locals.iter().filter(|l| mentions(scrut, &l.name)).map(|l| l.cname.clone()).collect();
+            param_moves.retain(|c| !held.contains(c));
+            cx.owns_current = false;
+        }
         let st = sv0.ty.clone();
         let md = self
             .module(type_head(&st))
@@ -2188,12 +2683,15 @@ static bool {inst}__has(struct {inst}* xs, {ce} x) {{\n\
             let untyped = cx.untyped_num(&c.body);
             let arm_expect = if soft_result { None } else { result_ty.as_deref() };
             cx.tail = tail;
+            cx.param_moves = param_moves.clone();
             let bv = self.lower_block(cx, &c.stmts, &c.body, arm_expect, hc)?;
             if soft_result && result_ty.as_deref().is_some_and(|t| numeric_conflict(t, &bv.ty)) {
                 // Earlier arms were untyped numbers: this arm decides the type of the `match`.
                 cx.locals.truncate(mark);
                 let t = bv.ty.clone();
                 cx.tail = tail;
+                cx.owns_current = owns_current;
+                cx.param_moves = param_moves;
                 cx.tail_drops.truncate(depth);
                 return self.lower_match(cx, scrut, cases, Some(&t), hc);
             }
@@ -2208,6 +2706,7 @@ static bool {inst}__has(struct {inst}* xs, {ce} x) {{\n\
             arms.push(format!("{label} {{ {pre}{rv} = {b}; break; }}\n"));
         }
         cx.tail_drops.truncate(depth);
+        cx.owns_current = owns_current;
         let rt = result_ty.ok_or("empty `match`")?;
         let crt = self.ctype(&rt)?;
         let mut s = format!("({{\n{sct} {sv} = {sc};\n{crt} {rv};\nswitch ({sv}->tag) {{\n");
@@ -2255,6 +2754,7 @@ static bool {inst}__has(struct {inst}* xs, {ce} x) {{\n\
         cx.tail_site = false;
         // Like `tail`, for this expression only, and only a constructor or a call uses it.
         let moves = std::mem::take(&mut cx.moves);
+        let param_moves = std::mem::take(&mut cx.param_moves);
         let expect_n = expect.map(norm_type);
         let expect = expect_n.as_deref();
         match e {
@@ -2293,6 +2793,9 @@ static bool {inst}__has(struct {inst}* xs, {ce} x) {{\n\
                     return Ok(borrowed("Current".into(), cx.self_ty.clone().unwrap_or_default()));
                 }
                 if hc {
+                    if cx.steals.contains(v) {
+                        return self.steal_field(cx, v);
+                    }
                     if let Some(st) = cx.self_ty.clone() {
                         if let Some(fs) = self.variant_fields(&st, None) {
                             if let Some((_, ft)) = fs.iter().find(|(f, _)| f == v) {
@@ -2360,6 +2863,7 @@ static bool {inst}__has(struct {inst}* xs, {ce} x) {{\n\
                 if Self::find_routine(owner, f).is_some() {
                     cx.tail_site = tail;
                     cx.moves = moves;
+                    cx.param_moves = param_moves;
                     return self.lower_call(cx, owner, f, None, args, expect, hc);
                 }
                 Err(format!("unknown function `{f}`"))
@@ -2377,7 +2881,61 @@ static bool {inst}__has(struct {inst}* xs, {ce} x) {{\n\
                         || (self.module(v).is_none() && self.ctor_owner(v, None, cx).is_some());
                     if !is_value {
                         cx.tail_site = tail;
-                        return self.lower_static(cx, v, m, args, expect, hc);
+                        return self.lower_static(cx, v, m, args, expect, hc, moves, param_moves);
+                    }
+                }
+                // `a.set(i, x)` on a local nothing after it uses: the `set` may take the
+                // array, if no later call of the chain reads it (Task H.5).
+                if let Some((v, outer)) = array_chain(e) {
+                    let take = cx.local(v).filter(|l| type_head(&l.ty) == "ARRAY" && !outer.iter().any(|a| mentions(a, v)));
+                    let give = take.and_then(|l| {
+                        if moves.contains(&l.cname) {
+                            Some((l.cname.clone(), "true"))
+                        } else if param_moves.contains(&l.cname) {
+                            Some((l.cname.clone(), "_owned"))
+                        } else {
+                            None
+                        }
+                    });
+                    if let Some((c, g)) = give {
+                        cx.gives.push((c.clone(), g.to_string()));
+                        let r = self.lower(cx, recv, None, hc).and_then(|rv| self.lower_array_method(cx, rv, m, args, hc));
+                        cx.gives.retain(|(g, _)| *g != c);
+                        return r;
+                    }
+                }
+                // `Current.slots`, taken out of a `Current` this routine owns (Task H.4).
+                if args.is_empty() && matches!(&**recv, Expr::Var(v) if v == "Current") && cx.steals.contains(m) {
+                    return self.steal_field(cx, m);
+                }
+                // `h.push(x)` on a record that holds an array and that nothing after it uses:
+                // the routine owns it.
+                if let Some(v) = call_chain(e) {
+                    let direct = matches!(&**recv, Expr::Var(_));
+                    let l = cx.local(v).cloned().filter(|l| direct && self.holds_array(&l.ty) && self.gives_back(&l.ty, m));
+                    let give = l.as_ref().and_then(|l| {
+                        cx.gives
+                            .iter()
+                            .find(|(c, _)| *c == l.cname)
+                            .map(|(_, g)| g.clone())
+                            .or_else(|| param_moves.contains(&l.cname).then(|| "_owned".to_string()))
+                    });
+                    if let (Some(l), Some(g)) = (l, give) {
+                        let md = self.module(type_head(&l.ty)).ok_or("unknown module")?;
+                        let code = if g == "true" {
+                            if !cx.moved.contains(&l.cname) {
+                                cx.moved.push(l.cname.clone());
+                            }
+                            l.cname.clone()
+                        } else {
+                            // The parameter is the routine's to release only when it owns it.
+                            self.owned_flag = true;
+                            let k = self.next();
+                            let ct = self.ctype(&l.ty)?;
+                            let d = self.dup(&l.ty, &l.cname)?;
+                            format!("({{ {ct} _g{k} = _owned ? {c} : {d}; if (_owned) {c} = NULL; _g{k}; }})", c = l.cname)
+                        };
+                        return self.lower_call(cx, md, m, Some(owned(code, l.ty)), args, expect, hc);
                     }
                 }
                 let rv = match self.lower(cx, recv, None, hc) {
@@ -2392,6 +2950,11 @@ static bool {inst}__has(struct {inst}* xs, {ce} x) {{\n\
                 let rt = rv.ty.clone();
                 if rt == "STRING" || rt == "BYTES" {
                     return self.lower_text_method(cx, rv, m, args, hc);
+                }
+                if type_head(&rt) == "ARRAY" {
+                    // A routine compiled from source, as `fold_from`, may be a loop.
+                    cx.tail_site = tail;
+                    return self.lower_array_method(cx, rv, m, args, hc);
                 }
                 // `equals` on a type without its own `equals` routine (scalars,
                 // `CANONICAL_EQ` elements) is Leibniz equality.
@@ -2447,12 +3010,14 @@ static bool {inst}__has(struct {inst}* xs, {ce} x) {{\n\
                 }
                 cx.tail_site = tail;
                 cx.moves = moves;
+                cx.param_moves = param_moves;
                 self.lower_call(cx, md, m, Some(rv), args, expect, hc)
             }
             // A block written as an expression by pattern compilation. Its dead branch is a
             // copy, and lowering it would double the C at every nested level.
             Expr::If(c, ts, te, _, _) if matches!(**c, Expr::Bool(true)) => {
                 cx.tail = tail;
+                cx.param_moves = param_moves;
                 self.lower_block(cx, ts, te, expect, hc)
             }
             Expr::If(c, ts, te, es, ee) => {
@@ -2460,6 +3025,7 @@ static bool {inst}__has(struct {inst}* xs, {ce} x) {{\n\
                 // An untyped number takes its type from the other branch.
                 let else_first = expect.is_none() && cx.untyped_num(te) && !cx.untyped_num(ee);
                 cx.tail = tail;
+                cx.param_moves = param_moves.clone();
                 let first = if else_first {
                     Err(NEED_TYPE.to_string())
                 } else {
@@ -2469,9 +3035,11 @@ static bool {inst}__has(struct {inst}* xs, {ce} x) {{\n\
                     Ok(x) => x,
                     Err(e) if need(&e) && expect.is_none() => {
                         cx.tail = tail;
+                        cx.param_moves = param_moves.clone();
                         let b = self.lower_block(cx, es, ee, None, hc)?;
                         let tb = b.ty.clone();
                         cx.tail = tail;
+                        cx.param_moves = param_moves.clone();
                         let a = self.lower_block(cx, ts, te, Some(&tb), hc)?;
                         let (ac, bc) = (self.own(a)?, self.own(b)?);
                         return Ok(owned(format!("({cc} ? ({ac}) : ({bc}))"), tb));
@@ -2480,12 +3048,14 @@ static bool {inst}__has(struct {inst}* xs, {ce} x) {{\n\
                 };
                 let ta = a.ty.clone();
                 cx.tail = tail;
+                cx.param_moves = param_moves;
                 let b = self.lower_block(cx, es, ee, Some(expect.unwrap_or(&ta)), hc)?;
                 let (ac, bc) = (self.own(a)?, self.own(b)?);
                 Ok(owned(format!("({cc} ? ({ac}) : ({bc}))"), ta))
             }
             Expr::Match(scrut, cases) => {
                 cx.tail = tail;
+                cx.param_moves = param_moves;
                 self.lower_match(cx, scrut, cases, expect, hc)
             }
             Expr::RecordLit(fields) => {
@@ -2497,15 +3067,34 @@ static bool {inst}__has(struct {inst}* xs, {ce} x) {{\n\
                     .variant_fields(&ty, None)
                     .ok_or_else(|| format!("record literal of non-record type `{ty}`"))?;
                 self.ctype(&ty)?;
+                // The routine's result: an array of `Current` that only one of its fields
+                // reads, once, may be taken (Task H.4).
+                let mut steals = Vec::new();
+                if let (true, true, Some(st)) = (tail, cx.owns_current, cx.self_ty.clone()) {
+                    let own = self.variant_fields(&st, None).unwrap_or_default();
+                    let names: Vec<String> = own.iter().map(|(f, _)| f.clone()).collect();
+                    let mut reads = Vec::new();
+                    if fields.iter().all(|(_, x)| field_reads(x, &names, &cx.owner, cx, &mut reads)) {
+                        steals = own
+                            .into_iter()
+                            .filter(|(f, t)| type_head(t) == "ARRAY" && reads.iter().filter(|r| *r == f).count() == 1)
+                            .map(|(f, _)| f)
+                            .collect();
+                    }
+                }
+                let outer = std::mem::replace(&mut cx.steals, steals);
                 let mut a = Vec::new();
-                for (f, ft) in &fs {
+                let built = fs.iter().try_for_each(|(f, ft)| {
                     let (_, fe) = fields
                         .iter()
                         .find(|(n, _)| n == f)
                         .ok_or_else(|| format!("record literal misses field `{f}`"))?;
                     let v = self.lower(cx, fe, Some(ft), hc)?;
                     a.push(self.own(v)?);
-                }
+                    Ok::<(), String>(())
+                });
+                cx.steals = outer;
+                built?;
                 Ok(owned(format!("make_{}({})", c_instance_name(&ty), a.join(", ")), ty))
             }
             Expr::RecordUpdate(base, fields) => {
@@ -2661,7 +3250,21 @@ static bool {inst}__has(struct {inst}* xs, {ce} x) {{\n\
     }
 
     /// `T.r(args)` where `T` names a type or a runtime facility rather than a value.
-    fn lower_static(&mut self, cx: &mut Ctx, v: &str, m: &str, args: &[Expr], expect: Option<&str>, hc: bool) -> Lowered {
+    /// `moves` and `param_moves` are the caller's (Task H.3): a routine called by its module's
+    /// name, as `SORTING.merge_into(x, y, out, 0, 0)`, may take an array as a plain call does.
+    /// Only the calls of routines get them, not the primitives' arguments.
+    #[allow(clippy::too_many_arguments)]
+    fn lower_static(
+        &mut self,
+        cx: &mut Ctx,
+        v: &str,
+        m: &str,
+        args: &[Expr],
+        expect: Option<&str>,
+        hc: bool,
+        moves: Vec<String>,
+        param_moves: Vec<String>,
+    ) -> Lowered {
         match (v, m, args.len()) {
             ("IO", "print", 1) | ("IO", "print_line", 1) => {
                 let a = self.lower(cx, &args[0], Some("STRING"), hc)?;
@@ -2675,6 +3278,37 @@ static bool {inst}__has(struct {inst}* xs, {ce} x) {{\n\
                     "gardel_io_read_line_result()".into(),
                     format!("IO[{}]", cnorm(READ_LINE_RESULT_TYPE)),
                 ));
+            }
+            ("IO", "now", 0) => {
+                self.needs_clock_random = true;
+                return Ok(owned("gardel_wall_ms()".into(), "IO[I64]"));
+            }
+            ("IO", "random", 1) => {
+                self.needs_clock_random = true;
+                self.needs_random = true;
+                let a = self.lower(cx, &args[0], Some("NAT"), hc)?;
+                self.ctype(RANDOM_RESULT_TYPE)?;
+                return Ok(owned(
+                    format!("gardel_io_random({})", a.code),
+                    format!("IO[{}]", cnorm(RANDOM_RESULT_TYPE)),
+                ));
+            }
+            ("IO", "log", 2) => {
+                self.needs_log_env = true;
+                self.needs_log = true;
+                let l = self.lower(cx, &args[0], Some("LOG_LEVEL"), hc)?;
+                let t = self.lower(cx, &args[1], Some("STRING"), hc)?;
+                return self.runtime_call("gardel_io_log", vec![l, t], "IO[UNIT]", true);
+            }
+            ("IO", "env", 1) => {
+                self.needs_log_env = true;
+                self.needs_env = true;
+                self.needs_validator = true;
+                self.ctype(ENV_RESULT_TYPE)?;
+                let a = self.lower(cx, &args[0], Some("STRING"), hc)?;
+                // Built at the option's C type, so a temporary of the name holds that, not `IO`'s.
+                let v = self.runtime_call("gardel_io_env", vec![a], ENV_RESULT_TYPE, true)?;
+                return Ok(V { ty: format!("IO[{}]", cnorm(ENV_RESULT_TYPE)), ..v });
             }
             ("IO", "exit", 1) => {
                 // Nothing runs after the argument, so its scopes do not release.
@@ -2690,6 +3324,11 @@ static bool {inst}__has(struct {inst}* xs, {ce} x) {{\n\
                 self.ctype(FROM_UTF8_RESULT_TYPE)?;
                 let a = self.lower(cx, &args[0], Some("BYTES"), hc)?;
                 return self.runtime_call("gardel_string_from_utf8", vec![a], &cnorm(FROM_UTF8_RESULT_TYPE), true);
+            }
+            ("STRING_BUILDER", "join_reversed", 1) => {
+                let a = self.lower(cx, &args[0], Some("LIST[STRING]"), hc)?;
+                let f = self.string_join_reversed_helper()?;
+                return self.runtime_call(&f, vec![a], "STRING", true);
             }
             ("BYTES_BUILDER", "join_reversed", 1) => {
                 let a = self.lower(cx, &args[0], Some("LIST[BYTES]"), hc)?;
@@ -2714,7 +3353,11 @@ static bool {inst}__has(struct {inst}* xs, {ce} x) {{\n\
                 // Not a primitive: a routine with no `Current` compiles from its verified source.
                 let md = self.module(v).ok_or_else(|| format!("unknown name `{v}`"))?;
                 return match Self::find_routine(md, m) {
-                    Some((_, kind)) if kind == "create" => self.lower_call(cx, md, m, None, args, expect, hc),
+                    Some((_, kind)) if kind == "create" => {
+                        cx.moves = moves;
+                        cx.param_moves = param_moves;
+                        self.lower_call(cx, md, m, None, args, expect, hc)
+                    }
                     _ => Err(format!("`{v}.{m}` has no C runtime implementation")),
                 };
             }
@@ -2729,6 +3372,44 @@ static bool {inst}__has(struct {inst}* xs, {ce} x) {{\n\
             ("CHAR", "from_scalar", 1) => {
                 let a = self.lower(cx, &args[0], Some("NAT"), hc)?;
                 return Ok(owned(format!("((uint32_t)({}))", a.code), "CHAR"));
+            }
+            ("ARRAY", "make", 2) | ("ARRAY", "from_list", 1) | ("ARRAY", "empty", 0) => {
+                let elem = expect
+                    .filter(|e| type_head(e) == "ARRAY")
+                    .and_then(|e| split_type_app(e).1.first().map(|s| cnorm(s)));
+                let (vals, elem) = match m {
+                    "make" => {
+                        let n = self.lower(cx, &args[0], Some("NAT"), hc)?;
+                        let x = self.lower(cx, &args[1], elem.as_deref(), hc)?;
+                        let t = cnorm(&x.ty);
+                        (vec![n, x], t)
+                    }
+                    "from_list" => {
+                        let want = elem.as_ref().map(|t| format!("LIST[{t}]"));
+                        let xs = self.lower(cx, &args[0], want.as_deref(), hc)?;
+                        let t = split_type_app(&cnorm(&xs.ty)).1.first().map(|s| cnorm(s)).unwrap_or_default();
+                        (vec![xs], t)
+                    }
+                    _ => (Vec::new(), elem.ok_or(NEED_TYPE.to_string())?),
+                };
+                let at = format!("ARRAY[{elem}]");
+                self.ctype(&at)?;
+                let inst = c_instance_name(&at);
+                if m == "empty" {
+                    return Ok(owned(format!("{inst}_alloc(0)"), at));
+                }
+                return self.runtime_call(&format!("{inst}__{m}"), vals, &at, true);
+            }
+            ("ARRAY", _, _) => {
+                let md = self.module(v).ok_or_else(|| format!("unknown name `{v}`"))?;
+                return match Self::find_routine(md, m) {
+                    Some((_, kind)) if kind == "create" && m != "repeat" => {
+                        cx.moves = moves;
+                        cx.param_moves = param_moves;
+                        self.lower_call(cx, md, m, None, args, expect, hc)
+                    }
+                    _ => Err(format!("`ARRAY.{m}` has no C runtime implementation")),
+                };
             }
             ("LIST", "empty", 0) => {
                 let lt = expect.filter(|e| type_head(e) == "LIST").ok_or(NEED_TYPE.to_string())?;
@@ -2752,6 +3433,8 @@ static bool {inst}__has(struct {inst}* xs, {ce} x) {{\n\
         }
         let md = self.module(v).ok_or_else(|| format!("unknown name `{v}`"))?;
         if Self::find_routine(md, m).is_some() {
+            cx.moves = moves;
+            cx.param_moves = param_moves;
             return self.lower_call(cx, md, m, None, args, expect, hc);
         }
         Err(format!("`{v}` has no routine `{m}`"))
@@ -2867,13 +3550,17 @@ static struct SEQ_STRING* gardel_main_args(int argc, char** argv) {
         let cmd = self.ctype("COMMAND")?;
         let cmds = self.ctype("LIST[COMMAND]")?;
         // Files and processes: their values are built by the host (`host_files::typed_runtime`).
-        let file_types = ["RESULT[IO_ERROR, BYTES]", "RESULT[IO_ERROR, LIST[DIR_ENTRY]]", "RESULT[IO_ERROR, I64]", "LIST[DIR_ENTRY]", "LIST[STRING]", "RESULT[IO_ERROR, U64]"];
+        let file_types = ["RESULT[IO_ERROR, BYTES]", "RESULT[IO_ERROR, LIST[DIR_ENTRY]]", "RESULT[IO_ERROR, I64]", "LIST[DIR_ENTRY]", "LIST[STRING]", "RESULT[IO_ERROR, U64]", ENV_RESULT_TYPE];
         for t in file_types {
             self.ctype(t)?;
         }
         let names = file_types.map(c_instance_name);
         let files_typed = crate::host_files::typed_runtime(&names);
         let files_rt = crate::host_files::HOST_FILES_RUNTIME;
+        self.needs_clock_random = false;
+        self.needs_log_env = false;
+        let os_rt = crate::host_files::OS_CLOCK_RANDOM;
+        let log_rt = crate::host_files::OS_LOG_ENV;
         self.drain();
 
         // One case per variant, so a variant with no host code cannot be ignored at run time.
@@ -2908,7 +3595,7 @@ static struct SEQ_STRING* gardel_main_args(int argc, char** argv) {
         let drop_args = self.drop_stmt("SEQ[STRING]", "args")?;
         Ok((
             format!(
-                "{REACTIVE_RUNTIME}\n{files_rt}\n{files_typed}\
+                "{REACTIVE_RUNTIME}\n{os_rt}\n{log_rt}\n{files_rt}\n{files_typed}\
                  static void gardel_run_commands({cmds} p) {{\n    for (; p; p = p->tail) {{\n        {cmd} c = p->head;\n        switch (c->tag) {{\n{run}        default: abort();\n        }}\n    }}\n    gardel_log_flush();\n    /* The program may now wait for days: what it printed must already be out. */\n    fflush(stdout);\n}}\n\n\
                  static {keyt} gardel_key_plain(struct gardel_host_event ev) {{\n    switch (ev.key) {{\n{make_key}        default: abort();\n    }}\n}}\n\n\
                  /* A key with Shift, Alt or Ctrl is that key in a `Mod`. */\n\
@@ -2918,6 +3605,7 @@ static struct SEQ_STRING* gardel_main_args(int argc, char** argv) {
                  static {mouset} gardel_mouse_value(struct gardel_host_event ev) {{\n    {mouset} m = gardel_mouse_plain(ev);\n    if (!ev.mods) return m;\n    return make_MOUSE_MouseMod(m, (ev.mods & GARDEL_MOD_SHIFT) != 0, (ev.mods & GARDEL_MOD_ALT) != 0, (ev.mods & GARDEL_MOD_CTRL) != 0);\n}}\n\n\
                  static {evt} gardel_event_value(struct gardel_host_event ev) {{\n    switch (ev.kind) {{\n{make}        default: abort();\n    }}\n}}\n\n\
                  int gardel_reactive_main(int argc, char** argv) {{\n\
+                 \x20   gardel_log_threshold(); /* a bad GARDEL_LOG_LEVEL stops the program before it starts */\n\
                  \x20   gardel_host_install();\n\
                  \x20   gardel_term_start();\n\
                  \x20   gardel_timer_count = 0;\n\
@@ -3026,6 +3714,64 @@ static struct SEQ_STRING* gardel_main_args(int argc, char** argv) {
         if self.needs_from_utf8 {
             out.push_str(&emit_c11_from_utf8_runtime());
         }
+        if self.needs_clock_random {
+            out.push_str(crate::host_files::OS_CLOCK_RANDOM);
+        }
+        if self.needs_log_env {
+            out.push_str(crate::host_files::OS_LOG_ENV);
+        }
+        if self.needs_log {
+            out.push_str(
+                "/* IO.log (Task H.2): one line on standard error, at the level's ordinal. */\n\
+                 static inline int64_t gardel_io_log(struct LOG_LEVEL* level, GardelString text) {\n\
+                 \x20   gardel_log_write((int)level->tag, text.data, (size_t)text.len);\n\
+                 \x20   return 0;\n\
+                 }\n\n",
+            );
+        }
+        if self.needs_env {
+            let o = c_instance_name(ENV_RESULT_TYPE);
+            out.push_str(&format!(
+                "/* IO.env (Task H.2): the variable's value, or None when it is not set or not UTF-8. */\n\
+                 static struct {o}* gardel_io_env(GardelString name) {{\n\
+                 \x20   size_t len = 0;\n\
+                 \x20   char* v = gardel_env_get(name.data, (size_t)name.len, &len);\n\
+                 \x20   if (!v) return make_{o}_None();\n\
+                 \x20   uint64_t chars = 0;\n\
+                 \x20   struct STRING_ERROR* bad = gardel_utf8_validate((const uint8_t*)v, (uint64_t)len, &chars);\n\
+                 \x20   if (bad) {{\n\
+                 \x20       drop_STRING_ERROR(bad);\n\
+                 \x20       free(v);\n\
+                 \x20       return make_{o}_None();\n\
+                 \x20   }}\n\
+                 \x20   void* owner = NULL;\n\
+                 \x20   char* data = gardel_buf_alloc(len + 1, &owner);\n\
+                 \x20   memcpy(data, v, len + 1);\n\
+                 \x20   free(v);\n\
+                 \x20   GardelString s = {{ data, (uint64_t)len, chars, owner }};\n\
+                 \x20   return make_{o}_Some(s);\n\
+                 }}\n\n"
+            ));
+        }
+        if self.needs_random {
+            let r = c_instance_name(RANDOM_RESULT_TYPE);
+            out.push_str(&format!(
+                "/* IO.random (Task H.1): `count` bytes from the system's generator, at most GARDEL_RANDOM_MAX. */\n\
+                 static struct {r}* gardel_io_random(uint64_t count) {{\n\
+                 \x20   if (count > GARDEL_RANDOM_MAX) return make_{r}_Error(make_IO_ERROR_OsError(GARDEL_RANDOM_ERR_INVALID));\n\
+                 \x20   void* owner = NULL;\n\
+                 \x20   char* buf = gardel_buf_alloc((size_t)count + 1, &owner);\n\
+                 \x20   int64_t err = gardel_os_random((unsigned char*)buf, (size_t)count);\n\
+                 \x20   buf[count] = '\\0';\n\
+                 \x20   GardelBytes b = {{ (const uint8_t*)buf, count, owner }};\n\
+                 \x20   if (err != 0) {{\n\
+                 \x20       gardel_bytes_drop(b);\n\
+                 \x20       return make_{r}_Error(make_IO_ERROR_OsError(err));\n\
+                 \x20   }}\n\
+                 \x20   return make_{r}_Ok(b);\n\
+                 }}\n\n"
+            ));
+        }
         out.push_str(args_rt);
         for s in &self.protos {
             out.push_str(s);
@@ -3049,7 +3795,7 @@ enum gardel_host_kind {
     GARDEL_HOST_CONNECTED, GARDEL_HOST_CONNECT_FAILED, GARDEL_HOST_RESIZED, GARDEL_HOST_FILE_READ,
     GARDEL_HOST_DIR_LISTED, GARDEL_HOST_PROC_STARTED, GARDEL_HOST_PROC_FAILED, GARDEL_HOST_PROC_OUT,
     GARDEL_HOST_PROC_ERR, GARDEL_HOST_PROC_EXITED, GARDEL_HOST_ATTACHED_ENDED, GARDEL_HOST_FILE_WRITTEN,
-    GARDEL_HOST_PASTED, GARDEL_HOST_MOUSE
+    GARDEL_HOST_PASTED, GARDEL_HOST_MOUSE, GARDEL_HOST_CLOCK, GARDEL_HOST_RANDOM, GARDEL_HOST_ENV
 };
 enum gardel_host_key {
     GARDEL_KEY_CHAR, GARDEL_KEY_UP, GARDEL_KEY_DOWN, GARDEL_KEY_LEFT, GARDEL_KEY_RIGHT,
@@ -3096,6 +3842,8 @@ struct gardel_dir_item { char* name; size_t len; bool is_dir; };
 /* Files and processes (Task F.11a), defined after the log. */
 static volatile int gardel_attached_now = 0; /* a RunAttached child has the terminal: Ctrl-C is its own */
 static bool gardel_workers_started = false;
+/* The loop itself queued an answer (ReadClock, Random), so the queue must be read. */
+static bool gardel_loop_answered = false;
 static bool gardel_reader_gate(void);
 static void gardel_reader_gate_open(void);
 static void gardel_answer_taken(struct gardel_host_event* ev);
@@ -3633,6 +4381,7 @@ static void gardel_read_console_key(struct gardel_host_event* ev) {
 #include <pthread.h>
 #include <signal.h>
 #include <sys/ioctl.h>
+#include <sys/random.h>
 #include <sys/socket.h>
 #include <termios.h>
 #include <time.h>
@@ -4361,7 +5110,7 @@ static void gardel_reader_main(void) {
 }
 
 static bool gardel_take_answer(struct gardel_host_event* ev) {
-    if (!gardel_reader_started && !gardel_workers_started) return false;
+    if (!gardel_reader_started && !gardel_workers_started && !gardel_loop_answered) return false;
     gardel_lock();
     struct gardel_answer* a = gardel_answers;
     if (a) {
@@ -5564,6 +6313,10 @@ pub(crate) fn host_command_code(variant: &str) -> Option<&'static str> {
         "StopProcess" => Some("gardel_host_proc_stop(c->StopProcess.proc->id);"),
         "RunAttached" => Some("gardel_host_run_list(c->RunAttached.tag, c->RunAttached.program, c->RunAttached.args, c->RunAttached.dir, true);"),
         "WriteFile" => Some("gardel_host_write_file(c->WriteFile.tag, c->WriteFile.path, c->WriteFile.data);"),
+        "ReadClock" => Some("gardel_host_read_clock(c->ReadClock.tag);"),
+        "Random" => Some("gardel_host_random(c->Random.tag, c->Random.count);"),
+        "Log" => Some("gardel_host_log((int)c->Log.level->tag, c->Log.text);"),
+        "ReadEnv" => Some("gardel_host_read_env(c->ReadEnv.tag, c->ReadEnv.name);"),
         _ => None,
     }
 }
@@ -5592,6 +6345,10 @@ pub(crate) fn host_command_log(variant: &str) -> Option<&'static str> {
         "StopProcess" => Some("gardel_log_word(\"StopProcess:\"); gardel_log_number(c->StopProcess.proc->id);"),
         "RunAttached" => Some("gardel_log_word(\"RunAttached:\"); gardel_log_run(c->RunAttached.tag, c->RunAttached.program, c->RunAttached.args, c->RunAttached.dir);"),
         "WriteFile" => Some("gardel_log_word(\"WriteFile:\"); gardel_log_number(c->WriteFile.tag); gardel_log_word(\":\"); gardel_log_text(c->WriteFile.path.data, c->WriteFile.path.len); gardel_log_word(\":\"); gardel_log_text((const char*)c->WriteFile.data.data, c->WriteFile.data.len);"),
+        "ReadClock" => Some("gardel_log_word(\"ReadClock:\"); gardel_log_number(c->ReadClock.tag);"),
+        "Random" => Some("gardel_log_word(\"Random:\"); gardel_log_number(c->Random.tag); gardel_log_word(\":\"); gardel_log_number(c->Random.count);"),
+        "Log" => Some("gardel_log_word(\"Log:\"); gardel_log_word(gardel_level_names[c->Log.level->tag]); gardel_log_word(\":\"); gardel_log_text(c->Log.text.data, c->Log.text.len);"),
+        "ReadEnv" => Some("gardel_log_word(\"ReadEnv:\"); gardel_log_number(c->ReadEnv.tag); gardel_log_word(\":\"); gardel_log_text(c->ReadEnv.name.data, c->ReadEnv.name.len);"),
         _ => None,
     }
 }
@@ -5622,6 +6379,9 @@ pub(crate) fn host_event_code(variant: &str) -> Option<&'static str> {
         "FileWritten" => Some("case GARDEL_HOST_FILE_WRITTEN: return make_EVENT_FileWritten(ev.tag, gardel_written_value(ev));"),
         "Pasted" => Some("case GARDEL_HOST_PASTED: return make_EVENT_Pasted(gardel_paste_value(ev));"),
         "Mouse" => Some("case GARDEL_HOST_MOUSE: return make_EVENT_Mouse(gardel_mouse_value(ev));"),
+        "Clock" => Some("case GARDEL_HOST_CLOCK: return make_EVENT_Clock(ev.tag, ev.code, ev.id);"),
+        "RandomBytes" => Some("case GARDEL_HOST_RANDOM: return make_EVENT_RandomBytes(ev.tag, gardel_file_value(ev));"),
+        "EnvRead" => Some("case GARDEL_HOST_ENV: return make_EVENT_EnvRead(ev.tag, gardel_env_value(ev));"),
         _ => None,
     }
 }

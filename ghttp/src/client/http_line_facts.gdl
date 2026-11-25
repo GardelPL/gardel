@@ -1,0 +1,112 @@
+-- Stage D of the round trip: facts about the bytes of a field line, apart from
+-- `HTTP_WIRE_FACTS`, as a law weighs on every proof that sees its module.
+functions HTTP_LINE_FACTS
+
+specify {ANY}
+
+  -- The digits of a number are ASCII digits.
+  law digits_are_digits(n: NAT, rest: LIST[U64])
+    require
+      rest_digits: forall k: NAT. k < rest.length implies
+        (LIST_OPS.at(rest, k) >= 48 and LIST_OPS.at(rest, k) <= 57)
+    variant
+      n
+    do
+      NUMBER_TEXT.digits_step(n, rest) and
+      rest.prepend(48 + n % 10).tail = rest and
+      rest.prepend(48 + n % 10).length = rest.length + 1 and
+      (forall k: NAT. k < rest.length + 1 implies
+        (LIST_OPS.at(rest.prepend(48 + n % 10), k) >= 48 and LIST_OPS.at(rest.prepend(48 + n % 10), k) <= 57)) and
+      (if n < 10 then True else digits_are_digits(n / 10, rest.prepend(48 + n % 10)) end)
+    ensure
+      digits: forall k: NAT. k < NUMBER_TEXT.digits(n, rest).length implies
+        (LIST_OPS.at(NUMBER_TEXT.digits(n, rest), k) >= 48 and LIST_OPS.at(NUMBER_TEXT.digits(n, rest), k) <= 57)
+    end
+
+  -- What `is_token` says, byte by byte, and back.
+  law token_bytes(tok: BYTES, i: NAT)
+    require
+      in_bounds: i <= tok.length
+      token: HTTP_HEAD_PARSER.is_token(tok, i)
+    variant
+      tok.length - i
+    do
+      if i = tok.length then True else token_bytes(tok, i + 1) end
+    ensure
+      some: tok.length > 0
+      each: forall k: NAT. (i <= k and k < tok.length) implies HTTP_HEAD_PARSER.is_tchar(LIST_OPS.at(tok.model, k))
+    end
+
+  law token_from(tok: BYTES, i: NAT)
+    require
+      in_bounds: i <= tok.length
+      some: tok.length > 0
+      each: forall k: NAT. (i <= k and k < tok.length) implies HTTP_HEAD_PARSER.is_tchar(LIST_OPS.at(tok.model, k))
+    variant
+      tok.length - i
+    do
+      if i = tok.length then True else tok.at(i) = LIST_OPS.at(tok.model, i) and token_from(tok, i + 1) end
+    ensure
+      token: HTTP_HEAD_PARSER.is_token(tok, i)
+    end
+
+  -- What `all_field_bytes` says, byte by byte, and back.
+  law field_bytes_each(b: BYTES, lo: NAT, hi: NAT)
+    require
+      ordered: lo <= hi
+      in_buf: hi <= b.length
+      field: HTTP_HEAD_PARSER.all_field_bytes(b, lo, hi)
+    variant
+      hi - lo
+    do
+      if lo = hi then True else field_bytes_each(b, lo + 1, hi) end
+    ensure
+      each: forall k: NAT. (lo <= k and k < hi) implies
+        ((LIST_OPS.at(b.model, k) >= 32 or LIST_OPS.at(b.model, k) = 9) and LIST_OPS.at(b.model, k) != 127)
+    end
+
+  law field_bytes_from(b: BYTES, lo: NAT, hi: NAT)
+    require
+      ordered: lo <= hi
+      in_buf: hi <= b.length
+      each: forall k: NAT. (lo <= k and k < hi) implies
+        ((LIST_OPS.at(b.model, k) >= 32 or LIST_OPS.at(b.model, k) = 9) and LIST_OPS.at(b.model, k) != 127)
+    variant
+      hi - lo
+    do
+      if lo = hi then True else b.at(lo) = LIST_OPS.at(b.model, lo) and field_bytes_from(b, lo + 1, hi) end
+    ensure
+      field: HTTP_HEAD_PARSER.all_field_bytes(b, lo, hi)
+    end
+
+  -- A comparison ignoring case depends on the bytes only.
+  law ci_same(a: BYTES, b: BYTES, lower: BYTES, i: NAT)
+    require
+      same: a.model = b.model
+      in_bounds: i <= a.length
+    variant
+      a.length - i
+    do
+      a.length = b.length and
+      (if i >= a.length then True else a.at(i) = b.at(i) and ci_same(a, b, lower, i + 1) end)
+    ensure
+      same_answer: HTTP_HEAD_PARSER.ascii_equal_ci(a, lower, i) = HTTP_HEAD_PARSER.ascii_equal_ci(b, lower, i)
+    end
+
+  -- `b` from `from` is first found at `n`, where it is, when it is not before it.
+  law byte_found(buf: BYTES, b: U64, from: NAT, n: NAT)
+    require
+      ordered: from <= n
+      fits: n < buf.length
+      here: LIST_OPS.at(buf.model, n) = b
+      none_before: forall k: NAT. (from <= k and k < n) implies LIST_OPS.at(buf.model, k) != b
+    do
+      buf.index_of_byte(b, from).is_some and
+      buf.index_of_byte(b, from).get <= n and
+      LIST_OPS.at(buf.model, buf.index_of_byte(b, from).get) = b and
+      buf.index_of_byte(b, from).get >= n
+    ensure
+      found: buf.index_of_byte(b, from).is_some and buf.index_of_byte(b, from).get = n
+    end
+
+end

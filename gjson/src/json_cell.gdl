@@ -194,6 +194,17 @@ create {ANY}
       end
     end
 
+  -- The chain of items `c` with `e` in place of its end.
+  ending_in(c: JSON_CELL, e: JSON_CELL): JSON_CELL
+    variant
+      c
+    do
+      match c
+        case JItem(v, n) then JItem(v, JSON_CELL.ending_in(n, e))
+        case _ then e
+      end
+    end
+
   reverse_fields(c: JSON_CELL, acc: JSON_CELL): JSON_CELL
     variant
       c
@@ -570,6 +581,21 @@ create {ANY}
     ensure
       holds: Result
       reversed: JSON_CELL.reverse_items(c, acc).ok_items(d)
+    end
+
+  -- A chain of items reversed in front of `b`, and all of it reversed in front of `e`, is `b`
+  -- reversed in front of the chain and `e`.
+  reverse_items_twice(c: JSON_CELL, b: JSON_CELL, e: JSON_CELL): BOOL
+    variant
+      c
+    do
+      match c
+        case JItem(v, n) then JSON_CELL.reverse_items_twice(n, JItem(v, b), e)
+        case _ then True
+      end
+    ensure
+      holds: Result
+      twice: JSON_CELL.reverse_items(JSON_CELL.reverse_items(c, b), e) = JSON_CELL.reverse_items(b, JSON_CELL.ending_in(c, e))
     end
 
   -- Descending keys reversed in front of ascending ones that are all above them ascend.

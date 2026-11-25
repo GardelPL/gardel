@@ -1,0 +1,7 @@
+# Cases for GTEST_CASES, which `gardelc test` sends on standard input. Each input,
+# read with %XX as a byte, must come back in capitals.
+
+abc => ABC
+%41b => AB
+a%20b => A%20B
+mixed Case 9 => MIXED CASE 9

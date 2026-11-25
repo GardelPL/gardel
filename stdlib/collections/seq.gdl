@@ -160,6 +160,22 @@ feature {ANY}
       model_fold_right: Result = LIST_OPS.fold_right(Current.model, f, init)
     end
 
+  -- A fold that folds the two sides of a `Concat` apart, so they may run in parallel. Over a
+  -- monoid it is either sequential fold of the model: law `reduce_folds` (Task H.21).
+  reduce(f: (acc: A, x: A) -> A, e: A): A
+    variant
+      Current
+    do
+      match Current
+        case Empty then
+          e
+        case Leaf(v) then
+          v
+        case Concat(l, r, _) then
+          f(l.reduce(f, e), r.reduce(f, e))
+      end
+    end
+
 specify {EQ}
 
   law reflexive(a: SEQ[A])
@@ -254,6 +270,31 @@ specify {ANY}
   law filter_conjunction(s: SEQ[A], p: A -> BOOL, q: A -> BOOL)
     ensure
       conjunction: s.filter(p).filter(q).equals(s.filter(fn(x: A): BOOL do p(x) and q(x) end))
+    end
+
+  -- Over a monoid, `reduce` is either sequential fold of the model: by `LIST_OPS`'
+  -- homomorphism on each `Concat`, and its first duality theorem (Task H.21).
+  law reduce_folds(s: SEQ[A], f: (acc: A, x: A) -> A, e: A)
+    require
+      associative: forall p: A. forall q: A. forall r: A. f(f(p, q), r) = f(p, f(q, r))
+      left_identity: forall p: A. f(e, p) = p
+      right_identity: forall p: A. f(p, e) = p
+    variant
+      s
+    do
+      match s
+        case Empty then
+          LIST_OPS.fold_duality_first(s.model, f, e)
+        case Leaf(v) then
+          f(e, v) = v and LIST_OPS.fold_duality_first(s.model, f, e)
+        case Concat(l, r, _) then
+          reduce_folds(l, f, e) and reduce_folds(r, f, e) and
+            LIST_OPS.fold_homomorphism(l.model, r.model, f, e) and
+            LIST_OPS.fold_duality_first(s.model, f, e)
+      end
+    ensure
+      left: s.reduce(f, e) = LIST_OPS.fold_left(s.model, f, e)
+      right: s.reduce(f, e) = LIST_OPS.fold_right(s.model, f, e)
     end
 
 end

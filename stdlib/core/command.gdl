@@ -20,5 +20,9 @@ representation {ANY}
   | StopProcess(proc: PROC_ID)
   | RunAttached(tag: NAT, program: STRING, args: LIST[STRING], dir: STRING)
   | WriteFile(tag: NAT, path: STRING, data: BYTES)
+  | ReadClock(tag: NAT)
+  | Random(tag: NAT, count: NAT)
+  | Log(level: LOG_LEVEL, text: STRING)
+  | ReadEnv(tag: NAT, name: STRING)
 
 end

@@ -20,6 +20,9 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::time::{Duration, Instant};
 
+/// The suffix gardelc gives an executable: `.exe` on Windows, none elsewhere.
+const EXE: &str = std::env::consts::EXE_SUFFIX;
+
 fn root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("..")
 }
@@ -67,7 +70,7 @@ impl Dir {
     }
 
     fn bin(&self, program: &str) -> PathBuf {
-        self.0.join(format!("build/{program}_bin.exe"))
+        self.0.join(format!("build/{program}_bin{EXE}"))
     }
 }
 
@@ -553,7 +556,8 @@ fn a_shutdown_puts_the_terminal_back_and_a_replay_repeats_the_run() {
 }
 
 /// The bench redraws every cell on every key. A frame's cost is the time of a run with keys
-/// less that of one with none, over the keys; the best of three runs is taken.
+/// less that of one with none, over the keys; the best of five runs is taken, as other tests may
+/// run at the same time.
 #[test]
 fn a_full_redraw_of_200_by_60_fits_a_frame() {
     let dir = Dir::new("bench");
@@ -562,7 +566,7 @@ fn a_full_redraw_of_200_by_60_fits_a_frame() {
     let frames = 200;
     let time = |n: usize| {
         let script = format!("Resized:200:60 {}", "Key:Down ".repeat(n));
-        (0..3)
+        (0..5)
             .map(|_| {
                 let t = Instant::now();
                 let out = run(&bin, &script, &[]);
@@ -575,7 +579,7 @@ fn a_full_redraw_of_200_by_60_fits_a_frame() {
                 took
             })
             .min()
-            .expect("three runs")
+            .expect("five runs")
     };
     let base = time(0);
     let full = time(frames);
@@ -1141,7 +1145,13 @@ fn an_editor_scrolls_both_ways_to_keep_the_cursor_and_a_key_on_5000_lines_is_qui
     for i in 0..5000 {
         text += &format!("line {i}\r\n");
     }
-    let pasted = format!("Pasted:{} ", text.bytes().map(|b| format!("%{b:02X}")).collect::<String>());
+    // Only what a script cannot hold as it is is escaped: Linux takes at most 128 KiB in one
+    // variable, and every byte as `%XX` would be 150 KB.
+    let escaped: String = text
+        .bytes()
+        .map(|b| if b.is_ascii_graphic() && b != b'%' { char::from(b).to_string() } else { format!("%{b:02X}") })
+        .collect();
+    let pasted = format!("Pasted:{escaped} ");
     let script = format!("Resized:30:6 {pasted}Key:Ctrl+Home Key:End Resized:30:6 Key:Down Key:End Resized:30:6 Key:Home Resized:30:6 Key:Escape");
     let ran = run(&p.0.bin("editor"), &script, &[]);
     assert_eq!(ran.status.code(), Some(0), "{}", all(&ran));
@@ -1162,9 +1172,10 @@ fn an_editor_scrolls_both_ways_to_keep_the_cursor_and_a_key_on_5000_lines_is_qui
     let home = rows(3);
     assert_eq!(home[..2], ["   1 0123456789abcdefghijklmno", "   2 line 0"], "{home:?}");
 
-    // A key costs a line, not the text: the frames of 200 keys on a text of 5000 lines.
+    // A key costs a line, not the text: the frames of 200 keys on a text of 5000 lines,
+    // the best of five runs, as other tests may run at the same time.
     let time = |n: usize| {
-        (0..3)
+        (0..5)
             .map(|_| {
                 let mut s = format!("Resized:30:6 {pasted}");
                 for i in 0..n {
@@ -1177,7 +1188,7 @@ fn an_editor_scrolls_both_ways_to_keep_the_cursor_and_a_key_on_5000_lines_is_qui
                 t.elapsed()
             })
             .min()
-            .expect("three runs")
+            .expect("five runs")
     };
     let base = time(0);
     let keyed = time(200);

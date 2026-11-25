@@ -1,0 +1,52 @@
+-- Property tests (Task H.9): a property checked on `n` values of a generator. A failure
+-- gives the seed its case was made from, so a run from that seed makes it first.
+functions PROPERTY
+
+feature {ANY}
+
+  -- The first of `n - i` cases, from state `s` on, where `prop` is false: its index and the
+  -- state it was made from.
+  search[A](g: GEN[A], prop: A -> BOOL, i: NAT, n: NAT, s: U64): OPTION[TUPLE[NAT, U64]]
+    require
+      counted: i <= n
+    variant
+      n - i
+    do
+      if i = n then
+        None
+      else
+        let r = g.run(s)
+        if prop(r.first) then PROPERTY.search(g, prop, i + 1, n, r.second) else Some((i, s)) end
+      end
+    end
+
+  -- `case <i> of <n> fails, from seed <s>`.
+  failure(i: NAT, n: NAT, s: U64): STRING
+    do
+      let b = CHECK.add(CHECK.add(STRING_BUILDER.empty, "case "), NUMBER_TEXT.nat_to_text(i))
+      let c = CHECK.add(CHECK.add(CHECK.add(b, " of "), NUMBER_TEXT.nat_to_text(n)), " fails, from seed ")
+      CHECK.add(c, NUMBER_TEXT.nat_to_text(s)).to_string
+    end
+
+  -- `prop` holds for `n` values of `g` made from `seed`.
+  for_all[A](name: STRING, g: GEN[A], n: NAT, seed: U64, prop: A -> BOOL): TEST_RESULT
+    do
+      match PROPERTY.search(g, prop, 0, n, seed)
+        case None then Pass(name)
+        case Some(c) then Fail(name, PROPERTY.failure(c.first, n, c.second))
+      end
+    end
+
+  -- `for_all`, with the value that fails shown by `show`.
+  for_all_shown[A](name: STRING, g: GEN[A], n: NAT, seed: U64, prop: A -> BOOL, show: A -> STRING): TEST_RESULT
+    do
+      match PROPERTY.search(g, prop, 0, n, seed)
+        case None then
+          Pass(name)
+        case Some(c) then
+          let b = CHECK.add(CHECK.add(STRING_BUILDER.empty, PROPERTY.failure(c.first, n, c.second)), ": ")
+          Fail(name, CHECK.add(b, show(g.value(c.second))).to_string)
+      end
+    end
+
+end

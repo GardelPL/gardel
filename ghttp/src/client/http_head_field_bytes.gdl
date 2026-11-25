@@ -1,0 +1,38 @@
+-- Stage D of the round trip: in bytes that start with the head the writer writes for `req`,
+-- where its field lines and its `Content-Length` line are. The head is the request line, a
+-- line break, the field lines, the `Content-Length` line, if any, and the blank line's break.
+functions HTTP_HEAD_FIELD_BYTES
+
+specify {ANY}
+
+  law parts_hold(req: HTTP_REQUEST, buf: BYTES)
+    require
+      sendable: HTTP_REQUEST_WRITER.sendable(req)
+      prefix: buf.starts_with(HTTP_REQUEST_WRITER.head_text(req).to_utf8)
+    do
+      HTTP_REQUEST_WRITER.head_text(req).to_utf8.model = HTTP_REQUEST_WRITER.head_text(req).byte_model and
+      HTTP_REQUEST_WRITER.head_text(req).to_utf8.length = HTTP_REQUEST_WRITER.head_text(req).byte_model.length and
+      req.headers.fields.length <= 64 and
+      (forall k: NAT. k < HTTP_REQUEST_WRITER.head_text(req).byte_model.length implies
+        LIST_OPS.at(buf.model, k) = LIST_OPS.at(HTTP_REQUEST_WRITER.head_text(req).byte_model, k))
+    ensure
+      size: HTTP_REQUEST_WRITER.head_text(req).byte_model.length =
+        HTTP_REQUEST_WRITER.line_text(req.method, req.target, req.version).byte_model.length + 2 +
+        HTTP_REQUEST_WRITER.fields_text(req.headers.fields).byte_model.length +
+        HTTP_REQUEST_WRITER.length_line(req).byte_model.length + 2
+      in_buf: HTTP_REQUEST_WRITER.head_text(req).byte_model.length <= buf.length
+      fields_hold: forall k: NAT. (HTTP_REQUEST_WRITER.line_text(req.method, req.target, req.version).byte_model.length + 2 <= k and
+          k < HTTP_REQUEST_WRITER.line_text(req.method, req.target, req.version).byte_model.length + 2 +
+            HTTP_REQUEST_WRITER.fields_text(req.headers.fields).byte_model.length) implies
+        LIST_OPS.at(buf.model, k) = LIST_OPS.at(HTTP_REQUEST_WRITER.fields_text(req.headers.fields).byte_model,
+          k - (HTTP_REQUEST_WRITER.line_text(req.method, req.target, req.version).byte_model.length + 2))
+      length_holds: forall k: NAT. (HTTP_REQUEST_WRITER.line_text(req.method, req.target, req.version).byte_model.length + 2 +
+            HTTP_REQUEST_WRITER.fields_text(req.headers.fields).byte_model.length <= k and
+          k < HTTP_REQUEST_WRITER.line_text(req.method, req.target, req.version).byte_model.length + 2 +
+            HTTP_REQUEST_WRITER.fields_text(req.headers.fields).byte_model.length + HTTP_REQUEST_WRITER.length_line(req).byte_model.length) implies
+        LIST_OPS.at(buf.model, k) = LIST_OPS.at(HTTP_REQUEST_WRITER.length_line(req).byte_model,
+          k - (HTTP_REQUEST_WRITER.line_text(req.method, req.target, req.version).byte_model.length + 2 +
+            HTTP_REQUEST_WRITER.fields_text(req.headers.fields).byte_model.length))
+    end
+
+end

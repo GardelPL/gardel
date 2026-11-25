@@ -1,6 +1,4 @@
-# Cases for GJSON_TEST, read on standard input:
-#
-#   build/gjson_test_bin.exe < gjson/tests/cases.txt
+# Cases for GJSON_TEST, which `gardelc test gjson` sends on standard input.
 #
 # Each line is a document, ` => `, and what `JSON.parse` must say of it: `ok` and the value
 # written back, or `error`, the reason and the byte offset. Every accepted value must also
@@ -98,3 +96,9 @@ nulls => error TrailingBytes 4
 @escapes 50000 => ok depth 0 count 0 bytes 200002
 @fields 3000 => ok depth 1 count 3000 bytes 28891
 @items 2100000 => error TooLarge 4194304
+@array 0 => ok []
+@array 1 => ok [0]
+@array 4 => ok [0,1,2,3]
+@array 200000 => ok depth 1 count 200000 bytes 1288891
+@boxed 63 => ok depth 64 count 1 bytes 128
+@boxed 64 => error UnexpectedEnd 0

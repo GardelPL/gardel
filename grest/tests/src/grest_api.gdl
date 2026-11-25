@@ -77,6 +77,12 @@ feature {ANY}
       REST_RESPONSE.error(HTTP_STATUS.make(409), "taken")
     end
 
+  -- Waits under its tag, through five sweeps.
+  later(n: NAT, r: REST_REQUEST, tag: NAT): REST_OUTCOME[NAT]
+    do
+      REST_OUTCOME.waiting(n, tag, LIST.empty, 5, REST_RESPONSE.timed_out)
+    end
+
   router: REST_ROUTER[NAT]
     do
       REST_ROUTER.empty
@@ -89,8 +95,9 @@ feature {ANY}
         .on_get("/search", search)
         .on_get("/whoami", whoami)
         .on_get("/taken", taken)
+        .on_await(Get, "/later", later)
     ensure
-      nine: Result.route_count = 9
+      ten: Result.route_count = 10
     end
 
   -- A router with a pattern that is not valid.

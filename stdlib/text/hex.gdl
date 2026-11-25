@@ -1,0 +1,199 @@
+-- Bytes as hexadecimal text, and back (Task H.6). Encoding gives two lowercase digits per
+-- byte; decoding takes either case. Both run as loops over the bytes, so a long input needs
+-- no stack; `digits_of` and `read_pairs` are what they compute, one byte at a time.
+module HEX
+
+create {ANY}
+
+  encode(b: BYTES): STRING
+    require
+      fits: b.length <= 9223372036854775807
+    do
+      let out = HEX.encode_from(b, 0, BYTES_BUILDER.empty).to_bytes
+      check
+        text: NUMBER_TEXT.ascii_text(out.model)
+      end
+      match STRING.from_utf8(out)
+        case Ok(s) then s
+        case Error(_) then ""
+      end
+    ensure
+      bytes: Result.byte_model = HEX.digits_of(b.model)
+      len: Result.byte_length = 2 * b.length
+    end
+
+  decode(s: STRING): RESULT[CODEC_ERROR, BYTES]
+    do
+      HEX.decode_from(s.to_utf8, 0, BYTES_BUILDER.empty)
+    ensure
+      def: Result.is_ok = HEX.read_pairs(s.byte_model, 0).is_ok
+      model: Result.is_ok implies Result.get.model = HEX.read_pairs(s.byte_model, 0).get
+    end
+
+  -- The models. They are public because the contracts above mention them.
+
+  -- The two lowercase hex digits of the byte `x`, as ASCII codes.
+  pair(x: U64): LIST[U64]
+    do
+      let none: LIST[U64] = LIST.empty
+      none.prepend(NUMBER_TEXT.hex_digit(x % 16)).prepend(NUMBER_TEXT.hex_digit(x / 16 % 16))
+    ensure
+      two: Result.length = 2
+      ascii: NUMBER_TEXT.ascii(Result)
+    end
+
+  -- Two lowercase hex digits per byte.
+  digits_of(xs: LIST[U64]): LIST[U64]
+    variant
+      xs.length
+    do
+      if xs.length = 0 then LIST.empty else HEX.pair(xs.head).append(HEX.digits_of(xs.tail)) end
+    ensure
+      len: Result.length = 2 * xs.length
+      ascii: NUMBER_TEXT.ascii(Result)
+    end
+
+  -- Pairs of hex digits, either case, as bytes. `offset` is where `xs` starts, for the error.
+  read_pairs(xs: LIST[U64], offset: NAT): RESULT[CODEC_ERROR, LIST[U64]]
+    require
+      fits: offset + xs.length <= 18446744073709551615
+    variant
+      xs.length
+    do
+      if xs.length = 0 then
+        Ok(LIST.empty)
+      else
+        if xs.length = 1 then
+          Error(BadLength)
+        else
+          let hi = NUMBER_TEXT.hex_value(xs.head)
+          let lo = NUMBER_TEXT.hex_value(xs.tail.head)
+          if hi = 16 then
+            Error(BadSymbol(offset))
+          else
+            if lo = 16 then
+              Error(BadSymbol(offset + 1))
+            else
+              match HEX.read_pairs(xs.tail.tail, offset + 2)
+                case Ok(rest) then Ok(rest.prepend(hi * 16 + lo))
+                case Error(e) then Error(e)
+              end
+            end
+          end
+        end
+      end
+    ensure
+      octets: Result.is_ok implies BYTES.all_octets(Result.get)
+      len: Result.is_ok implies 2 * Result.get.length = xs.length
+    end
+
+  -- Lemma: the digits of `xs` read back as `xs`.
+  pairs_read(xs: LIST[U64], offset: NAT): BOOL
+    require
+      octets: BYTES.all_octets(xs)
+      fits: offset + 2 * xs.length <= 18446744073709551615
+    variant
+      xs.length
+    do
+      if xs.length = 0 then
+        True
+      else
+        check
+          whole: xs.tail.prepend(xs.head) = xs
+          sum: xs.head / 16 % 16 * 16 + xs.head % 16 = xs.head
+          front: HEX.pair(xs.head).append(HEX.digits_of(xs.tail)) =
+            HEX.digits_of(xs.tail).prepend(NUMBER_TEXT.hex_digit(xs.head % 16))
+              .prepend(NUMBER_TEXT.hex_digit(xs.head / 16 % 16))
+        end
+        HEX.pairs_read(xs.tail, offset + 2)
+      end
+    ensure
+      holds: Result
+      read: HEX.read_pairs(HEX.digits_of(xs), offset) = Ok(xs)
+    end
+
+create {NONE}
+
+  add_pair(out: BYTES_BUILDER, x: U64): BYTES_BUILDER
+    require
+      fits: out.length <= 18446744073709551613
+    do
+      out.add_byte(NUMBER_TEXT.hex_digit(x / 16 % 16)).add_byte(NUMBER_TEXT.hex_digit(x % 16))
+    ensure
+      model: Result.model = out.model.append(HEX.pair(x))
+      len: Result.length = out.length + 2
+    end
+
+  -- The digits of the bytes of `b` from index `i` on, after `out`.
+  encode_from(b: BYTES, i: NAT, out: BYTES_BUILDER): BYTES_BUILDER
+    require
+      inside: i <= b.length
+      fits: out.length + 2 * (b.length - i) <= 18446744073709551615
+    variant
+      b.length - i
+    do
+      if i = b.length then
+        out
+      else
+        check
+          step: LIST_OPS.drop_step(b.model, i)
+        end
+        HEX.encode_from(b, i + 1, HEX.add_pair(out, b.at(i)))
+      end
+    ensure
+      model: Result.model = out.model.append(HEX.digits_of(LIST_OPS.drop(b.model, i)))
+    end
+
+  -- `read_pairs` of the bytes of `bs` from index `i` on, after `out`.
+  decode_from(bs: BYTES, i: NAT, out: BYTES_BUILDER): RESULT[CODEC_ERROR, BYTES]
+    require
+      inside: i <= bs.length
+      shorter: out.length <= i
+    variant
+      bs.length - i
+    do
+      if i = bs.length then
+        Ok(out.to_bytes)
+      else
+        if i + 1 = bs.length then
+          Error(BadLength)
+        else
+          let hi = NUMBER_TEXT.hex_value(bs.at(i))
+          let lo = NUMBER_TEXT.hex_value(bs.at(i + 1))
+          check
+            first: LIST_OPS.drop_step(bs.model, i)
+            second: LIST_OPS.drop_step(bs.model, i + 1)
+          end
+          if hi = 16 then
+            Error(BadSymbol(i))
+          else
+            if lo = 16 then
+              Error(BadSymbol(i + 1))
+            else
+              HEX.decode_from(bs, i + 2, out.add_byte(hi * 16 + lo))
+            end
+          end
+        end
+      end
+    ensure
+      same: Result.is_ok = HEX.read_pairs(LIST_OPS.drop(bs.model, i), i).is_ok
+      model: Result.is_ok implies
+        Result.get.model = out.model.append(HEX.read_pairs(LIST_OPS.drop(bs.model, i), i).get)
+    end
+
+specify {ANY}
+
+  -- The hex text of any bytes decodes to those bytes.
+  law round_trip(b: BYTES)
+    require
+      fits: b.length <= 9223372036854775807
+    trigger
+      HEX.decode(HEX.encode(b))
+    do
+      HEX.pairs_read(b.model, 0)
+    ensure
+      ok: HEX.decode(HEX.encode(b)).is_ok
+      same: HEX.decode(HEX.encode(b)).get.model = b.model
+    end
+
+end

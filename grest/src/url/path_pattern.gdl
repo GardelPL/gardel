@@ -82,8 +82,6 @@ create {ANY}
 
   -- The parameters `ps` binds when it matches `xs`, one for each parameter segment, in order.
   match_segments(ps: LIST[PATH_SEGMENT], xs: LIST[STRING]): OPTION[LIST[URL_PARAM]]
-    require
-      short: ps.length <= 16
     variant
       ps.length
     do
@@ -123,6 +121,7 @@ feature {ANY}
       Current.seg_count
     ensure
       bounded: Result <= 16
+      none_if_invalid: not Current.is_valid implies Result = 0
     end
 
   param_count: NAT

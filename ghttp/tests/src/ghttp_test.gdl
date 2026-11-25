@@ -2,7 +2,7 @@
 -- Exit code 0 means all checks passed; k > 0 identifies the first failing check.
 --
 --   gardelc --project ghttp/tests --strict
---   build/ghttp_test_bin.exe < ghttp/tests/cases.txt
+--   build/ghttp_test_bin < ghttp/tests/cases.txt
 program GHTTP_TEST
 
 feature {ANY}

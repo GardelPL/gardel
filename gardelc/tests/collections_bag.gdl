@@ -1,0 +1,67 @@
+-- A record that holds an array, with each way a routine may or may not take the array out of
+-- the record it was given (Task H.4).
+module BAG
+
+representation {NONE}
+  slots: ARRAY[OPTION[STRING]]
+  n: NAT
+
+invariant
+  two: slots.length = 2
+  few: n < 1000000
+
+create {ANY}
+
+  make(s: STRING): BAG
+    do
+      { slots = ARRAY.make(2, Some(s)), n = 0 }
+    end
+
+feature {ANY}
+
+  count: NAT
+    do
+      Current.n
+    end
+
+  first: OPTION[STRING]
+    do
+      Current.slots.at(0)
+    end
+
+  -- May take the array.
+  put(s: STRING): BAG
+    do
+      { slots = Current.slots.set(0, Some(s)), n = (Current.n + 1) % 1000000 }
+    end
+
+  -- Reads the array twice: may not.
+  shift(s: STRING): BAG
+    do
+      { slots = Current.slots.set(1, Current.slots.at(0)).set(0, Some(s)), n = Current.n }
+    end
+
+  -- The binder points into the array: may not.
+  longer(s: STRING): BAG
+    do
+      match Current.slots.at(0)
+      case Some(x) then
+        { slots = Current.slots.set(0, if x.byte_length <= 1000 and s.byte_length <= 1000 then Some(x.concat(s)) else None end), n = Current.n }
+      case None then Current
+      end
+    end
+
+  -- The array is in a `let` too.
+  kept(s: STRING): BAG
+    do
+      let old = Current.slots
+      { slots = Current.slots.set(0, Some(s)), n = (Current.n + old.length) % 1000000 }
+    end
+
+  -- Takes it in one branch only.
+  put_if(b: BOOL, s: STRING): BAG
+    do
+      if b then { slots = Current.slots.set(1, Some(s)), n = Current.n } else Current end
+    end
+
+end

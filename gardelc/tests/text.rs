@@ -5,6 +5,9 @@ use std::fs;
 use std::path::PathBuf;
 use std::process::{Command, Output};
 
+/// The suffix gardelc gives an executable: `.exe` on Windows, none elsewhere.
+const EXE: &str = std::env::consts::EXE_SUFFIX;
+
 struct Project {
     dir: PathBuf,
 }
@@ -33,7 +36,7 @@ impl Project {
     }
 
     fn run_binary(&self) -> String {
-        let exe = self.dir.join("build").join("main_bin.exe");
+        let exe = self.dir.join("build").join(format!("main_bin{EXE}"));
         let out = Command::new(exe).output().expect("the program runs");
         assert!(out.status.success(), "{out:?}");
         String::from_utf8(out.stdout).expect("UTF-8 output").replace("\r\n", "\n")

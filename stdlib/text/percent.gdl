@@ -1,0 +1,253 @@
+-- Percent-encoding (RFC 3986 §2.1, Task H.6). The encoder keeps the unreserved bytes
+-- (`A`-`Z`, `a`-`z`, `0`-`9`, `-`, `.`, `_`, `~`) and writes every other byte as `%` and two
+-- uppercase hex digits. The decoder reads `%` and two hex digits of either case, keeps every
+-- other byte, and refuses bytes that are not UTF-8. `+` is not a space here. Both run as loops
+-- over the bytes, so a long input needs no stack; `escaped` and `unescaped` are what they
+-- compute.
+module PERCENT
+
+create {ANY}
+
+  encode(s: STRING): STRING
+    require
+      fits: s.byte_length <= 6148914691236517205
+    do
+      let out = PERCENT.encode_from(s.to_utf8, 0, BYTES_BUILDER.empty).to_bytes
+      check
+        text: NUMBER_TEXT.ascii_text(out.model)
+      end
+      match STRING.from_utf8(out)
+        case Ok(t) then t
+        case Error(_) then ""
+      end
+    ensure
+      bytes: Result.byte_model = PERCENT.escaped(s.byte_model)
+    end
+
+  decode(s: STRING): RESULT[CODEC_ERROR, STRING]
+    do
+      match PERCENT.decode_from(s.to_utf8, 0, BYTES_BUILDER.empty)
+        case Ok(b) then
+          match STRING.from_utf8(b)
+            case Ok(t) then Ok(t)
+            case Error(_) then Error(NotText)
+          end
+        case Error(e) then Error(e)
+      end
+    ensure
+      read: PERCENT.unescaped(s.byte_model, 0).is_ok implies
+        (Result.is_ok = BYTES.valid_utf8(PERCENT.unescaped(s.byte_model, 0).get))
+      model: Result.is_ok implies Result.get.byte_model = PERCENT.unescaped(s.byte_model, 0).get
+      refused: not PERCENT.unescaped(s.byte_model, 0).is_ok implies not Result.is_ok
+    end
+
+  -- The models. They are public because the contracts above mention them.
+
+  -- The bytes RFC 3986 calls unreserved.
+  unreserved(x: U64): BOOL
+    do
+      (x >= 65 and x <= 90) or (x >= 97 and x <= 122) or (x >= 48 and x <= 57) or
+        x = 45 or x = 46 or x = 95 or x = 126
+    end
+
+  -- The uppercase hex digit of `v`.
+  upper_digit(v: NAT): U64
+    require
+      digit: v < 16
+    do
+      if v < 10 then 48 + v else 55 + v end
+    ensure
+      ascii: Result < 128
+      reads_back: NUMBER_TEXT.hex_value(Result) = v
+    end
+
+  -- The byte `x` as it is, if unreserved, or as `%` and two hex digits.
+  escape(x: U64): LIST[U64]
+    do
+      let none: LIST[U64] = LIST.empty
+      if PERCENT.unreserved(x) then
+        none.prepend(x)
+      else
+        none.prepend(PERCENT.upper_digit(x % 16)).prepend(PERCENT.upper_digit(x / 16 % 16)).prepend(37)
+      end
+    ensure
+      ascii: NUMBER_TEXT.ascii(Result)
+      octets: BYTES.all_octets(Result)
+      len: 1 <= Result.length and Result.length <= 3
+    end
+
+  escaped(xs: LIST[U64]): LIST[U64]
+    variant
+      xs.length
+    do
+      if xs.length = 0 then LIST.empty else PERCENT.escape(xs.head).append(PERCENT.escaped(xs.tail)) end
+    ensure
+      ascii: NUMBER_TEXT.ascii(Result)
+      octets: BYTES.all_octets(Result)
+      len: Result.length <= 3 * xs.length
+    end
+
+  -- `%` and two hex digits as the byte they name; every other byte as it is. `offset` is
+  -- where `xs` starts, for the error.
+  unescaped(xs: LIST[U64], offset: NAT): RESULT[CODEC_ERROR, LIST[U64]]
+    require
+      fits: offset + xs.length <= 18446744073709551615
+    variant
+      xs.length
+    do
+      if xs.length = 0 then
+        Ok(LIST.empty)
+      else
+        if xs.head != 37 then
+          match PERCENT.unescaped(xs.tail, offset + 1)
+            case Ok(rest) then Ok(rest.prepend(xs.head))
+            case Error(e) then Error(e)
+          end
+        else
+          if xs.length < 3 then
+            Error(BadSymbol(offset))
+          else
+            let hi = NUMBER_TEXT.hex_value(xs.tail.head)
+            let lo = NUMBER_TEXT.hex_value(xs.tail.tail.head)
+            if hi = 16 or lo = 16 then
+              Error(BadSymbol(offset))
+            else
+              match PERCENT.unescaped(xs.tail.tail.tail, offset + 3)
+                case Ok(rest) then Ok(rest.prepend(hi * 16 + lo))
+                case Error(e) then Error(e)
+              end
+            end
+          end
+        end
+      end
+    ensure
+      shorter: Result.is_ok implies Result.get.length <= xs.length
+    end
+
+  -- Lemma: the escaped bytes of `xs` read back as `xs`.
+  escapes_read(xs: LIST[U64], offset: NAT): BOOL
+    require
+      octets: BYTES.all_octets(xs)
+      fits: offset + 3 * xs.length <= 18446744073709551615
+    variant
+      xs.length
+    do
+      if xs.length = 0 then
+        True
+      else
+        check
+          whole: xs.tail.prepend(xs.head) = xs
+          sum: xs.head / 16 % 16 * 16 + xs.head % 16 = xs.head
+          below: PERCENT.escaped(xs.tail).length <= 3 * xs.tail.length
+          kept: PERCENT.unreserved(xs.head) implies
+            PERCENT.escape(xs.head).append(PERCENT.escaped(xs.tail)) = PERCENT.escaped(xs.tail).prepend(xs.head)
+          coded: not PERCENT.unreserved(xs.head) implies
+            PERCENT.escape(xs.head).append(PERCENT.escaped(xs.tail)) =
+              PERCENT.escaped(xs.tail).prepend(PERCENT.upper_digit(xs.head % 16))
+                .prepend(PERCENT.upper_digit(xs.head / 16 % 16)).prepend(37)
+        end
+        if PERCENT.unreserved(xs.head) then
+          PERCENT.escapes_read(xs.tail, offset + 1)
+        else
+          PERCENT.escapes_read(xs.tail, offset + 3)
+        end
+      end
+    ensure
+      holds: Result
+      read: PERCENT.unescaped(PERCENT.escaped(xs), offset) = Ok(xs)
+    end
+
+create {NONE}
+
+  add_escape(out: BYTES_BUILDER, x: U64): BYTES_BUILDER
+    require
+      octet: x < 256
+      fits: out.length + 3 <= 18446744073709551615
+    do
+      if PERCENT.unreserved(x) then
+        out.add_byte(x)
+      else
+        out.add_byte(37).add_byte(PERCENT.upper_digit(x / 16 % 16)).add_byte(PERCENT.upper_digit(x % 16))
+      end
+    ensure
+      model: Result.model = out.model.append(PERCENT.escape(x))
+      len: Result.length <= out.length + 3
+    end
+
+  -- The escaped bytes of `bs` from index `i` on, after `out`.
+  encode_from(bs: BYTES, i: NAT, out: BYTES_BUILDER): BYTES_BUILDER
+    require
+      inside: i <= bs.length
+      fits: out.length + 3 * (bs.length - i) <= 18446744073709551615
+    variant
+      bs.length - i
+    do
+      if i = bs.length then
+        out
+      else
+        check
+          step: LIST_OPS.drop_step(bs.model, i)
+        end
+        PERCENT.encode_from(bs, i + 1, PERCENT.add_escape(out, bs.at(i)))
+      end
+    ensure
+      model: Result.model = out.model.append(PERCENT.escaped(LIST_OPS.drop(bs.model, i)))
+    end
+
+  -- `unescaped` of the bytes of `bs` from index `i` on, after `out`.
+  decode_from(bs: BYTES, i: NAT, out: BYTES_BUILDER): RESULT[CODEC_ERROR, BYTES]
+    require
+      inside: i <= bs.length
+      shorter: out.length <= i
+    variant
+      bs.length - i
+    do
+      if i = bs.length then
+        Ok(out.to_bytes)
+      else
+        check
+          step: LIST_OPS.drop_step(bs.model, i)
+        end
+        let x = bs.at(i)
+        if x != 37 then
+          PERCENT.decode_from(bs, i + 1, out.add_byte(x))
+        else
+          if bs.length - i < 3 then
+            Error(BadSymbol(i))
+          else
+            check
+              second: LIST_OPS.drop_step(bs.model, i + 1)
+              third: LIST_OPS.drop_step(bs.model, i + 2)
+            end
+            let hi = NUMBER_TEXT.hex_value(bs.at(i + 1))
+            let lo = NUMBER_TEXT.hex_value(bs.at(i + 2))
+            if hi = 16 or lo = 16 then
+              Error(BadSymbol(i))
+            else
+              PERCENT.decode_from(bs, i + 3, out.add_byte(hi * 16 + lo))
+            end
+          end
+        end
+      end
+    ensure
+      same: Result.is_ok = PERCENT.unescaped(LIST_OPS.drop(bs.model, i), i).is_ok
+      model: Result.is_ok implies
+        Result.get.model = out.model.append(PERCENT.unescaped(LIST_OPS.drop(bs.model, i), i).get)
+    end
+
+specify {ANY}
+
+  -- The percent-encoding of any text decodes to that text.
+  law round_trip(s: STRING)
+    require
+      fits: s.byte_length <= 6148914691236517205
+    trigger
+      PERCENT.decode(PERCENT.encode(s))
+    do
+      PERCENT.escapes_read(s.byte_model, 0)
+    ensure
+      ok: PERCENT.decode(PERCENT.encode(s)).is_ok
+      same: PERCENT.decode(PERCENT.encode(s)).get.equals(s)
+    end
+
+end

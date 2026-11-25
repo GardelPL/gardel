@@ -444,8 +444,6 @@ create {ANY}
 
   -- `acc` with the states `ls` end in in front of it, the last line's first. Each line is
   -- lexed from the state the one before it ends in: the head of `acc`, or 0 when it is empty.
-  -- (A state is passed in a list: a number a function gives back is not known to the prover
-  -- to be a `NAT`, so it could not be one of its arguments.)
   ends_onto(ls: LIST[LIST[CHAR]], lex: (start: NAT, line: LIST[CHAR]) -> NAT, acc: LIST[NAT]): LIST[NAT]
     variant
       ls.length

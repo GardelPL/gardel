@@ -27,11 +27,15 @@ create {ANY}
   max_segments: NAT
     do
       16
+    ensure
+      def: Result = 16
     end
 
   max_fields: NAT
     do
       32
+    ensure
+      def: Result = 32
     end
 
   -- Each of `parts`, decoded as a path segment.
@@ -123,10 +127,8 @@ create {ANY}
       bounded: Result.is_ok implies Result.get.length <= 32
     end
 
-  -- What follows index `i` of `t`, or nothing if `i` is its end.
+  -- What follows index `i` of `t`, or nothing if `i` is its end or past it.
   query_after(t: STRING, i: NAT): STRING
-    require
-      inside: i <= t.code_point_count
     do
       if i < t.code_point_count then t.slice(i + 1, t.code_point_count) else STRING.make_empty(1) end
     end

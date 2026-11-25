@@ -1,0 +1,250 @@
+-- An endless sequence as a finite value: a state and a step (Task H.22). `next` gives the
+-- item at a state and the state after it, so `take(n)` is the first `n` items. A step never
+-- ends: a client chooses what happens at the end of a bounded type, wrapping with `+%` or
+-- counting with `BIGNAT`. A sequence that may end is an `UNFOLD`.
+module GENERATOR[S, A]
+
+representation {ANY}
+  state: S
+  next: S -> TUPLE[A, S]
+
+create {ANY}
+
+  make(s: S, f: S -> TUPLE[A, S]): GENERATOR[S, A]
+    do
+      { state = s, next = f }
+    ensure
+      at_state: Result.state = s
+      with_step: Result.next = f
+    end
+
+  -- `x`, `f(x)`, `f(f(x))`, ...: the state is the item.
+  iterate[T](x: T, f: T -> T): GENERATOR[T, T]
+    do
+      { state = x, next = fn(s: T): TUPLE[T, T] do (s, f(s)) end }
+    ensure
+      at_state: Result.state = x
+      stepping: forall s: T. Result.next(s) = (s, f(s))
+    end
+
+  -- The items of `xs` over and over. The state is the index of the next item.
+  cycle[T](xs: LIST[T]): GENERATOR[NAT, T]
+    require
+      not_empty: xs.length > 0
+    do
+      { state = 0,
+        next = fn(i: NAT): TUPLE[T, NAT] do
+          (LIST_OPS.at(xs, i % xs.length), ((i % xs.length) +% 1) % xs.length)
+        end }
+    ensure
+      at_start: Result.state = 0
+    end
+
+create {NONE}
+
+  -- `map`'s step: it depends on the step alone, not on the state, so a generator and its
+  -- `tail` map to the same step.
+  mapped_step[B](step: S -> TUPLE[A, S], f: A -> B): S -> TUPLE[B, S]
+    do
+      fn(s: S): TUPLE[B, S] do (f(step(s).first), step(s).second) end
+    end
+
+feature {ANY}
+
+  head: A
+    do
+      Current.next(Current.state).first
+    ensure
+      first: Result = Current.next(Current.state).first
+    end
+
+  tail: GENERATOR[S, A]
+    do
+      { state = Current.next(Current.state).second, next = Current.next }
+    ensure
+      stepped: Result.state = Current.next(Current.state).second
+      same_step: Result.next = Current.next
+    end
+
+  -- The first `n` items.
+  take(n: NAT): LIST[A]
+    variant
+      n
+    do
+      if n = 0 then
+        LIST.empty
+      else
+        Current.tail.take(n - 1).prepend(Current.head)
+      end
+    ensure
+      length: Result.length = n
+      empty_case: n = 0 implies Result = LIST.empty
+      cons_case: n > 0 implies Result = Current.tail.take(n - 1).prepend(Current.head)
+    end
+
+  -- The item at index `n`.
+  nth(n: NAT): A
+    variant
+      n
+    do
+      if n = 0 then
+        Current.head
+      else
+        Current.tail.nth(n - 1)
+      end
+    ensure
+      head_case: n = 0 implies Result = Current.head
+      step_case: n > 0 implies Result = Current.tail.nth(n - 1)
+    end
+
+  -- The generator after its first `n` items.
+  drop(n: NAT): GENERATOR[S, A]
+    variant
+      n
+    do
+      if n = 0 then
+        Current
+      else
+        Current.tail.drop(n - 1)
+      end
+    ensure
+      zero_case: n = 0 implies Result = Current
+      step_case: n > 0 implies Result = Current.tail.drop(n - 1)
+    end
+
+  -- `f` of each item.
+  map[B](f: A -> B): GENERATOR[S, B]
+    do
+      { state = Current.state, next = mapped_step(Current.next, f) }
+    ensure
+      at_state: Result.state = Current.state
+      stepping: forall s: S. Result.next(s) = (f(Current.next(s).first), Current.next(s).second)
+    end
+
+  -- Pairs of the items at the same index. The state is the pair of states.
+  zip[T, B](other: GENERATOR[T, B]): GENERATOR[TUPLE[S, T], TUPLE[A, B]]
+    do
+      let f = Current.next
+      let g = other.next
+      { state = (Current.state, other.state),
+        next = fn(p: TUPLE[S, T]): TUPLE[TUPLE[A, B], TUPLE[S, T]] do
+          ((f(p.first).first, g(p.second).first), (f(p.first).second, g(p.second).second))
+        end }
+    ensure
+      at_state: Result.state = (Current.state, other.state)
+      stepping: forall p: TUPLE[S, T]. Result.next(p) =
+        ((Current.next(p.first).first, other.next(p.second).first), (Current.next(p.first).second, other.next(p.second).second))
+    end
+
+  -- `h` of the items at the same index.
+  zip_with[T, B, C](other: GENERATOR[T, B], h: (x: A, y: B) -> C): GENERATOR[TUPLE[S, T], C]
+    do
+      let f = Current.next
+      let g = other.next
+      { state = (Current.state, other.state),
+        next = fn(p: TUPLE[S, T]): TUPLE[C, TUPLE[S, T]] do
+          (h(f(p.first).first, g(p.second).first), (f(p.first).second, g(p.second).second))
+        end }
+    ensure
+      at_state: Result.state = (Current.state, other.state)
+      stepping: forall p: TUPLE[S, T]. Result.next(p) =
+        (h(Current.next(p.first).first, other.next(p.second).first), (Current.next(p.first).second, other.next(p.second).second))
+    end
+
+  -- `init`, then each item folded into the one before: `init`, `f(init, x0)`,
+  -- `f(f(init, x0), x1)`, ... The state is the generator's and the running value.
+  scan[B](f: (acc: B, x: A) -> B, init: B): GENERATOR[TUPLE[S, B], B]
+    do
+      let step = Current.next
+      { state = (Current.state, init),
+        next = fn(p: TUPLE[S, B]): TUPLE[B, TUPLE[S, B]] do
+          (p.second, (step(p.first).second, f(p.second, step(p.first).first)))
+        end }
+    ensure
+      at_state: Result.state = (Current.state, init)
+      stepping: forall p: TUPLE[S, B]. Result.next(p) =
+        (p.second, (Current.next(p.first).second, f(p.second, Current.next(p.first).first)))
+    end
+
+  -- The first item within the first `k` that satisfies `p`. A search without a bound may
+  -- never end, so there is none.
+  find_within(k: NAT, p: A -> BOOL): OPTION[A]
+    variant
+      k
+    do
+      if k = 0 then
+        None
+      else if p(Current.head) then
+        Some(Current.head)
+      else
+        Current.tail.find_within(k - 1, p)
+      end end
+    end
+
+  -- The items before the first that fails `p`, among the first `k`.
+  take_while_within(k: NAT, p: A -> BOOL): LIST[A]
+    variant
+      k
+    do
+      if k = 0 then
+        LIST.empty
+      else if p(Current.head) then
+        Current.tail.take_while_within(k - 1, p).prepend(Current.head)
+      else
+        LIST.empty
+      end end
+    ensure
+      not_longer: Result.length <= k
+    end
+
+specify {ANY}
+
+  -- The item at `k` is the item at `k` of any longer prefix.
+  law nth_take(g: GENERATOR[S, A], n: NAT, k: NAT)
+    require
+      inside: k < n
+    trigger
+      LIST_OPS.at(g.take(n), k)
+    variant
+      k
+    do
+      if k = 0 then
+        True
+      else
+        nth_take(g.tail, n - 1, k - 1)
+      end
+    ensure
+      same: g.nth(k) = LIST_OPS.at(g.take(n), k)
+    end
+
+  -- A prefix is a shorter prefix, then a prefix of what follows it.
+  law take_split(g: GENERATOR[S, A], n: NAT, m: NAT)
+    require
+      shorter: m <= n
+    variant
+      m
+    do
+      if m = 0 then
+        True
+      else
+        take_split(g.tail, n - 1, m - 1)
+      end
+    ensure
+      split: g.take(n) = g.take(m).append(g.drop(m).take(n - m))
+    end
+
+  -- A prefix of `map` is `map` of the prefix.
+  law map_take[B](g: GENERATOR[S, A], f: A -> B, n: NAT)
+    variant
+      n
+    do
+      if n = 0 then
+        True
+      else
+        g.map(f).tail = g.tail.map(f) and map_take(g.tail, f, n - 1)
+      end
+    ensure
+      prefix: g.map(f).take(n) = LIST_OPS.map(g.take(n), f)
+    end
+
+end

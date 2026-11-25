@@ -1,0 +1,41 @@
+-- What stage D of the round trip needs of the writer's `Content-Length` line: its name is a
+-- token that names the field, and its digits are a field value. Apart from the writer, as a
+-- law there weighs on every proof that sees the writer.
+functions HTTP_WRITER_LENGTH
+
+specify {ANY}
+
+  -- The writer's spelling of `Content-Length` is a token, and names the field that frames
+  -- a body by its length, for stage D of the round trip.
+  law content_length_spelling(x: NAT)
+    do
+      HTTP_REQUEST_WRITER.content_length_field.byte_model.length = 14 and
+      HTTP_REQUEST_WRITER.content_length_field.to_utf8.model = HTTP_REQUEST_WRITER.content_length_field.byte_model and
+      HTTP_LINE_FACTS.token_from(HTTP_REQUEST_WRITER.content_length_field.to_utf8, 0) and
+      HTTP_HEAD_PARSER.content_length_named(HTTP_REQUEST_WRITER.content_length_field.to_utf8)
+    ensure
+      token: HTTP_HEAD_PARSER.is_token(HTTP_REQUEST_WRITER.content_length_field.to_utf8, 0)
+      named: HTTP_HEAD_PARSER.ascii_equal_ci(HTTP_REQUEST_WRITER.content_length_field.to_utf8, HTTP_HEAD_PARSER.content_length_name, 0)
+    end
+
+  -- The digits of a `Content-Length` line are a field value with no space at either end,
+  -- for stage D of the round trip.
+  law length_digits_field(req: HTTP_REQUEST)
+    do
+      req.request_body_length <= 65536 and
+      NUMBER_TEXT.nat_to_text(req.request_body_length).byte_model = NUMBER_TEXT.digits(req.request_body_length, LIST.empty) and
+      NUMBER_TEXT.nat_to_text(req.request_body_length).byte_length <= 5 and
+      HTTP_REQUEST_WRITER.length_digits(req).byte_model = NUMBER_TEXT.nat_to_text(req.request_body_length).byte_model and
+      HTTP_LINE_FACTS.digits_are_digits(req.request_body_length, LIST.empty) and
+      HTTP_REQUEST_WRITER.length_digits(req).to_utf8.model = HTTP_REQUEST_WRITER.length_digits(req).byte_model and
+      HTTP_LINE_FACTS.field_bytes_from(HTTP_REQUEST_WRITER.length_digits(req).to_utf8, 0, HTTP_REQUEST_WRITER.length_digits(req).to_utf8.length)
+    ensure
+      some: HTTP_REQUEST_WRITER.length_digits(req).byte_length > 0
+      digits: HTTP_REQUEST_WRITER.length_digits(req).byte_model = NUMBER_TEXT.nat_to_text(req.request_body_length).byte_model
+      field: HTTP_HEAD_PARSER.all_field_bytes(HTTP_REQUEST_WRITER.length_digits(req).to_utf8, 0, HTTP_REQUEST_WRITER.length_digits(req).to_utf8.length)
+      trimmed: LIST_OPS.at(HTTP_REQUEST_WRITER.length_digits(req).byte_model, 0) != 32 and LIST_OPS.at(HTTP_REQUEST_WRITER.length_digits(req).byte_model, 0) != 9 and
+        LIST_OPS.at(HTTP_REQUEST_WRITER.length_digits(req).byte_model, HTTP_REQUEST_WRITER.length_digits(req).byte_length - 1) != 32 and
+        LIST_OPS.at(HTTP_REQUEST_WRITER.length_digits(req).byte_model, HTTP_REQUEST_WRITER.length_digits(req).byte_length - 1) != 9
+    end
+
+end

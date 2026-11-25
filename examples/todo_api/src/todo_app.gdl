@@ -1,0 +1,8 @@
+-- The state of `TODO_API`: waiting for the port from the environment, or serving (Task H.2).
+module TODO_APP
+
+representation {ANY}
+  | Starting
+  | Serving(server: REST_SERVER[TODO_STORE])
+
+end

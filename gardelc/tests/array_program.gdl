@@ -1,0 +1,171 @@
+-- `ARRAY` in C (Task H.5): `set` and `swap` change an array in place when nothing else holds
+-- it, in a loop, through a `let`, along a chain, and on items that are counted strings, and
+-- copy it when it is still read after. The leak test counts the copies.
+program MAIN
+
+feature {ANY}
+
+  -- `a` with `i` at each index from `i` on: a loop that owns `a` from its second iteration.
+  fill(a: ARRAY[NAT], i: NAT): ARRAY[NAT]
+    require
+      inside: i <= a.length
+    variant
+      a.length - i
+    do
+      if i = a.length then
+        a
+      else
+        fill(a.set(i, i), i + 1)
+      end
+    ensure
+      len: Result.length = a.length
+    end
+
+  -- `fill` written with a `let`: the old array is read by nothing after the `set`.
+  fill_let(a: ARRAY[NAT], i: NAT): ARRAY[NAT]
+    require
+      inside: i <= a.length
+    variant
+      a.length - i
+    do
+      if i = a.length then
+        a
+      else
+        let b = a.set(i, i % 7 + 1)
+        fill_let(b, i + 1)
+      end
+    ensure
+      len: Result.length = a.length
+    end
+
+  -- Reversing in place by swaps from both ends.
+  reverse(a: ARRAY[NAT], i: NAT): ARRAY[NAT]
+    require
+      half: i <= a.length / 2
+    variant
+      a.length - i
+    do
+      if a.length - i <= i + 1 then
+        a
+      else
+        reverse(a.swap(i, a.length - 1 - i), i + 1)
+      end
+    ensure
+      len: Result.length = a.length
+    end
+
+  -- The items joined by commas.
+  nats(a: ARRAY[NAT]): STRING
+    do
+      a.fold(fn(acc: STRING, x: NAT): STRING do
+        let t = NUMBER_TEXT.nat_to_text(x)
+        if acc.byte_length <= 1000000 then
+          (if acc.byte_length = 0 then t else acc.concat(",").concat(t) end)
+        else
+          acc
+        end
+      end, "")
+    end
+
+  texts(a: ARRAY[STRING]): STRING
+    do
+      a.fold(fn(acc: STRING, x: STRING): STRING do
+        if acc.byte_length <= 1000000 and x.byte_length <= 1000000 then
+          acc.concat("/").concat(x)
+        else
+          acc
+        end
+      end, "")
+    end
+
+  -- `a` and `b` joined by `sep`, or `a` alone if that would not fit.
+  join(a: STRING, sep: STRING, b: STRING): STRING
+    do
+      if a.byte_length <= 1000000 and b.byte_length <= 1000000 and sep.byte_length <= 10 then
+        a.concat(sep).concat(b)
+      else
+        a
+      end
+    end
+
+  total(a: ARRAY[NAT]): NAT
+    do
+      a.fold(fn(acc: NAT, x: NAT): NAT do acc +% x end, 0)
+    end
+
+  -- One million `set`s on an array held once.
+  big: NAT
+    do
+      total(fill(ARRAY.make(1000000, 0), 0))
+    end
+
+  -- One million `set`s through a `let`, then a million swaps.
+  big_let: NAT
+    do
+      let a = reverse(fill_let(ARRAY.make(1000000, 0), 0), 0)
+      a.at(0) +% a.at(999999)
+    end
+
+  -- The same loop on an array held twice: the loop copies it once, then changes the copy.
+  twice: NAT
+    do
+      let a = ARRAY.make(1000000, 1)
+      let b = fill(a, 0)
+      total(a) +% total(b)
+    end
+
+  -- The same loop on an array that is still read after it, so the loop copies it once.
+  shared: STRING
+    do
+      let a = ARRAY.make(5, 9)
+      let b = fill(a, 0)
+      join(nats(a), " ", nats(b))
+    end
+
+  -- A chain on a `let` nothing reads after: in place.
+  chained: STRING
+    do
+      let c = ARRAY.make(4, 0)
+      let d = c.set(0, 5).set(1, 6).swap(1, 3)
+      nats(d)
+    end
+
+  words: STRING
+    do
+      let w = ARRAY.from_list(LIST.empty.prepend("c").prepend("b").prepend("a"))
+      let v = w.set(1, w.at(0)).set(2, w.at(2))
+      let u = v.swap(0, 2)
+      join(join(texts(u), " ", texts(w.slice(1, 3))), " ", texts(ARRAY.from_list(u.to_list)))
+    end
+
+  -- An item set to itself, in place: the new reference is taken before the old is released.
+  same_item: STRING
+    do
+      let s = ARRAY.from_list(LIST.empty.prepend("q".concat("q")).prepend("p".concat("p")))
+      let t = s.set(1, s.at(1))
+      texts(t)
+    end
+
+  small: STRING
+    do
+      let r = nats(reverse(fill_let(ARRAY.make(5, 0), 0), 0))
+      join(join(join(join(shared, " | ", chained), " | ", words), " | ", r), " | ", same_item)
+    end
+
+  small_length: NAT
+    do
+      small.byte_length
+    end
+
+  main(args: SEQ[STRING]): IO[EXIT_CODE]
+    do
+      with IO
+        IO.print_line(small)
+        IO.print_line(NUMBER_TEXT.nat_to_text(big))
+        IO.print_line(NUMBER_TEXT.nat_to_text(twice))
+        IO.print_line(NUMBER_TEXT.nat_to_text(big_let))
+        IO.exit(if small_length > 0 then 0 else 1 end)
+      end
+    end
+
+end

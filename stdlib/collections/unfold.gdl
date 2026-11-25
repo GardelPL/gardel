@@ -1,0 +1,58 @@
+-- A sequence that may end, as Elixir's `Stream.unfold`: `next` gives the item at a state and
+-- the state after it, or `None` where the sequence ends (Task H.22). A sequence that never
+-- ends is a `GENERATOR`.
+module UNFOLD[S, A]
+
+representation {ANY}
+  state: S
+  next: S -> OPTION[TUPLE[A, S]]
+
+create {ANY}
+
+  make(s: S, f: S -> OPTION[TUPLE[A, S]]): UNFOLD[S, A]
+    do
+      { state = s, next = f }
+    ensure
+      at_state: Result.state = s
+      with_step: Result.next = f
+    end
+
+feature {ANY}
+
+  -- The first `n` items, or fewer where the sequence ends.
+  take(n: NAT): LIST[A]
+    variant
+      n
+    do
+      if n = 0 then
+        LIST.empty
+      else
+        match Current.next(Current.state)
+          case None then
+            LIST.empty
+          case Some(p) then
+            UNFOLD.make(p.second, Current.next).take(n - 1).prepend(p.first)
+        end
+      end
+    ensure
+      not_longer: Result.length <= n
+    end
+
+  -- Every item, for a sequence that ends: `measure` of the state shrinks at each step, as
+  -- the client proves.
+  to_list(measure: S -> NAT): LIST[A]
+    require
+      counts: forall s: S. measure(s) >= 0
+      shrinks: forall s: S. Current.next(s).is_some implies measure(Current.next(s).get.second) < measure(s)
+    variant
+      measure(Current.state)
+    do
+      match Current.next(Current.state)
+        case None then
+          LIST.empty
+        case Some(p) then
+          UNFOLD.make(p.second, Current.next).to_list(measure).prepend(p.first)
+      end
+    end
+
+end

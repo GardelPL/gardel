@@ -1,0 +1,25 @@
+-- A reactive step for `SCRIPT`'s checks: it prints each line it reads, counting them, and
+-- stops on `Shutdown` with the count.
+functions ECHO
+
+feature {ANY}
+
+  step(n: NAT, e: EVENT): STEP[NAT]
+    do
+      match e
+        case Line(r) then
+          match r
+            case Ok(t) then
+              if n < 1000 then
+                Continue(n + 1, LIST.empty.prepend(ReadLine).prepend(Print(t)))
+              else
+                Stop(1, LIST.empty)
+              end
+            case Error(_) then Stop(2, LIST.empty)
+          end
+        case Shutdown then Stop(n, LIST.empty)
+        case _ then Continue(n, LIST.empty)
+      end
+    end
+
+end

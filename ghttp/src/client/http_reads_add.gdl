@@ -1,0 +1,40 @@
+-- Stage D of the round trip: `HTTP_READ_FIELDS.reads` of `hs` is that of its tail with the
+-- field read from the line of `hs.head` added, at `p`, its line break at `e`. Stated as the
+-- same outcome of `HTTP_HEAD_PARSER.fields` from any `q`, as `HTTP_HEADERS` has no `=`.
+functions HTTP_READS_ADD
+
+specify {ANY}
+
+  law reads_add(buf: BYTES, pos: NAT, hs: LIST[HTTP_HEADER], acc: HTTP_HEADERS, p: NAT, e: NAT,
+                q: NAT, he: NAT, cl: OPTION[NAT], te: BOOL)
+    require
+      some: hs.length > 0
+      few: hs.length <= 64
+      small: pos <= 1000000000
+      at: p = pos + HTTP_REQUEST_WRITER.fields_text(hs.tail).byte_model.length
+      ends: e + 2 = p + hs.head.serialize_line.byte_model.length
+      in_buf: e <= buf.length
+      room: HTTP_READ_FIELDS.reads(buf, pos, hs.tail, acc).has_header_room
+      read: HTTP_HEAD_PARSER.field_at(buf, p, e).is_ok
+    do
+      HTTP_REQUEST_WRITER.fields_text(hs.tail).byte_length = HTTP_REQUEST_WRITER.fields_text(hs.tail).byte_model.length and
+      hs.head.serialize_line.byte_length = hs.head.serialize_line.byte_model.length
+    ensure
+      same_ok: HTTP_READ_FIELD.outcome_ok(HTTP_HEAD_PARSER.fields(buf, q, he,
+          HTTP_READ_FIELDS.reads(buf, pos, hs.tail, acc).add(HTTP_HEAD_PARSER.field_at(buf, p, e).get), cl, te)) =
+        HTTP_READ_FIELD.outcome_ok(HTTP_HEAD_PARSER.fields(buf, q, he, HTTP_READ_FIELDS.reads(buf, pos, hs, acc), cl, te))
+      same_names: HTTP_READ_FIELD.outcome_names(HTTP_HEAD_PARSER.fields(buf, q, he,
+          HTTP_READ_FIELDS.reads(buf, pos, hs.tail, acc).add(HTTP_HEAD_PARSER.field_at(buf, p, e).get), cl, te)) =
+        HTTP_READ_FIELD.outcome_names(HTTP_HEAD_PARSER.fields(buf, q, he, HTTP_READ_FIELDS.reads(buf, pos, hs, acc), cl, te))
+      same_values: HTTP_READ_FIELD.outcome_values(HTTP_HEAD_PARSER.fields(buf, q, he,
+          HTTP_READ_FIELDS.reads(buf, pos, hs.tail, acc).add(HTTP_HEAD_PARSER.field_at(buf, p, e).get), cl, te)) =
+        HTTP_READ_FIELD.outcome_values(HTTP_HEAD_PARSER.fields(buf, q, he, HTTP_READ_FIELDS.reads(buf, pos, hs, acc), cl, te))
+      same_length: HTTP_READ_FIELD.outcome_length(HTTP_HEAD_PARSER.fields(buf, q, he,
+          HTTP_READ_FIELDS.reads(buf, pos, hs.tail, acc).add(HTTP_HEAD_PARSER.field_at(buf, p, e).get), cl, te)) =
+        HTTP_READ_FIELD.outcome_length(HTTP_HEAD_PARSER.fields(buf, q, he, HTTP_READ_FIELDS.reads(buf, pos, hs, acc), cl, te))
+      same_chunked: HTTP_READ_FIELD.outcome_chunked(HTTP_HEAD_PARSER.fields(buf, q, he,
+          HTTP_READ_FIELDS.reads(buf, pos, hs.tail, acc).add(HTTP_HEAD_PARSER.field_at(buf, p, e).get), cl, te)) =
+        HTTP_READ_FIELD.outcome_chunked(HTTP_HEAD_PARSER.fields(buf, q, he, HTTP_READ_FIELDS.reads(buf, pos, hs, acc), cl, te))
+    end
+
+end

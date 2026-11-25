@@ -1,0 +1,141 @@
+-- Text built by appending (Task H.6), as `BYTES_BUILDER` builds bytes. An append keeps the
+-- part, and `to_string` copies every part once, so building is linear where repeated
+-- `concat` would be quadratic. The model is the text's scalars.
+module STRING_BUILDER
+
+representation {NONE}
+  parts: LIST[STRING]
+  total: NAT
+
+create {ANY}
+
+  empty: STRING_BUILDER
+    do
+      { parts = LIST.empty, total = 0 }
+    ensure
+      empty_model: Result.model = LIST.empty
+      none: Result.byte_length = 0
+    end
+
+feature {ANY}
+
+  -- The length of the text in bytes, which is what `fits` bounds. `empty` and each `add`
+  -- state it.
+  byte_length: NAT
+    do
+      Current.total
+    end
+
+  add(s: STRING): STRING_BUILDER
+    require
+      fits: Current.byte_length <= 18446744073709551615 - s.byte_length
+    do
+      { parts = Current.parts.prepend(s), total = Current.total + s.byte_length }
+    ensure
+      added: Result.model = Current.model.append(s.chars)
+      len: Result.byte_length = Current.byte_length + s.byte_length
+    end
+
+  add_char(c: CHAR): STRING_BUILDER
+    require
+      fits: Current.byte_length <= 18446744073709551615 - STRING.char_width(c)
+    do
+      Current.add(STRING.from_char(c))
+    ensure
+      added: Result.model = Current.model.append(LIST.singleton(c))
+      len: Result.byte_length = Current.byte_length + STRING.char_width(c)
+    end
+
+  -- `n` in decimal, as `NUMBER_TEXT.nat_to_text` writes it: at most 20 bytes.
+  add_nat(n: NAT): STRING_BUILDER
+    require
+      fits: Current.byte_length <= 18446744073709551595
+    do
+      let t = NUMBER_TEXT.nat_to_text(n)
+      check
+        short: t.byte_length <= 20
+      end
+      Current.add(t)
+    ensure
+      added: Result.model = Current.model.append(NUMBER_TEXT.nat_to_text(n).chars)
+      len: Result.byte_length = Current.byte_length + NUMBER_TEXT.nat_to_text(n).byte_length
+      short: Result.byte_length <= Current.byte_length + 20
+    end
+
+  -- `i` in decimal, as `NUMBER_TEXT.i64_to_text` writes it: at most 20 bytes.
+  add_i64(i: I64): STRING_BUILDER
+    require
+      fits: Current.byte_length <= 18446744073709551595
+    do
+      let t = NUMBER_TEXT.i64_to_text(i)
+      check
+        short: t.byte_length <= 20
+      end
+      Current.add(t)
+    ensure
+      added: Result.model = Current.model.append(NUMBER_TEXT.i64_to_text(i).chars)
+      len: Result.byte_length = Current.byte_length + NUMBER_TEXT.i64_to_text(i).byte_length
+      short: Result.byte_length <= Current.byte_length + 20
+    end
+
+  to_string: STRING
+    do
+      STRING_BUILDER.join_reversed(Current.parts)
+    ensure
+      chars_same: Result.chars = Current.model
+      len: Result.byte_length = Current.byte_length
+    end
+
+create {ANY}
+
+  -- The byte length of `parts` together.
+  byte_sum(parts: LIST[STRING]): MATH_INT
+    variant
+      parts.length
+    do
+      if parts.length = 0 then 0 else STRING_BUILDER.byte_sum(parts.tail) + parts.head.byte_length end
+    ensure
+      natural: Result >= 0
+    end
+
+  -- `parts` as one string, the last part first. C uses a primitive that sizes the result
+  -- first and copies each part once.
+  join_reversed(parts: LIST[STRING]): STRING
+    require
+      fits: STRING_BUILDER.byte_sum(parts) <= 18446744073709551615
+    variant
+      parts.length
+    do
+      if parts.length = 0 then
+        ""
+      else
+        STRING_BUILDER.join_reversed(parts.tail).concat(parts.head)
+      end
+    ensure
+      chars_joined: Result.chars = STRING_BUILDER.chars_reversed(parts)
+      len: Result.byte_length = STRING_BUILDER.byte_sum(parts)
+    end
+
+  -- The scalars of `parts`, the last part first.
+  chars_reversed(parts: LIST[STRING]): LIST[CHAR]
+    variant
+      parts.length
+    do
+      if parts.length = 0 then
+        LIST.empty
+      else
+        STRING_BUILDER.chars_reversed(parts.tail).append(parts.head.chars)
+      end
+    end
+
+specify {ANY}
+
+  model: LIST[CHAR]
+    do
+      STRING_BUILDER.chars_reversed(Current.parts)
+    end
+
+invariant
+  counted: total = STRING_BUILDER.byte_sum(parts)
+
+end

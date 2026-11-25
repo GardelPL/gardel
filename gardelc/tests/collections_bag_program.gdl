@@ -1,0 +1,114 @@
+-- Loops over a `BAG`, and over an array of options, whose items are text (Task H.4).
+program MAIN
+
+feature {ANY}
+
+  name(n: NAT): STRING
+    do
+      "item number ".concat(NUMBER_TEXT.nat_to_text(n))
+    end
+
+  text(o: OPTION[STRING]): STRING
+    do
+      match o
+      case Some(s) then s
+      case None then "none"
+      end
+    end
+
+  and_then(a: STRING, b: STRING): STRING
+    do
+      if a.byte_length <= 1000000 and b.byte_length <= 1000000 then
+        a.concat(" | ").concat(b)
+      else
+        a
+      end
+    end
+
+  -- A `match` binder borrowed from the array that the arm then changes.
+  spin(a: ARRAY[OPTION[STRING]], n: NAT, last: STRING): STRING
+    require
+      some: a.length > 0
+    variant
+      n
+    do
+      if n = 0 then
+        last
+      else
+        match a.at(0)
+        case Some(x) then spin(a.set(0, Some(name(n))), n - 1, x)
+        case None then last
+        end
+      end
+    end
+
+  -- The bag is given up on every iteration.
+  fill(b: BAG, n: NAT): BAG
+    variant
+      n
+    do
+      if n = 0 then b else fill(b.put(name(n)), n - 1) end
+    end
+
+  -- A chain of calls.
+  mixed(b: BAG, n: NAT): BAG
+    variant
+      n
+    do
+      if n = 0 then b else mixed(b.put(name(n)).shift("s").longer("!").put_if(n % 2 = 0, "even"), n - 1) end
+    end
+
+  -- The bag is read by another argument.
+  watched(b: BAG, n: NAT, seen: STRING): STRING
+    variant
+      n
+    do
+      if n = 0 then and_then(seen, text(b.first)) else watched(b.put(name(n)), n - 1, text(b.first)) end
+    end
+
+  -- A binder from the bag's own option, with the bag given up in the arm.
+  bound(b: BAG, n: NAT, last: STRING): STRING
+    variant
+      n
+    do
+      if n = 0 then
+        last
+      else
+        match b.first
+        case Some(x) then bound(b.kept(name(n)), n - 1, x)
+        case None then last
+        end
+      end
+    end
+
+  -- One bag, changed twice: neither change shows in the other, or in it.
+  shared: STRING
+    do
+      let b = BAG.make("start")
+      let c = b.put("c")
+      let d = b.longer("+d")
+      let e = c.put_if(False, "x")
+      and_then(and_then(and_then(text(b.first), text(c.first)), text(d.first)), text(e.first))
+    end
+
+  report: STRING
+    do
+      let m = mixed(BAG.make("m"), 7)
+      let f = fill(BAG.make("f"), 5)
+      and_then(and_then(and_then(and_then(and_then(spin(ARRAY.make(1, Some(name(100))), 5, "none"), text(f.first)), text(m.first)), watched(BAG.make("w"), 4, "-")), bound(BAG.make("start"), 4, "-")), shared)
+    end
+
+  report_length: NAT
+    do
+      report.byte_length
+    end
+
+  main(args: SEQ[STRING]): IO[EXIT_CODE]
+    do
+      with IO
+        IO.print_line(report)
+        IO.exit(if report_length > 0 then 0 else 1 end)
+      end
+    end
+
+end

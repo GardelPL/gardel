@@ -1,0 +1,143 @@
+-- Stage D of the round trip, one field: bytes that hold a token name, a colon, a space and
+-- a value with no space or tab at either end read back, by `HTTP_HEAD_PARSER.field_at`, as
+-- a field of that name and value.
+functions HTTP_READ_FIELD
+
+feature {ANY}
+
+  -- The names of `hs`, as bytes, in order.
+  names_of(hs: LIST[HTTP_HEADER]): LIST[LIST[U64]]
+    variant
+      hs.length
+    do
+      if hs.length = 0 then LIST.empty else names_of(hs.tail).prepend(hs.head.name.byte_model) end
+    end
+
+  -- The values of `hs`, as bytes, in order.
+  values_of(hs: LIST[HTTP_HEADER]): LIST[LIST[U64]]
+    variant
+      hs.length
+    do
+      if hs.length = 0 then LIST.empty else values_of(hs.tail).prepend(hs.head.value.byte_model) end
+    end
+
+  -- What a reading of fields gives, as values that compare by `=`: whether it read them,
+  -- their names and values, and the framing they declare.
+  outcome_ok(r: RESULT[HTTP_ERROR, HTTP_FIELDS]): BOOL
+    do
+      r.is_ok
+    end
+
+  outcome_names(r: RESULT[HTTP_ERROR, HTTP_FIELDS]): LIST[LIST[U64]]
+    do
+      match r
+        case Ok(f) then match f case ParsedFields(hs, _, _) then names_of(hs.fields) end
+        case Error(_) then LIST.empty
+      end
+    end
+
+  outcome_values(r: RESULT[HTTP_ERROR, HTTP_FIELDS]): LIST[LIST[U64]]
+    do
+      match r
+        case Ok(f) then match f case ParsedFields(hs, _, _) then values_of(hs.fields) end
+        case Error(_) then LIST.empty
+      end
+    end
+
+  outcome_length(r: RESULT[HTTP_ERROR, HTTP_FIELDS]): OPTION[NAT]
+    do
+      match r
+        case Ok(f) then match f case ParsedFields(_, c, _) then c end
+        case Error(_) then None
+      end
+    end
+
+  outcome_chunked(r: RESULT[HTTP_ERROR, HTTP_FIELDS]): BOOL
+    do
+      match r
+        case Ok(f) then match f case ParsedFields(_, _, t) then t end
+        case Error(_) then False
+      end
+    end
+
+
+specify {ANY}
+
+  law field_reads(buf: BYTES, pos: NAT, e: NAT, nm: STRING, vl: STRING)
+    require
+      name_token: HTTP_HEAD_PARSER.is_token(nm.to_utf8, 0)
+      name_fits: nm.byte_length <= 128
+      value_bytes: HTTP_HEAD_PARSER.all_field_bytes(vl.to_utf8, 0, vl.to_utf8.length)
+      value_fits: vl.byte_length <= 1024
+      trimmed: vl.byte_length > 0 implies
+        (LIST_OPS.at(vl.byte_model, 0) != 32 and LIST_OPS.at(vl.byte_model, 0) != 9 and
+         LIST_OPS.at(vl.byte_model, vl.byte_length - 1) != 32 and LIST_OPS.at(vl.byte_model, vl.byte_length - 1) != 9)
+      ends: e = pos + nm.byte_length + 2 + vl.byte_length
+      in_buf: e <= buf.length
+      name_at: forall k: NAT. (pos <= k and k < pos + nm.byte_length) implies
+        LIST_OPS.at(buf.model, k) = LIST_OPS.at(nm.byte_model, k - pos)
+      colon: LIST_OPS.at(buf.model, pos + nm.byte_length) = 58 and LIST_OPS.at(buf.model, pos + nm.byte_length + 1) = 32
+      value_at: forall k: NAT. (pos + nm.byte_length + 2 <= k and k < e) implies
+        LIST_OPS.at(buf.model, k) = LIST_OPS.at(vl.byte_model, k - (pos + nm.byte_length + 2))
+    do
+      nm.to_utf8.model = nm.byte_model and vl.to_utf8.model = vl.byte_model and
+      HTTP_LINE_FACTS.token_bytes(nm.to_utf8, 0) and
+      HTTP_LINE_FACTS.field_bytes_each(vl.to_utf8, 0, vl.to_utf8.length) and
+      not HTTP_HEAD_PARSER.is_tchar(58) and
+      (forall k: NAT. (pos <= k and k < pos + nm.byte_length) implies LIST_OPS.at(buf.model, k) != 58) and
+      HTTP_LINE_FACTS.byte_found(buf, 58, pos, pos + nm.byte_length) and
+      -- The name.
+      buf.slice(pos, pos + nm.byte_length).length = nm.byte_length and
+      (forall k: NAT. k < nm.byte_length implies
+        LIST_OPS.at(buf.slice(pos, pos + nm.byte_length).model, k) = LIST_OPS.at(nm.byte_model, k)) and
+      BYTES.same_items(buf.slice(pos, pos + nm.byte_length).model, nm.byte_model) and
+      HTTP_LINE_FACTS.token_from(buf.slice(pos, pos + nm.byte_length), 0) and
+      STRING.from_utf8(buf.slice(pos, pos + nm.byte_length)).is_ok and
+      -- The value, after the space.
+      HTTP_HEAD_PARSER.skip_ows(buf, pos + nm.byte_length + 1, e) = HTTP_HEAD_PARSER.skip_ows(buf, pos + nm.byte_length + 2, e) and
+      HTTP_HEAD_PARSER.skip_ows(buf, pos + nm.byte_length + 2, e) = pos + nm.byte_length + 2 and
+      HTTP_HEAD_PARSER.trim_ows(buf, pos + nm.byte_length + 2, e) = e and
+      HTTP_LINE_FACTS.field_bytes_from(buf, pos + nm.byte_length + 2, e) and
+      buf.slice(pos + nm.byte_length + 2, e).length = vl.byte_length and
+      (forall k: NAT. k < vl.byte_length implies
+        LIST_OPS.at(buf.slice(pos + nm.byte_length + 2, e).model, k) = LIST_OPS.at(vl.byte_model, k)) and
+      BYTES.same_items(buf.slice(pos + nm.byte_length + 2, e).model, vl.byte_model) and
+      STRING.from_utf8(buf.slice(pos + nm.byte_length + 2, e)).is_ok
+    ensure
+      ok: HTTP_HEAD_PARSER.field_at(buf, pos, e).is_ok
+      name: HTTP_HEAD_PARSER.field_at(buf, pos, e).get.name.byte_model = nm.byte_model
+      value: HTTP_HEAD_PARSER.field_at(buf, pos, e).get.value.byte_model = vl.byte_model
+    end
+
+  -- Headers with `n` fields more than `acc`, and the same room, have room for another when
+  -- `acc` has for `n + 1`.
+  law room_after(r: HTTP_HEADERS, acc: HTTP_HEADERS, n: NAT)
+    require
+      count: r.num_headers = acc.num_headers + n
+      cap: r.max_headers = acc.max_headers
+      room: acc.num_headers + n + 1 <= acc.max_headers
+    ensure
+      room: r.has_header_room
+    end
+
+  -- A field added goes first in the fields, before the ones added earlier.
+  law fields_after_add(hs: HTTP_HEADERS, h: HTTP_HEADER)
+    require
+      room: hs.has_header_room
+    ensure
+      first: hs.add(h).fields = hs.fields.prepend(h)
+    end
+
+  -- A field added to headers with room counts one more, in the same room, and goes first.
+  law add_counts(hs: HTTP_HEADERS, h: HTTP_HEADER)
+    require
+      room: hs.has_header_room
+    do
+      HTTP_READ_FIELD.fields_after_add(hs, h)
+    ensure
+      count: hs.add(h).num_headers = hs.num_headers + 1
+      cap: hs.add(h).max_headers = hs.max_headers
+      first: hs.add(h).fields = hs.fields.prepend(h)
+    end
+
+end

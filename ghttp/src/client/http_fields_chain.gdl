@@ -1,0 +1,53 @@
+-- Stage D of the round trip, the chain: from the field lines of `req` at `p0`, then its
+-- `Content-Length` line, if any, at `pf`, up to the blank line's break at `he + 2`,
+-- `HTTP_HEAD_PARSER.fields` reads the writer's fields in order, then the `Content-Length`
+-- it adds, and the length that declares. Over `p0`, `pf` and `he`, so that the solver sees
+-- small terms; `HTTP_ROUND_TRIP.fields_read_back` places them in the head. The field lines
+-- are `HTTP_FIELDS_PART.fields_part` and `HTTP_FIELDS_READ.fields_read`; the line after them is `HTTP_LENGTH_LAST`'s.
+functions HTTP_FIELDS_CHAIN
+
+specify {ANY}
+
+  law chain(req: HTTP_REQUEST, buf: BYTES, p0: NAT, pf: NAT, he: NAT)
+    require
+      sendable: HTTP_REQUEST_WRITER.sendable(req)
+      few: req.headers.fields.length <= 31
+      small: p0 <= 1000000000
+      fields_hold: forall k: NAT. (p0 <= k and k < p0 + HTTP_REQUEST_WRITER.fields_text(req.headers.fields).byte_model.length) implies
+        LIST_OPS.at(buf.model, k) = LIST_OPS.at(HTTP_REQUEST_WRITER.fields_text(req.headers.fields).byte_model, k - p0)
+      at: pf = p0 + HTTP_REQUEST_WRITER.fields_text(req.headers.fields).byte_model.length
+      length_holds: forall k: NAT. (pf <= k and k < pf + HTTP_REQUEST_WRITER.length_line(req).byte_model.length) implies
+        LIST_OPS.at(buf.model, k) = LIST_OPS.at(HTTP_REQUEST_WRITER.length_line(req).byte_model, k - pf)
+      ends: pf + HTTP_REQUEST_WRITER.length_line(req).byte_model.length = he + 2
+      in_buf: he + 4 <= buf.length
+    do
+      HTTP_FIELDS_PART.fields_part(req, buf, p0, pf, he) and
+      HTTP_FIELDS_READ.fields_read(req, buf, p0, pf, he) and
+      (if HTTP_REQUEST_WRITER.needs_length(req) then
+        HTTP_LENGTH_LAST.with_length(buf, pf, he, req,
+          HTTP_READ_FIELDS.reads(buf, p0, req.headers.fields, HTTP_HEADERS.default_empty))
+      else
+        HTTP_REQUEST_WRITER.length_line(req).byte_model.length = 0 and
+        HTTP_LENGTH_LAST.at_blank(buf, he,
+          HTTP_READ_FIELDS.reads(buf, p0, req.headers.fields, HTTP_HEADERS.default_empty))
+      end)
+    ensure
+      ok: HTTP_READ_FIELD.outcome_ok(HTTP_HEAD_PARSER.fields(buf, p0, he, HTTP_HEADERS.default_empty, None, False))
+      names: HTTP_READ_FIELD.outcome_names(HTTP_HEAD_PARSER.fields(buf, p0, he, HTTP_HEADERS.default_empty, None, False)) =
+        (if HTTP_REQUEST_WRITER.needs_length(req) then
+          HTTP_READ_FIELD.names_of(req.headers.fields).prepend(HTTP_REQUEST_WRITER.content_length_field.byte_model)
+        else
+          HTTP_READ_FIELD.names_of(req.headers.fields)
+        end)
+      values: HTTP_READ_FIELD.outcome_values(HTTP_HEAD_PARSER.fields(buf, p0, he, HTTP_HEADERS.default_empty, None, False)) =
+        (if HTTP_REQUEST_WRITER.needs_length(req) then
+          HTTP_READ_FIELD.values_of(req.headers.fields).prepend(NUMBER_TEXT.nat_to_text(req.request_body_length).byte_model)
+        else
+          HTTP_READ_FIELD.values_of(req.headers.fields)
+        end)
+      length: HTTP_READ_FIELD.outcome_length(HTTP_HEAD_PARSER.fields(buf, p0, he, HTTP_HEADERS.default_empty, None, False)) =
+        (if HTTP_REQUEST_WRITER.needs_length(req) then Some(req.request_body_length) else None end)
+      chunked: not HTTP_READ_FIELD.outcome_chunked(HTTP_HEAD_PARSER.fields(buf, p0, he, HTTP_HEADERS.default_empty, None, False))
+    end
+
+end

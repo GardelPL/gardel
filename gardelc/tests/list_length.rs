@@ -5,6 +5,9 @@
 use std::fs;
 use std::process::Command;
 
+/// The suffix gardelc gives an executable: `.exe` on Windows, none elsewhere.
+const EXE: &str = std::env::consts::EXE_SUFFIX;
+
 const PROGRAM: &str = "program MAIN
 
 feature {ANY}
@@ -70,7 +73,7 @@ fn a_list_knows_its_length_after_prepend_and_append() {
         .expect("gardelc runs");
     let text = format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
     assert!(out.status.success() && text.contains("0 errors, 0 warnings"), "{text}");
-    let run = Command::new(dir.join("build").join("main_bin.exe")).output().expect("the program runs");
+    let run = Command::new(dir.join("build").join(format!("main_bin{EXE}"))).output().expect("the program runs");
     assert!(run.status.success(), "{run:?}");
     let printed = String::from_utf8(run.stdout).expect("UTF-8 output").replace("\r\n", "\n");
     drop(fs::remove_dir_all(&dir));

@@ -1,7 +1,7 @@
 -- The `grest` cases, read on standard input:
 --
 --   gardelc --project grest/tests --strict
---   build/grest_test_bin.exe < grest/tests/cases.txt
+--   build/grest_test_bin < grest/tests/cases.txt
 --
 -- Exit code 0 means every case holds; 100 + n means line n is the first that does not,
 -- and it is printed.

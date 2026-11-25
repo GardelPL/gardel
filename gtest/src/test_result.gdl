@@ -1,0 +1,28 @@
+-- The outcome of one named check (Task H.9): it passed, or it failed and says why.
+module TEST_RESULT
+
+representation {ANY}
+  | Pass(name: STRING)
+  | Fail(name: STRING, message: STRING)
+
+feature {ANY}
+
+  passed: BOOL
+    do
+      match Current
+        case Pass(_) then True
+        case Fail(_, _) then False
+      end
+    ensure
+      def: Result = (match Current case Pass(_) then True case Fail(_, _) then False end)
+    end
+
+  label: STRING
+    do
+      match Current
+        case Pass(n) then n
+        case Fail(n, _) then n
+      end
+    end
+
+end

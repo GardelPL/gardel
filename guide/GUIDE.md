@@ -74,6 +74,8 @@ This guide is written for two audiences:
   - [Why Pure Modules Forbid Effects](#why-pure-modules-forbid-effects)
   - [Linear `IO[A]` Actions and `with IO`](#linear-ioa-actions-and-with-io)
   - [Reading Input: `IO.read_line`](#reading-input-ioread_line)
+  - [The Time and Random Bytes: `IO.now`, `IO.random`](#the-time-and-random-bytes-ionow-iorandom)
+  - [Logging and the Environment: `IO.log`, `IO.env`](#logging-and-the-environment-iolog-ioenv)
   - [Boundary Ingestion: Untrusted Data to Verified ADTs](#boundary-ingestion-untrusted-data-to-verified-adts)
 - [14. Reactive Programs](#14-reactive-programs)
   - [Two Total Routines](#two-total-routines)
@@ -95,6 +97,8 @@ This guide is written for two audiences:
   - [Project Manifests (`Gardel.toml`)](#project-manifests-gardeltoml)
   - [Dependencies](#dependencies)
   - [A Package for JSON: `gjson`](#a-package-for-json-gjson)
+  - [Testing a Package: `gardelc test` and `gtest`](#testing-a-package-gardelc-test-and-gtest)
+  - [Mutating a Package: `gardelc mutate`](#mutating-a-package-gardelc-mutate)
   - [Checking a New Version](#checking-a-new-version)
   - [Name Resolution](#name-resolution)
   - [The Standard Library Sources (`stdlib/`)](#the-standard-library-sources-stdlib)
@@ -381,9 +385,11 @@ Every operation states its result on `chars` (or, for `BYTES`, on `model`), so a
 | `s.starts_with(p)`, `s.ends_with(p)` | Whether `p` is at the start or the end. |
 | `s.trim` | `s` without ASCII white space at either end. |
 | `s.split(c)` | The parts between each `c`: `count_char(c, 0) + 1` of them. |
+| `s.to_chars` | The scalars as a `LIST[CHAR]`, to walk. C decodes the bytes once. |
+| `STRING.from_char(c)` | The text of one scalar. |
 | `a.less_than(b)` | Byte order of the UTF-8 form, so `STRING` is a key for a generic `[K: ORD]`. It is not a collation: `"Z"` comes before `"a"`. |
 
-The contract of `split` gives the number of parts, not their text, so the verifier knows nothing more about them. When a proof depends on the pieces, cut the text with `find_char` or `find` and `slice`, whose contracts are exact:
+The contract of `split` gives the number of parts and one step of the scan at a time, which is enough for laws such as `TEXT_FORMAT.join_split` below, but not the text of a given part. When a proof depends on one piece, cut the text with `find_char` or `find` and `slice`, whose contracts are exact:
 
 ```eiffel
 -- The text before the first `:`, or the whole line when there is none.
@@ -429,6 +435,69 @@ read_back(n: NAT): RESULT[NUMBER_ERROR, NAT]
 
 `NUMBER_TEXT.digits(n, rest)` puts the decimal digits of `n` in front of the byte list `rest`, as ASCII codes. A client cannot see its body, so the law `digits_step` gives one step of it: `digits(n, rest) = rest.prepend(48 + n)` when `n < 10`, and `digits(n / 10, rest.prepend(48 + n % 10))` otherwise. It has no trigger, so a proof calls it where it needs it, as in `check s: NUMBER_TEXT.digits_step(n, rest) end`.
 
+#### Building, formatting and encoding text
+
+`STRING_BUILDER` builds text by appending, as `BYTES_BUILDER` builds bytes. Each `add` keeps the part, and `to_string` copies every part once, so building is linear where a chain of `concat` would copy the text again at each step:
+
+```eiffel
+greeting(name: STRING, visits: NAT): STRING
+  require
+    short: name.byte_length <= 1000
+  do
+    STRING_BUILDER.empty.add("Hello, ").add(name).add_char('!')
+      .add(" Visit #").add_nat(visits).to_string
+  end
+```
+
+Its model is the scalars added so far: `b.add(s).model = b.model.append(s.chars)`, and `to_string.chars` is the model. Each `add` requires the text to fit a `U64` (`fits`), as `BYTES_BUILDER`'s does. `add_nat` and `add_i64` add at most 20 bytes, and `add_char(c)` adds `STRING.char_width(c)`, one to four.
+
+`TEXT_FORMAT` has the usual formatting, each stated on `chars`:
+
+| Routine | Gives |
+| :--- | :--- |
+| `pad_left(s, width, c)`, `pad_right(s, width, c)` | `s` with copies of `c` before or after it, up to `width` scalars. A longer `s` is kept as it is. |
+| `repeat(s, n)` | `n` copies of `s`. Needs `n * s.byte_length` to fit. |
+| `join(parts, sep)` | The parts with `sep` between each two. Needs `joined_bytes(parts, sep)` to fit. |
+| `to_lower(s)`, `to_upper(s)` | ASCII `A` to `Z` as `a` to `z`, or back. Every other scalar is kept, so `é` stays `é`, and the byte length is the same. |
+
+`split`'s contract now states each step, and the law `join_split` states that joining the parts again gives the text back, for any text and separator:
+
+```eiffel
+rejoin(s: STRING, c: CHAR): STRING
+  do
+    TEXT_FORMAT.join(s.split(c), STRING.from_char(c))
+  ensure
+    same: Result.equals(s)
+  end
+```
+
+The law `join_split_fits` gives the call its `fits`. For parts of unknown length and another separator, test it at run time with `join_fits`, whose contract is that `fits`: `if TEXT_FORMAT.join_fits(parts, ", ") then TEXT_FORMAT.join(parts, ", ") else ... end`.
+
+Three codecs turn bytes into text and back. Encoding is total and decoding returns a `RESULT[CODEC_ERROR, _]`, whose errors are `BadLength`, `BadSymbol(at)` with the byte offset, and `NotText`:
+
+| Module | Encodes | Decodes |
+| :--- | :--- | :--- |
+| `HEX` | `encode(b)`: two lowercase digits per byte | `decode(s)`: either case |
+| `BASE64` | `encode(b)`: RFC 4648's standard alphabet, padded. `encode_with(b, url, pad)` picks the URL-safe alphabet and whether to pad. | `decode(s)`, `decode_with(s, url, pad)`. A symbol outside the alphabet, padding out of place, and unused bits that are not zero are refused, so a text decodes in at most one way. |
+| `PERCENT` | `encode(s)`: RFC 3986's unreserved bytes as they are, every other byte as `%` and two uppercase digits | `decode(s)`: `NotText` if the bytes are not UTF-8. `+` is not a space here. |
+
+Each round trip is a proven law: `HEX.round_trip`, `BASE64.round_trip` (for both alphabets, padded or not) and `PERCENT.round_trip`. A client gets it with no extra work:
+
+```eiffel
+back(b: BYTES): BOOL
+  require
+    short: b.length <= 1000000
+  do
+    True
+  ensure
+    same: BASE64.decode(BASE64.encode(b)).is_ok and BASE64.decode(BASE64.encode(b)).get.model = b.model
+  end
+```
+
+The decoded value is the same bytes or text, so the law states that its `model` (or `equals`) is the same. `=` on a `BYTES` or a `STRING` compares the representation, which a client does not see.
+
+`NUMBER_TEXT.nat_to_hex(n)` writes `n` in lowercase hex, and `parse_hex(s)` reads hex of any length and either case, with `OutOfRange` above `U64`. The law `hex_round_trip` states that one reads back the other.
+
 `MAP[K, V]` maps keys to values. `K` must be ordered (`ORD`): `STRING` and every number type are. Its representation is hidden, so what a client can prove comes from its laws, and each law reaches a client by itself:
 
 ```eiffel
@@ -443,6 +512,34 @@ facts(m: MAP[NAT, NAT], x: NAT): BOOL
 ```
 
 `keys` come out in ascending order and `fold(init, fn(acc: B, k: K, v: V): B do ... end)` visits them in that order. Each operation walks the map, so it takes time linear in its size. With `STRING` values, compare what `get` gives with `.equals`, as `=` on `OPTION[STRING]` is `E0311`.
+
+Other laws count the keys:
+- `m.put(k, v).size` is at most `m.size + 1`, and is `m.size + 1` when `not m.has(k)`. `m.remove(k).size` is at most `m.size`, and is `m.size` when `not m.has(k)`.
+- When `m.has(k)`, `m.put(k, v).size = m.size` and `m.remove(k).size + 1 = m.size`. These two need the premise `agrees` (see `binary_search` below), which a `NAT`, `I64` or `U64` client states in one `check`, and which does not prove for `STRING`.
+
+`fold_put_last` says that a new key above every key is the last a fold meets: `m.put(k, v).fold(init, f) = f(m.fold(init, f), k, v)` when `not m.has(k)` and `m.size = 0 or LIST_OPS.at(m.keys, m.size - 1) < k`. `keys_put_last` says that `k` is then the last key, so a chain of `put`s in order can be folded step by step.
+
+`m.filter(fn(k: K, v: V): BOOL do ... end)` keeps the entries the function holds for, and `m.map(fn(k: K, v: V): W do ... end)` gives a map with the same keys and the function's values:
+
+```eiffel
+large(m: MAP[NAT, NAT], k: NAT): BOOL
+  require
+    present: m.has(k)
+    small: m.get(k).get <= 10
+  do
+    check
+      agrees: forall a: NAT. forall b: NAT. a.equals(b) = (a = b)
+    end
+    True
+  ensure
+    gone: m.filter(fn(i: NAT, v: NAT): BOOL do v > 10 end).get(k) = None
+  end
+```
+
+- `get_filter_kept`, `get_filter_holds` and `get_filter_absent` need no `agrees`, so they hold for `STRING` keys too. The first two need a function that cannot tell equal keys apart (`respects`), as one that looks at the value alone. `get_filter_dropped`, as above, needs `agrees`.
+- `size_filter_parts`: the sizes of two filters add up to `m.size` when one function holds where the other does not.
+- `get_map`: `m.map(f).get(k)` is `Some(f(k, v))` when `m.get(k) = Some(v)`, and `None` when `m` has no `k`. It needs `respects`.
+- `keys_present`: the map has each of its `keys`. `values_at`: the value of the key at place `i` of `keys` is at place `i` of `values`. It needs `agrees`.
 
 To change between `NAT` and `I64`, use `NAT.from_i64(i)`, which needs `i >= 0`, and `I64.from_nat(n)`, which needs `n <= 9223372036854775807`. Both are proof obligations (`in_range`), not run-time checks.
 
@@ -544,7 +641,17 @@ feature {ANY}
 end
 ```
 
-A field of a number type keeps the range of its type. In `| Box(n: NAT, i: I64)`, the `n` that `case Box(n, i)` binds is known to be in $[0, 2^{64} - 1]$ and `i` in $[-2^{63}, 2^{63} - 1]$, so a contract that needs that range applies to them. The same holds for a record's fields, and for `U64` and `CHAR`. An element of a `LIST[U64]` does not yet carry its range: check it, as `if b <= 255 then`, before relying on it.
+A field of a number type keeps the range of its type. In `| Box(n: NAT, i: I64)`, the `n` that `case Box(n, i)` binds is known to be in $[0, 2^{64} - 1]$ and `i` in $[-2^{63}, 2^{63} - 1]$, so a contract that needs that range applies to them. The same holds for a record's fields, and for `U64` and `CHAR`.
+
+An element of a `LIST` or `SEQ` of a number type keeps its range too. `xs.head`, `xs.tail.head`, `LIST_OPS.at(xs, i)`, an `x` with `xs.has(x)`, a fold's argument and the result of a generic routine such as `LIST_OPS.drop(xs, n)` are all known to be in range. So is a character of a line of a text, a `LIST[LIST[CHAR]]`. A byte read from `b.model` of a `BYTES` is also below 256, from the laws `model_octets`, `octets_head`, `octets_tail` and `octets_at`. A plain `LIST[U64]` is only in the range of `U64`, so to know that its elements are bytes, check them, as `if b < 256 then`.
+
+The range is checked where a list is built. A routine that returns a `LIST[U64]`, an argument passed as one, and a field of that type must each have their elements in range, so `LIST.singleton(n)` with `n: MATH_INT` is refused there, as a `Range Violation`. A lambda keeps its result type's range, so `s.map(fn(x: U64): U64 do x *% 2 end)` is still a list of `U64`s.
+
+A number is checked where it is made, as a list is. A routine that returns a `U64`, an argument passed as one, and a field of that type must each be in `U64`'s range. So `big: U64 do 18446744073709551616 end` is refused, and so is `take(m)` with `m: MATH_INT` and `take(x: U64)`, unless a `require` such as `m >= 0 and m < 100` bounds `m`. Both are a `Range Violation`. A parameter, a field, or a call of a routine declared to return a `U64`, is not checked again. A fold keeps its accumulator's range: `s.fold_left(fn(acc: U64, x: U64): U64 do acc *% 10 +% x end, 0)` is a `U64`, and so is a `MAP`'s `fold` whose start and steps are. The length of a list, `xs.length`, is a `NAT`. The verifier trusts this, since no list in memory holds $2^{64}$ elements.
+
+A container is checked the same way. An `OPTION[U64]`, a `TUPLE[U64, BOOL]`, a `RESULT[STRING, U64]`, a `MAP[STRING, U64]` and your own `BOX[U64]` hold only `U64`s. So `Some(m)` with `m: MATH_INT`, returned as an `OPTION[U64]`, is a `Range Violation`, and a number read back out is in range: `o.get` of an `OPTION[NAT]` is a `NAT`, and so are `p.first` and the `x` of `case Some(x)`. One case is not checked where the value goes in: `m.put("a", x)` with `x: MATH_INT`, on a `MAP[STRING, NAT]`. Its result holds a `MATH_INT`, so a `NAT` read out of it is refused where it is used.
+
+A function value keeps its result type's range too. Given `lex: (start: NAT, line: LIST[CHAR]) -> NAT`, `lex(s, line)` is a `NAT` when `s` and `line` are in range, so it can be the next state passed to `lex`. A function is checked where it is passed: a `(x: NAT) -> MATH_INT` given where a `(x: NAT) -> NAT` is expected is refused, as a `Range Violation`.
 
 Two arms of one `match` may not bind the same name at different types, as `case JInt(v)` with `v: I64` beside `case JString(v)` with `v: LIST[U64]`. The verifier cannot translate it and reports `E0199`. Give each its own name.
 
@@ -1182,6 +1289,32 @@ This is the prelude's own `stdlib/concepts/ord.gdl`; `EQ`, `CANONICAL_EQ` and `O
 
 Generic modules like `SORTED_LIST[A: ORD]` can safely assume these laws as axioms during sorting and lookup proofs.
 
+### Enumerations Get Their Instance
+
+A sum whose variants have no fields needs no `equals` or `less_than` of its own:
+
+```gardel
+module LOG_LEVEL satisfies ORD
+
+representation {ANY}
+  | Debug
+  | Info
+  | Warn
+  | Error
+
+end
+```
+
+The compiler writes `equals` as `Current = other`, which also makes `LOG_LEVEL` `CANONICAL_EQ`, and `less_than` by the order the variants are written in. It adds:
+
+- `t.ordinal`: 0 for `Debug`, up to 3 for `Error`.
+- `LOG_LEVEL.from_ordinal(k)`: `Some(Warn)` for 2, `None` from 4 on.
+- `LOG_LEVEL.all`: the four variants in order.
+- The laws `ordinal_back`, `all_listed` and `all_at_ordinal`, which a client calls like any law: `LOG_LEVEL.all_listed(t)` gives `LOG_LEVEL.all.has(t)`.
+- Every law of `EQ`, `CANONICAL_EQ` and `ORD` not written in the module.
+
+All of it is verified, as if you had written it. A routine you write yourself is kept instead, and the laws are proven for yours. A sum with a field, or a record, must write `equals` and `less_than` (`E0323`).
+
 ### Bounds on Type Parameters
 
 A bound gives a type parameter the methods of its concept, and the proof their laws:
@@ -1204,7 +1337,54 @@ create {ANY}
 end
 ```
 
-`K` is `EQ`, `CANONICAL_EQ` or `ORD`. Only those have a theory, so another concept is `E0320`. `a = b` on a `K` needs `CANONICAL_EQ`, because `equals` is not the identity under `EQ` or `ORD`.
+`K` is `EQ`, `CANONICAL_EQ`, `ORD` or a concept of your own. `a = b` on a `K` needs `CANONICAL_EQ`, because `equals` is not the identity under `EQ` or `ORD`.
+
+Your own concept works the same way. Its methods become the parameter's, and its laws are what the proof knows of them:
+
+```gardel
+concept HASH refines EQ
+
+  hash: U64
+
+  law consistent(a: Current, b: Current)
+    require
+      ab: a.equals(b)
+    ensure
+      same: a.hash = b.hash
+    end
+
+end
+
+module BAG[K: HASH]
+
+representation {ANY}
+  item: K
+
+create {ANY}
+
+  bucket(k: K, n: NAT): NAT
+    require
+      pos: n > 0
+    do
+      k.hash % n          -- `k.hash` is a U64, so it is below 2^64
+    ensure
+      below: Result < n
+    end
+
+  same_bucket(a: K, b: K, n: NAT): BOOL
+    require
+      pos: n > 0
+      eq: a.equals(b)
+    do
+      True
+    ensure
+      claim: BAG.bucket(a, n) = BAG.bucket(b, n)   -- from `consistent`
+    end
+
+end
+```
+
+A concept with type parameters, or with a method that has a body, cannot be a bound (`E0320`): the proof would need that body for every instance.
 
 The type is checked at every use, written or inferred. `SORTED.smaller(s, s)` on a `STRING` is `E0317`, because `STRING` is `EQ` and not `ORD`. So is `SORTED[F64]`. A method the bound does not give is `E0318`.
 
@@ -1234,6 +1414,8 @@ module RESULT[E, A] satisfies CANONICAL_EQ where E satisfies CANONICAL_EQ, A sat
 ```
 
 The constraint is enforced where the concept's routines are used. `SEQ.equals` compares elements structurally, which is behavioral equality only for canonical elements, so `SEQ[U64].equals` is accepted while `SEQ[STRING].equals` and `SEQ[SEQ[U64]].equals` are rejected with `E0314: unsatisfied_where_constraint`. Primitives satisfy `CANONICAL_EQ` and `ORD`, a type parameter satisfies its declared bound (`[A: CANONICAL_EQ]`), and a module type satisfies the concepts it lists when its own `where` constraints hold.
+
+A parameter can have both. In `module KEYED[K: ORD] satisfies HASH where K satisfies HASH`, every use of `KEYED` needs an `ORD` type, and inside `KEYED`, `K` has `less_than` and `hash` with the laws of both.
 
 ---
 
@@ -1296,6 +1478,44 @@ Reading can fail, so the result is a `RESULT` that must be matched:
 
 For the verifier, every `<- IO.read_line` is a **fresh, unknown value**: two reads are never assumed equal. The only thing assumed is the boundary guarantee that an `Ok` payload is a valid `STRING`. The native C runtime establishes that guarantee by validating every byte before building the `STRING`.
 
+### The Time and Random Bytes: `IO.now`, `IO.random`
+
+```eiffel
+IO.now : IO[I64]                                  -- milliseconds since 1970, UTC
+IO.random(count: NAT) : IO[RESULT[IO_ERROR, BYTES]]  -- from the system's generator
+```
+
+Both are fresh values, as a line is. The verifier knows a time is an `I64` and nothing more: not that it is after 1970, and not that a second read is later than the first, since the system's clock can be set back. It knows an `Ok` of `IO.random(n)` holds exactly `n` bytes, so a routine that needs 16 can be given `IO.random(16)`'s bytes with no check, and two draws are never known to be equal. More than 1024 bytes in one call is an `Error`.
+
+```eiffel
+with IO
+  r <- IO.random(16)
+  match r
+    case Ok(key) then IO.exit(serve(key))   -- serve's `require key.length = 16` holds
+    case Error(_) then IO.exit(1)
+  end
+end
+```
+
+### Logging and the Environment: `IO.log`, `IO.env`
+
+```eiffel
+IO.log(level: LOG_LEVEL, text: STRING) : IO[UNIT]   -- one line on standard error
+IO.env(name: STRING) : IO[OPTION[STRING]]           -- an environment variable
+```
+
+`IO.print_line` is the program's output; `IO.log` is for what its operator reads, and goes to standard error as one line, such as `warn: disk almost full`. `LOG_LEVEL` is `Debug | Info | Warn | Severe`, in that order (it is an ordered enumeration, so `Info.less_than(Warn)` holds). `GARDEL_LOG_LEVEL` names the lowest level written, `info` when it is not set, in any case; any other value stops the program with exit status 2 before it runs. A control byte or a `\` in the text is written escaped, as `\x0a` or `\\`, so a line from a request cannot end its line early or forge another.
+
+`IO.env(name)` is a fresh value, as a line is: `None` when the variable is not set, or when its value is not UTF-8, and the verifier knows nothing more, not even that two reads agree. A variable set to nothing is `Some("")`. Windows matches names in any case, POSIX exactly.
+
+```eiffel
+with IO
+  port <- IO.env("PORT")
+  IO.log(Info, match port case Some(p) then "port ".concat(p) case None then "no port" end)
+  IO.exit(0)
+end
+```
+
 ### Boundary Ingestion: Untrusted Data to Verified ADTs
 
 External data (network packets, command line inputs, disk files) is inherently untrusted.
@@ -1351,11 +1571,12 @@ The runtime calls `init`, performs the commands it returns, waits for an event, 
 | Prelude type | Contents |
 | :--- | :--- |
 | `STEP[S]` | `Continue(next, cmds)` or `Stop(code, cmds)` |
-| `COMMAND` | `Print`, `Write`, `TerminalSize`, `SetTimer`, `CancelTimer`, `ReadLine`, `ReadKey`, `Listen`, `Connect`, `Send`, `Close`, `ReadFile`, `ListDir`, `RunProcess`, `WriteProcess`, `CloseInput`, `StopProcess`, `RunAttached`, `WriteFile` |
-| `EVENT` | `Tick`, `Line`, `Key`, `Resized`, `Accepted`, `ListenFailed`, `Connected`, `ConnectFailed`, `Received`, `SendFailed`, `Closed`, `FileRead`, `DirListed`, `ProcessStarted`, `ProcessFailed`, `ProcessOutput`, `ProcessErrorOutput`, `ProcessExited`, `AttachedEnded`, `FileWritten`, `Pasted`, `Shutdown` |
+| `COMMAND` | `Print`, `Write`, `TerminalSize`, `SetTimer`, `CancelTimer`, `ReadLine`, `ReadKey`, `Listen`, `Connect`, `Send`, `Close`, `ReadFile`, `ListDir`, `RunProcess`, `WriteProcess`, `CloseInput`, `StopProcess`, `RunAttached`, `WriteFile`, `ReadClock`, `Random`, `Log`, `ReadEnv` |
+| `EVENT` | `Tick`, `Line`, `Key`, `Resized`, `Accepted`, `ListenFailed`, `Connected`, `ConnectFailed`, `Received`, `SendFailed`, `Closed`, `FileRead`, `DirListed`, `ProcessStarted`, `ProcessFailed`, `ProcessOutput`, `ProcessErrorOutput`, `ProcessExited`, `AttachedEnded`, `FileWritten`, `Pasted`, `Clock`, `RandomBytes`, `EnvRead`, `Shutdown` |
 | `KEY` | `Char(c)`, arrows, `Enter`, `Escape`, `Backspace`, `Tab`, `Home`, `End`, `PageUp`, `PageDown`, `Delete`, `Insert`, `Function(n)`, `Ctrl(c)`, `Mod(key, shift, alt, ctrl)`, `Other`, `KeysEnded` |
 | `CONN_ID`, `PROC_ID` | Opaque connection and process handles: they can be compared and stored, never forged |
 | `DIR_ENTRY` | An entry of a listing: `name` and `is_dir` |
+| `LOG_LEVEL` | `Debug`, `Info`, `Warn`, `Severe`, in that order |
 
 Rules worth knowing:
 - There is no `main`, no `IO` type and no `with IO`. `Stop` is the only way out, and its `code` is the exit status.
@@ -1367,6 +1588,10 @@ Rules worth knowing:
 - To draw a screen, `Write` text with no newline, VT sequences included: a step's output goes out together, and the bytes are the same on Linux and Windows. `TerminalSize` answers with `Resized(width, height)`, and every later resize arrives the same way. Output that is not a terminal is 80 by 24. The `gtui` package draws a screen this way, writing only the cells that change: see [A Package for Terminal Interfaces](#a-package-for-terminal-interfaces-gtui).
 - `ReadFile(tag, path)` answers with `FileRead(tag, res)`, the whole file as `BYTES`, and `ListDir(tag, path)` with `DirListed(tag, res)`, the entries sorted by name. Both run on a thread of their own.
 - `WriteFile(tag, path, data)` answers with `FileWritten(tag, res)`, the number of bytes written. It writes a new file beside `path` and renames it over `path`, so a crash leaves the old file or the new one, never half of one. It replaces a file that is there: read it first if that must not happen.
+- `ReadClock(tag)` answers with `Clock(tag, wall_millis, monotonic_millis)`. The wall clock is milliseconds since 1970 in UTC, for showing a date or stamping a record; it can jump when someone sets the system's clock. The monotonic clock is the one timers use: measure how long something took with it. The answer comes in the next step, as every answer does.
+- `Random(tag, count)` answers with `RandomBytes(tag, res)`: `count` bytes from the system's generator, at most 1024, for keys, tokens and ids that must not be guessed. The bytes are written to a recording, since a replay needs them, so **a recording of a program that makes secrets is itself a secret**: keep it as you keep the keys. An `Ok` holds `count` bytes, but the event does not say what you asked for, so check the length where you take them in (`if bs.length = 16 then ...`).
+- `Log(level, text)` writes one line on standard error, as `IO.log` does (above), at once and in order with what the step printed before it. It is logged and compared on a replay like `Print`, so a replay writes the same lines.
+- `ReadEnv(tag, name)` answers with `EnvRead(tag, value)`, the variable's value as an `OPTION[STRING]`, in the next step. A server reads its port this way, in `init`, and listens once the answer comes: see `examples/todo_api`.
 - `RunProcess(tag, program, args, dir)` starts a program, with no shell: each argument reaches it as you wrote it. It answers with `ProcessStarted(tag, proc)` or `ProcessFailed(tag, err)`. Then `ProcessOutput(proc, data)` and `ProcessErrorOutput(proc, data)` bring what it writes, and `ProcessExited(proc, code)` comes last. `WriteProcess(proc, data)` and `CloseInput(proc)` feed its input, and `StopProcess(proc)` kills it and whatever it started.
 - `RunAttached(tag, program, args, dir)` gives a program the terminal, say an editor or another full-screen program, and answers with `AttachedEnded(tag, res)` when it ends. Your keys go to it meanwhile. After it, `Resized` comes again, so a screen is drawn anew.
 - `Ctrl(c)` is Ctrl with a letter, given lowercase. Ctrl-H, Ctrl-I, Ctrl-J and Ctrl-M are `Backspace`, `Tab` and `Enter`, and Ctrl-C is always a `Shutdown`, so a program in raw mode can still be stopped and leaves the terminal as it found it.
@@ -1434,15 +1659,16 @@ A reactive program is a pure function of its arguments and its events, so a run 
 
 | Variable | Effect |
 | :--- | :--- |
-| `GARDEL_EVENTS=<script>` | Run from a script, such as `Resized:80:24 Tick:1 Key:Up Key:Ctrl:s Line:hello%20there Shutdown`. The end of the script is a `Shutdown`. |
+| `GARDEL_EVENTS=<script>` | Run from a script, such as `Resized:80:24 Tick:1 Key:Up Key:Ctrl:s Line:hello%20there Shutdown`. The end of the script is a `Shutdown`. On Linux one variable holds at most 128 KiB, so a longer run is a replay. |
 | `GARDEL_RECORD=<file>` | Write a log of the run |
-| `GARDEL_REPLAY=<file>` | Run from a log, with no timers, reads, sockets, files or processes |
+| `GARDEL_REPLAY=<file>` | Run from a log, with no timers, reads, sockets, files, processes, clock, generator or environment |
 | `GARDEL_LISTEN_ADDR=<ip>` | Bind `Listen` to an address other than loopback |
 | `GARDEL_CONNECT_TIMEOUT_MS=<n>` | How long a `Connect` may take before it fails, 10000 by default |
+| `GARDEL_LOG_LEVEL=<level>` | The lowest level of `Log` and `IO.log` written: `debug`, `info` (the default), `warn` or `severe` |
 
 The log holds the commands and the exit code as well as the events. A replay compares each command before it takes effect, and the first difference stops the program with exit status 3 and the line that differs, so a log from a working build is a regression test for a changed one. These are environment variables, not flags, because the command line belongs to the program and is part of what is replayed.
 
-A log holds everything the program received, in the clear, and has no size limit. A replay shows that the commands repeat, not that their real effects did.
+A log holds everything the program received, in the clear, and has no size limit: random bytes too, and the times read, so a replay on another day gives the same output, and a log of a program that makes keys from `Random` is as secret as the keys. In a script, `Clock:1:1795000000000:42` and `RandomBytes:2:%00%FF` give a time and two bytes, and `EnvRead:3:8080` and `EnvMissing:3` a variable's value and its absence. The value of a variable read is in the log too. A replay shows that the commands repeat, not that their real effects did.
 
 ---
 
@@ -1532,9 +1758,10 @@ When repairing failing Gardel code:
 | `E0317: unsatisfied_bound` | `SORTED[STRING]` with `K: ORD`, written or inferred | Use a type that satisfies the bound, or weaken the bound |
 | `E0318: method_not_in_bound` | `a.less_than(b)` on `K: EQ`, or `a.equals(b)` on a bare `K` | Add or strengthen the bound |
 | `E0319: variant_no_measure` | `variant xs` on a `LIST` or a `STRING` | Use a number (`xs.length`), or a parameter of a sum type |
-| `E0320: unsupported_bound` | `[K: MY_CONCEPT]` | Bound by `EQ`, `CANONICAL_EQ` or `ORD` |
+| `E0320: unsupported_bound` | `[K: C]` where `C` has type parameters or a method with a body | Move the body to each instance, or bound by a concept without one |
 | `E0321: refined_function_type_position` | `let g: ((x: NAT) -> NAT ensure ...) = ...`, `LIST[(x: NAT) -> NAT ensure ...]`, a `require` on a field | Put the clauses on a parameter, a field or a result; a `require` on a parameter only |
 | `E0322: refined_function_escapes` | `let g = f` or returning `f`, where `f`'s type has a `require` | Apply `f`, or pass it to a parameter whose `require` implies `f`'s |
+| `E0323: underivable_instance` | `module CELL satisfies CANONICAL_EQ` with a variant `Full(n: NAT)` and no `equals` | Write `equals` (and `less_than` for `ORD`); only an enumeration gets them from the compiler |
 
 ---
 
@@ -1818,13 +2045,338 @@ Every program automatically sees the **Standard Prelude**:
 | :--- | :--- |
 | Concepts | `EQ`, `CANONICAL_EQ`, `ORD` |
 | Core types | `OPTION[A]`, `RESULT[E, A]`, `IO_ERROR` |
-| Collections | `SEQ[A]`, `LIST[A]`, `LIST_OPS`, `MAP[K, V]`, `KEY_ORDER[K]` |
+| Collections | `SEQ[A]`, `LIST[A]`, `LIST_OPS`, `ARRAY[A]`, `MAP[K, V]`, `SET[K]`, `QUEUE[A]`, `HEAP[K]`, `KEY_ORDER[K]`, `HEAP_ORDER[K]`, `SORTING[K]`, `GENERATOR[S, A]`, `UNFOLD[S, A]` |
 | Numbers | `BIGNAT`, `NUMBER_TEXT`, `NUMBER_ERROR` |
-| Text | `STRING`, `STRING_ERROR`, `BYTES`, `BYTES_BUILDER` |
+| Text | `STRING`, `STRING_ERROR`, `BYTES`, `BYTES_BUILDER`, `STRING_BUILDER`, `TEXT_FORMAT` |
+| Encodings | `HEX`, `BASE64`, `PERCENT`, `CODEC_ERROR` |
 | Functions | `FUNCTION_OPS` |
 | Reactive programs | `STEP[S]`, `COMMAND`, `EVENT`, `KEY`, `CONN_ID` |
 
 The prelude is verified once, on its own (`gardelc --stdlib`). In user programs its contracts and laws are trusted facts, and calls into it must still establish its preconditions. You may declare a name the prelude already uses: the bare name then means yours, and `GARDEL::NAME` means the prelude's. Pass `--no-prelude` only to build a prelude-free program on purpose.
+
+### Lists and Their Laws: `LIST_OPS`
+
+`LIST_OPS` has the list operations of Bird and Wadler's *Introduction to Functional Programming*, §3.2 to §3.5. Each is total and runs in C:
+
+| Operation | Gives |
+| :--- | :--- |
+| `map`, `filter`, `fold_left`, `fold_right`, `at(xs, i)` | As usual. `at` needs `i < xs.length` |
+| `take(xs, n)`, `drop(xs, n)` | The first `n` items and the rest. With fewer than `n` items, `take` gives them all and `drop` none |
+| `take_while(xs, p)`, `drop_while(xs, p)` | The longest prefix whose items satisfy `p`, and what follows it |
+| `reverse(xs)`, `reverse_onto(xs, acc)` | The items in reverse order; the second puts them in front of `acc` |
+| `concat(xss)`, `concat_map(xs, f)` | The lists one after another; `concat_map` concatenates the lists `f` gives |
+| `zip(xs, ys)`, `zip_with(xs, ys, f)` | Pairs `(x, y)` or `f(x, y)` of items at the same place, as long as the shorter list |
+| `last(xs)`, `init(xs)` | The last item, and every item but it. Both need `xs.length > 0` |
+| `range(lo, hi)`, `iterate_n(f, x, n)` | `lo` up to but not including `hi`; and `x`, `f(x)`, `f(f(x))` and so on, `n` items |
+| `update(xs, i, x)` | `xs` with `x` at `i`, or `xs` itself when `i` is past the end |
+
+A contract states each one's length and how it unfolds once (`empty_case`, `cons_case`). What takes induction to prove is a law. Call the law where you need it:
+
+```eiffel
+  twice(xs: LIST[U64]): LIST[U64]
+    do
+      check
+        back: LIST_OPS.reverse_reverse(xs)
+      end
+      LIST_OPS.reverse(LIST_OPS.reverse(xs))
+    ensure
+      same: Result = xs
+    end
+```
+
+The laws:
+- **Lists:** `at_update_same` and `at_update_other` (what `at` gives after an `update`; the solver applies them on its own), `take_drop` (`take(xs, n).append(drop(xs, n)) = xs`), `take_while_drop_while`, `reverse_reverse`, `reverse_append` (`reverse(xs.append(ys)) = reverse(ys).append(reverse(xs))`), `reverse_cons`, `init_last`, `map_fusion` (`map(map(xs, g), f) = map(xs, FUNCTION_OPS.compose(f, g))`), `filter_map`, `map_append` and `filter_append`.
+- **Folds:**
+  - `fold_duality_first`: over a monoid, `fold_right` and `fold_left` agree.
+  - `fold_duality_second`: the same for two functions that associate with each other.
+  - `fold_duality_third`: `fold_right(xs, f, a) = fold_left(reverse(xs), g, a)`, where `g` is `f` with its arguments swapped.
+  - `fold_homomorphism`: a monoid fold of `xs.append(ys)` combines the folds of each.
+- **`concat_map`:** it is `concat` after `map` (`concat_map_is_concat_map`). It also has the monad laws, named as `OPTION.and_then`'s are: `concat_map_left_unit`, `concat_map_right_identity` and `concat_map_associative`.
+
+A law about a function needs something of that function. It asks for it as `forall` premises in its `require`, and your call must prove them for the function you pass. So `fold_duality_first(xs, f, e)` needs `f` to be associative with `e` as its identity on both sides. A function you write as `fn(p: BOOL, q: BOOL): BOOL do p or q end` meets that. A law takes the function another law would build, such as `g` for the third theorem or `h` for associativity, as a parameter, with a premise saying what it is: a law that holds an `fn` is not given to clients.
+
+Two limits:
+- A premise over a number type quantifies over every integer, not only those of the type, so a function on `NAT` must meet it for negative numbers too. A function on `BOOL`, or one that never does arithmetic, meets it most easily.
+- `take`, `map` and the other operations recurse once per item, so a list of millions of items can exhaust the C stack.
+
+`SEQ.reduce(f, e)` folds the two sides of each `Concat` apart, so they may run in parallel. The law `SEQ.reduce_folds(s, f, e)` has the same monoid premises as `fold_duality_first`. It states that `reduce` then equals both `fold_left` and `fold_right` of the model, proven by `fold_homomorphism` and the first duality theorem.
+
+### Sorting: `SORTING`
+
+`SORTING[K: ORD]` sorts a `LIST[K]` of any ordered type: numbers, `STRING`, `BIGNAT`, an enumeration, or a module of yours that satisfies `ORD`.
+
+| Routine | Gives |
+| :--- | :--- |
+| `SORTING.sort(xs)` | The items of `xs` in order, by merge sort |
+| `SORTING.merge(xs, ys)` | The items of both, in order when both are |
+| `SORTING.sorted(xs)` | Whether each item is at most the next, by `less_or_equal` |
+| `SORTING.count(xs, x)` | How many items are `x` itself. It is ghost: contracts only |
+| `SORTING.sort_array(a)` | The items of the `ARRAY` `a` in order, with `sort`'s contract on `a.to_list` |
+| `SORTING.lower_bound(a, k)` | In a sorted array, the first position whose item is not below `k` |
+| `SORTING.binary_search(a, k)` | In a sorted array, `Some` position of `k`, or `None` |
+
+`sort`'s contract has three parts:
+- `ordered`: `SORTING.sorted(Result)`.
+- `same_length`: `Result.length = xs.length`.
+- `permutation`: `forall x: K. SORTING.count(Result, x) = SORTING.count(xs, x)`. The result has the same items, each as many times.
+
+`count` compares with `=`, which a contract may use on any type, so the permutation holds even where `equals` is not `=`, as for `STRING`.
+
+The law `first_least(xs, j)` says that the first item of a sorted list is at most the item at `j`. Its proof chains `less_or_equal` along the list, which needs `equals` and `less_than` to agree. `ORD` does not promise that, so the law asks for it as the premise `agrees: forall a: K. forall b: K. a.equals(b) = (a = b)`. For a `NAT`, or any `CANONICAL_EQ` key, it holds at once:
+
+```eiffel
+  smallest(xs: LIST[NAT], j: NAT): NAT
+    require
+      inside: j < xs.length
+    do
+      check
+        nat_agrees: forall a: NAT. forall b: NAT. a.equals(b) = (a = b)
+        least: SORTING.first_least(SORTING.sort(xs), j)
+      end
+      SORTING.sort(xs).head
+    ensure
+      at_most: Result <= LIST_OPS.at(SORTING.sort(xs), j)
+    end
+```
+
+The sort is stable: items that are `equals` but differ keep their order. A module that orders records by a key, as `less_than` on `Current.key < other.key`, gets them back in the order they came. This is tested, not proven (see the limits below).
+
+In C, every step of the sort is a loop, so a list of millions of items cannot exhaust the stack. The two halves of each split are independent `let`s, so they run as parallel tasks. Each step builds new list cells, so a million `U64`s take about 2.7 s.
+
+`sort_array` is the same merge sort on an `ARRAY`, and stable too. Each half is copied out with `slice` and sorted as a parallel task. The two sorted halves are then merged into a new array, which the merge loop fills with `set` in place. Its contract is `sort`'s, stated on `Result.to_list` and `a.to_list`. A program that fills and sorts a million `U64`s takes 0.68 s on one thread and 0.22 s on twenty, against 2.7 s with `sort` on a list. C's `qsort` on a plain array takes about 0.16 s in the same conditions.
+
+`lower_bound` and `binary_search` search a sorted array in about log2(n) steps. Like `first_least`, they ask for the premise `agrees`, which a client states once in a `check`:
+
+```eiffel
+  position(a: ARRAY[NAT], k: NAT): NAT
+    require
+      ordered: SORTING.sorted(a.to_list)
+    do
+      check
+        nat_agrees: forall p: NAT. forall q: NAT. p.equals(q) = (p = q)
+      end
+      match SORTING.binary_search(a, k)
+        case Some(i) then i
+        case None then a.length
+      end
+    end
+```
+
+`lower_bound`'s contract says that every item before the position it gives is below `k`, and that no item from it on is. `binary_search`'s says that what it finds is `k`, and that when it gives `None` no item of the array is `k`.
+
+Limits:
+- Stability is tested, not proven. For a key whose `equals` is not `=`, the proof needs `equals` and `less_than` to agree (`a.equals(b) and b.less_than(c) implies a.less_than(c)`). As a premise that quantifies over three values, the solver cannot use it.
+- There is no `sort` for `SEQ`: a client cannot see how a `SEQ`'s model unfolds. Sort its items as a list, such as the one `s.fold_right` builds with `prepend`.
+- `sort_array` is not in place. It copies each half, about n log2(n) items moved in all, and allocates about 2n arrays.
+- A search needs `agrees`, and for `STRING` it does not hold: `equals` compares the bytes, and two strings with the same bytes are not known to be `=`. A client cannot prove the premise, so an array of strings can be sorted but not searched.
+
+### Arrays: `ARRAY`
+
+An `ARRAY[A]` holds a fixed number of items, read and changed by index.
+
+| Routine | Gives |
+| :--- | :--- |
+| `ARRAY.make(n, x)` | `n` items, each `x` |
+| `ARRAY.from_list(xs)` | The items of `xs` |
+| `ARRAY.empty` | No items |
+| `a.length` | The number of items |
+| `a.at(i)` | The item at `i`, for `i < a.length` |
+| `a.set(i, x)` | The array with `x` at `i`, for `i < a.length` |
+| `a.swap(i, j)` | The array with the items at `i` and `j` exchanged |
+| `a.slice(lo, hi)` | The items from `lo` up to, not including, `hi`, as a new array |
+| `a.to_list` | The items, as a list |
+| `a.fold(f, init)` | The items combined from the first, as `LIST_OPS.fold_left` |
+
+A proof sees an array as the list of its items, `a.model`, and every contract is stated on it. `set`'s says `Result.model = LIST_OPS.update(a.model, i, x)`. Two laws, applied wherever a changed array is read, say what `at` gives after a `set`:
+- `at_set_same`: `a.set(i, x).at(i) = x`.
+- `at_set_other`: `a.set(i, x).at(j) = a.at(j)` when `i != j`.
+
+So a client proves this from the contracts alone:
+
+```eiffel
+  put_read(a: ARRAY[NAT], i: NAT, x: NAT): NAT
+    require
+      inside: i < a.length
+    do
+      a.set(i, x).at(i)
+    ensure
+      same: Result = x
+    end
+```
+
+An index past the end is refused by `at`'s and `set`'s `in_bounds`. There is no `=` on arrays in running code, as for `MAP`: compare `a.to_list`.
+
+In C an array is one block, so `at` and `length` take constant time. `set` and `swap` change the array in place when nothing else holds it, and copy it otherwise. Nothing else holds it when the caller is done with it:
+- the array is the result of another call, as in `ARRAY.make(n, 0).set(0, 1)`;
+- it is a `let` that nothing after the `set` reads;
+- it is a parameter that nothing after the `set` reads. A loop owns its parameters from its second iteration, and from its first when its caller gave it the array.
+
+Every step of this loop changes the array in place, and `fill(ARRAY.make(1000000, 0), 0)` makes no copy:
+
+```eiffel
+  fill(a: ARRAY[NAT], i: NAT): ARRAY[NAT]
+    require
+      inside: i <= a.length
+    variant
+      a.length - i
+    do
+      if i = a.length then
+        a
+      else
+        fill(a.set(i, i), i + 1)
+      end
+    ensure
+      len: Result.length = a.length
+    end
+```
+
+`let b = a.set(i, i)` then `fill(b, i + 1)` is the same. A million `set`s through it take about 15 ms, the allocation of the array included.
+
+A copy is never wrong, only slow, and nothing warns you of it. Keep the old array out of anything after the `set`:
+- `let b = fill(a, 0)` followed by a read of `a` copies `a` once, at the first `set`, since `a` is still needed. That is right when you want both.
+- `a.set(i, x).set(j, a.at(k))` copies at the first `set`: the second call reads `a` after it. Read first: `let y = a.at(k)`, then `a.set(i, x).set(j, y)`.
+- In a loop, an argument that reads the array beside the one that changes it, as `loop(a.set(i, x), a.length)`, makes every step copy. Read `a.length` inside the loop instead.
+- In a `match` on something read from the array, as `match a.at(i)`, no arm changes the array in place: the names the `match` binds still point into it.
+
+A record with a field of type `ARRAY` gives up its array in the same cases. `HEAP.push` is written `{ slots = HEAP_ORDER.push(Current.slots, Current.n, x), n = Current.n + 1 }`, and a loop `fill(h.push(x), n - 1)` changes the array in place from its second iteration. The routine must return its own type, and must build the record as its result, reading the field once and `Current` only through its fields.
+
+### Sets, Queues and Heaps: `SET`, `QUEUE` and `HEAP`
+
+| Routine | Gives |
+| :--- | :--- |
+| `SET.empty`, `s.add(k)`, `s.remove(k)` | A set of `ORD` keys |
+| `s.has(k)`, `s.size`, `s.items` | Whether `k` is there, how many keys, and the keys in ascending order |
+| `s.union(t)`, `s.intersection(t)` | The keys of either, and of both |
+| `QUEUE.empty`, `q.push(x)`, `q.pop` | A queue, with `x` last, and without its oldest item |
+| `q.peek`, `q.size`, `q.items` | The oldest item or `None`, how many, and the items, oldest first |
+| `HEAP.empty`, `h.push(x)`, `h.pop_min` | A heap of `ORD` items, with `x`, and without one of its least items |
+| `h.peek`, `h.size` | The least item or `None`, and how many |
+
+A `SET` is proven through laws on `has`, as `MAP` is on `get`: `has_add_same`, `has_add_other`, `has_remove_same`, `has_remove_other`, `has_union` and `has_intersection`. `size_add_new`, `size_add_at_most`, `size_remove_absent` and `size_remove_at_most` count. `has`, `add` and `remove` take time linear in the size, and `union` and `intersection` the product of the two sizes.
+
+A `QUEUE`'s contracts say what each operation does to `items`: `push` appends, `pop` takes the tail, `peek` is the head. Every operation but `items` takes amortized constant time.
+
+A `HEAP` is proven through a ghost `count`: how many items are a given value. `count_push` adds one, `count_pop` takes away one of `h.peek.get`, and `peek_least` says that no item is below `peek`. `push` and `pop_min` need `agrees`:
+
+```eiffel
+  least(h: HEAP[NAT], x: NAT): BOOL
+    require
+      room: h.size < 1000
+    do
+      check
+        agrees: forall p: NAT. forall q: NAT. p.equals(q) = (p = q)
+      end
+      let g = h.push(x)
+      check
+        counted: g.count(x) > 0
+      end
+      not x.less_than(g.peek.get)
+    ensure
+      holds: Result
+    end
+```
+
+In C a heap is an array that `push` and `pop_min` change in place when the caller is done with the heap, in a logarithmic number of steps. A `push` on a full array makes one about twice as long.
+
+Limits:
+- `push` on a queue or a heap asks for room: `size < 18446744073709551615`.
+- `HEAP` needs `agrees`, which does not hold for `STRING`, so there is no heap of strings.
+- A proof about a fold or a count that uses `+%` can be slow: the solver reasons about wrapping addition bit by bit.
+
+### Endless Sequences: `GENERATOR` and `UNFOLD`
+
+A `GENERATOR[S, A]` is an endless sequence held as a finite value: a `state: S` and a step `next: S -> TUPLE[A, S]` that gives the item at a state and the state after it. `take(n)` is the first `n` items.
+
+```eiffel
+  naturals(from: NAT): GENERATOR[NAT, NAT]
+    do
+      GENERATOR.make(from, fn(s: NAT): TUPLE[NAT, NAT] do (s, s +% 1) end)
+    end
+
+  fibs(a: NAT): GENERATOR[TUPLE[NAT, NAT], NAT]
+    do
+      GENERATOR.make((a, 1), fn(p: TUPLE[NAT, NAT]): TUPLE[NAT, TUPLE[NAT, NAT]] do (p.first, (p.second, p.first +% p.second)) end)
+    end
+
+  tenth: NAT
+    do
+      fibs(0).nth(9)
+    ensure
+      is_34: Result = 34      -- proven from the contracts of `nth` and `make`
+    end
+```
+
+A step never ends, so you choose what it does at the end of a bounded type: wrap with `+%`, as above, or count with `BIGNAT`. A step written `s + 1` over `NAT` is refused as an overflow.
+
+What you can do with a generator:
+- **Read it:** `head`, `tail`, `take(n)`, `nth(n)` and `drop(n)`.
+- **Build one:** `make(s, f)`, `GENERATOR.iterate(x, f)` (`x`, `f(x)`, `f(f(x))` and so on), and `GENERATOR.cycle(xs)` for a non-empty list.
+- **Combine:** `map(f)`, `zip(other)`, `zip_with(other, h)` and `scan(f, init)`. `zip`'s state is the pair of both states.
+- **Search, with a bound:** `find_within(k, p)` and `take_while_within(k, p)` look at the first `k` items only.
+
+There is no `filter`. A generator's next item that passes might never come, so a filter could run forever. Take a prefix first, and filter that. B&W §7.3's sieve on a bounded prefix:
+
+```eiffel
+  sieve(xs: LIST[NAT]): LIST[NAT]
+    variant
+      xs.length
+    do
+      if xs.length = 0 then
+        LIST.empty
+      else
+        let p = xs.head
+        sieve(LIST_OPS.filter(xs.tail, fn(x: NAT): BOOL do if p = 0 then True else x % p != 0 end end)).prepend(p)
+      end
+    end
+```
+
+`sieve(LIST_OPS.range(2, 30))` gives the ten primes below 30.
+
+Laws let a client reason about a prefix with `LIST_OPS`' laws:
+- `nth_take(g, n, k)`: for `k < n`, `g.nth(k) = LIST_OPS.at(g.take(n), k)`.
+- `take_split(g, n, m)`: for `m <= n`, `g.take(n) = g.take(m).append(g.drop(m).take(n - m))`.
+- `map_take(g, f, n)`: `g.map(f).take(n) = LIST_OPS.map(g.take(n), f)`.
+
+Each combinator states its step (`stepping`), so `GENERATOR.iterate(x, f).next(s)` is known to be `(s, f(s))`. `cycle` is the exception: it states only where it starts.
+
+**What holds of every item.** A property holds of every item when it holds of the first state and the step keeps it. That is an induction on the number of items. Here it bounds a retry schedule:
+
+```eiffel
+  delays: GENERATOR[NAT, NAT]
+    do
+      GENERATOR.iterate(100, fn(d: NAT): NAT do if d >= 5000 then 10000 else d * 2 end end)
+    end
+
+  capped(g: GENERATOR[NAT, NAT], n: NAT): BOOL
+    require
+      starts: g.state >= 0 and g.state <= 10000
+      keeps: forall d: NAT. d <= 10000 implies
+        (g.next(d).first >= 0 and g.next(d).first <= 10000 and g.next(d).second >= 0 and g.next(d).second <= 10000)
+    variant
+      n
+    do
+      if n = 0 then True else capped(g.tail, n - 1) end
+    ensure
+      holds: Result
+      bounded: forall k: NAT. k < n implies (g.nth(k) >= 0 and g.nth(k) <= 10000)
+    end
+```
+
+A call `capped(delays, k + 1)` in a `check` then proves that `delays.nth(k)` is at most 10 s. A generic version over any property needs a concept bound on the state, which this library does not have yet.
+
+**A generator's items are in their type's range.** The verifier knows this of any generator, not only of a prefix it can unfold. So a routine can return `g.take(n)` as a `LIST[NAT]`, or `g.nth(k)` as a `NAT`, for any `g`, `n` and `k`. The combinators carry ranges too. For example, `naturals(1).map(f)`'s items are in `f`'s result range.
+
+The verifier states this range over the state and the item together. The state is in its type's range, and the step takes a state in range to an item in range and a next state in range. Every lambda and every function parameter is proven to keep that promise, so every generator built from them does too.
+
+A bound other than the type's, such as `<= 10000` above, still needs a property like `capped`.
+
+An `UNFOLD[S, A]` is a sequence that may end, like Elixir's `Stream.unfold`: its step gives an `OPTION`, and `None` ends it. `take(n)` gives at most `n` items. `to_list(measure)` gives all of them, if you prove the sequence ends: `measure` of the state is never negative, and it shrinks at each step. Over a `NAT` state, "never negative" quantifies over every integer, so a measure such as a list's length is the easy case.
+
+Compared with Elixir's `Stream` (`unfold`, `iterate`, `cycle`, `Enum.take`):
+- A search that may never end is refused, where Elixir would loop.
+- Overflow is the client's choice, not a bignum.
+- The state's type is visible in the generator's type, as there are no existential types.
+- There are no effects; those belong to reactive programs.
 
 ### Multi-File Projects
 
@@ -1910,7 +2462,7 @@ match JSON.parse_text("{\"b\": [1, 2.5, \"x\"], \"a\": null}")
 end
 ```
 
-- **The value.** `JSON` is opaque. Build it with `null`, `bool`, `int`, `number`, `string`, `empty_array`, `empty_object`, `with_item` and `with_field`, and read it with `is_null`, `as_bool`, `as_int`, `number_text`, `as_string`, `count`, `item`, `field` and `depth`. Its invariant keeps text valid UTF-8, the keys of an object unique and in ascending byte order, and nesting at most 64 levels, so `with_item` and `with_field` return an `OPTION`. An integer in the range of `I64` is an `I64`, and any other number keeps its text as read.
+- **The value.** `JSON` is opaque. Build it with `null`, `bool`, `int`, `number`, `string`, `empty_array`, `empty_object`, `with_item` and `with_field`, or an array from a list with `JSON_ARRAY.of`, and read it with `is_null`, `as_bool`, `as_int`, `number_text`, `as_string`, `count`, `item`, `field` and `depth`. Its invariant keeps text valid UTF-8, the keys of an object unique and in ascending byte order, and nesting at most 64 levels, so `with_item` and `with_field` return an `OPTION`. An integer in the range of `I64` is an `I64`, and any other number keeps its text as read.
 - **Parsing.** `JSON.parse(b: BYTES)` and `JSON.parse_text(s: STRING)` are total and return `RESULT[JSON_ERROR, JSON]`. Every error names a byte offset (`e.offset`). Input over 4 MiB is `TooLarge`, nesting over 64 levels is `TooDeep`, and a repeated key is `DuplicateKey`.
 - **Writing.** `to_bytes` and `to_text` add no white space and write keys in order, so equal values give equal bytes.
 - **What you can prove.** The law `JSON.scalar_round_trip` says a scalar read back from its own bytes is itself. With the builders' contracts it reaches your code with no extra work:
@@ -1952,6 +2504,70 @@ step(t: TUI[TODO_STATE], e: EVENT): STEP[TUI[TODO_STATE]] do t.step(e) end
 `examples/todo_tui` is a small program, and `examples/gtui_tour` a workbench of three panes that uses every widget. A full redraw of 200 by 60 takes about 7 ms. `gtui/README.md` has the details.
 
 `tools/tablon` is a workbench for a Gardel project, written in Gardel on `gtui` and `gjson`. Build it from `tools/tablon` with `gardelc --project . --strict`, as `gardelc` writes `build/` under the directory it runs in, and run `tools/tablon/build/tablon_bin DIR [GARDELC] [EDITOR]` in a terminal, where `DIR` is a project, `GARDELC` the compiler, `gardelc` on the `PATH` when it is not given, and `EDITOR` the command line that edits a file, `vi` when it is not given. It reads the project's modules from `gardelc --inspect --json-diagnostics --no-verify`, so it browses a project whose proofs fail. Tab moves between the panes; `m` and `f` choose Modules or Files on the left; `t`, `s`, `f`, `n`, `l`, `i`, `a`, `d`, `c` and `u` choose a view on the right (text, short form, features, creators, laws, invariants, concepts, instances, clients, suppliers); Enter opens a node, a part's line or a module; `/` opens the commands; `q` quits. Ctrl-K checks the project, and Problems lists its failures, Enter going to each one's line; Ctrl-B builds it; Ctrl-R builds and runs it, an ordinary program with its output in Run and the keys typing to its input, a reactive one attached; in Text, Enter edits the file shown and Escape stops, Ctrl-S saves it and checks again, and quitting with unsaved files asks first; Ctrl-E edits the file shown in your own editor, then checks again; Ctrl-X stops what runs; `/new NAME` writes a new module's file under `src`, where there is none, opens it and reads the modules again. `tools/tablon/README.md` has the details.
+
+### Testing a Package: `gardelc test` and `gtest`
+
+A package's tests are a package of their own in its `tests/` directory, with a `Gardel.toml` that depends on the package, so they see only its contracts. Each `program` in it is a test. `gardelc test DIR` verifies that package under `--strict` and builds it, once, runs each program in `DIR/tests` with `tests/cases.txt` on its standard input when there is one, and reports each by its exit status. Its own exit status is 0 when every program passed, and 1 when one failed or the tests did not verify or build. A failing program's output is shown under its name.
+
+```text
+$ gardelc test gjson
+[test] `gjson\tests` verified: 0 modules verified now, 23 proven earlier on this machine (1.9 s)
+[test] GJSON_TEST ... ok (1.2 s)
+[test] 1 program: 1 passed, 0 failed (3.1 s)
+```
+
+`--filter NAME` runs only the programs whose name contains `NAME`. The package and its tests share one build and the proof cache, and an executable whose C file has not changed is not compiled again, so a run with nothing changed takes a few seconds. A program that runs for ten minutes is stopped and fails.
+
+The package `gtest` (in `gtest/`) is what a test program is written with. Add `gtest = { path = ".../gtest" }` to the tests' manifest.
+
+- **Checks.** `CHECK.that(name, b)`, `equal_text`, `equal_nat`, `equal_int`, `equal_shown(name, got, expected, same, show)`, `is_ok`, `is_error`, `is_some` and `is_none` each give a `TEST_RESULT`: `Pass(name)` or `Fail(name, message)`, where the message says what was expected and what came, as `expected 4, got 3`.
+- **The runner.** IO belongs to a `program`, so its `main` prints `TESTS.report(rs)`, each failure with its name and then the count, and exits with `TESTS.exit_code(rs)`:
+
+```eiffel
+main(args: SEQ[STRING]): IO[EXIT_CODE]
+  do
+    let rs = LIST.empty
+      .prepend(CHECK.equal_nat("twice", DOUBLE.twice(21), 42))
+      .prepend(CHECK.is_error("not a number", NUMBER_TEXT.parse_nat("x")))
+    with IO
+      IO.print_line(TESTS.report(rs))
+      IO.exit(TESTS.exit_code(rs))
+    end
+  end
+```
+
+- **Cases files.** `CASES` reads a line `input => expected`. Empty lines and lines that start with `#` are skipped, and `%XX` stands for a byte. `CASES.check(rs, n, line, run)` adds the result of line `n`: `run(input)` compared with the expected text. A program reads its lines with `IO.read_line` and checks each, as `gjson/tests/src/gjson_test.gdl` does; `CASES.bytes(s)` gives an input that need not be text.
+- **Property tests.** `PROPERTY.for_all(name, gen, n, seed, prop)` checks `prop` on `n` values of a generator made from `seed`. A failure says which case and the seed it was made from, so a run from that seed makes it first; `for_all_shown` also shows the value. The values come from SplitMix64 (`SPLIT_MIX`), pure and the same on every system. `GENS` has `u64`, `nat_below(n)`, `nat_in(lo, hi)`, `bool`, `list(g, max)`, `text(max)`, `text_from(alphabet, max)`, `map` and `pair`, and `GEN.make` takes any step from a state to a value and the next state.
+- **Reactive steps.** `SCRIPT.play(step, state, events)` runs a `step` over a list of events and gives `Running(state, commands)` or `Stopped(code, commands)`, with every command in order; `SCRIPT.printed(commands)` is the text of each `Print` and `Write`. The `step` must be a routine of a module, as a `reactive program` cannot be named. Keep the run in a `let`: a routine that returns a `SCRIPTED[NAT]` must show its state in range, and a generic routine's result has no range.
+
+`gjson`, `gtest` and its own tests (`gtest/tests`) use it. `ghttp` and `grest` still read their cases from Rust tests.
+
+### Mutating a Package: `gardelc mutate`
+
+A proof shows that the code keeps its contract, and a test that it does what the test asks. Neither shows that the contract and the tests say enough. `gardelc mutate DIR` changes the package's code in small ways, one change at a time, and says what refuses each changed package (a *mutant*):
+
+- **the verifier**, with the clause that fails: what the change breaks is proven;
+- **a test**, with its name: it is tested, and not proven;
+- **nothing**: the mutant *survives*, and no proof or test tells it from the original.
+
+```text
+$ gardelc mutate price
+[mutate] 10 mutants
+[mutate] the package as it is: verified and tested (4.1 s)
+[mutate] 1/10 src/price.gdl:7 PRICE.doubled: `require` `small` dropped ... killed by the verifier: `overflow_add` of `doubled` (Arithmetic Overflow) (2.4 s)
+[mutate] 2/10 src/price.gdl:16 PRICE.fee: `>` -> `>=` ... killed by a test: PRICE_TEST: FAIL paid: expected 50, got 0 (6.6 s)
+[mutate] 3/10 src/price.gdl:21 PRICE.label: `5` -> `6` ... SURVIVED (4.8 s)
+    - 5
+    + 6
+```
+
+The changes are: an integer one more or one less; `True` for `False`; `<` for `<=`, `>` for `>=`, `=` for `!=` and `and` for `or`, each both ways; a condition negated; one branch of an `if` always taken; an arm of a `match` with the next arm's body; a `require` or `invariant` clause dropped; two arguments next to each other swapped; and a call replaced by its receiver or an argument. Only code is changed. A `check`, an `ensure`, a law's proof, a `specify` routine and a routine that states a fact (a `BOOL` with a clause that ensures `Result`) are left alone. Many changes are of the wrong type; they are refused before any proof and counted as "not a program".
+
+Each mutant is made in a private copy, verified with `--strict`, its own module first, and then tested with `gardelc test` if the package has a `tests/` package. The exit status is 0 when none survived, 1 when one did or the package itself does not pass, and 2 for a wrong command line.
+
+- `--only MODULE` changes only that module, and may be repeated. `--limit N` tries `N` of the mutants, chosen by `--seed` (0 when it is not given). `--list` lists them and tries none.
+- `--jobs N` tries `N` at a time. A mutant can keep the solver busy for long: `--time-limit SECS` stops the verifier on one after that time (1800 when it is not given). A mutant the solver gives up on is refused, as any module it gives up on is, but it was not shown to be wrong, so it is counted apart, as "not proven".
+- A survivor is an invitation to state or to test more. One that means the same as the original goes in `Gardel.mutants`, beside the manifest: one a line, as the report writes it, with the reason above it as a `--` comment. It is not tried again. A line that fits no mutant any more is reported.
 
 ### Checking a New Version
 
@@ -2110,7 +2726,8 @@ gardelc --stdlib --strict
 # built as without the flag: a C compiler that fails is `E0401`, and a `note` names the executable
 gardelc <file.gdl> --json-diagnostics
 
-# Fix the solver seed, to check that a proof is stable, or its work limit per procedure
+# Fix the solver seed, to check that a proof is stable, or its work limit per procedure.
+# Without a seed, a module on which the solver gives up is verified again under seeds 1 to 3
 gardelc <file.gdl> --z3-seed <N>
 gardelc <file.gdl> --z3-rlimit <N>
 
@@ -2150,6 +2767,17 @@ gardelc <file.gdl> --run
 
 # Report what would break a client of an older version of this package
 gardelc --compare-with <old-dir>
+
+# Verify and build DIR/tests (default ./tests), run each program in it with tests/cases.txt
+# on its standard input, and report each by its exit status
+gardelc test [DIR] [--filter <NAME>]
+
+# Change the package's code in small ways, and report the changes that neither its proofs
+# nor its tests refuse
+gardelc mutate [DIR] [--only <MODULE>] [--limit <N>] [--seed <N>] [--jobs <N>] [--time-limit <SECS>] [--list]
+
+# Check MODULE first, and stop at the first module with an error
+gardelc <file.gdl> --fail-fast <MODULE>
 ```
 
 `gardelc` remembers what this machine has proven, in `GARDEL_CACHE_DIR` or your user cache directory. A module whose verification condition has not changed is not given to the solver again, and the run says how many came from the cache. Changing `gardelc`, Boogie, Z3 or a limit verifies everything again. If Boogie or Z3 cannot give its version, the run uses no cache, and a `[cache] off` line names the tool and the reason. All other checks run every time, so `--strict` cannot be answered by an earlier run. The cache only saves time: deleting it is always safe.
@@ -2164,6 +2792,8 @@ A normal run reports five steps:
 [4/5] Emitted Bend v2 target    -> build/<module>.bend
 [5/5] Emitted C11 runtime target -> build/<module>.c
 ```
+
+A `program` or a reactive program is then compiled to `build/<module>_bin`, or `build/<module>_bin.exe` on Windows. Both shells there also run it as `build/<module>_bin`. A C file is written only when its text changes, and an executable no older than its C file is not compiled again: the run then says `Native executable up to date`.
 
 ```bash
 # Write the Standard Prelude embedded in gardelc to build/stdlib/ (or --emit-stdlib <DIR>); never overwrites edited files

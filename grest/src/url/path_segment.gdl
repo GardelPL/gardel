@@ -10,8 +10,6 @@ create {ANY}
 
   -- How many segments of `ps` are parameters.
   params_in(ps: LIST[PATH_SEGMENT]): NAT
-    require
-      short: ps.length <= 16
     variant
       ps.length
     do

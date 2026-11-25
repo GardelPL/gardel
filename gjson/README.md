@@ -11,7 +11,7 @@ end
 
 ## The value
 
-`JSON` is opaque. It is built with `null`, `bool`, `int`, `number`, `string`, `empty_array`, `empty_object`, `with_item` and `with_field`. It is read with `is_null`, `is_array`, `is_object`, `as_bool`, `as_int`, `number_text`, `as_string`, `count`, `item`, `field` and `depth`.
+`JSON` is opaque. It is built with `null`, `bool`, `int`, `number`, `string`, `empty_array`, `empty_object`, `with_item`, `with_first` and `with_field`, and `JSON_ARRAY.of(vs)` makes the array of a list of values. It is read with `is_null`, `is_array`, `is_object`, `as_bool`, `as_int`, `number_text`, `as_string`, `count`, `item`, `field` and `depth`.
 
 Its invariant says the value is well-formed:
 
@@ -44,15 +44,15 @@ Two equal values are written as the same bytes: the writer adds no white space a
 - **The value is well-formed.** Every value the parser returns and every builder keeps the invariant: valid UTF-8, unique keys in order, depth at most 64.
 - **The parser is total and bounded.** It terminates on every input, reads at most 4 MiB, and nests at most 64 levels.
 - **The round trip, stage 1.** The law `JSON.scalar_round_trip` says `JSON.parse(v.to_bytes) = Ok(v)` for every scalar whose text fits `max_input`: `null`, booleans, integers (including `I64.min`), other numbers, and strings with every escape. A client proves it for its own values from the builders' contracts. For example, `JSON.parse(JSON.int(i).to_bytes) = Ok(JSON.int(i))` holds for every `i`.
+- **`JSON_ARRAY.of(vs)`** is `with_item` for each of `vs` in turn, from an empty array (`same`), and so `None` when one nests too deep. `JSON.with_first_then_item` says that an item put first and one put last may be put in either order.
 - **Not yet proven: arrays and objects.** The round trip of an array or object is checked by tests only (below). The reader and writer of chains are proven to keep the invariant, but not to undo each other.
 
 ## Tests
 
-`gjson/tests` is a package that depends on `gjson`, so it sees only contracts. Its cases are in `gjson/tests/cases.txt`, read on standard input. Each case is a document and what `parse` must say of it. Every accepted value must also read back as itself from what it writes, which covers the round trip of arrays and objects. Generated cases reach the limits: 64 and 65 levels of nesting, 200,000 items, 300,000 bytes of text, 50,000 escapes, 3,000 fields in reverse order, and a document over 4 MiB.
+`gjson/tests` is a package that depends on `gjson` and on `gtest`, so it sees only contracts. Its cases are in `gjson/tests/cases.txt`, which `gardelc test` sends on standard input, and `gtest`'s `CASES` checks each line, printing every failure with its line, what it expected and what it got. Each case is a document and what `parse` must say of it. Every accepted value must also read back as itself from what it writes, which covers the round trip of arrays and objects. Generated cases reach the limits: 64 and 65 levels of nesting, 200,000 items, 300,000 bytes of text, 50,000 escapes, 3,000 fields in reverse order, and a document over 4 MiB.
 
 ```
-gardelc --project gjson/tests --strict
-gjson/tests/build/gjson_test_bin.exe < gjson/tests/cases.txt
+gardelc test gjson
 ```
 
 ## Costs
@@ -60,4 +60,4 @@ gjson/tests/build/gjson_test_bin.exe < gjson/tests/cases.txt
 - The parser reads the document as a list of bytes, about 32 bytes of memory per byte of input while it runs. The writer builds its text the same way.
 - Arrays, objects, strings and numbers are read and written by loops, so a long array needs no stack. Only nesting uses the stack, at most 64 levels.
 - Each field of an object read out of order is inserted into a sorted list. Reading an object whose keys arrive in reverse order is therefore quadratic in its number of fields: 3,000 fields take about a second. Keys in ascending order, as `gjson` writes them, cost one comparison each.
-- `field`, `item`, `with_item` and `with_field` walk the chain, so each is linear in the size of the array or object.
+- `field`, `item`, `with_item` and `with_field` walk the chain, so each is linear in the size of the array or object. An array made with `with_item` for each item is quadratic. `with_first` takes constant time, and `JSON_ARRAY.of` time linear in the list: 10,000 objects take about a millisecond, where `with_item` for each took 3.7 s.

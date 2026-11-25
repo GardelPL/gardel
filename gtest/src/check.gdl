@@ -1,0 +1,107 @@
+-- Checks that each give a `TEST_RESULT` (Task H.9). A check that fails says what it expected
+-- and what it got, as text, so the runner can print it.
+functions CHECK
+
+feature {ANY}
+
+  -- `b` then `s`, or `b` alone once the text passes a megabyte: a message stays readable,
+  -- and the bound is what `STRING_BUILDER.add` needs.
+  add(b: STRING_BUILDER, s: STRING): STRING_BUILDER
+    do
+      if b.byte_length <= 1000000 and s.byte_length <= 1000000 then b.add(s) else b end
+    end
+
+  -- `expected <e>, got <g>`.
+  differ(expected: STRING, got: STRING): STRING
+    do
+      let b = CHECK.add(STRING_BUILDER.empty, "expected ")
+      CHECK.add(CHECK.add(CHECK.add(b, expected), ", got "), got).to_string
+    end
+
+  -- `s` between double quotes.
+  quoted(s: STRING): STRING
+    do
+      CHECK.add(CHECK.add(CHECK.add(STRING_BUILDER.empty, "\""), s), "\"").to_string
+    end
+
+  that(name: STRING, ok: BOOL): TEST_RESULT
+    do
+      if ok then Pass(name) else Fail(name, "is false") end
+    ensure
+      passes: Result.passed = ok
+    end
+
+  equal_text(name: STRING, got: STRING, expected: STRING): TEST_RESULT
+    do
+      if got.equals(expected) then
+        Pass(name)
+      else
+        Fail(name, CHECK.differ(CHECK.quoted(expected), CHECK.quoted(got)))
+      end
+    ensure
+      passes: Result.passed = got.equals(expected)
+    end
+
+  equal_nat(name: STRING, got: NAT, expected: NAT): TEST_RESULT
+    do
+      if got = expected then
+        Pass(name)
+      else
+        Fail(name, CHECK.differ(NUMBER_TEXT.nat_to_text(expected), NUMBER_TEXT.nat_to_text(got)))
+      end
+    ensure
+      passes: Result.passed = (got = expected)
+    end
+
+  equal_int(name: STRING, got: I64, expected: I64): TEST_RESULT
+    do
+      if got = expected then
+        Pass(name)
+      else
+        Fail(name, CHECK.differ(NUMBER_TEXT.i64_to_text(expected), NUMBER_TEXT.i64_to_text(got)))
+      end
+    ensure
+      passes: Result.passed = (got = expected)
+    end
+
+  -- Equal values of any type, each shown by `show` when they differ.
+  equal_shown[A](name: STRING, got: A, expected: A, same: BOOL, show: A -> STRING): TEST_RESULT
+    do
+      if same then
+        Pass(name)
+      else
+        Fail(name, CHECK.differ(show(expected), show(got)))
+      end
+    ensure
+      passes: Result.passed = same
+    end
+
+  is_ok[E, A](name: STRING, r: RESULT[E, A]): TEST_RESULT
+    do
+      if r.is_ok then Pass(name) else Fail(name, "expected Ok, got an Error") end
+    ensure
+      passes: Result.passed = r.is_ok
+    end
+
+  is_error[E, A](name: STRING, r: RESULT[E, A]): TEST_RESULT
+    do
+      if r.is_error then Pass(name) else Fail(name, "expected an Error, got Ok") end
+    ensure
+      passes: Result.passed = r.is_error
+    end
+
+  is_some[A](name: STRING, o: OPTION[A]): TEST_RESULT
+    do
+      if o.is_some then Pass(name) else Fail(name, "expected Some, got None") end
+    ensure
+      passes: Result.passed = o.is_some
+    end
+
+  is_none[A](name: STRING, o: OPTION[A]): TEST_RESULT
+    do
+      if o.is_some then Fail(name, "expected None, got Some") else Pass(name) end
+    ensure
+      passes: Result.passed = o.is_none
+    end
+
+end

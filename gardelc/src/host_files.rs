@@ -9,6 +9,186 @@
 //! The C below is emitted after `REACTIVE_RUNTIME`, whose declarations it uses. The parts that
 //! name instance types (`LIST_STRING`, `RESULT_IO_ERROR_BYTES`, ...) are in `typed_runtime`.
 
+/// The wall clock and the system's generator (Task H.1), for the reactive host's `ReadClock`
+/// and `Random` and for a `program`'s `IO.now` and `IO.random`. Emitted once, before either.
+pub(crate) const OS_CLOCK_RANDOM: &str = r#"/* The wall clock and the system's generator (Task H.1). */
+#define GARDEL_RANDOM_MAX 1024
+#ifdef _WIN32
+#define GARDEL_RANDOM_ERR_INVALID 87 /* ERROR_INVALID_PARAMETER */
+#include <stddef.h>
+__declspec(dllimport) unsigned long __stdcall GetLastError(void);
+__declspec(dllimport) void __stdcall GetSystemTimePreciseAsFileTime(void*);
+__declspec(dllimport) void* __stdcall LoadLibraryW(const wchar_t*);
+__declspec(dllimport) void* __stdcall GetProcAddress(void*, const char*);
+static int64_t gardel_wall_ms(void) {
+    unsigned long ft[2]; /* FILETIME: 100 ns since 1601, low part first */
+    GetSystemTimePreciseAsFileTime(ft);
+    int64_t t = (int64_t)(((uint64_t)ft[1] << 32) | ft[0]);
+    return (t - 116444736000000000LL) / 10000;
+}
+/* BCryptGenRandom, found at run time, so a program links with nothing new. */
+typedef long (__stdcall* gardel_bcrypt_fn)(void*, unsigned char*, unsigned long, unsigned long);
+static int64_t gardel_os_random(unsigned char* buf, size_t n) {
+    static gardel_bcrypt_fn gen = NULL;
+    if (!gen) {
+        void* lib = LoadLibraryW(L"bcrypt.dll");
+        if (lib) gen = (gardel_bcrypt_fn)GetProcAddress(lib, "BCryptGenRandom");
+        if (!gen) return (int64_t)GetLastError();
+    }
+    /* BCRYPT_USE_SYSTEM_PREFERRED_RNG */
+    long st = gen(NULL, buf, (unsigned long)n, 2);
+    return st == 0 ? 0 : (int64_t)(st & 0xFFFF ? st & 0xFFFF : 31);
+}
+#else
+#include <errno.h>
+#include <sys/random.h>
+#include <time.h>
+#include <unistd.h>
+#define GARDEL_RANDOM_ERR_INVALID EINVAL
+static int64_t gardel_wall_ms(void) {
+    struct timespec t;
+    clock_gettime(CLOCK_REALTIME, &t);
+    int64_t ms = (int64_t)t.tv_sec * 1000 + (int64_t)(t.tv_nsec / 1000000);
+    return ms;
+}
+/* getentropy gives at most 256 bytes a call. */
+static int64_t gardel_os_random(unsigned char* buf, size_t n) {
+    for (size_t at = 0; at < n;) {
+        size_t k = n - at < 256 ? n - at : 256;
+        if (getentropy(buf + at, k) != 0) return errno ? (int64_t)errno : 5;
+        at += k;
+    }
+    return 0;
+}
+#endif
+"#;
+
+/// Logging and the environment (Task H.2), for the reactive host's `Log` and `ReadEnv` and for a
+/// `program`'s `IO.log` and `IO.env`. Emitted once, before either.
+pub(crate) const OS_LOG_ENV: &str = r#"/* Logging and the environment (Task H.2). */
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+static int gardel_log_min = -1; /* the lowest level written; -1 until GARDEL_LOG_LEVEL is read */
+static const char* const gardel_level_names[4] = { "debug", "info", "warn", "severe" };
+/* GARDEL_LOG_LEVEL, in any case, or `info` when it is unset or empty. Any other value stops the
+   program with status 2: a log that is silently lost is worse than one that will not start. */
+static int gardel_log_threshold(void) {
+    if (gardel_log_min >= 0) return gardel_log_min;
+    gardel_log_min = 1;
+    const char* v = getenv("GARDEL_LOG_LEVEL");
+    if (!v || !*v) return gardel_log_min;
+    for (int l = 0; l < 4; l++) {
+        const char* w = gardel_level_names[l];
+        size_t i = 0;
+        while (v[i] && w[i] && (v[i] | 0x20) == w[i]) i++;
+        if (!v[i] && !w[i]) {
+            gardel_log_min = l;
+            return l;
+        }
+    }
+    fprintf(stderr, "error: GARDEL_LOG_LEVEL is `%s`; it must be debug, info, warn or severe\n", v);
+    exit(2);
+}
+/* One line on standard error, `info: text`, when `level` is at least the threshold. A byte below
+   0x20, 0x7F and `\` are escaped (`\x0a`, `\\`), so no text can end its line or forge another. */
+static void gardel_log_write(int level, const char* s, size_t n) {
+    if (level < 0 || level > 3 || level < gardel_log_threshold()) return;
+    static const char hex[] = "0123456789abcdef";
+    const char* name = gardel_level_names[level];
+    size_t k = strlen(name);
+    char* out = (char*)malloc(k + 3 + 4 * n);
+    if (!out) abort();
+    memcpy(out, name, k);
+    out[k++] = ':';
+    out[k++] = ' ';
+    for (size_t i = 0; i < n; i++) {
+        unsigned char c = (unsigned char)s[i];
+        if (c == '\\') {
+            out[k++] = '\\';
+            out[k++] = '\\';
+        } else if (c < 0x20 || c == 0x7f) {
+            out[k++] = '\\';
+            out[k++] = 'x';
+            out[k++] = hex[c >> 4];
+            out[k++] = hex[c & 15];
+        } else {
+            out[k++] = (char)c;
+        }
+    }
+    out[k++] = '\n';
+    fflush(stdout); /* what the program printed before this line comes before it */
+    fwrite(out, 1, k, stderr);
+    fflush(stderr);
+    free(out);
+}
+/* The value of the environment variable `name`, as bytes from malloc with a NUL after them, or
+   NULL when it is not set or `name` is empty or holds `=` or a NUL. Whether the bytes are UTF-8
+   is the caller's to check. Windows matches names in any case, POSIX exactly. */
+#ifdef _WIN32
+__declspec(dllimport) int __stdcall MultiByteToWideChar(unsigned int, unsigned long, const char*, int, wchar_t*, int);
+__declspec(dllimport) int __stdcall WideCharToMultiByte(unsigned int, unsigned long, const wchar_t*, int, char*, int, const char*, int*);
+__declspec(dllimport) unsigned long __stdcall GetEnvironmentVariableW(const wchar_t*, wchar_t*, unsigned long);
+static char* gardel_env_get(const char* name, size_t n, size_t* len) {
+    *len = 0;
+    if (n == 0 || n > 32767 || memchr(name, '=', n) || memchr(name, 0, n)) return NULL;
+    int wl = MultiByteToWideChar(65001, 8 /* MB_ERR_INVALID_CHARS */, name, (int)n, NULL, 0);
+    if (wl <= 0) return NULL;
+    wchar_t* w = (wchar_t*)malloc(sizeof(wchar_t) * ((size_t)wl + 1));
+    if (!w) abort();
+    MultiByteToWideChar(65001, 8, name, (int)n, w, wl);
+    w[wl] = 0;
+    /* The size with its NUL, or 0 when the variable is not set. */
+    unsigned long need = GetEnvironmentVariableW(w, NULL, 0);
+    wchar_t* v = NULL;
+    unsigned long got = 0;
+    while (need > 0) {
+        v = (wchar_t*)realloc(v, sizeof(wchar_t) * need);
+        if (!v) abort();
+        got = GetEnvironmentVariableW(w, v, need);
+        if (got < need) break;
+        need = got; /* it grew in between */
+    }
+    free(w);
+    if (need == 0) {
+        free(v);
+        return NULL;
+    }
+    /* UTF-16 that is not valid (a lone surrogate) has no UTF-8, so it is no value. */
+    int ul = got == 0 ? 0 : WideCharToMultiByte(65001, 0x80 /* WC_ERR_INVALID_CHARS */, v, (int)got, NULL, 0, NULL, NULL);
+    if (got > 0 && ul <= 0) {
+        free(v);
+        return NULL;
+    }
+    char* out = (char*)malloc((size_t)ul + 1);
+    if (!out) abort();
+    if (ul > 0) WideCharToMultiByte(65001, 0x80, v, (int)got, out, ul, NULL, NULL);
+    out[ul] = '\0';
+    free(v);
+    *len = (size_t)ul;
+    return out;
+}
+#else
+static char* gardel_env_get(const char* name, size_t n, size_t* len) {
+    *len = 0;
+    if (n == 0 || memchr(name, '=', n) || memchr(name, 0, n)) return NULL;
+    char* z = (char*)malloc(n + 1);
+    if (!z) abort();
+    memcpy(z, name, n);
+    z[n] = '\0';
+    const char* v = getenv(z);
+    free(z);
+    if (!v) return NULL;
+    size_t l = strlen(v);
+    char* out = (char*)malloc(l + 1);
+    if (!out) abort();
+    memcpy(out, v, l + 1);
+    *len = l;
+    return out;
+}
+#endif
+"#;
+
 /// What the host does for files and processes, apart from building the events' values.
 pub(crate) const HOST_FILES_RUNTIME: &str = r#"/* Files and processes (spec 11.6). */
 #define GARDEL_FILE_MAX (256u * 1024u * 1024u) /* the longest file ReadFile reads */
@@ -872,6 +1052,70 @@ static void gardel_host_write_file(uint64_t tag, GardelString path, GardelBytes 
     gardel_thread_run(gardel_write_main, j);
 }
 
+/* ReadClock and Random (Task H.1): answered at once, on the queue the helpers use, so the answer
+   comes as an event after the step that asked, as every other answer does. The monotonic clock
+   is the one timers use; the wall clock counts milliseconds since 1970 in UTC, as POSIX does,
+   with no leap seconds. Random takes the system's generator, and at most 1024 bytes a time. */
+static void gardel_host_read_clock(uint64_t tag) {
+    if (gardel_host_script) {
+        fprintf(stderr, "host: ReadClock %llu\n", (unsigned long long)tag);
+        return;
+    }
+    struct gardel_answer* a = gardel_answer_new(GARDEL_HOST_CLOCK);
+    a->ev.tag = tag;
+    a->ev.code = gardel_wall_ms();
+    a->ev.id = gardel_host_now_ms();
+    a->ev.ok = true;
+    gardel_loop_answered = true;
+    gardel_answer_post(a);
+}
+static void gardel_host_random(uint64_t tag, uint64_t count) {
+    if (gardel_host_script) {
+        fprintf(stderr, "host: Random %llu %llu\n", (unsigned long long)tag, (unsigned long long)count);
+        return;
+    }
+    struct gardel_answer* a = gardel_answer_new(GARDEL_HOST_RANDOM);
+    a->ev.tag = tag;
+    if (count > GARDEL_RANDOM_MAX) {
+        a->ev.err = GARDEL_RANDOM_ERR_INVALID;
+    } else {
+        a->ev.buf = (char*)malloc((size_t)count + 1);
+        if (!a->ev.buf) abort();
+        a->ev.buf_len = (size_t)count;
+        a->ev.err = gardel_os_random((unsigned char*)a->ev.buf, (size_t)count);
+        if (a->ev.err != 0) {
+            free(a->ev.buf);
+            a->ev.buf = NULL;
+            a->ev.buf_len = 0;
+        }
+    }
+    a->ev.ok = a->ev.err == 0;
+    gardel_loop_answered = true;
+    gardel_answer_post(a);
+}
+
+/* Log and ReadEnv (Task H.2). A Log line goes out at once, on standard error, in a script and a
+   replay too, as Print's text does. ReadEnv is answered as ReadClock is; the value is the
+   variable's bytes, and whether they are a STRING is decided when the event is built, by the same
+   rule on a replay. */
+static void gardel_host_log(int level, GardelString text) {
+    gardel_log_write(level, text.data, (size_t)text.len);
+}
+static void gardel_host_read_env(uint64_t tag, GardelString name) {
+    if (gardel_host_script) {
+        fprintf(stderr, "host: ReadEnv %llu %.*s\n", (unsigned long long)tag, (int)name.len, name.data);
+        return;
+    }
+    struct gardel_answer* a = gardel_answer_new(GARDEL_HOST_ENV);
+    a->ev.tag = tag;
+    size_t len = 0;
+    a->ev.buf = gardel_env_get(name.data, (size_t)name.len, &len);
+    a->ev.buf_len = len;
+    a->ev.ok = a->ev.buf != NULL;
+    gardel_loop_answered = true;
+    gardel_answer_post(a);
+}
+
 /* Processes. */
 static struct gardel_proc* gardel_proc_find(uint64_t id) {
     for (struct gardel_proc* p = gardel_procs; p; p = p->next) if (p->id == id) return p;
@@ -1166,6 +1410,8 @@ static void gardel_attach_end(void) {
 static void gardel_answer_taken(struct gardel_host_event* ev) {
     switch (ev->kind) {
     case GARDEL_HOST_FILE_READ:
+    case GARDEL_HOST_RANDOM:
+    case GARDEL_HOST_ENV:
     case GARDEL_HOST_PROC_OUT:
     case GARDEL_HOST_PROC_ERR:
     case GARDEL_HOST_PASTED:
@@ -1192,6 +1438,31 @@ static void gardel_answer_taken(struct gardel_host_event* ev) {
 /* Log lines of these events. */
 static bool gardel_log_host_event(struct gardel_host_event* ev) {
     switch (ev->kind) {
+    case GARDEL_HOST_CLOCK:
+        /* Clock:<tag>:<wall>:<monotonic>, the wall time with a `-` before 1970. */
+        gardel_log_word("Clock:");
+        gardel_log_number(ev->tag);
+        gardel_log_word(ev->code < 0 ? ":-" : ":");
+        gardel_log_number(ev->code < 0 ? (uint64_t)0 - (uint64_t)ev->code : (uint64_t)ev->code);
+        gardel_log_word(":");
+        gardel_log_number(ev->id);
+        return true;
+    case GARDEL_HOST_RANDOM:
+        gardel_log_word(ev->ok ? "RandomBytes:" : "RandomFailed:");
+        gardel_log_number(ev->tag);
+        gardel_log_word(":");
+        if (ev->ok) gardel_log_text((const char*)ev->data.data, ev->data.len);
+        else gardel_log_number((uint64_t)ev->err);
+        return true;
+    case GARDEL_HOST_ENV:
+        /* EnvRead:<tag>:<bytes>, or EnvMissing:<tag> when the variable is not set. */
+        gardel_log_word(ev->ok ? "EnvRead:" : "EnvMissing:");
+        gardel_log_number(ev->tag);
+        if (ev->ok) {
+            gardel_log_word(":");
+            gardel_log_text((const char*)ev->data.data, ev->data.len);
+        }
+        return true;
     case GARDEL_HOST_PASTED:
         gardel_log_word("Pasted:");
         gardel_log_text((const char*)ev->data.data, ev->data.len);
@@ -1259,7 +1530,38 @@ static bool gardel_script_host(const char* name, size_t n, struct gardel_host_ev
         {"ProcessOutput:", GARDEL_HOST_PROC_OUT, true}, {"ProcessErrorOutput:", GARDEL_HOST_PROC_ERR, true},
         {"ProcessExited:", GARDEL_HOST_PROC_EXITED, true},
         {"FileWritten:", GARDEL_HOST_FILE_WRITTEN, true}, {"WriteFailed:", GARDEL_HOST_FILE_WRITTEN, false},
+        {"RandomBytes:", GARDEL_HOST_RANDOM, true}, {"RandomFailed:", GARDEL_HOST_RANDOM, false},
+        {"EnvRead:", GARDEL_HOST_ENV, true},
     };
+    /* EnvMissing:<tag> */
+    if (n >= 11 && memcmp(name, "EnvMissing:", 11) == 0) {
+        size_t i = 11;
+        uint64_t tag;
+        if (!gardel_script_number(name, n, &i, &tag) || i != n) return false;
+        ev->kind = GARDEL_HOST_ENV;
+        ev->tag = tag;
+        ev->ok = false;
+        return true;
+    }
+    /* Clock:<tag>:<wall>:<monotonic>, where the wall time may start with `-`. */
+    if (n >= 6 && memcmp(name, "Clock:", 6) == 0) {
+        size_t i = 6;
+        uint64_t tag, wall, mono;
+        if (!gardel_script_number(name, n, &i, &tag) || i == n || name[i] != ':') return false;
+        i++;
+        bool before = i < n && name[i] == '-';
+        if (before) i++;
+        if (!gardel_script_number(name, n, &i, &wall) || i == n || name[i] != ':') return false;
+        if (wall > (uint64_t)INT64_MAX + (before ? 1u : 0u)) return false;
+        i++;
+        if (!gardel_script_number(name, n, &i, &mono) || i != n) return false;
+        ev->kind = GARDEL_HOST_CLOCK;
+        ev->tag = tag;
+        ev->code = before ? (int64_t)((uint64_t)0 - wall) : (int64_t)wall;
+        ev->id = mono;
+        ev->ok = true;
+        return true;
+    }
     /* Pasted:<text>, cleaned as a terminal's paste is. */
     if (n >= 7 && memcmp(name, "Pasted:", 7) == 0) {
         size_t len;
@@ -1282,7 +1584,8 @@ static bool gardel_script_host(const char* name, size_t n, struct gardel_host_ev
         if (!gardel_script_number(name, n, &i, &first) || i == n || name[i] != ':') return false;
         i++;
         bool text = kinds[k].ok && (kind == GARDEL_HOST_FILE_READ || kind == GARDEL_HOST_DIR_LISTED
-                                    || kind == GARDEL_HOST_PROC_OUT || kind == GARDEL_HOST_PROC_ERR);
+                                    || kind == GARDEL_HOST_PROC_OUT || kind == GARDEL_HOST_PROC_ERR
+                                    || kind == GARDEL_HOST_RANDOM || kind == GARDEL_HOST_ENV);
         if (text) {
             size_t len;
             char* t = gardel_script_text(name, n, i, &len);
@@ -1329,8 +1632,8 @@ static bool gardel_script_host(const char* name, size_t n, struct gardel_host_ev
 /// `RunAttached`. `names` gives the C names of `RESULT[IO_ERROR, BYTES]`,
 /// `RESULT[IO_ERROR, LIST[DIR_ENTRY]]`, `RESULT[IO_ERROR, I64]`, `LIST[DIR_ENTRY]`,
 /// `LIST[STRING]` and `RESULT[IO_ERROR, NAT]` (whose C name is that of `U64`).
-pub(crate) fn typed_runtime(names: &[String; 6]) -> String {
-    let [bytes_result, dir_result, code_result, dir_list, strings, count_result] = names;
+pub(crate) fn typed_runtime(names: &[String; 7]) -> String {
+    let [bytes_result, dir_result, code_result, dir_list, strings, count_result, opt_string] = names;
     format!(
         r#"/* The values of file and process events, built by the loop. */
 static struct {count_result}* gardel_written_value(struct gardel_host_event ev) {{
@@ -1350,6 +1653,20 @@ static GardelString gardel_paste_value(struct gardel_host_event ev) {{
     }}
     GardelString s = {{ (const char*)ev.data.data, n, chars, ev.data.owner }};
     return s;
+}}
+/* An environment variable's value (Task H.2), which takes over the bytes: `None` when it is not
+   set or is not UTF-8. */
+static struct {opt_string}* gardel_env_value(struct gardel_host_event ev) {{
+    if (!ev.ok) return make_{opt_string}_None();
+    uint64_t chars = 0;
+    struct STRING_ERROR* bad = gardel_utf8_validate(ev.data.data, ev.data.len, &chars);
+    if (bad) {{
+        drop_STRING_ERROR(bad);
+        gardel_bytes_drop(ev.data);
+        return make_{opt_string}_None();
+    }}
+    GardelString s = {{ (const char*)ev.data.data, ev.data.len, chars, ev.data.owner }};
+    return make_{opt_string}_Some(s);
 }}
 static struct {bytes_result}* gardel_file_value(struct gardel_host_event ev) {{
     if (!ev.ok) return make_{bytes_result}_Error(make_IO_ERROR_OsError(ev.err));

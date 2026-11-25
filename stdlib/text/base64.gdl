@@ -1,0 +1,1049 @@
+-- Base64 (RFC 4648, Task H.6): the standard alphabet (§4) and the URL-safe one (§5), with
+-- or without padding. Decoding is total: it refuses a symbol outside the alphabet, padding
+-- where there should be none, and unused bits that are not zero, so a text that decodes
+-- is the encoding of exactly one byte string. Both run as loops over the bytes, so a long
+-- input needs no stack; `symbols` and `read_groups` are what they compute.
+module BASE64
+
+create {ANY}
+
+  -- The standard alphabet, padded: what MIME and most protocols use.
+  encode(b: BYTES): STRING
+    require
+      fits: b.length <= 4611686018427387903
+    do
+      BASE64.encode_with(b, False, True)
+    ensure
+      bytes: Result.byte_model = BASE64.symbols(b.model, False, True)
+    end
+
+  decode(s: STRING): RESULT[CODEC_ERROR, BYTES]
+    do
+      BASE64.decode_with(s, False, True)
+    ensure
+      def: Result.is_ok = BASE64.read_groups(s.byte_model, False, True, 0).is_ok
+      model: Result.is_ok implies Result.get.model = BASE64.read_groups(s.byte_model, False, True, 0).get
+    end
+
+  -- `url` picks the URL-safe alphabet (`-` and `_` for `+` and `/`); `pad` ends the text
+  -- with `=` to a multiple of four symbols.
+  encode_with(b: BYTES, url: BOOL, pad: BOOL): STRING
+    require
+      fits: b.length <= 4611686018427387903
+    do
+      let out = BASE64.encode_from(b, 0, url, pad, BYTES_BUILDER.empty).to_bytes
+      check
+        text: NUMBER_TEXT.ascii_text(out.model)
+      end
+      match STRING.from_utf8(out)
+        case Ok(s) then s
+        case Error(_) then ""
+      end
+    ensure
+      bytes: Result.byte_model = BASE64.symbols(b.model, url, pad)
+    end
+
+  decode_with(s: STRING, url: BOOL, pad: BOOL): RESULT[CODEC_ERROR, BYTES]
+    do
+      BASE64.decode_from(s.to_utf8, 0, url, pad, BYTES_BUILDER.empty)
+    ensure
+      def: Result.is_ok = BASE64.read_groups(s.byte_model, url, pad, 0).is_ok
+      model: Result.is_ok implies Result.get.model = BASE64.read_groups(s.byte_model, url, pad, 0).get
+    end
+
+  -- The models. They are public because the contracts above mention them.
+
+  -- The symbol for the six bits `v`.
+  symbol(v: NAT, url: BOOL): U64
+    require
+      six_bits: v < 64
+    do
+      if v < 26 then
+        65 + v
+      else
+        if v < 52 then
+          71 + v
+        else
+          if v < 62 then
+            v - 4
+          else
+            if v = 62 then (if url then 45 else 43 end) else (if url then 95 else 47 end) end
+          end
+        end
+      end
+    ensure
+      ascii: Result < 128
+      not_pad: Result != 61
+      reads_back: BASE64.value(Result, url) = v
+    end
+
+  -- The six bits a symbol stands for, or 64 for a byte that is not one.
+  value(x: U64, url: BOOL): NAT
+    do
+      if x >= 65 and x <= 90 then
+        x - 65
+      else
+        if x >= 97 and x <= 122 then
+          x - 71
+        else
+          if x >= 48 and x <= 57 then
+            x + 4
+          else
+            if x = (if url then 45 else 43 end) then 62 else (if x = (if url then 95 else 47 end) then 63 else 64 end) end
+          end
+        end
+      end
+    ensure
+      bounded: Result <= 64
+    end
+
+  -- Four symbols for each three bytes; a last one or two bytes take two or three, then `=`
+  -- to four when `pad`.
+  -- The four symbols of three bytes.
+  group(a: U64, b: U64, c: U64, url: BOOL): LIST[U64]
+    require
+      octets: a < 256 and b < 256 and c < 256
+    do
+      let none: LIST[U64] = LIST.empty
+      none.prepend(BASE64.symbol(c % 64, url)).prepend(BASE64.symbol(b % 16 * 4 + c / 64, url))
+        .prepend(BASE64.symbol(a % 4 * 16 + b / 16, url)).prepend(BASE64.symbol(a / 4, url))
+    ensure
+      four: Result.length = 4
+      ascii: NUMBER_TEXT.ascii(Result)
+    end
+
+  -- The symbols of one last byte, then `=` to four when `pad`.
+  last_one_symbols(a: U64, url: BOOL, pad: BOOL): LIST[U64]
+    require
+      octet: a < 256
+    do
+      let none: LIST[U64] = LIST.empty
+      let tail = if pad then none.prepend(61).prepend(61) else none end
+      tail.prepend(BASE64.symbol(a % 4 * 16, url)).prepend(BASE64.symbol(a / 4, url))
+    ensure
+      len: Result.length = (if pad then 4 else 2 end)
+      ascii: NUMBER_TEXT.ascii(Result)
+    end
+
+  -- The symbols of two last bytes, then `=` to four when `pad`.
+  last_two_symbols(a: U64, b: U64, url: BOOL, pad: BOOL): LIST[U64]
+    require
+      octets: a < 256 and b < 256
+    do
+      let none: LIST[U64] = LIST.empty
+      let tail = if pad then none.prepend(61) else none end
+      tail.prepend(BASE64.symbol(b % 16 * 4, url)).prepend(BASE64.symbol(a % 4 * 16 + b / 16, url))
+        .prepend(BASE64.symbol(a / 4, url))
+    ensure
+      len: Result.length = (if pad then 4 else 3 end)
+      ascii: NUMBER_TEXT.ascii(Result)
+    end
+
+  symbols(xs: LIST[U64], url: BOOL, pad: BOOL): LIST[U64]
+    variant
+      xs.length
+    do
+      if xs.length = 0 then
+        LIST.empty
+      else
+        if xs.length = 1 then
+          BASE64.last_one_symbols(xs.head % 256, url, pad)
+        else
+          if xs.length = 2 then
+            BASE64.last_two_symbols(xs.head % 256, xs.tail.head % 256, url, pad)
+          else
+            check
+              lengths: BASE64.group_lengths(xs.length)
+            end
+            BASE64.group(xs.head % 256, xs.tail.head % 256, xs.tail.tail.head % 256, url)
+              .append(BASE64.symbols(xs.tail.tail.tail, url, pad))
+          end
+        end
+      end
+    ensure
+      ascii: NUMBER_TEXT.ascii(Result)
+      padded: pad implies Result.length = (xs.length + 2) / 3 * 4
+      unpadded: not pad implies Result.length = (xs.length * 4 + 2) / 3
+    end
+
+  -- Groups of four symbols as bytes, the last one perhaps shorter (`pad` off) or ending in
+  -- `=` (`pad` on). `offset` is where `ys` starts, for the error.
+  read_groups(ys: LIST[U64], url: BOOL, pad: BOOL, offset: NAT): RESULT[CODEC_ERROR, LIST[U64]]
+    require
+      fits: offset + ys.length <= 18446744073709551615
+    variant
+      ys.length
+    do
+      let none: LIST[U64] = LIST.empty
+      if ys.length = 0 then
+        Ok(none)
+      else
+        if ys.length = 1 or (pad and ys.length < 4) then
+          Error(BadLength)
+        else
+          let v0 = BASE64.value(ys.head, url)
+          let v1 = BASE64.value(ys.tail.head, url)
+          if v0 = 64 then
+            Error(BadSymbol(offset))
+          else
+            if v1 = 64 then
+              Error(BadSymbol(offset + 1))
+            else
+              let a = v0 * 4 + v1 / 16
+              if ys.length = 2 or (pad and ys.length = 4 and ys.tail.tail.head = 61 and ys.tail.tail.tail.head = 61) then
+                -- One byte: the last symbol's low four bits are unused.
+                if v1 % 16 != 0 then
+                  Error(BadSymbol(offset + 1))
+                else
+                  Ok(none.prepend(a))
+                end
+              else
+                let v2 = BASE64.value(ys.tail.tail.head, url)
+                if v2 = 64 then
+                  Error(BadSymbol(offset + 2))
+                else
+                  let b = v1 % 16 * 16 + v2 / 4
+                  if ys.length = 3 or (pad and ys.length = 4 and ys.tail.tail.tail.head = 61) then
+                    -- Two bytes: the last symbol's low two bits are unused.
+                    if v2 % 4 != 0 then
+                      Error(BadSymbol(offset + 2))
+                    else
+                      Ok(none.prepend(b).prepend(a))
+                    end
+                  else
+                    let v3 = BASE64.value(ys.tail.tail.tail.head, url)
+                    if v3 = 64 then
+                      Error(BadSymbol(offset + 3))
+                    else
+                      match BASE64.read_groups(ys.tail.tail.tail.tail, url, pad, offset + 4)
+                        case Ok(rest) then Ok(rest.prepend(v2 % 4 * 64 + v3).prepend(b).prepend(a))
+                        case Error(e) then Error(e)
+                      end
+                    end
+                  end
+                end
+              end
+            end
+          end
+        end
+      end
+    ensure
+      octets: Result.is_ok implies BYTES.all_octets(Result.get)
+      shorter: Result.is_ok implies Result.get.length <= ys.length
+    end
+
+  -- Lemma: a group of three bytes takes four symbols, padded or not. Apart from `symbols`,
+  -- whose proof was seed-fragile with the division in it.
+  group_lengths(n: NAT): BOOL
+    require
+      three: n >= 3
+    do
+      True
+    ensure
+      holds: Result
+      padded_step: (n - 3 + 2) / 3 * 4 + 4 = (n + 2) / 3 * 4
+      unpadded_step: ((n - 3) * 4 + 2) / 3 + 4 = (n * 4 + 2) / 3
+    end
+
+  -- Lemma: three bytes split into four six-bit values and back.
+  group_sum(a: U64, b: U64, c: U64): BOOL
+    require
+      octets: a < 256 and b < 256 and c < 256
+    do
+      True
+    ensure
+      holds: Result
+      first: a / 4 * 4 + (a % 4 * 16 + b / 16) / 16 = a
+      second: (a % 4 * 16 + b / 16) % 16 * 16 + (b % 16 * 4 + c / 64) / 4 = b
+      third: (b % 16 * 4 + c / 64) % 4 * 64 + c % 64 = c
+      six: a % 4 * 16 + b / 16 < 64 and b % 16 * 4 + c / 64 < 64
+    end
+
+  -- Lemma: the symbols of one last byte read back as it.
+  one_read(xs: LIST[U64], url: BOOL, pad: BOOL, offset: NAT): BOOL
+    require
+      octets: BYTES.all_octets(xs)
+      one: xs.length = 1
+      fits: offset <= 18446744073709551611
+    do
+      check
+        whole: LIST.singleton(xs.head) = xs
+        sum: xs.head / 4 * 4 + xs.head % 4 * 16 / 16 = xs.head
+        low: xs.head % 4 * 16 % 16 = 0
+        same: xs.head % 256 = xs.head
+      end
+      True
+    ensure
+      holds: Result
+      read: BASE64.read_groups(BASE64.symbols(xs, url, pad), url, pad, offset) = Ok(xs)
+    end
+
+  -- Lemma: the symbols of two last bytes read back as them.
+  two_read(xs: LIST[U64], url: BOOL, pad: BOOL, offset: NAT): BOOL
+    require
+      octets: BYTES.all_octets(xs)
+      two: xs.length = 2
+      fits: offset <= 18446744073709551611
+    do
+      check
+        whole: LIST.singleton(xs.tail.head).prepend(xs.head) = xs
+        sums: BASE64.group_sum(xs.head, xs.tail.head, 0)
+        low: xs.tail.head % 16 * 4 % 4 = 0
+        same: xs.head % 256 = xs.head and xs.tail.head % 256 = xs.tail.head
+      end
+      True
+    ensure
+      holds: Result
+      read: BASE64.read_groups(BASE64.symbols(xs, url, pad), url, pad, offset) = Ok(xs)
+    end
+
+  -- Lemma: a full group of three bytes, before symbols that read back as the rest.
+  three_read(xs: LIST[U64], url: BOOL, pad: BOOL, offset: NAT): BOOL
+    require
+      octets: BYTES.all_octets(xs)
+      three: xs.length >= 3
+      fits: offset + 2 * xs.length + 4 <= 18446744073709551615
+      rest: BASE64.read_groups(BASE64.symbols(xs.tail.tail.tail, url, pad), url, pad, offset + 4) =
+        Ok(xs.tail.tail.tail)
+    do
+      check
+        heads: BASE64.three_heads(xs)
+        step: BASE64.symbols_cons(xs, url, pad)
+        front: BASE64.group_front(xs.head, xs.tail.head, xs.tail.tail.head,
+          BASE64.symbols(xs.tail.tail.tail, url, pad), url)
+      end
+      BASE64.three_tail(xs, url, pad, offset)
+    ensure
+      holds: Result
+      read: BASE64.read_groups(BASE64.symbols(xs, url, pad), url, pad, offset) = Ok(xs)
+    end
+
+  -- Lemma: the first three items of a list of octets are octets.
+  three_heads(xs: LIST[U64]): BOOL
+    require
+      octets: BYTES.all_octets(xs)
+      three: xs.length >= 3
+    do
+      check
+        one: xs.tail.prepend(xs.head) = xs
+        two: xs.tail.tail.prepend(xs.tail.head) = xs.tail
+        three: xs.tail.tail.tail.prepend(xs.tail.tail.head) = xs.tail.tail
+        first: BYTES.octets_prepend(xs.head, xs.tail)
+        second: BYTES.octets_prepend(xs.tail.head, xs.tail.tail)
+        third: BYTES.octets_prepend(xs.tail.tail.head, xs.tail.tail.tail)
+      end
+      True
+    ensure
+      holds: Result
+      heads: xs.head < 256 and xs.tail.head < 256 and xs.tail.tail.head < 256
+      same: xs.head % 256 = xs.head and xs.tail.head % 256 = xs.tail.head and
+        xs.tail.tail.head % 256 = xs.tail.tail.head
+    end
+
+  -- Lemma: a group, then `rest`.
+  group_front(a: U64, b: U64, c: U64, rest: LIST[U64], url: BOOL): BOOL
+    require
+      octets: a < 256 and b < 256 and c < 256
+    do
+      True
+    ensure
+      holds: Result
+      front: BASE64.group(a, b, c, url).append(rest) =
+        rest.prepend(BASE64.symbol(c % 64, url)).prepend(BASE64.symbol(b % 16 * 4 + c / 64, url))
+          .prepend(BASE64.symbol(a % 4 * 16 + b / 16, url)).prepend(BASE64.symbol(a / 4, url))
+    end
+
+  -- Lemma: the second half of `three_read`, in a proof of its own: given the shape of the
+  -- symbols, the group reads back as its three bytes.
+  three_tail(xs: LIST[U64], url: BOOL, pad: BOOL, offset: NAT): BOOL
+    require
+      three: xs.length >= 3
+      heads: xs.head < 256 and xs.tail.head < 256 and xs.tail.tail.head < 256
+      fits: offset + 2 * xs.length + 4 <= 18446744073709551615
+      rest: BASE64.read_groups(BASE64.symbols(xs.tail.tail.tail, url, pad), url, pad, offset + 4) =
+        Ok(xs.tail.tail.tail)
+      shape: BASE64.symbols(xs, url, pad) = BASE64.symbols(xs.tail.tail.tail, url, pad)
+        .prepend(BASE64.symbol(xs.tail.tail.head % 64, url))
+        .prepend(BASE64.symbol(xs.tail.head % 16 * 4 + xs.tail.tail.head / 64, url))
+        .prepend(BASE64.symbol(xs.head % 4 * 16 + xs.tail.head / 16, url)).prepend(BASE64.symbol(xs.head / 4, url))
+    do
+      let a = xs.head
+      let b = xs.tail.head
+      let c = xs.tail.tail.head
+      let ys = BASE64.symbols(xs, url, pad)
+      check
+        sums: BASE64.group_sum(a, b, c)
+        read: BASE64.groups_cons(ys, url, pad, offset)
+        rest_at: ys.tail.tail.tail.tail = BASE64.symbols(xs.tail.tail.tail, url, pad)
+        values: BASE64.value(ys.head, url) = a / 4 and BASE64.value(ys.tail.head, url) = a % 4 * 16 + b / 16 and
+          BASE64.value(ys.tail.tail.head, url) = b % 16 * 4 + c / 64 and BASE64.value(ys.tail.tail.tail.head, url) = c % 64
+        ok: BASE64.read_groups(ys, url, pad, offset).is_ok
+        later: BASE64.read_groups(ys.tail.tail.tail.tail, url, pad, offset + 4).get = xs.tail.tail.tail
+        first_byte: BASE64.value(ys.head, url) * 4 + BASE64.value(ys.tail.head, url) / 16 = a
+        second_byte: BASE64.value(ys.tail.head, url) % 16 * 16 + BASE64.value(ys.tail.tail.head, url) / 4 = b
+        third_byte: BASE64.value(ys.tail.tail.head, url) % 4 * 64 + BASE64.value(ys.tail.tail.tail.head, url) = c
+        got: BASE64.three_got(xs, ys, url, pad, offset)
+      end
+      True
+    ensure
+      holds: Result
+      read: BASE64.read_groups(BASE64.symbols(xs, url, pad), url, pad, offset) = Ok(xs)
+    end
+
+  -- Lemma: the last step of `three_read`, in a proof of its own: a group read back as its
+  -- three bytes, before the rest read back.
+  three_got(xs: LIST[U64], ys: LIST[U64], url: BOOL, pad: BOOL, offset: NAT): BOOL
+    require
+      three: xs.length >= 3
+      four: ys.length >= 4
+      fits: offset + ys.length <= 18446744073709551615
+      ok: BASE64.read_groups(ys, url, pad, offset).is_ok
+      model: BASE64.read_groups(ys, url, pad, offset).get = BASE64.read_groups(ys.tail.tail.tail.tail, url, pad, offset + 4).get.prepend(BASE64.value(ys.tail.tail.head, url) % 4 * 64 + BASE64.value(ys.tail.tail.tail.head, url)).prepend(BASE64.value(ys.tail.head, url) % 16 * 16 + BASE64.value(ys.tail.tail.head, url) / 4)
+        .prepend(BASE64.value(ys.head, url) * 4 + BASE64.value(ys.tail.head, url) / 16)
+      later: BASE64.read_groups(ys.tail.tail.tail.tail, url, pad, offset + 4).get = xs.tail.tail.tail
+      first_byte: BASE64.value(ys.head, url) * 4 + BASE64.value(ys.tail.head, url) / 16 = xs.head
+      second_byte: BASE64.value(ys.tail.head, url) % 16 * 16 + BASE64.value(ys.tail.tail.head, url) / 4 = xs.tail.head
+      third_byte: BASE64.value(ys.tail.tail.head, url) % 4 * 64 + BASE64.value(ys.tail.tail.tail.head, url) = xs.tail.tail.head
+    do
+      xs.tail.tail.tail.prepend(xs.tail.tail.head).prepend(xs.tail.head).prepend(xs.head) = xs
+    ensure
+      holds: Result
+      got: BASE64.read_groups(ys, url, pad, offset).get = xs
+    end
+
+  -- Lemma: the symbols of `xs` read back as `xs`.
+  groups_read(xs: LIST[U64], url: BOOL, pad: BOOL, offset: NAT): BOOL
+    require
+      octets: BYTES.all_octets(xs)
+      fits: offset + 2 * xs.length + 4 <= 18446744073709551615
+    variant
+      xs.length
+    do
+      if xs.length = 0 then
+        True
+      else
+        if xs.length = 1 then
+          BASE64.one_read(xs, url, pad, offset)
+        else
+          if xs.length = 2 then
+            BASE64.two_read(xs, url, pad, offset)
+          else
+            BASE64.groups_read(xs.tail.tail.tail, url, pad, offset + 4) and
+            BASE64.three_read(xs, url, pad, offset)
+          end
+        end
+      end
+    ensure
+      holds: Result
+      read: BASE64.read_groups(BASE64.symbols(xs, url, pad), url, pad, offset) = Ok(xs)
+    end
+
+create {NONE}
+
+  -- `out` with the bytes of `xs` after it, at most four.
+  add_all(out: BYTES_BUILDER, xs: LIST[U64]): BYTES_BUILDER
+    require
+      ascii: NUMBER_TEXT.ascii(xs)
+      fits: out.length + xs.length <= 18446744073709551615
+    variant
+      xs.length
+    do
+      if xs.length = 0 then
+        out
+      else
+        check
+          whole: xs.tail.prepend(xs.head) = xs
+        end
+        BASE64.add_all(out.add_byte(xs.head), xs.tail)
+      end
+    ensure
+      model: Result.model = out.model.append(xs)
+      len: Result.length = out.length + xs.length
+    end
+
+  -- The symbols of the bytes of `b` from index `i` on, after `out`.
+  encode_from(b: BYTES, i: NAT, url: BOOL, pad: BOOL, out: BYTES_BUILDER): BYTES_BUILDER
+    require
+      inside: i <= b.length
+      fits: out.length + 2 * (b.length - i) + 4 <= 18446744073709551615
+    variant
+      b.length - i
+    do
+      let n = b.length - i
+      if n = 0 then
+        out
+      else
+        if n = 1 then
+          check
+            one: BASE64.symbols_one(b, i, url, pad)
+          end
+          BASE64.add_all(out, BASE64.last_one_symbols(b.at(i), url, pad))
+        else
+          if n = 2 then
+            check
+              two: BASE64.symbols_two(b, i, url, pad)
+            end
+            BASE64.add_all(out, BASE64.last_two_symbols(b.at(i), b.at(i + 1), url, pad))
+          else
+            check
+              more: BASE64.symbols_more(b, i, url, pad)
+            end
+            BASE64.encode_from(b, i + 3, url, pad, BASE64.add_all(out, BASE64.group(b.at(i), b.at(i + 1), b.at(i + 2), url)))
+          end
+        end
+      end
+    ensure
+      model: Result.model = out.model.append(BASE64.symbols(LIST_OPS.drop(b.model, i), url, pad))
+    end
+
+  -- Lemmas: the symbols of what follows index `i` of `b`, by how many bytes are left. Each
+  -- unfolds `symbols` once, in a proof of its own.
+  symbols_one(b: BYTES, i: NAT, url: BOOL, pad: BOOL): BOOL
+    require
+      one: i + 1 = b.length
+    do
+      check
+        step: LIST_OPS.drop_step(b.model, i)
+        same: b.at(i) % 256 = b.at(i)
+      end
+      True
+    ensure
+      holds: Result
+      same: BASE64.symbols(LIST_OPS.drop(b.model, i), url, pad) = BASE64.last_one_symbols(b.at(i), url, pad)
+    end
+
+  symbols_two(b: BYTES, i: NAT, url: BOOL, pad: BOOL): BOOL
+    require
+      two: i + 2 = b.length
+    do
+      check
+        first: LIST_OPS.drop_step(b.model, i)
+        second: LIST_OPS.drop_step(b.model, i + 1)
+        same: b.at(i) % 256 = b.at(i) and b.at(i + 1) % 256 = b.at(i + 1)
+      end
+      True
+    ensure
+      holds: Result
+      same: BASE64.symbols(LIST_OPS.drop(b.model, i), url, pad) =
+        BASE64.last_two_symbols(b.at(i), b.at(i + 1), url, pad)
+    end
+
+  -- Lemma: what follows index `i`, three or four items at a time.
+  drop_three(xs: LIST[U64], i: NAT): BOOL
+    require
+      inside: i + 3 <= xs.length
+      small: xs.length <= 18446744073709551615
+    do
+      check
+        first: LIST_OPS.drop_step(xs, i)
+        second: LIST_OPS.drop_step(xs, i + 1)
+        third: LIST_OPS.drop_step(xs, i + 2)
+      end
+      True
+    ensure
+      holds: Result
+      three: LIST_OPS.drop(xs, i) = LIST_OPS.drop(xs, i + 3).prepend(LIST_OPS.at(xs, i + 2))
+        .prepend(LIST_OPS.at(xs, i + 1)).prepend(LIST_OPS.at(xs, i))
+    end
+
+  drop_four(xs: LIST[U64], i: NAT): BOOL
+    require
+      inside: i + 4 <= xs.length
+      small: xs.length <= 18446744073709551615
+    do
+      check
+        three: BASE64.drop_three(xs, i)
+        fourth: LIST_OPS.drop_step(xs, i + 3)
+      end
+      True
+    ensure
+      holds: Result
+      four: LIST_OPS.drop(xs, i) = LIST_OPS.drop(xs, i + 4).prepend(LIST_OPS.at(xs, i + 3))
+        .prepend(LIST_OPS.at(xs, i + 2)).prepend(LIST_OPS.at(xs, i + 1)).prepend(LIST_OPS.at(xs, i))
+    end
+
+  -- Lemma: one step of `symbols` on a list of three or more.
+  symbols_cons(xs: LIST[U64], url: BOOL, pad: BOOL): BOOL
+    require
+      three: xs.length >= 3
+    do
+      True
+    ensure
+      holds: Result
+      step: BASE64.symbols(xs, url, pad) = BASE64.group(xs.head % 256, xs.tail.head % 256, xs.tail.tail.head % 256, url)
+        .append(BASE64.symbols(xs.tail.tail.tail, url, pad))
+    end
+
+  -- Lemma: `symbols_cons`, on a list given as three octets before `rest`.
+  symbols_three(a: U64, b: U64, c: U64, rest: LIST[U64], url: BOOL, pad: BOOL): BOOL
+    require
+      octets: a < 256 and b < 256 and c < 256
+    do
+      let xs = rest.prepend(c).prepend(b).prepend(a)
+      check
+        parts: xs.head = a and xs.tail.head = b and xs.tail.tail.head = c and xs.tail.tail.tail = rest
+        three: xs.length >= 3
+        step: BASE64.symbols_cons(xs, url, pad)
+        same: a % 256 = a and b % 256 = b and c % 256 = c
+      end
+      True
+    ensure
+      holds: Result
+      step: BASE64.symbols(rest.prepend(c).prepend(b).prepend(a), url, pad) =
+        BASE64.group(a, b, c, url).append(BASE64.symbols(rest, url, pad))
+    end
+
+  symbols_more(b: BYTES, i: NAT, url: BOOL, pad: BOOL): BOOL
+    require
+      more: i + 3 <= b.length
+    do
+      check
+        three: BASE64.drop_three(b.model, i)
+        at: b.at(i) = LIST_OPS.at(b.model, i) and b.at(i + 1) = LIST_OPS.at(b.model, i + 1) and
+          b.at(i + 2) = LIST_OPS.at(b.model, i + 2)
+        step: BASE64.symbols_three(b.at(i), b.at(i + 1), b.at(i + 2), LIST_OPS.drop(b.model, i + 3), url, pad)
+      end
+      True
+    ensure
+      holds: Result
+      same: BASE64.symbols(LIST_OPS.drop(b.model, i), url, pad) =
+        BASE64.group(b.at(i), b.at(i + 1), b.at(i + 2), url).append(BASE64.symbols(LIST_OPS.drop(b.model, i + 3), url, pad))
+    end
+
+  -- Lemmas: `read_groups` of what follows index `i` of `bs`, for each way a group ends well.
+  -- Each unfolds `read_groups` once, in a proof of its own; `decode_from` only applies them.
+  groups_one_short(bs: BYTES, i: NAT, url: BOOL, pad: BOOL): BOOL
+    require
+      two_left: i + 2 = bs.length
+      unpadded: not pad
+      symbols: BASE64.value(bs.at(i), url) < 64 and BASE64.value(bs.at(i + 1), url) < 64
+      low: BASE64.value(bs.at(i + 1), url) % 16 = 0
+    do
+      check
+        first: LIST_OPS.drop_step(bs.model, i)
+        second: LIST_OPS.drop_step(bs.model, i + 1)
+      end
+      True
+    ensure
+      holds: Result
+      read: BASE64.read_groups(LIST_OPS.drop(bs.model, i), url, pad, i) = Ok(LIST.singleton(BASE64.value(bs.at(i), url) * 4 + BASE64.value(bs.at(i + 1), url) / 16))
+    end
+
+  groups_one_padded(bs: BYTES, i: NAT, url: BOOL, pad: BOOL): BOOL
+    require
+      four_left: i + 4 = bs.length
+      padded: pad and bs.at(i + 2) = 61 and bs.at(i + 3) = 61
+      symbols: BASE64.value(bs.at(i), url) < 64 and BASE64.value(bs.at(i + 1), url) < 64
+      low: BASE64.value(bs.at(i + 1), url) % 16 = 0
+    do
+      check
+        first: LIST_OPS.drop_step(bs.model, i)
+        second: LIST_OPS.drop_step(bs.model, i + 1)
+        third: LIST_OPS.drop_step(bs.model, i + 2)
+        fourth: LIST_OPS.drop_step(bs.model, i + 3)
+      end
+      True
+    ensure
+      holds: Result
+      read: BASE64.read_groups(LIST_OPS.drop(bs.model, i), url, pad, i) = Ok(LIST.singleton(BASE64.value(bs.at(i), url) * 4 + BASE64.value(bs.at(i + 1), url) / 16))
+    end
+
+  groups_two_short(bs: BYTES, i: NAT, url: BOOL, pad: BOOL): BOOL
+    require
+      three_left: i + 3 = bs.length
+      unpadded: not pad
+      symbols: BASE64.value(bs.at(i), url) < 64 and BASE64.value(bs.at(i + 1), url) < 64 and BASE64.value(bs.at(i + 2), url) < 64
+      low: BASE64.value(bs.at(i + 2), url) % 4 = 0
+    do
+      check
+        first: LIST_OPS.drop_step(bs.model, i)
+        second: LIST_OPS.drop_step(bs.model, i + 1)
+        third: LIST_OPS.drop_step(bs.model, i + 2)
+      end
+      True
+    ensure
+      holds: Result
+      read: BASE64.read_groups(LIST_OPS.drop(bs.model, i), url, pad, i) = Ok(LIST.singleton(BASE64.value(bs.at(i + 1), url) % 16 * 16 + BASE64.value(bs.at(i + 2), url) / 4).prepend(BASE64.value(bs.at(i), url) * 4 + BASE64.value(bs.at(i + 1), url) / 16))
+    end
+
+  groups_two_padded(bs: BYTES, i: NAT, url: BOOL, pad: BOOL): BOOL
+    require
+      four_left: i + 4 = bs.length
+      padded: pad and bs.at(i + 3) = 61
+      symbols: BASE64.value(bs.at(i), url) < 64 and BASE64.value(bs.at(i + 1), url) < 64 and BASE64.value(bs.at(i + 2), url) < 64
+      low: BASE64.value(bs.at(i + 2), url) % 4 = 0
+    do
+      check
+        first: LIST_OPS.drop_step(bs.model, i)
+        second: LIST_OPS.drop_step(bs.model, i + 1)
+        third: LIST_OPS.drop_step(bs.model, i + 2)
+        fourth: LIST_OPS.drop_step(bs.model, i + 3)
+        not_pad: bs.at(i + 2) != 61
+      end
+      True
+    ensure
+      holds: Result
+      read: BASE64.read_groups(LIST_OPS.drop(bs.model, i), url, pad, i) = Ok(LIST.singleton(BASE64.value(bs.at(i + 1), url) % 16 * 16 + BASE64.value(bs.at(i + 2), url) / 4).prepend(BASE64.value(bs.at(i), url) * 4 + BASE64.value(bs.at(i + 1), url) / 16))
+    end
+
+  -- Lemma: one full group of `read_groups` on a list, then the groups after it.
+  groups_cons(ys: LIST[U64], url: BOOL, pad: BOOL, offset: NAT): BOOL
+    require
+      four: ys.length >= 4
+      fits: offset + ys.length <= 18446744073709551615
+      not_last: not (pad and ys.length = 4 and (ys.tail.tail.head = 61 or ys.tail.tail.tail.head = 61))
+      symbols: BASE64.value(ys.head, url) < 64 and BASE64.value(ys.tail.head, url) < 64 and BASE64.value(ys.tail.tail.head, url) < 64 and BASE64.value(ys.tail.tail.tail.head, url) < 64
+    do
+      True
+    ensure
+      holds: Result
+      same: BASE64.read_groups(ys, url, pad, offset).is_ok =
+        BASE64.read_groups(ys.tail.tail.tail.tail, url, pad, offset + 4).is_ok
+      model: BASE64.read_groups(ys, url, pad, offset).is_ok implies BASE64.read_groups(ys, url, pad, offset).get =
+        BASE64.read_groups(ys.tail.tail.tail.tail, url, pad, offset + 4).get.prepend(BASE64.value(ys.tail.tail.head, url) % 4 * 64 + BASE64.value(ys.tail.tail.tail.head, url))
+          .prepend(BASE64.value(ys.tail.head, url) % 16 * 16 + BASE64.value(ys.tail.tail.head, url) / 4).prepend(BASE64.value(ys.head, url) * 4 + BASE64.value(ys.tail.head, url) / 16)
+    end
+
+  -- A full group, then the groups after it.
+  groups_full(bs: BYTES, i: NAT, url: BOOL, pad: BOOL): BOOL
+    require
+      four_left: i + 4 <= bs.length
+      not_last: not (pad and i + 4 = bs.length and (bs.at(i + 2) = 61 or bs.at(i + 3) = 61))
+      symbols: BASE64.value(bs.at(i), url) < 64 and BASE64.value(bs.at(i + 1), url) < 64 and BASE64.value(bs.at(i + 2), url) < 64 and BASE64.value(bs.at(i + 3), url) < 64
+    do
+      check
+        four: BASE64.drop_four(bs.model, i)
+        step: BASE64.groups_cons(LIST_OPS.drop(bs.model, i), url, pad, i)
+      end
+      True
+    ensure
+      holds: Result
+      same: BASE64.read_groups(LIST_OPS.drop(bs.model, i), url, pad, i).is_ok = BASE64.read_groups(LIST_OPS.drop(bs.model, i + 4), url, pad, i + 4).is_ok
+      model: BASE64.read_groups(LIST_OPS.drop(bs.model, i), url, pad, i).is_ok implies BASE64.read_groups(LIST_OPS.drop(bs.model, i), url, pad, i).get =
+        BASE64.read_groups(LIST_OPS.drop(bs.model, i + 4), url, pad, i + 4).get.prepend(BASE64.value(bs.at(i + 2), url) % 4 * 64 + BASE64.value(bs.at(i + 3), url)).prepend(BASE64.value(bs.at(i + 1), url) % 16 * 16 + BASE64.value(bs.at(i + 2), url) / 4).prepend(BASE64.value(bs.at(i), url) * 4 + BASE64.value(bs.at(i + 1), url) / 16)
+    end
+
+  -- Lemmas: where `read_groups` of what follows index `i` of `bs` fails, in its order of
+  -- tests. Each is a proof of its own, so `decode_from` only applies them.
+  -- Too few symbols left.
+  fails_length(bs: BYTES, i: NAT, url: BOOL, pad: BOOL): BOOL
+    require
+      inside: i < bs.length
+      short: (bs.length - i) = 1 or (pad and (bs.length - i) < 4)
+    do
+      check
+        len: LIST_OPS.drop(bs.model, i).length = bs.length - i
+      end
+      True
+    ensure
+      holds: Result
+      fails: not BASE64.read_groups(LIST_OPS.drop(bs.model, i), url, pad, i).is_ok
+    end
+
+  -- The first symbol is not one.
+  fails_first(bs: BYTES, i: NAT, url: BOOL, pad: BOOL): BOOL
+    require
+      two: i + 2 <= bs.length
+      enough: not (pad and (bs.length - i) < 4)
+      bad: BASE64.value(bs.at(i), url) = 64
+    do
+      check
+        s0: LIST_OPS.drop_step(bs.model, i)
+        s1: LIST_OPS.drop_step(bs.model, i + 1)
+      end
+      if bs.length - i >= 4 then
+        check
+          s2: LIST_OPS.drop_step(bs.model, i + 2)
+          s3: LIST_OPS.drop_step(bs.model, i + 3)
+        end
+        True
+      else
+        True
+      end
+    ensure
+      holds: Result
+      fails: not BASE64.read_groups(LIST_OPS.drop(bs.model, i), url, pad, i).is_ok
+    end
+
+  -- The second symbol is not one.
+  fails_second(bs: BYTES, i: NAT, url: BOOL, pad: BOOL): BOOL
+    require
+      two: i + 2 <= bs.length
+      enough: not (pad and (bs.length - i) < 4)
+      good: BASE64.value(bs.at(i), url) < 64
+      bad: BASE64.value(bs.at(i + 1), url) = 64
+    do
+      check
+        s0: LIST_OPS.drop_step(bs.model, i)
+        s1: LIST_OPS.drop_step(bs.model, i + 1)
+      end
+      if bs.length - i >= 4 then
+        check
+          s2: LIST_OPS.drop_step(bs.model, i + 2)
+          s3: LIST_OPS.drop_step(bs.model, i + 3)
+        end
+        True
+      else
+        True
+      end
+    ensure
+      holds: Result
+      fails: not BASE64.read_groups(LIST_OPS.drop(bs.model, i), url, pad, i).is_ok
+    end
+
+  -- One last byte, with low bits set.
+  fails_one_low(bs: BYTES, i: NAT, url: BOOL, pad: BOOL): BOOL
+    require
+      two: i + 2 <= bs.length
+      enough: not (pad and (bs.length - i) < 4)
+      good: BASE64.value(bs.at(i), url) < 64 and BASE64.value(bs.at(i + 1), url) < 64
+      one: ((bs.length - i) = 2 or (pad and (bs.length - i) = 4 and bs.at(i + 2) = 61 and bs.at(i + 3) = 61))
+      bad: BASE64.value(bs.at(i + 1), url) % 16 != 0
+    do
+      check
+        s0: LIST_OPS.drop_step(bs.model, i)
+        s1: LIST_OPS.drop_step(bs.model, i + 1)
+      end
+      if bs.length - i >= 4 then
+        check
+          s2: LIST_OPS.drop_step(bs.model, i + 2)
+          s3: LIST_OPS.drop_step(bs.model, i + 3)
+        end
+        True
+      else
+        True
+      end
+    ensure
+      holds: Result
+      fails: not BASE64.read_groups(LIST_OPS.drop(bs.model, i), url, pad, i).is_ok
+    end
+
+  -- The third symbol is not one.
+  fails_third(bs: BYTES, i: NAT, url: BOOL, pad: BOOL): BOOL
+    require
+      three: i + 3 <= bs.length
+      enough: not (pad and (bs.length - i) < 4)
+      good: BASE64.value(bs.at(i), url) < 64 and BASE64.value(bs.at(i + 1), url) < 64
+      more: not ((bs.length - i) = 2 or (pad and (bs.length - i) = 4 and bs.at(i + 2) = 61 and bs.at(i + 3) = 61))
+      bad: BASE64.value(bs.at(i + 2), url) = 64
+    do
+      check
+        s0: LIST_OPS.drop_step(bs.model, i)
+        s1: LIST_OPS.drop_step(bs.model, i + 1)
+        s2: LIST_OPS.drop_step(bs.model, i + 2)
+      end
+      if bs.length - i >= 4 then
+        check
+          s3: LIST_OPS.drop_step(bs.model, i + 3)
+        end
+        True
+      else
+        True
+      end
+    ensure
+      holds: Result
+      fails: not BASE64.read_groups(LIST_OPS.drop(bs.model, i), url, pad, i).is_ok
+    end
+
+  -- Two last bytes, with low bits set.
+  fails_two_low(bs: BYTES, i: NAT, url: BOOL, pad: BOOL): BOOL
+    require
+      three: i + 3 <= bs.length
+      enough: not (pad and (bs.length - i) < 4)
+      good: BASE64.value(bs.at(i), url) < 64 and BASE64.value(bs.at(i + 1), url) < 64 and BASE64.value(bs.at(i + 2), url) < 64
+      more: not ((bs.length - i) = 2 or (pad and (bs.length - i) = 4 and bs.at(i + 2) = 61 and bs.at(i + 3) = 61))
+      two: ((bs.length - i) = 3 or (pad and (bs.length - i) = 4 and bs.at(i + 3) = 61))
+      bad: BASE64.value(bs.at(i + 2), url) % 4 != 0
+    do
+      check
+        s0: LIST_OPS.drop_step(bs.model, i)
+        s1: LIST_OPS.drop_step(bs.model, i + 1)
+        s2: LIST_OPS.drop_step(bs.model, i + 2)
+      end
+      if bs.length - i >= 4 then
+        check
+          s3: LIST_OPS.drop_step(bs.model, i + 3)
+        end
+        True
+      else
+        True
+      end
+    ensure
+      holds: Result
+      fails: not BASE64.read_groups(LIST_OPS.drop(bs.model, i), url, pad, i).is_ok
+    end
+
+  -- The fourth symbol is not one.
+  fails_fourth(bs: BYTES, i: NAT, url: BOOL, pad: BOOL): BOOL
+    require
+      four: i + 4 <= bs.length
+      good: BASE64.value(bs.at(i), url) < 64 and BASE64.value(bs.at(i + 1), url) < 64 and BASE64.value(bs.at(i + 2), url) < 64
+      more: not ((bs.length - i) = 2 or (pad and (bs.length - i) = 4 and bs.at(i + 2) = 61 and bs.at(i + 3) = 61))
+      full: not ((bs.length - i) = 3 or (pad and (bs.length - i) = 4 and bs.at(i + 3) = 61))
+      bad: BASE64.value(bs.at(i + 3), url) = 64
+    do
+      check
+        s0: LIST_OPS.drop_step(bs.model, i)
+        s1: LIST_OPS.drop_step(bs.model, i + 1)
+        s2: LIST_OPS.drop_step(bs.model, i + 2)
+        s3: LIST_OPS.drop_step(bs.model, i + 3)
+      end
+      True
+    ensure
+      holds: Result
+      fails: not BASE64.read_groups(LIST_OPS.drop(bs.model, i), url, pad, i).is_ok
+    end
+
+  -- `read_groups` of the bytes of `bs` from index `i` on, after `out`. It tests in the order
+  -- `read_groups` does, so it fails where that does.
+  decode_from(bs: BYTES, i: NAT, url: BOOL, pad: BOOL, out: BYTES_BUILDER): RESULT[CODEC_ERROR, BYTES]
+    require
+      inside: i <= bs.length
+      shorter: out.length <= i
+    variant
+      bs.length - i
+    do
+      let n = bs.length - i
+      if n = 0 then
+        Ok(out.to_bytes)
+      else
+        if n = 1 or (pad and n < 4) then
+          check
+            fails: BASE64.fails_length(bs, i, url, pad)
+          end
+          Error(BadLength)
+        else
+          check
+            first: LIST_OPS.drop_step(bs.model, i)
+            second: LIST_OPS.drop_step(bs.model, i + 1)
+          end
+          let v0 = BASE64.value(bs.at(i), url)
+          let v1 = BASE64.value(bs.at(i + 1), url)
+          if v0 = 64 then
+            check
+              fails: BASE64.fails_first(bs, i, url, pad)
+            end
+            Error(BadSymbol(i))
+          else
+            if v1 = 64 then
+              check
+                fails: BASE64.fails_second(bs, i, url, pad)
+              end
+              Error(BadSymbol(i + 1))
+            else
+              if n = 2 then
+                if v1 % 16 != 0 then
+                  check
+                    fails: BASE64.fails_one_low(bs, i, url, pad)
+                  end
+                  Error(BadSymbol(i + 1))
+                else
+                  check
+                    read: BASE64.groups_one_short(bs, i, url, pad)
+                  end
+                  Ok(out.add_byte(v0 * 4 + v1 / 16).to_bytes)
+                end
+              else
+                check
+                  third: LIST_OPS.drop_step(bs.model, i + 2)
+                end
+                if n = 3 then
+                  let v2 = BASE64.value(bs.at(i + 2), url)
+                  if v2 = 64 then
+                    check
+                      fails: BASE64.fails_third(bs, i, url, pad)
+                    end
+                    Error(BadSymbol(i + 2))
+                  else
+                    if v2 % 4 != 0 then
+                      check
+                        fails: BASE64.fails_two_low(bs, i, url, pad)
+                      end
+                      Error(BadSymbol(i + 2))
+                    else
+                      check
+                        read: BASE64.groups_two_short(bs, i, url, pad)
+                      end
+                      Ok(out.add_byte(v0 * 4 + v1 / 16).add_byte(v1 % 16 * 16 + v2 / 4).to_bytes)
+                    end
+                  end
+                else
+                  check
+                    fourth: LIST_OPS.drop_step(bs.model, i + 3)
+                  end
+                  if pad and n = 4 and bs.at(i + 2) = 61 and bs.at(i + 3) = 61 then
+                    if v1 % 16 != 0 then
+                      check
+                        fails: BASE64.fails_one_low(bs, i, url, pad)
+                      end
+                      Error(BadSymbol(i + 1))
+                    else
+                      check
+                        read: BASE64.groups_one_padded(bs, i, url, pad)
+                      end
+                      Ok(out.add_byte(v0 * 4 + v1 / 16).to_bytes)
+                    end
+                  else
+                    let v2 = BASE64.value(bs.at(i + 2), url)
+                    if v2 = 64 then
+                      check
+                        fails: BASE64.fails_third(bs, i, url, pad)
+                      end
+                      Error(BadSymbol(i + 2))
+                    else
+                      if pad and n = 4 and bs.at(i + 3) = 61 then
+                        if v2 % 4 != 0 then
+                          check
+                            fails: BASE64.fails_two_low(bs, i, url, pad)
+                          end
+                          Error(BadSymbol(i + 2))
+                        else
+                          check
+                            read: BASE64.groups_two_padded(bs, i, url, pad)
+                          end
+                          Ok(out.add_byte(v0 * 4 + v1 / 16).add_byte(v1 % 16 * 16 + v2 / 4).to_bytes)
+                        end
+                      else
+                        let v3 = BASE64.value(bs.at(i + 3), url)
+                        if v3 = 64 then
+                          check
+                            fails: BASE64.fails_fourth(bs, i, url, pad)
+                          end
+                          Error(BadSymbol(i + 3))
+                        else
+                          check
+                            read: BASE64.groups_full(bs, i, url, pad)
+                          end
+                          BASE64.decode_from(bs, i + 4, url, pad,
+                            out.add_byte(v0 * 4 + v1 / 16).add_byte(v1 % 16 * 16 + v2 / 4).add_byte(v2 % 4 * 64 + v3))
+                        end
+                      end
+                    end
+                  end
+                end
+              end
+            end
+          end
+        end
+      end
+    ensure
+      same: Result.is_ok = BASE64.read_groups(LIST_OPS.drop(bs.model, i), url, pad, i).is_ok
+      model: Result.is_ok implies Result.get.model = out.model.append(BASE64.read_groups(LIST_OPS.drop(bs.model, i), url, pad, i).get)
+    end
+
+specify {ANY}
+
+  -- The Base64 text of any bytes, in either alphabet, padded or not, decodes to them.
+  law round_trip(b: BYTES, url: BOOL, pad: BOOL)
+    require
+      fits: b.length <= 4611686018427387903
+    trigger
+      BASE64.decode_with(BASE64.encode_with(b, url, pad), url, pad)
+    do
+      BASE64.groups_read(b.model, url, pad, 0)
+    ensure
+      ok: BASE64.decode_with(BASE64.encode_with(b, url, pad), url, pad).is_ok
+      same: BASE64.decode_with(BASE64.encode_with(b, url, pad), url, pad).get.model = b.model
+    end
+
+end

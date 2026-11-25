@@ -1,0 +1,203 @@
+-- `SET`, `QUEUE` and `HEAP` in C (Task H.4): number and text items, repeats, the empty
+-- collections, and a heap and a queue of `count` items.
+program MAIN
+
+feature {ANY}
+
+  -- The items joined by commas.
+  nats(xs: LIST[NAT]): STRING
+    do
+      LIST_OPS.fold_left(xs, fn(acc: STRING, x: NAT): STRING do
+        let t = NUMBER_TEXT.nat_to_text(x)
+        if acc.byte_length <= 1000000 then
+          (if acc.byte_length = 0 then t else acc.concat(",").concat(t) end)
+        else
+          acc
+        end
+      end, "")
+    end
+
+  texts(xs: LIST[STRING]): STRING
+    do
+      LIST_OPS.fold_left(xs, fn(acc: STRING, x: STRING): STRING do
+        if acc.byte_length <= 1000000 and x.byte_length <= 1000000 then
+          (if acc.byte_length = 0 then x else acc.concat(",").concat(x) end)
+        else
+          acc
+        end
+      end, "")
+    end
+
+  item(o: OPTION[NAT]): STRING
+    do
+      match o
+      case Some(x) then NUMBER_TEXT.nat_to_text(x)
+      case None then "-"
+      end
+    end
+
+  -- `a` and `b` joined by ` | `, or `a` alone if that would not fit.
+  and_then(a: STRING, b: STRING): STRING
+    do
+      if a.byte_length <= 1000000 and b.byte_length <= 1000000 then
+        a.concat(" | ").concat(b)
+      else
+        a
+      end
+    end
+
+  yes(b: BOOL): STRING
+    do
+      if b then "yes" else "no" end
+    end
+
+  sets: STRING
+    do
+      let none: SET[NAT] = SET.empty
+      let a = none.add(5).add(1).add(3).add(5).add(9)
+      let b = none.add(3).add(4).add(9)
+      let t: SET[STRING] = SET.empty
+      let texts_set = t.add("pear").add("apple").add("fig").add("apple").remove("fig")
+      and_then(and_then(and_then(and_then(and_then(nats(a.items), nats(a.union(b).items)), nats(a.intersection(b).items)), nats(a.remove(3).items)), texts(texts_set.items)), yes(a.has(9) and not a.has(4) and not none.has(1)))
+    end
+
+  queues: STRING
+    do
+      let none: QUEUE[NAT] = QUEUE.empty
+      let a = none.push(1).push(2).push(3)
+      let b = a.pop.push(4)
+      let c = b.pop.pop.pop.pop
+      let t: QUEUE[STRING] = QUEUE.empty
+      let words = t.push("one").push("two").push("three").pop
+      and_then(and_then(and_then(and_then(nats(a.items), nats(b.items)), item(b.peek)), item(c.peek)), texts(words.items))
+    end
+
+  -- The items of `h`, least first.
+  drained(h: HEAP[NAT], n: NAT, acc: LIST[NAT]): LIST[NAT]
+    variant
+      n
+    do
+      check
+        nat_agrees: forall p: NAT. forall q: NAT. p.equals(q) = (p = q)
+      end
+      if n = 0 then
+        LIST_OPS.reverse(acc)
+      else
+        match h.peek
+        case Some(x) then drained(h.pop_min, n - 1, acc.prepend(x))
+        case None then LIST_OPS.reverse(acc)
+        end
+      end
+    end
+
+  heaps: STRING
+    do
+      check
+        nat_agrees: forall p: NAT. forall q: NAT. p.equals(q) = (p = q)
+      end
+      let none: HEAP[NAT] = HEAP.empty
+      let a = none.push(5).push(2).push(8).push(2).push(0).push(7)
+      -- `a` is used twice, so a change to it copies.
+      let b = a.pop_min
+      and_then(and_then(and_then(nats(drained(a, 10, LIST.empty)), nats(drained(b, 3, LIST.empty))), item(a.peek)), item(none.pop_min.peek))
+    end
+
+  -- The next number of a linear congruential sequence.
+  next(seed: U64): U64
+    do
+      seed *% 6364136223846793005 +% 1442695040888963407
+    end
+
+  -- `h` with `n` numbers of the sequence pushed.
+  filled(h: HEAP[U64], n: NAT, seed: U64): HEAP[U64]
+    variant
+      n
+    do
+      check
+        u64_agrees: forall p: U64. forall q: U64. p.equals(q) = (p = q)
+      end
+      if n = 0 or h.size >= 18446744073709551615 then
+        h
+      else
+        filled(h.push(seed >> 20), n - 1, next(seed))
+      end
+    end
+
+  -- How many items come out of `h`, each not below the one before.
+  in_order(h: HEAP[U64], n: NAT, last: U64, done: NAT): NAT
+    variant
+      n
+    do
+      check
+        u64_agrees: forall p: U64. forall q: U64. p.equals(q) = (p = q)
+      end
+      if n = 0 then
+        done
+      else
+        match h.peek
+        case Some(x) then
+          if x < last or done = 18446744073709551615 then done else in_order(h.pop_min, n - 1, x, done + 1) end
+        case None then done
+        end
+      end
+    end
+
+  -- `q` with the numbers below `n` pushed, the greatest first.
+  queued(q: QUEUE[U64], n: NAT): QUEUE[U64]
+    variant
+      n
+    do
+      if n = 0 or q.size >= 18446744073709551615 then q else queued(q.push(n), n - 1) end
+    end
+
+  -- The items of `q` added up, and each pop followed by the pop of the rest.
+  served(q: QUEUE[U64], n: NAT, acc: U64): U64
+    variant
+      n
+    do
+      if n = 0 then
+        acc
+      else
+        match q.peek
+        case Some(x) then served(q.pop, n - 1, acc +% x)
+        case None then acc
+        end
+      end
+    end
+
+  heap_run(n: NAT): NAT
+    do
+      let none: HEAP[U64] = HEAP.empty
+      in_order(filled(none, n, 42), n, 0, 0)
+    end
+
+  queue_run(n: NAT): U64
+    do
+      let none: QUEUE[U64] = QUEUE.empty
+      served(queued(none, n), n, 0)
+    end
+
+  small: STRING
+    do
+      and_then(and_then(sets, queues), heaps)
+    end
+
+  big: STRING
+    do
+      and_then(NUMBER_TEXT.nat_to_text(heap_run(100000)), NUMBER_TEXT.nat_to_text(queue_run(100000)))
+    end
+
+  small_length: NAT
+    do
+      small.byte_length
+    end
+
+  main(args: SEQ[STRING]): IO[EXIT_CODE]
+    do
+      with IO
+        IO.print_line(and_then(small, big))
+        IO.exit(if small_length > 0 then 0 else 1 end)
+      end
+    end
+
+end

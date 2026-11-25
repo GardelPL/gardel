@@ -7,6 +7,9 @@ use std::io::{Read, Write};
 use std::path::PathBuf;
 use std::process::{Command, Output};
 
+/// The suffix gardelc gives an executable: `.exe` on Windows, none elsewhere.
+const EXE: &str = std::env::consts::EXE_SUFFIX;
+
 fn root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("..")
 }
@@ -122,7 +125,7 @@ fn todo_api_verifies_and_serves_crud_over_sockets() {
 
     // A port nothing holds: the one the system gives, let go of.
     let port = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("a free port").local_addr().expect("its address").port();
-    let mut server = Command::new(dir.0.join("build/todo_api_bin.exe"))
+    let mut server = Command::new(dir.0.join(format!("build/todo_api_bin{EXE}")))
         .arg(port.to_string())
         .spawn()
         .expect("the service starts");
@@ -192,6 +195,66 @@ fn todo_api_verifies_and_serves_crud_over_sockets() {
         assert_eq!(got, want, "request {i}: {:?}", session[i]);
     }
     assert!(closed, "the connection stays open after the error");
+
+    logs_each_request_on_the_port_from_the_environment(&dir);
+}
+
+/// With no argument the service listens on `TODO_API_PORT` (Task H.2), and logs each request
+/// it answers at `Info` on standard error; the run's recording replays to the same lines.
+fn logs_each_request_on_the_port_from_the_environment(dir: &Dir) {
+    let port = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("a free port").local_addr().expect("its address").port();
+    let mut server = Command::new(dir.0.join(format!("build/todo_api_bin{EXE}")))
+        .current_dir(&dir.0)
+        .env("TODO_API_PORT", port.to_string())
+        .env("GARDEL_RECORD", "env.log")
+        .env_remove("GARDEL_LOG_LEVEL")
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("the service starts");
+    let up = (0..50).any(|_| {
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        std::net::TcpStream::connect(("127.0.0.1", port)).is_ok()
+    });
+    let answers: Vec<String> = if up {
+        let mut socket = std::net::TcpStream::connect(("127.0.0.1", port)).expect("connect");
+        let body = r#"{"title":"milk"}"#;
+        let asks = [
+            format!("POST /todos HTTP/1.1\r\nHost: test\r\nContent-Length: {}\r\n\r\n{body}", body.len()),
+            "GET /todos/1 HTTP/1.1\r\nHost: test\r\nConnection: close\r\n\r\n".to_string(),
+        ];
+        asks.iter()
+            .map(|a| {
+                socket.write_all(a.as_bytes()).expect("request");
+                read_answer(&mut socket)
+            })
+            .collect()
+    } else {
+        vec![]
+    };
+    // The answers are out before the lines are read: the second closed the connection.
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    drop(server.kill());
+    let out = server.wait_with_output().expect("the service's output");
+    assert!(up, "the service did not listen on TODO_API_PORT:\n{}", all(&out));
+    assert!(answers.len() == 2 && answers[0].starts_with("HTTP/1.1 201") && answers[1].starts_with("HTTP/1.1 200"), "{answers:?}");
+    let lines = |o: &Output| -> Vec<String> {
+        String::from_utf8_lossy(&o.stderr).lines().filter(|l| l.starts_with("info: ")).map(str::to_string).collect()
+    };
+    assert_eq!(lines(&out), ["info: POST /todos", "info: GET /todos/1"], "{}", all(&out));
+    let log = fs::read_to_string(dir.0.join("env.log")).expect("a recording");
+    assert!(log.contains("command ReadEnv:1:TODO%5FAPI%5FPORT\n") && log.contains("command Log:info:GET%20%2Ftodos%2F1\n"), "{log}");
+
+    // The recording stops where the service was killed; its replay listens on nothing, reads
+    // no variable, and writes the same lines.
+    let again = Command::new(dir.0.join(format!("build/todo_api_bin{EXE}")))
+        .current_dir(&dir.0)
+        .env("GARDEL_REPLAY", "env.log")
+        .env_remove("TODO_API_PORT")
+        .env_remove("GARDEL_LOG_LEVEL")
+        .output()
+        .expect("the replay runs");
+    assert_eq!(lines(&again), lines(&out), "{}", all(&again));
+    assert!(!all(&again).contains("differs from the log"), "{}", all(&again));
 }
 
 /// One answer from `socket`: its head, up to the blank line, and as many body bytes as its

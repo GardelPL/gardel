@@ -1,0 +1,150 @@
+-- A priority queue: the least item comes out first (Task H.4).
+--
+-- A client sees `push`, `peek`, `pop_min` and `size`, and the ghost `count`, how many items
+-- are a given key. The laws below say how each change counts, and that no item is below
+-- `peek`.
+--
+-- The representation is hidden: a binary heap in an array, kept by `HEAP_ORDER`. `push` and
+-- `pop_min` take a number of steps logarithmic in the size, and need `agrees`: that `equals`
+-- is `=`, as `SORTING.binary_search` does.
+module HEAP[K: ORD]
+
+representation {NONE}
+  slots: ARRAY[K]
+  n: NAT
+
+invariant
+  inside: n <= slots.length
+  ordered: HEAP_ORDER.ordered(slots, n)
+
+create {ANY}
+
+  empty: HEAP[K]
+    do
+      { slots = ARRAY.empty, n = 0 }
+    ensure
+      none: Result.size = 0
+    end
+
+feature {ANY}
+
+  size: NAT
+    do
+      Current.n
+    end
+
+  is_empty: BOOL
+    do
+      Current.n = 0
+    ensure
+      def: Result = (Current.size = 0)
+    end
+
+  -- The least item, or `None` when the heap is empty.
+  peek: OPTION[K]
+    do
+      if Current.n = 0 then
+        None
+      else
+        check
+          counted: HEAP_ORDER.count_has(Current.slots, Current.n, 0)
+        end
+        Some(Current.slots.at(0))
+      end
+    ensure
+      none: Current.size = 0 implies Result = None
+      some: Current.size > 0 implies Result.is_some
+      present: Result.is_some implies Current.count(Result.get) > 0
+    end
+
+  -- The heap with `x`.
+  push(x: K): HEAP[K]
+    require
+      room: Current.size < 18446744073709551615
+      agrees: forall p: K. forall q: K. p.equals(q) = (p = q)
+    do
+      check
+        heap: HEAP_ORDER.push_ordered(Current.slots, Current.n, x)
+      end
+      { slots = HEAP_ORDER.push(Current.slots, Current.n, x), n = Current.n + 1 }
+    ensure
+      grows: Result.size = Current.size + 1
+    end
+
+  -- The heap without one of its least items, `peek`. The empty heap stays empty.
+  pop_min: HEAP[K]
+    require
+      agrees: forall p: K. forall q: K. p.equals(q) = (p = q)
+    do
+      if Current.n = 0 then
+        Current
+      else
+        check
+          heap: HEAP_ORDER.pop_ordered(Current.slots, Current.n)
+        end
+        { slots = HEAP_ORDER.pop(Current.slots, Current.n), n = Current.n - 1 }
+      end
+    ensure
+      empty_case: Current.size = 0 implies Result.size = 0
+      shrinks: Current.size > 0 implies Result.size + 1 = Current.size
+    end
+
+specify {ANY}
+
+  -- How many items are `y` itself.
+  count(y: K): NAT
+    do
+      HEAP_ORDER.count_upto(Current.slots, Current.n, y)
+    ensure
+      at_most: Result <= Current.size
+    end
+
+  law count_empty(h: HEAP[K], y: K)
+    require
+      none: h.size = 0
+    trigger
+      h.count(y)
+    ensure
+      nothing: h.count(y) = 0
+    end
+
+  -- `push` adds one item.
+  law count_push(h: HEAP[K], x: K, y: K)
+    require
+      room: h.size < 18446744073709551615
+      agrees: forall p: K. forall q: K. p.equals(q) = (p = q)
+    trigger
+      h.push(x).count(y)
+    do
+      HEAP_ORDER.push_count(h.slots, h.n, x, y)
+    ensure
+      adds: h.push(x).count(y) = h.count(y) + (if x = y then 1 else 0 end)
+    end
+
+  -- `pop_min` takes away one item, `peek`.
+  law count_pop(h: HEAP[K], y: K)
+    require
+      some: h.size > 0
+      agrees: forall p: K. forall q: K. p.equals(q) = (p = q)
+    trigger
+      h.pop_min.count(y)
+    do
+      HEAP_ORDER.pop_count(h.slots, h.n, y)
+    ensure
+      takes: h.count(y) = h.pop_min.count(y) + (if h.peek.get = y then 1 else 0 end)
+    end
+
+  -- No item is below `peek`.
+  law peek_least(h: HEAP[K], y: K)
+    require
+      present: h.count(y) > 0
+      agrees: forall p: K. forall q: K. p.equals(q) = (p = q)
+    trigger
+      h.count(y)
+    do
+      HEAP_ORDER.least_counted(h.slots, h.n, h.n, y)
+    ensure
+      least: not y.less_than(h.peek.get)
+    end
+
+end

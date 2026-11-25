@@ -1,0 +1,25 @@
+-- A generator of test values (Task H.9): from a `SPLIT_MIX` state, a value and the state
+-- after it. Generators combine by passing the state along, so a seed decides every value.
+module GEN[A]
+
+representation {ANY}
+  run: U64 -> TUPLE[A, U64]
+
+create {ANY}
+
+  make(f: U64 -> TUPLE[A, U64]): GEN[A]
+    do
+      { run = f }
+    ensure
+      runs: Result.run = f
+    end
+
+feature {ANY}
+
+  -- The value at state `s`.
+  value(s: U64): A
+    do
+      Current.run(s).first
+    end
+
+end

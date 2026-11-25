@@ -29,6 +29,8 @@ create {ANY}
       empty: ps.length = 0 implies not Result.is_some
       first: (ps.length > 0 and ps.head.name.equals(n)) implies
         (Result.is_some and Result.get.equals(ps.head.value))
+      later: (ps.length > 0 and not ps.head.name.equals(n)) implies
+        Result.is_some = URL_PARAM.find(ps.tail, n).is_some
     end
 
 feature {ANY}

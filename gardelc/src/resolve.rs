@@ -537,6 +537,14 @@ impl<'a> Resolver<'a> {
                 if routine == "read_line" && matches!(&**recv, Expr::Var(v) if v == "IO") {
                     return Some("RESULT".to_string());
                 }
+                if matches!(&**recv, Expr::Var(v) if v == "IO") {
+                    match routine.as_str() {
+                        "now" => return Some("I64".to_string()),
+                        "random" => return Some("RESULT".to_string()),
+                        "env" => return Some("OPTION".to_string()),
+                        _ => {}
+                    }
+                }
                 let head = match &**recv {
                     Expr::Var(v) if v.starts_with(|c: char| c.is_ascii_uppercase()) && v != "Current" => v.clone(),
                     other => self.head_of(other)?,
@@ -892,7 +900,7 @@ impl<'a> Resolver<'a> {
         m.name = self.own.top(&m.name);
         let params = m.type_params.clone();
         self.with_type_params(&params, |this| {
-            for bound in m.type_bounds.values_mut() {
+            for bound in m.type_bounds.values_mut().chain(m.declared_bounds.values_mut()) {
                 this.ty(bound);
             }
             if let Some(sat) = &mut m.satisfies {

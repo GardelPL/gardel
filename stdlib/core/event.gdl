@@ -24,6 +24,9 @@ representation {ANY}
 | FileWritten(tag: NAT, res: RESULT[IO_ERROR, NAT])
 | Pasted(text: STRING)
   | Mouse(mouse: MOUSE)
+  | Clock(tag: NAT, wall_millis: I64, monotonic_millis: U64)
+  | RandomBytes(tag: NAT, res: RESULT[IO_ERROR, BYTES])
+  | EnvRead(tag: NAT, value: OPTION[STRING])
 
 feature {ANY}
 

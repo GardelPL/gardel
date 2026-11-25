@@ -55,9 +55,9 @@ feature {ANY}
           s.body_limit = r.body_limit
         case CompleteResponse(q, rest) then
           rest.length <= buf.length and q.body.length <= buf.length - rest.length and
-          rest.model = BYTES.list_take(BYTES.list_drop(buf.model, buf.length - rest.length), rest.length) and
-          q.body.model = BYTES.list_take(
-            BYTES.list_drop(buf.model, buf.length - rest.length - q.body.length), q.body.length)
+          rest.model = LIST_OPS.take(LIST_OPS.drop(buf.model, buf.length - rest.length), rest.length) and
+          q.body.model = LIST_OPS.take(
+            LIST_OPS.drop(buf.model, buf.length - rest.length - q.body.length), q.body.length)
         case FailedResponse(_) then
           True
       end
