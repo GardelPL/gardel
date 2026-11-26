@@ -450,6 +450,7 @@ A project may declare its identity and boundaries via a `Gardel.toml` file in it
 | `E0114: export_outside_package` | An export list naming a module of another package or the prelude |
 | `E0115: reserved_name` | A declared name of the form `PK<n>_...`, which is how a dependency's names are held internally |
 | `E0116: let_type_mismatch` | A `let x: T = e` whose value has another type, as far as it can be told. An integer literal must fit `T`. A value of unknown type is built at `T` by the back ends, or refused |
+| `E0117: argument_type_mismatch` | An argument, or a constructor's field, whose type is known to differ from its parameter's: a routine's, or `prepend`, `append` and `has` of a `LIST`. The integer types (`U64`, `NAT`, `I64`, `INT`, `MATH_INT`, `EXIT_CODE`) pass for one another, and a value out of its parameter's range is a `Range Violation`. A type parameter, concept or function type is left to the verifier |
 
 A receiver's type is followed through parameters, `let`s, routine results with their type arguments, `if`, `match`, pattern bindings and constructor calls. A `require` of an exported law may not mention what the law's clients cannot see, as for a routine: a client given the conclusion without the hypothesis could prove `False`. Beyond that, what the verifier cannot translate is `E0199: verifier_translation_failed`: the module is not verified, and the fault is reported as a limit of `gardelc`, not of the program. An unknown command-line flag is an error.
 

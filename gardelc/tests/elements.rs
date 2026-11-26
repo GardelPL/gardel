@@ -91,7 +91,7 @@ create {ANY}
       holds: Result
     end
 
-  member(cs: LIST[CHAR], c: MATH_INT): BOOL
+  member(cs: LIST[CHAR], c: CHAR): BOOL
     require
       has: cs.has(c)
     do

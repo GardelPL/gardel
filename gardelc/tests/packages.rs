@@ -972,6 +972,64 @@ end
     assert_refused(&world.run("root", &[]), "E0107: unknown_type");
 }
 
+/// An argument of another type than its parameter is refused at the call. Each of these was
+/// refused only by Boogie's type check, as `E0199`, which blamed `gardelc`; a `CHAR` passed
+/// for a `NAT` was not refused at all.
+#[test]
+fn an_argument_must_have_its_parameter_type() {
+    let module = |call: &str| {
+        format!(
+            "functions ARGS
+
+feature {{ANY}}
+
+  id(x: NAT): NAT
+    do
+      x
+    end
+
+  count(xs: LIST[NAT]): NAT
+    do
+      xs.length
+    end
+
+  given(o: OPTION[NAT]): BOOL
+    do
+      True
+    end
+
+  t(xs: LIST[NAT], y: I64, c: CHAR, o: OPTION[NAT], e: EXIT_CODE): NAT
+    do
+      {call}
+    end
+
+end
+"
+        )
+    };
+    for call in [
+        "ARGS.id(True)",
+        "id(c)",
+        "ARGS.count(5)",
+        "xs.prepend(True).length",
+        "xs.prepend(xs).length",
+        "xs.append(4).length",
+        "if xs.has(True) then 1 else 0 end",
+        "if ARGS.given(Some(True)) then 1 else 0 end",
+    ] {
+        let world = World::new("arg_mismatch", &[]);
+        world.package("root", &[], &[("args.gdl", &module(call))]);
+        assert_refused(&world.run("root", &[]), "E0117: argument_type_mismatch");
+    }
+    // Numbers of the integer types pass for one another, as far as their ranges allow.
+    let fits = "if ARGS.id(5) = 5 and ARGS.id(e) = e and ARGS.id(c.code) >= 0 and xs.prepend(3).append(xs).length > 0 \
+        and ARGS.count(LIST.empty) = 0 and xs.has(3) and ARGS.given(o) and ARGS.given(Some(3)) and ARGS.given(None) \
+        then 1 else 0 end";
+    let world = World::new("arg_match", &[]);
+    world.package("root", &[], &[("args.gdl", &module(fits))]);
+    assert_ok(&world.run("root", &["--strict"]));
+}
+
 /// A declared type settles what the value alone leaves open, here across a package boundary,
 /// so it has to be resolved like any other type.
 #[test]
