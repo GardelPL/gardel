@@ -2507,7 +2507,7 @@ step(t: TUI[TODO_STATE], e: EVENT): STEP[TUI[TODO_STATE]] do t.step(e) end
 
 ### Testing a Package: `gardelc test` and `gtest`
 
-A package's tests are a package of their own in its `tests/` directory, with a `Gardel.toml` that depends on the package, so they see only its contracts. Each `program` in it is a test. `gardelc test DIR` verifies that package under `--strict` and builds it, once, runs each program in `DIR/tests` with `tests/cases.txt` on its standard input when there is one, and reports each by its exit status. Its own exit status is 0 when every program passed, and 1 when one failed or the tests did not verify or build. A failing program's output is shown under its name.
+A package's tests are a package of their own in its `tests/` directory, with a `Gardel.toml` that depends on the package, so they see only its contracts. Each `program` in it is a test. `gardelc test DIR` verifies that package under `--strict` and builds it, once, runs each program in `DIR/tests` with `tests/cases.txt` on its standard input when there is one, and reports each by its exit status. A `reactive program` is a test too, and one named `P` with a file `tests/p.events` runs from the script in it, as from `GARDEL_EVENTS`; lines that start with `#` are skipped, and a line that starts with `> ` is a `Line` event with the rest of it. Its own exit status is 0 when every program passed, and 1 when one failed or the tests did not verify or build. A failing program's output is shown under its name.
 
 ```text
 $ gardelc test gjson
@@ -2538,9 +2538,9 @@ main(args: SEQ[STRING]): IO[EXIT_CODE]
 
 - **Cases files.** `CASES` reads a line `input => expected`. Empty lines and lines that start with `#` are skipped, and `%XX` stands for a byte. `CASES.check(rs, n, line, run)` adds the result of line `n`: `run(input)` compared with the expected text. A program reads its lines with `IO.read_line` and checks each, as `gjson/tests/src/gjson_test.gdl` does; `CASES.bytes(s)` gives an input that need not be text.
 - **Property tests.** `PROPERTY.for_all(name, gen, n, seed, prop)` checks `prop` on `n` values of a generator made from `seed`. A failure says which case and the seed it was made from, so a run from that seed makes it first; `for_all_shown` also shows the value. The values come from SplitMix64 (`SPLIT_MIX`), pure and the same on every system. `GENS` has `u64`, `nat_below(n)`, `nat_in(lo, hi)`, `bool`, `list(g, max)`, `text(max)`, `text_from(alphabet, max)`, `map` and `pair`, and `GEN.make` takes any step from a state to a value and the next state.
-- **Reactive steps.** `SCRIPT.play(step, state, events)` runs a `step` over a list of events and gives `Running(state, commands)` or `Stopped(code, commands)`, with every command in order; `SCRIPT.printed(commands)` is the text of each `Print` and `Write`. The `step` must be a routine of a module, as a `reactive program` cannot be named. Keep the run in a `let`: a routine that returns a `SCRIPTED[NAT]` must show its state in range, and a generic routine's result has no range.
+- **Reactive steps.** `SCRIPT.play(step, state, events)` runs a `step` over a list of events and gives `Running(state, commands)` or `Stopped(code, commands)`, with every command in order; `SCRIPT.printed(commands)` is the text of each `Print` and `Write`. The `step` must be a routine of a module, as a `reactive program` cannot be named. Keep the run in a `let`: a routine that returns a `SCRIPTED[NAT]` must show its state in range, and a generic routine's result has no range. Only the host can make a `CONN_ID`, so a test whose events need them is a `reactive program`: its events file begins with `Accepted:1 Accepted:2`, it keeps the connections it is given and makes its runs with them, and it stops with their exit code at `Shutdown`. `grest/tests/src/grest_server_test.gdl` does so, with each script on a `> ` line. A long text is better kept there than in a literal, which the solver has to read.
 
-`gjson`, `gtest` and its own tests (`gtest/tests`) use it. `ghttp` and `grest` still read their cases from Rust tests.
+`gjson`, `grest`, and `gtest`'s own tests (`gtest/tests`) use it. `ghttp` still reads its cases from a Rust test.
 
 ### Mutating a Package: `gardelc mutate`
 
@@ -2769,7 +2769,7 @@ gardelc <file.gdl> --run
 gardelc --compare-with <old-dir>
 
 # Verify and build DIR/tests (default ./tests), run each program in it with tests/cases.txt
-# on its standard input, and report each by its exit status
+# on its standard input, or from tests/<program>.events, and report each by its exit status
 gardelc test [DIR] [--filter <NAME>]
 
 # Change the package's code in small ways, and report the changes that neither its proofs

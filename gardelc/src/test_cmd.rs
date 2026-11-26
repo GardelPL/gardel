@@ -4,7 +4,8 @@
 //! reports it by its exit status.
 //!
 //! A program gets `tests/cases.txt` on its standard input when there is one, and runs in
-//! `tests/`. Its output is shown only when it fails.
+//! `tests/`. Its output is shown only when it fails. A reactive program `P` with a file
+//! `tests/p.events` runs from the script in that file instead of the system's events.
 
 use std::fs;
 use std::io::Read;
@@ -103,18 +104,45 @@ fn drain(stream: Option<impl Read + Send + 'static>) -> std::thread::JoinHandle<
     })
 }
 
+/// The script in an events file, as `GARDEL_EVENTS` holds it: the file's words, without the
+/// lines that start with `#`. A line that starts with `> ` is a `Line` event with the rest of it.
+fn script_of(text: &str) -> String {
+    let mut words = Vec::new();
+    for line in text.lines().map(str::trim) {
+        if let Some(read) = line.strip_prefix("> ") {
+            let mut word = "Line:".to_string();
+            for b in read.bytes() {
+                if b.is_ascii_graphic() && b != b'%' {
+                    word.push(char::from(b));
+                } else {
+                    word.push_str(&format!("%{b:02X}"));
+                }
+            }
+            words.push(word);
+        } else if !line.starts_with('#') {
+            words.extend(line.split_whitespace().map(str::to_string));
+        }
+    }
+    words.join(" ")
+}
+
 enum Outcome {
     Exited(Option<i32>),
     TimedOut,
 }
 
-/// Runs a test program in `dir` with `input` on its standard input.
-fn run_program(exe: &Path, dir: &Path, input: Option<&Path>) -> std::io::Result<(Outcome, String)> {
+/// Runs a test program in `dir` with `input` on its standard input, from the script in `events`.
+fn run_program(exe: &Path, dir: &Path, input: Option<&Path>, events: Option<&Path>) -> std::io::Result<(Outcome, String)> {
     let stdin = match input {
         Some(p) => Stdio::from(fs::File::open(p)?),
         None => Stdio::null(),
     };
-    let mut child = Command::new(exe)
+    // Absolute, as the program runs in `dir`: Linux looks a relative path up from there.
+    let mut cmd = Command::new(std::path::absolute(exe)?);
+    if let Some(p) = events {
+        cmd.env("GARDEL_EVENTS", script_of(&fs::read_to_string(p)?));
+    }
+    let mut child = cmd
         .current_dir(dir)
         .stdin(stdin)
         .stdout(Stdio::piped())
@@ -229,8 +257,10 @@ pub(crate) fn run(args: &[String]) -> i32 {
                 }
             }
         }
+        let events = tests.join(format!("{stem}.events"));
+        let events = events.is_file().then_some(events.as_path());
         let began = Instant::now();
-        match run_program(&exe, &tests, input) {
+        match run_program(&exe, &tests, input, events) {
             Ok((Outcome::Exited(Some(0)), _)) => println!("[test] {name} ... ok ({})", seconds(began.elapsed())),
             Ok((outcome, output)) => {
                 let why = match outcome {

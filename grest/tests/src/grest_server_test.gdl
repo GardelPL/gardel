@@ -1,0 +1,31 @@
+-- The scripts of `grest_server_test.events`, run with `gtest`'s `SCRIPT`. Only the host can make
+-- a `CONN_ID`, so this is a reactive program: the events file gives it the connections that the
+-- scripts name, and then each script as a line. `GREST_LIMITS` is checked too.
+reactive program GREST_SERVER_TEST
+
+feature {ANY}
+
+  init(args: SEQ[STRING]): STEP[GREST_RUN]
+    do
+      Continue(GREST_RUN.empty, LIST.empty)
+    end
+
+  step(r: GREST_RUN, e: EVENT): STEP[GREST_RUN]
+    do
+      match e
+        case Accepted(c) then
+          Continue(r.connected(c), LIST.empty)
+        case Line(res) then
+          match res
+            case Ok(text) then Continue(r.ran(text), LIST.empty)
+            case Error(_) then Continue(r, LIST.empty)
+          end
+        case Shutdown then
+          let rs = r.results.append(GREST_LIMITS.checks)
+          Stop(TESTS.exit_code(rs), LIST.empty.prepend(Print(TESTS.report(rs))))
+        case _ then
+          Continue(r, LIST.empty)
+      end
+    end
+
+end

@@ -1,0 +1,76 @@
+-- The service that the scripts of `GREST_SCRIPTS` run. Its state is a `NAT`: a count of the
+-- bumps, or the tag of the last request that waited, or what its wake handler left in it.
+functions GREST_SERVICE
+
+feature {ANY}
+
+  hi(r: REST_REQUEST): HTTP_RESPONSE
+    do
+      REST_RESPONSE.ok_text("hi")
+    end
+
+  -- Adds one to the count, up to 1000.
+  bump(n: NAT, r: REST_REQUEST): REST_OUTCOME[NAT]
+    do
+      if n < 1000 then
+        REST_OUTCOME.make(n + 1, REST_RESPONSE.ok_text("bumped"))
+      else
+        REST_OUTCOME.make(n, REST_RESPONSE.error(HTTP_STATUS.make(409), "full"))
+      end
+    end
+
+  count(n: NAT, r: REST_REQUEST): HTTP_RESPONSE
+    do
+      if n <= 1000 then REST_RESPONSE.ok_json(JSON.int(I64.from_nat(n))) else REST_RESPONSE.not_found end
+    end
+
+  -- Waits through six sweeps for an upstream, whose tag is the state. It also asks for the
+  -- sweep's timer, which is not its own, and for a timer of its own.
+  up(n: NAT, r: REST_REQUEST, tag: NAT): REST_OUTCOME[NAT]
+    do
+      let start = LIST.empty.prepend(SetTimer(7, 50)).prepend(SetTimer(0, 50)).prepend(Connect(tag, "127.0.0.1", 9999))
+      REST_OUTCOME.waiting(tag, tag, start, 6, REST_RESPONSE.timed_out)
+    end
+
+  -- Waits with a tag it was not given.
+  forged(n: NAT, r: REST_REQUEST): REST_OUTCOME[NAT]
+    do
+      REST_OUTCOME.waiting(n, 999, LIST.empty.prepend(Connect(999, "127.0.0.1", 9999)), 3, REST_RESPONSE.timed_out)
+    end
+
+  -- An upstream that connects is sent `ping`; its first bytes answer the last request that
+  -- waited, and it is closed; one that does not connect answers `502`. A close, a failed send
+  -- and a timer only change the state, and the timer asks for timers too.
+  wake(n: NAT, e: EVENT): REST_WAKE[NAT]
+    do
+      match e
+        case Connected(_, c) then REST_WAKE.make(n, LIST.empty.prepend(Send(c, "ping".to_utf8)))
+        case ConnectFailed(t, _) then REST_WAKE.answering(n, LIST.empty, t, REST_RESPONSE.error(HTTP_STATUS.make(502), "down"))
+        case Received(c, _) then REST_WAKE.answering(n, LIST.empty.prepend(Close(c)), n, REST_RESPONSE.ok_text("pong"))
+        case Closed(_) then REST_WAKE.make(901, LIST.empty)
+        case SendFailed(_, _) then REST_WAKE.make(902, LIST.empty)
+        case Tick(_) then
+          REST_WAKE.make(903, LIST.empty.prepend(CancelTimer(8)).prepend(CancelTimer(0)).prepend(SetTimer(8, 50)).prepend(SetTimer(0, 50)))
+        case _ then REST_WAKE.make(n, LIST.empty)
+      end
+    end
+
+  routes: REST_ROUTER[NAT]
+    do
+      REST_ROUTER.empty
+        .on_get("/hi", hi)
+        .on(Post, "/bump", bump)
+        .on_view("/count", count)
+        .on_await(Get, "/up", up)
+        .on(Get, "/forged", forged)
+        .on_post("/posted", hi)
+        .on_put("/stored", hi)
+    end
+
+  -- With a pattern that is not valid.
+  broken: REST_ROUTER[NAT]
+    do
+      REST_ROUTER.empty.on_get("/hi", hi).on_get("/bad/:", hi)
+    end
+
+end

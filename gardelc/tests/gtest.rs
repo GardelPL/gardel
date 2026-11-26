@@ -212,6 +212,48 @@ end
     assert!(all(&out).contains("FAIL line 2: 3: expected \"7\", got \"6\""), "{}", all(&out));
 }
 
+/// A reactive program runs from the script in its `.events` file, whose lines that start with
+/// `#` are skipped. A line that starts with `> ` is a `Line` with the rest of it, as it is.
+#[test]
+fn a_reactive_program_runs_from_its_events_file() {
+    let source = "reactive program CONNS_TEST
+
+feature {ANY}
+
+  init(args: SEQ[STRING]): STEP[LIST[CONN_ID]]
+    do
+      Continue(LIST.empty, LIST.empty)
+    end
+
+  step(cs: LIST[CONN_ID], e: EVENT): STEP[LIST[CONN_ID]]
+    do
+      match e
+        case Accepted(c) then Continue(cs.append(LIST.singleton(c)), LIST.empty)
+        case Line(Ok(t)) then if t.equals(\"50% of  it, café\") then Continue(cs, LIST.empty) else Stop(3, LIST.empty.prepend(Print(t))) end
+        case Shutdown then
+          let rs = LIST.empty.prepend(CHECK.equal_nat(\"connections\", cs.length, 3))
+          Stop(TESTS.exit_code(rs), LIST.empty.prepend(Print(TESTS.report(rs))))
+        case _ then Continue(cs, LIST.empty)
+      end
+    end
+
+end
+";
+    let p = Package::new(
+        "events",
+        &[("double.gdl", DOUBLE)],
+        &[("src/conns_test.gdl", source), ("conns_test.events", "# three\nAccepted:1 Accepted:2\n  # not this: Accepted:9\n> 50% of  it, café\nAccepted:3\nShutdown\n")],
+    );
+    let out = p.test(&[]);
+    assert!(out.status.success(), "{}", all(&out));
+    assert!(all(&out).contains("[test] CONNS_TEST ... ok"), "{}", all(&out));
+
+    fs::write(p.dir.join("tests/conns_test.events"), "Accepted:1").expect("events");
+    let out = p.test(&[]);
+    assert_eq!(out.status.code(), Some(1), "{}", all(&out));
+    assert!(all(&out).contains("FAIL connections: expected 3, got 1"), "{}", all(&out));
+}
+
 /// A second run with nothing changed proves nothing again and compiles nothing again: every
 /// proof comes from the cache, and the executable is up to date. A change to a test is built
 /// again.

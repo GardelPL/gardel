@@ -1,0 +1,116 @@
+# What a `REST_SERVER` does over scripts of events, run by GREST_SERVER_TEST:
+#
+#   gardelc test grest --filter GREST_SERVER_TEST
+#
+# First seventy connections: only the host can make a `CONN_ID`, so this is how the scripts get
+# theirs. Then a script a line: its name, the server it runs, its events, ` => `, and what the
+# server does. See `src/grest_script.gdl` for how they are written, and `src/grest_service.gdl`
+# for the service.
+Accepted:1 Accepted:2 Accepted:3 Accepted:4 Accepted:5 Accepted:6 Accepted:7 Accepted:8 Accepted:9 Accepted:10
+Accepted:11 Accepted:12 Accepted:13 Accepted:14 Accepted:15 Accepted:16 Accepted:17 Accepted:18 Accepted:19 Accepted:20
+Accepted:21 Accepted:22 Accepted:23 Accepted:24 Accepted:25 Accepted:26 Accepted:27 Accepted:28 Accepted:29 Accepted:30
+Accepted:31 Accepted:32 Accepted:33 Accepted:34 Accepted:35 Accepted:36 Accepted:37 Accepted:38 Accepted:39 Accepted:40
+Accepted:41 Accepted:42 Accepted:43 Accepted:44 Accepted:45 Accepted:46 Accepted:47 Accepted:48 Accepted:49 Accepted:50
+Accepted:51 Accepted:52 Accepted:53 Accepted:54 Accepted:55 Accepted:56 Accepted:57 Accepted:58 Accepted:59 Accepted:60
+Accepted:61 Accepted:62 Accepted:63 Accepted:64 Accepted:65 Accepted:66 Accepted:67 Accepted:68 Accepted:69 Accepted:70
+
+# A router with a pattern that is not valid, or an argument that is not a port, stops the service
+# before it listens, with exit status 2, and a port it cannot listen on stops it with 1.
+> no-argument start => Listen:8090 SetTimer:0:1000 End:4:0:0
+> an-argument start:9001 => Listen:9001 SetTimer:0:1000 End:4:0:0
+> two-arguments start:9001:9002 => Listen:9001 SetTimer:0:1000 End:4:0:0
+> not-a-port start:99999 => Print:grest:_not_a_port:_99999 Stop:2
+> a-bad-route broken => Print:grest:_route_pattern_is_not_valid:_/bad/: Stop:2
+> waking-with-an-argument start_waking:9001 Closed:50 => Listen:9001 SetTimer:0:1000 End:901:0:0
+> listen-failed plain ListenFailed:8090 Tick:0 => Print:grest:_listen_failed Stop:1
+> shutdown plain Shutdown Tick:0 => Stop:0
+
+# Each way to start, over an event of a connection that is not the server's: a service that waits
+# for nothing closes it. The ports are those at each end.
+> made made Received:50:x => Close:50 End:4:0:0
+> made-waking made_waking Closed:50 => End:901:0:0
+> from-none from Received:50:x => Listen:8091 SetTimer:0:1000 Close:50 End:4:0:0
+> from-the-first-port from:1 SendFailed:50 => Listen:1 SetTimer:0:1000 Close:50 End:4:0:0
+> from-the-last-port from:65535 Closed:50 => Listen:65535 SetTimer:0:1000 End:4:0:0
+> from-below-the-first-port from:0 => Print:grest:_not_a_port:_0 Stop:2
+> from-past-the-last-port from:65536 => Print:grest:_not_a_port:_65536 Stop:2
+> waking-from-a-port from_waking:9002 SendFailed:50 => Listen:9002 SetTimer:0:1000 End:902:0:0
+> waking-from-none from_waking SendFailed:50 => Listen:8091 SetTimer:0:1000 End:902:0:0
+> a-bad-route-with-a-port broken_from:x => Print:grest:_route_pattern_is_not_valid:_/bad/: Stop:2
+> strangers plain Received:50:x SendFailed:51 Closed:52 Tick:9 Connected:0:53 ConnectFailed:0 => Close:50 Close:51 End:0:0:0
+
+# A full server closes the next connection it is given and answers none of its requests, each
+# request gets one answer, and a connection is freed by its answer.
+> full plain Accepted:<1-65> Received:65:GET_/hi_HTTP/1.1|Connection:_close|| Received:64:GET_/hi_HTTP/1.1|Connection:_close|| 2*Received:1:GET_/hi_HTTP/1.1|Connection:_close|| Accepted:66 Received:66:GET_/hi_HTTP/1.1|Connection:_close|| => Close:65 Close:65 Log:GET_/hi Send:64:200:close:2:hi Close:64 Log:GET_/hi Send:1:200:close:2:hi Close:1 Close:1 Log:GET_/hi Send:66:200:close:2:hi Close:66 End:0:62:0
+> closed-and-failed plain Accepted:<1-4> Closed:2 SendFailed:3 Received:<1-4>:GET_/hi_HTTP/1.1|| => Close:3 Log:GET_/hi Send:1:200:2:hi Close:2 Close:3 Log:GET_/hi Send:4:200:2:hi End:0:2:0
+
+# A connection stays open after an answer (F.8): requests in turn and requests sent at once are
+# answered in order, a `HEAD` answer has no body, and the connection closes after a request that
+# asks for it, after an HTTP/1.0 request, after bytes that are not a request, and after its 100th
+# request, whose answer says so. Bytes after the close are not read.
+> in-turn-and-at-once plain Accepted:1 2*Received:1:GET_/hi_HTTP/1.1|| Received:1:GET_/hi_HTTP/1.1||HEAD_/hi_HTTP/1.1||GET_/hi_HTTP/1.1|Connection:_keep-alive,_Close||GET_/hi_HTTP/1.1|| => 2*Log:GET_/hi;Send:1:200:2:hi Log:GET_/hi Log:HEAD_/hi Log:GET_/hi Send:1:200:2:hi Send:1:200:2: Send:1:200:close:2:hi Close:1 End:0:0:0
+> one-request-that-closes plain Accepted:1 Received:1:HEAD_/hi_HTTP/1.1|Connection:_close|| => Log:HEAD_/hi Send:1:200:close:2: Close:1 End:0:0:0
+> http-1.0 plain Accepted:2 Received:2:GET_/hi_HTTP/1.0|| => Log:GET_/hi Send:2:200:close:2:hi Close:2 End:0:0:0
+> 101-at-once plain Accepted:3 Received:3:101@GET_/hi_HTTP/1.1|| => 100*Log:GET_/hi 99*Send:3:200:2:hi Send:3:200:close:2:hi Close:3 End:0:0:0
+> 99-and-then-2 plain Accepted:4 Received:4:99@GET_/hi_HTTP/1.1|| Received:4:2@GET_/hi_HTTP/1.1|| => 99*Log:GET_/hi 99*Send:4:200:2:hi Log:GET_/hi Send:4:200:close:2:hi Close:4 End:0:0:0
+> not-a-request plain Accepted:5 Received:5:GET_/hi_HTTP/1.1||%00%00||GET_/hi_HTTP/1.1|| => Log:GET_/hi Send:5:200:2:hi Send:5:400:close:0: Close:5 End:0:0:0
+
+# The sweep (timer 0) closes a connection on the fifth sweep without a completed request, counted
+# from when it was accepted or last answered (F.8). Bytes that do not complete a request do not
+# count as one, and other timers do nothing.
+> swept plain Accepted:1 3*Tick:0 Accepted:2 Accepted:3 Tick:0 Received:2:GET_/hi_HTTP/1.1|| Received:3:GET_ Received:2:GET_/hi Tick:0 Received:3:/hi 10*Tick:7 Tick:0 Received:3:_HTTP Tick:0 Received:3:/1.1 Tick:0 Received:2:_HTTP/1.1|| 4*Tick:0 Accepted:4 Tick:0 => 4*SetTimer:0:1000 Log:GET_/hi Send:2:200:2:hi Close:1 3*SetTimer:0:1000 Close:3 SetTimer:0:1000 Log:GET_/hi Send:2:200:2:hi 4*SetTimer:0:1000 Close:2 SetTimer:0:1000 End:0:1:0
+
+# The state a handler gives back is the one the next request sees, in the order the requests
+# complete, and a request that is not answered by a handler, or that cannot be read, leaves it as
+# it was.
+> the-state plain Accepted:<1-7> Received:1:POST_/bump_HTTP/1.1| Received:2:POST_/bump_HTTP/1.1|| Received:1:| Received:3:POST_/nothing_HTTP/1.1|| Received:4:DELETE_/bump_HTTP/1.1|| Received:5:GET_/count%25zz_HTTP/1.1|| Received:6:%00%00|| Received:7:GET_/count_HTTP/1.1|| => Log:POST_/bump Send:2:200:6:bumped Log:POST_/bump Send:1:200:6:bumped Log:POST_/nothing Send:3:404:21:{"error":"not_found"} Log:DELETE_/bump Send:4:405:30:{"error":"method_not_allowed"} Log:GET_/count%zz Send:5:400:49:{"error":"a_%_is_not_followed_by_two_hex_digits"} Send:6:400:close:0: Close:6 Log:GET_/count Send:7:200:1:2 End:2:6:0
+> three-bumps-at-once plain Accepted:1 Received:1:3@POST_/bump_HTTP/1.1||&GET_/count_HTTP/1.1|| => 3*Log:POST_/bump Log:GET_/count 3*Send:1:200:6:bumped Send:1:200:1:3 End:3:1:0
+> two-bumps-and-a-close plain Accepted:1 Received:1:2@POST_/bump_HTTP/1.1||&POST_/bump_HTTP/1.1|Connection:_close|| => 3*Log:POST_/bump 2*Send:1:200:6:bumped Send:1:200:close:6:bumped Close:1 End:3:0:0
+> a-post-and-a-put plain Accepted:1 Received:1:POST_/posted_HTTP/1.1|| Received:1:PUT_/stored_HTTP/1.1|| Received:1:GET_/posted_HTTP/1.1|| Received:1:POST_/stored_HTTP/1.1|| => Log:POST_/posted Send:1:200:2:hi Log:PUT_/stored Send:1:200:2:hi Log:GET_/posted Send:1:405:30:{"error":"method_not_allowed"} Log:POST_/stored Send:1:405:30:{"error":"method_not_allowed"} End:0:1:0
+
+# An async handler (F.8): a request waits while the server answers others, and is answered by its
+# tag when the upstream answers; a request whose upstream does not answer is answered `504` on its
+# sixth sweep, and its connection is not swept as idle meanwhile; a failed connect is a `502`; an
+# answer to a request that no longer waits, as it timed out or its connection closed, is dropped;
+# a handler that waits with a tag it was not given is answered at once; bytes while a request
+# waits close the connection, unanswered.
+> answered-by-its-upstream waking Accepted:1 Received:1:GET_/up_HTTP/1.1|| Accepted:2 Received:2:GET_/hi_HTTP/1.1|| Connected:0:50 Received:50:pong Received:1:GET_/hi_HTTP/1.1|| => Log:GET_/up Connect:0:127.0.0.1:9999 SetTimer:7:50 Log:GET_/hi Send:2:200:2:hi Send:50:ping Close:50 Send:1:200:4:pong Log:GET_/hi Send:1:200:2:hi End:0:2:0
+> timed-out waking Accepted:<1-2> Received:2:GET_/up_HTTP/1.1|| 3*Tick:0 Received:1:GET_/hi_HTTP/1.1|| 3*Tick:0 Received:51:late Received:2:GET_/hi_HTTP/1.1|| => Log:GET_/up Connect:0:127.0.0.1:9999 SetTimer:7:50 3*SetTimer:0:1000 Log:GET_/hi Send:1:200:2:hi 2*SetTimer:0:1000 Send:2:504:21:{"error":"timed_out"} SetTimer:0:1000 Close:51 Log:GET_/hi Send:2:200:2:hi End:0:2:0
+> a-failed-connect waking Accepted:1 Received:1:GET_/up_HTTP/1.1|| ConnectFailed:3 ConnectFailed:0 ConnectFailed:0 => Log:GET_/up Connect:0:127.0.0.1:9999 SetTimer:7:50 Send:1:502:16:{"error":"down"} End:0:1:0
+> closed-while-it-waits waking Accepted:3 Received:3:GET_/up_HTTP/1.1|| Closed:3 Received:52:pong => Log:GET_/up Connect:0:127.0.0.1:9999 SetTimer:7:50 Close:52 End:0:0:0
+> failed-while-it-waits waking Accepted:3 Received:3:GET_/up_HTTP/1.1|| SendFailed:3 Received:52:pong => Log:GET_/up Connect:0:127.0.0.1:9999 SetTimer:7:50 Close:3 Close:52 End:0:0:0
+> a-forged-tag waking Accepted:1 Received:1:GET_/forged_HTTP/1.1|| => Log:GET_/forged Send:1:504:21:{"error":"timed_out"} End:0:1:0
+> bytes-while-it-waits waking Accepted:5 Received:5:GET_/up_HTTP/1.1|| Received:5:GET_/hi_HTTP/1.1|| Received:54:pong => Log:GET_/up Connect:0:127.0.0.1:9999 SetTimer:7:50 Close:5 Close:54 End:0:0:0
+> answers-before-it waking Accepted:1 Received:1:2@GET_/hi_HTTP/1.1||&GET_/up_HTTP/1.1|| Received:50:pong Received:1:GET_/hi_HTTP/1.1|| => 2*Log:GET_/hi Log:GET_/up 2*Send:1:200:2:hi Connect:0:127.0.0.1:9999 SetTimer:7:50 Close:50 Send:1:200:4:pong Log:GET_/hi Send:1:200:2:hi End:0:1:0
+> two-wait waking Accepted:<1-2> Received:<1-2>:GET_/up_HTTP/1.1|| Received:50:pong 5*Tick:0 ConnectFailed:0 Tick:0 => Log:GET_/up;Connect:<0-1>:127.0.0.1:9999;SetTimer:7:50 Close:50 Send:2:200:4:pong 4*SetTimer:0:1000 Close:2 SetTimer:0:1000 Send:1:502:16:{"error":"down"} SetTimer:0:1000 End:1:1:0
+
+# A request that waits and is the last its connection sends, as something came after it or it
+# asked to close, and one for a `HEAD`: how its answer is sent, in time and late.
+> a-request-after-it waking Accepted:1 Received:1:GET_/up_HTTP/1.1||GET_/hi_HTTP/1.1|| Received:50:pong => Log:GET_/up Log:GET_/hi Connect:0:127.0.0.1:9999 SetTimer:7:50 Close:50 Send:1:200:close:4:pong Close:1 End:0:0:0
+> part-of-a-request-after-it waking Accepted:1 Received:1:GET_/up_HTTP/1.1||G Received:50:pong => Log:GET_/up Connect:0:127.0.0.1:9999 SetTimer:7:50 Close:50 Send:1:200:close:4:pong Close:1 End:0:0:0
+> not-a-request-after-it waking Accepted:1 Received:1:GET_/up_HTTP/1.1||%00%00|| Received:50:pong => Log:GET_/up Connect:0:127.0.0.1:9999 SetTimer:7:50 Close:50 Send:1:200:close:4:pong Close:1 End:0:0:0
+> bytes-after-not-a-request waking Accepted:1 Received:1:GET_/up_HTTP/1.1||%00%00|| Received:1:GET_/hi_HTTP/1.1|| Received:50:pong => Log:GET_/up Connect:0:127.0.0.1:9999 SetTimer:7:50 Close:1 Close:50 End:0:0:0
+> bytes-after-part-of-a-request waking Accepted:1 Received:1:GET_/up_HTTP/1.1||G Received:1:ET_/hi_HTTP/1.1|| Received:50:pong => Log:GET_/up Connect:0:127.0.0.1:9999 SetTimer:7:50 Close:1 Close:50 End:0:0:0
+> bytes-after-asked-to-close waking Accepted:1 Received:1:GET_/up_HTTP/1.1|Connection:_close|| Received:1:GET_/hi_HTTP/1.1|| Received:50:pong => Log:GET_/up Connect:0:127.0.0.1:9999 SetTimer:7:50 Close:1 Close:50 End:0:0:0
+> asked-to-close waking Accepted:1 Received:1:GET_/up_HTTP/1.1|Connection:_close|| Received:50:pong => Log:GET_/up Connect:0:127.0.0.1:9999 SetTimer:7:50 Close:50 Send:1:200:close:4:pong Close:1 End:0:0:0
+> asked-to-close-and-late waking Accepted:1 Received:1:GET_/up_HTTP/1.1|Connection:_close|| 7*Tick:0 => Log:GET_/up Connect:0:127.0.0.1:9999 SetTimer:7:50 5*SetTimer:0:1000 Send:1:504:close:21:{"error":"timed_out"} Close:1 2*SetTimer:0:1000 End:0:0:0
+> a-head waking Accepted:1 Received:1:HEAD_/up_HTTP/1.1|| Received:50:pong => Log:HEAD_/up Connect:0:127.0.0.1:9999 SetTimer:7:50 Close:50 Send:1:200:4: End:0:1:0
+> a-head-and-late waking Accepted:1 Received:1:HEAD_/up_HTTP/1.1|| 6*Tick:0 => Log:HEAD_/up Connect:0:127.0.0.1:9999 SetTimer:7:50 5*SetTimer:0:1000 Send:1:504:21: SetTimer:0:1000 End:0:1:0
+> a-head-that-closes waking Accepted:1 Received:1:HEAD_/up_HTTP/1.1|Connection:_close|| Received:50:pong => Log:HEAD_/up Connect:0:127.0.0.1:9999 SetTimer:7:50 Close:50 Send:1:200:close:4: Close:1 End:0:0:0
+
+# 32 requests wait, and a 33rd that would is a `503`. Their time runs out on one sweep: each is
+# answered late, the oldest first, after the idle connections are closed, and then reads again. A
+# late answer may close its connection, between two that do not.
+> 32-wait waking Accepted:<1-2> Accepted:<10-42> Received:<10-42>:GET_/up_HTTP/1.1|| 6*Tick:0 Received:<10-41>:GET_/hi_HTTP/1.1|| => Log:GET_/up;Connect:<0-31>:127.0.0.1:9999;SetTimer:7:50 Log:GET_/up Send:42:503:16:{"error":"busy"} 4*SetTimer:0:1000 Close:42 Close:2 Close:1 SetTimer:0:1000 Send:<10-41>:504:21:{"error":"timed_out"} SetTimer:0:1000 Log:GET_/hi;Send:<10-41>:200:2:hi End:31:32:0
+> three-late-and-one-closes waking Accepted:<1-3> Received:1:GET_/up_HTTP/1.1|| Received:2:GET_/up_HTTP/1.1|Connection:_close|| Received:3:GET_/up_HTTP/1.1|| 6*Tick:0 Received:<1-3>:GET_/hi_HTTP/1.1|| => Log:GET_/up;Connect:<0-2>:127.0.0.1:9999;SetTimer:7:50 5*SetTimer:0:1000 Send:1:504:21:{"error":"timed_out"} Send:2:504:close:21:{"error":"timed_out"} Close:2 Send:3:504:21:{"error":"timed_out"} SetTimer:0:1000 Log:GET_/hi Send:1:200:2:hi Close:2 Log:GET_/hi Send:3:200:2:hi End:2:2:0
+
+# An event that is not the server's own goes to the service, whose state is what it gave, and the
+# server sends only the commands that name none of its connections and leave its sweep alone.
+> a-timer-of-the-service waking Tick:9 => SetTimer:8:50 CancelTimer:8 End:903:0:0
+> a-stranger-closed waking Accepted:1 Closed:50 => End:901:1:0
+> a-stranger-failed waking Accepted:1 SendFailed:50 => End:902:1:0
+> a-stranger-connected waking Accepted:1 Connected:4:50 => Send:50:ping End:0:1:0
+> one-of-its-own-connected waking Accepted:1 Connected:4:1 => End:0:1:0
+> its-own-closed-and-failed waking Accepted:<1-2> Closed:1 SendFailed:2 => Close:2 End:0:0:0
+> the-sweep waking Tick:0 => SetTimer:0:1000 End:0:0:0
+Shutdown

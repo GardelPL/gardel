@@ -287,6 +287,10 @@ feature {ANY}
       end
     ensure
       below_cap: Result < 100
+      def: Result = (match Current.connections.lookup_connection(c)
+        case None then 0
+        case Some(conn) then conn.completed_requests
+      end)
     end
 
   -- The wait under the tag `t`, if a request waits under it.
@@ -321,12 +325,12 @@ feature {ANY}
   -- `closing`, and an answer to a `HEAD` has no body. A request whose handler waits with the
   -- tag `w` offers is held: the answers before it are sent, then its handler's commands of
   -- the service's own, and neither the requests after it nor `after`; its connection closes
-  -- after its answer when `closing`, or when anything came after it.
+  -- after its answer when a request came after it. `settled` closes it when anything else did,
+  -- or when it asked to.
   replies(s: S, reqs: LIST[HTTP_REQUEST], c: CONN_ID, closing: BOOL, after: LIST[COMMAND], w: OPTION[NAT]): REST_REPLIES[S]
     require
       held: Current.holds(c)
       shaped: REST_COMMANDS.for_conn(after, c)
-      few: reqs.length <= 100
       short: after.length <= 2
     variant
       reqs.length
@@ -336,7 +340,7 @@ feature {ANY}
       else
         let out = Current.api.dispatch_as(s, reqs.head, w)
         if out.held_by(w) then
-          Current.held_reply(out, reqs.head, c, closing or reqs.length > 1 or after.length > 0)
+          Current.held_reply(out, reqs.head, c, reqs.length > 1)
         else
           let wire = HTTP_SERIALIZER.serialize_answer(out.response, reqs.head.method = Head, closing and (reqs.length = 1))
           Current.replies(out.state, reqs.tail, c, closing, after, w).sent_first(Send(c, wire))
@@ -425,7 +429,6 @@ feature {ANY}
     require
       same_limit: done.max_connections = Current.max_connections
       tagged: r.holds_wait implies Current.offered = Some(r.wait_tag)
-      few: reqs.length + r.commands.length <= 1000
     do
       let cmds = REST_COMMANDS.logged(reqs, r.commands, c, Current.conns)
       if r.holds_wait then
@@ -456,7 +459,7 @@ feature {ANY}
             Continue(Current.without(c), REST_COMMANDS.close_only(c))
           else
             let b = HTTP_PIPELINE.split(conn, data)
-            let w = Current.queue.offered
+            let w = Current.offered
             match b.ending
               case ReadOn(n) then
                 Current.settled(c, b.requests, Current.replies(Current.app, b.requests, c, False, LIST.empty, w),

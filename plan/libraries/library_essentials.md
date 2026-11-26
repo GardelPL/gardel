@@ -1,7 +1,7 @@
 # Phase H: Library Essentials
 
 **Date:** November 12, 2026
-**Status:** In progress. H.0a is done (2026-11-16), H.0b and H.0c (2026-11-17), and H.0d (2026-11-18). Decisions 4 and 13 are taken; no other decision below is.
+**Status:** In progress. Done (2026-11-16 to 2026-11-25): H.0a to H.0e, H.1 to H.6, H.9, H.10, H.21, H.22 and H.22b, but for `HASH_MAP` (H.4). Not started: H.6b, H.7, H.8 and H.11 to H.20. Decisions 1 to 6, 10, 13 and 15 are taken.
 **Follows:** [Phase F](verified_libraries.md) (verified libraries) and [Phase G](../ffi/ffi_plan.md) (foreign interfaces).
 
 ---
@@ -818,18 +818,18 @@ Client: every package. Today each package's tests are a `cases.txt` read on stan
 
 Client: this plan's own rule. Phases E and F made well over a hundred mutations by hand, each on a private copy.
 
-**Status:** ✅ The tool is done (2026-11-24). Its acceptance test is met for eleven of `grest`'s modules, and not for the other six (see the results).
+**Status:** ✅ Completed (2026-11-25). The tool was done on 2026-11-24, with its acceptance test met for eleven of `grest`'s modules. The other six followed.
 
 - [x] Mutation operators on `.gdl` source: a constant off by one, a comparison swapped (`<` and `<=`), a condition negated, a branch replaced by the other, a `require` or an invariant clause dropped, an argument pair swapped, a call's result replaced by its argument.
 - [x] Each mutant is built in a private copy and run through verification and `gardelc test`. A mutant that passes both is a survivor.
 - [x] Report: per mutant, what killed it, the verifier (with the clause) or a test (with its name). This is the split Phase F reports by hand, and it shows what is proven against what is only tested.
 - [x] `--only <module>`, and a limit on the number of mutants, chosen by a seed.
 - [x] A way to mark a mutant as equivalent, in a file beside the package (`Gardel.mutants`, one a line as the report writes it, with the reason as a comment), so it is not reported again.
-- Acceptance: on `grest`, the tool finds no survivor among the operators that Phase F's hand-made mutations covered. On a copy of `grest` with one test case removed, it finds one. The second half is met. The first is met for the modules below only.
+- Acceptance: on `grest`, the tool finds no survivor among the operators that Phase F's hand-made mutations covered. On a copy of `grest` with one test case removed, it finds one. Both are met, for all seventeen modules (see the limits for what was not proven).
 
 **How it works.** The AST has no spans, so the parser records where each expression, clause and literal is when it is asked to (`parse_sites`), and a mutant is a change of the source text. `--fail-fast` verifies the mutated module first and stops at the first module with an error. Only code is changed, not what is ghost.
 
-**Results, on `grest` (2026-11-24).**
+**Results, on `grest` (2026-11-24 and 2026-11-25).**
 
 | Run | Mutants | Verifier | Not proven | Test | Survived | Not a program |
 | :--- | :--- | :--- | :--- | :--- | :--- | :--- |
@@ -838,22 +838,38 @@ Client: this plan's own rule. Phases E and F made well over a hundred mutations 
 | 100 of the whole package, seed 1 | 100 | 28 | 1 | 5 | 9 | 57 |
 | The ten modules below, before | 688 | 209 | 8 | 114 | 16 | 341 |
 | Those ten and `REST_WAITING`, after, 8 marked | 782 | 265 | 12 | 118 | 0 | 387 |
+| The other six, with the scripts in `grest/tests` | 1649 | 402 | 6 | 153 | 22 | 1066 |
+| Those six, 0.8.2, 5 marked | 1627 | 407 | 6 | 150 | 0 | 1064 |
 
 - The ten modules are `URL_TEXT`, `REQUEST_TARGET`, `PATH_PATTERN`, `PATH_SEGMENT`, `URL_ERROR`, `URL_PARAM`, `REST_WAIT`, `REST_ROUTE`, `REST_OUTCOME` and `REST_REQUEST`. The last run took 4759 s with 10 jobs.
 - `REST_WAITING`'s six were a real gap. That a held wait replaces an earlier one on its connection was unproven, and that tags are given in order was only a comment. Both are now stated (`holding_replaces`, `next_given`).
 - The ten modules' 16: seven were equivalent, and are marked. Two were a `require` that no proof needs, and are gone. Three are refused by a new clause (`PATH_PATTERN.segment_count`, `URL_PARAM.find`, `REST_WAIT.wire`). Four needed a case: a `+` in the name of a query field (two of them), a target with too many fields at the router, and an async handler given a tag, for which `cases.txt` has a new kind, `await`.
 - The 12 not proven all drop or move a limit (16 segments, 32 fields) and time out, so they were refused but not shown to be wrong. `cases.txt` has each limit and one past it.
 - With a case removed: `REQUEST_TARGET.read_query`'s `32 -> 31` is killed by a test with the whole `cases.txt`, and survives without the 32-field case.
-- **Not met: `REST_SERVER`, `REST_COMMANDS`, `REST_REPLIES`, `REST_RESPONSE`, `REST_ROUTER` and `REST_WAKE`.** They hold about 1,650 of the 2,440 mutants, and were only sampled. Eight of the sample's nine survivors are in four of them: `REST_SERVER` (5), `REST_REPLIES`, `REST_COMMANDS` and `REST_WAKE`. Most change what only the scripted runs in `gardelc/tests/grest.rs` exercise, which `mutate` does not run. Whether those runs kill them has not been checked. Moving them to `grest/tests`, with `SCRIPT.play`, would let the tool see them.
+- **The other six: `REST_SERVER`, `REST_COMMANDS`, `REST_REPLIES`, `REST_RESPONSE`, `REST_ROUTER` and `REST_WAKE` (2026-11-25).** They hold two thirds of the mutants, and were only sampled at first: eight of the sample's nine survivors were in them. Most change what only a scripted run in `gardelc/tests/grest.rs` exercised, which `mutate` did not run. Those runs are now `grest/tests/grest_server_test.events`, 58 scripts, with 3 more since. The last run of the six took 7140 s with 10 jobs.
+  - The 22 survivors: 9 are refused by a new clause, 1 by a new script, 7 are gone with code that was not needed, 1 was a `require` that no proof needs, and 4 are equivalent, and are marked.
+  - **A real gap: `capped` said less than it seemed.** The clause says that no connection gets more than 100 answers. It counts them with `REST_COMMANDS.sent_to` and `REST_SERVER.answered_on`, which had no clause to say what they count: a `sent_to` that always gives 0 passed every proof. Both now state it, and `capped` still holds.
+  - That a held request's connection closes after its answer was decided in two places, `replies` and `settled`. Now `replies` decides it only for a request that came after, and `settled` for the rest.
+  - After that, five `require` clauses were not needed. Four are gone. The fifth, `woken` of `delivered`, follows from `own`, but without all five `REST_SERVER` times out; with `woken` alone it is proven in 104 s. It stays, and is marked.
+  - The 6 not proven are in `REST_SERVER`, and time out.
+
+**Scripts of a server in `grest/tests`.** `CONN_ID` is opaque and only the host makes one, so a plain test program cannot build `Accepted(c)` for `SCRIPT.play`. `gardelc test` now runs a reactive test program from `tests/<name>.events`, if there is one: its words are events, a line `> text` is `Line(Ok(text))`, and a line that starts with `#` is a comment. `GREST_SERVER_TEST` is given its connections as events and each script as a line, which it runs purely with `SCRIPT.run`. `GREST_LIMITS` has 16 checks of the limits of `REST_RESPONSE`, `REST_COMMANDS` and `REST_WAKE`.
+
+**Found on the way, in the compiler, and not fixed: a program that verifies can crash.** `head` and `tail` of a `LIST` have no precondition. `match xs.head case Some(_) then True case None then False end` verifies for any `xs: LIST[OPTION[NAT]]`, and in C it reads through a null pointer when `xs` is empty (a segmentation fault, 2026-11-25, with 0 errors and 0 warnings). An element of a number type is refused only as out of range, by chance. Found by a mutant of `one_answer` with its check for an empty list removed, which is marked for now. The fix is an obligation, `length > 0`, at each `head` and `tail` in code. What it costs in the stdlib and the libraries is not measured.
+
+**Found on the Linux run, and fixed: `gardelc test` could start no program there** (since H.9). It gave a relative path to the program and ran it in `tests`, and Linux looks a relative path up from the directory the program runs in, so each test program was "not found". Windows looks it up from the caller's, so H.9 and H.10, run on Windows only, passed. The path is now absolute.
 
 **Known limits.**
+- A mutant that is not proven is refused, but not shown to be wrong, and its tests are not run. `grest` has 18 of them.
 - Half the mutants are of the wrong type, and are refused in 0.3 s to 2 s. A survivor costs the whole package and its tests, about 5 minutes in `grest`.
 - A default routine of a concept is not mutated.
 - A condition that is one `=` gives two mutants that mean the same, negated and `!=`.
 - A call replaced by a part in parentheses, on the line after a `let`, can be read as a call of the `let`'s value (H.9's limit), so it is refused as ill-typed instead of tried.
 - Some mutations made by hand are not among the operators: a call to another routine (`off` for `on`), a whole field set to `MAP.empty`.
 
-**Totals, with the `GET /todos` fix.** All 564 tests pass: the 242 unit tests and 322 in 48 suites (the `gtui` frame-time test run alone). The stdlib is 0/0 (37 modules). Run on Windows only.
+**Totals, with the `GET /todos` fix (2026-11-24).** All 564 tests pass: the 242 unit tests and 322 in 48 suites (the `gtui` frame-time test run alone). The stdlib is 0/0 (37 modules). Run on Windows only.
+
+**Totals, at the end (2026-11-25).** On Windows, all 560 tests pass: the 242 unit tests and 318 in 48 suites, as the five scripted runs left `tests/grest.rs` and one test came in `tests/gtest.rs`. On Linux, in Docker, all 561 pass (243 unit tests there). The `gtui` frame-time test is run alone on each, and the stdlib is 0/0 on each. `gtest`, `grest` and `mutate` were run again on both after the fix to `gardelc test`.
 
 ### Step 5: Time, hashes and configuration
 

@@ -1,0 +1,96 @@
+-- A script of `grest_server_test.events`: its name, the server it runs, its events, ` => ` and
+-- what the server does. See `GREST_SCRIPT` for the events and what they give. The servers are:
+--
+--   plain, waking                the server of `start` or `start_waking` in the state 0, once it
+--                                has started
+--   start, start_waking          the same, in the state 4 as below, with the commands that start
+--                                it; `start:9001` gives it an argument, `start:1:2` gives two
+--   from, from_waking            that of `start_from` or `start_waking_from`, on 8091 or on the
+--                                port of `from:9001`
+--   broken, broken_from          that of `start` or `start_from` with a bad route
+--   made, made_waking            that of `make` or `make_waking`, with no commands
+functions GREST_SCRIPTS
+
+feature {ANY}
+
+  wake(n: NAT, e: EVENT): REST_WAKE[NAT]
+    do
+      GREST_SERVICE.wake(n, e)
+    end
+
+  -- `st` with no commands.
+  started(st: STEP[REST_SERVER[NAT]]): STEP[REST_SERVER[NAT]]
+    do
+      match st
+        case Continue(s, _) then Continue(s, LIST.empty)
+        case Stop(code, cmds) then Stop(code, cmds)
+      end
+    end
+
+  -- The arguments of a program, at most two.
+  arguments(ws: LIST[STRING]): SEQ[STRING]
+    do
+      if ws.length = 0 then
+        Empty
+      else if ws.length = 1 then
+        Leaf(ws.head)
+      else
+        Concat(Leaf(ws.head), Leaf(ws.tail.head), 2)
+      end end
+    end
+
+  -- The server that a script calls `kind`, given the arguments `ws`.
+  server(kind: STRING, ws: LIST[STRING]): OPTION[STEP[REST_SERVER[NAT]]]
+    do
+      let api = GREST_SERVICE.routes
+      let given = if ws.length = 0 then None else Some(ws.head) end
+      if kind.equals("plain") then
+        Some(GREST_SCRIPTS.started(REST_SERVER.start(Empty, 8090, api, 0)))
+      else if kind.equals("waking") then
+        Some(GREST_SCRIPTS.started(REST_SERVER.start_waking(Empty, 8090, api, wake, 0)))
+      else if kind.equals("start") then
+        Some(REST_SERVER.start(GREST_SCRIPTS.arguments(ws), 8090, api, 4))
+      else if kind.equals("start_waking") then
+        Some(REST_SERVER.start_waking(GREST_SCRIPTS.arguments(ws), 8090, api, wake, 4))
+      else if kind.equals("from") then
+        Some(REST_SERVER.start_from(given, 8091, api, 4))
+      else if kind.equals("from_waking") then
+        Some(REST_SERVER.start_waking_from(given, 8091, api, wake, 4))
+      else if kind.equals("broken") then
+        Some(REST_SERVER.start(Empty, 8090, GREST_SERVICE.broken, 4))
+      else if kind.equals("broken_from") then
+        Some(REST_SERVER.start_from(given, 8091, GREST_SERVICE.broken, 4))
+      else if kind.equals("made") then
+        Some(Continue(REST_SERVER.make(8090, api, 4), LIST.empty))
+      else if kind.equals("made_waking") then
+        Some(Continue(REST_SERVER.make_waking(8090, api, wake, 4), LIST.empty))
+      else
+        None
+      end end end end end end end end end end
+    end
+
+  -- The check of a script, whose connections are `cs`, and of what it gives.
+  check(cs: LIST[CONN_ID], script: STRING, expected: STRING): TEST_RESULT
+    do
+      let ws = script.split(' ')
+      let name = GREST_SCRIPT.word(ws, 0)
+      let way = GREST_SCRIPT.word(ws, 1).split(':')
+      let rest = if ws.length >= 2 then LIST_OPS.drop(ws, 2) else LIST.empty end
+      let args = if way.length >= 1 then way.tail else LIST.empty end
+      match GREST_SCRIPTS.server(GREST_SCRIPT.word(way, 0), args)
+        case None then Fail(name, "not a server")
+        case Some(st) then GREST_SCRIPT.check(name, cs, st, GREST_SCRIPT.joined(rest, " "), expected)
+      end
+    end
+
+  -- `rs` with the result of `line` before it.
+  add(cs: LIST[CONN_ID], rs: LIST[TEST_RESULT], line: STRING): LIST[TEST_RESULT]
+    do
+      match CASES.read(line)
+        case Blank then rs
+        case NoArrow then rs.prepend(Fail(line, "no ` => ` on this line"))
+        case Pair(script, expected) then rs.prepend(GREST_SCRIPTS.check(cs, script, expected))
+      end
+    end
+
+end
