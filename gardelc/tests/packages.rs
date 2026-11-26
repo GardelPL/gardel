@@ -1030,6 +1030,58 @@ end
     assert_ok(&world.run("root", &["--strict"]));
 }
 
+/// A routine's result whose type is known to differ from the declared one is refused where it
+/// is given, in its body or a branch of an `if` or `match` there (`E0118`). Before, it was
+/// refused only by Boogie's type check, as `E0199`; a `CHAR` returned as a `NAT` was not
+/// refused at all.
+#[test]
+fn a_result_must_have_the_declared_type() {
+    let module = |ty: &str, body: &str| {
+        format!(
+            "functions RES
+
+feature {{ANY}}
+
+  id(x: NAT): NAT
+    do
+      x
+    end
+
+  t(xs: LIST[NAT], y: I64, c: CHAR, o: OPTION[NAT], b: BOOL): {ty}
+    do
+      {body}
+    end
+
+end
+"
+        )
+    };
+    for (ty, body) in [
+        ("NAT", "True"),
+        ("NAT", "c"),
+        ("BOOL", "RES.id(3)"),
+        ("OPTION[NAT]", "Some(True)"),
+        ("LIST[NAT]", "xs.head"),
+        ("NAT", "if b then 1 else False end"),
+        ("NAT", "match o case Some(v) then v case None then b end"),
+    ] {
+        let world = World::new("res_mismatch", &[]);
+        world.package("root", &[], &[("res.gdl", &module(ty, body))]);
+        assert_refused(&world.run("root", &[]), "E0118: result_type_mismatch");
+    }
+    // Numbers of the integer types pass for one another, and a branch may be any of them.
+    for (ty, body) in [
+        ("NAT", "match o case Some(v) then v case None then 0 end"),
+        ("OPTION[NAT]", "if b then Some(3) else o end"),
+        ("LIST[NAT]", "xs.prepend(3)"),
+        ("NAT", "c.code"),
+    ] {
+        let world = World::new("res_match", &[]);
+        world.package("root", &[], &[("res.gdl", &module(ty, body))]);
+        assert_ok(&world.run("root", &["--strict"]));
+    }
+}
+
 /// A declared type settles what the value alone leaves open, here across a package boundary,
 /// so it has to be resolved like any other type.
 #[test]

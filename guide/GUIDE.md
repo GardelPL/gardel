@@ -2656,6 +2656,7 @@ There are no import statements. Before anything is verified, `gardelc` resolves 
 | `E0115: reserved_name` | A declared name of the form `PK<n>_...`, which is how a dependency's names are held internally |
 | `E0116: let_type_mismatch` | A `let x: T = e` whose value is known to have another type, or an integer literal that does not fit `T` |
 | `E0117: argument_type_mismatch` | An argument of another type than its parameter, such as `xs.append(4)`: `append` joins two lists, so the element goes in `prepend`. Integer types pass for one another where the range allows |
+| `E0118: result_type_mismatch` | A result of another type than the routine declares, such as `xs.head` for a `LIST[NAT]`, or one branch of an `if` that gives a `BOOL` where the other gives a number. Integer types pass for one another where the range allows |
 | `E0199: verifier_translation_failed` | The verifier could not accept what `gardelc` generated. The module is not verified. This is a limit of the compiler, not a fault shown in your program, and `GARDEL_KEEP_BPL=1` keeps the generated file. |
 
 Exporting to a named module across files, as in `feature {OTHER}`, is not usable yet: the export list counts as a dependency, so it forms a cycle (`E0103`).

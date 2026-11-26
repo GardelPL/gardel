@@ -227,6 +227,9 @@ struct Walker<'a, 'u> {
     scope: Vec<(String, Option<String>)>,
     /// The declared type of the `let` that comes next.
     let_type: Option<String>,
+    /// The routine's result type, while the walk is at a value the routine returns: its body,
+    /// or a branch of an `if` or `match` there.
+    result_want: Option<String>,
     diags: &'u mut Vec<Diagnostic>,
     reported: &'u mut HashSet<(&'static str, String, String)>,
 }
@@ -389,6 +392,8 @@ impl<'a> Walker<'a, '_> {
             Expr::Var(v) if v == "Current" && !self.in_scope("Current") => {
                 Some(module_self_type(self.module))
             }
+            // A constructor of no fields, such as `None` or `Fine`.
+            Expr::Var(v) if !self.in_scope(v) && starts_upper(v) && !all_caps(v) => self.ctor_type(v, &[]),
             Expr::Var(v) => self.scope.iter().rev().find(|(n, _)| n == v).and_then(|(_, t)| t.clone()),
             Expr::Str(_) => Some("STRING".to_string()),
             Expr::Call(f, args) if !self.in_scope(f) && starts_upper(f) => self.ctor_type(f, args),
@@ -440,6 +445,9 @@ impl<'a> Walker<'a, '_> {
         let owners = self.universe.user_ctors.get(name).cloned().unwrap_or_default();
         let owner = if ctor_names(self.module).contains(&name) {
             self.module
+        } else if owners.len() > 1 {
+            // `E0112` already: it is no one's.
+            return None;
         } else {
             self.ctor_owner(name, &owners)?
         };
@@ -655,12 +663,39 @@ impl<'a> Walker<'a, '_> {
     }
 
     fn block(&mut self, stmts: &[Stmt], body: &Expr) {
+        self.block_returning(stmts, body, None);
+    }
+
+    /// A block whose value is the routine's result when `want` is its type.
+    fn block_returning(&mut self, stmts: &[Stmt], body: &Expr, want: Option<String>) {
         let mark = self.scope.len();
         for st in stmts {
             self.stmt(st);
         }
+        self.result_want = want;
         self.expr(body);
         self.scope.truncate(mark);
+    }
+
+    /// A value the routine returns, against its declared result type `want`.
+    fn check_result_type(&mut self, e: &Expr, want: &str) {
+        let Some(found) = self.arg_type(e) else { return };
+        if self.may_fit(&found, want) {
+            return;
+        }
+        let needle = match e {
+            Expr::Var(v) => v.clone(),
+            Expr::Call(f, _) => f.clone(),
+            Expr::MethodCall(_, n, _) => n.clone(),
+            Expr::Bool(b) => if *b { "True" } else { "False" }.to_string(),
+            _ => self.routine.clone(),
+        };
+        let found = if found == LITERAL_NUMBER { "a number".to_string() } else { format!("`{found}`") };
+        self.report(
+            "E0118: result_type_mismatch",
+            &needle,
+            format!("`{}` returns `{want}`, and this value is {found}", self.routine),
+        );
     }
 
     fn stmt(&mut self, st: &Stmt) {
@@ -694,6 +729,13 @@ impl<'a> Walker<'a, '_> {
     }
 
     fn expr(&mut self, e: &Expr) {
+        // Only the value itself is returned, not the parts it is made of.
+        let want = self.result_want.take();
+        if let Some(w) = &want {
+            if !matches!(e, Expr::If(..) | Expr::Match(..) | Expr::WithIo(..)) {
+                self.check_result_type(e, w);
+            }
+        }
         match e {
             Expr::Int(_) | Expr::Float(_) | Expr::Char(_) | Expr::Unit | Expr::Bool(_) | Expr::Str(_) => {}
             Expr::Var(v) => self.var(v),
@@ -716,8 +758,8 @@ impl<'a> Walker<'a, '_> {
             }
             Expr::If(c, ts, te, es, ee) => {
                 self.expr(c);
-                self.block(ts, te);
-                self.block(es, ee);
+                self.block_returning(ts, te, want.clone());
+                self.block_returning(es, ee, want);
             }
             Expr::Match(scrut, cases) => {
                 self.expr(scrut);
@@ -726,7 +768,7 @@ impl<'a> Walker<'a, '_> {
                     self.check_pattern(&c.pattern);
                     let mark = self.scope.len();
                     self.bind_pattern(&c.pattern, ty.as_deref());
-                    self.block(&c.stmts, &c.body);
+                    self.block_returning(&c.stmts, &c.body, want.clone());
                     self.scope.truncate(mark);
                 }
             }
@@ -920,12 +962,12 @@ impl<'a> Walker<'a, '_> {
         for e in &r.variant {
             self.expr(e);
         }
-        let mark = self.scope.len();
-        for st in &r.stmts {
-            self.stmt(st);
-        }
-        self.expr(&r.body);
-        self.scope.truncate(mark);
+        let want = match r.ret_type.as_str() {
+            "" => None,
+            "Current" => Some(module_self_type(self.module)),
+            t => Some(t.to_string()),
+        };
+        self.block_returning(&r.stmts, &r.body, want);
         for (_, e) in &r.ensures {
             self.expr(e);
         }
@@ -1006,6 +1048,7 @@ pub(crate) fn check_names(
                 type_params: Vec::new(),
                 scope: Vec::new(),
                 let_type: None,
+                result_want: None,
                 diags: &mut diags,
                 reported: &mut reported,
             }
