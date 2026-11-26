@@ -1747,6 +1747,7 @@ When repairing failing Gardel code:
 | :--- | :--- | :--- |
 | Arithmetic Overflow / `overflow_add`, `overflow_sub`, `overflow_mul` | Unchecked `a + b`, `a - b`, `a * b` | Add a `require` bound or rewrite (e.g. `lo + (hi - lo) / 2`) |
 | Division by Zero / `div_by_zero` | Divisor not proven non-zero | Add `require d > 0` or branch on `d = 0` |
+| Empty List / `.head`, `.tail` | `xs.head` or `xs.tail` of a list not proven non-empty | Add `require xs.length > 0`, or test it first: `if xs.length > 0 then`, `xs.length > 0 and` |
 | Termination Variant Violation / `variant_decrease` | A recursive call does not shrink the `variant` | Check the call's arguments; pick a metric that decreases on every call in the group |
 | Termination Variant Violation / `variant_missing` | A routine in a recursive group has no `variant` | Add a `variant` to every routine of the group |
 | Termination Variant Violation / `variant_non_negative` | An integer metric can go below 0 | Strengthen `require` or choose a `NAT` metric |

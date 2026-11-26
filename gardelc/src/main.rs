@@ -8916,6 +8916,32 @@ fn emit_list_length_trust(
     format!("{pad}assume in_u64({v});\n")
 }
 
+/// `xs.head` and `xs.tail` of a `LIST` are defined only when `xs` is not empty: the C reads
+/// through the list's first cell, and `Seq_head` says nothing of an empty list. Keyed on the
+/// translation, as `emit_list_length_trust` is, so a module's own `head` is not concerned.
+#[allow(clippy::too_many_arguments)]
+fn emit_list_nonempty_obligation(
+    e: &Expr,
+    recv: &Expr,
+    mname: &str,
+    args: &[Expr],
+    r: &RoutineDecl,
+    m: &ModuleDecl,
+    revealed: &HashSet<String>,
+    pad: &str,
+    strings: &[String],
+) -> String {
+    if !matches!(mname, "head" | "tail") || !args.is_empty() {
+        return String::new();
+    }
+    let v = emit_boogie_expr_with_strings(e, m, &HashSet::new(), revealed, "DefaultFuel", strings);
+    if !v.starts_with("Seq_head(") && !v.starts_with("Seq_tail(") {
+        return String::new();
+    }
+    let xs = emit_boogie_expr_with_strings(recv, m, &HashSet::new(), revealed, "DefaultFuel", strings);
+    format!("{pad}assert {{:msg \"{}::empty::.{mname}\"}} Seq_length({xs}) > 0;\n", r.name)
+}
+
 /// Task H.0d: `m.fold(init, f)` of a `MAP[K, V]` is in a machine range when `init` is and each
 /// step keeps it there, as `emit_fold_range_theory` states of a list. A step may assume its
 /// value in range when the map's values are (H.0e); the axiom is stated here, where `V` is
@@ -14625,6 +14651,7 @@ fn emit_boogie_expr_obligations(
             ));
             s.push_str(&emit_call_arg_obligations(e, args, r, m, revealed, indent, strings));
             s.push_str(&emit_list_length_trust(e, mname, args, m, revealed, &pad, strings));
+            s.push_str(&emit_list_nonempty_obligation(e, recv, mname, args, r, m, revealed, &pad, strings));
             s.push_str(&emit_map_fold_range(e, recv, mname, args, m, revealed, &pad, strings));
             // Applying a function, held or in a field, must establish its type's `require`.
             if mname == "apply" {
@@ -17688,6 +17715,7 @@ pub fn parse_boogie_output(
                 "overflow" => "Phase 3 Boogie (Arithmetic Overflow)",
                 "range" => "Phase 3 Boogie (Range Violation)",
                 "div_by_zero" => "Phase 3 Boogie (Division by Zero)",
+                "empty" => "Phase 3 Boogie (Empty List)",
                 "variant" => "Phase 3 Boogie (Termination Variant Violation)",
                 "invariant" => "Phase 3 Boogie (Invariant Violation)",
                 "ensure" => "Phase 3 Boogie (Postcondition Violation)",
@@ -17699,6 +17727,8 @@ pub fn parse_boogie_output(
             };
             let message = if rule_kind == "hidden" {
                 format!("E0113: hidden_member: `{routine}` calls `{tag}`, which is private to its module. Use a routine that module exports")
+            } else if rule_kind == "empty" {
+                format!("`{tag}` of a list that may be empty, in `{routine}`. Test `length > 0` first, or require it")
             } else {
                 format!("Formal verification condition `{tag}` failed in `{routine}`")
             };
@@ -17787,6 +17817,7 @@ pub fn parse_boogie_output(
                     "overflow" => "Phase 3 Boogie (Arithmetic Overflow)",
                     "range" => "Phase 3 Boogie (Range Violation)",
                     "div_by_zero" => "Phase 3 Boogie (Division by Zero)",
+                    "empty" => "Phase 3 Boogie (Empty List)",
                     "variant" => "Phase 3 Boogie (Termination Variant Violation)",
                     "invariant" => "Phase 3 Boogie (Invariant Violation)",
                     "ensure" => "Phase 3 Boogie (Postcondition Violation)",
@@ -27992,6 +28023,35 @@ end
         assert!(tags_of(module(update)).iter().any(|t| t == "overflow_mul"));
         let guarded = "  t(x: U64): REC\n    require\n      small: x < 100\n    do\n      { Current with a = x * 10 }\n    end\n";
         assert_eq!(tags_of(module(guarded)), Vec::<String>::new());
+    }
+
+    #[test]
+    fn test_head_and_tail_need_a_list_that_is_not_empty() {
+        // Each verified, and read through a null pointer in C on an empty list (H.10).
+        let rejected = [
+            ("match xs.head case Some(_) then True case None then False end", "LIST[OPTION[NAT]]", "BOOL", ".head"),
+            ("xs.tail.length", "LIST[NAT]", "NAT", ".tail"),
+            ("if xs.length > 0 then xs.tail.head else 0 end", "LIST[NAT]", "NAT", ".head"),
+            ("xs.length > 0 or xs.head = 1", "LIST[NAT]", "BOOL", ".head"),
+        ];
+        for (body, list, ty, tag) in rejected {
+            let routine = format!("  t(xs: {list}): {ty}\n    do\n      {body}\n    end\n");
+            let tags = failed_tags_of_routine(&routine);
+            assert!(tags.iter().any(|t| t == tag), "{body}: wanted {tag}, got {tags:?}");
+        }
+        let verified = [
+            ("if xs.length > 0 then xs.head else 0 end", "NAT"),
+            ("xs.length > 1 and xs.tail.head = 3", "BOOL"),
+            ("xs.length = 0 or xs.tail.length < xs.length", "BOOL"),
+            ("xs.prepend(4).head", "NAT"),
+            ("xs.prepend(4).tail.length", "NAT"),
+        ];
+        for (body, ty) in verified {
+            let routine = format!("  t(xs: LIST[NAT]): {ty}\n    do\n      {body}\n    end\n");
+            assert_eq!(failed_tags_of_routine(&routine), Vec::<String>::new(), "{body}");
+        }
+        let required = "  t(xs: LIST[NAT]): NAT\n    require\n      some: xs.length > 0\n    do\n      xs.head\n    end\n";
+        assert_eq!(failed_tags_of_routine(required), Vec::<String>::new());
     }
 
     #[test]
