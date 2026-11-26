@@ -1,0 +1,329 @@
+-- A script of events for a `REST_SERVER`, and what the server does with it, both as text, for
+-- the checks of `GREST_SCRIPTS`. A script is words with a space between each two:
+--
+--   Accepted:1            Closed:1            SendFailed:1        Tick:0
+--   Connected:<tag>:1     ConnectFailed:<tag> ListenFailed:8090   Shutdown
+--   Received:1:<bytes>    where `_` is a space, `|` is a CRLF, `%XX` is a byte, `&` joins two
+--                         parts, and `3@x` is three times the part `x`
+--
+-- where 1 is the first connection the program was given. `3*word` is the word three times, and
+-- a word with `<4-6>` in it is three words, with 4, 5 and 6 in its place. Either may be a group,
+-- which is words with `;` between them.
+--
+-- What the server does is its commands, one word each:
+--
+--   Listen:8090   SetTimer:0:1000   CancelTimer:7   Connect:<tag>:<host>:<port>   Close:1
+--   Log:<text>    Print:<text>      Send:1:<text>
+--   Send:1:<status>[:close]:<length>:<body>    for an answer
+--
+-- and then `End:<state>:<open>:<waiting>`, or `Stop:<exit code>`. A space is written `_`.
+functions GREST_SCRIPT
+
+feature {ANY}
+
+  -- `xs`, with `sep` between each two.
+  joined(xs: LIST[STRING], sep: STRING): STRING
+    variant
+      xs.length
+    do
+      if xs.length = 0 then
+        ""
+      else if xs.length = 1 then
+        xs.head
+      else
+        GREST_TEXT.join(GREST_TEXT.join(xs.head, sep), GREST_SCRIPT.joined(xs.tail, sep))
+      end end
+    end
+
+  -- `s` with `text` for each `c`.
+  replaced(s: STRING, c: CHAR, text: STRING): STRING
+    do
+      GREST_SCRIPT.joined(s.split(c), text)
+    end
+
+  -- `s` with no spaces.
+  one_word(s: STRING): STRING
+    do
+      GREST_SCRIPT.replaced(s, ' ', "_")
+    end
+
+  -- The word of `ws` at `i`, or no text when there is none.
+  word(ws: LIST[STRING], i: NAT): STRING
+    do
+      if i < ws.length then LIST_OPS.at(ws, i) else "" end
+    end
+
+  nat(s: STRING): NAT
+    do
+      match NUMBER_TEXT.parse_nat(s)
+        case Ok(n) then n
+        case Error(_) then 0
+      end
+    end
+
+  -- `n` times `s`.
+  times(n: NAT, s: STRING): LIST[STRING]
+    variant
+      n
+    do
+      if n = 0 then LIST.empty else GREST_SCRIPT.times(n - 1, s).prepend(s) end
+    end
+
+  -- `before`, the number and `after`, for each number from `lo` to `hi`.
+  numbered(before: STRING, lo: NAT, hi: NAT, after: STRING): LIST[STRING]
+    do
+      if lo <= hi and hi <= 100000 then
+        LIST_OPS.map(LIST_OPS.range(lo, hi + 1), fn(n: NAT): STRING do
+          GREST_TEXT.join(GREST_TEXT.join(before, GREST_TEXT.number(n)), after)
+        end)
+      else
+        LIST.empty
+      end
+    end
+
+  -- The words that `w` stands for: itself, or those of a range.
+  ranged(w: STRING): LIST[STRING]
+    do
+      match w.find_char('<', 0)
+        case None then LIST.singleton(w)
+        case Some(i) then
+          match w.find_char('>', i + 1)
+            case None then LIST.singleton(w)
+            case Some(j) then
+              let ends = w.slice(i + 1, j).split('-')
+              GREST_SCRIPT.numbered(w.slice(0, i), GREST_SCRIPT.nat(GREST_SCRIPT.word(ends, 0)), GREST_SCRIPT.nat(GREST_SCRIPT.word(ends, 1)), w.slice(j + 1, w.code_point_count))
+          end
+      end
+    end
+
+  -- The words that `w` stands for: those of a range, or of `n*w`.
+  expanded(w: STRING): LIST[STRING]
+    do
+      match w.find_char('*', 0)
+        case None then GREST_SCRIPT.ranged(w)
+        case Some(i) then
+          let n = GREST_SCRIPT.nat(w.slice(0, i))
+          if n >= 1 and n <= 1000 then GREST_SCRIPT.times(n, w.slice(i + 1, w.code_point_count)) else LIST.singleton(w) end
+      end
+    end
+
+  -- The words of a script, with each range and each `n*w` written out, and then the words of
+  -- each group.
+  words(s: STRING): LIST[STRING]
+    do
+      let written = LIST_OPS.concat_map(s.split(' '), fn(w: STRING): LIST[STRING] do
+        if w.code_point_count = 0 then LIST.empty else GREST_SCRIPT.expanded(w) end
+      end)
+      LIST_OPS.concat_map(written, fn(w: STRING): LIST[STRING] do w.split(';') end)
+    end
+
+  -- A part of the bytes of a `Received`, as text: `n@x` is `n` times `x`.
+  part(s: STRING): STRING
+    do
+      match s.find_char('@', 0)
+        case None then s
+        case Some(i) then
+          let n = GREST_SCRIPT.nat(s.slice(0, i))
+          let rest = s.slice(i + 1, s.code_point_count)
+          if n <= 1000 then GREST_SCRIPT.joined(GREST_SCRIPT.times(n, rest), "") else rest end
+      end
+    end
+
+  data(s: STRING): BYTES
+    do
+      let parts = LIST_OPS.map(s.split('&'), fn(p: STRING): STRING do GREST_SCRIPT.part(p) end)
+      let spaced = GREST_SCRIPT.replaced(GREST_SCRIPT.joined(parts, ""), '_', "%20")
+      CASES.bytes(GREST_SCRIPT.replaced(spaced, '|', "%0D%0A"))
+    end
+
+  -- The connection that a script calls `n`.
+  conn(cs: LIST[CONN_ID], n: NAT): OPTION[CONN_ID]
+    do
+      if n >= 1 and n <= cs.length then Some(LIST_OPS.at(cs, n - 1)) else None end
+    end
+
+  -- What a script calls `c`: its place in `cs`, counted from `n`.
+  number_of(cs: LIST[CONN_ID], c: CONN_ID, n: NAT): STRING
+    variant
+      cs.length
+    do
+      if cs.length = 0 or n > 1000000 then
+        "?"
+      else if cs.head.equals(c) then
+        GREST_TEXT.number(n)
+      else
+        GREST_SCRIPT.number_of(cs.tail, c, n + 1)
+      end end
+    end
+
+  -- An event of the connection `c`.
+  conn_event(kind: STRING, c: CONN_ID, rest: STRING): OPTION[EVENT]
+    do
+      if kind.equals("Accepted") then
+        Some(Accepted(c))
+      else if kind.equals("Closed") then
+        Some(Closed(c))
+      else if kind.equals("SendFailed") then
+        Some(SendFailed(c, OsError(32)))
+      else if kind.equals("Received") then
+        Some(Received(c, GREST_SCRIPT.data(rest)))
+      else
+        None
+      end end end end
+    end
+
+  -- The event that a word names, or `None` for a word that names none.
+  event(w: STRING, cs: LIST[CONN_ID]): OPTION[EVENT]
+    do
+      let ws = w.split(':')
+      let kind = GREST_SCRIPT.word(ws, 0)
+      let n = GREST_SCRIPT.nat(GREST_SCRIPT.word(ws, 1))
+      if kind.equals("Tick") then
+        Some(Tick(n))
+      else if kind.equals("Shutdown") then
+        Some(Shutdown)
+      else if kind.equals("ListenFailed") then
+        Some(ListenFailed(n, OsError(98)))
+      else if kind.equals("ConnectFailed") then
+        Some(ConnectFailed(n, OsError(111)))
+      else if kind.equals("Connected") then
+        match GREST_SCRIPT.conn(cs, GREST_SCRIPT.nat(GREST_SCRIPT.word(ws, 2)))
+          case None then None
+          case Some(c) then Some(Connected(n, c))
+        end
+      else
+        match GREST_SCRIPT.conn(cs, n)
+          case None then None
+          case Some(c) then
+            let rest = if ws.length >= 2 then LIST_OPS.drop(ws, 2) else LIST.empty end
+            GREST_SCRIPT.conn_event(kind, c, GREST_SCRIPT.joined(rest, ":"))
+        end
+      end end end end end
+    end
+
+  -- The events of the words `ws`, or the first word that names none.
+  events(ws: LIST[STRING], cs: LIST[CONN_ID]): RESULT[STRING, LIST[EVENT]]
+    variant
+      ws.length
+    do
+      if ws.length = 0 then
+        Ok(LIST.empty)
+      else
+        match GREST_SCRIPT.event(ws.head, cs)
+          case None then Error(ws.head)
+          case Some(e) then
+            match GREST_SCRIPT.events(ws.tail, cs)
+              case Error(w) then Error(w)
+              case Ok(es) then Ok(es.prepend(e))
+            end
+        end
+      end
+    end
+
+  -- The text of `s` after the first `from` in it, up to the first `to` after that.
+  between(s: STRING, from: STRING, to: STRING): STRING
+    do
+      match s.find(from, 0)
+        case None then ""
+        case Some(i) then
+          let a = i + from.code_point_count
+          match s.find(to, a)
+            case None then s.slice(a, s.code_point_count)
+            case Some(j) then s.slice(a, j)
+          end
+      end
+    end
+
+  -- The body of the answer `t`.
+  body(t: STRING): STRING
+    do
+      match t.find("\r\n\r\n", 0)
+        case None then "?"
+        case Some(i) then t.slice(i + 4, t.code_point_count)
+      end
+    end
+
+  -- What was sent: an answer as its status, whether it closes, its length and its body.
+  sent(t: STRING): STRING
+    do
+      if t.starts_with("HTTP/1.1 ") then
+        let status = GREST_SCRIPT.between(t, " ", "\r\n")
+        let close = if t.find("\r\nConnection: close\r\n", 0).is_some then ":close" else "" end
+        let length = GREST_SCRIPT.between(t, "\r\nContent-Length: ", "\r\n")
+        let answer = LIST.empty.prepend(GREST_SCRIPT.body(t)).prepend(length).prepend(GREST_TEXT.join(status, close))
+        GREST_SCRIPT.joined(answer, ":")
+      else
+        t
+      end
+    end
+
+  -- `a` and `b`, with a colon between them.
+  pair(a: STRING, b: STRING): STRING
+    do
+      GREST_TEXT.join(GREST_TEXT.join(a, ":"), b)
+    end
+
+  -- A command, with what it names, as one word.
+  command(cmd: COMMAND, cs: LIST[CONN_ID]): STRING
+    do
+      match cmd
+        case Print(t) then GREST_SCRIPT.one_word(pair("Print", t))
+        case Log(level, t) then
+          match level
+            case Info then GREST_SCRIPT.one_word(pair("Log", t))
+            case _ then "Other"
+          end
+        case Listen(p) then pair("Listen", GREST_TEXT.number(p))
+        case SetTimer(id, ms) then pair(pair("SetTimer", GREST_TEXT.number(id)), NUMBER_TEXT.nat_to_text(ms))
+        case CancelTimer(id) then pair("CancelTimer", GREST_TEXT.number(id))
+        case Close(c) then pair("Close", GREST_SCRIPT.number_of(cs, c, 1))
+        case Connect(t, h, p) then pair(pair(pair("Connect", GREST_TEXT.number(t)), h), GREST_TEXT.number(p))
+        case Send(c, d) then
+          match STRING.from_utf8(d)
+            case Ok(t) then GREST_SCRIPT.one_word(pair(pair("Send", GREST_SCRIPT.number_of(cs, c, 1)), GREST_SCRIPT.sent(t)))
+            case Error(_) then "Other"
+          end
+        case _ then "Other"
+      end
+    end
+
+  -- The commands `cmds`, then `last`.
+  outcome(cmds: LIST[COMMAND], cs: LIST[CONN_ID], last: STRING): STRING
+    do
+      let shown = LIST_OPS.map(cmds, fn(c: COMMAND): STRING do GREST_SCRIPT.command(c, cs) end)
+      GREST_SCRIPT.joined(shown.append(LIST.singleton(last)), " ")
+    end
+
+  -- The end of a server that still runs. Its state comes out of a generic module, so its range
+  -- is not known.
+  ended(s: REST_SERVER[NAT]): STRING
+    do
+      let state = if 0 <= s.state and s.state <= 1000000 then GREST_TEXT.number(s.state) else "?" end
+      let counts = LIST.empty.prepend(GREST_TEXT.number(s.waiting)).prepend(GREST_TEXT.number(s.open_connections)).prepend(state)
+      GREST_SCRIPT.joined(counts.prepend("End"), ":")
+    end
+
+  -- What the server that starts with `st` does over `es`.
+  play(st: STEP[REST_SERVER[NAT]], es: LIST[EVENT], cs: LIST[CONN_ID]): STRING
+    do
+      match st
+        case Stop(code, cmds) then
+          GREST_SCRIPT.outcome(cmds, cs, pair("Stop", GREST_TEXT.number(code)))
+        case Continue(s, first) then
+          match SCRIPT.run(fn(x: REST_SERVER[NAT], e: EVENT): STEP[REST_SERVER[NAT]] do x.serve(e) end, s, es, first)
+            case Stopped(code, cmds) then GREST_SCRIPT.outcome(cmds, cs, pair("Stop", GREST_TEXT.number(code)))
+            case Running(n, cmds) then GREST_SCRIPT.outcome(cmds, cs, GREST_SCRIPT.ended(n))
+          end
+      end
+    end
+
+  -- The check named `name`: the server that starts with `st` does `expected` over `script`.
+  check(name: STRING, cs: LIST[CONN_ID], st: STEP[REST_SERVER[NAT]], script: STRING, expected: STRING): TEST_RESULT
+    do
+      match GREST_SCRIPT.events(GREST_SCRIPT.words(script), cs)
+        case Error(w) then Fail(name, GREST_TEXT.join("not an event: ", w))
+        case Ok(es) then CHECK.equal_text(name, GREST_SCRIPT.play(st, es, cs), GREST_SCRIPT.joined(GREST_SCRIPT.words(expected), " "))
+      end
+    end
+
+end

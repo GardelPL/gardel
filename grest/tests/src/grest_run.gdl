@@ -1,0 +1,40 @@
+-- What GREST_SERVER_TEST has so far: the connections it was given, in order, and the result of
+-- each script, the last first.
+module GREST_RUN
+
+representation {NONE}
+  conns: LIST[CONN_ID]
+  found: LIST[TEST_RESULT]
+
+create {ANY}
+
+  empty: GREST_RUN
+    do
+      { conns = LIST.empty, found = LIST.empty }
+    end
+
+feature {ANY}
+
+  connections: LIST[CONN_ID]
+    do
+      Current.conns
+    end
+
+  -- The results, in order.
+  results: LIST[TEST_RESULT]
+    do
+      LIST_OPS.reverse(Current.found)
+    end
+
+  connected(c: CONN_ID): GREST_RUN
+    do
+      { Current with conns = Current.conns.append(LIST.singleton(c)) }
+    end
+
+  -- With the result of the script in `line`, if there is one.
+  ran(line: STRING): GREST_RUN
+    do
+      { Current with found = GREST_SCRIPTS.add(Current.conns, Current.found, line) }
+    end
+
+end

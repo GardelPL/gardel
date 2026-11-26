@@ -145,8 +145,6 @@ feature {ANY}
 
   -- How many answers `cmds` sends to `c`.
   sent_to(cmds: LIST[COMMAND], c: CONN_ID): NAT
-    require
-      bounded: cmds.length <= 1000
     variant
       cmds.length
     do
@@ -159,6 +157,9 @@ feature {ANY}
       end end
     ensure
       at_most: Result <= cmds.length
+      none: cmds.length = 0 implies Result = 0
+      one_more: cmds.length >= 1 and REST_COMMANDS.sends(cmds.head, c) implies Result = REST_COMMANDS.sent_to(cmds.tail, c) + 1
+      no_more: cmds.length >= 1 and not REST_COMMANDS.sends(cmds.head, c) implies Result = REST_COMMANDS.sent_to(cmds.tail, c)
     end
 
   -- `cmd` is a `Send`.
@@ -227,7 +228,6 @@ feature {ANY}
     require
       held: cs.lookup_connection(c).is_some
       own: REST_COMMANDS.all_foreign(cmds, cs)
-      bounded: cmds.length <= 1000
     variant
       cmds.length
     do
@@ -287,11 +287,9 @@ feature {ANY}
     do
       if REST_COMMANDS.for_conn_out(cmds, c, cs) then
         True
-      else if cmds.length = 0 then
-        False
       else
         REST_COMMANDS.logs(cmds.head) and REST_COMMANDS.for_conn_logged(cmds.tail, c, cs)
-      end end
+      end
     ensure
       def: Result = (REST_COMMANDS.for_conn_out(cmds, c, cs)
         or (cmds.length >= 1 and REST_COMMANDS.logs(cmds.head) and REST_COMMANDS.for_conn_logged(cmds.tail, c, cs)))
@@ -300,8 +298,6 @@ feature {ANY}
   -- A line for each of `reqs`, in order, then `cmds`: the shape and the answers to `c` stay
   -- those of `cmds`.
   logged(reqs: LIST[HTTP_REQUEST], cmds: LIST[COMMAND], c: CONN_ID, cs: HTTP_SERVER_STATE): LIST[COMMAND]
-    require
-      bounded: reqs.length + cmds.length <= 1000
     variant
       reqs.length
     do
@@ -327,6 +323,11 @@ feature {ANY}
           case _ then False
         end
       end
+    ensure
+      def: Result = (cmds.length >= 1 and (match cmds.head
+        case Send(d, _) then cmds.length = 1 or (cmds.length = 2 and REST_COMMANDS.closes(cmds.tail.head, d))
+        case _ then False
+      end))
     end
 
   -- What an event the service handles may do: send commands of the service's own, and then
@@ -473,6 +474,10 @@ feature {ANY}
     ensure
       once: REST_COMMANDS.for_conn(Result, c)
       two: Result.length = 2
+      wire: match Result.head
+        case Send(d, b) then d = c and b.equals(HTTP_SERIALIZER.serialize_answer(resp, False, True))
+        case _ then False
+      end
     end
 
   -- Only `Close(c)`.

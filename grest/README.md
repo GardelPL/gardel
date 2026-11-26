@@ -214,8 +214,8 @@ empty one, so it does not match `/users`. Patterns are written decoded.
 claims past them are refused: a `404` for every request to an empty router, a `200` for every
 `ok_json`, a route that never answers `400`, the limits less one, a server that never stops, one
 that always answers, one that is never full, one that starts with any argument, and one whose
-state never changes. It also runs
-a scripted service: a bad route and a bad port stop it with exit status 2, with 64
+state never changes. `grest/tests/grest_server_test.events` scripts
+a service: a bad route and a bad port stop it with exit status 2, with 64
 connections open the next is closed and its request is not answered, and a count kept as the
 state goes up with each request that reaches its handler, in the order the requests complete,
 and not with one that is refused. On one connection, requests sent in turn and at once are
@@ -228,7 +228,7 @@ waiting one, bytes while waiting, and a `503` when 32 wait.
 
 ## Tests
 
-`grest/tests` is a package that depends on `grest`, `ghttp` and `gjson`. `GREST_API` is a small API
+`grest/tests` is a package that depends on `grest`, `ghttp`, `gjson` and `gtest`. `GREST_API` is a small API
 of nine routes, and its program reads the cases of `grest/tests/cases.txt` on standard input. Each
 line is a decoding, a target, a pattern, a match, a request to that API (or the bytes of its
 answer), and what it must give:
@@ -238,7 +238,9 @@ gardelc --project grest/tests --strict
 grest/tests/build/grest_test_bin < grest/tests/cases.txt
 ```
 
-Exit code 0 means every case holds. `cargo test --test grest` does both.
+Exit code 0 means every case holds. A second program, `GREST_SERVER_TEST`, runs the scripts of
+`grest_server_test.events`: the events a server gets, and the commands it must give. It is a
+reactive program, as only the host can make a `CONN_ID`. `gardelc test grest` runs both.
 
 ## Known limits
 

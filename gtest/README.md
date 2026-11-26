@@ -72,6 +72,8 @@ A `GEN[A]` is a step from a state to a value and the next state. `GENS` has:
 
 `SCRIPT.play(step, state, events)` runs a reactive `step` over a list of events. The result is `Running(state, commands)`, or `Stopped(code, commands)` at the first `Stop`, with every command in order. `SCRIPT.printed(commands)` is the text of each `Print` and `Write`. The `step` must be a routine of a module, since nothing can name a `reactive program`.
 
+Only the host can make a `CONN_ID`. A test whose events need connections is therefore a `reactive program` with an events file: `gardelc test` runs a program `P` from the script in `tests/p.events`, as from `GARDEL_EVENTS`. Lines that start with `#` are skipped, and a line that starts with `> ` is a `Line` event with the rest of it. With `Accepted:1 Accepted:2` first, the program keeps the connections it is given, makes its runs with them, and stops with `TESTS.exit_code` at `Shutdown`. See `grest/tests/src/grest_server_test.gdl`.
+
 ## Known limits
 
 - The runner's report is text up to about a megabyte; past that, the rest is left out.

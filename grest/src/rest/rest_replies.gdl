@@ -29,6 +29,7 @@ create {ANY}
       state_set: Result.state = s
       commands_set: Result.commands = cs
       none_held: not Result.holds_wait
+      tag_unset: Result.wait_tag = 0
     end
 
   -- The state `s` and the commands `cs`, with a request held to wait under the tag `t`,

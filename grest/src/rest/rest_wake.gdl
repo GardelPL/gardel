@@ -23,6 +23,7 @@ create {ANY}
       state_set: Result.state = s
       commands_set: cs.length <= 16 implies Result.commands = cs
       no_answer: Result.answer.is_none
+      tag_unset: Result.answer_tag = 0
     end
 
   -- The state `s` and `cs`, and `resp` as the answer to the request tagged `t`.

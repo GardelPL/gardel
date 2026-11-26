@@ -1,0 +1,79 @@
+-- The limits of `REST_RESPONSE`, `REST_COMMANDS` and `REST_WAKE` that no script reaches: each at
+-- its edge and one past it.
+functions GREST_LIMITS
+
+feature {ANY}
+
+  -- `s`, doubled `n` times.
+  doubled(s: STRING, n: NAT): STRING
+    variant
+      n
+    do
+      if n = 0 then s else GREST_LIMITS.doubled(GREST_TEXT.join(s, s), n - 1) end
+    end
+
+  -- `n` letters, up to 131072.
+  letters(n: NAT): STRING
+    do
+      let s = GREST_LIMITS.doubled("a", 17)
+      if n <= s.code_point_count then s.slice(0, n) else s end
+    end
+
+  -- The status of `resp`, how its body is stated, and the length of that body.
+  summary(resp: HTTP_RESPONSE): STRING
+    do
+      let kind = match resp.content_type
+        case Unstated then "none"
+        case PlainText then "text"
+        case Json then "json"
+      end
+      let parts = LIST.empty.prepend(GREST_TEXT.number(resp.response_body_length)).prepend(kind).prepend(GREST_TEXT.number(resp.response_status_code))
+      GREST_SCRIPT.joined(parts, " ")
+    end
+
+  -- A string of `n` letters as JSON has `n + 2` bytes, and a response holds 65536.
+  responses: LIST[TEST_RESULT]
+    do
+      let fits = JSON.string(GREST_LIMITS.letters(65534))
+      let long = JSON.string(GREST_LIMITS.letters(65535))
+      let st = HTTP_STATUS.make(409)
+      LIST.empty
+        .prepend(CHECK.equal_text("json that fits", GREST_LIMITS.summary(REST_RESPONSE.json(st, fits)), "409 json 65536"))
+        .prepend(CHECK.equal_text("json too long", GREST_LIMITS.summary(REST_RESPONSE.json(st, long)), "500 none 0"))
+        .prepend(CHECK.equal_text("created json", GREST_LIMITS.summary(REST_RESPONSE.created_json(JSON.int(5))), "201 json 1"))
+        .prepend(CHECK.equal_text("error that fits", GREST_LIMITS.summary(REST_RESPONSE.error_body(st, Some(fits))), "409 json 65536"))
+        .prepend(CHECK.equal_text("error too long", GREST_LIMITS.summary(REST_RESPONSE.error_body(st, Some(long))), "409 none 0"))
+        .prepend(CHECK.equal_text("error with no body", GREST_LIMITS.summary(REST_RESPONSE.error_body(st, None)), "409 none 0"))
+        .prepend(CHECK.equal_text("no content", GREST_LIMITS.summary(REST_RESPONSE.no_content), "204 none 0"))
+        .prepend(CHECK.equal_text("the last offset", REST_RESPONSE.bad_body(TooLarge(9223372036854775807)).body_string, "{\"at\":9223372036854775807,\"error\":\"invalid JSON body\"}"))
+        .prepend(CHECK.equal_text("past the last offset", REST_RESPONSE.bad_body(TooLarge(9223372036854775808)).body_string, "{\"at\":0,\"error\":\"invalid JSON body\"}"))
+    end
+
+  -- A message is joined to a text of at most 1024 bytes.
+  complaints: LIST[TEST_RESULT]
+    do
+      LIST.empty
+        .prepend(CHECK.equal_nat("two that fit", REST_COMMANDS.complaint(GREST_LIMITS.letters(1024), GREST_LIMITS.letters(1024)).byte_length, 2048))
+        .prepend(CHECK.equal_nat("a long text", REST_COMMANDS.complaint(GREST_LIMITS.letters(2), GREST_LIMITS.letters(1025)).byte_length, 2))
+        .prepend(CHECK.equal_nat("a long message", REST_COMMANDS.complaint(GREST_LIMITS.letters(1025), GREST_LIMITS.letters(2)).byte_length, 1025))
+    end
+
+  -- At most 16 commands are sent: of more, none is.
+  sixteen: LIST[TEST_RESULT]
+    do
+      let full = LIST_OPS.map(LIST_OPS.range(0, 16), fn(n: NAT): COMMAND do Listen(n) end)
+      let more = full.prepend(Listen(16))
+      let resp = REST_RESPONSE.not_found
+      LIST.empty
+        .prepend(CHECK.equal_nat("sixteen to wake", REST_WAKE.make(1, full).commands.length, 16))
+        .prepend(CHECK.equal_nat("seventeen to wake", REST_WAKE.make(1, more).commands.length, 0))
+        .prepend(CHECK.equal_nat("sixteen with an answer", REST_WAKE.answering(1, full, 2, resp).commands.length, 16))
+        .prepend(CHECK.equal_nat("seventeen with an answer", REST_WAKE.answering(1, more, 2, resp).commands.length, 0))
+    end
+
+  checks: LIST[TEST_RESULT]
+    do
+      GREST_LIMITS.responses.append(GREST_LIMITS.complaints).append(GREST_LIMITS.sixteen)
+    end
+
+end
