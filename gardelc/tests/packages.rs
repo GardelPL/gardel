@@ -1082,6 +1082,78 @@ end
     }
 }
 
+/// A routine of a `module` that works on its `Current`, a `feature` or a `specify` routine, is
+/// called on a value of the module, and `BOX.get` is refused where it is written (`E0119`).
+/// Before, it was refused by Boogie's arity check, as `E0199` at line 1. A `create` routine
+/// needs no value, and is called on the module.
+#[test]
+fn a_routine_of_current_is_called_on_a_value() {
+    let boxed = |inside: &str| {
+        format!(
+            "module BOX
+
+representation {{ANY}}
+  | Held(v: NAT)
+
+create {{ANY}}
+
+  make(x: NAT): BOX
+    do
+      Held(x)
+    end
+
+  same(x: NAT): NAT
+    do
+      x
+    end
+
+feature {{ANY}}
+
+  get: NAT
+    do
+      match Current
+        case Held(v) then v
+      end
+    end
+
+  plus(x: NAT): NAT
+    do
+      x
+    end
+
+  inside: NAT
+    do
+      {inside}
+    end
+
+specify {{ANY}}
+
+  size: NAT
+    do
+      0
+    end
+
+end
+"
+        )
+    };
+    let user = |body: &str| format!("functions USER\n\nfeature {{ANY}}\n\n  t(b: BOX): NAT\n    do\n      {body}\n    end\n\nend\n");
+    for (inside, body) in [
+        ("0", "BOX.get"),
+        ("0", "BOX.plus(1)"),
+        ("0", "BOX.size"),
+        ("BOX.get", "0"),
+    ] {
+        let world = World::new("needs_instance", &[]);
+        world.package("root", &[], &[("box.gdl", &boxed(inside)), ("user.gdl", &user(body))]);
+        assert_refused(&world.run("root", &[]), "E0119: needs_an_instance");
+    }
+    let world = World::new("has_instance", &[]);
+    let body = "if b.get = BOX.make(3).get then BOX.same(b.plus(b.size)) else 0 end";
+    world.package("root", &[], &[("box.gdl", &boxed("Current.get")), ("user.gdl", &user(body))]);
+    assert_ok(&world.run("root", &["--strict"]));
+}
+
 /// A declared type settles what the value alone leaves open, here across a package boundary,
 /// so it has to be resolved like any other type.
 #[test]

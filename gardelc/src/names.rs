@@ -39,6 +39,9 @@ struct Member<'a> {
     type_params: &'a [String],
     /// Laws state facts, and may be invoked as lemmas from anywhere.
     is_law: bool,
+    /// A routine whose verified form takes a receiver `Current`: a `feature` of a `module`,
+    /// or a `specify` routine of one with a representation. It cannot be called as `M.f(..)`.
+    needs_instance: bool,
 }
 
 struct Universe<'a> {
@@ -79,6 +82,7 @@ fn add_member<'a>(table: &mut HashMap<&'a str, Member<'a>>, name: &'a str, membe
                 old.arity = None;
             }
             old.params = None;
+            old.needs_instance = false;
         })
         .or_insert(member);
 }
@@ -92,6 +96,7 @@ fn routine_member<'a>(vis: &'a Visibility, r: &'a RoutineDecl) -> Member<'a> {
         ret: Some(&r.ret_type),
         type_params: &r.type_params,
         is_law: false,
+        needs_instance: false,
     }
 }
 
@@ -113,6 +118,7 @@ fn add_concept_members<'a>(
             ret: Some(&s.ret_type),
             type_params: &[],
             is_law: false,
+            needs_instance: false,
         });
     }
     for r in &c.default_routines {
@@ -123,6 +129,7 @@ fn add_concept_members<'a>(
             ret: Some(&r.ret_type),
             type_params: &r.type_params,
             is_law: false,
+            needs_instance: false,
         });
     }
     for l in &c.laws {
@@ -133,6 +140,7 @@ fn add_concept_members<'a>(
             ret: None,
             type_params: &[],
             is_law: true,
+            needs_instance: false,
         });
     }
     for parent in &c.refines {
@@ -150,23 +158,23 @@ fn members_of<'a>(
             add_member(
                 &mut table,
                 f,
-                Member { vis: &m.repr_vis, arity: None, params: None, ret: Some(t), type_params: &[], is_law: false },
+                Member { vis: &m.repr_vis, arity: None, params: None, ret: Some(t), type_params: &[], is_law: false, needs_instance: false },
             );
         }
     }
-    for (vis, r) in m
-        .create_routines
-        .iter()
-        .chain(&m.feature_routines)
-        .chain(&m.specify_routines)
-    {
-        add_member(&mut table, &r.name, routine_member(vis, r));
+    let is_module = m.kind == ModuleKind::Module;
+    let specify_current = is_module && !matches!(&m.repr, ReprKind::Product(fields) if fields.is_empty());
+    let sections = [(&m.create_routines, false), (&m.feature_routines, is_module), (&m.specify_routines, specify_current)];
+    for (routines, needs_instance) in sections {
+        for (vis, r) in routines {
+            add_member(&mut table, &r.name, Member { needs_instance, ..routine_member(vis, r) });
+        }
     }
     for (vis, l) in &m.specify_laws {
         add_member(
             &mut table,
             &l.name,
-            Member { vis, arity: Some(l.params.len()), params: None, ret: None, type_params: &[], is_law: true },
+            Member { vis, arity: Some(l.params.len()), params: None, ret: None, type_params: &[], is_law: true, needs_instance: false },
         );
     }
     if let Some(sat) = &m.satisfies {
@@ -556,6 +564,19 @@ impl<'a> Walker<'a, '_> {
         }
     }
 
+    /// `owner.name(..)` with `owner` a module, of a routine that takes a receiver.
+    fn check_needs_instance(&mut self, owner: &str, name: &str) {
+        let Some(member) = self.universe.member(owner, name).filter(|m| m.needs_instance) else { return };
+        let call = if member.arity == Some(0) { format!("x.{name}") } else { format!("x.{name}(..)") };
+        self.report(
+            "E0119: needs_an_instance",
+            name,
+            format!(
+                "`{owner}.{name}` works on an `{owner}` value, its `Current`, so it is called on one, as `{call}`, not on `{owner}` itself. A routine that needs no `{owner}` value belongs in `create`"
+            ),
+        );
+    }
+
     /// The type of an argument as far as it can be told, a literal included. `#number` is an
     /// integer literal, which fits any number type it is in range of.
     fn arg_type(&self, e: &Expr) -> Option<String> {
@@ -895,6 +916,7 @@ impl<'a> Walker<'a, '_> {
             if self.is_static_receiver(v) {
                 if self.universe.modules.contains_key(v.as_str()) {
                     self.check_member(v, name, Some(argc));
+                    self.check_needs_instance(v, name);
                     self.check_arg_types(v, name, args);
                 } else if !self.universe.knows_type(v) && !self.type_params.iter().any(|t| t == v) {
                     self.report(
