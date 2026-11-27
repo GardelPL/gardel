@@ -1,0 +1,16 @@
+-- What a reader of a `CURSOR` expected where it stopped.
+module PARSE_EXPECTED satisfies CANONICAL_EQ
+
+representation {ANY}
+  -- More bytes: the text ended.
+  | MoreBytes
+  -- The bytes `CURSOR.expect` was given.
+  | Word
+  -- A byte that the reader's test keeps.
+  | KeptByte
+  -- A decimal digit.
+  | Digit
+  -- A number no larger than the reader's limit.
+  | SmallerNumber
+
+end

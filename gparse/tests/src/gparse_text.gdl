@@ -1,0 +1,172 @@
+-- What a case line asks of a cursor, and what the cursor answers, as text.
+--
+-- A case is `op arg text`: `text` is everything after the second space, and `~` stands for
+-- an empty text. `arg` is `-` where the op takes none.
+--
+--   nat L t     `read_nat(L)`: `ok V at N` or `error WHAT at N`
+--   word W t    `expect(W)`: `ok at N` or `error WHAT at N`
+--   byte B t    `expect_byte(B)`, `B` a number
+--   digits - t  `take_while` of digits: `taken BYTES at N`
+--   some - t    `take_some` of digits: `taken BYTES at N` or `error WHAT at N`
+--   space - t   `skip_while` of spaces: `at N`
+--   fields - t  `name=number` pairs split by `;`: `ok name:number,...` or `error WHAT at N`
+functions GPARSE_TEXT
+
+feature {ANY}
+
+  -- `a` then `b`, or `a` alone if that would not fit.
+  join(a: STRING, b: STRING): STRING
+    do
+      if a.byte_length <= 100000000 and b.byte_length <= 100000000 then a.concat(b) else a end
+    end
+
+  number(n: NAT): STRING
+    do
+      NUMBER_TEXT.nat_to_text(n)
+    end
+
+  wanted_name(w: PARSE_EXPECTED): STRING
+    do
+      match w
+        case MoreBytes then "MoreBytes"
+        case Word then "Word"
+        case KeptByte then "KeptByte"
+        case Digit then "Digit"
+        case SmallerNumber then "SmallerNumber"
+      end
+    end
+
+  at_text(c: CURSOR): STRING
+    do
+      join(" at ", number(c.offset))
+    end
+
+  error_text(e: PARSE_ERROR): STRING
+    do
+      join(join(join("error ", wanted_name(e.expected)), " at "), number(e.offset))
+    end
+
+  -- The bytes `b` as text, `~` when there are none.
+  bytes_text(b: BYTES): STRING
+    do
+      if b.length = 0 then
+        "~"
+      else
+        match STRING.from_utf8(b)
+          case Ok(t) then t
+          case Error(_) then "?"
+        end
+      end
+    end
+
+  is_lower(b: U64): BOOL
+    do
+      b >= 97 and b <= 122
+    end
+
+  is_space(b: U64): BOOL
+    do
+      b = 32
+    end
+
+  -- The pairs from `c` on, written after `out`. Each pass reads at least a name, so the
+  -- cursor's progress facts alone show that the loop ends.
+  fields(c: CURSOR, out: STRING): STRING
+    variant
+      c.remaining
+    do
+      match c.take_some(fn(b: U64): BOOL do GPARSE_TEXT.is_lower(b) end)
+        case Error(e) then
+          error_text(e)
+        case Ok(name) then
+          match name.second.expect_byte(61)
+            case Error(e) then
+              error_text(e)
+            case Ok(after_eq) then
+              match after_eq.read_nat(1000000)
+                case Error(e) then
+                  error_text(e)
+                case Ok(v) then
+                  let item = join(join(join(out, bytes_text(name.first)), ":"), number(v.first))
+                  if v.second.at_end then
+                    join("ok ", item)
+                  else
+                    match v.second.expect_byte(59)
+                      case Error(e) then error_text(e)
+                      case Ok(next) then fields(next, join(item, ","))
+                    end
+                  end
+              end
+          end
+      end
+    end
+
+  -- `op` run on a cursor at the start of `text`, with `arg`.
+  run(op: STRING, arg: STRING, text: STRING): STRING
+    do
+      let cur = CURSOR.start(text.to_utf8)
+      let digit = fn(b: U64): BOOL do DECIMAL.is_digit(b) end
+      if op.equals("nat") then
+        match NUMBER_TEXT.parse_nat(arg)
+          case Error(_) then "bad limit"
+          case Ok(limit) then
+            match cur.read_nat(limit)
+              case Error(e) then error_text(e)
+              case Ok(r) then join(join("ok ", number(r.first)), at_text(r.second))
+            end
+        end
+      else if op.equals("word") then
+        let w = arg.to_utf8
+        if w.length = 0 then
+          "bad word"
+        else
+          match cur.expect(w)
+            case Error(e) then error_text(e)
+            case Ok(r) then join("ok", at_text(r))
+          end
+        end
+      else if op.equals("byte") then
+        match NUMBER_TEXT.parse_nat(arg)
+          case Error(_) then "bad byte"
+          case Ok(b) then
+            match cur.expect_byte(b)
+              case Error(e) then error_text(e)
+              case Ok(r) then join("ok", at_text(r))
+            end
+        end
+      else if op.equals("digits") then
+        let p = cur.take_while(digit)
+        join(join("taken ", bytes_text(p.first)), at_text(p.second))
+      else if op.equals("some") then
+        match cur.take_some(digit)
+          case Error(e) then error_text(e)
+          case Ok(p) then join(join("taken ", bytes_text(p.first)), at_text(p.second))
+        end
+      else if op.equals("space") then
+        join("at ", number(cur.skip_while(fn(b: U64): BOOL do GPARSE_TEXT.is_space(b) end).offset))
+      else if op.equals("fields") then
+        fields(cur, "")
+      else
+        "unknown op"
+      end end end end end end end
+    end
+
+  -- What the case `c` gives.
+  got(c: STRING): STRING
+    do
+      match c.find_char(' ', 0)
+        case None then
+          "bad case"
+        case Some(i) then
+          let rest = c.slice(i + 1, c.code_point_count)
+          match rest.find_char(' ', 0)
+            case None then
+              "bad case"
+            case Some(j) then
+              let text = rest.slice(j + 1, rest.code_point_count)
+              run(c.slice(0, i), rest.slice(0, j), if text.equals("~") then "" else text end)
+          end
+      end
+    end
+
+end

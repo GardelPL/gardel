@@ -300,3 +300,36 @@ end
         assert!(text.contains(&format!("E0323: underivable_instance")) && text.contains(&format!("writes no `{method}`")), "{text}");
     }
 }
+
+/// Two constructors with no fields are different values, with or without a derived instance:
+/// each one's own test holds of it, which sets off the axioms that tell the constructors apart.
+/// Before, `Result != Blue` could not be proven, and neither could `(Result = Red) = (n = 0)`.
+#[test]
+fn constructors_without_fields_are_told_apart() {
+    let colour = |claims: &str| {
+        format!(
+            "module COLOUR
+
+representation {{ANY}}
+  | Red
+  | Green
+  | Blue
+
+create {{ANY}}
+
+  pick(n: NAT): COLOUR
+    do
+      if n = 0 then Red else Green end
+    ensure
+{claims}
+    end
+
+end
+"
+        )
+    };
+    let told = colour("      not_blue: Result != Blue\n      red_when: (Result = Red) = (n = 0)");
+    assert_ok(&Project::new("told_apart", &[("colour.gdl", &told)]).check());
+    let lie = colour("      claim: Result = Blue or Result = Red");
+    assert_refused(&Project::new("told_apart_lie", &[("colour.gdl", &lie)]).check(), &[("pick", "claim")]);
+}

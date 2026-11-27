@@ -1,0 +1,7 @@
+[project]
+name = "gparse-tests"
+version = "0.1.0"
+
+[dependencies]
+gparse = { path = ".." }
+gtest = { path = "../../gtest" }

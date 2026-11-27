@@ -10585,6 +10585,13 @@ fn emit_own_boogie_parts(
                         "axiom (forall{tp_quant} x: {mod_bpl_ty} :: {{ is_{}(x) }} is_{}(x) <==> x == {}());\n",
                         v.name, v.name, v.name
                     ));
+                    // The constructor's own test holds of it. Without this ground fact no term
+                    // triggers the distinctness axioms below for two constructors with no fields,
+                    // and `Word != MoreBytes` cannot be proven. A generic one has no ground
+                    // term, and the test of a constructor with fields is part of its axiom.
+                    if m.type_params.is_empty() {
+                        out.push_str(&format!("axiom is_{}({}());\n", v.name, v.name));
+                    }
                 } else {
                     let ctor_app = if m.type_params.is_empty() {
                         ctor_call.clone()

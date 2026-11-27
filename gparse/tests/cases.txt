@@ -1,0 +1,58 @@
+# Cases for GPARSE_TEST, which `gardelc test gparse` sends on standard input.
+#
+# Each line is `op arg text`, ` => `, and what the cursor must answer: see
+# `tests/src/gparse_text.gdl` for each op. `~` stands for an empty text, and `-` for no
+# argument. Lines that start with # and empty lines are skipped.
+
+# Numbers.
+nat 100 42 => ok 42 at 2
+nat 100 7 => ok 7 at 1
+nat 100 0 => ok 0 at 1
+nat 100 007x => ok 7 at 3
+nat 100 100 => ok 100 at 3
+nat 100 101 => error SmallerNumber at 0
+nat 100 1000 => error SmallerNumber at 0
+nat 0 0 => ok 0 at 1
+nat 0 1 => error SmallerNumber at 0
+nat 18446744073709551615 18446744073709551615 => ok 18446744073709551615 at 20
+nat 18446744073709551615 18446744073709551616 => error SmallerNumber at 0
+nat 18446744073709551615 99999999999999999999 => error SmallerNumber at 0
+nat 100 12;3 => ok 12 at 2
+nat 100 x1 => error Digit at 0
+nat 100 ~ => error MoreBytes at 0
+
+# Words.
+word GET GET / => ok at 3
+word GET GE => error Word at 0
+word GET POST => error Word at 0
+word GET ~ => error Word at 0
+word ab ab => ok at 2
+
+# Bytes.
+byte 61 =1 => ok at 1
+byte 61 :1 => error Word at 0
+byte 61 ~ => error MoreBytes at 0
+
+# Runs of bytes.
+digits - 123abc => taken 123 at 3
+digits - abc => taken ~ at 0
+digits - ~ => taken ~ at 0
+digits - 9 => taken 9 at 1
+some - 123abc => taken 123 at 3
+some - abc => error KeptByte at 0
+some - ~ => error MoreBytes at 0
+space -    x => at 3
+space - x => at 0
+space - ~ => at 0
+
+# A loop over the cursor.
+fields - a=1 => ok a:1
+fields - a=12;bc=7 => ok a:12,bc:7
+fields - a=12;bc=7;d=0 => ok a:12,bc:7,d:0
+fields - a=12;bc=x => error Digit at 8
+fields - a=12;=7 => error KeptByte at 5
+fields - a=12; => error MoreBytes at 5
+fields - a12 => error Word at 1
+fields - a=12,b=1 => error Word at 4
+fields - a=1000001 => error SmallerNumber at 2
+fields - ~ => error MoreBytes at 0

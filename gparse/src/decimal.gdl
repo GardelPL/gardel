@@ -1,0 +1,25 @@
+-- Decimal digits and their value, as a reader proves what it read.
+functions DECIMAL
+
+feature {ANY}
+
+  -- Whether `b` is an ASCII digit, `0` to `9`.
+  is_digit(b: U64): BOOL
+    do
+      b >= 48 and b <= 57
+    end
+
+specify {ANY}
+
+  -- The value of the digits `bs[lo, hi)`, read as a decimal number. Defined on the last digit,
+  -- so that a reader going forward adds one digit with one step of the definition.
+  value(bs: LIST[U64], lo: NAT, hi: NAT): MATH_INT
+    require
+      ordered: lo <= hi
+    variant
+      hi - lo
+    do
+      if hi = lo then 0 else DECIMAL.value(bs, lo, hi - 1) * 10 + (LIST_OPS.at(bs, hi - 1) - 48) end
+    end
+
+end

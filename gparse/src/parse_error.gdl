@@ -1,0 +1,31 @@
+-- Why a reader of a `CURSOR` stopped: the offset where it did, and what it expected there.
+module PARSE_ERROR
+
+representation {ANY}
+  at: NAT
+  wanted: PARSE_EXPECTED
+
+create {ANY}
+
+  make(offset: NAT, expected: PARSE_EXPECTED): PARSE_ERROR
+    do
+      { at = offset, wanted = expected }
+    ensure
+      offset_kept: Result.offset = offset
+      expected_kept: Result.expected = expected
+    end
+
+feature {ANY}
+
+  -- The offset from the start of the text where the reader stopped.
+  offset: NAT
+    do
+      Current.at
+    end
+
+  expected: PARSE_EXPECTED
+    do
+      Current.wanted
+    end
+
+end

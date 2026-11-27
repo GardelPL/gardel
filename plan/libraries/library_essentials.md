@@ -1,7 +1,7 @@
 # Phase H: Library Essentials
 
 **Date:** November 12, 2026
-**Status:** In progress. Done (2026-11-16 to 2026-11-25): H.0a to H.0e, H.1 to H.6, H.9, H.10, H.21, H.22 and H.22b, but for `HASH_MAP` (H.4). Not started: H.6b, H.7, H.8 and H.11 to H.20. Decisions 1 to 6, 10, 13 and 15 are taken.
+**Status:** In progress. Done (2026-11-16 to 2026-11-25): H.0a to H.0e, H.1 to H.6, H.9, H.10, H.21, H.22 and H.22b, but for `HASH_MAP` (H.4). In progress: H.7, whose cursor is done (2026-11-27) and whose moves of `grest`, `ghttp` and `gjson` onto it are not. Not started: H.6b, H.8 and H.11 to H.20. Decisions 1 to 6, 10, 13 and 15 are taken.
 **Follows:** [Phase F](verified_libraries.md) (verified libraries) and [Phase G](../ffi/ffi_plan.md) (foreign interfaces).
 
 ---
@@ -740,14 +740,18 @@ Client: every program that prints a value, and `gtest`'s failure messages (H.9).
 
 Client: `gjson`, `ghttp` and `grest`'s URL layer each wrote their own reading loop, with their own offset arithmetic and their own F.13 workarounds. Needs H.0b and P1.
 
-- [ ] `module CURSOR`: a `BYTES` and an offset, with invariant `offset <= length`. `peek`, `advance`, `take_while(pred)`, `expect(bytes)`, `remaining`.
-- [ ] Every reading routine ensures progress or failure: `Result.offset > Current.offset` or an `Error` with the offset. This is the fact each hand-written parser proves again today, and it is what makes `variant remaining` work.
-- [ ] `PARSE_ERROR` with an offset and an expected-what code.
-- [ ] Number, token and quoted-string readers shared by JSON, HTTP and TOML.
+- [x] `module CURSOR`: a `BYTES` and an offset, with invariant `offset <= length`. `peek`, `advance`, `take_while(pred)`, `expect(bytes)`, `remaining`. Also `sees`, `since`, `expect_byte`, `skip_while` and `take_some` (2026-11-27, `gparse/`).
+- [x] Every reading routine ensures progress or failure: `Result.offset > Current.offset` or an `Error` with the offset. This is the fact each hand-written parser proves again today, and it is what makes `variant remaining` work. `skip_while` and `take_while`, which may read nothing, ensure only that they do not go back.
+- [x] `PARSE_ERROR` with an offset and an expected-what code: `PARSE_EXPECTED`, an enumeration. Each reader also says which errors it gives and when, so a client can tell them apart.
+- [ ] Number, token and quoted-string readers shared by JSON, HTTP and TOML. Done: `read_nat(limit)`, whose value is `DECIMAL.value` of its digits, checked against the limit before each digit. A token is `take_some` with the format's byte test. Not done: a quoted string, left until a client needs one, as the three formats' escapes differ.
 - [ ] Move `grest`'s URL layer onto it first, as the smallest. Then `ghttp`'s head parser. `gjson` last, and only if its scalar round-trip proof survives.
 - [ ] Measure parse speed before and after on F.4's 4 MiB document.
 - Acceptance: the URL layer and `ghttp` verify on `gparse` with every existing case passing, and are shorter. If `gjson` cannot move without losing a proof, say so and leave it.
 - Risk: a shared abstraction between the parser and its proof can cost solver resources, as F.5's three-module split showed. Each move is its own commit, measured.
+
+**First part, done 2026-11-27.** `gparse` verifies in about 5 s. Its `tests/` cases (43, run by `gardelc test gparse`) cover each reader at and past its limits, and a loop. `gardelc/tests/gparse.rs` has a client that proves through the contracts alone where a reader stopped, what it read, which error it gives and why, and that its loop ends; and five claims past the contracts, each refused, none by a timeout.
+
+**Compiler change.** *Two constructors with no fields could not be told apart.* The axioms that make the constructors of a sum differ fire on a test of one (`is_Word(x)`). A constructor with fields puts its own test in play with its projection axiom; one with no fields did not, so `Word != MoreBytes` could not be proven. Each such constructor of a type with no parameters now has `is_Word(Word())` as a fact (`gardelc/tests/derived.rs`, `constructors_without_fields_are_told_apart`).
 
 #### Task H.8: `F64` Text and Math
 

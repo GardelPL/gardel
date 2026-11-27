@@ -1,0 +1,303 @@
+-- A place in a text of bytes: the text, and the offset of the next byte to read.
+--
+-- A cursor is a value. Reading gives a new cursor further on and leaves this one where it
+-- was, so a reader can try one form and go back to try another.
+--
+-- Every reading routine that can fail ensures progress or failure: an `Ok` cursor is past
+-- this one, and an `Error` is at this one's offset. A reader built from them can therefore
+-- loop on `variant remaining`. `skip_while` and `take_while`, which may read nothing, ensure
+-- only that they do not go back.
+--
+-- Each fact about the text is stated on `input.model`, the bytes as a list, so a client
+-- proves what it read with `LIST_OPS.at` and no body of this module.
+module CURSOR
+
+representation {NONE}
+  text: BYTES
+  pos: NAT
+
+invariant
+  inside: pos <= text.length
+
+create {ANY}
+
+  -- A cursor at the start of `b`.
+  start(b: BYTES): CURSOR
+    do
+      { text = b, pos = 0 }
+    ensure
+      input_kept: Result.input.model = b.model
+      at_start: Result.offset = 0
+    end
+
+feature {ANY}
+
+  -- The whole text, also what was read already.
+  input: BYTES
+    do
+      Current.text
+    ensure
+      fits: Current.offset <= Result.length
+    end
+
+  -- How many bytes were read from the start of the text.
+  offset: NAT
+    do
+      Current.pos
+    ensure
+      within: Result <= Current.input.length
+    end
+
+  -- How many bytes are left to read.
+  remaining: NAT
+    do
+      Current.text.length - Current.pos
+    ensure
+      def: Result = Current.input.length - Current.offset
+    end
+
+  at_end: BOOL
+    do
+      Current.pos = Current.text.length
+    ensure
+      def: Result = (Current.offset = Current.input.length)
+    end
+
+  -- The next byte, or nothing at the end.
+  peek: OPTION[U64]
+    do
+      if Current.pos < Current.text.length then Some(Current.text.at(Current.pos)) else None end
+    ensure
+      there: Result.is_some = (Current.offset < Current.input.length)
+      byte: Result.is_some implies
+        (Result.get < 256 and Result.get = LIST_OPS.at(Current.input.model, Current.offset))
+    end
+
+  -- Whether the next byte is `b`.
+  sees(b: U64): BOOL
+    do
+      Current.pos < Current.text.length and Current.text.at(Current.pos) = b
+    ensure
+      def: Result = (Current.offset < Current.input.length and
+        LIST_OPS.at(Current.input.model, Current.offset) = b)
+    end
+
+  -- The cursor `n` bytes further on.
+  advance(n: NAT): CURSOR
+    require
+      room: n <= Current.remaining
+    do
+      { text = Current.text, pos = Current.pos + n }
+    ensure
+      same_input: Result.input.model = Current.input.model
+      moved: Result.offset = Current.offset + n
+    end
+
+  -- The bytes read since `from`, a cursor on the same text at or before this one.
+  since(from: CURSOR): BYTES
+    require
+      same_input: from.input.model = Current.input.model
+      before: from.offset <= Current.offset
+    do
+      Current.text.slice(from.offset, Current.pos)
+    ensure
+      len: Result.length = Current.offset - from.offset
+      read: forall k: NAT. k < Result.length implies
+        LIST_OPS.at(Result.model, k) = LIST_OPS.at(Current.input.model, from.offset + k)
+    end
+
+  -- An error at this offset.
+  fail(wanted: PARSE_EXPECTED): PARSE_ERROR
+    do
+      PARSE_ERROR.make(Current.pos, wanted)
+    ensure
+      here: Result.offset = Current.offset
+      what: Result.expected = wanted
+    end
+
+  -- Past `word`, if the text goes on with it here. `word` must not be empty, so that an
+  -- `Ok` is progress.
+  expect(word: BYTES): RESULT[PARSE_ERROR, CURSOR]
+    require
+      not_empty: word.length > 0
+    do
+      if word.length > Current.text.length - Current.pos then
+        Error(Current.fail(Word))
+      else if Current.text.matches_at(word, Current.pos, 0) then
+        Ok({ text = Current.text, pos = Current.pos + word.length })
+      else
+        Error(Current.fail(Word))
+      end end
+    ensure
+      read: Result.is_ok implies
+        (Result.get.input.model = Current.input.model and
+         Result.get.offset = Current.offset + word.length and
+         (forall k: NAT. k < word.length implies
+           LIST_OPS.at(Current.input.model, Current.offset + k) = LIST_OPS.at(word.model, k)))
+      found: (word.length <= Current.remaining and
+         (forall k: NAT. k < word.length implies
+           LIST_OPS.at(Current.input.model, Current.offset + k) = LIST_OPS.at(word.model, k)))
+        implies Result.is_ok
+      progress: Result.is_ok implies Result.get.offset > Current.offset
+      refused: Result.is_error implies
+        (Result.get_error.offset = Current.offset and Result.get_error.expected = Word)
+    end
+
+  -- Past the byte `b`, if it is next.
+  expect_byte(b: U64): RESULT[PARSE_ERROR, CURSOR]
+    do
+      if Current.pos < Current.text.length and Current.text.at(Current.pos) = b then
+        Ok({ text = Current.text, pos = Current.pos + 1 })
+      else if Current.pos < Current.text.length then
+        Error(Current.fail(Word))
+      else
+        Error(Current.fail(MoreBytes))
+      end end
+    ensure
+      read: Result.is_ok implies
+        (Result.get.input.model = Current.input.model and Result.get.offset = Current.offset + 1)
+      def: Result.is_ok = Current.sees(b)
+      progress: Result.is_ok implies Result.get.offset > Current.offset
+      refused: Result.is_error implies Result.get_error.offset = Current.offset
+      ended: Result.is_error implies
+        ((Result.get_error.expected = MoreBytes) = (Current.offset = Current.input.length))
+      kinds: Result.is_error implies
+        (Result.get_error.expected = MoreBytes or Result.get_error.expected = Word)
+    end
+
+  -- Past every byte from here that `keep` keeps: the first byte it does not keep, or the end.
+  skip_while(keep: U64 -> BOOL): CURSOR
+    variant
+      Current.remaining
+    do
+      if Current.pos < Current.text.length and keep(Current.text.at(Current.pos)) then
+        Current.advance(1).skip_while(keep)
+      else
+        Current
+      end
+    ensure
+      same_input: Result.input.model = Current.input.model
+      not_back: Current.offset <= Result.offset
+      kept: forall k: NAT. (Current.offset <= k and k < Result.offset) implies
+        keep(LIST_OPS.at(Current.input.model, k))
+      stops: Result.offset < Result.input.length implies
+        not keep(LIST_OPS.at(Current.input.model, Result.offset))
+    end
+
+  -- The bytes `skip_while` passes, and the cursor after them.
+  take_while(keep: U64 -> BOOL): TUPLE[BYTES, CURSOR]
+    do
+      let after = Current.skip_while(keep)
+      let pair = (after.since(Current), after)
+      pair
+    ensure
+      same_input: Result.second.input.model = Current.input.model
+      not_back: Current.offset <= Result.second.offset
+      len: Result.first.length = Result.second.offset - Current.offset
+      read: forall k: NAT. k < Result.first.length implies
+        LIST_OPS.at(Result.first.model, k) = LIST_OPS.at(Current.input.model, Current.offset + k)
+      kept: forall k: NAT. (Current.offset <= k and k < Result.second.offset) implies
+        keep(LIST_OPS.at(Current.input.model, k))
+      stops: Result.second.offset < Result.second.input.length implies
+        not keep(LIST_OPS.at(Current.input.model, Result.second.offset))
+    end
+
+  -- As `take_while`, but at least one byte, so an `Ok` is progress.
+  take_some(keep: U64 -> BOOL): RESULT[PARSE_ERROR, TUPLE[BYTES, CURSOR]]
+    do
+      if Current.pos = Current.text.length then
+        Error(Current.fail(MoreBytes))
+      else if keep(Current.text.at(Current.pos)) then
+        Ok(Current.take_while(keep))
+      else
+        Error(Current.fail(KeptByte))
+      end end
+    ensure
+      same_input: Result.is_ok implies Result.get.second.input.model = Current.input.model
+      progress: Result.is_ok implies Result.get.second.offset > Current.offset
+      len: Result.is_ok implies Result.get.first.length = Result.get.second.offset - Current.offset
+      read: Result.is_ok implies (forall k: NAT. k < Result.get.first.length implies
+        LIST_OPS.at(Result.get.first.model, k) = LIST_OPS.at(Current.input.model, Current.offset + k))
+      kept: Result.is_ok implies (forall k: NAT. (Current.offset <= k and k < Result.get.second.offset) implies
+        keep(LIST_OPS.at(Current.input.model, k)))
+      stops: Result.is_ok implies (Result.get.second.offset < Result.get.second.input.length implies
+        not keep(LIST_OPS.at(Current.input.model, Result.get.second.offset)))
+      refused: Result.is_error implies Result.get_error.offset = Current.offset
+      ended: Result.is_error implies
+        ((Result.get_error.expected = MoreBytes) = (Current.offset = Current.input.length))
+      not_kept: Result.is_error implies
+        ((Result.get_error.expected = KeptByte) = (Current.offset < Current.input.length and
+          not keep(LIST_OPS.at(Current.input.model, Current.offset))))
+      kinds: Result.is_error implies
+        (Result.get_error.expected = MoreBytes or Result.get_error.expected = KeptByte)
+    end
+
+  -- The digits from here on onto `acc`, the value of those from `first` to here. Each step
+  -- is a tail call, so C runs it as a loop.
+  digits_onto(first: CURSOR, acc: NAT, limit: NAT): RESULT[PARSE_ERROR, TUPLE[NAT, CURSOR]]
+    require
+      same_input: first.input.model = Current.input.model
+      after: first.offset <= Current.offset
+      so_far: acc = DECIMAL.value(Current.input.model, first.offset, Current.offset)
+      within: acc <= limit
+    variant
+      Current.remaining
+    do
+      if Current.pos < Current.text.length and DECIMAL.is_digit(Current.text.at(Current.pos)) then
+        let d = Current.text.at(Current.pos) - 48
+        if d > limit then
+          Error(first.fail(SmallerNumber))
+        else if acc > (limit - d) / 10 then
+          Error(first.fail(SmallerNumber))
+        else
+          Current.advance(1).digits_onto(first, acc * 10 + d, limit)
+        end end
+      else
+        Ok((acc, Current))
+      end
+    ensure
+      same_input: Result.is_ok implies Result.get.second.input.model = Current.input.model
+      not_back: Result.is_ok implies Current.offset <= Result.get.second.offset
+      value: Result.is_ok implies
+        Result.get.first = DECIMAL.value(Current.input.model, first.offset, Result.get.second.offset)
+      bounded: Result.is_ok implies Result.get.first <= limit
+      digits: Result.is_ok implies (forall k: NAT. (Current.offset <= k and k < Result.get.second.offset) implies
+        DECIMAL.is_digit(LIST_OPS.at(Current.input.model, k)))
+      stops: Result.is_ok implies (Result.get.second.offset < Result.get.second.input.length implies
+        not DECIMAL.is_digit(LIST_OPS.at(Current.input.model, Result.get.second.offset)))
+      refused: Result.is_error implies
+        (Result.get_error.offset = first.offset and Result.get_error.expected = SmallerNumber)
+    end
+
+  -- A decimal number of one digit or more, no larger than `limit`, and the cursor after it.
+  -- Leading zeros are read as such: a format that refuses them checks the first digit.
+  read_nat(limit: NAT): RESULT[PARSE_ERROR, TUPLE[NAT, CURSOR]]
+    do
+      if Current.pos = Current.text.length then
+        Error(Current.fail(MoreBytes))
+      else if DECIMAL.is_digit(Current.text.at(Current.pos)) then
+        Current.digits_onto(Current, 0, limit)
+      else
+        Error(Current.fail(Digit))
+      end end
+    ensure
+      same_input: Result.is_ok implies Result.get.second.input.model = Current.input.model
+      progress: Result.is_ok implies Result.get.second.offset > Current.offset
+      value: Result.is_ok implies
+        Result.get.first = DECIMAL.value(Current.input.model, Current.offset, Result.get.second.offset)
+      bounded: Result.is_ok implies Result.get.first <= limit
+      digits: Result.is_ok implies (forall k: NAT. (Current.offset <= k and k < Result.get.second.offset) implies
+        DECIMAL.is_digit(LIST_OPS.at(Current.input.model, k)))
+      stops: Result.is_ok implies (Result.get.second.offset < Result.get.second.input.length implies
+        not DECIMAL.is_digit(LIST_OPS.at(Current.input.model, Result.get.second.offset)))
+      refused: Result.is_error implies Result.get_error.offset = Current.offset
+      ended: Result.is_error implies
+        ((Result.get_error.expected = MoreBytes) = (Current.offset = Current.input.length))
+      no_digit: Result.is_error implies
+        ((Result.get_error.expected = Digit) = (Current.offset < Current.input.length and
+          not DECIMAL.is_digit(LIST_OPS.at(Current.input.model, Current.offset))))
+      kinds: Result.is_error implies (Result.get_error.expected = MoreBytes or
+        Result.get_error.expected = Digit or Result.get_error.expected = SmallerNumber)
+    end
+
+end
