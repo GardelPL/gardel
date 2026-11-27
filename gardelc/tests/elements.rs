@@ -91,7 +91,7 @@ create {ANY}
       holds: Result
     end
 
-  member(cs: LIST[CHAR], c: MATH_INT): BOOL
+  member(cs: LIST[CHAR], c: CHAR): BOOL
     require
       has: cs.has(c)
     do
@@ -144,6 +144,8 @@ create {ANY}
     end
 
   built(x: U64, xs: LIST[U64]): READS
+    require
+      some: xs.length > 0
     do
       { items = xs.prepend(x).append(xs.tail) }
     end

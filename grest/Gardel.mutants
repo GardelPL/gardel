@@ -24,10 +24,6 @@ REST_REPLIES.make: { next = s, cmds = cs, held = False, id = 0, sweeps = 0, late
 REST_REPLIES.make: { next = s, cmds = cs, held = False, id = 0, sweeps = 0, late = REST_RESPONSE.timed_out, for_head = False, cut_after = False } => { next = s, cmds = cs, held = False, id = 0, sweeps = 0, late = REST_RESPONSE.timed_out, for_head = True, cut_after = False }
 REST_REPLIES.make: { next = s, cmds = cs, held = False, id = 0, sweeps = 0, late = REST_RESPONSE.timed_out, for_head = False, cut_after = False } => { next = s, cmds = cs, held = False, id = 0, sweeps = 0, late = REST_RESPONSE.timed_out, for_head = False, cut_after = True }
 
-# With no command, each arm is `False`: the length is neither 1 nor 2. Only contracts call this
-# routine, so the head of an empty list is never read when a program runs.
-REST_COMMANDS.one_answer: if cmds.length = 0 then => if False then
-
 # `own` gives it, by induction. It is stated so that the solver need not find that: without it,
 # `REST_SERVER` is proven more slowly, or not at all.
 REST_SERVER.delivered: woken: REST_COMMANDS.for_wake(mine, Current.connections) => woken: True

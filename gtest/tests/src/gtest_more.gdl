@@ -23,9 +23,17 @@ feature {ANY}
         .prepend(CHECK.equal_nat("bytes", CASES.bytes("%FF%zz").length, 4))
         .prepend(CHECK.equal_text("name", CASES.name(7, "abc"), "line 7: abc"))
         .prepend(CHECK.equal_nat("skipped", CASES.check(LIST.empty, 1, "# x", fn(i: STRING): STRING do i end).length, 0))
-        .prepend(CHECK.equal_text("case fails",
-          GTEST_MORE.message(CASES.check(LIST.empty, 3, "a => b", fn(i: STRING): STRING do i end).head),
-          "expected \"b\", got \"a\""))
+        .prepend(GTEST_MORE.case_fails(CASES.check(LIST.empty, 3, "a => b", fn(i: STRING): STRING do i end)))
+    end
+
+  -- The one result of a case that fails, which must say what it expected.
+  case_fails(rs: LIST[TEST_RESULT]): TEST_RESULT
+    do
+      if rs.length > 0 then
+        CHECK.equal_text("case fails", GTEST_MORE.message(rs.head), "expected \"b\", got \"a\"")
+      else
+        CHECK.that("case fails", False)
+      end
     end
 
   -- SplitMix64's first outputs from seed 0, as its reference implementation gives them.

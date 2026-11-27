@@ -20,11 +20,20 @@ pub(crate) const BUILTIN_TYPES: &[&str] = &[
 
 static ANY_VISIBILITY: Visibility = Visibility::Any;
 
+/// The integer types, among which a value may pass where its range allows (§3). `EXIT_CODE` is
+/// an alias of `U64`.
+const NUMBER_TYPES: &[&str] = &["U64", "NAT", "I64", "INT", "MATH_INT", "EXIT_CODE"];
+
+/// The type `arg_type` gives an integer literal, which no source can spell.
+const LITERAL_NUMBER: &str = "#number";
+
 struct Member<'a> {
     vis: &'a Visibility,
     /// Declared parameters, or `None` when the count does not decide a call: a field, a name
     /// declared twice, or a routine returning a function.
     arity: Option<usize>,
+    /// The declared parameters of a routine declared once, for typing its arguments.
+    params: Option<&'a [(String, String)]>,
     ret: Option<&'a str>,
     /// The routine's own type parameters, which a receiver's type says nothing about.
     type_params: &'a [String],
@@ -69,6 +78,7 @@ fn add_member<'a>(table: &mut HashMap<&'a str, Member<'a>>, name: &'a str, membe
             if old.arity != member.arity {
                 old.arity = None;
             }
+            old.params = None;
         })
         .or_insert(member);
 }
@@ -78,6 +88,7 @@ fn routine_member<'a>(vis: &'a Visibility, r: &'a RoutineDecl) -> Member<'a> {
     Member {
         vis,
         arity: (!returns_function).then_some(r.params.len()),
+        params: (!returns_function).then_some(r.params.as_slice()),
         ret: Some(&r.ret_type),
         type_params: &r.type_params,
         is_law: false,
@@ -98,6 +109,7 @@ fn add_concept_members<'a>(
         table.entry(&s.name).or_insert(Member {
             vis: &ANY_VISIBILITY,
             arity: None,
+            params: None,
             ret: Some(&s.ret_type),
             type_params: &[],
             is_law: false,
@@ -107,6 +119,7 @@ fn add_concept_members<'a>(
         table.entry(&r.name).or_insert(Member {
             vis: &ANY_VISIBILITY,
             arity: None,
+            params: None,
             ret: Some(&r.ret_type),
             type_params: &r.type_params,
             is_law: false,
@@ -116,6 +129,7 @@ fn add_concept_members<'a>(
         table.entry(&l.name).or_insert(Member {
             vis: &ANY_VISIBILITY,
             arity: None,
+            params: None,
             ret: None,
             type_params: &[],
             is_law: true,
@@ -136,7 +150,7 @@ fn members_of<'a>(
             add_member(
                 &mut table,
                 f,
-                Member { vis: &m.repr_vis, arity: None, ret: Some(t), type_params: &[], is_law: false },
+                Member { vis: &m.repr_vis, arity: None, params: None, ret: Some(t), type_params: &[], is_law: false },
             );
         }
     }
@@ -152,7 +166,7 @@ fn members_of<'a>(
         add_member(
             &mut table,
             &l.name,
-            Member { vis, arity: Some(l.params.len()), ret: None, type_params: &[], is_law: true },
+            Member { vis, arity: Some(l.params.len()), params: None, ret: None, type_params: &[], is_law: true },
         );
     }
     if let Some(sat) = &m.satisfies {
@@ -213,6 +227,9 @@ struct Walker<'a, 'u> {
     scope: Vec<(String, Option<String>)>,
     /// The declared type of the `let` that comes next.
     let_type: Option<String>,
+    /// The routine's result type, while the walk is at a value the routine returns: its body,
+    /// or a branch of an `if` or `match` there.
+    result_want: Option<String>,
     diags: &'u mut Vec<Diagnostic>,
     reported: &'u mut HashSet<(&'static str, String, String)>,
 }
@@ -375,6 +392,8 @@ impl<'a> Walker<'a, '_> {
             Expr::Var(v) if v == "Current" && !self.in_scope("Current") => {
                 Some(module_self_type(self.module))
             }
+            // A constructor of no fields, such as `None` or `Fine`.
+            Expr::Var(v) if !self.in_scope(v) && starts_upper(v) && !all_caps(v) => self.ctor_type(v, &[]),
             Expr::Var(v) => self.scope.iter().rev().find(|(n, _)| n == v).and_then(|(_, t)| t.clone()),
             Expr::Str(_) => Some("STRING".to_string()),
             Expr::Call(f, args) if !self.in_scope(f) && starts_upper(f) => self.ctor_type(f, args),
@@ -426,6 +445,9 @@ impl<'a> Walker<'a, '_> {
         let owners = self.universe.user_ctors.get(name).cloned().unwrap_or_default();
         let owner = if ctor_names(self.module).contains(&name) {
             self.module
+        } else if owners.len() > 1 {
+            // `E0112` already: it is no one's.
+            return None;
         } else {
             self.ctor_owner(name, &owners)?
         };
@@ -433,7 +455,12 @@ impl<'a> Walker<'a, '_> {
         let variant = variants.iter().find(|v| v.name == name)?;
         let mut map = HashMap::new();
         for ((_, field), arg) in variant.fields.iter().zip(args) {
-            if let Some(actual) = self.type_of(arg) {
+            // An integer literal does not settle which number type it is.
+            let actual = match arg {
+                Expr::Int(_) | Expr::UnaryNeg(_) => None,
+                other => self.arg_type(other),
+            };
+            if let Some(actual) = actual {
                 unify_type(field, &actual, &owner.type_params, &mut map);
             }
         }
@@ -529,6 +556,100 @@ impl<'a> Walker<'a, '_> {
         }
     }
 
+    /// The type of an argument as far as it can be told, a literal included. `#number` is an
+    /// integer literal, which fits any number type it is in range of.
+    fn arg_type(&self, e: &Expr) -> Option<String> {
+        match e {
+            Expr::Int(_) => Some(LITERAL_NUMBER.to_string()),
+            Expr::UnaryNeg(x) if matches!(**x, Expr::Int(_)) => Some(LITERAL_NUMBER.to_string()),
+            Expr::Bool(_) => Some("BOOL".to_string()),
+            Expr::Char(_) => Some("CHAR".to_string()),
+            Expr::Float(_) => Some("F64".to_string()),
+            other => self.type_of(other),
+        }
+    }
+
+    /// Whether `t` names a concrete type here, so that a difference in it is a real one: no
+    /// type parameter, concept, function type or `Current` in it.
+    fn concrete(&self, t: &str) -> bool {
+        !t.contains("->")
+            && !t.contains('(')
+            && type_tokens(t).into_iter().all(|tok| {
+                tok != "Current"
+                    && !self.type_params.iter().any(|p| p == tok)
+                    && !self.universe.concepts.contains_key(tok)
+                    && (BUILTIN_TYPES.contains(&tok) || self.universe.modules.contains_key(tok))
+            })
+    }
+
+    /// `false` only when `found` cannot be a value of `wanted`. The number types are one family
+    /// here: a value out of range for its parameter is the verifier's to refuse, as a range
+    /// violation. A type that cannot be told is taken to fit.
+    fn may_fit(&self, found: &str, wanted: &str) -> bool {
+        let plain = |t: &str| t.split_whitespace().collect::<String>();
+        if found == LITERAL_NUMBER {
+            return !self.concrete(wanted) || NUMBER_TYPES.contains(&plain(wanted).as_str()) || plain(wanted) == "F64";
+        }
+        if !self.concrete(found) || !self.concrete(wanted) || plain(found) == plain(wanted) {
+            return true;
+        }
+        let (fh, fa) = split_type_app(found);
+        let (wh, wa) = split_type_app(wanted);
+        if NUMBER_TYPES.contains(&fh) && NUMBER_TYPES.contains(&wh) {
+            return true;
+        }
+        fh == wh && (fa.len() != wa.len() || fa.iter().zip(&wa).all(|(f, w)| self.may_fit(f, w)))
+    }
+
+    /// The parameter types of `name` called on a value of type `owner`, each `None` where the
+    /// owner's type arguments leave it open.
+    fn param_types(&self, owner: &str, name: &str) -> Option<Vec<Option<String>>> {
+        let (head, args) = split_type_app(owner);
+        if head == "LIST" {
+            let elem = args.first().map(ToString::to_string);
+            return match name {
+                "prepend" | "has" => Some(vec![elem]),
+                "append" => Some(vec![elem.map(|e| format!("LIST[{e}]"))]),
+                _ => None,
+            };
+        }
+        let member = self.universe.member(head, name)?;
+        let params = member.params?;
+        let tps = &self.universe.modules.get(head)?.type_params;
+        let map = type_arg_map(tps, &args);
+        let open = |t: &str| {
+            t == "Current"
+                || member.type_params.iter().any(|p| p == t)
+                || tps.iter().any(|p| p == t && !map.contains_key(t))
+        };
+        Some(
+            params
+                .iter()
+                .map(|(_, t)| (!type_tokens(t).into_iter().any(open)).then(|| subst_type_idents(t, &map)))
+                .collect(),
+        )
+    }
+
+    /// Each argument of a call of `name` on a value of type `owner` against its parameter.
+    fn check_arg_types(&mut self, owner: &str, name: &str, args: &[Expr]) {
+        let Some(wanted) = self.param_types(owner, name) else { return };
+        if wanted.len() != args.len() {
+            return;
+        }
+        for (i, (w, a)) in wanted.iter().zip(args).enumerate() {
+            let (Some(w), Some(found)) = (w, self.arg_type(a)) else { continue };
+            if !self.may_fit(&found, w) {
+                let found = if found == LITERAL_NUMBER { "a number".to_string() } else { format!("`{found}`") };
+                let owner = type_head(owner);
+                self.report(
+                    "E0117: argument_type_mismatch",
+                    name,
+                    format!("argument {} of `{owner}.{name}` is `{w}`, and this call gives it {found}", i + 1),
+                );
+            }
+        }
+    }
+
     fn is_hidden(&self, vis: &Visibility) -> bool {
         match vis {
             Visibility::Any => false,
@@ -542,12 +663,39 @@ impl<'a> Walker<'a, '_> {
     }
 
     fn block(&mut self, stmts: &[Stmt], body: &Expr) {
+        self.block_returning(stmts, body, None);
+    }
+
+    /// A block whose value is the routine's result when `want` is its type.
+    fn block_returning(&mut self, stmts: &[Stmt], body: &Expr, want: Option<String>) {
         let mark = self.scope.len();
         for st in stmts {
             self.stmt(st);
         }
+        self.result_want = want;
         self.expr(body);
         self.scope.truncate(mark);
+    }
+
+    /// A value the routine returns, against its declared result type `want`.
+    fn check_result_type(&mut self, e: &Expr, want: &str) {
+        let Some(found) = self.arg_type(e) else { return };
+        if self.may_fit(&found, want) {
+            return;
+        }
+        let needle = match e {
+            Expr::Var(v) => v.clone(),
+            Expr::Call(f, _) => f.clone(),
+            Expr::MethodCall(_, n, _) => n.clone(),
+            Expr::Bool(b) => if *b { "True" } else { "False" }.to_string(),
+            _ => self.routine.clone(),
+        };
+        let found = if found == LITERAL_NUMBER { "a number".to_string() } else { format!("`{found}`") };
+        self.report(
+            "E0118: result_type_mismatch",
+            &needle,
+            format!("`{}` returns `{want}`, and this value is {found}", self.routine),
+        );
     }
 
     fn stmt(&mut self, st: &Stmt) {
@@ -581,6 +729,13 @@ impl<'a> Walker<'a, '_> {
     }
 
     fn expr(&mut self, e: &Expr) {
+        // Only the value itself is returned, not the parts it is made of.
+        let want = self.result_want.take();
+        if let Some(w) = &want {
+            if !matches!(e, Expr::If(..) | Expr::Match(..) | Expr::WithIo(..)) {
+                self.check_result_type(e, w);
+            }
+        }
         match e {
             Expr::Int(_) | Expr::Float(_) | Expr::Char(_) | Expr::Unit | Expr::Bool(_) | Expr::Str(_) => {}
             Expr::Var(v) => self.var(v),
@@ -593,18 +748,18 @@ impl<'a> Walker<'a, '_> {
                 for a in args {
                     self.expr(a);
                 }
-                self.call(f, args.len());
+                self.call(f, args);
             }
             Expr::MethodCall(recv, name, args) => {
                 for a in args {
                     self.expr(a);
                 }
-                self.method(recv, name, args.len());
+                self.method(recv, name, args);
             }
             Expr::If(c, ts, te, es, ee) => {
                 self.expr(c);
-                self.block(ts, te);
-                self.block(es, ee);
+                self.block_returning(ts, te, want.clone());
+                self.block_returning(es, ee, want);
             }
             Expr::Match(scrut, cases) => {
                 self.expr(scrut);
@@ -613,7 +768,7 @@ impl<'a> Walker<'a, '_> {
                     self.check_pattern(&c.pattern);
                     let mark = self.scope.len();
                     self.bind_pattern(&c.pattern, ty.as_deref());
-                    self.block(&c.stmts, &c.body);
+                    self.block_returning(&c.stmts, &c.body, want.clone());
                     self.scope.truncate(mark);
                 }
             }
@@ -689,12 +844,14 @@ impl<'a> Walker<'a, '_> {
         }
     }
 
-    fn call(&mut self, f: &str, argc: usize) {
+    fn call(&mut self, f: &str, args: &[Expr]) {
+        let argc = args.len();
         if self.in_scope(f) {
             return;
         }
         if starts_upper(f) {
             self.check_ctor(f);
+            self.check_ctor_arg_types(f, args);
         } else if self.universe.member(&self.module.name, f).is_none() {
             self.report(
                 "E0108: unknown_routine",
@@ -703,14 +860,42 @@ impl<'a> Walker<'a, '_> {
             );
         } else {
             self.check_member(&self.module.name.clone(), f, Some(argc));
+            self.check_arg_types(&module_self_type(self.module), f, args);
         }
     }
 
-    fn method(&mut self, recv: &Expr, name: &str, argc: usize) {
+    /// The arguments of constructor `name` against those of its fields that do not depend on
+    /// its type's parameters.
+    fn check_ctor_arg_types(&mut self, name: &str, args: &[Expr]) {
+        // A name declared twice is `E0112` already, and its fields are no one's.
+        let own = ctor_names(self.module).contains(&name);
+        if !own && self.universe.user_ctors.get(name).is_some_and(|o| o.len() > 1) {
+            return;
+        }
+        let fields = self.variant_field_types(name, None);
+        if fields.len() != args.len() {
+            return;
+        }
+        for (i, (w, a)) in fields.iter().zip(args).enumerate() {
+            let (Some(w), Some(found)) = (w, self.arg_type(a)) else { continue };
+            if !self.may_fit(&found, w) {
+                let found = if found == LITERAL_NUMBER { "a number".to_string() } else { format!("`{found}`") };
+                self.report(
+                    "E0117: argument_type_mismatch",
+                    name,
+                    format!("field {} of `{name}` is `{w}`, and this call gives it {found}", i + 1),
+                );
+            }
+        }
+    }
+
+    fn method(&mut self, recv: &Expr, name: &str, args: &[Expr]) {
+        let argc = args.len();
         if let Expr::Var(v) = recv {
             if self.is_static_receiver(v) {
                 if self.universe.modules.contains_key(v.as_str()) {
                     self.check_member(v, name, Some(argc));
+                    self.check_arg_types(v, name, args);
                 } else if !self.universe.knows_type(v) && !self.type_params.iter().any(|t| t == v) {
                     self.report(
                         "E0106: unknown_module",
@@ -729,6 +914,7 @@ impl<'a> Walker<'a, '_> {
             }
             let argc = self.universe.member(&owner, name).and_then(|m| m.arity).map(|_| argc);
             self.check_member(&owner, name, argc);
+            self.check_arg_types(&t, name, args);
         } else {
             self.check_untyped_member(name);
         }
@@ -776,12 +962,12 @@ impl<'a> Walker<'a, '_> {
         for e in &r.variant {
             self.expr(e);
         }
-        let mark = self.scope.len();
-        for st in &r.stmts {
-            self.stmt(st);
-        }
-        self.expr(&r.body);
-        self.scope.truncate(mark);
+        let want = match r.ret_type.as_str() {
+            "" => None,
+            "Current" => Some(module_self_type(self.module)),
+            t => Some(t.to_string()),
+        };
+        self.block_returning(&r.stmts, &r.body, want);
         for (_, e) in &r.ensures {
             self.expr(e);
         }
@@ -862,6 +1048,7 @@ pub(crate) fn check_names(
                 type_params: Vec::new(),
                 scope: Vec::new(),
                 let_type: None,
+                result_want: None,
                 diags: &mut diags,
                 reported: &mut reported,
             }

@@ -511,16 +511,18 @@ fn edit_cell() -> String {
     format!("{}Key:Tab Key:Enter ", choose(2, 1001, "cell.gdl"))
 }
 
-/// The fixture's `cell.gdl` with `text` put at the start of its second line.
+/// The fixture's `cell.gdl` with `text` put at the start of its second line, its line ends
+/// kept: CR LF in a Windows checkout (git's `autocrlf`), LF in one on Linux, as git stores it.
 fn cell_with(text: &str) -> Vec<u8> {
     let cell = fs::read_to_string(fixture().join("cell.gdl")).expect("cell.gdl");
-    assert!(cell.contains("\r\nmodule CELL"), "the fixture ends its lines with CR LF");
-    cell.replacen("\r\nmodule CELL", &format!("\r\n{text}module CELL"), 1).into_bytes()
+    let end = if cell.contains("\r\nmodule CELL") { "\r\n" } else { "\n" };
+    assert!(cell.contains(&format!("{end}module CELL")), "the fixture's second line is `module CELL`");
+    cell.replacen(&format!("{end}module CELL"), &format!("{end}{text}module CELL"), 1).into_bytes()
 }
 
 #[test]
 fn text_is_edited_and_saved_with_its_own_line_ends_then_checked_again() {
-    // Typed: the title says unsaved; saved: the text written with its CR LF kept, and a check.
+    // Typed: the title says unsaved; saved: the text written with its line ends kept, and a check.
     let steps = format!("{}{}Key:Ctrl:s ", edit_cell(), keys("x"));
     let (term, log) = screen(&steps);
     let shown = term.text();
