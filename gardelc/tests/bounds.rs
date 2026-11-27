@@ -445,7 +445,7 @@ feature {ANY}
     variant
       xs
     do
-      if xs.length = 0 then 0 else 1 + J.count(xs.tail) end
+      if xs.length = 0 then 0 else 1 + Current.count(xs.tail) end
     end
 
 end
@@ -484,7 +484,7 @@ end
 
     // A `LIST` is measured by its length, and a sum type by its size.
     let measured = list.replace("      xs\n    do", "      xs.length\n    do");
-    let measured = measured.replace("1 + J.count(xs.tail)", "1");
+    let measured = measured.replace("1 + Current.count(xs.tail)", "1");
     assert_ok(&Project::new("variant_ok", &[("j.gdl", &measured)]).check());
 }
 

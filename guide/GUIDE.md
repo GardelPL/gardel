@@ -2658,6 +2658,9 @@ There are no import statements. Before anything is verified, `gardelc` resolves 
 | `E0117: argument_type_mismatch` | An argument of another type than its parameter, such as `xs.append(4)`: `append` joins two lists, so the element goes in `prepend`. Integer types pass for one another where the range allows |
 | `E0118: result_type_mismatch` | A result of another type than the routine declares, such as `xs.head` for a `LIST[NAT]`, or one branch of an `if` that gives a `BOOL` where the other gives a number. Integer types pass for one another where the range allows |
 | `E0119: needs_an_instance` | `BOX.get` where `get` is a `feature` of `module BOX`: it works on a `BOX` value, so call it on one, `b.get`. Move a routine that needs no value to `create`, which is called as `BOX.make(3)` |
+| `E0120: pattern_type_mismatch` | `case Some(x)` on a value that is not an `OPTION`, or `case Some(x, y)`: `Some` has one field |
+| `E0121: field_type_mismatch` | `{ count = "a", name = "b" }` where `count` is a `NAT`, in a record literal or a `{ x with f = v }` update |
+| `E0122: compare_type_mismatch` | `n = True` for a `NAT` `n`, or `case "a"` in a `match` on one: the two sides have no value in common |
 | `E0199: verifier_translation_failed` | The verifier could not accept what `gardelc` generated. The module is not verified. This is a limit of the compiler, not a fault shown in your program, and `GARDEL_KEEP_BPL=1` keeps the generated file. |
 
 Exporting to a named module across files, as in `feature {OTHER}`, is not usable yet: the export list counts as a dependency, so it forms a cycle (`E0103`).

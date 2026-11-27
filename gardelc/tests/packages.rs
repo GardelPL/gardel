@@ -1154,6 +1154,63 @@ end
     assert_ok(&world.run("root", &["--strict"]));
 }
 
+/// A record field, a pattern and the two sides of `=` are typed where they are written:
+/// `E0121`, `E0120` and `E0122` instead of Boogie's type check as `E0199`.
+#[test]
+fn fields_patterns_and_comparisons_are_typed() {
+    let point = |made: &str| {
+        format!(
+            "module PT
+
+representation {{ANY}}
+  count: NAT
+  name: STRING
+
+create {{ANY}}
+
+  make(n: NAT): PT
+    do
+      {made}
+    end
+
+feature {{ANY}}
+
+  get: NAT
+    do
+      Current.count
+    end
+
+end
+"
+        )
+    };
+    let user = |body: &str| {
+        format!(
+            "functions USER\n\nfeature {{ANY}}\n\n  t(p: PT, n: NAT, o: OPTION[NAT]): NAT\n    do\n      {body}\n    end\n\nend\n"
+        )
+    };
+    let ok_record = "{ count = n, name = \"b\" }";
+    for (made, body, code) in [
+        ("{ count = \"a\", name = \"b\" }", "0", "E0121: field_type_mismatch"),
+        ("{ PT.make(1) with count = True }", "0", "E0121: field_type_mismatch"),
+        (ok_record, "match p case Some(x) then x case None then 0 end", "E0120: pattern_type_mismatch"),
+        (ok_record, "match o case Some(x, y) then x case None then 0 end", "E0120: pattern_type_mismatch"),
+        (ok_record, "match n case \"a\" then 1 case _ then 0 end", "E0122: compare_type_mismatch"),
+        (ok_record, "match o case Some(True) then 1 case _ then 0 end", "E0122: compare_type_mismatch"),
+        (ok_record, "if n = True then 1 else 0 end", "E0122: compare_type_mismatch"),
+    ] {
+        let world = World::new("typed_fields", &[]);
+        world.package("root", &[], &[("pt.gdl", &point(made)), ("user.gdl", &user(body))]);
+        let out = world.run("root", &[]);
+        assert_refused(&out, code);
+        assert!(!all(&out).contains("E0199"), "{}", all(&out));
+    }
+    let world = World::new("typed_fields_ok", &[]);
+    let body = "match o case Some(0) then p.get case Some(x) then x case None then PT.make(n).get end";
+    world.package("root", &[], &[("pt.gdl", &point(ok_record)), ("user.gdl", &user(body))]);
+    assert_ok(&world.run("root", &["--strict"]));
+}
+
 /// A declared type settles what the value alone leaves open, here across a package boundary,
 /// so it has to be resolved like any other type.
 #[test]

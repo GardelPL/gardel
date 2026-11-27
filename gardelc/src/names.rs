@@ -27,6 +27,9 @@ const NUMBER_TYPES: &[&str] = &["U64", "NAT", "I64", "INT", "MATH_INT", "EXIT_CO
 /// The type `arg_type` gives an integer literal, which no source can spell.
 const LITERAL_NUMBER: &str = "#number";
 
+/// The fields of a product representation, by name, each with its type where it is settled.
+type FieldTypes = Vec<(String, Option<String>)>;
+
 struct Member<'a> {
     vis: &'a Visibility,
     /// Declared parameters, or `None` when the count does not decide a call: a field, a name
@@ -525,6 +528,151 @@ impl<'a> Walker<'a, '_> {
         }
     }
 
+    /// Pattern `p` against the type `ty` of the value it matches, where that is known: a
+    /// constructor of another type, a constructor given another number of fields, or a tuple
+    /// of another length cannot match.
+    fn check_pattern_type(&mut self, p: &Pattern, ty: Option<&str>) {
+        let ty = ty.filter(|t| self.concrete(t));
+        match p {
+            Pattern::Variant(c, subs) => {
+                let bare = c.rsplit(['.', ':']).next().unwrap_or(c);
+                let head = ty.map(type_head);
+                let in_ty = head
+                    .and_then(|h| self.universe.modules.get(h))
+                    .is_some_and(|m| matches!(&m.repr, ReprKind::Sum(vs) if vs.iter().any(|v| v.name == bare)));
+                if let (Some(t), false) = (ty, in_ty) {
+                    let owners = self.universe.user_ctors.get(bare).cloned().unwrap_or_default();
+                    if let Some(owner) = self.ctor_owner(bare, &owners).filter(|_| owners.len() <= 1) {
+                        self.report(
+                            "E0120: pattern_type_mismatch",
+                            c,
+                            format!("`{bare}` is a constructor of `{}`, and the value matched is `{t}`", owner.name),
+                        );
+                    }
+                    return;
+                }
+                let fields = self.variant_field_types(bare, ty);
+                let want = self.variant_owner(bare, ty).and_then(|owner| match &owner.repr {
+                    ReprKind::Sum(vs) => vs.iter().find(|v| v.name == bare).map(|v| v.fields.len()),
+                    ReprKind::Product(_) => None,
+                });
+                if let Some(n) = want.filter(|&n| !subs.is_empty() && n != subs.len()) {
+                    self.report(
+                        "E0120: pattern_type_mismatch",
+                        c,
+                        format!(
+                            "`{bare}` has {n} field{}, and this pattern gives {}",
+                            if n == 1 { "" } else { "s" },
+                            subs.len()
+                        ),
+                    );
+                    return;
+                }
+                for (i, sub) in subs.iter().enumerate() {
+                    self.check_pattern_type(sub, fields.get(i).and_then(Option::as_deref));
+                }
+            }
+            Pattern::Tuple(subs) => {
+                let Some(t) = ty else {
+                    for sub in subs {
+                        self.check_pattern_type(sub, None);
+                    }
+                    return;
+                };
+                let (head, args) = split_type_app(t);
+                if head != "TUPLE" || args.len() != subs.len() {
+                    let needle = self.routine.clone();
+                    self.report(
+                        "E0120: pattern_type_mismatch",
+                        &needle,
+                        format!("a tuple pattern of {} values cannot match a `{t}`", subs.len()),
+                    );
+                    return;
+                }
+                let args: Vec<String> = args.iter().map(ToString::to_string).collect();
+                for (sub, a) in subs.iter().zip(&args) {
+                    self.check_pattern_type(sub, Some(a));
+                }
+            }
+            // A literal never reaches here: `patterns::desugar_patterns` makes it an `=` test,
+            // which `check_compare_types` checks.
+            Pattern::Lit(_) | Pattern::Wildcard | Pattern::Bind(_) => {}
+        }
+    }
+
+    /// The module whose sum type declares constructor `name`, for a value of type `ty` or,
+    /// with `ty` unknown, by the name alone.
+    fn variant_owner(&self, name: &str, ty: Option<&str>) -> Option<&'a ModuleDecl> {
+        if let Some(t) = ty {
+            return self.universe.modules.get(type_head(t)).copied();
+        }
+        let owners = self.universe.user_ctors.get(name).cloned().unwrap_or_default();
+        if owners.len() > 1 {
+            return None;
+        }
+        self.ctor_owner(name, &owners)
+    }
+
+    /// The fields of a record of type `ty`, a module with a product representation, each with
+    /// its type where the type's arguments settle it, after the module's name.
+    fn record_fields(&self, ty: &str) -> Option<(String, FieldTypes)> {
+        let (head, args) = split_type_app(ty);
+        let owner = self.universe.modules.get(head).copied()?;
+        let ReprKind::Product(fields) = &owner.repr else { return None };
+        let map = type_arg_map(&owner.type_params, &args);
+        let open = |t: &str| owner.type_params.iter().any(|p| p == t && !map.contains_key(t));
+        let fields = fields
+            .iter()
+            .map(|(n, f)| (n.clone(), (!type_tokens(f).into_iter().any(open)).then(|| subst_type_idents(f, &map))))
+            .collect();
+        Some((owner.name.clone(), fields))
+    }
+
+    /// The values of a record literal or update of type `ty` against its fields' types.
+    fn check_record_fields(&mut self, ty: &str, given: &[(String, Expr)]) {
+        let Some((owner, fields)) = self.record_fields(ty) else { return };
+        for (name, value) in given {
+            let Some((_, Some(want))) = fields.iter().find(|(n, _)| n == name) else { continue };
+            let Some(found) = self.arg_type(value) else { continue };
+            if !self.may_fit(&found, want) {
+                let found = if found == LITERAL_NUMBER { "a number".to_string() } else { format!("`{found}`") };
+                self.report(
+                    "E0121: field_type_mismatch",
+                    name,
+                    format!("field `{name}` of `{owner}` is `{want}`, and this record gives it {found}"),
+                );
+            }
+        }
+    }
+
+    /// `l = r` of two types no value shares. A literal `case` pattern is compiled to this test
+    /// (`patterns::desugar_patterns`), so it is checked here too.
+    fn check_compare_types(&mut self, op: &str, l: &Expr, r: &Expr) {
+        let (Some(lt), Some(rt)) = (self.arg_type(l), self.arg_type(r)) else { return };
+        if self.may_fit(&lt, &rt) && self.may_fit(&rt, &lt) {
+            return;
+        }
+        let shown = |t: &str| if t == LITERAL_NUMBER { "a number".to_string() } else { format!("`{t}`") };
+        let needle = [r, l]
+            .iter()
+            .find_map(|e| match e {
+                Expr::Str(s) => Some(format!("\"{s}\"")),
+                Expr::Bool(b) => Some(if *b { "True" } else { "False" }.to_string()),
+                Expr::Int(n) => Some(n.to_string()),
+                _ => None,
+            })
+            .unwrap_or_else(|| self.routine.clone());
+        self.report(
+            "E0122: compare_type_mismatch",
+            &needle,
+            format!(
+                "`{op}` compares {} with {}, and no value is both. A literal `case` pattern is compared with its value the same way",
+                shown(&lt),
+                shown(&rt)
+            ),
+        );
+    }
+
     fn is_static_receiver(&self, v: &str) -> bool {
         all_caps(v) && !self.in_scope(v)
     }
@@ -761,9 +909,12 @@ impl<'a> Walker<'a, '_> {
             Expr::Int(_) | Expr::Float(_) | Expr::Char(_) | Expr::Unit | Expr::Bool(_) | Expr::Str(_) => {}
             Expr::Var(v) => self.var(v),
             Expr::UnaryNot(x) | Expr::UnaryNeg(x) => self.expr(x),
-            Expr::BinOp(_, l, r) => {
+            Expr::BinOp(op, l, r) => {
                 self.expr(l);
                 self.expr(r);
+                if matches!(op.as_str(), "=" | "!=" | "/=") {
+                    self.check_compare_types(op, l, r);
+                }
             }
             Expr::Call(f, args) => {
                 for a in args {
@@ -787,6 +938,7 @@ impl<'a> Walker<'a, '_> {
                 let ty = self.type_of(scrut);
                 for c in cases {
                     self.check_pattern(&c.pattern);
+                    self.check_pattern_type(&c.pattern, ty.as_deref());
                     let mark = self.scope.len();
                     self.bind_pattern(&c.pattern, ty.as_deref());
                     self.block_returning(&c.stmts, &c.body, want.clone());
@@ -797,12 +949,16 @@ impl<'a> Walker<'a, '_> {
                 for (_, v) in fields {
                     self.expr(v);
                 }
+                // A record literal builds a value of its own module (§5.1).
+                self.check_record_fields(&module_self_type(self.module), fields);
             }
             Expr::RecordUpdate(base, fields) => {
                 self.expr(base);
                 for (_, v) in fields {
                     self.expr(v);
                 }
+                let ty = self.type_of(base).unwrap_or_else(|| module_self_type(self.module));
+                self.check_record_fields(&ty, fields);
             }
             Expr::TupleLit(items) => {
                 for i in items {
