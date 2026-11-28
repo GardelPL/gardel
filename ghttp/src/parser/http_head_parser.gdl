@@ -8,38 +8,45 @@ feature {ANY}
     require
       in_buf: le <= buf.length
     do
-      match buf.index_of_byte(32, 0)
-        case None then
+      let start = CURSOR.start(buf)
+      let method_end = word_end(start)
+      if method_end.offset = 0 or method_end.offset >= le then
+        Error(MalformedRequestLine)
+      else
+        let target_end = word_end(method_end.advance(1))
+        if target_end.offset >= le then
           Error(MalformedRequestLine)
-        case Some(s1) then
-          if s1 = 0 or s1 >= le then
-            Error(MalformedRequestLine)
-          else
-            match buf.index_of_byte(32, s1 + 1)
-              case None then
-                Error(MalformedRequestLine)
-              case Some(s2) then
-                if s2 >= le then
-                  Error(MalformedRequestLine)
-                else
-                  match method_of(buf.slice(0, s1))
-                    case Error(e) then
-                      Error(e)
-                    case Ok(m) then
-                      match target_of(buf, s1 + 1, s2)
-                        case Error(e) then
-                          Error(e)
-                        case Ok(t) then
-                          match version_of(buf.slice(s2 + 1, le))
-                            case Error(e) then Error(e)
-                            case Ok(v) then Ok(HTTP_REQUEST.make_line(m, t, v))
-                          end
-                      end
+        else
+          match method_of(method_end.since(start))
+            case Error(e) then
+              Error(e)
+            case Ok(m) then
+              match target_of(buf, method_end.offset + 1, target_end.offset)
+                case Error(e) then
+                  Error(e)
+                case Ok(t) then
+                  match version_of(buf.slice(target_end.offset + 1, le))
+                    case Error(e) then Error(e)
+                    case Ok(v) then Ok(HTTP_REQUEST.make_line(m, t, v))
                   end
-                end
-            end
+              end
           end
+        end
       end
+    end
+
+  -- The cursor past a word of a request line: past every byte before the next space, or to
+  -- the end. Its contract is on the bytes, so a proof about a request line needs no lambda.
+  word_end(c: CURSOR): CURSOR
+    do
+      c.skip_while(fn(b: U64): BOOL do b != 32 end)
+    ensure
+      same_input: Result.input.model = c.input.model
+      not_back: c.offset <= Result.offset
+      no_space: forall k: NAT. (c.offset <= k and k < Result.offset) implies
+        LIST_OPS.at(c.input.model, k) != 32
+      at_space: Result.offset < Result.input.length implies
+        LIST_OPS.at(c.input.model, Result.offset) = 32
     end
 
   -- A line break, which ends a line of a head. Its bytes are stated, as a client of this
@@ -409,6 +416,17 @@ specify {ANY}
       end
     ensure
       reads: match HTTP_HEAD_PARSER.version_of(tok) case Ok(x) then x = v case Error(_) then False end
+    end
+
+  -- A word ends at the first space after it.
+  law word_ends_at(c: CURSOR, n: NAT)
+    require
+      ordered: c.offset <= n
+      fits: n < c.input.length
+      here: LIST_OPS.at(c.input.model, n) = 32
+      none_before: forall k: NAT. (c.offset <= k and k < n) implies LIST_OPS.at(c.input.model, k) != 32
+    ensure
+      found: HTTP_HEAD_PARSER.word_end(c).offset = n
     end
 
   -- What `all_visible` says, byte by byte, and back.

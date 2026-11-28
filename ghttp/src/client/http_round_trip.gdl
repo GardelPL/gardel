@@ -38,9 +38,20 @@ specify {ANY}
       -- The two spaces.
       LIST_OPS.at(buf.model, m.to_string.byte_length) = 32 and
       LIST_OPS.at(buf.model, m.to_string.byte_length + 1 + t.byte_length) = 32 and
-      -- The method, the target and the version, each read back from its slice.
-      BYTES.same_items(buf.slice(0, m.to_string.byte_length).model, m.to_string.byte_model) and
-      HTTP_HEAD_PARSER.method_reads_back(m, buf.slice(0, m.to_string.byte_length)) and
+      -- Where `request_line`'s cursor finds the two spaces.
+      CURSOR.start(buf).input.model = buf.model and
+      CURSOR.start(buf).offset = 0 and
+      HTTP_HEAD_PARSER.word_ends_at(CURSOR.start(buf), m.to_string.byte_length) and
+      HTTP_HEAD_PARSER.word_end(CURSOR.start(buf)).advance(1).offset = m.to_string.byte_length + 1 and
+      HTTP_HEAD_PARSER.word_end(CURSOR.start(buf)).advance(1).input.model = buf.model and
+      HTTP_HEAD_PARSER.word_ends_at(HTTP_HEAD_PARSER.word_end(CURSOR.start(buf)).advance(1),
+        m.to_string.byte_length + 1 + t.byte_length) and
+      -- The method, the target and the version, each read back from its bytes.
+      BYTES.same_items(
+        HTTP_HEAD_PARSER.word_end(CURSOR.start(buf)).since(CURSOR.start(buf)).model,
+        m.to_string.byte_model) and
+      HTTP_HEAD_PARSER.method_reads_back(m,
+        HTTP_HEAD_PARSER.word_end(CURSOR.start(buf)).since(CURSOR.start(buf))) and
       BYTES.same_items(
         buf.slice(m.to_string.byte_length + 1, m.to_string.byte_length + 1 + t.byte_length).model,
         t.byte_model) and
@@ -50,11 +61,7 @@ specify {ANY}
         v.to_string.byte_model) and
       HTTP_HEAD_PARSER.version_reads_back(v,
         buf.slice(m.to_string.byte_length + 2 + t.byte_length, m.to_string.byte_length + t.byte_length + 10)) and
-      -- What `request_line` finds on the way.
-      buf.index_of_byte(32, 0).is_some and
-      buf.index_of_byte(32, 0).get = m.to_string.byte_length and
-      buf.index_of_byte(32, m.to_string.byte_length + 1).is_some and
-      buf.index_of_byte(32, m.to_string.byte_length + 1).get = m.to_string.byte_length + 1 + t.byte_length and
+      -- The target.
       HTTP_HEAD_PARSER.target_of(buf, m.to_string.byte_length + 1, m.to_string.byte_length + 1 + t.byte_length).is_ok and
       HTTP_HEAD_PARSER.target_of(buf, m.to_string.byte_length + 1, m.to_string.byte_length + 1 + t.byte_length).get.equals(t)
     ensure

@@ -29,15 +29,31 @@ specify {ANY}
       line_end: LIST_OPS.at(HTTP_REQUEST_WRITER.head_text(req).byte_model, HTTP_REQUEST_WRITER.line_text(req.method, req.target, req.version).byte_length) = 13 and LIST_OPS.at(HTTP_REQUEST_WRITER.head_text(req).byte_model, HTTP_REQUEST_WRITER.line_text(req.method, req.target, req.version).byte_length + 1) = 10
     end
 
-  -- The head ends with a blank line.
-  law head_blank(req: HTTP_REQUEST)
+  -- What `HTTP_HEAD_WHOLE.blank` needs of the writer's texts. Apart from `head_blank`: in one
+  -- condition with it, the solver took 2 s or 110 s by its seed (H.7).
+  law blank_parts(req: HTTP_REQUEST)
     require
       sendable: HTTP_REQUEST_WRITER.sendable(req)
     do
       HTTP_REQUEST_WRITER.target_ok(req.target) and
       HTTP_REQUEST_WRITER.fields_ok(req.headers.fields) and
       req.headers.fields.length <= 64 and
-      HTTP_WRITER_FIELDS.fields_ends(req.headers.fields) and
+      HTTP_WRITER_FIELDS.fields_ends(req.headers.fields)
+    ensure
+      whole: HTTP_REQUEST_WRITER.head_text(req).byte_model =
+        HTTP_REQUEST_WRITER.line_text(req.method, req.target, req.version).byte_model.append(LIST.empty.prepend(10).prepend(13)).append(HTTP_REQUEST_WRITER.fields_text(req.headers.fields).byte_model).append(HTTP_REQUEST_WRITER.length_line(req).byte_model).append(LIST.empty.prepend(10).prepend(13))
+      fields_ends: HTTP_REQUEST_WRITER.fields_text(req.headers.fields).byte_model.length > 0 implies
+        (HTTP_REQUEST_WRITER.fields_text(req.headers.fields).byte_model.length >= 2 and LIST_OPS.at(HTTP_REQUEST_WRITER.fields_text(req.headers.fields).byte_model, HTTP_REQUEST_WRITER.fields_text(req.headers.fields).byte_model.length - 2) = 13 and LIST_OPS.at(HTTP_REQUEST_WRITER.fields_text(req.headers.fields).byte_model, HTTP_REQUEST_WRITER.fields_text(req.headers.fields).byte_model.length - 1) = 10)
+      length_ends: HTTP_REQUEST_WRITER.length_line(req).byte_model.length > 0 implies
+        (HTTP_REQUEST_WRITER.length_line(req).byte_model.length >= 2 and LIST_OPS.at(HTTP_REQUEST_WRITER.length_line(req).byte_model, HTTP_REQUEST_WRITER.length_line(req).byte_model.length - 2) = 13 and LIST_OPS.at(HTTP_REQUEST_WRITER.length_line(req).byte_model, HTTP_REQUEST_WRITER.length_line(req).byte_model.length - 1) = 10)
+    end
+
+  -- The head ends with a blank line.
+  law head_blank(req: HTTP_REQUEST)
+    require
+      sendable: HTTP_REQUEST_WRITER.sendable(req)
+    do
+      HTTP_WRITER_HEAD.blank_parts(req) and
       HTTP_HEAD_WHOLE.blank(
         HTTP_REQUEST_WRITER.head_text(req).byte_model,
         HTTP_REQUEST_WRITER.line_text(req.method, req.target, req.version).byte_model,
