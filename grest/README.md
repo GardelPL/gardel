@@ -79,6 +79,8 @@ ghttp = { path = "../ghttp" }
 gjson = { path = "../gjson" }
 ```
 
+`grest` also uses `gparse`, but only inside: a client that does not name `CURSOR` need not list it.
+
 ## Modules
 
 | Module | What it does |
@@ -93,7 +95,7 @@ gjson = { path = "../gjson" }
 | `REST_COMMANDS` | The commands a server step may give (`for_conn`, `for_none`, `shaped`), and what `start` reads from its arguments. They do not depend on the state, so they are apart from the generic server. |
 | `REST_REQUEST` | What a handler sees: `method`, `param` and `param_nat` (path parameters), `query`, `header` (ignoring the case of the name), `body`, `json_body`, and the `http` request itself. |
 | `REST_RESPONSE` | `json`, `ok_json`, `created_json`, `text`, `ok_text` and `no_content`, and errors as a JSON object: `error(status, message)`, `bad_request`, `not_found`, `method_not_allowed`, `bad_target` and `bad_body`. A JSON body is sent with `Content-Type: application/json`, and text with `text/plain; charset=utf-8`. |
-| `URL_TEXT` | Percent decoding (RFC 3986 section 2.1). In a query, `+` is also a space. A `%` with no two hex digits is `BadEscape`, and bytes that are not UTF-8 are `NotUtf8`. |
+| `URL_TEXT` | Percent decoding (RFC 3986 section 2.1). In a query, `+` is also a space. A `%` with no two hex digits is `BadEscape`, and bytes that are not UTF-8 are `NotUtf8`. It reads with `gparse`'s `CURSOR`. |
 | `REQUEST_TARGET` | `/users/42?q=a+b` as segments `users`, `42` and the field `q` = `a b`. A segment is decoded after the split, so `%2F` stays inside it. Empty query fields are skipped, and a field with no `=` has an empty value. |
 | `PATH_PATTERN`, `PATH_SEGMENT` | `/users/:id`: a segment that starts with `:` is a parameter, and the others must equal the request's decoded segment. |
 | `URL_PARAM` | A decoded name and value, and `find`, the value of the first one with a name. |

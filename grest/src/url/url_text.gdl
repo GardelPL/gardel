@@ -21,40 +21,39 @@ feature {ANY}
         (LIST_OPS.at(bs.model, k) != 37 and not (plus and LIST_OPS.at(bs.model, k) = 43)))
     end
 
-  -- The bytes of `raw` from `i` on, decoded, after `out`. Never more bytes than it reads.
-  decode_from(raw: BYTES, i: NAT, plus: BOOL, out: BYTES_BUILDER): RESULT[URL_ERROR, BYTES]
+  -- The bytes from `c` on, decoded, after `out`. Never more bytes than it reads.
+  decode_from(c: CURSOR, plus: BOOL, out: BYTES_BUILDER): RESULT[URL_ERROR, BYTES]
     require
-      inside: i <= raw.length
-      no_longer: out.length <= i
+      no_longer: out.length <= c.offset
     variant
-      raw.length - i
+      c.remaining
     do
-      if i = raw.length then
-        Ok(out.to_bytes)
-      else
-        let b = raw.at(i)
-        if b = 37 then
-          if raw.length - i >= 3 then
-            let high = NUMBER_TEXT.hex_value(raw.at(i + 1))
-            let low = NUMBER_TEXT.hex_value(raw.at(i + 2))
-            if high < 16 and low < 16 then
-              decode_from(raw, i + 3, plus, out.add_byte(high * 16 + low))
+      match c.peek
+        case None then
+          Ok(out.to_bytes)
+        case Some(b) then
+          if b = 37 then
+            if c.remaining >= 3 then
+              let high = NUMBER_TEXT.hex_value(c.input.at(c.offset + 1))
+              let low = NUMBER_TEXT.hex_value(c.input.at(c.offset + 2))
+              if high < 16 and low < 16 then
+                decode_from(c.advance(3), plus, out.add_byte(high * 16 + low))
+              else
+                Error(BadEscape)
+              end
             else
               Error(BadEscape)
             end
           else
-            Error(BadEscape)
+            if plus and b = 43 then
+              decode_from(c.advance(1), plus, out.add_byte(32))
+            else
+              decode_from(c.advance(1), plus, out.add_byte(b))
+            end
           end
-        else
-          if plus and b = 43 then
-            decode_from(raw, i + 1, plus, out.add_byte(32))
-          else
-            decode_from(raw, i + 1, plus, out.add_byte(b))
-          end
-        end
       end
     ensure
-      shorter: Result.is_ok implies Result.get.length <= out.length + (raw.length - i)
+      shorter: Result.is_ok implies Result.get.length <= out.length + c.remaining
     end
 
   -- `s` decoded. Text with no `%`, nor `+` in a query, is returned as it is, with no copy.
@@ -65,7 +64,7 @@ feature {ANY}
       if plain_from(raw, 0, plus) then
         Ok(s)
       else
-        let r = decode_from(raw, 0, plus, BYTES_BUILDER.empty)
+        let r = decode_from(CURSOR.start(raw), plus, BYTES_BUILDER.empty)
         check r_short: r.is_ok implies r.get.length <= raw.length end
         match r
           case Error(e) then
